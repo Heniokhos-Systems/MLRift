@@ -344,9 +344,11 @@ fn main() {
         u8 cf = 0; unsafe { *(ev_full as u8) -> cf }
         if cf != 48 {
             // Slice 2.4-pre fixes shipped (host-pointer + attn_decode_batched
-            // s16-clobber), but chain still NaNs — leave use_gpu_full=0 in
-            // batched mode so existing CPU-fallback path keeps producing
-            // PyTorch-identical output.
+            // s16-clobber).  Live chain still produces NaN attn output —
+            // remaining bug is buffer-init-pattern dependent (smoke at the
+            // exact same shape passes; some shape of buffer reuse in chain
+            // breaks the kernel).  Leave use_gpu_full=0 by default so the
+            // CPU-fallback path keeps producing PyTorch-identical output.
             if gpu_pipeline_ready() == 1 {
                 d_x_A = dev_try_alloc_host_visible(M_eff * hidden * 4)
                 d_x_B = dev_try_alloc_host_visible(M_eff * hidden * 4)
@@ -550,6 +552,40 @@ fn main() {
                     } else {
                         if gpu_insert_k_qwen3_f32_to_dev(_gpuq_d_k_stage, d_k_pos_b, batch_size) != 0 { exit(1) }
                     }
+                    if step == 0 { if layer == 0 {
+                        // SELF-TEST: allocate fresh GPU bufs with known data,
+                        // run attn_decode_batched, verify output. If correct,
+                        // kernel works at this point in chain; if NaN, GPU
+                        // state is corrupt.
+                        gpu_pipeline_flush()
+                        u64 q_b   = batch_size * q_dim * 4
+                        u64 kvb   = batch_size * 64 * 1024 * 4   // max_seq=64, kv_dim=1024
+                        u64 fq = 0; u64 fkc = 0; u64 fvc = 0; u64 fout = 0
+                        u64 sl = alloc(8); hipMalloc(sl, q_b);  unsafe { *(sl as u64) -> fq }
+                        sl = alloc(8); hipMalloc(sl, kvb); unsafe { *(sl as u64) -> fkc }
+                        sl = alloc(8); hipMalloc(sl, kvb); unsafe { *(sl as u64) -> fvc }
+                        sl = alloc(8); hipMalloc(sl, q_b);  unsafe { *(sl as u64) -> fout }
+                        u64 hb = alloc(q_b)
+                        u64 ii = 0
+                        while ii < (batch_size * q_dim) { unsafe { *((hb + ii*4) as f32) = 0.5f }; ii = ii+1 }
+                        hipMemcpy(fq, hb, q_b, 1)
+                        u64 hbk = alloc(kvb)
+                        ii = 0
+                        while ii < (batch_size * 64 * 1024) { unsafe { *((hbk + ii*4) as f32) = 0.25f }; ii = ii+1 }
+                        hipMemcpy(fkc, hbk, kvb, 1)
+                        ii = 0
+                        while ii < (batch_size * 64 * 1024) { unsafe { *((hbk + ii*4) as f32) = 0.75f }; ii = ii+1 }
+                        hipMemcpy(fvc, hbk, kvb, 1)
+                        if gpu_attn_decode_to_dev_batched(fq, fkc, fvc, fout, 1, batch_size) != 0 { exit(1) }
+                        gpu_pipeline_flush()
+                        u64 hout = alloc(q_b)
+                        hipMemcpy(hout, fout, q_b, 2)
+                        u32 ot0 = 0; unsafe { *(hout as u32) -> ot0 }
+                        u32 ot1 = 0; unsafe { *((hout + 8192) as u32) -> ot1 }
+                        eout("[selftest] expected=0.75 (0x3F400000) got_b0="); eu64(ot0); eout(" got_b1="); eu64(ot1); eout("\n")
+                        hipFree(fq); hipFree(fkc); hipFree(fvc); hipFree(fout)
+                        dealloc(hb); dealloc(hbk); dealloc(hout)
+                    } }
                     if is_spec != 0 {
                         if gpu_attn_decode_to_dev_speck4(_gpuq_d_q_attn, d_kc_layer_b, d_vc_layer_b,
                                                           _gpuq_d_attn, pos + M_eff) != 0 { exit(1) }
