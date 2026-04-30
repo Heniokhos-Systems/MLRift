@@ -6519,11 +6519,32 @@ fn _emit_attn_decode_f32_body(uint64 args_desc) {
     asm_u32(0xBFBD0000)                            // s_barrier
     _emit_lds_reduce_pow2(32, 0x200A0F05, 2)       // v_max_f32 v5,v5,v7
 
+    // The reduce helper leaves the final result only in lane 0's v5 (and
+    // partial-tree leftovers in lanes 1..15). LDS[0] holds the final max
+    // (lane 0's last writeback). Broadcast LDS[0] → v5 in every lane so
+    // the centring step below sees the same max in all lanes — otherwise
+    // padding lanes (-inf score + their stale max-of-pair) compute
+    // (-inf) - (-inf) = NaN which poisons the sum reduce.
+    asm_v_mov_b32(7, 0x80)                         // v7 = 0 (lane-uniform addr)
+    asm_s_delay_alu(0x01)
+    asm_u32(0xD8D80000); asm_u32(0x05000007)       // ds_load_b32 v5, v7 offset:0
+    asm_u32(0xBF89FC07)                            // s_waitcnt lgkmcnt(0)
+
     // Centred score = v11 − v5, then * log2(e), then v_exp_f32 (= 2^x).
-    asm_u32(0x0A160B0B)                            // v_sub_f32  v11, v11, v5
+    // (Original 0x0A160B0B was v_subrev_f32 — computed v5-v11 instead of
+    // v11-v5, flipping the sign and pushing v_exp_f32 input to +large.)
+    asm_u32(0x08160B0B)                            // v_sub_f32  v11, v11, v5
     asm_v_mov_b32_lit32(7, 0x3FB8AA3B)             // v7 = log2(e)
     asm_u32(0x10160F0B)                            // v_mul_f32  v11, v11, v7
     asm_u32(0x7E164B0B)                            // v_exp_f32  v11, v11
+
+    // Inactive lanes had v11 = -inf going into v_exp_f32. RDNA3
+    // v_exp_f32(-inf) does not always return +0 (observed: contributes
+    // +inf to the sum-reduce). Force inactive lanes' e to 0 explicitly
+    // (src0 = inline 0 = 0x80 in the 9-bit field) so the sum sees only
+    // contributions from active lanes.
+    asm_u32(0x7C98000C)                            // v_cmp_gt_u32 vcc_lo, s12, v0
+    asm_u32(0x02161680)                            // v_cndmask_b32 v11, 0, v11, vcc_lo
 
     // Copy e to v5 for the sum reduce.
     asm_u32(0x7E0A030B)                            // v_mov_b32 v5, v11
@@ -6532,9 +6553,16 @@ fn _emit_attn_decode_f32_body(uint64 args_desc) {
     asm_u32(0xBFBD0000)                            // s_barrier
     _emit_lds_reduce_pow2(32, 0x060A0F05, 2)       // v_add_f32 v5,v5,v7
 
+    // Same broadcast: lane 0 has the sum, others have stale partials.
+    asm_v_mov_b32(7, 0x80)                         // v7 = 0
+    asm_s_delay_alu(0x01)
+    asm_u32(0xD8D80000); asm_u32(0x05000007)       // ds_load_b32 v5, v7 offset:0
+    asm_u32(0xBF89FC07)                            // s_waitcnt lgkmcnt(0)
+
     // weight = e * (1/sum).
     asm_u32(0x7E0A5505)                            // v_rcp_f32 v5, v5
     asm_u32(0x100A0B0B)                            // v_mul_f32 v5, v11, v5
+
 
     // Recompute active mask, then lane < pos_plus_1 stores the weight
     // back to LDS scores buffer (consumed by the accum loop below).
@@ -6709,14 +6737,27 @@ fn _emit_attn_decode_f32_batched_body(uint64 args_desc) {
     asm_u32(0xD8340000); asm_u32(0x00000506)
     asm_u32(0xBF89FC07); asm_u32(0xBFBD0000)
     _emit_lds_reduce_pow2(32, 0x200A0F05, 2)
-    asm_u32(0x0A160B0B)
+    // Broadcast LDS[0] (= max) into v5 in every lane.
+    asm_v_mov_b32(7, 0x80)
+    asm_s_delay_alu(0x01)
+    asm_u32(0xD8D80000); asm_u32(0x05000007)
+    asm_u32(0xBF89FC07)
+    asm_u32(0x08160B0B)                            // v_sub_f32 v11, v11, v5  (was v_subrev_f32 — sign bug)
     asm_v_mov_b32_lit32(7, 0x3FB8AA3B)
     asm_u32(0x10160F0B)
     asm_u32(0x7E164B0B)
+    // Force inactive lanes' e to 0 (defensive vs v_exp_f32(-inf) on RDNA3).
+    asm_u32(0x7C98000C)                            // v_cmp_gt_u32 vcc_lo, s12, v0
+    asm_u32(0x02161680)                            // v_cndmask_b32 v11, 0, v11, vcc_lo
     asm_u32(0x7E0A030B)
     asm_u32(0xD8340000); asm_u32(0x00000506)
     asm_u32(0xBF89FC07); asm_u32(0xBFBD0000)
     _emit_lds_reduce_pow2(32, 0x060A0F05, 2)
+    // Broadcast LDS[0] (= sum) into v5 in every lane.
+    asm_v_mov_b32(7, 0x80)
+    asm_s_delay_alu(0x01)
+    asm_u32(0xD8D80000); asm_u32(0x05000007)
+    asm_u32(0xBF89FC07)
     asm_u32(0x7E0A5505)
     asm_u32(0x100A0B0B)
     asm_u32(0x7C98000C)
@@ -6867,14 +6908,27 @@ fn _emit_attn_decode_f32_speck4_body(uint64 args_desc) {
     asm_u32(0xD8340000); asm_u32(0x00000506)
     asm_u32(0xBF89FC07); asm_u32(0xBFBD0000)
     _emit_lds_reduce_pow2(32, 0x200A0F05, 2)
-    asm_u32(0x0A160B0B)
+    // Broadcast LDS[0] (= max) into v5 in every lane.
+    asm_v_mov_b32(7, 0x80)
+    asm_s_delay_alu(0x01)
+    asm_u32(0xD8D80000); asm_u32(0x05000007)
+    asm_u32(0xBF89FC07)
+    asm_u32(0x08160B0B)                            // v_sub_f32 v11, v11, v5  (was v_subrev_f32)
     asm_v_mov_b32_lit32(7, 0x3FB8AA3B)
     asm_u32(0x10160F0B)
     asm_u32(0x7E164B0B)
+    // Force inactive lanes' e to 0 (defensive vs v_exp_f32(-inf) on RDNA3).
+    asm_u32(0x7C980017)                            // v_cmp_gt_u32 vcc_lo, s23, v0  (causal cutoff)
+    asm_u32(0x02161680)                            // v_cndmask_b32 v11, 0, v11, vcc_lo
     asm_u32(0x7E0A030B)
     asm_u32(0xD8340000); asm_u32(0x00000506)
     asm_u32(0xBF89FC07); asm_u32(0xBFBD0000)
     _emit_lds_reduce_pow2(32, 0x060A0F05, 2)
+    // Broadcast LDS[0] (= sum) into v5 in every lane.
+    asm_v_mov_b32(7, 0x80)
+    asm_s_delay_alu(0x01)
+    asm_u32(0xD8D80000); asm_u32(0x05000007)
+    asm_u32(0xBF89FC07)
     asm_u32(0x7E0A5505)
     asm_u32(0x100A0B0B)
     asm_u32(0x7C980017)                            // v_cmp_gt_u32 vcc_lo, s23, v0  (use s23)
