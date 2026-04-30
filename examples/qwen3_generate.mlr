@@ -680,13 +680,80 @@ fn main() {
                 layer = layer + 1
             }
             // After the layer sweep, d_in_arr[b] holds the final residual
-            // device VA for stream b; D2H back to that stream's x_cur.
-            u64 b_d2h = 0
-            while b_d2h < batch_size {
-                u64 dih_f = 0; unsafe { *((d_in_h_arr + b_d2h * 8) as u64) -> dih_f }
-                u64 xc_f  = 0; unsafe { *((x_cur_arr  + b_d2h * 8) as u64) -> xc_f }
-                memcpy(xc_f, dih_f, hidden * 4)
-                b_d2h = b_d2h + 1
+            // device VA for stream b.  Non-spec: D2H row 0 to x_cur for
+            // the legacy lmhead path.  Spec: run slice 2.4 verify+accept
+            // here (inline, while d_in_h_arr is still in scope), then
+            // skip the post-layer lmhead block below.
+            if is_spec == 0 {
+                u64 b_d2h = 0
+                while b_d2h < batch_size {
+                    u64 dih_f = 0; unsafe { *((d_in_h_arr + b_d2h * 8) as u64) -> dih_f }
+                    u64 xc_f  = 0; unsafe { *((x_cur_arr  + b_d2h * 8) as u64) -> xc_f }
+                    memcpy(xc_f, dih_f, hidden * 4)
+                    b_d2h = b_d2h + 1
+                }
+            } else {
+                // Slice 2.4: speculative verify + accept.  Per-row final
+                // norm + lmhead + argmax → pred[r].  Walk the predictions
+                // vs drafts to decide how many tokens to accept.
+                // pred[0] is always accepted (= true next token at pos+1).
+                // For r >= 1: accept pred[r] iff draft[r-1] == pred[r-1].
+                u64 sids_s = 0; unsafe { *((seq_ids_arr + 0) as u64) -> sids_s }
+                u64 x_cur_s = 0; unsafe { *((x_cur_arr + 0) as u64) -> x_cur_s }
+                u64 pred_arr = alloc(M_eff * 8)
+                u64 lm_start = time_now()
+                u64 r_pred = 0
+                while r_pred < M_eff {
+                    u64 dih_r = 0; unsafe { *((d_in_h_arr + r_pred * 8) as u64) -> dih_r }
+                    qwen3_rmsnorm_bf16(final_out, dih_r, norm_ptr, hidden)
+                    qwen3_main_matmul(logits, final_out, embed_ptr, 1, vocab, hidden, num_workers, 0)
+                    u64 best_id = 0
+                    f32 best_val = 0.0f
+                    u64 first = 1
+                    u64 j = 0
+                    while j < vocab {
+                        f32 v = 0.0f
+                        unsafe { *((logits + j * 4) as f32) -> v }
+                        if first == 1 { best_val = v; best_id = j; first = 0 }
+                        else          { if v > best_val { best_val = v; best_id = j } }
+                        j = j + 1
+                    }
+                    unsafe { *((pred_arr + r_pred * 8) as u64) = best_id }
+                    r_pred = r_pred + 1
+                }
+                sum_lmhead_ns = sum_lmhead_ns + time_elapsed(lm_start)
+                u64 pred0 = 0; unsafe { *((pred_arr + 0) as u64) -> pred0 }
+                unsafe { *((sids_s + seq_len * 8) as u64) = pred0 }
+                u64 n_accept = 1
+                u64 ai = 1
+                while ai < M_eff {
+                    u64 di = 0; unsafe { *((draft_arr + (ai - 1) * 8) as u64) -> di }
+                    u64 pi_prev = 0; unsafe { *((pred_arr + (ai - 1) * 8) as u64) -> pi_prev }
+                    if di != pi_prev {
+                        ai = M_eff
+                    } else {
+                        u64 pi = 0; unsafe { *((pred_arr + ai * 8) as u64) -> pi }
+                        unsafe { *((sids_s + (seq_len + n_accept) * 8) as u64) = pi }
+                        n_accept = n_accept + 1
+                        ai = ai + 1
+                    }
+                }
+                dealloc(pred_arr)
+                dealloc(draft_arr)
+                u64 last_tok = 0; unsafe { *((sids_s + (seq_len + n_accept - 1) * 8) as u64) -> last_tok }
+                u64 emb_start = time_now()
+                u64 row_e_s = embed_ptr + last_tok * hidden * 2
+                u64 ie = 0
+                while ie < hidden {
+                    f32 ev = bf16_to_f32(row_e_s + ie * 2)
+                    unsafe { *((x_cur_s + ie * 4) as f32) = ev }
+                    ie = ie + 1
+                }
+                sum_embed_ns = sum_embed_ns + time_elapsed(emb_start)
+                unsafe { *((tok_arr + 0) as u64) = last_tok }
+                eout("[spec] step "); eu64(step); eout(" accepted "); eu64(n_accept); eout(" / "); eu64(M_eff); eout("\n")
+                seq_len = seq_len + n_accept
+                pos    = pos    + n_accept
             }
             dealloc(d_in_arr); dealloc(d_out_arr); dealloc(d_in_h_arr)
         } else {
@@ -714,53 +781,9 @@ fn main() {
         // Slice 1.5: when batch > 1 and the batched lm_head buffers are
         // allocated, run final_norm × M into the batched final_out buffer,
         // then ONE batched lm_head matmul for all streams, then per-stream
-        // argmax + embed.
-        if is_spec != 0 {
-            // Slice 2.4 verify block lives here in a future iteration.
-            // For now: consume row 0 only (single-stream-equivalent
-            // semantics) and free draft_arr.
-            dealloc(draft_arr)
-            // Fall through to the existing per-stream path which
-            // operates on x_cur (already updated by D2H from row 0).
-            u64 b_step = 0
-            while b_step < batch_size {
-                u64 x_cur = 0; unsafe { *((x_cur_arr + b_step * 8) as u64) -> x_cur }
-                u64 sids  = 0; unsafe { *((seq_ids_arr + b_step * 8) as u64) -> sids }
-                u64 norm_start_ns = time_now()
-                qwen3_rmsnorm_bf16(final_out, x_cur, norm_ptr, hidden)
-                sum_norm_ns = sum_norm_ns + time_elapsed(norm_start_ns)
-                u64 lmhead_start_ns = time_now()
-                qwen3_main_matmul(logits, final_out, embed_ptr, 1, vocab, hidden, num_workers, 0)
-                sum_lmhead_ns = sum_lmhead_ns + time_elapsed(lmhead_start_ns)
-                u64 argmax_start_ns = time_now()
-                u64 best_id = 0
-                f32 best_val = 0.0f
-                u64 first = 1
-                u64 j = 0
-                while j < vocab {
-                    f32 v = 0.0f
-                    unsafe { *((logits + j * 4) as f32) -> v }
-                    if first == 1 { best_val = v; best_id = j; first = 0 }
-                    else          { if v > best_val { best_val = v; best_id = j } }
-                    j = j + 1
-                }
-                sum_argmax_ns = sum_argmax_ns + time_elapsed(argmax_start_ns)
-                unsafe { *((sids + seq_len * 8) as u64) = best_id }
-                u64 embed_start_ns = time_now()
-                u64 row_e = embed_ptr + best_id * hidden * 2
-                u64 i1 = 0
-                while i1 < hidden {
-                    f32 v = bf16_to_f32(row_e + i1 * 2)
-                    unsafe { *((x_cur + i1 * 4) as f32) = v }
-                    i1 = i1 + 1
-                }
-                sum_embed_ns = sum_embed_ns + time_elapsed(embed_start_ns)
-                unsafe { *((tok_arr + b_step * 8) as u64) = best_id }
-                b_step = b_step + 1
-            }
-            seq_len = seq_len + 1
-            pos    = pos    + 1
-        } else {
+        // argmax + embed.  In spec mode the verify+accept already ran
+        // inline within the use_gpu_full block above; skip this block.
+        if is_spec == 0 {
             u64 use_batched_lmhead = 0
             if batch_size > 1 {
                 if d_logits_batched != 0 { use_batched_lmhead = 1 }
