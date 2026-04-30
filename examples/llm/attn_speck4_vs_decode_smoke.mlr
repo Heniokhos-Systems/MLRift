@@ -1,0 +1,202 @@
+// Side-by-side smoke: attn_decode_f32 (M=1) vs attn_decode_f32_speck4
+// on identical row-0 Q / K[0] / V[0] at pos_plus_1 cases the chain
+// hits at step 0 layer 0 (M=1 → pos_plus_1=1; M=4 → pos_plus_1=4 with
+// causal bound on row 0 = 1).  Both kernels should produce IDENTICAL
+// row-0 output (= V[0] at this single-position bound).
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --emit-amdgpu-attn-decode-f32=/tmp/attn_decode_f32.co dummy
+//   ./build/mlrc --arch=x86_64 --emit-amdgpu-attn-decode-f32-speck4=/tmp/attn_decode_f32_speck4.co dummy
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/attn_speck4_vs_decode_smoke.mlr -o /tmp/attn_vs_smoke
+// Run:
+//   /tmp/attn_vs_smoke
+
+import "../../std/hip.mlr"
+import "../../std/io.mlr"
+import "../../std/fmt.mlr"
+import "../../std/string.mlr"
+import "../../std/math_float.mlr"
+
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn getenv(uint64 name) -> uint64
+fn die(uint64 m, uint64 c) { print_str(m); print_str(" e="); u64 s = fmt_dec(c); print_str(s); dealloc(s); print_str("\n"); exit(1) }
+
+fn main() {
+    uint32 err = hipSetDevice(0); if err != 0 { die("setDev", err) }
+
+    // Load both code objects.
+    u64 fd1 = file_open("/tmp/attn_decode_f32.co", 0)
+    if fd1 > 0xFFFFFFFFFFFFF000 { die("missing co1", 0) }
+    u64 sz1 = file_size(fd1); u64 blob1 = alloc(sz1)
+    file_read(fd1, blob1, sz1); file_close(fd1)
+    u64 ms1 = alloc(8); err = hipModuleLoadData(ms1, blob1); if err != 0 { die("Load1", err) }
+    u64 mod1 = 0; unsafe { *(ms1 as u64) -> mod1 }
+    u64 fhs1 = alloc(8)
+    err = hipModuleGetFunction(fhs1, mod1, "attn_decode_f32"); if err != 0 { die("getFn1", err) }
+    u64 fh1 = 0; unsafe { *(fhs1 as u64) -> fh1 }
+
+    u64 fd2 = file_open("/tmp/attn_decode_f32_speck4.co", 0)
+    if fd2 > 0xFFFFFFFFFFFFF000 { die("missing co2", 0) }
+    u64 sz2 = file_size(fd2); u64 blob2 = alloc(sz2)
+    file_read(fd2, blob2, sz2); file_close(fd2)
+    u64 ms2 = alloc(8); err = hipModuleLoadData(ms2, blob2); if err != 0 { die("Load2", err) }
+    u64 mod2 = 0; unsafe { *(ms2 as u64) -> mod2 }
+    u64 fhs2 = alloc(8)
+    err = hipModuleGetFunction(fhs2, mod2, "attn_decode_f32_speck4"); if err != 0 { die("getFn2", err) }
+    u64 fh2 = 0; unsafe { *(fhs2 as u64) -> fh2 }
+
+    print_str("both kernels loaded\n")
+
+    u64 K = 4
+    u64 nh = 16; u64 nkv = 8; u64 hd = 128
+    u64 max_seq = 64
+
+    // Q for M=1 kernel: [nh, hd].  Q for speck4: [K, nh, hd].
+    u64 q1_bytes  = nh * hd * 4
+    u64 q4_bytes  = K * nh * hd * 4
+    u64 kv_bytes  = max_seq * nkv * hd * 4
+    u64 out1_bytes = q1_bytes
+    u64 out4_bytes = q4_bytes
+
+    // Allocate GPU buffers (separate set per kernel — same data values).
+    u64 d_q1 = 0; u64 d_q4 = 0
+    u64 d_kc1 = 0; u64 d_kc4 = 0
+    u64 d_vc1 = 0; u64 d_vc4 = 0
+    u64 d_out1 = 0; u64 d_out4 = 0
+    u64 slot
+    slot = alloc(8); hipMalloc(slot, q1_bytes);  unsafe { *(slot as u64) -> d_q1 }
+    slot = alloc(8); hipMalloc(slot, q4_bytes);  unsafe { *(slot as u64) -> d_q4 }
+    slot = alloc(8); hipMalloc(slot, kv_bytes);  unsafe { *(slot as u64) -> d_kc1 }
+    slot = alloc(8); hipMalloc(slot, kv_bytes);  unsafe { *(slot as u64) -> d_kc4 }
+    slot = alloc(8); hipMalloc(slot, kv_bytes);  unsafe { *(slot as u64) -> d_vc1 }
+    slot = alloc(8); hipMalloc(slot, kv_bytes);  unsafe { *(slot as u64) -> d_vc4 }
+    slot = alloc(8); hipMalloc(slot, out1_bytes); unsafe { *(slot as u64) -> d_out1 }
+    slot = alloc(8); hipMalloc(slot, out4_bytes); unsafe { *(slot as u64) -> d_out4 }
+
+    // Q values: fill nh*hd with deterministic pattern Q[h,j] = (h+1)*0.01 + j*0.001.
+    // For speck4: row 0 gets the same Q; rows 1..3 are zeros (don't affect row-0 output).
+    u64 h_q1 = alloc(q1_bytes)
+    u64 h_q4 = alloc(q4_bytes)
+    u64 i = 0
+    while i < nh * hd { unsafe { *((h_q4 + i * 4) as f32) = 0.0f }; i = i + 1 }
+    i = 0
+    while i < nh * hd {
+        u64 ih = i / hd
+        u64 ij = i % hd
+        f64 v = (int_to_f64(ih) + 1.0) * 0.01 + int_to_f64(ij) * 0.001
+        f32 vf = f64_to_f32(v)
+        unsafe { *((h_q1 + i * 4) as f32) = vf }
+        // speck4 Q: row 0 only
+        unsafe { *((h_q4 + i * 4) as f32) = vf }
+        i = i + 1
+    }
+    // Zero rows 1..K-1 of speck4 Q.
+    i = nh * hd
+    while i < K * nh * hd { unsafe { *((h_q4 + i * 4) as f32) = 0.0f }; i = i + 1 }
+    hipMemcpy(d_q1, h_q1, q1_bytes, 1)
+    hipMemcpy(d_q4, h_q4, q4_bytes, 1)
+
+    // K cache: only slot 0 matters.  K[0, kvh, j] = (kvh+1)*0.02 + j*0.0005.
+    // Other slots zeroed.
+    u64 h_kc = alloc(kv_bytes)
+    i = 0
+    while i < max_seq * nkv * hd { unsafe { *((h_kc + i * 4) as f32) = 0.0f }; i = i + 1 }
+    i = 0
+    while i < nkv * hd {
+        u64 ikv = i / hd
+        u64 ij  = i % hd
+        f64 v = (int_to_f64(ikv) + 1.0) * 0.02 + int_to_f64(ij) * 0.0005
+        unsafe { *((h_kc + i * 4) as f32) = f64_to_f32(v) }
+        i = i + 1
+    }
+    hipMemcpy(d_kc1, h_kc, kv_bytes, 1)
+    hipMemcpy(d_kc4, h_kc, kv_bytes, 1)
+
+    // V cache: only slot 0 matters.  V[0, kvh, j] = (kvh+1)*0.03 + j*0.0007.
+    u64 h_vc = alloc(kv_bytes)
+    i = 0
+    while i < max_seq * nkv * hd { unsafe { *((h_vc + i * 4) as f32) = 0.0f }; i = i + 1 }
+    i = 0
+    while i < nkv * hd {
+        u64 ikv = i / hd
+        u64 ij  = i % hd
+        f64 v = (int_to_f64(ikv) + 1.0) * 0.03 + int_to_f64(ij) * 0.0007
+        unsafe { *((h_vc + i * 4) as f32) = f64_to_f32(v) }
+        i = i + 1
+    }
+    hipMemcpy(d_vc1, h_vc, kv_bytes, 1)
+    hipMemcpy(d_vc4, h_vc, kv_bytes, 1)
+
+    // Launch M=1 kernel: pos_plus_1 = 1, grid (nh,1,1), block 32.
+    u64 pos_plus_1_m1 = 1
+    u64 a0 = alloc(8); unsafe { *(a0 as u64) = d_q1 }
+    u64 a1 = alloc(8); unsafe { *(a1 as u64) = d_kc1 }
+    u64 a2 = alloc(8); unsafe { *(a2 as u64) = d_vc1 }
+    u64 a3 = alloc(8); unsafe { *(a3 as u64) = d_out1 }
+    u64 a4 = alloc(8); unsafe { *(a4 as u64) = pos_plus_1_m1 }
+    u64 kp1 = alloc(5 * 8)
+    unsafe { *(kp1        as u64) = a0 }
+    unsafe { *((kp1 +  8) as u64) = a1 }
+    unsafe { *((kp1 + 16) as u64) = a2 }
+    unsafe { *((kp1 + 24) as u64) = a3 }
+    unsafe { *((kp1 + 32) as u64) = a4 }
+    err = hipModuleLaunchKernel(fh1, nh, 1, 1, 32, 1, 1, 0, 0, kp1, 0); if err != 0 { die("launch1", err) }
+    err = hipDeviceSynchronize(); if err != 0 { die("sync1", err) }
+
+    // Launch speck4 kernel: pos_plus_1 = K = 4 (= 0 + K), grid (nh, K, 1), block 32.
+    u64 pos_plus_1_m4 = K
+    u64 b0 = alloc(8); unsafe { *(b0 as u64) = d_q4 }
+    u64 b1 = alloc(8); unsafe { *(b1 as u64) = d_kc4 }
+    u64 b2 = alloc(8); unsafe { *(b2 as u64) = d_vc4 }
+    u64 b3 = alloc(8); unsafe { *(b3 as u64) = d_out4 }
+    u64 b4 = alloc(8); unsafe { *(b4 as u64) = pos_plus_1_m4 }
+    u64 kp2 = alloc(5 * 8)
+    unsafe { *(kp2        as u64) = b0 }
+    unsafe { *((kp2 +  8) as u64) = b1 }
+    unsafe { *((kp2 + 16) as u64) = b2 }
+    unsafe { *((kp2 + 24) as u64) = b3 }
+    unsafe { *((kp2 + 32) as u64) = b4 }
+    err = hipModuleLaunchKernel(fh2, nh, K, 1, 32, 1, 1, 0, 0, kp2, 0); if err != 0 { die("launch2", err) }
+    err = hipDeviceSynchronize(); if err != 0 { die("sync2", err) }
+
+    // D2H both outputs.
+    u64 h_out1 = alloc(out1_bytes)
+    u64 h_out4 = alloc(out4_bytes)
+    hipMemcpy(h_out1, d_out1, out1_bytes, 2)
+    hipMemcpy(h_out4, d_out4, out4_bytes, 2)
+
+    // Compare row-0 of speck4 (first nh*hd elements) vs the entire M=1 output.
+    u64 fail = 0
+    u64 j = 0
+    while j < nh * hd {
+        u32 b1v = 0; u32 b2v = 0
+        unsafe { *((h_out1 + j * 4) as u32) -> b1v }
+        unsafe { *((h_out4 + j * 4) as u32) -> b2v }
+        if b1v != b2v { fail = fail + 1 }
+        j = j + 1
+    }
+    print_str("compare M=1 vs speck4 row0: fail = "); u64 sf = fmt_dec(fail); print_str(sf); dealloc(sf)
+    print_str(" / "); u64 st = fmt_dec(nh * hd); print_str(st); dealloc(st); print_str("\n")
+
+    // Print first 8 elements of each for inspection.
+    print_str("M=1   row0[0..7]: ")
+    j = 0
+    while j < 8 {
+        u32 bv = 0; unsafe { *((h_out1 + j * 4) as u32) -> bv }
+        u64 sv = fmt_dec(bv); print_str(sv); dealloc(sv); print_str(" ")
+        j = j + 1
+    }
+    print_str("\n")
+    print_str("speck row0[0..7]: ")
+    j = 0
+    while j < 8 {
+        u32 bv = 0; unsafe { *((h_out4 + j * 4) as u32) -> bv }
+        u64 sv = fmt_dec(bv); print_str(sv); dealloc(sv); print_str(" ")
+        j = j + 1
+    }
+    print_str("\n")
+
+    if fail == 0 { print_str("OK — speck4 row 0 matches M=1\n"); exit(0) }
+    print_str("FAIL — speck4 row-0 diverges from M=1\n")
+    exit(1)
+}
