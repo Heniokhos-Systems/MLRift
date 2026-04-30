@@ -329,10 +329,16 @@ fn main() {
     // half boundaries.  Gated by MLRIFT_GPU_FULL_FORWARD=1.  At
     // batch_size > 1 each stream gets its own ping-pong pair.
     u64 use_gpu_full = 0
-    u64 d_x_a_arr   = alloc(batch_size * 8)
-    u64 d_x_b_arr   = alloc(batch_size * 8)
-    u64 d_x_a_h_arr = alloc(batch_size * 8)
-    u64 d_x_b_h_arr = alloc(batch_size * 8)
+    // Pointer arrays must hold M_eff entries (= K rows in spec mode), not
+    // just batch_size — the use_gpu_full chain feeds these to batched
+    // dispatch with M_eff lanes.  Pre-spec the arrays were sized
+    // batch_size and the M_eff > batch_size loop in
+    // qwen3_forward_layer_qkv_batched_gpu OOB-read garbage pointers and
+    // hung the GPU at the first rmsnorm.
+    u64 d_x_a_arr   = alloc(M_eff * 8)
+    u64 d_x_b_arr   = alloc(M_eff * 8)
+    u64 d_x_a_h_arr = alloc(M_eff * 8)
+    u64 d_x_b_h_arr = alloc(M_eff * 8)
     // Slice 1.6: contiguous [batch, hidden] residual buffers (one A, one B
     // for ping-pong).  Per-stream pointers in d_x_a_arr / d_x_b_arr now
     // reference slots inside the single contiguous allocation, so the
@@ -343,12 +349,11 @@ fn main() {
     if ev_full != 0 {
         u8 cf = 0; unsafe { *(ev_full as u8) -> cf }
         if cf != 48 {
-            // Slice 2.4-pre fixes shipped (host-pointer + attn_decode_batched
-            // s16-clobber).  Live chain still produces NaN attn output —
-            // remaining bug is buffer-init-pattern dependent (smoke at the
-            // exact same shape passes; some shape of buffer reuse in chain
-            // breaks the kernel).  Leave use_gpu_full=0 by default so the
-            // CPU-fallback path keeps producing PyTorch-identical output.
+            // Force _gpu_mm_init_once via gpu_matmul_enabled() so
+            // gpu_pipeline_ready() can return 1.  Without this, the
+            // pipeline_ready check returns 0 at startup (no GPU op has
+            // fired yet) and use_gpu_full stays dormant.
+            uint64 _force_init = gpu_matmul_enabled()
             if gpu_pipeline_ready() == 1 {
                 d_x_A = dev_try_alloc_host_visible(M_eff * hidden * 4)
                 d_x_B = dev_try_alloc_host_visible(M_eff * hidden * 4)
@@ -356,8 +361,11 @@ fn main() {
                     if d_x_B != 0 {
                         d_x_A_h = dev_host_ptr(d_x_A)
                         d_x_B_h = dev_host_ptr(d_x_B)
+                        // Populate ALL M_eff slots (K rows in spec mode share
+                        // batch_size==1 but live at consecutive offsets in
+                        // the contiguous d_x_A allocation).
                         u64 b_dx = 0
-                        while b_dx < batch_size {
+                        while b_dx < M_eff {
                             u64 da = d_x_A + b_dx * hidden * 4
                             u64 db = d_x_B + b_dx * hidden * 4
                             unsafe { *((d_x_a_arr   + b_dx * 8) as u64) = da }
@@ -482,12 +490,14 @@ fn main() {
                     r = r + 1
                 }
             }
-            // Per-stream d_in/d_out pointer arrays (ping-pong across layers).
-            u64 d_in_arr   = alloc(batch_size * 8)
-            u64 d_out_arr  = alloc(batch_size * 8)
-            u64 d_in_h_arr = alloc(batch_size * 8)
+            // Per-row d_in/d_out pointer arrays (ping-pong across layers).
+            // Sized M_eff so the batched-chain dispatch reads valid pointers
+            // for every K row in spec mode.
+            u64 d_in_arr   = alloc(M_eff * 8)
+            u64 d_out_arr  = alloc(M_eff * 8)
+            u64 d_in_h_arr = alloc(M_eff * 8)
             u64 b_set = 0
-            while b_set < batch_size {
+            while b_set < M_eff {
                 u64 da   = 0; unsafe { *((d_x_a_arr   + b_set * 8) as u64) -> da }
                 u64 db   = 0; unsafe { *((d_x_b_arr   + b_set * 8) as u64) -> db }
                 u64 dah  = 0; unsafe { *((d_x_a_h_arr + b_set * 8) as u64) -> dah }
@@ -616,9 +626,11 @@ fn main() {
                     u64 vc = v_cache + layer * batch_stride
                     if qwen3_forward_layer_gpu(d_in_b, d_out_b, w, pos, kc, vc, num_workers, 0, 0xFF) != 0 { exit(1) }
                 }
-                // Swap ping-pong pointers per stream.
+                // Swap ping-pong pointers — every M_eff row, not just the
+                // batch_size streams (in spec mode batch_size=1 but we have
+                // M_eff=K rows that all need their pointers flipped).
                 u64 b_sw = 0
-                while b_sw < batch_size {
+                while b_sw < M_eff {
                     u64 di = 0; unsafe { *((d_in_arr   + b_sw * 8) as u64) -> di }
                     u64 do_ = 0; unsafe { *((d_out_arr  + b_sw * 8) as u64) -> do_ }
                     u64 dih = 0; unsafe { *((d_in_h_arr + b_sw * 8) as u64) -> dih }
@@ -626,7 +638,7 @@ fn main() {
                     u64 doh = 0
                     if do_ == 0 { } else {
                         u64 b_lk = 0
-                        while b_lk < batch_size {
+                        while b_lk < M_eff {
                             u64 dxa  = 0; unsafe { *((d_x_a_arr   + b_lk * 8) as u64) -> dxa }
                             u64 dxah = 0; unsafe { *((d_x_a_h_arr + b_lk * 8) as u64) -> dxah }
                             u64 dxb  = 0; unsafe { *((d_x_b_arr   + b_lk * 8) as u64) -> dxb }
