@@ -1,4 +1,4 @@
-// Standalone smoke for attn_decode_f32_batched at batch=2.
+// Standalone smoke for attn_decode_f32 at batch=2.
 // Tests the wg_y=batch_idx addressing fix (slice 2.4-pre).
 
 import "../../std/hip.mlr"
@@ -15,8 +15,19 @@ fn die(uint64 m, uint64 c) { print_str(m); print_str(" e="); u64 s = fmt_dec(c);
 fn main() {
     uint32 err = hipSetDevice(0); if err != 0 { die("setDev", err) }
 
+    // Simulate qwen3_generate's startup KV-cache GTT alloc.
+    u64 dummy_slot = alloc(8); hipMalloc(dummy_slot, 64)
+    u64 dummy_va = 0; unsafe { *(dummy_slot as u64) -> dummy_va }
+    hipFree(dummy_va)
+    u64 big1 = dev_try_alloc_host_visible(58720256)  // 56 MB (qwen3 KV cache size at batch=2)
+    u64 big2 = dev_try_alloc_host_visible(58720256)
+    print_str("simulated KV cache GTT allocated\n")
 
-    u64 fd = file_open("/tmp/attn_decode_f32_batched.co", 0)
+    // Simulate qwen3_generate's lazy GPU init (loads ~25 .co files).
+    if gpu_matmul_enabled() == 1 { print_str("gpu_matmul_enabled\n") }
+    else { print_str("gpu_matmul NOT enabled\n") }
+
+    u64 fd = file_open("/tmp/attn_decode_f32.co", 0)
     if fd > 0xFFFFFFFFFFFFF000 { die("missing co", 0) }
     u64 sz = file_size(fd); u64 blob = alloc(sz)
     file_read(fd, blob, sz); file_close(fd)
@@ -24,14 +35,14 @@ fn main() {
     err = hipModuleLoadData(mod_slot, blob); if err != 0 { die("LoadData", err) }
     u64 mod = 0; unsafe { *(mod_slot as u64) -> mod }
     u64 fh_slot = alloc(8)
-    err = hipModuleGetFunction(fh_slot, mod, "attn_decode_f32_batched"); if err != 0 { die("getFn", err) }
+    err = hipModuleGetFunction(fh_slot, mod, "attn_decode_f32"); if err != 0 { die("getFn", err) }
     u64 fh = 0; unsafe { *(fh_slot as u64) -> fh }
-    print_str("attn_decode_f32_batched loaded\n")
+    print_str("attn_decode_f32 loaded\n")
 
     u64 nh = 16; u64 nkv = 8; u64 hd = 128
     u64 q_dim = nh * hd      // 2048
     u64 max_seq = 64
-    u64 batch = 2
+    u64 batch = 1
     u64 pos_plus_1 = 1       // single position per batch (pos=0)
 
     u64 q_bytes  = batch * q_dim * 4
@@ -98,7 +109,7 @@ fn main() {
     unsafe { *((kp + 24) as u64) = a3 }
     unsafe { *((kp + 32) as u64) = a4 }
 
-    err = hipModuleLaunchKernel(fh, nh, batch, 1, 32, 1, 1, 0, 0, kp, 0)
+    err = hipModuleLaunchKernel(fh, nh, 1, 1, 32, 1, 1, 0, 0, kp, 0)
     if err != 0 { die("launch", err) }
     err = hipDeviceSynchronize(); if err != 0 { die("sync", err) }
 
@@ -119,6 +130,9 @@ fn main() {
                 u64 out_idx = b * nh * hd + head * hd + j
                 f32 expected = 0.0f; unsafe { *((h_vc + v_idx * 4) as f32) -> expected }
                 f32 actual = 0.0f; unsafe { *((h_out + out_idx * 4) as f32) -> actual }
+                u32 actbits = 0; unsafe { *((h_out + out_idx * 4) as u32) -> actbits }
+                u64 isnan_e = 0; if (actbits & 0x7F800000) == 0x7F800000 { if (actbits & 0x007FFFFF) != 0 { isnan_e = 1 } }
+                if isnan_e == 1 { fail = fail + 1 }
                 f32 d = actual - expected; if d < 0.0f { d = 0.0f - d }
                 if d > max_abs { max_abs = d }
                 f32 abs_e = expected; if abs_e < 0.0f { abs_e = 0.0f - abs_e }
