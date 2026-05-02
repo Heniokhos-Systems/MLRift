@@ -1,0 +1,53 @@
+// LLM Phase 3c-22 — gemv_coop_bf16_f32_batched expressed as a real
+// @kernel.  Multi-stream bf16-direct cooperative gemv: per (row, batch)
+// WG, 32 lanes cooperatively load u16 weights + lshl-16 dequant + FMA
+// against per-batch f32 input.  Discriminator: gemv_coop_bf16_batched_marker()
+// Call.
+
+fn block_idx_x() -> uint64 { return 0 }
+fn block_idx_y() -> uint64 { return 0 }
+fn tid_local_x() -> uint64 { return 0 }
+fn lds_reduce_sum_f32(f32 x) -> f32 { return x }
+fn gemv_coop_bf16_batched_marker() -> uint64 { return 0 }
+
+@kernel
+fn gemv_coop_bf16_f32_batched(
+    uint64 a_ptr,    // [N*K] bf16
+    uint64 b_ptr,    // [batch, K] f32
+    uint64 c_ptr,    // [batch, N] f32
+    uint64 n,
+    uint64 k_dim
+) {
+    uint64 row   = block_idx_x()
+    uint64 batch = block_idx_y()
+    uint64 lane  = tid_local_x()
+    uint64 _m    = gemv_coop_bf16_batched_marker()
+    if row < n {
+        f32 partial = 0.0
+        uint64 row_base = a_ptr + row * k_dim * 2
+        uint64 b_row    = b_ptr + batch * k_dim * 4
+        uint64 j = lane
+        while j < k_dim {
+            uint64 ap = row_base + j * 2
+            uint64 bp = b_row    + j * 4
+            uint16 ar = 0
+            unsafe { *(ap as uint16) -> ar }
+            uint64 ar64 = ar
+            uint32 a_bits = ar64 << 16
+            f32 a = 0.0
+            f32 b = 0.0
+            unsafe { *(bp as f32) -> b }
+            partial = partial + a * b
+            j = j + 32
+        }
+        f32 total = lds_reduce_sum_f32(partial)
+        if lane == 0 {
+            uint64 cp = c_ptr + (batch * n + row) * 4
+            unsafe { *(cp as f32) = total }
+        }
+    }
+}
+
+fn main() {
+    exit(0)
+}

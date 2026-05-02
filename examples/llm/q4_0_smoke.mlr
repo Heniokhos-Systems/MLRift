@@ -1,0 +1,109 @@
+// Smoke test for Q4_0 quantize + dequant round-trip.
+// Generates synthetic bf16 weights, quantizes to Q4_0, dequantizes,
+// and reports max-abs and mean-abs error.
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 examples/llm/q4_0_smoke.mlr -o /tmp/q4_0_smoke
+// Run:
+//   /tmp/q4_0_smoke
+//   N=151936 K=1024 /tmp/q4_0_smoke   (lm_head shape)
+
+import "../../std/io.mlr"
+import "../../std/fmt.mlr"
+import "../../std/string.mlr"
+import "../../std/math_float.mlr"
+import "../../std/quant.mlr"
+
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn getenv(uint64 name) -> uint64
+
+fn parse_env_u64(u64 name, u64 default_v) -> u64 {
+    u64 ev = getenv(name)
+    if ev == 0 { return default_v }
+    u64 parsed = 0; u64 i = 0
+    u8 c = 0; unsafe { *(ev as u8) -> c }
+    while c >= 48 && c <= 57 {
+        parsed = parsed * 10 + (c - 48); i = i + 1
+        unsafe { *((ev + i) as u8) -> c }
+    }
+    if parsed > 0 { return parsed }
+    return default_v
+}
+
+fn main() {
+    u64 N = parse_env_u64("N", 1024)
+    u64 K = parse_env_u64("K", 1024)
+
+    print_str("N="); u64 sn = fmt_dec(N); print_str(sn); dealloc(sn)
+    print_str(" K="); u64 sk = fmt_dec(K); print_str(sk); dealloc(sk); print_str("\n")
+
+    // Generate synthetic bf16 weights: mix of small + large magnitudes,
+    // mimicking the distribution of a real Qwen3 weight matrix.
+    u64 bf16_buf = alloc(N * K * 2)
+    u64 i = 0
+    while i < N * K {
+        // Pseudo-random pattern: ((i * 2654435761) mod 1024 - 512) / 1024.0
+        u64 hash = (i * 2654435761) & 0xFFFFFFFF
+        u64 modr = hash % 1024
+        f64 vd = (int_to_f64(modr) - 512.0) / 1024.0
+        f32 vf = f64_to_f32(vd)
+        u64 pf = alloc(4); unsafe { *(pf as f32) = vf }
+        u32 fbits = 0; unsafe { *(pf as u32) -> fbits }
+        u16 b16 = (fbits >> 16) & 0xFFFF
+        unsafe { *((bf16_buf + i * 2) as u16) = b16 }
+        dealloc(pf)
+        i = i + 1
+    }
+
+    u64 q4_buf = alloc(N * (K / 32) * 18)
+    u64 q4_bytes = quantize_bf16_to_q4_0(bf16_buf, q4_buf, N, K)
+    print_str("quantize done — q4_bytes="); u64 sq = fmt_dec(q4_bytes); print_str(sq); dealloc(sq)
+    print_str(" (vs bf16="); u64 sb = fmt_dec(N * K * 2); print_str(sb); dealloc(sb); print_str(")\n")
+
+    u64 deq_f32 = alloc(N * K * 4)
+    dequantize_q4_0_to_f32(q4_buf, deq_f32, N, K)
+
+    // Compare original bf16 (cast to f32) vs dequantized Q4_0.
+    f32 max_abs = 0.0f
+    f32 sum_abs = 0.0f
+    u64 nzero = 0
+    u64 j = 0
+    while j < N * K {
+        u16 b16 = 0; unsafe { *((bf16_buf + j * 2) as u16) -> b16 }
+        u32 fbits = b16
+        fbits = fbits << 16
+        u64 fb = alloc(4); unsafe { *(fb as u32) = fbits }
+        f32 v_orig = 0.0f; unsafe { *(fb as f32) -> v_orig }
+        dealloc(fb)
+        u64 deq_addr = deq_f32 + j * 4
+        f32 v_deq = 0.0f; unsafe { *(deq_addr as f32) -> v_deq }
+        f32 d = v_orig - v_deq
+        if d < 0.0f { d = 0.0f - d }
+        if d > max_abs { max_abs = d }
+        sum_abs = sum_abs + d
+        if v_deq == 0.0f { nzero = nzero + 1 }
+        j = j + 1
+    }
+    f32 mean_abs = sum_abs / f64_to_f32(int_to_f64(N * K))
+
+    u64 mab = alloc(4); unsafe { *(mab as f32) = max_abs }
+    u32 mab_bits = 0; unsafe { *(mab as u32) -> mab_bits }
+    print_str("max_abs_err_bits="); u64 sm = fmt_dec(mab_bits); print_str(sm); dealloc(sm); print_str("\n")
+
+    u64 meab = alloc(4); unsafe { *(meab as f32) = mean_abs }
+    u32 meab_bits = 0; unsafe { *(meab as u32) -> meab_bits }
+    print_str("mean_abs_err_bits="); u64 sme = fmt_dec(meab_bits); print_str(sme); dealloc(sme); print_str("\n")
+
+    print_str("zeros_in_dequant="); u64 sz = fmt_dec(nzero); print_str(sz); dealloc(sz); print_str("\n")
+
+    // For Q4_0 the typical max abs error is ~scale/2 ≈ max_abs/14.  At our
+    // synthetic distribution (uniform ±0.5), max_abs per block is ~0.5,
+    // so expected max err per element is ~0.036.  Sanity threshold: 0.1.
+    f32 thresh = 0.1f
+    if max_abs > thresh {
+        print_str("FAIL: max abs error exceeds threshold\n")
+        exit(1)
+    }
+    print_str("OK: Q4_0 round-trip within tolerance.\n")
+    exit(0)
+}

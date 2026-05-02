@@ -38,36 +38,98 @@ fn eu64(u64 v) {
     dealloc(s)
 }
 
+// Multi-shard wrapper.  Single-file mode (mode=0): only `st_single`
+// is populated.  Sharded mode (mode=1): `st_shard` is populated and
+// st_single is unused.  All weight lookups go through wt_get().
+static u64 _wt_mode      = 0
+static u64 _wt_st_single = 0          // SafetensorFile (heap struct ptr)
+static u64 _wt_sh        = 0          // SafetensorShard (heap struct ptr)
+
+fn wt_get(u64 name) -> SafetensorView {
+    if _wt_mode == 1 {
+        SafetensorShard sh = _wt_sh
+        return safetensors_shard_get(sh, name)
+    } else {
+        SafetensorFile st = _wt_st_single
+        return safetensors_get(st, name)
+    }
+}
+
 fn main() {
     u64 num_workers = 16
     thread_pool_init(num_workers)
     g_fd = file_open("/tmp/qw3_gen.out", 1)
 
-    u64 path = "/home/pantelis/Desktop/Projects/Work/MLRift-experimental/Qwen3-0.6B/model.safetensors"
-    eout("[qwen3_generate] loading weights\n")
-    u64 load_start_ns = time_now()
-    SafetensorFile st = safetensors_open(path)
-    if st.file_size == 0 {
-        eout("open fail\n")
-        thread_pool_shutdown(); file_close(g_fd); exit(1)
+    // Model selection.  MLRIFT_QWEN3_MODEL=14b switches to Qwen3-14B
+    // (8 shards, hidden=5120, ff=17408, n_layers=40, n_heads=40, kv=8).
+    // Default is the single-file Qwen3-0.6B at the hardcoded path.
+    u64 model_14b = 0
+    u64 ev_model = getenv("MLRIFT_QWEN3_MODEL")
+    if ev_model != 0 {
+        u8 ec = 0; unsafe { *(ev_model as u8) -> ec }
+        // Match "1" prefix (covers "14b" / "1.4b" / etc).
+        if ec == 49 { model_14b = 1 }
     }
 
-    u64 hidden = QWEN3_HIDDEN
-    u64 kv_dim = QWEN3_KV_DIM
-    u64 q_dim  = QWEN3_Q_DIM
-    u64 ff     = QWEN3_INTERMEDIATE
-    u64 n_layers = 28
+    u64 hidden = 0
+    u64 kv_dim = 0
+    u64 q_dim  = 0
+    u64 ff     = 0
+    u64 n_layers = 0
     u64 vocab = 151936
     u64 max_seq = 64
     u64 max_new = 20
+    u64 ev_mn = getenv("MLRIFT_QWEN3_MAX_NEW")
+    if ev_mn != 0 {
+        u64 parsed = 0; u64 mi = 0
+        u8 mc = 0; unsafe { *(ev_mn as u8) -> mc }
+        while mc >= 48 && mc <= 57 {
+            parsed = parsed * 10 + (mc - 48); mi = mi + 1
+            unsafe { *((ev_mn + mi) as u8) -> mc }
+        }
+        if parsed > 0 { max_new = parsed }
+    }
 
-    SafetensorView embed_v = safetensors_get(st, "model.embed_tokens.weight")
+    eout("[qwen3_generate] loading weights\n")
+    u64 load_start_ns = time_now()
+    if model_14b != 0 {
+        // 14B arch.  Hidden=5120, head_dim=128, n_heads=40, n_kv_heads=8,
+        // ff=17408, num_layers=40.
+        qwen3_set_arch(5120, 128, 40, 8, 17408)
+        u64 dir14 = "/home/pantelis/Desktop/Projects/Work/MLRift-experimental/Qwen3-14b"
+        SafetensorShard sh = safetensors_shard_open(dir14, 8)
+        if sh.n_shards != 8 {
+            eout("14B shard open fail\n")
+            thread_pool_shutdown(); file_close(g_fd); exit(1)
+        }
+        _wt_sh = sh
+        _wt_mode = 1
+        n_layers = 40
+        eout("[qwen3_generate] Qwen3-14B mode (8 shards)\n")
+    } else {
+        u64 path = "/home/pantelis/Desktop/Projects/Work/MLRift-experimental/Qwen3-0.6B/model.safetensors"
+        SafetensorFile st = safetensors_open(path)
+        if st.file_size == 0 {
+            eout("open fail\n")
+            thread_pool_shutdown(); file_close(g_fd); exit(1)
+        }
+        _wt_st_single = st
+        _wt_mode = 0
+        n_layers = 28
+    }
+
+    hidden = QWEN3_HIDDEN
+    kv_dim = QWEN3_KV_DIM
+    q_dim  = QWEN3_Q_DIM
+    ff     = QWEN3_INTERMEDIATE
+
+    SafetensorView embed_v = wt_get("model.embed_tokens.weight")
     u64 embed_ptr = embed_v.ptr
-    SafetensorView norm_v = safetensors_get(st, "model.norm.weight")
+    SafetensorView norm_v = wt_get("model.norm.weight")
     u64 norm_ptr = norm_v.ptr
     if embed_ptr == 0 || norm_ptr == 0 {
         eout("missing embed or final norm\n")
-        safetensors_free(st); thread_pool_shutdown(); file_close(g_fd); exit(1)
+        thread_pool_shutdown(); file_close(g_fd); exit(1)
     }
 
     // Per-layer weight pointer table (see qwen3_forward.mlr for field layout).
@@ -82,57 +144,57 @@ fn main() {
         dealloc(li_s); dealloc(pre0)
 
         u64 n01 = str_cat(prefix, "input_layernorm.weight")
-        SafetensorView v01 = safetensors_get(st, n01)
+        SafetensorView v01 = wt_get(n01)
         unsafe { *((base + 0 * 8) as u64) = v01.ptr }
         dealloc(n01)
 
         u64 n02 = str_cat(prefix, "self_attn.q_proj.weight")
-        SafetensorView v02 = safetensors_get(st, n02)
+        SafetensorView v02 = wt_get(n02)
         unsafe { *((base + 1 * 8) as u64) = v02.ptr }
         dealloc(n02)
 
         u64 n03 = str_cat(prefix, "self_attn.k_proj.weight")
-        SafetensorView v03 = safetensors_get(st, n03)
+        SafetensorView v03 = wt_get(n03)
         unsafe { *((base + 2 * 8) as u64) = v03.ptr }
         dealloc(n03)
 
         u64 n04 = str_cat(prefix, "self_attn.v_proj.weight")
-        SafetensorView v04 = safetensors_get(st, n04)
+        SafetensorView v04 = wt_get(n04)
         unsafe { *((base + 3 * 8) as u64) = v04.ptr }
         dealloc(n04)
 
         u64 n05 = str_cat(prefix, "self_attn.q_norm.weight")
-        SafetensorView v05 = safetensors_get(st, n05)
+        SafetensorView v05 = wt_get(n05)
         unsafe { *((base + 4 * 8) as u64) = v05.ptr }
         dealloc(n05)
 
         u64 n06 = str_cat(prefix, "self_attn.k_norm.weight")
-        SafetensorView v06 = safetensors_get(st, n06)
+        SafetensorView v06 = wt_get(n06)
         unsafe { *((base + 5 * 8) as u64) = v06.ptr }
         dealloc(n06)
 
         u64 n07 = str_cat(prefix, "self_attn.o_proj.weight")
-        SafetensorView v07 = safetensors_get(st, n07)
+        SafetensorView v07 = wt_get(n07)
         unsafe { *((base + 6 * 8) as u64) = v07.ptr }
         dealloc(n07)
 
         u64 n08 = str_cat(prefix, "post_attention_layernorm.weight")
-        SafetensorView v08 = safetensors_get(st, n08)
+        SafetensorView v08 = wt_get(n08)
         unsafe { *((base + 7 * 8) as u64) = v08.ptr }
         dealloc(n08)
 
         u64 n09 = str_cat(prefix, "mlp.gate_proj.weight")
-        SafetensorView v09 = safetensors_get(st, n09)
+        SafetensorView v09 = wt_get(n09)
         unsafe { *((base + 8 * 8) as u64) = v09.ptr }
         dealloc(n09)
 
         u64 n10 = str_cat(prefix, "mlp.up_proj.weight")
-        SafetensorView v10 = safetensors_get(st, n10)
+        SafetensorView v10 = wt_get(n10)
         unsafe { *((base + 9 * 8) as u64) = v10.ptr }
         dealloc(n10)
 
         u64 n11 = str_cat(prefix, "mlp.down_proj.weight")
-        SafetensorView v11 = safetensors_get(st, n11)
+        SafetensorView v11 = wt_get(n11)
         unsafe { *((base + 10 * 8) as u64) = v11.ptr }
         dealloc(n11)
 
@@ -155,31 +217,62 @@ fn main() {
     u64 gu_row_bytes  = QWEN3_HIDDEN * 2
     u64 gate_bytes    = QWEN3_INTERMEDIATE * gu_row_bytes
     u64 gu_stacked_bytes = gu_dim_elems * gu_row_bytes
-    eout("[qwen3_generate] fusing QKV + gate/up weights (")
-    eu64((stacked_bytes + gu_stacked_bytes) * n_layers); eout(" bytes total)\n")
-    li = 0
-    while li < n_layers {
-        u64 base  = layers_arr + li * 88
-        u64 qp = 0; unsafe { *((base + 1 * 8) as u64) -> qp }
-        u64 kp = 0; unsafe { *((base + 2 * 8) as u64) -> kp }
-        u64 vp = 0; unsafe { *((base + 3 * 8) as u64) -> vp }
-        u64 stacked = alloc(stacked_bytes)
-        memcpy(stacked,               qp, q_bytes)
-        memcpy(stacked + q_bytes,     kp, kv_bytes)
-        memcpy(stacked + q_bytes + kv_bytes, vp, kv_bytes)
-        unsafe { *((base + 1 * 8) as u64) = stacked }
+    // Fusion materialises ~3 GB of bf16 page-ins on Qwen3-0.6B (worse on
+    // 14B: ~17 GB of pages touched).  At 14B with 30 GB host RAM this
+    // triggers swap thrashing.  Skip when MLRIFT_QWEN3_NO_FUSE=1 — caller
+    // accepts the slower 3-matmul path for QKV / 2-matmul for gate_up.
+    u64 no_fuse = 0
+    u64 ev_nf = getenv("MLRIFT_QWEN3_NO_FUSE")
+    if ev_nf != 0 {
+        u8 nfc = 0; unsafe { *(ev_nf as u8) -> nfc }
+        if nfc != 48 { no_fuse = 1 }
+    }
+    if no_fuse == 0 {
+        eout("[qwen3_generate] fusing QKV + gate/up weights (")
+        eu64((stacked_bytes + gu_stacked_bytes) * n_layers); eout(" bytes total)\n")
+        li = 0
+        while li < n_layers {
+            u64 base  = layers_arr + li * 88
+            u64 qp = 0; unsafe { *((base + 1 * 8) as u64) -> qp }
+            u64 kp = 0; unsafe { *((base + 2 * 8) as u64) -> kp }
+            u64 vp = 0; unsafe { *((base + 3 * 8) as u64) -> vp }
+            u64 stacked = alloc(stacked_bytes)
+            memcpy(stacked,               qp, q_bytes)
+            memcpy(stacked + q_bytes,     kp, kv_bytes)
+            memcpy(stacked + q_bytes + kv_bytes, vp, kv_bytes)
+            unsafe { *((base + 1 * 8) as u64) = stacked }
 
-        u64 gpw = 0; unsafe { *((base + 8 * 8) as u64) -> gpw }
-        u64 upw = 0; unsafe { *((base + 9 * 8) as u64) -> upw }
-        u64 gu_stacked = alloc(gu_stacked_bytes)
-        memcpy(gu_stacked,              gpw, gate_bytes)
-        memcpy(gu_stacked + gate_bytes, upw, gate_bytes)
-        unsafe { *((base + 8 * 8) as u64) = gu_stacked }
-        li = li + 1
+            u64 gpw = 0; unsafe { *((base + 8 * 8) as u64) -> gpw }
+            u64 upw = 0; unsafe { *((base + 9 * 8) as u64) -> upw }
+            u64 gu_stacked = alloc(gu_stacked_bytes)
+            memcpy(gu_stacked,              gpw, gate_bytes)
+            memcpy(gu_stacked + gate_bytes, upw, gate_bytes)
+            unsafe { *((base + 8 * 8) as u64) = gu_stacked }
+            li = li + 1
+        }
+    } else {
+        eout("[qwen3_generate] QKV/gate_up fusion SKIPPED (MLRIFT_QWEN3_NO_FUSE=1)\n")
+        // Tell qwen3_forward_layer to take the 3-matmul / 2-matmul path
+        // instead of expecting pre-stacked weights at the q_proj/gate_proj
+        // slots.
+        qwen3_set_fuse_qkv(0)
     }
     u64 load_elapsed_ns = time_elapsed(load_start_ns)
-    eout("[qwen3_generate] 28 layers indexed; load_ms=")
+    eout("[qwen3_generate] "); eu64(n_layers); eout(" layers indexed; load_ms=")
     eu64(load_elapsed_ns / 1000000); eout("\n")
+
+    // MLRIFT_QWEN3_LOAD_ONLY=1: exit immediately after layer indexing.
+    // Used for validating the multi-shard loader on huge models without
+    // running a full forward pass (which would need GB of further
+    // working memory).
+    u64 ev_lo = getenv("MLRIFT_QWEN3_LOAD_ONLY")
+    if ev_lo != 0 {
+        u8 loc = 0; unsafe { *(ev_lo as u8) -> loc }
+        if loc != 48 {
+            eout("[qwen3_generate] LOAD_ONLY exit\n")
+            thread_pool_shutdown(); file_close(g_fd); exit(0)
+        }
+    }
 
     // Detect MLRIFT_GPU_FULL_FORWARD early so we know whether to put
     // the kv_cache in GTT (needed for the fused-attention kernel that
@@ -499,6 +592,10 @@ fn main() {
     decode_start_ns = time_now()
     while step < max_new {
         u64 step_start_ns = time_now()
+        u64 step_launch_start  = hipkfd_get_launch_count()
+        u64 step_sync_start    = hipkfd_get_sync_count()
+        u64 step_sync_ns_start = hipkfd_get_sync_total_ns()
+        u64 step_sync_busy_start = hipkfd_get_sync_busy_calls()
         eout("step "); eu64(step); eout(" pos="); eu64(pos); eout("\n")
 
         // Slice 2.3: PLD draft proposal (computed once per step, used
@@ -706,22 +803,34 @@ fn main() {
                     if gpu_resid_add_to_dev(_gpuq_d_mid, d_in_full_pa, _gpuq_d_o, M_eff * hidden) != 0 { exit(1) }
                     u64 d_post_gamma_b = gpu_cache_bf16_as_f32(w.post_norm_w, hidden)
                     if d_post_gamma_b == 0 { exit(1) }
-                    if gpu_rmsnorm_1024_to_dev(_gpuq_d_mid_norm, _gpuq_d_mid, d_post_gamma_b, M_eff) != 0 { exit(1) }
-                    if gpu_matmul_to_dev_batched(_gpuq_d_gu, _gpuq_d_mid_norm, w.gate_proj_w,
-                                                  2 * ff, hidden, M_eff) != 0 { exit(1) }
+                    if gpu_rmsnorm_hidden_to_dev(_gpuq_d_mid_norm, _gpuq_d_mid, d_post_gamma_b, M_eff, hidden) != 0 { exit(1) }
+                    // gate/up matmul: fused (one matmul of 2*ff) when
+                    // qwen3_fuse_qkv != 0, otherwise two separate matmuls
+                    // writing into the gate and up halves of _gpuq_d_gu.
+                    if qwen3_fuse_qkv != 0 {
+                        if gpu_matmul_to_dev_batched(_gpuq_d_gu, _gpuq_d_mid_norm, w.gate_proj_w,
+                                                      2 * ff, hidden, M_eff) != 0 { exit(1) }
+                    } else {
+                        if M_eff != 1 { eout("no-fuse gate_up requires M_eff=1\n"); exit(1) }
+                        if gpu_matmul_to_dev_batched(_gpuq_d_gu,           _gpuq_d_mid_norm, w.gate_proj_w,
+                                                      ff, hidden, 1) != 0 { exit(1) }
+                        if gpu_matmul_to_dev_batched(_gpuq_d_gu + ff * 4, _gpuq_d_mid_norm, w.up_proj_w,
+                                                      ff, hidden, 1) != 0 { exit(1) }
+                    }
                     if gpu_silu_mul_f32_batched_to_dev(_gpuq_d_ff, _gpuq_d_gu, _gpuq_d_gu + ff * 4,
                                                         ff, M_eff) != 0 { exit(1) }
                     if gpu_matmul_to_dev_batched(_gpuq_d_ff_out, _gpuq_d_ff, w.down_proj_w,
                                                   hidden, ff, M_eff) != 0 { exit(1) }
                     u64 d_out_full_pa = 0; unsafe { *((d_out_arr + 0) as u64) -> d_out_full_pa }
                     if gpu_resid_add_to_dev(d_out_full_pa, _gpuq_d_mid, _gpuq_d_ff_out, M_eff * hidden) != 0 { exit(1) }
-                    // Per-layer flush: without this, the M_eff > 1 batched
-                    // chain accumulates mis-tracked queue state across the
-                    // ~17 dispatches per layer × 28 layers = 476/step, and
-                    // the final residual reads as NaN even though every
-                    // intermediate kernel produced sane data.  With the
-                    // flush the chain is correctness-debuggable (still
-                    // diverges from PyTorch but at least doesn't NaN).
+                    // Per-layer flush: required for correctness, not just
+                    // crash prevention.  Tested 2026-05-01: skipping causes
+                    // numerical drift that crashes spec accept rate from
+                    // 2.05 tok/step to 1.35 tok/step (41 → 27 tokens).  The
+                    // flush forces the chain to re-converge to a clean
+                    // state every 17 dispatches.  Removing this needs
+                    // either a deeper queue-tracking fix or a mega-kernel
+                    // that doesn't accumulate the drifting state.
                     gpu_pipeline_flush()
                 } else {
                     // M_eff == 1: legacy single-stream path with full mask.
@@ -941,7 +1050,16 @@ fn main() {
         u64 step_elapsed_ns = time_elapsed(step_start_ns)
         sum_decode_ns = sum_decode_ns + step_elapsed_ns
         u64 step_ms = step_elapsed_ns / 1000000
-        eout("  step "); eu64(step); eout(" took "); eu64(step_ms); eout(" ms\n")
+        u64 step_launches      = hipkfd_get_launch_count() - step_launch_start
+        u64 step_syncs         = hipkfd_get_sync_count()   - step_sync_start
+        u64 step_sync_ns       = hipkfd_get_sync_total_ns() - step_sync_ns_start
+        u64 step_sync_busy     = hipkfd_get_sync_busy_calls() - step_sync_busy_start
+        u64 step_sync_us       = step_sync_ns / 1000
+        eout("  step "); eu64(step); eout(" took "); eu64(step_ms); eout(" ms ")
+        eout("launches="); eu64(step_launches)
+        eout(" syncs="); eu64(step_syncs)
+        eout(" sync_us="); eu64(step_sync_us)
+        eout(" sync_busy="); eu64(step_sync_busy); eout("\n")
         step = step + 1
     }
     u64 total_decode_ns = time_elapsed(decode_start_ns)
@@ -1001,7 +1119,13 @@ fn main() {
 
     dealloc(final_out); dealloc(logits); dealloc(layers_arr)
     dealloc(k_cache); dealloc(v_cache)
-    safetensors_free(st)
+    if _wt_mode == 1 {
+        SafetensorShard sh_close = _wt_sh
+        safetensors_shard_free(sh_close)
+    } else {
+        SafetensorFile st_close = _wt_st_single
+        safetensors_free(st_close)
+    }
     thread_pool_shutdown()
     file_close(g_fd)
     exit(0)

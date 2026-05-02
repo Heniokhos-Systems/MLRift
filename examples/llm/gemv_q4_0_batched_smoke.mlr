@@ -1,0 +1,217 @@
+// Smoke test for gemv_coop_q4_0_f32_batched.  Compares GPU output to
+// a CPU reference computed via CPU dequant Q4_0 → f32 + per-stream matmul.
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --emit-amdgpu-gemv-coop-q4-0-f32-batched=/tmp/gemv_coop_q4_0_f32_batched.co dummy
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/gemv_q4_0_batched_smoke.mlr -o /tmp/gemv_q4_0_smoke
+// Run:
+//   /tmp/gemv_q4_0_smoke
+
+import "../../std/hip.mlr"
+import "../../std/inference.mlr"
+import "../../std/io.mlr"
+import "../../std/fmt.mlr"
+import "../../std/string.mlr"
+import "../../std/thread.mlr"
+import "../../std/time.mlr"
+import "../../std/math_float.mlr"
+import "../../std/quant.mlr"
+
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn getenv(uint64 name) -> uint64
+
+fn die(uint64 msg, uint64 code) {
+    print_str(msg); print_str(" e="); u64 s = fmt_dec(code); print_str(s); dealloc(s); print_str("\n"); exit(1)
+}
+
+fn main() {
+    u64 num_workers = 16
+    thread_pool_init(num_workers)
+    uint32 err = hipSetDevice(0); if err != 0 { die("setDev", err) }
+
+    u64 fd = file_open("/tmp/gemv_coop_q4_0_f32_batched.co", 0)
+    if fd > 0xFFFFFFFFFFFFF000 { die("missing co", 0) }
+    u64 sz = file_size(fd); u64 blob = alloc(sz)
+    file_read(fd, blob, sz); file_close(fd)
+    u64 mod_slot = alloc(8)
+    err = hipModuleLoadData(mod_slot, blob); if err != 0 { die("LoadData", err) }
+    u64 mod = 0; unsafe { *(mod_slot as u64) -> mod }
+    u64 fh_slot = alloc(8)
+    err = hipModuleGetFunction(fh_slot, mod, "gemv_coop_q4_0_f32_batched"); if err != 0 { die("getFn", err) }
+    u64 fh = 0; unsafe { *(fh_slot as u64) -> fh }
+    print_str("gemv_coop_q4_0_f32_batched loaded\n")
+
+    u64 N = 256
+    u64 K = 5120
+    u64 batch = 1
+    u64 q4_bytes  = N * (K / 32) * 18           // Q4_0 weight buffer
+    u64 x_bytes   = batch * K * 4               // f32 input
+    u64 out_bytes = batch * N * 4               // f32 output
+
+    // Synthetic bf16 weights, then quantize to Q4_0.
+    u64 bf16_buf = alloc(N * K * 2)
+    u64 i = 0
+    while i < N * K {
+        // De-aliased hash: pure i*GR aliases at K=1024 strides because
+        // i*GR mod 2^32 with i=1024 zeros the low 10 bits.  Add a
+        // row-byte-shifted term to break the stride.
+        u64 raw = i * 2654435761 + (i >> 5) * 31
+        u64 hash = raw & 0xFFFFFFFF
+        u64 modr = hash % 1024
+        f64 vd = (int_to_f64(modr) - 512.0) / 1024.0
+        f32 vf = f64_to_f32(vd)
+        u64 pf = alloc(4); unsafe { *(pf as f32) = vf }
+        u32 fbits = 0; unsafe { *(pf as u32) -> fbits }
+        u16 b16 = (fbits >> 16) & 0xFFFF
+        unsafe { *((bf16_buf + i * 2) as u16) = b16 }
+        dealloc(pf)
+        i = i + 1
+    }
+    u64 q4_buf = alloc(q4_bytes)
+    quantize_bf16_to_q4_0(bf16_buf, q4_buf, N, K)
+
+    // f32 inputs, deterministic per (batch, k).
+    u64 h_x = alloc(x_bytes)
+    i = 0
+    while i < batch * K {
+        f64 v = (int_to_f64(i) * 0.0003) - 0.05
+        unsafe { *((h_x + i * 4) as f32) = f64_to_f32(v) }
+        i = i + 1
+    }
+
+    // CPU reference: dequant Q4_0 → f32, then per-stream f32 gemv.
+    u64 ref_w = alloc(N * K * 4)
+    dequantize_q4_0_to_f32(q4_buf, ref_w, N, K)
+
+    u64 h_ref = alloc(out_bytes)
+    f32 acc = 0.0f
+    f32 wv = 0.0f
+    f32 xv = 0.0f
+    u64 b = 0
+    while b < batch {
+        u64 x_row   = h_x + b * K * 4
+        u64 out_row = h_ref + b * N * 4
+        u64 n = 0
+        while n < N {
+            acc = 0.0f
+            u64 k = 0
+            while k < K {
+                u64 wa = ref_w + (n * K + k) * 4
+                u64 xa = x_row + k * 4
+                unsafe { *(wa as f32) -> wv }
+                unsafe { *(xa as f32) -> xv }
+                acc = acc + wv * xv
+                k = k + 1
+            }
+            u64 oa = out_row + n * 4
+            unsafe { *(oa as f32) = acc }
+            n = n + 1
+        }
+        b = b + 1
+    }
+    print_str("CPU reference computed\n")
+    // Probe: print first 4 ref values and confirm they differ.
+    u64 dbgi = 0
+    while dbgi < 4 {
+        u64 da = h_ref + dbgi * 4
+        u32 db = 0; unsafe { *(da as u32) -> db }
+        u64 db64 = db
+        print_str("  CPU ref["); u64 sx = fmt_dec(dbgi); print_str(sx); dealloc(sx)
+        print_str("]="); u64 sy = fmt_dec(db64); print_str(sy); dealloc(sy)
+        print_str("\n")
+        dbgi = dbgi + 1
+    }
+
+    // GPU buffers + H2D.
+    u64 d_w = 0; u64 d_x = 0; u64 d_out = 0
+    u64 slot
+    slot = alloc(8); err = hipMalloc(slot, q4_bytes);  if err != 0 { die("mw",  err) }; unsafe { *(slot as u64) -> d_w }
+    slot = alloc(8); err = hipMalloc(slot, x_bytes);   if err != 0 { die("mx",  err) }; unsafe { *(slot as u64) -> d_x }
+    slot = alloc(8); err = hipMalloc(slot, out_bytes); if err != 0 { die("mo",  err) }; unsafe { *(slot as u64) -> d_out }
+    err = hipMemcpy(d_w, q4_buf, q4_bytes, 1); if err != 0 { die("H2D w", err) }
+    err = hipMemcpy(d_x, h_x,    x_bytes,  1); if err != 0 { die("H2D x", err) }
+
+    // Kernarg.
+    u64 a0 = alloc(8); unsafe { *(a0 as u64) = d_w }
+    u64 a1 = alloc(8); unsafe { *(a1 as u64) = d_x }
+    u64 a2 = alloc(8); unsafe { *(a2 as u64) = d_out }
+    u64 a3 = alloc(8); unsafe { *(a3 as u64) = N }
+    u64 a4 = alloc(8); unsafe { *(a4 as u64) = K }
+    u64 kp = alloc(5 * 8)
+    unsafe { *(kp        as u64) = a0 }
+    unsafe { *((kp +  8) as u64) = a1 }
+    unsafe { *((kp + 16) as u64) = a2 }
+    unsafe { *((kp + 24) as u64) = a3 }
+    unsafe { *((kp + 32) as u64) = a4 }
+
+    u32 cgrid_x = N
+    u32 cgrid_y = batch
+    u64 t0 = time_now()
+    err = hipModuleLaunchKernel(fh, cgrid_x, cgrid_y, 1, 32, 1, 1, 0, 0, kp, 0)
+    if err != 0 { die("launch", err) }
+    err = hipDeviceSynchronize(); if err != 0 { die("sync", err) }
+    u64 t1 = time_now()
+
+    u64 h_gpu = alloc(out_bytes)
+    err = hipMemcpy(h_gpu, d_out, out_bytes, 2); if err != 0 { die("D2H", err) }
+    print_str("kernel_us="); u64 ks = fmt_dec((t1 - t0) / 1000); print_str(ks); dealloc(ks); print_str("\n")
+
+    // Compare CPU vs GPU.  Both use the same Q4_0 dequant math (CPU
+    // does it in dequantize_q4_0_to_f32, GPU does it inline), so the
+    // only divergence is reduction order in the final sum.  Tolerance
+    // ~1e-3 absolute or 1e-3 relative.
+    u64 fail = 0
+    u64 nan_gpu = 0
+    f32 max_abs = 0.0f
+    u64 k = 0
+    while k < batch * N {
+        u32 cb = 0; u32 gb = 0
+        u64 ref_addr = h_ref + k * 4
+        u64 gpu_addr = h_gpu + k * 4
+        unsafe { *(ref_addr as u32) -> cb }
+        unsafe { *(gpu_addr as u32) -> gb }
+        u32 g_exp = (gb >> 23) & 0xFF; u32 g_man = gb & 0x7FFFFF
+        if g_exp == 0xFF && g_man != 0 { nan_gpu = nan_gpu + 1 }
+        f32 cv = 0.0f; unsafe { *(ref_addr as f32) -> cv }
+        f32 gv = 0.0f; unsafe { *(gpu_addr as f32) -> gv }
+        f32 d = cv - gv; if d < 0.0f { d = 0.0f - d }
+        if d > max_abs { max_abs = d }
+        f32 ac = cv; if ac < 0.0f { ac = 0.0f - ac }
+        f32 thresh = ac * 0.001f
+        if thresh < 0.001f { thresh = 0.001f }
+        if d > thresh { fail = fail + 1 }
+        k = k + 1
+    }
+    u64 total = batch * N
+    print_str("q4_0-batched-gemv fail count: "); u64 sf = fmt_dec(fail); print_str(sf); dealloc(sf)
+    print_str(" / "); u64 stot = fmt_dec(total); print_str(stot); dealloc(stot); print_str("\n")
+    print_str("nan_gpu: "); u64 sng = fmt_dec(nan_gpu); print_str(sng); dealloc(sng); print_str("\n")
+    u64 mb = alloc(4); unsafe { *(mb as f32) = max_abs }
+    u32 mb_b = 0; unsafe { *(mb as u32) -> mb_b }
+    u64 mb64 = mb_b
+    print_str("max abs diff bits="); u64 smb = fmt_dec(mb64); print_str(smb); dealloc(smb); print_str("\n"); dealloc(mb)
+
+    print_str("first 4 ref / gpu pairs:\n")
+    u64 di = 0
+    while di < 4 {
+        u32 cb = 0; u32 gb = 0
+        u64 ra = h_ref + di * 4
+        u64 ga = h_gpu + di * 4
+        unsafe { *(ra as u32) -> cb }
+        unsafe { *(ga as u32) -> gb }
+        u64 cb64 = cb; u64 gb64 = gb
+        print_str("  ["); u64 sx = fmt_dec(di); print_str(sx); dealloc(sx)
+        print_str("] ref="); u64 sy = fmt_dec(cb64); print_str(sy); dealloc(sy)
+        print_str(" gpu="); u64 sz = fmt_dec(gb64); print_str(sz); dealloc(sz)
+        print_str("\n")
+        di = di + 1
+    }
+
+    if fail == 0 && nan_gpu == 0 {
+        print_str("OK — gemv_coop_q4_0_f32_batched matches CPU reference.\n")
+        thread_pool_shutdown(); exit(0)
+    } else {
+        print_str("FAIL\n")
+        thread_pool_shutdown(); exit(1)
+    }
+}

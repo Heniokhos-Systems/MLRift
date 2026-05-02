@@ -271,6 +271,135 @@ fn safetensors_dtype(SafetensorFile st, u64 name) -> u64 {
     return 0
 }
 
+// ─── Sharded safetensors (multi-file models like Qwen3-14B) ─────────
+//
+// Hugging Face splits large models across N shards named
+// `model-NNNNN-of-NNNNN.safetensors` plus a `model.safetensors.index.json`
+// that maps tensor names → shard filenames.
+//
+// We don't parse the index.json: instead, open all shards and look up
+// each tensor by linear scan over their JSON headers via the existing
+// `safetensors_exists`.  Lookup cost = O(N_shards × header_size); for
+// 14B (8 shards × ~1 MB JSON each) the per-tensor lookup is microseconds
+// — fine for the ~600 lookups done at model load.
+struct SafetensorShard {
+    u64 n_shards
+    u64 shards     // SafetensorFile[n_shards] — fixed-size 48-byte struct
+}
+
+// Open up to `max_shards` files at `dir/model-NNNNN-of-MMMMM.safetensors`.
+// `max_shards` is fixed (the index.json's n_total).  We walk i = 1..M,
+// build the path, open it; first failure stops the walk.  Caller passes
+// the directory path (no trailing slash).
+fn safetensors_shard_open(u64 dir_path, u64 max_shards) -> SafetensorShard {
+    SafetensorShard sh = alloc(16)
+    sh.n_shards = 0
+    sh.shards = alloc(max_shards * 48)
+
+    u64 i = 0
+    while i < max_shards {
+        // Build filename: "<dir>/model-<NNNNN>-of-<MMMMM>.safetensors"
+        u64 path = alloc(512)
+        u64 len = 0
+        u64 dir_len = str_len(dir_path)
+        memcpy(path, dir_path, dir_len)
+        len = dir_len
+        u64 slash = 47          // '/'
+        store8(path + len, slash); len = len + 1
+        u64 m_prefix = "model-"
+        u64 m_pre_len = 6
+        memcpy(path + len, m_prefix, m_pre_len); len = len + m_pre_len
+        // Format (i+1) and max_shards as 5-digit zero-padded.
+        u64 idx1 = i + 1
+        u64 d
+        d = idx1 / 10000;            store8(path + len, 48 + d); len = len + 1; idx1 = idx1 % 10000
+        d = idx1 / 1000;             store8(path + len, 48 + d); len = len + 1; idx1 = idx1 % 1000
+        d = idx1 / 100;              store8(path + len, 48 + d); len = len + 1; idx1 = idx1 % 100
+        d = idx1 / 10;               store8(path + len, 48 + d); len = len + 1; idx1 = idx1 % 10
+        d = idx1;                    store8(path + len, 48 + d); len = len + 1
+        u64 of_str = "-of-"
+        u64 of_len = 4
+        memcpy(path + len, of_str, of_len); len = len + of_len
+        u64 m1 = max_shards
+        d = m1 / 10000;              store8(path + len, 48 + d); len = len + 1; m1 = m1 % 10000
+        d = m1 / 1000;               store8(path + len, 48 + d); len = len + 1; m1 = m1 % 1000
+        d = m1 / 100;                store8(path + len, 48 + d); len = len + 1; m1 = m1 % 100
+        d = m1 / 10;                 store8(path + len, 48 + d); len = len + 1; m1 = m1 % 10
+        d = m1;                      store8(path + len, 48 + d); len = len + 1
+        u64 ext = ".safetensors"
+        u64 ext_len = 12
+        memcpy(path + len, ext, ext_len); len = len + ext_len
+        u64 zero = 0
+        store8(path + len, zero)
+
+        // Open this shard.  `safetensors_open` writes 48 bytes into the
+        // output struct; we copy it into our array slot.
+        SafetensorFile st = safetensors_open(path)
+        if st.json_ptr == 0 {
+            dealloc(path)
+            break
+        }
+        // Copy 48 bytes from the heap-allocated SafetensorFile into our
+        // contiguous slot.  (The struct's heap allocation is leaked here;
+        // shard_free below munmaps via the slot's base_addr fields.)
+        u64 slot_addr = sh.shards + i * 48
+        u64 src = st               // st is a u64 holding the heap ptr
+        u64 j = 0
+        while j < 48 {
+            u64 b = load8(src + j)
+            store8(slot_addr + j, b)
+            j = j + 1
+        }
+        dealloc(path)
+        sh.n_shards = sh.n_shards + 1
+        i = i + 1
+    }
+    return sh
+}
+
+// Scan all open shards for `name`.  Returns the SafetensorView from
+// the first shard that has the tensor.
+fn safetensors_shard_get(SafetensorShard sh, u64 name) -> SafetensorView {
+    SafetensorView view = alloc(16)
+    view.ptr = 0
+    view.len = 0
+    u64 i = 0
+    while i < sh.n_shards {
+        u64 slot_addr = sh.shards + i * 48
+        // Slot is a contiguous SafetensorFile struct; cast to use it.
+        SafetensorFile st = slot_addr
+        if safetensors_exists(st, name) != 0 {
+            return safetensors_get(st, name)
+        }
+        i = i + 1
+    }
+    return view
+}
+
+fn safetensors_shard_dtype(SafetensorShard sh, u64 name) -> u64 {
+    u64 i = 0
+    while i < sh.n_shards {
+        u64 slot_addr = sh.shards + i * 48
+        SafetensorFile st = slot_addr
+        if safetensors_exists(st, name) != 0 {
+            return safetensors_dtype(st, name)
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn safetensors_shard_free(SafetensorShard sh) {
+    u64 i = 0
+    while i < sh.n_shards {
+        u64 slot_addr = sh.shards + i * 48
+        SafetensorFile st = slot_addr
+        safetensors_free(st)
+        i = i + 1
+    }
+    if sh.shards != 0 { dealloc(sh.shards) }
+}
+
 // Element size in bytes for a dtype code returned by `safetensors_dtype`.
 // 0 for unknown / not found.
 fn safetensors_dtype_size(u64 dtype_code) -> u64 {

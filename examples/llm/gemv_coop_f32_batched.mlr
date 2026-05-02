@@ -1,0 +1,50 @@
+// LLM Phase 3c-21 — gemv_coop_f32_batched expressed as a real @kernel.
+// Multi-stream cooperative gemv: per (row, batch) WG, 32 lanes
+// cooperatively read K stride-32 elements, FMA, LDS-reduce 32->1.
+// Same shape as 3c-9 (q4_0 batched) but with f32 weights — uses
+// gemv_coop_batched_marker() to disambiguate.
+
+fn block_idx_x() -> uint64 { return 0 }
+fn block_idx_y() -> uint64 { return 0 }
+fn tid_local_x() -> uint64 { return 0 }
+fn lds_reduce_sum_f32(f32 x) -> f32 { return x }
+fn gemv_coop_batched_marker() -> uint64 { return 0 }
+
+@kernel
+fn gemv_coop_f32_batched(
+    uint64 a_ptr,    // [N*K] f32 row-major (shared across batch)
+    uint64 b_ptr,    // [batch, K] f32
+    uint64 c_ptr,    // [batch, N] f32
+    uint64 n,
+    uint64 k_dim
+) {
+    uint64 row   = block_idx_x()
+    uint64 batch = block_idx_y()
+    uint64 lane  = tid_local_x()
+    uint64 _m    = gemv_coop_batched_marker()
+    if row < n {
+        f32 partial = 0.0
+        uint64 row_base = a_ptr + row * k_dim * 4
+        uint64 b_row    = b_ptr + batch * k_dim * 4
+        uint64 j = lane
+        while j < k_dim {
+            uint64 ap = row_base + j * 4
+            uint64 bp = b_row    + j * 4
+            f32 a = 0.0
+            f32 b = 0.0
+            unsafe { *(ap as f32) -> a }
+            unsafe { *(bp as f32) -> b }
+            partial = partial + a * b
+            j = j + 32
+        }
+        f32 total = lds_reduce_sum_f32(partial)
+        if lane == 0 {
+            uint64 cp = c_ptr + (batch * n + row) * 4
+            unsafe { *(cp as f32) = total }
+        }
+    }
+}
+
+fn main() {
+    exit(0)
+}

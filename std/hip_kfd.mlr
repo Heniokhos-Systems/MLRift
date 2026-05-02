@@ -27,6 +27,7 @@
 
 import "kfd.mlr"
 import "thread.mlr"
+import "time.mlr"
 
 // --- Lazily-initialised global queue + kernarg ring + drain signal ---
 //
@@ -66,6 +67,21 @@ static uint64 _hipkfd_pending        = 0     // (0 - launched) in u64, wraps
 static uint64 _hipkfd_kernarg_ring   = 0
 static uint64 _hipkfd_kernarg_ring_h = 0
 static uint64 _hipkfd_karg_slot      = 0     // round-robin index
+static uint64 _hipkfd_launch_count   = 0     // total successful hipModuleLaunchKernel calls (audit-only)
+static uint64 _hipkfd_sync_count     = 0     // total hipDeviceSynchronize calls (audit-only)
+static uint64 _hipkfd_sync_total_ns  = 0     // cumulative nanoseconds spent in hipDeviceSynchronize busy-poll
+static uint64 _hipkfd_sync_busy_calls = 0   // syncs where v != _hipkfd_pending on entry (i.e. actually waited)
+// AQL chain mode: write packets to the ring without ringing the doorbell on
+// every launch.  Doorbell is rung at hipDeviceSynchronize (single submission
+// for the whole batch) or on a high-watermark flush.  Gated by
+// MLRIFT_AQL_CHAIN=1.  At qwen3-decode this collapses 592 doorbell rings
+// per token to 1, and 32 syncs to ~1.
+static uint64 _hipkfd_chain_mode        = 0  // 0 = per-launch doorbell (legacy); 1 = chain
+static uint64 _hipkfd_chain_mode_init   = 0  // env-gate read once
+// Stored as new_wp (one past the last-written slot).  Zero ⇒ nothing
+// pending; non-zero ⇒ doorbell value to ring is `_hipkfd_chain_pending_wp - 1`.
+// Avoids the slot-0 sentinel collision on the very first deferred launch.
+static uint64 _hipkfd_chain_pending_wp  = 0  // 0=none, else new_wp of last queued packet
 
 // KFD event-driven completion (B-full in docs/SYNC_LAUNCH_GAP.md).
 // Tested and rejected — see SYNC_LAUNCH_GAP.md "Events port: dead
@@ -918,10 +934,30 @@ fn hipMemcpy(uint64 dst, uint64 src, uint64 size, uint32 kind) -> uint32 {
 // the launch count in unsigned wrap-around — equivalent to "after
 // every dispatched kernel atomic-decrements by 1, we expect this".
 fn hipDeviceSynchronize() -> uint32 {
+    _hipkfd_sync_count = _hipkfd_sync_count + 1
     if _hipkfd_q == 0 { return 0 }
     if _hipkfd_signal_h == 0 { return 0 }
+
+    // Chain mode: ring the doorbell now for the most recently queued
+    // packet.  CP processes the entire batch (slots up to and including
+    // _hipkfd_chain_pending_wp).  After this we busy-poll the same
+    // shared signal as the legacy path — no semantic difference, just
+    // one doorbell instead of one-per-launch.
+    if _hipkfd_chain_mode != 0 {
+        if _hipkfd_chain_pending_wp != 0 {
+            uint64 db = _hipkfd_q_db_host
+            uint64 db_value = _hipkfd_chain_pending_wp - 1
+            unsafe { *(db as uint64) = db_value }
+            _hipkfd_chain_pending_wp = 0
+        }
+    }
+
     uint64 sig_addr = _hipkfd_signal_h + 0x08
     uint64 v = 0; unsafe { *(sig_addr as uint64) -> v }
+
+    uint64 t_start = time_now()
+    uint64 was_busy = 0
+    if v != _hipkfd_pending { was_busy = 1 }
 
     uint64 spin = 0
     while v != _hipkfd_pending {
@@ -931,7 +967,24 @@ fn hipDeviceSynchronize() -> uint32 {
         }
         unsafe { *(sig_addr as uint64) -> v }
     }
+
+    uint64 t_end = time_now()
+    _hipkfd_sync_total_ns = _hipkfd_sync_total_ns + (t_end - t_start)
+    if was_busy != 0 { _hipkfd_sync_busy_calls = _hipkfd_sync_busy_calls + 1 }
+
     return 0
+}
+
+fn hipkfd_get_sync_count() -> uint64 {
+    return _hipkfd_sync_count
+}
+
+fn hipkfd_get_sync_total_ns() -> uint64 {
+    return _hipkfd_sync_total_ns
+}
+
+fn hipkfd_get_sync_busy_calls() -> uint64 {
+    return _hipkfd_sync_busy_calls
 }
 
 // --- Module loading ---
@@ -1120,6 +1173,21 @@ fn hipModuleLaunchKernel(
 
     uint64 rp = 0
     unsafe { *(rp_host as uint64) -> rp }
+    // Chain mode: if the ring is past 75 % full, ring the doorbell so
+    // the CP can drain.  Without this, a long-running batch (qwen3 fits
+    // comfortably under 1024 packets/token but multi-step batches
+    // could exceed) would deadlock on the wp-vs-rp wait below.
+    if _hipkfd_chain_mode != 0 {
+        if _hipkfd_chain_pending_wp != 0 {
+            uint64 ring_used = wp - rp
+            uint64 hi_water = (ring_capacity * 3) / 4
+            if ring_used >= hi_water {
+                uint64 db_flush = _hipkfd_chain_pending_wp - 1
+                unsafe { *(db_host as uint64) = db_flush }
+                _hipkfd_chain_pending_wp = 0
+            }
+        }
+    }
     while (wp - rp) >= ring_capacity {
         unsafe { *(rp_host as uint64) -> rp }
     }
@@ -1162,7 +1230,26 @@ fn hipModuleLaunchKernel(
     unsafe { *(wp_host as uint64) = new_wp }
     _kfd_fence()
     uint64 db_value = new_wp - 1
-    unsafe { *(db_host as uint64) = db_value }
+
+    // First-call env gate for AQL chain mode.  Read once; later launches
+    // hit the cached _hipkfd_chain_mode value.
+    if _hipkfd_chain_mode_init == 0 {
+        _hipkfd_chain_mode_init = 1
+        uint64 ch_env = getenv("MLRIFT_AQL_CHAIN")
+        if ch_env != 0 {
+            uint8 cc = 0; unsafe { *(ch_env as uint8) -> cc }
+            if cc != 48 { _hipkfd_chain_mode = 1 }
+        }
+    }
+
+    if _hipkfd_chain_mode != 0 {
+        // Chain mode: defer doorbell.  hipDeviceSynchronize rings it
+        // once for the whole batch.  Store new_wp (= db_value + 1) so a
+        // pending slot-0 launch is distinguishable from "no pending".
+        _hipkfd_chain_pending_wp = new_wp
+    } else {
+        unsafe { *(db_host as uint64) = db_value }
+    }
     _hipkfd_hist_record(kd_va, karg_va, header_setup, slot, wp, 0)
 
     // GPU-clock keepalive: top up the dedicated boost queue if the
@@ -1171,6 +1258,9 @@ fn hipModuleLaunchKernel(
     // user queue. This runs from the user thread (no separate
     // keepalive thread needed); refilling 16-deep at most adds
     // ~16 packet writes (~few hundred ns).
+    //
+    // In chain mode we still need clock-state held high — boost queue
+    // doorbell is independent of the user queue, so keep topping up.
     uint64 boost_env = getenv("MLRIFT_BOOST")
     uint64 boost_off = 0
     if boost_env != 0 {
@@ -1182,5 +1272,13 @@ fn hipModuleLaunchKernel(
         _hipkfd_sdma_boost_topup()
     }
 
+    _hipkfd_launch_count = _hipkfd_launch_count + 1
     return 0
+}
+
+// Audit-only: read the running total of successful hipModuleLaunchKernel
+// calls.  Used by qwen3_generate / benchmarks to compute launches per
+// accepted token without needing a separate counter on every call site.
+fn hipkfd_get_launch_count() -> uint64 {
+    return _hipkfd_launch_count
 }

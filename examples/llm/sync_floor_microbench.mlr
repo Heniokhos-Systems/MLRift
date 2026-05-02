@@ -1,0 +1,143 @@
+// Measure the per-sync floor on this hardware, in three regimes:
+//   1. cold sync (sync immediately, no work in flight)
+//   2. single-launch sync (1 trivial kernel + sync)
+//   3. deep-queue sync (16 trivial kernels + sync)
+//
+// Helps disambiguate "signal observation floor" from "GPU compute time
+// per sync" in the qwen3 audit (32 syncs × 200 µs = 6.5 ms / step).
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --emit-amdgpu-residual-add-f32=/tmp/residual_add_f32.co dummy
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/sync_floor_microbench.mlr -o /tmp/sync_floor_bench
+// Run:
+//   /tmp/sync_floor_bench
+
+import "../../std/hip.mlr"
+import "../../std/io.mlr"
+import "../../std/fmt.mlr"
+import "../../std/string.mlr"
+import "../../std/time.mlr"
+
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn getenv(uint64 name) -> uint64
+
+fn die(uint64 m, uint64 c) { print_str(m); print_str(" e="); u64 s = fmt_dec(c); print_str(s); dealloc(s); print_str("\n"); exit(1) }
+
+fn main() {
+    uint32 err = hipSetDevice(0); if err != 0 { die("setDev", err) }
+
+    // Load a trivial kernel (residual_add_f32 — short, mostly memory-bound).
+    u64 fd = file_open("/tmp/residual_add_f32.co", 0)
+    if fd > 0xFFFFFFFFFFFFF000 { die("missing co", 0) }
+    u64 sz = file_size(fd); u64 blob = alloc(sz)
+    file_read(fd, blob, sz); file_close(fd)
+    u64 ms = alloc(8); err = hipModuleLoadData(ms, blob); if err != 0 { die("LoadData", err) }
+    u64 mod = 0; unsafe { *(ms as u64) -> mod }
+    u64 fhs = alloc(8)
+    err = hipModuleGetFunction(fhs, mod, "residual_add_f32"); if err != 0 { die("getFn", err) }
+    u64 fh = 0; unsafe { *(fhs as u64) -> fh }
+
+    u64 N = 1024
+    u64 bytes = N * 4
+    u64 d_a = 0; u64 d_b = 0; u64 d_o = 0
+    u64 slot
+    slot = alloc(8); hipMalloc(slot, bytes); unsafe { *(slot as u64) -> d_a }
+    slot = alloc(8); hipMalloc(slot, bytes); unsafe { *(slot as u64) -> d_b }
+    slot = alloc(8); hipMalloc(slot, bytes); unsafe { *(slot as u64) -> d_o }
+
+    // Build a reusable kernarg.
+    u64 a0 = alloc(8); unsafe { *(a0 as u64) = d_a }
+    u64 a1 = alloc(8); unsafe { *(a1 as u64) = d_b }
+    u64 a2 = alloc(8); unsafe { *(a2 as u64) = d_o }
+    u64 a3 = alloc(8); unsafe { *(a3 as u64) = N }
+    u64 kp = alloc(4 * 8)
+    unsafe { *(kp        as u64) = a0 }
+    unsafe { *((kp +  8) as u64) = a1 }
+    unsafe { *((kp + 16) as u64) = a2 }
+    unsafe { *((kp + 24) as u64) = a3 }
+
+    // Warmup — let DPM ramp + boost queue spin up.
+    u64 wi = 0
+    while wi < 32 {
+        hipModuleLaunchKernel(fh, 4, 1, 1, 256, 1, 1, 0, 0, kp, 0)
+        wi = wi + 1
+    }
+    hipDeviceSynchronize()
+
+    // ── Regime 1: cold-sync (queue already drained) ──
+    print_str("=== Regime 1: cold sync (no work in flight) ===\n")
+    u64 trials = 100
+    u64 i = 0
+    u64 ns_before = hipkfd_get_sync_total_ns()
+    u64 cnt_before = hipkfd_get_sync_count()
+    while i < trials {
+        hipDeviceSynchronize()
+        i = i + 1
+    }
+    u64 ns_after = hipkfd_get_sync_total_ns()
+    u64 cnt_after = hipkfd_get_sync_count()
+    u64 dn = ns_after - ns_before
+    u64 dc = cnt_after - cnt_before
+    print_str("  syncs="); u64 s1 = fmt_dec(dc); print_str(s1); dealloc(s1)
+    print_str(" total_us="); u64 s2 = fmt_dec(dn / 1000); print_str(s2); dealloc(s2)
+    if dc > 0 {
+        print_str(" mean_ns="); u64 s3 = fmt_dec(dn / dc); print_str(s3); dealloc(s3)
+    }
+    print_str("\n")
+
+    // ── Regime 2: single-launch sync ──
+    print_str("=== Regime 2: 1 launch + sync ===\n")
+    i = 0
+    ns_before = hipkfd_get_sync_total_ns()
+    cnt_before = hipkfd_get_sync_count()
+    while i < trials {
+        hipModuleLaunchKernel(fh, 4, 1, 1, 256, 1, 1, 0, 0, kp, 0)
+        hipDeviceSynchronize()
+        i = i + 1
+    }
+    ns_after = hipkfd_get_sync_total_ns()
+    cnt_after = hipkfd_get_sync_count()
+    dn = ns_after - ns_before
+    dc = cnt_after - cnt_before
+    print_str("  syncs="); u64 s4 = fmt_dec(dc); print_str(s4); dealloc(s4)
+    print_str(" total_us="); u64 s5 = fmt_dec(dn / 1000); print_str(s5); dealloc(s5)
+    if dc > 0 {
+        print_str(" mean_ns="); u64 s6 = fmt_dec(dn / dc); print_str(s6); dealloc(s6)
+    }
+    print_str("\n")
+
+    // ── Regime 3: deep-queue sync (16 launches before sync) ──
+    print_str("=== Regime 3: 16 launches + sync ===\n")
+    i = 0
+    ns_before = hipkfd_get_sync_total_ns()
+    cnt_before = hipkfd_get_sync_count()
+    while i < trials {
+        u64 j = 0
+        while j < 16 {
+            hipModuleLaunchKernel(fh, 4, 1, 1, 256, 1, 1, 0, 0, kp, 0)
+            j = j + 1
+        }
+        hipDeviceSynchronize()
+        i = i + 1
+    }
+    ns_after = hipkfd_get_sync_total_ns()
+    cnt_after = hipkfd_get_sync_count()
+    dn = ns_after - ns_before
+    dc = cnt_after - cnt_before
+    print_str("  syncs="); u64 s7 = fmt_dec(dc); print_str(s7); dealloc(s7)
+    print_str(" total_us="); u64 s8 = fmt_dec(dn / 1000); print_str(s8); dealloc(s8)
+    if dc > 0 {
+        print_str(" mean_ns="); u64 s9 = fmt_dec(dn / dc); print_str(s9); dealloc(s9)
+    }
+    print_str("\n")
+
+    print_str("\nReadout:\n")
+    print_str("  Regime 1 mean = signal observation floor (no work)\n")
+    print_str("  Regime 2 mean = floor + 1 kernel time (~few µs of compute)\n")
+    print_str("  Regime 3 mean = floor + 16-deep compute pipeline\n")
+    print_str("  qwen3 measured: ~200 µs / sync (~17-deep pipeline)\n")
+    print_str("If R1 << R2 << R3, sync_us is dominated by GPU compute, not floor.\n")
+    print_str("If R1 ≈ R2 ≈ R3, the floor IS the dominant cost — fix it.\n")
+
+    exit(0)
+}

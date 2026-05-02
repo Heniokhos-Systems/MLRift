@@ -16,11 +16,39 @@ SRCS = src/lexer.mlr src/ast.mlr src/parser.mlr src/codegen.mlr \
        src/format_archive.mlr src/format_android.mlr src/bcj.mlr src/analysis.mlr src/living.mlr \
        src/runtime.mlr src/formatter.mlr src/main.mlr
 
-.PHONY: all build test install dist clean bootstrap
+.PHONY: all build mlr-runner test install dist clean bootstrap
 
-all: build
+all: build mlr-runner
 
 build: build/mlrc
+
+# Build the .mlrbo runner. runner.mlr references filter_aarch64_bcj /
+# filter_x86_64_bcj from bcj.mlr, so the two must be concatenated before
+# compile — otherwise the runner builds with unresolved BCJ calls and
+# silently corrupts every extracted slice (entry-point bytes get
+# clobbered, slice bus-errors at startup on the device).
+#
+# `kr` is a shell wrapper (packaging/kr.sh) that catches exit-120 from
+# kr-bin and re-execs the extracted ./kr-exec — needed on Termux/Android
+# where raw execve from app data dirs is SELinux-denied. Other hosts hit
+# the wrapper's `exit $status` line as a no-op since the runner exec's
+# the slice directly.
+mlr-runner: build/kr build/kr-bin
+
+build/kr-runner.mlr: src/runner.mlr src/bcj.mlr
+	@mkdir -p build
+	cat src/runner.mlr src/bcj.mlr > build/kr-runner.mlr
+
+build/kr-bin: build/kr-runner.mlr build/mlrc
+	./build/mlrc --arch=x86_64 build/kr-runner.mlr -o build/kr-bin
+	chmod +x build/kr-bin
+	@echo "Built build/kr-bin (host-native runner binary)"
+
+build/kr: packaging/kr.sh
+	@mkdir -p build
+	cp packaging/kr.sh build/kr
+	chmod +x build/kr
+	@echo "Built build/kr (shell wrapper for kr-bin)"
 
 build/mlrc.mlr: $(SRCS)
 	@mkdir -p build

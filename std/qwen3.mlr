@@ -63,6 +63,9 @@ fn qwen3_set_arch(u64 hidden, u64 head_dim, u64 n_heads, u64 n_kv_heads, u64 ff)
     QWEN3_KV_DIM       = n_kv_heads * head_dim
     QWEN3_INTERMEDIATE = ff
     QWEN3_ROPE_DIM     = head_dim
+    // Mirror arch into inference_gpu's static state so its shape-aware
+    // dispatchers (qkv_split, attn_decode) can pick the right kernel.
+    gpu_set_arch(n_heads * head_dim, n_heads)
 }
 
 // rope_theta = 1e6 (big-number base for long-context positional encoding).
@@ -1241,7 +1244,9 @@ fn qwen3_forward_layer_qkv_batched_gpu(u64 d_x_in_arr_ptr,
                                         u64 batch_size) -> u64 {
     if _qwen3_gpu_pipeline_init() == 0 { return 1 }
     u64 hidden  = QWEN3_HIDDEN
-    u64 qkv_dim = QWEN3_Q_DIM + 2 * QWEN3_KV_DIM
+    u64 q_dim   = QWEN3_Q_DIM
+    u64 kv_dim  = QWEN3_KV_DIM
+    u64 qkv_dim = q_dim + 2 * kv_dim
 
     u64 d_in_gamma = gpu_cache_bf16_as_f32(w.input_norm_w, hidden)
     if d_in_gamma == 0 { return 1 }
@@ -1249,12 +1254,43 @@ fn qwen3_forward_layer_qkv_batched_gpu(u64 d_x_in_arr_ptr,
     while b < batch_size {
         u64 d_x_in_b = 0; unsafe { *((d_x_in_arr_ptr + b * 8) as u64) -> d_x_in_b }
         u64 b_x_norm = _gpuq_d_x_norm + b * hidden * 4
-        if gpu_rmsnorm_1024_to_dev(b_x_norm, d_x_in_b, d_in_gamma, 1) != 0 { return 1 }
+        if gpu_rmsnorm_hidden_to_dev(b_x_norm, d_x_in_b, d_in_gamma, 1, hidden) != 0 { return 1 }
         b = b + 1
     }
-    // ONE batched qkv matmul for all M streams.
-    if gpu_matmul_to_dev_batched(_gpuq_d_qkv, _gpuq_d_x_norm, w.q_proj_w,
-                                  qkv_dim, hidden, batch_size) != 0 { return 1 }
+    // QKV projection.  Two paths:
+    //   fused (qwen3_fuse_qkv != 0): caller pre-stacked q/k/v into
+    //     w.q_proj_w → ONE batched matmul of [qkv_dim, hidden].
+    //   unfused (qwen3_fuse_qkv == 0): three separate matmuls writing
+    //     into the q-, k-, v- slots of _gpuq_d_qkv (offsets 0,
+    //     q_dim*4, (q_dim + kv_dim)*4 per batch slot).  Used by
+    //     larger models where the 17 GB stacked-bf16 buffer doesn't
+    //     fit host RAM.
+    if qwen3_fuse_qkv != 0 {
+        if gpu_matmul_to_dev_batched(_gpuq_d_qkv, _gpuq_d_x_norm, w.q_proj_w,
+                                      qkv_dim, hidden, batch_size) != 0 { return 1 }
+    } else {
+        // Unfused: 3 matmuls.  Per-batch stride in _gpuq_d_qkv is
+        // qkv_dim*4 bytes (Q at +0, K at +q_dim*4, V at +(q_dim+kv_dim)*4).
+        // gpu_matmul_to_dev_batched uses contiguous [batch, N] output
+        // layout; here each output is contiguous within its own slab,
+        // not interleaved with K/V.  Solution: temporarily write each
+        // projection into _gpuq_d_qkv at the right offset using three
+        // separate matmuls, then a fix-up step interleaves them.
+        // NOTE: this works only when batch_size == 1 — for batch>1 we
+        // need a different layout (each batch's qkv must be contiguous
+        // for the downstream qkv_split kernel).  Caller restricts to
+        // batch=1 in the no-fuse 14B path.
+        if batch_size != 1 {
+            // Unsupported — falls back to layer-by-layer mode at the caller.
+            return 1
+        }
+        if gpu_matmul_to_dev_batched(_gpuq_d_qkv,                _gpuq_d_x_norm, w.q_proj_w,
+                                      q_dim,  hidden, 1) != 0 { return 1 }
+        if gpu_matmul_to_dev_batched(_gpuq_d_qkv + q_dim * 4,    _gpuq_d_x_norm, w.k_proj_w,
+                                      kv_dim, hidden, 1) != 0 { return 1 }
+        if gpu_matmul_to_dev_batched(_gpuq_d_qkv + (q_dim + kv_dim) * 4, _gpuq_d_x_norm, w.v_proj_w,
+                                      kv_dim, hidden, 1) != 0 { return 1 }
+    }
     return 0
 }
 
