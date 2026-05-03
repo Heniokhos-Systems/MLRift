@@ -20,13 +20,14 @@ KernRift compiler + a small ML stdlib (`std/qwen3.mlr`,
 `std/matmul.mlr`, `std/tokenizer.mlr`, `std/gguf.mlr`) — no external
 runtime, no Python.
 
-| Model | Quant | tok/s | vs PyTorch BF16 | Peak RSS |
-|---|---|---:|---:|---:|
-| Qwen3-0.6B | bf16 (HF safetensors) | 32.03 | **1.24×** | 1.67 GB |
-| Qwen3-0.6B | bf16 (GGUF) | 32.27 | **1.25×** | 1.67 GB |
-| **Qwen3-14B** | **Q8_0 (GGUF)** | **0.479** | **3.63×** | **14.81 GB** |
+| Model | Quant | tok/s (CPU) | tok/s (GPU matmul) | vs PyTorch BF16 | Peak RSS |
+|---|---|---:|---:|---:|---:|
+| Qwen3-0.6B | bf16 (HF safetensors) | 32.03 | ~33 | **1.24×** | 1.67 GB |
+| Qwen3-0.6B | bf16 (GGUF) | 32.27 | ~33 | **1.25×** | 1.67 GB |
+| **Qwen3-14B** | **Q8_0 (GGUF)** | **0.479** | — | **3.63×** | **14.81 GB** |
 
-7900X / 16 threads / greedy decode / use_cache. First 10 generated
+7900X / 16 threads / greedy decode / use_cache.  GPU rows: RX 7800 XT
+gfx1100, native KFD shim, `MLRIFT_GPU_MATMUL=1`.  First 10 generated
 tokens are bit-identical to HuggingFace `transformers.generate`
 across both sizes (token-id check, not a fuzzy text match). Methodology
 + commit-by-commit perf history:
@@ -36,6 +37,21 @@ across both sizes (token-id check, not a fuzzy text match). Methodology
 - `docs/BENCH_QWEN3_14B.md` — Qwen3-14B Q8_0 vs PyTorch BF16 (3.63×
   decode, 1.37× less peak RSS, 5-token prompt → 20-token greedy
   continuation).
+- `docs/bench_60m.md` — 60 M neuron / 240 M synapse spiking sim,
+  74× over PyTorch CPU and 3.6× over PyTorch GPU on the same card,
+  end-to-end via the native AMDGCN emitter (zero ROCm DSOs in the
+  launcher binary).
+
+## AMD GPU backend
+
+The native AMDGCN emitter (`src/format_amdgpu.mlr`) compiles `@kernel`
+functions directly to gfx1100 (RDNA 3) ELF code objects.  31 LLM
+kernels are reachable today via the AST-walking lowerer (Phase 3).
+Pass `--target-arch=gfx1030` and the same source emits RDNA 2 binaries
+that disassemble cleanly under `llvm-objdump --mcpu=gfx1030` with zero
+`.long` placeholders — Slice B (RDNA 2) is feature-complete for the
+LLM kernel set.  Slice C (NVIDIA Blackwell / Ada / Ampere via PTX) is
+the next target.
 
 ## Build
 

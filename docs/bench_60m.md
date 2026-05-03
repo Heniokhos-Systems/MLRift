@@ -62,21 +62,29 @@ hipcc dependency is the `spike_reduce` host-side reduction kernel, and
 that path is bypassed entirely when `NOESIS_CSR_CO_PATH` is unset (the
 launcher just skips the on-device reduce).
 
-End-to-end reproducibility (verified 2026-04-28):
+End-to-end reproducibility (re-verified 2026-05-04 against current HEAD):
 
 ```
 $ ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/noesis_60m_gpu.mlr        -o /tmp/noesis_60m_gpu
 $ ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/noesis_60m_gpu_launch.mlr -o /tmp/noesis_60m_gpu_launch
 $ /tmp/noesis_60m_gpu_launch
-init_us:        1639334     (1.64 s)
-csr_build_us:    153315     (0.15 s)
-sim_us:        26453133     (26.45 s, 13.2 ms/step over 2000 steps)
+init_us:        1693529     (1.69 s)
+csr_build_us:    151283     (0.15 s)
+sim_us:        26644143     (26.64 s, 13.3 ms/step over 2000 steps)
 total_spikes: 1985575926
-total_wall_us: 28594657     (28.59 s)
+total_wall_us: 28378560     (28.38 s)
 ```
 
 `mlrc` round-trip from source → AMDGCN code object: **3.4 ms** for all
 four kernels. No external toolchain in the build OR runtime path.
+
+The native ISA emitter is now **portable across two AMD ISA families**
+out of the same source — pass `--target-arch=gfx1030` instead of the
+default `gfx1100` and the same `mlrc` invocation produces RDNA2 (gfx10)
+binaries with zero `.long` under `llvm-objdump --mcpu=gfx1030`.  31 LLM
+kernels validated cross-arch; see `MEMORY` for the encoding pair
+catalogue.  Slice C (NVIDIA Blackwell / Ada / Ampere via PTX) is the
+next target.
 
 ## Results
 
