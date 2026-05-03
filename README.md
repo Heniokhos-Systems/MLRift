@@ -116,7 +116,7 @@ Roadmap to extend the lead, ranked by ceiling:
 | 2. ✅ Per-token flush throttle (`MLRIFT_GPU_FLUSH_EVERY_N=28`) | drop 27/28 per-layer syncs (~75 µs each) | **60.4** | **1.45× ROCm fp32** |
 | 3. ✅ **Pure fp32 path** (`MLRIFT_GPU_MATMUL_BF16=0`) | f32 weight VRAM, f32 GEMM accum (apples-to-apples vs ROCm fp32) | **59.1** | **1.42× ROCm fp32** |
 | 2b. Kernel-level fusion (`resid+rmsnorm`, `qknorm+rope`, qknorm-Q+K) | save ~5 launches/layer × 28 × ~10 µs ≈ 1.4 ms/token | 65–70 | 0.88–0.95× ROCm bf16 |
-| 4. **Mega-kernel** (one dispatch per layer; collapses ~15 ops) | 421 → ~30 dispatches/token; eliminates launch-overhead floor | **120–160** | **1.6–2.2× ROCm bf16** |
+| 4. **Mega-kernel** (one dispatch per layer; collapses ~15 ops) — design + measurement complete, see [`docs/SLICE4_MEGAKERNEL_DESIGN.md`](docs/SLICE4_MEGAKERNEL_DESIGN.md) | 421 → ~29 dispatches/token; saves 9 ms of launch overhead | **143 (projected)** | **1.94× ROCm bf16** |
 | 4b. WMMA bf16 GEMV through `gpu_matmul` (M ≥ 4) | 2× on prefill / spec_K matmuls (gfx1100 tensor cores) | 100–120 PLD | 1.4–1.6× ROCm bf16 |
 
 WMMA at honest M=1 decode is dropped from the critical path: profile
