@@ -65,28 +65,33 @@ Token-id output of every MLRift row is bit-identical to HuggingFace
 | PyTorch ROCm eager | fp32 / fp32 | 41.6 | 2 280 | 1.00× (baseline) |
 | PyTorch ROCm eager | bf16 / bf16 | 73.7 | 1 140 | 1.00× (baseline) |
 | MLRift `--target=amdgpu-native` (matmul only) | bf16 / f32 | 35.1 | 1 920 | 0.48× vs ROCm bf16 |
-| MLRift `--target=amdgpu-native` (matmul only, `MLRIFT_GPU_MATMUL_BF16=0`) | f32 / f32 | 35.2 | 1 920 | **0.85× vs ROCm fp32** |
-| ⚠ MLRift `use_gpu_full + spec_K=4 + bf16-batched` (dormant) | bf16-direct / f32 | **92.9** | 3 938 | **1.26× vs ROCm bf16** |
+| MLRift `--target=amdgpu-native` (matmul only, `MLRIFT_GPU_MATMUL_BF16=0`) | f32 / f32 | 35.2 | 1 920 | 0.85× vs ROCm fp32 |
+| **MLRift `--target=amdgpu-native` + `MLRIFT_GPU_FULL_FORWARD=1`** | bf16 / f32 | **55.4** | 1 920 | **1.33× vs ROCm fp32** |
+| **MLRift + `GPU_FULL_FORWARD` + `SPEC_K=4` + LONG-prompt (PLD)** | bf16 / f32 | **87.5** | 1 920 | **1.19× vs ROCm bf16** |
 
 The matmul-only rows route only the matmul + lm_head through native
 gfx1100 ISA; qknorm, rope, attn, residuals still run CPU.  The
-**dormant** row was measured 2026-05-01 with the full forward chain
-on-device — it already destroyed PyTorch ROCm bf16 by 26 % and ROCm
-fp32 by 2.23×.  The current single-stream regression hides that
-ceiling.  This is the path back, ranked by ceiling:
+**`GPU_FULL_FORWARD=1`** row keeps the entire 28-layer forward
+on-device (one D2H per token, only at lm_head) and **beats PyTorch
+ROCm fp32 by 33 % at honest single-stream decode**, bit-identical
+output.  The PLD row uses a synthetic prefill that the prefix-lookup
+draft proposer hits at ~2 tok/step accept; **beats ROCm bf16 by 19 %**
+on that workload.
+
+Roadmap to extend the lead, ranked by ceiling:
 
 | Slice | unlock | projected tok/s | vs ROCm bf16 |
 |---|---|---:|---:|
-| 1. Revive `use_gpu_full=1` chain (recogniser-ordering family of bugs) | restore the May-1 92.9 figure | **92** | **1.25×** |
-| 2. Path B intra-WG fusion: `resid+rmsnorm`, `qknorm+rope`, `silu+down` | −3 syncs/layer × 28 × ~100 µs | **105–115** | **1.43×** |
-| 3. WMMA bf16 GEMV through `gpu_matmul` dispatch | 2× on dominant matmuls (~65 % of step) | **130–145** | **1.78×** |
-| 4. Mega-kernel (one dispatch per layer; collapses ~12 ops) | 340 → ~30 dispatches/token | **150–200** | **2.0–2.7×** |
+| 2. Path B intra-WG fusion: `resid+rmsnorm`, `qknorm+rope`, `silu+down` | −3 syncs/layer × 28 × ~100 µs | **65–70** | 0.92× → close gap |
+| 3. WMMA bf16 GEMV through `gpu_matmul` dispatch | 2× on dominant matmuls (~65 % of step) | **85–95** | **1.15–1.29×** |
+| 4. Mega-kernel (one dispatch per layer; collapses ~12 ops) | 340 → ~30 dispatches/token | **120–160** | **1.6–2.2×** |
 | 5. Native fp32 weight bench (no bf16→f32 dequant cost) | 0.85× → 1.0×+ vs ROCm fp32 | **45+ (fp32)** | n/a |
 
 Memory roofline on this card (624 GB/s ÷ 600 MB bf16 weights) is
-≈1 040 tok/s; we are at 9 % today, ROCm bf16 is at 7 %.  Nothing here
-is blocked on hardware.  Tracking as tasks #178–#182 with the full
-methodology and per-slice notes in `project_destroy_pytorch_roadmap.md`.
+≈1 040 tok/s; we are at **5 % single-stream / 8 % with PLD** today,
+ROCm bf16 is at 7 %.  Nothing here is blocked on hardware.  Tracking
+as tasks #178–#181 with the full methodology and per-slice notes in
+`project_destroy_pytorch_roadmap.md`.
 
 ## Build
 
