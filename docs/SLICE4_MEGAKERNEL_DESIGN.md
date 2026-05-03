@@ -123,3 +123,40 @@ projected.
 - The implementation has no unknowns left — design is settled, constants
   are measured, the rest is execution.
 
+
+## Stepping stone: slice 2b (residual+rmsnorm fusion)
+
+A smaller fusion that would ship as a single concrete @kernel before
+the full mega-kernel:
+
+- `examples/llm/residual_rmsnorm_f32.mlr` — @kernel definition
+  committed; uses `residual_rmsnorm_marker()` discriminator so the
+  AST recogniser routes correctly relative to the existing rmsnorm
+  family.
+- 7-param shape: `(in_a, in_b, out_resid, out_norm, gamma, m, n)`.
+- Fires twice per qwen3 layer (mid resid+post_norm; cross-layer
+  final-resid+input_norm).  ≈56 launches/token saved at ~24 µs each
+  ≈ 1.3 ms/token, projecting **60.4 → ~67 tok/s** on the same RX
+  7800 XT, qwen3-0.6B / single-stream.
+
+Remaining work for slice 2b:
+
+1. **Emit body.**  Cleanest path: reorder the kernarg so SGPRs reuse
+   the existing rmsnorm assignment (in_a→s4-5 as 'in', out_norm→s6-7
+   as 'out', gamma→s8-9, m→s10, n→s12), then put in_b/out_resid at
+   trailing kernarg offsets loaded into s14-17.  Prologue is then a
+   4-instruction insertion: load b, add to v10 (which already holds a),
+   store v10 to out_resid.  Body otherwise unchanged.
+2. **AST recogniser** `amdgpu_lower_residual_rmsnorm_f32_3b`: gates on
+   7 params + presence of `residual_rmsnorm_marker()` Call + lds_reduce
+   + rsqrt.  Routes BEFORE rmsnorm_3b.
+3. **CLI flag** `--emit-amdgpu-residual-rmsnorm-f32-N=N:path`.
+4. **Launcher** `gpu_residual_rmsnorm_to_dev` in std/inference_gpu.mlr.
+5. **Wire** in qwen3_forward_layer_gpu (lines 1502-1508) — replace
+   `gpu_resid_add_to_dev(...) → gpu_rmsnorm_1024_to_dev(...)` pair
+   with one call.  Cross-layer fusion at qwen3_generate.mlr is a
+   second wiring point.
+
+Estimate: 2-3 hours for the emit body alone (dword-level ISA edits
+need llvm-mc verification on every instruction).  Worth a dedicated
+session.

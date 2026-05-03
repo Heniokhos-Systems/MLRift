@@ -1,0 +1,49 @@
+// Slice 4a partial — fused residual_add + rmsnorm.
+// Replaces the (gpu_resid_add_to_dev → gpu_rmsnorm_*_to_dev) pair that
+// fires twice per qwen3 layer (mid + post-down) with a single launch.
+// At hidden=N=1024, 56 fires/token -> 56 launches saved.
+//
+// Structure parallels rmsnorm_f32_N1024.mlr; recogniser detects the
+// residual prologue via the (a + b) pattern feeding the rmsnorm body.
+
+fn block_idx_x() -> uint64 { return 0 }
+fn tid_local_x() -> uint64 { return 0 }
+fn lds_reduce_sum_f32(f32 x) -> f32 { return x }
+fn rsqrt_f32(f32 x) -> f32 { return x }
+fn residual_rmsnorm_marker() -> uint64 { return 0 }
+
+@kernel
+fn residual_rmsnorm_f32(uint64 in_a, uint64 in_b,
+                         uint64 out_resid, uint64 out_norm,
+                         uint64 gamma_ptr, uint64 m, uint64 n) {
+    uint64 row = block_idx_x()
+    uint64 lane = tid_local_x()
+    uint64 _mark = residual_rmsnorm_marker()
+    if row < m {
+        uint64 row_off = row * n
+        uint64 idx = row_off + lane
+        uint64 ap = in_a + idx * 4
+        uint64 bp = in_b + idx * 4
+        uint64 rp = out_resid + idx * 4
+        uint64 op = out_norm  + idx * 4
+        uint64 gp = gamma_ptr + lane * 4
+        f32 a = 0.0
+        f32 b = 0.0
+        unsafe { *(ap as f32) -> a }
+        unsafe { *(bp as f32) -> b }
+        f32 x = a + b
+        unsafe { *(rp as f32) = x }
+        f32 xsq = x * x
+        f32 sumsq = lds_reduce_sum_f32(xsq)
+        f32 mean = sumsq * 0.0009765625
+        f32 me = mean + 0.00001
+        f32 rrms = rsqrt_f32(me)
+        f32 g = 0.0
+        unsafe { *(gp as f32) -> g }
+        f32 xr = x * rrms
+        f32 r = xr * g
+        unsafe { *(op as f32) = r }
+    }
+}
+
+fn main() { exit(0) }
