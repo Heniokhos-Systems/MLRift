@@ -68,6 +68,7 @@ Token-id output of every MLRift row is bit-identical to HuggingFace
 | MLRift `--target=amdgpu-native` (matmul only, `MLRIFT_GPU_MATMUL_BF16=0`) | f32 / f32 | 35.2 | 1 920 | 0.85× vs ROCm fp32 |
 | **MLRift `--target=amdgpu-native` + `MLRIFT_GPU_FULL_FORWARD=1`** | bf16 / f32 | **55.4** | 1 920 | **1.33× vs ROCm fp32** |
 | **+ `MLRIFT_GPU_FLUSH_EVERY_N=28`** (slice 2 — drop per-layer sync) | bf16 / f32 | **60.4** | 1 920 | **1.45× vs ROCm fp32** |
+| **+ `MLRIFT_GPU_MATMUL_BF16=0`** (slice 3 — pure fp32 weights) | f32 / f32 | **59.1** | 2 480 | **1.42× vs ROCm fp32** |
 | **MLRift + `GPU_FULL_FORWARD` + `SPEC_K=4` + LONG-prompt (PLD)** | bf16 / f32 | **87.5** | 1 920 | **1.19× vs ROCm bf16** |
 
 The matmul-only rows route only the matmul + lm_head through native
@@ -110,19 +111,40 @@ forward-style flag wouldn't apply.
 
 Roadmap to extend the lead, ranked by ceiling:
 
-| Slice | unlock | projected tok/s | vs ROCm bf16 |
+| Slice | unlock | tok/s | vs PyTorch (same dtype) |
 |---|---|---:|---:|
-| 2. ✅ Per-token flush throttle (`MLRIFT_GPU_FLUSH_EVERY_N=28`) | drop 27 of 28 per-layer syncs (~75 µs each) | **60.4 (shipped)** | 0.82× |
-| 2b. Kernel-level fusion (`resid+rmsnorm`, `qknorm+rope`) | save 1 launch/op × 56 fires × ~10 µs | **65–70** | 0.88–0.95× |
-| 3. WMMA bf16 GEMV through `gpu_matmul` dispatch | 2× on dominant matmuls (~65 % of step) | **85–95** | **1.15–1.29×** |
-| 4. Mega-kernel (one dispatch per layer; collapses ~12 ops) | 340 → ~30 dispatches/token | **120–160** | **1.6–2.2×** |
-| 5. Native fp32 weight bench (no bf16→f32 dequant cost) | 0.85× → 1.0×+ vs ROCm fp32 | **45+ (fp32)** | n/a |
+| 2. ✅ Per-token flush throttle (`MLRIFT_GPU_FLUSH_EVERY_N=28`) | drop 27/28 per-layer syncs (~75 µs each) | **60.4** | **1.45× ROCm fp32** |
+| 3. ✅ **Pure fp32 path** (`MLRIFT_GPU_MATMUL_BF16=0`) | f32 weight VRAM, f32 GEMM accum (apples-to-apples vs ROCm fp32) | **59.1** | **1.42× ROCm fp32** |
+| 2b. Kernel-level fusion (`resid+rmsnorm`, `qknorm+rope`, qknorm-Q+K) | save ~5 launches/layer × 28 × ~10 µs ≈ 1.4 ms/token | 65–70 | 0.88–0.95× ROCm bf16 |
+| 4. **Mega-kernel** (one dispatch per layer; collapses ~15 ops) | 421 → ~30 dispatches/token; eliminates launch-overhead floor | **120–160** | **1.6–2.2× ROCm bf16** |
+| 4b. WMMA bf16 GEMV through `gpu_matmul` (M ≥ 4) | 2× on prefill / spec_K matmuls (gfx1100 tensor cores) | 100–120 PLD | 1.4–1.6× ROCm bf16 |
+
+WMMA at honest M=1 decode is dropped from the critical path: profile
+shows we're now **launch-overhead bound**, not ALU-bound (421 launches
+× ~24 µs ≈ 10 ms/step; only 2.3 ms is sync wait).  WMMA accelerates
+ALU on a workload that's bandwidth-bound — no help at M=1.  It still
+matters for prefill / `SPEC_K=4` mode where M_eff ≥ 4 hits the tensor
+core efficiently.
+
+Single-stream **bf16 win** has to come from launch-count reduction
+(slice 4 mega-kernel).  The mega-kernel collapses the 15-op layer
+into 1 dispatch — saves ~14 launches/layer × 28 layers × ~10 µs =
+3.9 ms/token, taking step time from 10 ms → 6 ms ≈ 165 tok/s ceiling.
 
 Memory roofline on this card (624 GB/s ÷ 600 MB bf16 weights) is
-≈1 040 tok/s; we are at **5 % single-stream / 8 % with PLD** today,
+≈1 040 tok/s; we are at **6 % single-stream / 8 % with PLD** today,
 ROCm bf16 is at 7 %.  Nothing here is blocked on hardware.  Tracking
 as tasks #178–#181 with the full methodology and per-slice notes in
 `project_destroy_pytorch_roadmap.md`.
+
+### Pure fp32 win — fully apples-to-apples vs PyTorch ROCm fp32
+
+The `MLRIFT_GPU_MATMUL_BF16=0` row above is the dtype-clean f32
+comparison: f32 weights resident in VRAM (one-time dequant from
+bf16 + cached), f32 GEMM compute, f32 accumulator — same dtype
+profile as PyTorch ROCm fp32.  We hit **59.1 tok/s vs their 41.6
+(1.42×)** at honest single-stream decode, bit-identical token output,
+all on the same RX 7800 XT.
 
 ## Build
 
