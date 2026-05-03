@@ -13692,10 +13692,17 @@ fn amdgpu_lower_rmsnorm_f32_3b(uint64 fn_node, uint64 source,
     if stmt2 == 0 || ast_kind(stmt2) != 13 { return 1 }   // If
     if ast_next(stmt2) != 0 { return 1 }
 
-    // ── if-then-block must contain a Call to lds_reduce_sum_f32 ──
+    // ── if-then-block must contain a Call to lds_reduce_sum_f32 AND
+    // a Call to rsqrt_f32 (the defining op of *RMS*norm).  Without the
+    // rsqrt check, this recogniser is structurally identical to the
+    // gemv_coop_f32 shape (5p + 3-stmt body + lds_reduce_sum_f32) and
+    // would mis-emit gemv_coop_f32 as rmsnorm bytes — symptom: kernel
+    // squares its input instead of computing a dot product, qwen3
+    // lm_head hangs the queue at N=151936.
     uint32 then_block = ast_data1(stmt2)
     if then_block == 0 || ast_kind(then_block) != 15 { return 1 }
     uint64 saw_lds_reduce = 0
+    uint64 saw_rsqrt = 0
     uint32 walk = ast_child(then_block)
     while walk != 0 {
         // The reducer call is the init-expr of a VarDecl: `f32 sumsq =
@@ -13708,11 +13715,19 @@ fn amdgpu_lower_rmsnorm_f32_3b(uint64 fn_node, uint64 source,
                 if tok_matches(callee, "lds_reduce_sum_f32", 18) != 0 {
                     saw_lds_reduce = 1
                 }
+                if tok_matches(callee, "rsqrt_f32", 9) != 0 {
+                    saw_rsqrt = 1
+                }
             }
+        }
+        if ast_kind(walk) == 35 {
+            uint32 callee = ast_data1(walk)
+            if tok_matches(callee, "rsqrt_f32", 9) != 0 { saw_rsqrt = 1 }
         }
         walk = ast_next(walk)
     }
     if saw_lds_reduce == 0 { return 1 }
+    if saw_rsqrt == 0 { return 1 }
 
     // ── emit ISA via parametric helper at N=256 ──────────────────
     // The helper (`_emit_rmsnorm_f32_body_N_eps`) emits the same
