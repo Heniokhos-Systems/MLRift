@@ -67,6 +67,7 @@ Token-id output of every MLRift row is bit-identical to HuggingFace
 | MLRift `--target=amdgpu-native` (matmul only) | bf16 / f32 | 35.1 | 1 920 | 0.48× vs ROCm bf16 |
 | MLRift `--target=amdgpu-native` (matmul only, `MLRIFT_GPU_MATMUL_BF16=0`) | f32 / f32 | 35.2 | 1 920 | 0.85× vs ROCm fp32 |
 | **MLRift `--target=amdgpu-native` + `MLRIFT_GPU_FULL_FORWARD=1`** | bf16 / f32 | **55.4** | 1 920 | **1.33× vs ROCm fp32** |
+| **+ `MLRIFT_GPU_FLUSH_EVERY_N=28`** (slice 2 — drop per-layer sync) | bf16 / f32 | **60.4** | 1 920 | **1.45× vs ROCm fp32** |
 | **MLRift + `GPU_FULL_FORWARD` + `SPEC_K=4` + LONG-prompt (PLD)** | bf16 / f32 | **87.5** | 1 920 | **1.19× vs ROCm bf16** |
 
 The matmul-only rows route only the matmul + lm_head through native
@@ -111,7 +112,8 @@ Roadmap to extend the lead, ranked by ceiling:
 
 | Slice | unlock | projected tok/s | vs ROCm bf16 |
 |---|---|---:|---:|
-| 2. Path B intra-WG fusion: `resid+rmsnorm`, `qknorm+rope`, `silu+down` | −3 syncs/layer × 28 × ~100 µs | **65–70** | 0.92× → close gap |
+| 2. ✅ Per-token flush throttle (`MLRIFT_GPU_FLUSH_EVERY_N=28`) | drop 27 of 28 per-layer syncs (~75 µs each) | **60.4 (shipped)** | 0.82× |
+| 2b. Kernel-level fusion (`resid+rmsnorm`, `qknorm+rope`) | save 1 launch/op × 56 fires × ~10 µs | **65–70** | 0.88–0.95× |
 | 3. WMMA bf16 GEMV through `gpu_matmul` dispatch | 2× on dominant matmuls (~65 % of step) | **85–95** | **1.15–1.29×** |
 | 4. Mega-kernel (one dispatch per layer; collapses ~12 ops) | 340 → ~30 dispatches/token | **120–160** | **1.6–2.2×** |
 | 5. Native fp32 weight bench (no bf16→f32 dequant cost) | 0.85× → 1.0×+ vs ROCm fp32 | **45+ (fp32)** | n/a |

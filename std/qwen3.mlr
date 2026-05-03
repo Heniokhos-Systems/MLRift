@@ -1165,6 +1165,14 @@ static u64 _gpuq_kv_layer_stride  = 0     // bytes per (batch, layer) slab
 static u64 _gpuq_kv_batch_stride  = 0     // bytes per layer = batch_size * layer_stride
 static u64 _gpuq_kv_batch_size    = 1
 
+// Per-layer flush throttle (slice 2 / Path B).  When N_eff > 1, the
+// trailing gpu_pipeline_flush() in qwen3_forward_layer_gpu fires only
+// every N_eff calls.  Initialised lazily from MLRIFT_GPU_FLUSH_EVERY_N
+// on first use; 0 / unset means flush every call (legacy).
+static u64 _gpuq_flush_every_n     = 0
+static u64 _gpuq_flush_every_n_init = 0
+static u64 _gpuq_flush_skip_count   = 0
+
 @export
 fn qwen3_gpu_set_kv_cache_dev(u64 k_dev_base, u64 v_dev_base,
                                u64 layer_stride, u64 batch_size) {
@@ -1526,8 +1534,34 @@ fn qwen3_forward_layer_gpu(u64 d_x_in, u64 d_x_out,
 
     // Sync 2 — drain before next layer reads d_x_out.  Skip when we
     // know more phases will run on the same chain (saves sync cost).
-    // For simplicity, always flush at the end of any partial chain:
-    gpu_pipeline_flush()
+    // Throttle: MLRIFT_GPU_FLUSH_EVERY_N=K flushes only every K calls
+    // (default K=1).  Saves ~14 syncs/token at K=2 / ~21 at K=4 —
+    // meaningful for the use_gpu_full chain where every flush is a
+    // 100 µs round trip.  Bit-identity at K>1 is workload-dependent;
+    // verify before enabling.  K=0/1/unset: per-call flush (legacy).
+    if _gpuq_flush_every_n_init == 0 {
+        _gpuq_flush_every_n_init = 1
+        u64 ev_n = getenv("MLRIFT_GPU_FLUSH_EVERY_N")
+        if ev_n != 0 {
+            u64 parsed = 0
+            u64 i = 0
+            u8 c = 0
+            unsafe { *(ev_n as u8) -> c }
+            while c >= 48 && c <= 57 {
+                parsed = parsed * 10 + (c - 48)
+                i = i + 1
+                unsafe { *((ev_n + i) as u8) -> c }
+            }
+            if parsed > 0 { _gpuq_flush_every_n = parsed }
+        }
+    }
+    _gpuq_flush_skip_count = _gpuq_flush_skip_count + 1
+    u64 N_eff = _gpuq_flush_every_n
+    if N_eff == 0 { N_eff = 1 }
+    if _gpuq_flush_skip_count >= N_eff {
+        gpu_pipeline_flush()
+        _gpuq_flush_skip_count = 0
+    }
     return 0
 }
 
