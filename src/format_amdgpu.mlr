@@ -6872,16 +6872,13 @@ fn emit_amdgpu_gemv_coop_q4_0_f32_batched_blob(uint64 out_path) -> uint64 {
 //   s_lshr_b32   s18, s18, 2             ; final divide
 fn _emit_attn_decode_kv_head_divide(uint64 kv_ratio) {
     if kv_ratio == 2 {
-        asm_u32(0x8512810F)                        // s_lshr_b32 s18, s15, 1
+        asm_u32_arch(0x8512810F, 0x9012810F)       // s_lshr_b32 s18, s15, 1
     } else if kv_ratio == 5 {
-        asm_u32(0x9692FF0F); asm_u32(0xCCCCCCCD)   // s_mul_hi_u32 s18, s15, 0xCCCCCCCD
-        asm_u32(0x85128212)                        // s_lshr_b32  s18, s18, 2
+        // s_mul_hi_u32: gfx11 top byte 0x96 → gfx10 top byte 0x9A.
+        asm_u32_arch(0x9692FF0F, 0x9A92FF0F); asm_u32(0xCCCCCCCD)
+        asm_u32_arch(0x85128212, 0x90128212)       // s_lshr_b32 s18, s18, 2
     } else {
-        // Generic /N: caller is responsible for emitting; we just
-        // emit a no-op (s18 = s15) so the kernel doesn't crash but
-        // produces wrong KV indexing.  Safer to fail at the dispatch
-        // layer for unknown ratios.
-        asm_u32(0xBE92000F)                        // s_mov_b32 s18, s15
+        asm_u32_arch(0xBE92000F, 0xBE92030F)       // s_mov_b32 s18, s15
     }
 }
 
@@ -6889,9 +6886,9 @@ fn _emit_attn_decode_f32_body_kvr(uint64 args_desc, uint64 kv_ratio) {
     asm_init()
 
     // Kernarg load.
-    asm_u32(0xF40C0100); asm_u32(0xF8000000)       // s_load_b256 s[4:11], s[0:1], 0x0
-    asm_u32(0xF4040300); asm_u32(0xF8000020)       // s_load_b64  s[12:13], s[0:1], 0x20
-    asm_u32(0xBF89FC07)                            // s_waitcnt   lgkmcnt(0)
+    asm_u32_arch(0xF40C0100, 0xF40C0100); asm_u32_arch(0xF8000000, 0xFA000000)
+    asm_u32_arch(0xF4040300, 0xF4040300); asm_u32_arch(0xF8000020, 0xFA000020)
+    asm_u32_arch(0xBF89FC07, 0xBF8CC07F)
 
     // Kernarg layout (loaded by s_load_b256 → s4..s11, b64 → s12,s13):
     //   q_ptr  (offset 0x00..0x07)  → s[4:5]
@@ -6900,22 +6897,20 @@ fn _emit_attn_decode_f32_body_kvr(uint64 args_desc, uint64 kv_ratio) {
     //   out_ptr(offset 0x18..0x1F)  → s[10:11]
     //   pos_plus_1 (offset 0x20..)  → s[12:13]
 
-    // s14 = head*512   (Q row stride in bytes; 128 f32 × 4 = 512)
-    asm_u32(0x840E890F)                            // s_lshl_b32 s14, s15, 9
+    // s14 = head*512
+    asm_u32_arch(0x840E890F, 0x8F0E890F)           // s_lshl_b32 s14, s15, 9
     // s[16:17] = q_ptr + head*512
-    asm_u32(0x80100E04)                            // s_add_u32  s16, s4, s14
-    asm_u32(0x82118005)                            // s_addc_u32 s17, s5, 0
+    asm_u32     (0x80100E04)                       // s_add_u32 (SOP2 stable)
+    asm_u32     (0x82118005)
     // s[24:25] = out_ptr + head*512
-    asm_u32(0x80180E0A)                            // s_add_u32  s24, s10, s14
-    asm_u32(0x8219800B)                            // s_addc_u32 s25, s11, 0
-    // s18 = kv_h = head / kv_ratio.  0.6B (nh/nkv = 2) → lshr by 1;
-    // 14B (nh/nkv = 5) → magic-number divide.
+    asm_u32     (0x80180E0A)
+    asm_u32     (0x8219800B)
     _emit_attn_decode_kv_head_divide(kv_ratio)
-    // s19 = kv_h * 512   (KV per-head stride within a slot)
-    asm_u32(0x84138912)                            // s_lshl_b32 s19, s18, 9
-    // s[20:21] = kc_ptr + kv_h*512   (K slot 0 base for this head's KV slice)
-    asm_u32(0x80141306)                            // s_add_u32  s20, s6, s19
-    asm_u32(0x82158007)                            // s_addc_u32 s21, s7, 0
+    // s19 = kv_h * 512
+    asm_u32_arch(0x84138912, 0x8F138912)
+    // s[20:21] = kc_ptr + kv_h*512
+    asm_u32     (0x80141306)
+    asm_u32     (0x82158007)
 
     // MILESTONE 2 PHASE 2e: Iterate pos = 0..pos_plus_1; for each pos
     // compute (1/√128) * Q · K[pos] and store to out[head*128 + pos].
@@ -6937,19 +6932,17 @@ fn _emit_attn_decode_f32_body_kvr(uint64 args_desc, uint64 kv_ratio) {
     //   s28:29   = current K-slot base (advanced per iter)
     //   s30      = pos counter
     //   s31      = K-slot stride (= 4096)
-    asm_u32(0x30100084)                            // v_lshlrev_b32 v8, 4, v0   (lane*16)
-    asm_u32(0x300C0082)                            // v_lshlrev_b32 v6, 2, v0   (lane*4 LDS slot)
-    asm_s_delay_alu(0x01)                          // VALU→VMEM wait state for v8
+    asm_u32_arch(0x30100084, 0x34100084) // v_lshlrev_b32 v8, 4, v0
+    asm_u32_arch(0x300C0082, 0x340C0082) // v_lshlrev_b32 v6, 2, v0
+    asm_s_delay_alu(0x01)
 
-    // Q-load (once).
-    asm_u32(0xDC5E0000); asm_u32(0x0C100008)       // global_load_b128 v[12:15], v8, s[16:17]
-    asm_u32(0xBF8903F7)                            // s_waitcnt vmcnt(0)
+    asm_u32_arch(0xDC5E0000, 0xDC388000); asm_u32(0x0C100008) // global_load_b128 v[12:15], v8, s[16:17]
+    asm_u32_arch(0xBF8903F7, 0xBF8C3F70)
 
-    // Loop init: s28:29 = K-slot base (= s20:21), s30 = 0, s31 = 4096.
-    asm_u32(0xBE9C0014)                            // s_mov_b32 s28, s20
-    asm_u32(0xBE9D0015)                            // s_mov_b32 s29, s21
-    asm_u32(0xBE9E0080)                            // s_mov_b32 s30, 0
-    asm_u32(0xBE9F00FF); asm_u32(0x00001000)       // s_mov_b32 s31, 0x1000
+    asm_u32_arch(0xBE9C0014, 0xBE9C0314) // s_mov_b32 s28, s20
+    asm_u32_arch(0xBE9D0015, 0xBE9D0315) // s_mov_b32 s29, s21
+    asm_u32_arch(0xBE9E0080, 0xBE9E0380) // s_mov_b32 s30, 0
+    asm_u32_arch(0xBE9F00FF, 0xBE9F03FF); asm_u32(0x00001000) // s_mov_b32 s31, 0x1000
 
     // 1/√128 literal (loaded once into v7; reduce helper clobbers v7 each
     // iter, so reload at top of body before scale).  Actually simpler:
@@ -6958,48 +6951,40 @@ fn _emit_attn_decode_f32_body_kvr(uint64 args_desc, uint64 kv_ratio) {
     // .Lloop:
     uint64 score_loop_idx = asm_text_len / 4
 
-    // Load K[pos, kvh, lane*4..+3] from s[28:29] base.
-    asm_u32(0xDC5E0000); asm_u32(0x101C0008)       // global_load_b128 v[16:19], v8, s[28:29]
-    asm_u32(0xBF8903F7)                            // s_waitcnt vmcnt(0)
+    asm_u32_arch(0xDC5E0000, 0xDC388000); asm_u32(0x101C0008) // global_load_b128 v[16:19]
+    asm_u32_arch(0xBF8903F7, 0xBF8C3F70)
 
-    // Per-lane partial dot.
-    asm_u32(0x100A210C)                            // v_mul_f32  v5, v12, v16
-    asm_u32(0x560A230D)                            // v_fmac_f32 v5, v13, v17
-    asm_u32(0x560A250E)                            // v_fmac_f32 v5, v14, v18
-    asm_u32(0x560A270F)                            // v_fmac_f32 v5, v15, v19
+    asm_u32     (0x100A210C)             // v_mul_f32 v5, v12, v16 (VOP2 stable)
+    asm_u32     (0x560A230D); asm_u32(0x560A250E); asm_u32(0x560A270F)
 
-    // LDS-broadcast + 32→1 reduce.
-    asm_u32(0xD8340000); asm_u32(0x00000506)       // ds_store_b32 v6, v5
-    asm_u32(0xBF89FC07)                            // s_waitcnt lgkmcnt(0)
-    asm_u32(0xBFBD0000)                            // s_barrier
-    _emit_lds_reduce_pow2(32, 0x060A0F05, 2)       // v_add_f32 v5,v5,v7
+    asm_u32     (0xD8340000); asm_u32(0x00000506) // ds_store
+    asm_u32_arch(0xBF89FC07, 0xBF8CC07F)
+    asm_u32_arch(0xBFBD0000, 0xBF8A0000) // s_barrier
+    _emit_lds_reduce_pow2(32, 0x060A0F05, 2)
 
-    // Scale by 1/√128.
-    asm_v_mov_b32_lit32(7, 0x3DB504F3)             // v7 = 1/√128
-    asm_u32(0x100A0F05)                            // v_mul_f32 v5, v5, v7
+    asm_v_mov_b32_lit32(7, 0x3DB504F3)
+    asm_u32     (0x100A0F05)             // v_mul_f32 v5, v5, v7
 
-    // Per-pos byte offset for the lane-0 score store: v9 = s30*4.
-    asm_v_mov_b32(10, 30)                          // v10 = s30  (broadcast pos to vgpr)
-    asm_u32(0x30121482)                            // v_lshlrev_b32 v9, 2, v10   (v9 = pos*4)
+    asm_v_mov_b32(10, 30)
+    asm_u32_arch(0x30121482, 0x34121482) // v_lshlrev_b32 v9, 2, v10
     asm_s_delay_alu(0x01)
 
-    // Lane 0 stores score to out[head*128 + pos*4-element] = byte offset
-    // pos*4 from the head's out base s[24:25].
-    asm_v_cmp_eq_u32_imm_vgpr(0, 0)                // v_cmp_eq_u32 vcc_lo, 0, v0
-    asm_u32(0xBE82206A)                            // s_and_saveexec_b32 s2, vcc_lo
-    asm_u32(0xDC6A0000); asm_u32(0x00180509)       // global_store_b32 v9, v5, s[24:25]
-    asm_u32(0xD8340080); asm_u32(0x00000509)       // ds_store_b32 v9, v5 offset:128  (LDS scores[pos])
-    asm_u32(0xBC7C0000)                            // s_waitcnt_vscnt null, 0
-    asm_u32(0xBEFE0002)                            // s_mov_b32 exec_lo, s2
+    asm_v_cmp_eq_u32_imm_vgpr(0, 0)
+    asm_u32_arch(0xBE82206A, 0xBE823C6A) // s_and_saveexec_b32 s2, vcc_lo
+    asm_u32_arch(0xDC6A0000, 0xDC708000); asm_u32(0x00180509) // global_store_b32
+    asm_u32     (0xD8340080); asm_u32(0x00000509) // ds_store_b32 offset:128
+    asm_u32_arch(0xBC7C0000, 0xBBFD0000)
+    asm_u32_arch(0xBEFE0002, 0xBEFE0302) // s_mov_b32 exec_lo, s2
 
-    // Advance loop: pos += 1, K-base += 4096, loop while pos < s12.
-    asm_u32(0x801E811E)                            // s_add_u32  s30, s30, 1
-    asm_u32(0x801C1F1C)                            // s_add_u32  s28, s28, s31
-    asm_u32(0x821D801D)                            // s_addc_u32 s29, s29, 0
-    asm_u32(0xBF0A0C1E)                            // s_cmp_lt_u32 s30, s12
+    asm_u32     (0x801E811E)             // s_add_u32 s30, s30, 1
+    asm_u32     (0x801C1F1C)             // s_add_u32 s28, s28, s31
+    asm_u32     (0x821D801D)             // s_addc_u32 s29, s29, 0
+    asm_u32     (0xBF0A0C1E)             // s_cmp_lt_u32 s30, s12
     uint64 score_branch_idx = asm_text_len / 4
     uint64 score_back_simm = score_loop_idx - (score_branch_idx + 1)
-    asm_u32(0xBFA20000 | (score_back_simm & 0xFFFF))   // s_cbranch_scc1 .Lloop
+    uint64 sccbr_top = 0xBFA20000
+    if _is_gfx10() != 0 { sccbr_top = 0xBF850000 }
+    asm_u32(sccbr_top | (score_back_simm & 0xFFFF))
 
     // ---------------------------------------------------------------
     // MILESTONE 3: Softmax over scores[0..pos_plus_1) in LDS @ off 128.
@@ -7014,28 +6999,23 @@ fn _emit_attn_decode_f32_body_kvr(uint64 args_desc, uint64 kv_ratio) {
     //   v6   lane*4 LDS slot (unchanged)
     //   v7   reduce scratch / literal holder
     //   v11  per-lane post-exp value (saved across the sum-reduce)
-    asm_u32(0xBF89FC07)                            // s_waitcnt lgkmcnt(0)
-    asm_u32(0xBFBD0000)                            // s_barrier  (all WG sees scores)
+    asm_u32_arch(0xBF89FC07, 0xBF8CC07F)
+    asm_u32_arch(0xBFBD0000, 0xBF8A0000) // s_barrier
 
-    // Active-lane mask: vcc_lo[lane] = (lane < s12).
-    asm_u32(0x7C98000C)                            // v_cmp_gt_u32 vcc_lo, s12, v0
+    asm_u32_arch(0x7C98000C, 0x7D88000C) // v_cmp_gt_u32 vcc_lo, s12, v0
 
-    // Load this lane's score from LDS scores buffer (offset 128).
-    asm_u32(0xD8D80080); asm_u32(0x05000006)       // ds_load_b32 v5, v6 offset:128
-    asm_u32(0xBF89FC07)                            // s_waitcnt lgkmcnt(0)
+    asm_u32     (0xD8D80080); asm_u32(0x05000006) // ds_load_b32 v5, v6 offset:128
+    asm_u32_arch(0xBF89FC07, 0xBF8CC07F)
 
-    // Pad inactive lanes with -inf for the max reduce.
-    asm_v_mov_b32_lit32(7, 0xFF800000)             // v7 = -inf
-    asm_u32(0x020A0B07)                            // v_cndmask_b32 v5, v7, v5, vcc_lo
+    asm_v_mov_b32_lit32(7, 0xFF800000)
+    asm_u32     (0x020A0B07)             // v_cndmask_b32 v5, v7, v5, vcc_lo (VOP2 stable)
 
-    // Save the padded score for later (centered, then exp).
-    asm_u32(0x7E160305)                            // v_mov_b32 v11, v5
+    asm_u32     (0x7E160305)             // v_mov_b32 v11, v5
 
-    // LDS broadcast + 32 → 1 max reduce.
-    asm_u32(0xD8340000); asm_u32(0x00000506)       // ds_store_b32 v6, v5
-    asm_u32(0xBF89FC07)                            // s_waitcnt lgkmcnt(0)
-    asm_u32(0xBFBD0000)                            // s_barrier
-    _emit_lds_reduce_pow2(32, 0x200A0F05, 2)       // v_max_f32 v5,v5,v7
+    asm_u32     (0xD8340000); asm_u32(0x00000506) // ds_store_b32
+    asm_u32_arch(0xBF89FC07, 0xBF8CC07F)
+    asm_u32_arch(0xBFBD0000, 0xBF8A0000)
+    _emit_lds_reduce_pow2(32, 0x200A0F05, 2)
 
     // The reduce helper leaves the final result only in lane 0's v5 (and
     // partial-tree leftovers in lanes 1..15). LDS[0] holds the final max
@@ -7043,53 +7023,39 @@ fn _emit_attn_decode_f32_body_kvr(uint64 args_desc, uint64 kv_ratio) {
     // the centring step below sees the same max in all lanes — otherwise
     // padding lanes (-inf score + their stale max-of-pair) compute
     // (-inf) - (-inf) = NaN which poisons the sum reduce.
-    asm_v_mov_b32(7, 0x80)                         // v7 = 0 (lane-uniform addr)
+    asm_v_mov_b32(7, 0x80)
     asm_s_delay_alu(0x01)
-    asm_u32(0xD8D80000); asm_u32(0x05000007)       // ds_load_b32 v5, v7 offset:0
-    asm_u32(0xBF89FC07)                            // s_waitcnt lgkmcnt(0)
+    asm_u32     (0xD8D80000); asm_u32(0x05000007) // ds_load_b32 v5, v7
+    asm_u32_arch(0xBF89FC07, 0xBF8CC07F)
 
-    // Centred score = v11 − v5, then * log2(e), then v_exp_f32 (= 2^x).
-    // (Original 0x0A160B0B was v_subrev_f32 — computed v5-v11 instead of
-    // v11-v5, flipping the sign and pushing v_exp_f32 input to +large.)
-    asm_u32(0x08160B0B)                            // v_sub_f32  v11, v11, v5
-    asm_v_mov_b32_lit32(7, 0x3FB8AA3B)             // v7 = log2(e)
-    asm_u32(0x10160F0B)                            // v_mul_f32  v11, v11, v7
-    asm_u32(0x7E164B0B)                            // v_exp_f32  v11, v11
+    asm_u32     (0x08160B0B)             // v_sub_f32 v11, v11, v5
+    asm_v_mov_b32_lit32(7, 0x3FB8AA3B)
+    asm_u32     (0x10160F0B)             // v_mul_f32 v11, v11, v7
+    asm_u32     (0x7E164B0B)             // v_exp_f32 v11, v11
 
-    // Inactive lanes had v11 = -inf going into v_exp_f32. RDNA3
-    // v_exp_f32(-inf) does not always return +0 (observed: contributes
-    // +inf to the sum-reduce). Force inactive lanes' e to 0 explicitly
-    // (src0 = inline 0 = 0x80 in the 9-bit field) so the sum sees only
-    // contributions from active lanes.
-    asm_u32(0x7C98000C)                            // v_cmp_gt_u32 vcc_lo, s12, v0
-    asm_u32(0x02161680)                            // v_cndmask_b32 v11, 0, v11, vcc_lo
+    asm_u32_arch(0x7C98000C, 0x7D88000C)
+    asm_u32     (0x02161680)             // v_cndmask_b32 v11, 0, v11, vcc_lo
 
-    // Copy e to v5 for the sum reduce.
-    asm_u32(0x7E0A030B)                            // v_mov_b32 v5, v11
-    asm_u32(0xD8340000); asm_u32(0x00000506)       // ds_store_b32 v6, v5
-    asm_u32(0xBF89FC07)                            // s_waitcnt lgkmcnt(0)
-    asm_u32(0xBFBD0000)                            // s_barrier
-    _emit_lds_reduce_pow2(32, 0x060A0F05, 2)       // v_add_f32 v5,v5,v7
+    asm_u32     (0x7E0A030B)
+    asm_u32     (0xD8340000); asm_u32(0x00000506)
+    asm_u32_arch(0xBF89FC07, 0xBF8CC07F)
+    asm_u32_arch(0xBFBD0000, 0xBF8A0000)
+    _emit_lds_reduce_pow2(32, 0x060A0F05, 2)
 
-    // Same broadcast: lane 0 has the sum, others have stale partials.
-    asm_v_mov_b32(7, 0x80)                         // v7 = 0
+    asm_v_mov_b32(7, 0x80)
     asm_s_delay_alu(0x01)
-    asm_u32(0xD8D80000); asm_u32(0x05000007)       // ds_load_b32 v5, v7 offset:0
-    asm_u32(0xBF89FC07)                            // s_waitcnt lgkmcnt(0)
+    asm_u32     (0xD8D80000); asm_u32(0x05000007)
+    asm_u32_arch(0xBF89FC07, 0xBF8CC07F)
 
-    // weight = e * (1/sum).
-    asm_u32(0x7E0A5505)                            // v_rcp_f32 v5, v5
-    asm_u32(0x100A0B0B)                            // v_mul_f32 v5, v11, v5
+    asm_u32     (0x7E0A5505)             // v_rcp_f32 v5 (VOP1 stable)
+    asm_u32     (0x100A0B0B)             // v_mul_f32 v5, v11, v5
 
-
-    // Recompute active mask, then lane < pos_plus_1 stores the weight
-    // back to LDS scores buffer (consumed by the accum loop below).
-    asm_u32(0x7C98000C)                            // v_cmp_gt_u32 vcc_lo, s12, v0
-    asm_u32(0xBE82206A)                            // s_and_saveexec_b32 s2, vcc_lo
-    asm_u32(0xD8340080); asm_u32(0x00000506)       // ds_store_b32 v6, v5 offset:128
-    asm_u32(0xBEFE0002)                            // s_mov_b32 exec_lo, s2
-    asm_u32(0xBF89FC07)                            // s_waitcnt lgkmcnt(0)
-    asm_u32(0xBFBD0000)                            // s_barrier  (all lanes see weights)
+    asm_u32_arch(0x7C98000C, 0x7D88000C)
+    asm_u32_arch(0xBE82206A, 0xBE823C6A)
+    asm_u32     (0xD8340080); asm_u32(0x00000506)
+    asm_u32_arch(0xBEFE0002, 0xBEFE0302)
+    asm_u32_arch(0xBF89FC07, 0xBF8CC07F)
+    asm_u32_arch(0xBFBD0000, 0xBF8A0000)
 
     // ---------------------------------------------------------------
     // MILESTONE 4: Accum loop  acc[lane*4..+3] = Σᵢ w[i] · V[i, kvh, lane*4..+3]
@@ -7118,47 +7084,35 @@ fn _emit_attn_decode_f32_body_kvr(uint64 args_desc, uint64 kv_ratio) {
     asm_v_mov_b32(26, 0x80)                        // v26 = 0
     asm_v_mov_b32(27, 0x80)                        // v27 = 0
 
-    // V-slot base = vc_ptr + kvh*512 = s[8:9] + s19.
-    asm_u32(0x801C1308)                            // s_add_u32  s28, s8,  s19
-    asm_u32(0x821D8009)                            // s_addc_u32 s29, s9,  0
-    asm_u32(0xBE9E0080)                            // s_mov_b32  s30, 0   (pos counter)
+    asm_u32     (0x801C1308)             // s_add_u32 s28, s8, s19
+    asm_u32     (0x821D8009)             // s_addc_u32 s29, s9, 0
+    asm_u32_arch(0xBE9E0080, 0xBE9E0380) // s_mov_b32 s30, 0
 
-    // .Laccum_loop:
     uint64 accum_loop_idx = asm_text_len / 4
 
-    // Load weight w[pos] from LDS scores[pos*4 + 128] using
-    // v9 = s30*4 (already lane-broadcasted vgpr).  Reuse v9 store-offset.
-    asm_v_mov_b32(10, 30)                          // v10 = s30
-    asm_u32(0x30121482)                            // v_lshlrev_b32 v9, 2, v10  (= pos*4)
+    asm_v_mov_b32(10, 30)
+    asm_u32_arch(0x30121482, 0x34121482) // v_lshlrev_b32 v9, 2, v10
     asm_s_delay_alu(0x01)
-    asm_u32(0xD8D80080); asm_u32(0x16000009)       // ds_load_b32 v22, v9 offset:128
-    // Load V[pos, kvh, lane*4..+3] into v[16:19].
-    asm_u32(0xDC5E0000); asm_u32(0x101C0008)       // global_load_b128 v[16:19], v8, s[28:29]
-    asm_u32(0xBF89FC07)                            // s_waitcnt lgkmcnt(0)   (for LDS w)
-    asm_u32(0xBF8903F7)                            // s_waitcnt vmcnt(0)     (for V load)
+    asm_u32     (0xD8D80080); asm_u32(0x16000009) // ds_load_b32 v22 offset:128
+    asm_u32_arch(0xDC5E0000, 0xDC388000); asm_u32(0x101C0008) // global_load_b128 v[16:19]
+    asm_u32_arch(0xBF89FC07, 0xBF8CC07F)
+    asm_u32_arch(0xBF8903F7, 0xBF8C3F70)
 
-    // acc[j] += w * V[j].  v22 is per-lane scalar (same value).
-    asm_u32(0x56302D10)                            // v_fmac_f32 v24, v16, v22
-    asm_u32(0x56322D11)                            // v_fmac_f32 v25, v17, v22
-    asm_u32(0x56342D12)                            // v_fmac_f32 v26, v18, v22
-    asm_u32(0x56362D13)                            // v_fmac_f32 v27, v19, v22
+    asm_u32     (0x56302D10); asm_u32(0x56322D11); asm_u32(0x56342D12); asm_u32(0x56362D13)
 
-    // Advance: pos += 1, V-base += 4096.
-    asm_u32(0x801E811E)                            // s_add_u32  s30, s30, 1
-    asm_u32(0x801C1F1C)                            // s_add_u32  s28, s28, s31
-    asm_u32(0x821D801D)                            // s_addc_u32 s29, s29, 0
-    asm_u32(0xBF0A0C1E)                            // s_cmp_lt_u32 s30, s12
+    asm_u32     (0x801E811E)
+    asm_u32     (0x801C1F1C)
+    asm_u32     (0x821D801D)
+    asm_u32     (0xBF0A0C1E)
     uint64 accum_branch_idx = asm_text_len / 4
     uint64 accum_back_simm = accum_loop_idx - (accum_branch_idx + 1)
-    asm_u32(0xBFA20000 | (accum_back_simm & 0xFFFF))  // s_cbranch_scc1 .Laccum_loop
+    asm_u32(sccbr_top | (accum_back_simm & 0xFFFF))
 
-    // Final write: global_store_b128 v8, v[24:27], s[24:25] (overwrites
-    // the per-pos scores we wrote earlier — that's OK, we're done with them).
-    asm_s_delay_alu(0x01)                          // VALU→VMEM wait state for v[24:27]
-    asm_u32(0xDC760000); asm_u32(0x00181808)       // global_store_b128 v8, v[24:27], s[24:25]
-    asm_u32(0xBC7C0000)                            // s_waitcnt_vscnt null, 0
+    asm_s_delay_alu(0x01)
+    asm_u32_arch(0xDC760000, 0xDC788000); asm_u32(0x00181808) // global_store_b128
+    asm_u32_arch(0xBC7C0000, 0xBBFD0000)
 
-    asm_u32(0xBFB00000)                            // s_endpgm
+    asm_u32_arch(0xBFB00000, 0xBF810000)
 
     // args_desc fill — 5 args, all 8 bytes.
     uint64 a0 = args_desc + 0;   unsafe { *(a0 as uint64) = 8 }
@@ -7182,128 +7136,117 @@ fn _emit_attn_decode_f32_body_kvr(uint64 args_desc, uint64 kv_ratio) {
 // batch-slab base for kc/vc (= base + layer * batch_stride from slice 1.1).
 fn _emit_attn_decode_f32_batched_body(uint64 args_desc) {
     asm_init()
-    // Kernarg load (same 5 args as single-stream).
-    asm_u32(0xF40C0100); asm_u32(0xF8000000)       // s_load_b256 s[4:11], s[0:1], 0x0
-    asm_u32(0xF4040300); asm_u32(0xF8000020)       // s_load_b64  s[12:13], s[0:1], 0x20
-    asm_u32(0xBF89FC07)                            // s_waitcnt   lgkmcnt(0)
+    asm_u32_arch(0xF40C0100, 0xF40C0100); asm_u32_arch(0xF8000000, 0xFA000000)
+    asm_u32_arch(0xF4040300, 0xF4040300); asm_u32_arch(0xF8000020, 0xFA000020)
+    asm_u32_arch(0xBF89FC07, 0xBF8CC07F)
 
-    // s14 = head*512 + batch_idx*8192   (Q/out byte offset).
-    // CRITICAL: stash s23 = wg_y * 262144 BEFORE the s_add_u32 s16, s4, s14
-    // below which CLOBBERS s16 (= wg_id_y from USER_SGPR).  Using the
-    // post-clobber s16 (= q_ptr_low_32) for the KV per-batch shift gave
-    // a giant garbage address → invalid global read → GPU fault → next
-    // kernel hangs.  Phase 1 batched substrate was dormant for the entire
-    // project before slice 2.4-pre exposed this — fixed 2026-04-30.
-    asm_u32(0x840E890F)                            // s_lshl_b32 s14, s15, 9    (head*512)
-    asm_u32(0x84168D10)                            // s_lshl_b32 s22, s16, 13   (batch*8192)
-    asm_u32(0x84179210)                            // s_lshl_b32 s23, s16, 18   (batch*262144) — pre-clobber!
-    asm_u32(0x800E160E)                            // s_add_u32  s14, s14, s22
-    asm_u32(0x80100E04)                            // s_add_u32  s16, s4, s14   (clobbers s16)
-    asm_u32(0x82118005)                            // s_addc_u32 s17, s5, 0
-    asm_u32(0x80180E0A)                            // s_add_u32  s24, s10, s14
-    asm_u32(0x8219800B)                            // s_addc_u32 s25, s11, 0
+    asm_u32_arch(0x840E890F, 0x8F0E890F) // s_lshl_b32 s14, s15, 9
+    asm_u32_arch(0x84168D10, 0x8F168D10) // s_lshl_b32 s22, s16, 13
+    asm_u32_arch(0x84179210, 0x8F179210) // s_lshl_b32 s23, s16, 18 (pre-clobber)
+    asm_u32     (0x800E160E)
+    asm_u32     (0x80100E04)
+    asm_u32     (0x82118005)
+    asm_u32     (0x80180E0A)
+    asm_u32     (0x8219800B)
 
-    // s19 = kvh*512 + batch_idx*262144   (K/V slot byte offset)
-    asm_u32(0x8512810F)                            // s_lshr_b32 s18, s15, 1   (kvh)
-    asm_u32(0x84138912)                            // s_lshl_b32 s19, s18, 9   (kvh*512)
-    asm_u32(0x80131713)                            // s_add_u32  s19, s19, s23 (use pre-clobber s23)
-    asm_u32(0x80141306)                            // s_add_u32  s20, s6, s19
-    asm_u32(0x82158007)                            // s_addc_u32 s21, s7, 0
+    asm_u32_arch(0x8512810F, 0x9012810F) // s_lshr_b32 s18, s15, 1
+    asm_u32_arch(0x84138912, 0x8F138912) // s_lshl_b32 s19, s18, 9
+    asm_u32     (0x80131713)
+    asm_u32     (0x80141306)
+    asm_u32     (0x82158007)
 
-    asm_u32(0x30100084)                            // v_lshlrev_b32 v8, 4, v0
-    asm_u32(0x300C0082)                            // v_lshlrev_b32 v6, 2, v0
+    asm_u32_arch(0x30100084, 0x34100084)
+    asm_u32_arch(0x300C0082, 0x340C0082)
     asm_s_delay_alu(0x01)
-    asm_u32(0xDC5E0000); asm_u32(0x0C100008)       // global_load_b128 v[12:15], v8, s[16:17]
-    asm_u32(0xBF8903F7)                            // s_waitcnt vmcnt(0)
+    asm_u32_arch(0xDC5E0000, 0xDC388000); asm_u32(0x0C100008)
+    asm_u32_arch(0xBF8903F7, 0xBF8C3F70)
 
-    asm_u32(0xBE9C0014)                            // s_mov_b32 s28, s20
-    asm_u32(0xBE9D0015)                            // s_mov_b32 s29, s21
-    asm_u32(0xBE9E0080)                            // s_mov_b32 s30, 0
-    asm_u32(0xBE9F00FF); asm_u32(0x00001000)       // s_mov_b32 s31, 0x1000
+    asm_u32_arch(0xBE9C0014, 0xBE9C0314)
+    asm_u32_arch(0xBE9D0015, 0xBE9D0315)
+    asm_u32_arch(0xBE9E0080, 0xBE9E0380)
+    asm_u32_arch(0xBE9F00FF, 0xBE9F03FF); asm_u32(0x00001000)
+
+    uint64 sccbr_top = 0xBFA20000
+    if _is_gfx10() != 0 { sccbr_top = 0xBF850000 }
 
     uint64 score_loop_idx = asm_text_len / 4
-    asm_u32(0xDC5E0000); asm_u32(0x101C0008)       // global_load_b128 v[16:19], v8, s[28:29]
-    asm_u32(0xBF8903F7)
-    asm_u32(0x100A210C); asm_u32(0x560A230D); asm_u32(0x560A250E); asm_u32(0x560A270F)
-    asm_u32(0xD8340000); asm_u32(0x00000506)
-    asm_u32(0xBF89FC07); asm_u32(0xBFBD0000)
+    asm_u32_arch(0xDC5E0000, 0xDC388000); asm_u32(0x101C0008)
+    asm_u32_arch(0xBF8903F7, 0xBF8C3F70)
+    asm_u32     (0x100A210C); asm_u32(0x560A230D); asm_u32(0x560A250E); asm_u32(0x560A270F)
+    asm_u32     (0xD8340000); asm_u32(0x00000506)
+    asm_u32_arch(0xBF89FC07, 0xBF8CC07F); asm_u32_arch(0xBFBD0000, 0xBF8A0000)
     _emit_lds_reduce_pow2(32, 0x060A0F05, 2)
     asm_v_mov_b32_lit32(7, 0x3DB504F3)
-    asm_u32(0x100A0F05)
+    asm_u32     (0x100A0F05)
     asm_v_mov_b32(10, 30)
-    asm_u32(0x30121482)
+    asm_u32_arch(0x30121482, 0x34121482)
     asm_s_delay_alu(0x01)
     asm_v_cmp_eq_u32_imm_vgpr(0, 0)
-    asm_u32(0xBE82206A)
-    asm_u32(0xDC6A0000); asm_u32(0x00180509)
-    asm_u32(0xD8340080); asm_u32(0x00000509)
-    asm_u32(0xBC7C0000)
-    asm_u32(0xBEFE0002)
-    asm_u32(0x801E811E); asm_u32(0x801C1F1C); asm_u32(0x821D801D); asm_u32(0xBF0A0C1E)
+    asm_u32_arch(0xBE82206A, 0xBE823C6A)
+    asm_u32_arch(0xDC6A0000, 0xDC708000); asm_u32(0x00180509)
+    asm_u32     (0xD8340080); asm_u32(0x00000509)
+    asm_u32_arch(0xBC7C0000, 0xBBFD0000)
+    asm_u32_arch(0xBEFE0002, 0xBEFE0302)
+    asm_u32     (0x801E811E); asm_u32(0x801C1F1C); asm_u32(0x821D801D); asm_u32(0xBF0A0C1E)
     uint64 score_branch_idx = asm_text_len / 4
     uint64 score_back_simm = score_loop_idx - (score_branch_idx + 1)
-    asm_u32(0xBFA20000 | (score_back_simm & 0xFFFF))
+    asm_u32(sccbr_top | (score_back_simm & 0xFFFF))
 
-    // Softmax (identical to single-stream).
-    asm_u32(0xBF89FC07); asm_u32(0xBFBD0000)
-    asm_u32(0x7C98000C)
-    asm_u32(0xD8D80080); asm_u32(0x05000006)
-    asm_u32(0xBF89FC07)
+    asm_u32_arch(0xBF89FC07, 0xBF8CC07F); asm_u32_arch(0xBFBD0000, 0xBF8A0000)
+    asm_u32_arch(0x7C98000C, 0x7D88000C)
+    asm_u32     (0xD8D80080); asm_u32(0x05000006)
+    asm_u32_arch(0xBF89FC07, 0xBF8CC07F)
     asm_v_mov_b32_lit32(7, 0xFF800000)
-    asm_u32(0x020A0B07)
-    asm_u32(0x7E160305)
-    asm_u32(0xD8340000); asm_u32(0x00000506)
-    asm_u32(0xBF89FC07); asm_u32(0xBFBD0000)
+    asm_u32     (0x020A0B07)
+    asm_u32     (0x7E160305)
+    asm_u32     (0xD8340000); asm_u32(0x00000506)
+    asm_u32_arch(0xBF89FC07, 0xBF8CC07F); asm_u32_arch(0xBFBD0000, 0xBF8A0000)
     _emit_lds_reduce_pow2(32, 0x200A0F05, 2)
-    // Broadcast LDS[0] (= max) into v5 in every lane.
     asm_v_mov_b32(7, 0x80)
     asm_s_delay_alu(0x01)
-    asm_u32(0xD8D80000); asm_u32(0x05000007)
-    asm_u32(0xBF89FC07)
-    asm_u32(0x08160B0B)                            // v_sub_f32 v11, v11, v5  (was v_subrev_f32 — sign bug)
+    asm_u32     (0xD8D80000); asm_u32(0x05000007)
+    asm_u32_arch(0xBF89FC07, 0xBF8CC07F)
+    asm_u32     (0x08160B0B)
     asm_v_mov_b32_lit32(7, 0x3FB8AA3B)
-    asm_u32(0x10160F0B)
-    asm_u32(0x7E164B0B)
-    // Force inactive lanes' e to 0 (defensive vs v_exp_f32(-inf) on RDNA3).
-    asm_u32(0x7C98000C)                            // v_cmp_gt_u32 vcc_lo, s12, v0
-    asm_u32(0x02161680)                            // v_cndmask_b32 v11, 0, v11, vcc_lo
-    asm_u32(0x7E0A030B)
-    asm_u32(0xD8340000); asm_u32(0x00000506)
-    asm_u32(0xBF89FC07); asm_u32(0xBFBD0000)
+    asm_u32     (0x10160F0B)
+    asm_u32     (0x7E164B0B)
+    asm_u32_arch(0x7C98000C, 0x7D88000C)
+    asm_u32     (0x02161680)
+    asm_u32     (0x7E0A030B)
+    asm_u32     (0xD8340000); asm_u32(0x00000506)
+    asm_u32_arch(0xBF89FC07, 0xBF8CC07F); asm_u32_arch(0xBFBD0000, 0xBF8A0000)
     _emit_lds_reduce_pow2(32, 0x060A0F05, 2)
-    // Broadcast LDS[0] (= sum) into v5 in every lane.
     asm_v_mov_b32(7, 0x80)
     asm_s_delay_alu(0x01)
-    asm_u32(0xD8D80000); asm_u32(0x05000007)
-    asm_u32(0xBF89FC07)
-    asm_u32(0x7E0A5505)
-    asm_u32(0x100A0B0B)
-    asm_u32(0x7C98000C)
-    asm_u32(0xBE82206A)
-    asm_u32(0xD8340080); asm_u32(0x00000506)
-    asm_u32(0xBEFE0002)
-    asm_u32(0xBF89FC07); asm_u32(0xBFBD0000)
+    asm_u32     (0xD8D80000); asm_u32(0x05000007)
+    asm_u32_arch(0xBF89FC07, 0xBF8CC07F)
+    asm_u32     (0x7E0A5505)
+    asm_u32     (0x100A0B0B)
+    asm_u32_arch(0x7C98000C, 0x7D88000C)
+    asm_u32_arch(0xBE82206A, 0xBE823C6A)
+    asm_u32     (0xD8340080); asm_u32(0x00000506)
+    asm_u32_arch(0xBEFE0002, 0xBEFE0302)
+    asm_u32_arch(0xBF89FC07, 0xBF8CC07F); asm_u32_arch(0xBFBD0000, 0xBF8A0000)
 
-    // Accum loop (identical).
     asm_v_mov_b32(24, 0x80); asm_v_mov_b32(25, 0x80); asm_v_mov_b32(26, 0x80); asm_v_mov_b32(27, 0x80)
-    asm_u32(0x801C1308); asm_u32(0x821D8009); asm_u32(0xBE9E0080)
+    asm_u32     (0x801C1308); asm_u32(0x821D8009); asm_u32_arch(0xBE9E0080, 0xBE9E0380)
     uint64 accum_loop_idx = asm_text_len / 4
     asm_v_mov_b32(10, 30)
-    asm_u32(0x30121482)
+    asm_u32_arch(0x30121482, 0x34121482)
     asm_s_delay_alu(0x01)
-    asm_u32(0xD8D80080); asm_u32(0x16000009)
-    asm_u32(0xDC5E0000); asm_u32(0x101C0008)
-    asm_u32(0xBF89FC07); asm_u32(0xBF8903F7)
-    asm_u32(0x56302D10); asm_u32(0x56322D11); asm_u32(0x56342D12); asm_u32(0x56362D13)
-    asm_u32(0x801E811E); asm_u32(0x801C1F1C); asm_u32(0x821D801D); asm_u32(0xBF0A0C1E)
+    asm_u32     (0xD8D80080); asm_u32(0x16000009)
+    asm_u32_arch(0xDC5E0000, 0xDC388000); asm_u32(0x101C0008)
+    asm_u32_arch(0xBF89FC07, 0xBF8CC07F); asm_u32_arch(0xBF8903F7, 0xBF8C3F70)
+    asm_u32     (0x56302D10); asm_u32(0x56322D11); asm_u32(0x56342D12); asm_u32(0x56362D13)
+    asm_u32     (0x801E811E); asm_u32(0x801C1F1C); asm_u32(0x821D801D); asm_u32(0xBF0A0C1E)
     uint64 accum_branch_idx = asm_text_len / 4
     uint64 accum_back_simm = accum_loop_idx - (accum_branch_idx + 1)
-    asm_u32(0xBFA20000 | (accum_back_simm & 0xFFFF))
+    asm_u32(sccbr_top | (accum_back_simm & 0xFFFF))
 
     asm_s_delay_alu(0x01)
-    asm_u32(0xDC760000); asm_u32(0x00181808)
-    asm_u32(0xBC7C0000)
-    asm_u32(0xBFB00000)
+    asm_u32_arch(0xDC760000, 0xDC788000); asm_u32(0x00181808)
+    asm_u32_arch(0xBC7C0000, 0xBBFD0000)
+    asm_u32_arch(0xBFB00000, 0xBF810000)
 
     uint64 a0 = args_desc + 0;   unsafe { *(a0 as uint64) = 8 }
     uint64 a1 = args_desc + 8;   unsafe { *(a1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
@@ -7364,132 +7307,115 @@ fn _emit_attn_decode_f32_speck4_body(uint64 args_desc) {
     // as `(pos_plus_1-3) + (q_ptr_lo + head*512 + wg_y*8192)`, which
     // wrapped to a huge value that masked off lane 0 in the softmax
     // and zeroed row 0's output.
-    asm_u32(0xBE830010)                            // s_mov_b32 s3, s16
+    asm_u32_arch(0xBE830010, 0xBE830310) // s_mov_b32 s3, s16
 
-    // Per-batch Q/out byte offset = head*512 + batch_idx*8192.
-    asm_u32(0x840E890F)                            // s_lshl_b32 s14, s15, 9
-    asm_u32(0x84168D10)                            // s_lshl_b32 s22, s16, 13
-    asm_u32(0x800E160E)                            // s_add_u32  s14, s14, s22
-    asm_u32(0x80100E04)                            // s_add_u32  s16, s4, s14
-    asm_u32(0x82118005)                            // s_addc_u32 s17, s5, 0
-    asm_u32(0x80180E0A)                            // s_add_u32  s24, s10, s14
-    asm_u32(0x8219800B)                            // s_addc_u32 s25, s11, 0
+    asm_u32_arch(0x840E890F, 0x8F0E890F)
+    asm_u32_arch(0x84168D10, 0x8F168D10)
+    asm_u32     (0x800E160E)
+    asm_u32     (0x80100E04)
+    asm_u32     (0x82118005)
+    asm_u32     (0x80180E0A)
+    asm_u32     (0x8219800B)
 
-    // KV byte offset = kvh*512  (NO per-batch shift — speculative shares
-    // a single-sequence KV cache across the K Q vectors; only Q/out
-    // get the wg_y stride.  Phase 1 batched used wg_y*262144 here for
-    // its independent-streams semantics.)
-    asm_u32(0x8512810F)                            // s_lshr_b32 s18, s15, 1
-    asm_u32(0x84138912)                            // s_lshl_b32 s19, s18, 9
-    asm_u32(0x80141306)                            // s_add_u32  s20, s6, s19
-    asm_u32(0x82158007)                            // s_addc_u32 s21, s7, 0
+    asm_u32_arch(0x8512810F, 0x9012810F)
+    asm_u32_arch(0x84138912, 0x8F138912)
+    asm_u32     (0x80141306)
+    asm_u32     (0x82158007)
 
-    // Causal mask bound: s23 = pos_plus_1 - K + 1 + m  (K = 4 hardcoded).
-    //                       = s12 - 3 + s3   (s3 = stashed wg_y)
-    asm_u32(0x8097FF0C); asm_u32(0x00000003)       // s_sub_u32 s23, s12, 3
-    asm_u32(0x80170317)                            // s_add_u32 s23, s23, s3
+    asm_u32     (0x8097FF0C); asm_u32(0x00000003) // s_sub_u32 s23, s12, 3 (literal escape, stable)
+    asm_u32     (0x80170317)
 
-    asm_u32(0x30100084)                            // v_lshlrev_b32 v8, 4, v0
-    asm_u32(0x300C0082)                            // v_lshlrev_b32 v6, 2, v0
+    asm_u32_arch(0x30100084, 0x34100084)
+    asm_u32_arch(0x300C0082, 0x340C0082)
     asm_s_delay_alu(0x01)
-    asm_u32(0xDC5E0000); asm_u32(0x0C100008)       // global_load_b128 v[12:15], v8, s[16:17]
-    asm_u32(0xBF8903F7)
+    asm_u32_arch(0xDC5E0000, 0xDC388000); asm_u32(0x0C100008)
+    asm_u32_arch(0xBF8903F7, 0xBF8C3F70)
 
-    asm_u32(0xBE9C0014)
-    asm_u32(0xBE9D0015)
-    asm_u32(0xBE9E0080)
-    asm_u32(0xBE9F00FF); asm_u32(0x00001000)
+    asm_u32_arch(0xBE9C0014, 0xBE9C0314)
+    asm_u32_arch(0xBE9D0015, 0xBE9D0315)
+    asm_u32_arch(0xBE9E0080, 0xBE9E0380)
+    asm_u32_arch(0xBE9F00FF, 0xBE9F03FF); asm_u32(0x00001000)
+
+    uint64 sccbr_top = 0xBFA20000
+    if _is_gfx10() != 0 { sccbr_top = 0xBF850000 }
 
     uint64 score_loop_idx = asm_text_len / 4
-    asm_u32(0xDC5E0000); asm_u32(0x101C0008)
-    asm_u32(0xBF8903F7)
-    asm_u32(0x100A210C); asm_u32(0x560A230D); asm_u32(0x560A250E); asm_u32(0x560A270F)
-    asm_u32(0xD8340000); asm_u32(0x00000506)
-    asm_u32(0xBF89FC07); asm_u32(0xBFBD0000)
+    asm_u32_arch(0xDC5E0000, 0xDC388000); asm_u32(0x101C0008)
+    asm_u32_arch(0xBF8903F7, 0xBF8C3F70)
+    asm_u32     (0x100A210C); asm_u32(0x560A230D); asm_u32(0x560A250E); asm_u32(0x560A270F)
+    asm_u32     (0xD8340000); asm_u32(0x00000506)
+    asm_u32_arch(0xBF89FC07, 0xBF8CC07F); asm_u32_arch(0xBFBD0000, 0xBF8A0000)
     _emit_lds_reduce_pow2(32, 0x060A0F05, 2)
     asm_v_mov_b32_lit32(7, 0x3DB504F3)
-    asm_u32(0x100A0F05)
+    asm_u32     (0x100A0F05)
     asm_v_mov_b32(10, 30)
-    asm_u32(0x30121482)
+    asm_u32_arch(0x30121482, 0x34121482)
     asm_s_delay_alu(0x01)
     asm_v_cmp_eq_u32_imm_vgpr(0, 0)
-    asm_u32(0xBE82206A)
-    asm_u32(0xDC6A0000); asm_u32(0x00180509)
-    asm_u32(0xD8340080); asm_u32(0x00000509)
-    asm_u32(0xBC7C0000)
-    asm_u32(0xBEFE0002)
-    asm_u32(0x801E811E); asm_u32(0x801C1F1C); asm_u32(0x821D801D); asm_u32(0xBF0A0C1E)
+    asm_u32_arch(0xBE82206A, 0xBE823C6A)
+    asm_u32_arch(0xDC6A0000, 0xDC708000); asm_u32(0x00180509)
+    asm_u32     (0xD8340080); asm_u32(0x00000509)
+    asm_u32_arch(0xBC7C0000, 0xBBFD0000)
+    asm_u32_arch(0xBEFE0002, 0xBEFE0302)
+    asm_u32     (0x801E811E); asm_u32(0x801C1F1C); asm_u32(0x821D801D); asm_u32(0xBF0A0C1E)
     uint64 score_branch_idx = asm_text_len / 4
     uint64 score_back_simm = score_loop_idx - (score_branch_idx + 1)
-    asm_u32(0xBFA20000 | (score_back_simm & 0xFFFF))
+    asm_u32(sccbr_top | (score_back_simm & 0xFFFF))
 
-    // Softmax: USE s23 (= pos_plus_1 - K + 1 + m) instead of s12 for
-    // the active-lane mask — this is the causal-within-K-window cutoff.
-    asm_u32(0xBF89FC07); asm_u32(0xBFBD0000)
-    asm_u32(0x7C980017)                            // v_cmp_gt_u32 vcc_lo, s23, v0
-    asm_u32(0xD8D80080); asm_u32(0x05000006)
-    asm_u32(0xBF89FC07)
+    asm_u32_arch(0xBF89FC07, 0xBF8CC07F); asm_u32_arch(0xBFBD0000, 0xBF8A0000)
+    asm_u32_arch(0x7C980017, 0x7D880017) // v_cmp_gt_u32 vcc_lo, s23, v0
+    asm_u32     (0xD8D80080); asm_u32(0x05000006)
+    asm_u32_arch(0xBF89FC07, 0xBF8CC07F)
     asm_v_mov_b32_lit32(7, 0xFF800000)
-    asm_u32(0x020A0B07)
-    asm_u32(0x7E160305)
-    asm_u32(0xD8340000); asm_u32(0x00000506)
-    asm_u32(0xBF89FC07); asm_u32(0xBFBD0000)
+    asm_u32     (0x020A0B07)
+    asm_u32     (0x7E160305)
+    asm_u32     (0xD8340000); asm_u32(0x00000506)
+    asm_u32_arch(0xBF89FC07, 0xBF8CC07F); asm_u32_arch(0xBFBD0000, 0xBF8A0000)
     _emit_lds_reduce_pow2(32, 0x200A0F05, 2)
-    // Broadcast LDS[0] (= max) into v5 in every lane.
     asm_v_mov_b32(7, 0x80)
     asm_s_delay_alu(0x01)
-    asm_u32(0xD8D80000); asm_u32(0x05000007)
-    asm_u32(0xBF89FC07)
-    asm_u32(0x08160B0B)                            // v_sub_f32 v11, v11, v5  (was v_subrev_f32)
+    asm_u32     (0xD8D80000); asm_u32(0x05000007)
+    asm_u32_arch(0xBF89FC07, 0xBF8CC07F)
+    asm_u32     (0x08160B0B)
     asm_v_mov_b32_lit32(7, 0x3FB8AA3B)
-    asm_u32(0x10160F0B)
-    asm_u32(0x7E164B0B)
-    // Force inactive lanes' e to 0 (defensive vs v_exp_f32(-inf) on RDNA3).
-    asm_u32(0x7C980017)                            // v_cmp_gt_u32 vcc_lo, s23, v0  (causal cutoff)
-    asm_u32(0x02161680)                            // v_cndmask_b32 v11, 0, v11, vcc_lo
-    asm_u32(0x7E0A030B)
-    asm_u32(0xD8340000); asm_u32(0x00000506)
-    asm_u32(0xBF89FC07); asm_u32(0xBFBD0000)
+    asm_u32     (0x10160F0B)
+    asm_u32     (0x7E164B0B)
+    asm_u32_arch(0x7C980017, 0x7D880017)
+    asm_u32     (0x02161680)
+    asm_u32     (0x7E0A030B)
+    asm_u32     (0xD8340000); asm_u32(0x00000506)
+    asm_u32_arch(0xBF89FC07, 0xBF8CC07F); asm_u32_arch(0xBFBD0000, 0xBF8A0000)
     _emit_lds_reduce_pow2(32, 0x060A0F05, 2)
-    // Broadcast LDS[0] (= sum) into v5 in every lane.
     asm_v_mov_b32(7, 0x80)
     asm_s_delay_alu(0x01)
-    asm_u32(0xD8D80000); asm_u32(0x05000007)
-    asm_u32(0xBF89FC07)
-    asm_u32(0x7E0A5505)
-    asm_u32(0x100A0B0B)
-    // Storeback weights to LDS[128 + lane*4].  The causal-bound s23
-    // marks active lanes (< s23); inactive lanes' weight is 0'd so
-    // every position's LDS slot holds a real weight (or 0), never a
-    // stale score left over from the score loop.  Without the zero-
-    // out the accum loop multiplied V[pos>=s23] by an old score and
-    // contaminated row 0's output whenever V[pos>=s23] was non-zero
-    // (i.e. always in the live qwen3 chain — the synthetic smoke had
-    // V[1..3]=0 which masked this bug).
-    asm_u32(0x7C980017)                            // v_cmp_gt_u32 vcc_lo, s23, v0
-    asm_u32(0x020A0A80)                            // v_cndmask_b32 v5, 0, v5, vcc_lo
-    asm_u32(0xD8340080); asm_u32(0x00000506)       // ds_store_b32 v6, v5 offset:128 (full exec)
-    asm_u32(0xBF89FC07); asm_u32(0xBFBD0000)
+    asm_u32     (0xD8D80000); asm_u32(0x05000007)
+    asm_u32_arch(0xBF89FC07, 0xBF8CC07F)
+    asm_u32     (0x7E0A5505)
+    asm_u32     (0x100A0B0B)
+    asm_u32_arch(0x7C980017, 0x7D880017)
+    asm_u32     (0x020A0A80)
+    asm_u32     (0xD8340080); asm_u32(0x00000506)
+    asm_u32_arch(0xBF89FC07, 0xBF8CC07F); asm_u32_arch(0xBFBD0000, 0xBF8A0000)
 
     asm_v_mov_b32(24, 0x80); asm_v_mov_b32(25, 0x80); asm_v_mov_b32(26, 0x80); asm_v_mov_b32(27, 0x80)
-    asm_u32(0x801C1308); asm_u32(0x821D8009); asm_u32(0xBE9E0080)
+    asm_u32     (0x801C1308); asm_u32(0x821D8009); asm_u32_arch(0xBE9E0080, 0xBE9E0380)
     uint64 accum_loop_idx = asm_text_len / 4
     asm_v_mov_b32(10, 30)
-    asm_u32(0x30121482)
+    asm_u32_arch(0x30121482, 0x34121482)
     asm_s_delay_alu(0x01)
-    asm_u32(0xD8D80080); asm_u32(0x16000009)
-    asm_u32(0xDC5E0000); asm_u32(0x101C0008)
-    asm_u32(0xBF89FC07); asm_u32(0xBF8903F7)
-    asm_u32(0x56302D10); asm_u32(0x56322D11); asm_u32(0x56342D12); asm_u32(0x56362D13)
-    asm_u32(0x801E811E); asm_u32(0x801C1F1C); asm_u32(0x821D801D); asm_u32(0xBF0A0C1E)
+    asm_u32     (0xD8D80080); asm_u32(0x16000009)
+    asm_u32_arch(0xDC5E0000, 0xDC388000); asm_u32(0x101C0008)
+    asm_u32_arch(0xBF89FC07, 0xBF8CC07F); asm_u32_arch(0xBF8903F7, 0xBF8C3F70)
+    asm_u32     (0x56302D10); asm_u32(0x56322D11); asm_u32(0x56342D12); asm_u32(0x56362D13)
+    asm_u32     (0x801E811E); asm_u32(0x801C1F1C); asm_u32(0x821D801D); asm_u32(0xBF0A0C1E)
     uint64 accum_branch_idx = asm_text_len / 4
     uint64 accum_back_simm = accum_loop_idx - (accum_branch_idx + 1)
-    asm_u32(0xBFA20000 | (accum_back_simm & 0xFFFF))
+    asm_u32(sccbr_top | (accum_back_simm & 0xFFFF))
 
     asm_s_delay_alu(0x01)
-    asm_u32(0xDC760000); asm_u32(0x00181808)
-    asm_u32(0xBC7C0000)
-    asm_u32(0xBFB00000)
+    asm_u32_arch(0xDC760000, 0xDC788000); asm_u32(0x00181808)
+    asm_u32_arch(0xBC7C0000, 0xBBFD0000)
+    asm_u32_arch(0xBFB00000, 0xBF810000)
 
     uint64 a0 = args_desc + 0;   unsafe { *(a0 as uint64) = 8 }
     uint64 a1 = args_desc + 8;   unsafe { *(a1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
