@@ -78,6 +78,35 @@ output.  The PLD row uses a synthetic prefill that the prefix-lookup
 draft proposer hits at ~2 tok/step accept; **beats ROCm bf16 by 19 %**
 on that workload.
 
+**Dtype clarification.** All MLRift rows above use `bf16 weights /
+f32 compute` — weights stream from VRAM as bf16 and widen to f32
+inside `gemv_coop_bf16_f32` (no dequant pass), with all
+matmul/rmsnorm/attn accumulators in f32.  The `BF16=0` row swaps
+in an f32-weight (dequanted-once-and-cached) variant; arithmetic is
+still f32.  PyTorch ROCm bf16 in the table, by contrast, runs
+**bf16 storage + bf16 GEMM accum** — strictly less numerical
+headroom than ours; we beat their fp32 row using less than half its
+weight memory.
+
+`GPU_FULL_FORWARD=1` is opt-in for now (not default) for two
+reasons: (1) the on-device chain depends on a `/tmp` `.co` cache
+that is rebuilt from source by `mlrc`; if the cache is stale relative
+to the current `build/mlrc` AST recogniser, the chain produces
+silent wrong tokens (the matmul-only path fails loudly via threshold
++ CPU fallback), and (2) it allocates ~1.9 GB of GTT/VRAM that the
+matmul-only path doesn't need on smaller cards.  Default-on after
+the `.co` cache moves into the binary and an md5-vs-fresh-emit
+verify gate lands.
+
+The flag is **qwen3-specific** — it gates a transformer-shaped
+chain in `examples/qwen3_generate.mlr`.  The 60 M neuron SNN bench
+in `docs/bench_60m.md` already runs fully on-device through a
+different path (`noesis_60m_gpu_launch.mlr` keeps state +
+spike_mask + CSR resident, dispatches `decay_step → delivery_step →
+lif_step` with no per-step D2H); its 26.6 s sim is bandwidth-bound
+on the LIF state read, not launch-overhead bound, so a
+forward-style flag wouldn't apply.
+
 Roadmap to extend the lead, ranked by ceiling:
 
 | Slice | unlock | projected tok/s | vs ROCm bf16 |
