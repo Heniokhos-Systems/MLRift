@@ -53,6 +53,29 @@ that disassemble cleanly under `llvm-objdump --mcpu=gfx1030` with zero
 LLM kernel set.  Slice C (NVIDIA Blackwell / Ada / Ampere via PTX) is
 the next target.
 
+### Qwen3-0.6B on RX 7800 XT — `--target=amdgpu-native` vs PyTorch ROCm
+
+Greedy decode, 20 new tokens, seed token 14990, `attn_implementation="eager"`.
+Median of 3 runs.  Peak GPU memory from `rocm-smi` snapshot at decode end.
+
+| Stack | weights / compute | tok/s | peak GPU MB | vs PyTorch (same dtype) |
+|---|---|---:|---:|---:|
+| **MLRift `--target=amdgpu-native`** (`MLRIFT_GPU_MATMUL=1`) | bf16 / f32 | **35.0** | 1 920 | **0.84× vs ROCm fp32** |
+| PyTorch ROCm eager | fp32 / fp32 | 41.6 | 2 280 | 1.00× |
+| PyTorch ROCm eager | bf16 / bf16 | 73.7 | 1 140 | 1.00× |
+
+The current `--target=amdgpu-native` path routes only the matmul +
+lm_head through native gfx1100 ISA; the rest of the layer (qknorm,
+rope, attn region) still runs on the CPU.  Token-id output is
+bit-identical to HuggingFace `transformers.generate(do_sample=False)`
+across all 20 generated tokens.
+
+A previously-measured full-pipeline path (`use_gpu_full=1` + spec_K=4)
+ran the same model at **92.9 tok/s** — **1.26× over PyTorch ROCm bf16**
+and **2.23× over ROCm fp32** — but is currently dormant pending a
+queue-state fix; see `docs/destroy_pytorch.md` and the project memory
+for the open follow-up.
+
 ## Build
 
 ```
