@@ -543,6 +543,11 @@ fn matmul_bf16_weights_f32_gpu(u64 out_ptr, u64 x_ptr, u64 w_bf16,
             }
         }
     }
+    // Cap single-stream bf16-direct at N ≤ 65536 to avoid the lm_head
+    // hang at N=151936 (same constraint the batched path documents).
+    // qwen3 inner-layer projections all sit at N ≤ 6144 so the cap
+    // doesn't lose the layer-sweep gain; lm_head falls back to f32 dequant.
+    if use_bf16 != 0 && N > 65536 { use_bf16 = 0 }
 
     if use_bf16 != 0 {
         // bf16-direct path: substitute d_W_bf16 for d_W_f32 in kernarg.
@@ -853,13 +858,11 @@ fn gpu_matmul_to_dev_batched(u64 d_out, u64 d_x, u64 w_bf16,
     if _gpu_mm_fh_gemv_coop_batched == 0 { return 1 }
     if batch_size == 0 { return 1 }
 
-    // bf16-direct opt-in: when MLRIFT_GPU_MATMUL_BF16=1 and the
-    // batched bf16 kernel is loaded, dispatch it instead of the f32
-    // dequant path.  Halves weight bandwidth on memory-bound shapes
-    // (lm_head batched is the big one — 152k × 1024 = 622 MB f32
-    // → 311 MB bf16).
-    // Q4_0-direct opt-in (mutually exclusive with bf16; takes priority).
-    // Same N≤cap guard as bf16 since the kernel uses the same WG shape.
+    // bf16-direct is the DEFAULT for batched matmul (matches the
+    // single-stream path).  Halves weight bandwidth on memory-bound
+    // shapes (lm_head 152k × 1024 = 622 MB f32 → 311 MB bf16).  Opt
+    // out via MLRIFT_GPU_MATMUL_BF16=0.
+    // Q4_0-direct opt-in (takes priority over bf16) via MLRIFT_GPU_MATMUL_Q4.
     u64 use_q4 = 0
     if _gpu_mm_fh_gemv_coop_batched_q4_0 != 0 {
         u64 q4_env = getenv("MLRIFT_GPU_MATMUL_Q4")
@@ -872,10 +875,11 @@ fn gpu_matmul_to_dev_batched(u64 d_out, u64 d_x, u64 w_bf16,
 
     u64 use_bf16 = 0
     if use_q4 == 0 && _gpu_mm_fh_gemv_coop_batched_bf16 != 0 {
+        use_bf16 = 1
         u64 bf16_env = getenv("MLRIFT_GPU_MATMUL_BF16")
         if bf16_env != 0 {
             u8 bc = 0; unsafe { *(bf16_env as u8) -> bc }
-            if bc != 48 { use_bf16 = 1 }
+            if bc == 48 { use_bf16 = 0 }   // explicit '0' = opt-out
         }
     }
     // Cap bf16-direct dispatch to N ≤ 65536.  At qwen3 lm_head shape
