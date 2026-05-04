@@ -1,0 +1,147 @@
+// Smoke test for slice 2b fused residual+rmsnorm at N=1024.
+// Loads /tmp/residual_rmsnorm_f32_1024.co, runs at M=4 with synthetic
+// a/b/gamma, and verifies output vs CPU reference: resid = a+b,
+// norm = (resid * rsqrt(mean(resid²) + 1e-5)) * gamma.
+
+import "../../std/hip.mlr"
+import "../../std/io.mlr"
+import "../../std/fmt.mlr"
+import "../../std/string.mlr"
+
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn getenv(uint64 name) -> uint64
+
+fn die(uint64 msg, uint64 code) {
+    print_str(msg); print_str(" e="); u64 s = fmt_dec(code); print_str(s); dealloc(s); print_str("\n"); exit(1)
+}
+
+fn rsqrt_f32_cpu(f32 x) -> f32 {
+    f64 xd = f32_to_f64(x)
+    f64 y = 1.0 / sqrt_f64(xd)
+    return f64_to_f32(y)
+}
+
+fn main() {
+    uint32 err = hipSetDevice(0); if err != 0 { die("setDev", err) }
+    u64 fd = file_open("/tmp/residual_rmsnorm_f32_1024.co", 0)
+    if fd > 0xFFFFFFFFFFFFF000 { die("missing co", 0) }
+    u64 sz = file_size(fd); u64 blob = alloc(sz)
+    file_read(fd, blob, sz); file_close(fd)
+    u64 mod_slot = alloc(8)
+    err = hipModuleLoadData(mod_slot, blob); if err != 0 { die("LoadData", err) }
+    u64 mod = 0; unsafe { *(mod_slot as u64) -> mod }
+    u64 fh_slot = alloc(8)
+    err = hipModuleGetFunction(fh_slot, mod, "residual_rmsnorm_f32"); if err != 0 { die("getFn", err) }
+    u64 fh = 0; unsafe { *(fh_slot as u64) -> fh }
+
+    u64 M = 4; u64 N = 1024
+    print_str("M="); u64 sm = fmt_dec(M); print_str(sm); dealloc(sm)
+    print_str(" N="); u64 sn = fmt_dec(N); print_str(sn); dealloc(sn); print_str("\n")
+
+    // Allocate device buffers.
+    u64 d_a = 0; u64 d_b = 0; u64 d_resid = 0; u64 d_norm = 0; u64 d_g = 0
+    u64 slot
+    slot = alloc(8); err = hipMalloc(slot, M*N*4); if err != 0 { die("mA", err) }; unsafe { *(slot as u64) -> d_a }
+    slot = alloc(8); err = hipMalloc(slot, M*N*4); if err != 0 { die("mB", err) }; unsafe { *(slot as u64) -> d_b }
+    slot = alloc(8); err = hipMalloc(slot, M*N*4); if err != 0 { die("mR", err) }; unsafe { *(slot as u64) -> d_resid }
+    slot = alloc(8); err = hipMalloc(slot, M*N*4); if err != 0 { die("mN", err) }; unsafe { *(slot as u64) -> d_norm }
+    slot = alloc(8); err = hipMalloc(slot, N*4);   if err != 0 { die("mG", err) }; unsafe { *(slot as u64) -> d_g }
+
+    // Synthetic data.
+    u64 h_a = alloc(M*N*4); u64 h_b = alloc(M*N*4)
+    u64 h_resid = alloc(M*N*4); u64 h_norm = alloc(M*N*4)
+    u64 h_g = alloc(N*4); u64 h_ref_resid = alloc(M*N*4); u64 h_ref_norm = alloc(M*N*4)
+    u64 i = 0
+    while i < M*N {
+        f64 va = (int_to_f64(i % 1009) * 0.001) - 0.4
+        f64 vb = (int_to_f64((i + 31) % 997) * 0.0008) - 0.3
+        unsafe { *((h_a + i*4) as f32) = f64_to_f32(va) }
+        unsafe { *((h_b + i*4) as f32) = f64_to_f32(vb) }
+        i = i + 1
+    }
+    i = 0
+    while i < N {
+        f64 vg = (int_to_f64(i % 53) * 0.01) + 0.5
+        unsafe { *((h_g + i*4) as f32) = f64_to_f32(vg) }
+        i = i + 1
+    }
+    err = hipMemcpy(d_a, h_a, M*N*4, 1); if err != 0 { die("H2D a", err) }
+    err = hipMemcpy(d_b, h_b, M*N*4, 1); if err != 0 { die("H2D b", err) }
+    err = hipMemcpy(d_g, h_g, N*4,   1); if err != 0 { die("H2D g", err) }
+
+    // Kernarg layout (SGPR-reorder trick — matches kernel's body emit):
+    //   0x00 in_a, 0x08 out_norm, 0x10 gamma, 0x18 m, 0x20 n,
+    //   0x28 in_b, 0x30 out_resid
+    u64 g0 = alloc(8); unsafe { *(g0 as u64) = d_a }
+    u64 g1 = alloc(8); unsafe { *(g1 as u64) = d_norm }
+    u64 g2 = alloc(8); unsafe { *(g2 as u64) = d_g }
+    u64 g3 = alloc(8); unsafe { *(g3 as u64) = M }
+    u64 g4 = alloc(8); unsafe { *(g4 as u64) = N }
+    u64 g5 = alloc(8); unsafe { *(g5 as u64) = d_b }
+    u64 g6 = alloc(8); unsafe { *(g6 as u64) = d_resid }
+    u64 kp = alloc(7*8)
+    unsafe { *(kp        as u64) = g0 }
+    unsafe { *((kp +  8) as u64) = g1 }
+    unsafe { *((kp + 16) as u64) = g2 }
+    unsafe { *((kp + 24) as u64) = g3 }
+    unsafe { *((kp + 32) as u64) = g4 }
+    unsafe { *((kp + 40) as u64) = g5 }
+    unsafe { *((kp + 48) as u64) = g6 }
+
+    err = hipModuleLaunchKernel(fh, M, 1, 1, N, 1, 1, 0, 0, kp, 0)
+    if err != 0 { die("L", err) }
+    err = hipDeviceSynchronize(); if err != 0 { die("sync", err) }
+    err = hipMemcpy(h_resid, d_resid, M*N*4, 2); if err != 0 { die("D2H r", err) }
+    err = hipMemcpy(h_norm,  d_norm,  M*N*4, 2); if err != 0 { die("D2H n", err) }
+
+    // CPU reference.
+    u64 r = 0
+    while r < M {
+        f64 sumsq = 0.0
+        u64 c = 0
+        while c < N {
+            u64 idx = r * N + c
+            f32 a = 0.0f; unsafe { *((h_a + idx*4) as f32) -> a }
+            f32 b = 0.0f; unsafe { *((h_b + idx*4) as f32) -> b }
+            f32 x = a + b
+            unsafe { *((h_ref_resid + idx*4) as f32) = x }
+            f64 xd = f32_to_f64(x)
+            sumsq = sumsq + xd * xd
+            c = c + 1
+        }
+        f64 mean = sumsq / int_to_f64(N)
+        f64 me = mean + 0.00001
+        f64 rrms = 1.0 / sqrt_f64(me)
+        c = 0
+        while c < N {
+            u64 idx = r * N + c
+            f32 x = 0.0f; unsafe { *((h_ref_resid + idx*4) as f32) -> x }
+            f32 g = 0.0f; unsafe { *((h_g + c*4) as f32) -> g }
+            f64 xd = f32_to_f64(x)
+            f64 res = xd * rrms * f32_to_f64(g)
+            unsafe { *((h_ref_norm + idx*4) as f32) = f64_to_f32(res) }
+            c = c + 1
+        }
+        r = r + 1
+    }
+
+    // Verify.
+    u64 fail_resid = 0; u64 fail_norm = 0
+    u64 j = 0
+    while j < M*N {
+        f32 ref_r = 0.0f; unsafe { *((h_ref_resid + j*4) as f32) -> ref_r }
+        f32 dev_r = 0.0f; unsafe { *((h_resid + j*4) as f32) -> dev_r }
+        f32 ref_n = 0.0f; unsafe { *((h_ref_norm + j*4) as f32) -> ref_n }
+        f32 dev_n = 0.0f; unsafe { *((h_norm + j*4) as f32) -> dev_n }
+        f32 dr = dev_r - ref_r; if dr < 0.0f { dr = 0.0f - dr }
+        f32 dn = dev_n - ref_n; if dn < 0.0f { dn = 0.0f - dn }
+        if dr > 0.0001f { fail_resid = fail_resid + 1 }
+        if dn > 0.001f  { fail_norm  = fail_norm  + 1 }
+        j = j + 1
+    }
+    print_str("fail_resid: "); u64 sf1 = fmt_dec(fail_resid); print_str(sf1); dealloc(sf1); print_str("\n")
+    print_str("fail_norm:  "); u64 sf2 = fmt_dec(fail_norm);  print_str(sf2); dealloc(sf2); print_str("\n")
+    if fail_resid != 0 || fail_norm != 0 { exit(1) }
+    print_str("PASS\n")
+    exit(0)
+}

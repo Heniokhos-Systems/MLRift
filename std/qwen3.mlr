@@ -1506,13 +1506,22 @@ fn qwen3_forward_layer_gpu(u64 d_x_in, u64 d_x_out,
     }
     // Steps 10-11: resid + post_norm (0x08).  post_norm is skippable
     // when the batched-decode caller has dispatched it once across
-    // all M streams (mask 0x100).
+    // all M streams (mask 0x100).  Slice 2b: when neither skip bit
+    // is set and N=1024 (qwen3-0.6B hidden), fuse into one launch
+    // via gpu_residual_rmsnorm_1024_to_dev — saves 1 launch per
+    // layer, half of slice 2b's 2x/layer projection.
     if (phase_mask & 0x08) != 0 {
-        if gpu_resid_add_to_dev(b_mid, d_x_in, b_o, hidden) != 0 { return 1 }
-        if (phase_mask & 0x100) == 0 {
+        if (phase_mask & 0x100) == 0 && hidden == 1024 {
             u64 d_post_gamma = gpu_cache_bf16_as_f32(w.post_norm_w, hidden)
             if d_post_gamma == 0 { return 1 }
-            if gpu_rmsnorm_1024_to_dev(b_mid_norm, b_mid, d_post_gamma, 1) != 0 { return 1 }
+            if gpu_residual_rmsnorm_1024_to_dev(d_x_in, b_o, b_mid, b_mid_norm, d_post_gamma, 1) != 0 { return 1 }
+        } else {
+            if gpu_resid_add_to_dev(b_mid, d_x_in, b_o, hidden) != 0 { return 1 }
+            if (phase_mask & 0x100) == 0 {
+                u64 d_post_gamma = gpu_cache_bf16_as_f32(w.post_norm_w, hidden)
+                if d_post_gamma == 0 { return 1 }
+                if gpu_rmsnorm_1024_to_dev(b_mid_norm, b_mid, d_post_gamma, 1) != 0 { return 1 }
+            }
         }
     }
     // Step 12: gate_up matmul (0x10).

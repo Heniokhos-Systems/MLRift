@@ -9196,6 +9196,155 @@ fn _emit_rmsnorm_f32_body_N_eps(uint64 args_desc, uint64 N, uint64 eps_bits) {
     uint64 a9 = args_desc + 72;  unsafe { *(a9 as uint64) = AMD_ARG_KIND_BY_VALUE }
 }
 
+// Slice 2b — fused residual_add + rmsnorm.  Same body as
+// _emit_rmsnorm_f32_body_N_eps but with two extra kernarg slots
+// (in_b, out_resid) at offset 0x28 / 0x30 and a 14-instruction
+// prologue inserted right after `v10 = global_load(in_a[idx])`:
+//
+//   v10 = a[idx]                  (existing rmsnorm load)
+//   v8  = b[idx]                  (NEW)
+//   v10 = v10 + v8                (NEW)
+//   *out_resid[idx] = v10         (NEW; residual side-output)
+//   ... rmsnorm body continues with v10 as the post-residual `x`
+//
+// Kernarg layout (so s4..s13 keep the existing rmsnorm SGPR
+// assignments and the rmsnorm body emits unchanged):
+//   0x00  in_a       (s4..5)
+//   0x08  out_norm   (s6..7)   — placed at the rmsnorm 'out' slot
+//   0x10  gamma      (s8..9)
+//   0x18  m          (s10)
+//   0x20  n          (s12)
+//   0x28  in_b       (s16..17) — NEW
+//   0x30  out_resid  (s18..19) — NEW
+//
+// VGPRs unchanged from rmsnorm.  v8 is reused for the residual-`b`
+// load (its later rmsnorm use is the LDS reduce broadcast, after
+// the prologue is done).  v[14:15] / v[16:17] are scratch addr regs
+// for in_b / out_resid; both ranges are unused by the rmsnorm body.
+// rsrc1 sgprs field bumped from 0 to 1 (32 SGPRs grant) to admit
+// s16..s19.  Every dword below is llvm-mc verified for gfx1100.
+fn _emit_residual_rmsnorm_f32_body_N_eps(uint64 args_desc, uint64 N, uint64 eps_bits) {
+    asm_init()
+    uint64 Np = _round_up_pow2(N)
+    uint64 inv_n_bits = _f32_bits_recip(N)
+
+    // Kernarg loads: identical to rmsnorm's first two SMEM loads.
+    asm_u32_arch(0xF40C0100, 0xF40C0100) // s_load_b256 s[4:11], s[0:1], 0x0
+    asm_u32_arch(0xF8000000, 0xFA000000)
+    asm_u32_arch(0xF4040300, 0xF4040300) // s_load_b64 s[12:13], s[0:1], 0x20
+    asm_u32_arch(0xF8000020, 0xFA000020)
+    // NEW kernarg loads: in_b → s[16:17], out_resid → s[18:19].
+    asm_u32_arch(0xF4040400, 0xF4040400) // s_load_b64 s[16:17], s[0:1], 0x28
+    asm_u32_arch(0xF8000028, 0xFA000028)
+    asm_u32_arch(0xF4040480, 0xF4040480) // s_load_b64 s[18:19], s[0:1], 0x30
+    asm_u32_arch(0xF8000030, 0xFA000030)
+    asm_u32_arch(0xBF89FC07, 0xBF8CC07F) // s_waitcnt lgkmcnt(0)
+    asm_u32     (0xBF090A0F)             // s_cmp_ge_u32 s15, s10
+    uint64 cbranch_dword_idx = asm_text_len / 4
+    asm_u32_arch(0xBFA20000, 0xBF850000) // s_cbranch_scc1 → .Lend
+    asm_u32_arch(0x960E0C0F, 0x930E0C0F) // s_mul_i32 s14, s15, s12
+    asm_u32     (0x4A02000E)             // v_add_nc_u32 v1, s14, v0
+    asm_u32_arch(0x30080282, 0x34080282) // v_lshlrev_b32 v4, 2, v1
+    asm_u32     (0x7E060280)             // v_mov_b32 v3, 0
+    asm_u32_arch(0xD7006A02, 0xD70F6A02) // v_add_co_u32 v2, vcc_lo, s4, v4
+    asm_u32     (0x00020804)
+    asm_u32_arch(0xD5207C03, 0xD5287D03) // v_add_co_ci_u32 v3, null, s5, v3, vcc_lo
+    asm_u32     (0x01AA0605)
+    asm_u32     (0x7E1A0280)             // v_mov_b32 v13, 0
+    asm_u32_arch(0xD7006A0C, 0xD70F6A0C) // v_add_co_u32 v12, vcc_lo, s6, v4
+    asm_u32     (0x00020806)
+    asm_u32_arch(0xD5207C0D, 0xD5287D0D) // v_add_co_ci_u32 v13, null, s7, v13, vcc_lo
+    asm_u32     (0x01AA1A07)
+    if N != Np {
+        _emit_gated_load_v10(14, 12, 0x00000000)
+    } else {
+        asm_u32_arch(0xDC520000, 0xDC308000) // global_load v10, x
+        asm_u32_arch(0x0A7C0002, 0x0A7D0002)
+        asm_u32_arch(0xBF8903F7, 0xBF8C3F70) // s_waitcnt vmcnt(0)
+    }
+
+    // ── Residual prologue (NEW) ────────────────────────────────────
+    // v[14:15] = in_b + (lane * 4); v[16:17] = out_resid + (lane * 4).
+    asm_u32     (0x7E1E0280)             // v_mov_b32 v15, 0
+    asm_u32_arch(0xD7006A0E, 0xD70F6A0E) // v_add_co_u32 v14, vcc_lo, s16, v4
+    asm_u32     (0x00020810)
+    asm_u32_arch(0xD5207C0F, 0xD5287D0F) // v_add_co_ci_u32 v15, null, s17, v15, vcc_lo
+    asm_u32     (0x01AA1E11)
+    asm_u32_arch(0xDC520000, 0xDC308000) // global_load v8, v[14:15]
+    asm_u32_arch(0x087C000E, 0x087D000E)
+    asm_u32_arch(0xBF8903F7, 0xBF8C3F70) // s_waitcnt vmcnt(0)
+    asm_u32     (0x0614110A)             // v_add_f32 v10, v10, v8  (v10 = a + b)
+    asm_u32     (0x7E220280)             // v_mov_b32 v17, 0
+    asm_u32_arch(0xD7006A10, 0xD70F6A10) // v_add_co_u32 v16, vcc_lo, s18, v4
+    asm_u32     (0x00020812)
+    asm_u32_arch(0xD5207C11, 0xD5287D11) // v_add_co_ci_u32 v17, null, s19, v17, vcc_lo
+    asm_u32     (0x01AA2213)
+    asm_u32_arch(0xDC6A0000, 0xDC708000) // global_store v[16:17], v10
+    asm_u32_arch(0x007C0A10, 0x007D0A10)
+
+    // ── rmsnorm body (unchanged) ───────────────────────────────────
+    asm_u32_arch(0x30040082, 0x34040082) // v_lshlrev_b32 v2, 2, v0
+    asm_u32     (0x7E060280)             // v_mov_b32 v3, 0
+    asm_u32_arch(0xD7006A02, 0xD70F6A02) // v_add_co_u32 v2, vcc_lo, s8, v2
+    asm_u32     (0x00020408)
+    asm_u32_arch(0xD5207C03, 0xD5287D03) // v_add_co_ci_u32 v3, null, s9, v3, vcc_lo
+    asm_u32     (0x01AA0609)
+    asm_u32_arch(0xDC520000, 0xDC308000) // global_load v11, gamma
+    asm_u32_arch(0x0B7C0002, 0x0B7D0002)
+    asm_u32_arch(0xBF8903F7, 0xBF8C3F70) // s_waitcnt vmcnt(0)
+
+    asm_u32     (0x100A150A)             // v_mul_f32 v5, v10, v10
+    asm_u32_arch(0x300C0082, 0x340C0082) // v6 = lane * 4
+    asm_u32     (0x7E120280)             // v_mov_b32 v9, 0
+    asm_u32     (0xD8340000)             // ds_store v6, v5
+    asm_u32     (0x00000506)
+    asm_u32_arch(0xBF89FC07, 0xBF8CC07F) // s_waitcnt lgkmcnt(0)
+    asm_u32_arch(0xBFBD0000, 0xBF8A0000) // s_barrier
+
+    _emit_lds_reduce_pow2(Np, 0x060A0F05, 14)
+
+    asm_u32     (0xD8D80000)             // ds_load v8, v9
+    asm_u32     (0x08000009)
+    asm_u32_arch(0xBF89FC07, 0xBF8CC07F) // s_waitcnt lgkmcnt(0)
+    asm_u32_arch(0xBE8E00FF, 0xBE8E03FF) // s_mov_b32 s14, lit (inv_n)
+    asm_u32     (inv_n_bits)
+    asm_u32     (0x1010100E)             // v_mul_f32 v8, s14, v8
+    asm_u32_arch(0xBE8E00FF, 0xBE8E03FF) // s_mov_b32 s14, lit (eps)
+    asm_u32     (eps_bits)
+    asm_u32     (0x0610100E)             // v_add_f32 v8, s14, v8
+    asm_u32     (0x7E105D08)             // v_rsq_f32 v8, v8
+    asm_u32     (0x100A110A)             // v_mul_f32 v5, v10, v8
+    asm_u32     (0x100A1705)             // v_mul_f32 v5, v5, v11
+    if N != Np { _emit_store_gate(14, 12) }
+    asm_u32_arch(0xDC6A0000, 0xDC708000) // global_store v[12:13], v5
+    asm_u32_arch(0x007C050C, 0x007D050C)
+    asm_u32_arch(0xBC7C0000, 0xBBFD0000) // s_waitcnt_vscnt null, 0
+    asm_u32_arch(0xBFB00000, 0xBF810000) // s_endpgm
+
+    uint64 total_dwords = asm_text_len / 4
+    uint64 simm16 = total_dwords - cbranch_dword_idx - 2
+    uint64 sccbr_top = 0xBFA20000
+    if _is_gfx10() != 0 { sccbr_top = 0xBF850000 }
+    asm_patch_u32(cbranch_dword_idx, sccbr_top | (simm16 & 0xFFFF))
+
+    // 7 args: in_a, in_b, out_resid, out_norm, gamma  (5 buffers) +
+    // m, n  (2 by-value).  args_desc layout pairs (size, kind).
+    uint64 a0 = args_desc + 0;    unsafe { *(a0 as uint64) = 8 }
+    uint64 a1 = args_desc + 8;    unsafe { *(a1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a2 = args_desc + 16;   unsafe { *(a2 as uint64) = 8 }
+    uint64 a3 = args_desc + 24;   unsafe { *(a3 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a4 = args_desc + 32;   unsafe { *(a4 as uint64) = 8 }
+    uint64 a5 = args_desc + 40;   unsafe { *(a5 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a6 = args_desc + 48;   unsafe { *(a6 as uint64) = 8 }
+    uint64 a7 = args_desc + 56;   unsafe { *(a7 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a8 = args_desc + 64;   unsafe { *(a8 as uint64) = 8 }
+    uint64 a9 = args_desc + 72;   unsafe { *(a9 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a10 = args_desc + 80;  unsafe { *(a10 as uint64) = 8 }
+    uint64 a11 = args_desc + 88;  unsafe { *(a11 as uint64) = AMD_ARG_KIND_BY_VALUE }
+    uint64 a12 = args_desc + 96;  unsafe { *(a12 as uint64) = 8 }
+    uint64 a13 = args_desc + 104; unsafe { *(a13 as uint64) = AMD_ARG_KIND_BY_VALUE }
+}
+
 // Thread-coarsened rmsnorm body for N > 1024. Block size is fixed at
 // 1024 lanes (gfx11 max workgroup size); each lane processes K =
 // ceil(N / 1024) elements across two passes (reduce + apply) over the
@@ -9415,6 +9564,42 @@ fn emit_amdgpu_rmsnorm_f32_N_blob(uint64 out_path, uint64 N) -> uint64 {
     uint64 fd = file_open(out_path, 1)
     if fd > 0xFFFFFFFFFFFFF000 {
         write(2, "emit_amdgpu_rmsnorm_f32_N_blob: cannot open output\n", 52)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
+// Slice 2b — fused residual_add + rmsnorm code-object emit.
+// Block size at launch must be Np = round_up_pow2(N), grid = M.
+// Kernarg layout: 7 args (in_a, in_b, out_resid, out_norm, gamma, m, n).
+// rsrc1 sgprs field bumped to 0x40 for the extended SGPR window
+// (s4..s19) needed by the residual prologue's in_b / out_resid.
+fn emit_amdgpu_residual_rmsnorm_f32_N_blob(uint64 out_path, uint64 N) -> uint64 {
+    if N < 32 || N > 1024 {
+        write(2, "emit_amdgpu_residual_rmsnorm_f32_N_blob: N must be in [32, 1024]\n", 65)
+        return 1
+    }
+    uint64[14] args_desc
+    _emit_residual_rmsnorm_f32_body_N_eps(args_desc, N, 0x3727C5AC)
+    uint64 Np = _round_up_pow2(N)
+    uint64 lds_bytes = Np * 4
+    // 0xE0AF0042 = rsrc1 bumping both:
+    //   bits 0-5 (VGPRS field) = 2 → 24-VGPR grant (rmsnorm used 16,
+    //     fused kernel touches v0-v17 → needs >= 24)
+    //   bit 6 (SGPRS LSB)      = 1 → 24-SGPR grant (rmsnorm used 16,
+    //     fused kernel touches s4-s19 → needs >= 20)
+    uint64 rsrc1 = 0xE0AF0042
+    uint64 size = emit_amdgpu_code_object_lds("residual_rmsnorm_f32", 20,
+                                               asm_text_buf, asm_text_len,
+                                               56, 8, 24, 18,
+                                               rsrc1, 0x0000009E, 0x00000010, 0x0408,
+                                               args_desc, 7,
+                                               lds_bytes)
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_residual_rmsnorm_f32_N_blob: cannot open output\n", 60)
         return 1
     }
     file_write(fd, amd_buf, size)

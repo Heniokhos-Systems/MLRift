@@ -650,6 +650,48 @@ fn gpu_rmsnorm_1024_to_dev(u64 d_out, u64 d_in, u64 d_gamma, u64 M) -> u64 {
     return gpu_rmsnorm_hidden_to_dev(d_out, d_in, d_gamma, M, 1024)
 }
 
+// Slice 2b — fused residual_add + rmsnorm.  One launch instead of
+// two for the resid+post_norm pair (twice per qwen3 layer).
+// Kernarg layout (SGPR-reorder trick — must match the emit body):
+//   0x00 in_a, 0x08 out_norm, 0x10 gamma, 0x18 m, 0x20 n,
+//   0x28 in_b, 0x30 out_resid
+// Grid = M, block_x = N.  Loads /tmp/residual_rmsnorm_f32_1024.co.
+static u64 _gpu_fh_residual_rmsnorm_1024 = 0
+static u64 _gpu_fh_residual_rmsnorm_init = 0
+
+fn gpu_residual_rmsnorm_1024_to_dev(u64 d_a, u64 d_b,
+                                     u64 d_resid, u64 d_norm,
+                                     u64 d_gamma, u64 M) -> u64 {
+    if _gpu_fh_residual_rmsnorm_init == 0 {
+        _gpu_fh_residual_rmsnorm_init = 1
+        _gpu_fh_residual_rmsnorm_1024 = _gpu_mm_load_co(
+            "/tmp/residual_rmsnorm_f32_1024.co", "residual_rmsnorm_f32")
+    }
+    if _gpu_fh_residual_rmsnorm_1024 == 0 { return 1 }
+    u64 N = 1024
+    u64 g0 = alloc(8); unsafe { *(g0 as u64) = d_a }
+    u64 g1 = alloc(8); unsafe { *(g1 as u64) = d_norm }
+    u64 g2 = alloc(8); unsafe { *(g2 as u64) = d_gamma }
+    u64 g3 = alloc(8); unsafe { *(g3 as u64) = M }
+    u64 g4 = alloc(8); unsafe { *(g4 as u64) = N }
+    u64 g5 = alloc(8); unsafe { *(g5 as u64) = d_b }
+    u64 g6 = alloc(8); unsafe { *(g6 as u64) = d_resid }
+    u64 kp = alloc(7 * 8)
+    unsafe { *(kp        as u64) = g0 }
+    unsafe { *((kp +  8) as u64) = g1 }
+    unsafe { *((kp + 16) as u64) = g2 }
+    unsafe { *((kp + 24) as u64) = g3 }
+    unsafe { *((kp + 32) as u64) = g4 }
+    unsafe { *((kp + 40) as u64) = g5 }
+    unsafe { *((kp + 48) as u64) = g6 }
+    u32 grid32 = M
+    u32 bx32 = N
+    u32 err = hipModuleLaunchKernel(_gpu_fh_residual_rmsnorm_1024,
+                                     grid32, 1, 1, bx32, 1, 1, 0, 0, kp, 0)
+    if err != 0 { return 1 }
+    return 0
+}
+
 // Shape-aware rmsnorm dispatch: picks the kernel matching N (the row
 // length).  Each variant must be pre-emitted with the right N-baked
 // kernel body via --emit-amdgpu-rmsnorm-f32-N=<N>.  Block size for the
