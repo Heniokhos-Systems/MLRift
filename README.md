@@ -53,6 +53,28 @@ that disassemble cleanly under `llvm-objdump --mcpu=gfx1030` with zero
 LLM kernel set.  Slice C (NVIDIA Blackwell / Ada / Ampere via PTX) is
 the next target.
 
+### OS portability
+
+The compiler and the emitted GPU bytes are OS-agnostic: `mlrc` builds
+on Linux/macOS/Windows/Android (KernRift's portable host backends),
+and the AMDGCN code object the emitter writes doesn't care about the
+host kernel.  The **runtime** that loads and dispatches those bytes
+is what's OS-bound:
+
+| Runtime path | Linux | Windows | macOS |
+|---|:---:|:---:|:---:|
+| `--target=amdgpu-native` (KFD shim, no ROCm DSOs) | ✅ shipped | ❌ — KFD is Linux-only | ❌ |
+| `--target=hip-amd` (links `libamdhip64.so` / `amdhip64.dll`) | ✅ | ⚠ untested but ROCm has Windows builds | ❌ — no ROCm |
+| Native Metal backend (Apple) | n/a | n/a | not implemented |
+
+The KFD shim talks directly to `/dev/kfd` via `ioctl()` — that's the
+AMDKFD kernel driver, which exists only on Linux.  The "zero ROCm
+DSOs" pitch trades portability for deployment simplicity.  Windows
+AMD support is reachable today via the HIP runtime path with no
+emitter changes (same code-object bytes, just a different DSO).
+macOS would need a separate Metal/MPS backend, planned alongside
+Slice C (NVIDIA PTX) as the next-platform work.
+
 ### Qwen3-0.6B on RX 7800 XT — destroy-PyTorch comparison
 
 Greedy decode, 20 new tokens, seed token 14990, `attn_implementation="eager"`.
