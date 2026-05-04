@@ -124,6 +124,56 @@ projected.
   are measured, the rest is execution.
 
 
+## Stepping stone: slice 2c (qknorm + rope_qk fusion)
+
+The next intra-layer fusion after slice 2b.  Saves 3 launches per
+qwen3 layer (qknorm Q + qknorm K + rope Q + rope K → 1 fused launch
+over `nh_q + nh_k` WGs), or 84 launches/token at 25 µs ≈ 2.1 ms/token,
+projecting **61.4 → ~64.5 tok/s** honest single-stream.
+
+- `examples/llm/qknorm_rope_qk_fused.mlr` — @kernel scaffolded.
+  Discriminator: `qknorm_rope_qk_marker()` Call.  8-param shape:
+  `(q_inout, k_inout, q_gamma, k_gamma, cos, sin, nh_q, nh_k)`.
+- Per WG: head_idx selects Q vs K (head < nh_q) and which gamma /
+  base pointer to use; phase 1 runs the existing rmsnorm body at
+  N=128 with eps=1e-6; LDS staging carries the normalised vector
+  to phase 2; phase 2 (lanes 0..63 only) loads pair (lane, lane+64)
+  from LDS, multiplies by cos/sin, writes back to global.
+- Block size = 128 (one lane per head element).  Grid = nh_q + nh_k
+  = 24 for qwen3-0.6B (16 + 8).
+
+Remaining work for slice 2c:
+
+1. **Emit body.**  Two-phase, more complex than slice 2b's residual
+   prologue:
+   - Kernarg loads (8 args).
+   - Per-WG dispatch: compute head_in_set + base + gamma based on
+     `head < nh_q`.  Use a conditional move (`s_cselect_b32` or
+     equivalent) on the SGPR side rather than a branch.
+   - Phase 1: clone of `_emit_rmsnorm_f32_body_N_eps(args, 128,
+     eps_bits=0x358637BD)`.  Replaces the global store with an
+     LDS store for staging.
+   - `s_barrier`.
+   - Phase 2: clone of the rope rotation body (lanes 0..63 only):
+     `s_and_saveexec_b32` mask + LDS loads + cos/sin global loads
+     + 4 v_fma_f32 + 2 global stores.
+   - rsrc1 likely needs higher VGPR/SGPR grant than slice 2b
+     (more live ranges through the LDS sync).
+2. **AST recogniser** `amdgpu_lower_qknorm_rope_qk_3c`: gates on
+   8 params + `qknorm_rope_qk_marker()` + lds_reduce_sum_f32.
+   Routes BEFORE rmsnorm_3b (same precedence rule as slice 2b).
+3. **CLI flag** `--emit-amdgpu-qknorm-rope-qk-fused-f32=path`.
+4. **Launcher** `gpu_qknorm_rope_qk_fused_to_dev` in
+   `std/inference_gpu.mlr`.
+5. **Wire** in `qwen3_forward_layer_gpu`'s use_gpu_attn block —
+   replace the four sequential `gpu_qknorm_f32_to_dev` /
+   `gpu_rope_f32_to_dev` calls with one fused call.
+
+Estimate: 3-4 hours for the dword-level emit (the multi-phase shape
+is genuinely harder than slice 2b's prologue insertion); +1-2 hours
+for AST recogniser, CLI flag, launcher, wiring, smoke test.  Best as
+a dedicated session.
+
 ## Stepping stone: slice 2b (residual+rmsnorm fusion)
 
 A smaller fusion that would ship as a single concrete @kernel before

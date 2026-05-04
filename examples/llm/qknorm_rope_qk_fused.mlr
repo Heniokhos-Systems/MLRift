@@ -1,0 +1,97 @@
+// Slice 2c scaffold — fused qknorm + rope over Q + K heads in one launch.
+// Replaces the four per-layer dispatches (qknorm Q, qknorm K, rope Q,
+// rope K) with a single launch over (n_q_heads + n_kv_heads) WGs.
+// Saves 3 launches per qwen3 layer × 28 layers = 84 launches/token at
+// ~25 µs effective per launch ≈ 2.1 ms/token; projects 61.4 → ~64.5
+// tok/s honest single-stream on RX 7800 XT.
+//
+// Per WG semantics:
+//   head_idx = block_idx_x()
+//   is_k     = (head_idx >= n_q_heads)
+//   base     = is_k ? k_in : q_in
+//   gamma    = is_k ? k_gamma : q_gamma
+//   head_in_set = is_k ? (head_idx - n_q_heads) : head_idx
+//   --- phase 1: rmsnorm over the head's 128 elements ---
+//   x[lane]    = base[head_in_set * 128 + lane]
+//   sumsq      = lds_reduce_sum_f32(x[lane] * x[lane])
+//   rrms       = rsqrt_f32(sumsq * (1/128) + 1e-6)
+//   x_norm     = x * rrms * gamma[lane]
+//   LDS[lane]  = x_norm  -- stage for rope phase
+//   --- phase 2: rope rotation (lanes 0..63 only) ---
+//   if lane < 64:
+//     a = LDS[lane]; b = LDS[lane + 64]
+//     c = cos[lane]; s = sin[lane]
+//     base[head_in_set*128 + lane]      = a*c - b*s
+//     base[head_in_set*128 + lane + 64] = a*s + b*c
+//
+// Block size = 128 (one lane per head element).  Grid = nh_q + nh_k.
+// Both gammas have N=128 elements.  cos/sin tables are head-shared
+// (same as the existing rope_qwen3_f32 kernel).
+
+fn block_idx_x() -> uint64 { return 0 }
+fn tid_local_x() -> uint64 { return 0 }
+fn lds_reduce_sum_f32(f32 x) -> f32 { return x }
+fn rsqrt_f32(f32 x) -> f32 { return x }
+fn lds_barrier() { return }
+fn lds_store_f32(uint64 idx, f32 v) { return }
+fn lds_load_f32(uint64 idx) -> f32 { return 0.0 }
+fn qknorm_rope_qk_marker() -> uint64 { return 0 }
+
+@kernel
+fn qknorm_rope_qk_fused_f32(uint64 q_inout, uint64 k_inout,
+                              uint64 q_gamma, uint64 k_gamma,
+                              uint64 cos_ptr, uint64 sin_ptr,
+                              uint64 nh_q, uint64 nh_k) {
+    uint64 head = block_idx_x()
+    uint64 lane = tid_local_x()
+    uint64 _mark = qknorm_rope_qk_marker()
+    uint64 total = nh_q + nh_k
+    if head < total {
+        uint64 is_k = 0
+        uint64 head_in_set = head
+        uint64 base = q_inout
+        uint64 gamma = q_gamma
+        if head >= nh_q {
+            is_k = 1
+            head_in_set = head - nh_q
+            base = k_inout
+            gamma = k_gamma
+        }
+        // --- phase 1: rmsnorm at N=128 ---
+        uint64 elem_off = head_in_set * 128 + lane
+        uint64 ip = base + elem_off * 4
+        uint64 gp = gamma + lane * 4
+        f32 x = 0.0
+        unsafe { *(ip as f32) -> x }
+        f32 xsq = x * x
+        f32 sumsq = lds_reduce_sum_f32(xsq)
+        f32 mean = sumsq * 0.0078125     // = 1/128
+        f32 me = mean + 0.000001         // qknorm eps = 1e-6
+        f32 rrms = rsqrt_f32(me)
+        f32 g = 0.0
+        unsafe { *(gp as f32) -> g }
+        f32 x_norm = x * rrms * g
+        // Stage normalised value in LDS for the rope phase.
+        lds_store_f32(lane, x_norm)
+        lds_barrier()
+        // --- phase 2: rope rotation, lanes 0..63 only ---
+        if lane < 64 {
+            f32 a = lds_load_f32(lane)
+            f32 b = lds_load_f32(lane + 64)
+            uint64 cp = cos_ptr + lane * 4
+            uint64 sp = sin_ptr + lane * 4
+            f32 c = 0.0
+            f32 s = 0.0
+            unsafe { *(cp as f32) -> c }
+            unsafe { *(sp as f32) -> s }
+            f32 ra = a * c - b * s
+            f32 rb = a * s + b * c
+            uint64 base_a = base + (head_in_set * 128 + lane) * 4
+            uint64 base_b = base + (head_in_set * 128 + lane + 64) * 4
+            unsafe { *(base_a as f32) = ra }
+            unsafe { *(base_b as f32) = rb }
+        }
+    }
+}
+
+fn main() { exit(0) }
