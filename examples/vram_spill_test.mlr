@@ -1,0 +1,174 @@
+// vram_spill_test.mlr — verify hipMallocAuto's VRAM-first / RAM-spill
+// behaviour, and that the SDMA staging path delivers data correctly to
+// either kind of allocation.
+//
+// Strategy:
+//   1. Allocate 1 GiB chunks via hipMallocAuto in a loop.
+//   2. After each alloc, log dev_alloc_kind:
+//        0 = VRAM     (good, fast path)
+//        2 = GTT      (RAM spill — expected after ~16 GiB on 7800 XT)
+//   3. Round-trip a sentinel pattern through each chunk:
+//        write [chunk_idx repeated as u64s] via hipMemcpyHostToVram
+//        read back via hipMemcpyVramToHost
+//        assert every u64 == chunk_idx
+//      This proves SDMA staging works for both VRAM-only and GTT dst.
+//   4. Stop on first allocation failure (== both VRAM + GTT exhausted)
+//      and report a clean summary: how many landed in VRAM, how many
+//      spilled, when the boundary fired.
+//
+// Build:
+//   build/mlrc --target=amdgpu-native examples/vram_spill_test.mlr -o /tmp/vram_spill_test
+// Run:
+//   /tmp/vram_spill_test
+//   /tmp/vram_spill_test 32       # cap at 32 chunks (32 GiB attempted)
+
+import "../std/hip.mlr"
+import "../std/io.mlr"
+import "../std/fmt.mlr"
+import "../std/string.mlr"
+
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn getenv(uint64 name) -> uint64
+
+fn die(uint64 msg, uint64 code) {
+    print_str(msg); print_str(" code="); u64 s = fmt_dec(code); print_str(s); dealloc(s); print_str("\n")
+    exit(1)
+}
+
+// Map kind code → readable label for the report.
+fn kind_label(uint64 k) -> uint64 {
+    if k == 0 { return "VRAM    " }
+    if k == 1 { return "VRAM-hv " }
+    if k == 2 { return "GTT(RAM)" }
+    return "?       "
+}
+
+fn main() {
+    uint32 e = hipSetDevice(0)
+    if e != 0 { die("hipSetDevice", e) }
+
+    // Chunk size = 1 GiB (134217728 u64s).  Big enough to actually exercise
+    // VRAM exhaustion within 16-32 chunks; small enough that a non-ReBar
+    // 256 MB BAR1 wouldn't have skewed the prior hipMalloc behaviour.
+    u64 CHUNK_BYTES = 1024 * 1024 * 1024
+    u64 N_U64 = CHUNK_BYTES / 8
+
+    u64 max_chunks = 24                     // default cap = 24 GiB attempted
+    u64 ev_max = getenv("VRAM_SPILL_MAX")
+    if ev_max != 0 {
+        u64 parsed = 0; u64 i = 0
+        u8 c = 0; unsafe { *(ev_max as u8) -> c }
+        while c >= 48 && c <= 57 {
+            parsed = parsed * 10 + (c - 48); i = i + 1
+            unsafe { *((ev_max + i) as u8) -> c }
+        }
+        if parsed > 0 { max_chunks = parsed }
+    }
+
+    print_str("vram_spill_test: chunk=1 GiB max_chunks=")
+    u64 mcs = fmt_dec(max_chunks); print_str(mcs); dealloc(mcs); print_str("\n\n")
+    print_str("idx  size      kind      alloc_status   verify\n")
+    print_str("---  --------  --------  -------------  ------\n")
+
+    // Track all VAs so we can free at end (and so kernel doesn't reclaim
+    // chunk N when we move on to N+1).
+    u64 va_arr = alloc(max_chunks * 8)
+
+    // Seed buffer (host) — filled per-chunk with `chunk_idx` repeated as u64.
+    u64 seed_buf = alloc(CHUNK_BYTES)
+    // Readback buffer (host) — destination of every VRAM→Host copy.
+    u64 read_buf = alloc(CHUNK_BYTES)
+
+    u64 n_vram_only  = 0
+    u64 n_gtt_spill  = 0
+    u64 first_spill_at = max_chunks         // sentinel: never spilled
+
+    u64 idx = 0
+    while idx < max_chunks {
+        // 1. Alloc.
+        u64 va_slot = alloc(8)
+        u32 ar = hipMallocAuto(va_slot, CHUNK_BYTES)
+        if ar != 0 {
+            print_str("  "); u64 si = fmt_dec(idx); print_str(si); dealloc(si)
+            print_str("    1 GiB     —         OOM (no VRAM, no GTT)\n")
+            print_str("\nallocation failed at idx="); u64 fs = fmt_dec(idx); print_str(fs); dealloc(fs)
+            print_str(" — system out of memory\n")
+            break
+        }
+        u64 va = 0; unsafe { *(va_slot as u64) -> va }
+        unsafe { *((va_arr + idx * 8) as u64) = va }
+
+        // 2. Classify.
+        u64 k = dev_alloc_kind(va)
+        if k == 0 { n_vram_only = n_vram_only + 1 }
+        if k == 2 {
+            n_gtt_spill = n_gtt_spill + 1
+            if first_spill_at == max_chunks { first_spill_at = idx }
+        }
+
+        // 3. Write a per-chunk sentinel via SDMA H2D.
+        u64 j = 0
+        while j < N_U64 {
+            unsafe { *((seed_buf + j * 8) as u64) = idx }
+            j = j + 1
+        }
+        u32 we = hipMemcpyHostToVram(va, seed_buf, CHUNK_BYTES)
+        if we != 0 { die("H2D failed", we) }
+
+        // 4. Read back via SDMA D2H, verify all u64s equal chunk idx.
+        u32 re = hipMemcpyVramToHost(read_buf, va, CHUNK_BYTES)
+        if re != 0 { die("D2H failed", re) }
+        u64 mismatches = 0
+        u64 v = 0
+        u64 sample_idx = 0
+        u64 jj = 0
+        while jj < N_U64 {
+            u64 r = 0; unsafe { *((read_buf + jj * 8) as u64) -> r }
+            if r != idx {
+                if mismatches == 0 { v = r; sample_idx = jj }
+                mismatches = mismatches + 1
+            }
+            jj = jj + 1
+        }
+
+        // 5. Print row.
+        print_str(" ")
+        if idx < 10 { print_str(" ") }
+        u64 ist = fmt_dec(idx); print_str(ist); dealloc(ist)
+        print_str("   1 GiB     ")
+        print_str(kind_label(k))
+        print_str("  ok             ")
+        if mismatches == 0 {
+            print_str("ok\n")
+        } else {
+            print_str("FAIL ("); u64 ms = fmt_dec(mismatches); print_str(ms); dealloc(ms); print_str(" mismatches, first @ ")
+            u64 sis = fmt_dec(sample_idx); print_str(sis); dealloc(sis); print_str(" got=")
+            u64 vs = fmt_dec(v); print_str(vs); dealloc(vs); print_str(")\n")
+        }
+
+        idx = idx + 1
+    }
+
+    // 6. Summary.
+    print_str("\n=== summary ===\n")
+    print_str("allocations succeeded:   "); u64 ms1 = fmt_dec(idx); print_str(ms1); dealloc(ms1); print_str("\n")
+    print_str("  → VRAM (kind=0):       "); u64 ms2 = fmt_dec(n_vram_only); print_str(ms2); dealloc(ms2); print_str("\n")
+    print_str("  → GTT (kind=2 spill):  "); u64 ms3 = fmt_dec(n_gtt_spill); print_str(ms3); dealloc(ms3); print_str("\n")
+    if first_spill_at < max_chunks {
+        print_str("first spill at idx:      "); u64 ms4 = fmt_dec(first_spill_at); print_str(ms4); dealloc(ms4)
+        print_str("  (≈ "); u64 ms5 = fmt_dec(first_spill_at); print_str(ms5); dealloc(ms5); print_str(" GiB of VRAM consumed before fallback fired)\n")
+    } else {
+        print_str("first spill at idx:      never (all chunks fit in VRAM)\n")
+    }
+
+    // 7. Free.
+    u64 fi = 0
+    while fi < idx {
+        u64 fv = 0; unsafe { *((va_arr + fi * 8) as u64) -> fv }
+        if fv != 0 { hipFree(fv) }
+        fi = fi + 1
+    }
+
+    exit(0)
+}

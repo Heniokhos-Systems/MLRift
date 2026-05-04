@@ -140,6 +140,7 @@ fn kfd_gpuvm_limit() -> uint64 { return _kfd_gpuvm_limit }
 
 @dynamic extern fn mmap(uint64 addr, uint64 length, uint32 prot, uint32 flags,
                         uint32 fd, uint64 offset) -> uint64
+@dynamic extern fn munmap(uint64 addr, uint64 length) -> uint32
 @dynamic extern fn memcpy(uint64 dst, uint64 src, uint64 nbytes) -> uint64
 
 // MAP_PRIVATE | MAP_SHARED: KFD's mmap'd buffers want MAP_SHARED.
@@ -165,6 +166,24 @@ static uint64[1024] _kfd_alloc_handle
 static uint64[1024] _kfd_alloc_size
 static uint64[1024] _kfd_alloc_host
 static uint64[1024] _kfd_alloc_kind
+
+// Persistent ioctl-scratch slots shared across all dev_alloc_* / dev_free
+// / dev_host_ptr calls.  Each `alloc(N)` in MLRift becomes a separate
+// `mmap(0, N+8, PROT_RW, ANON|PRIVATE)`, which rounds to a 4 KB page
+// even when N is 8 — so the previous pattern of `alloc(8)` × 3 per
+// ioctl was leaking 12 KB of RSS per call, not 24 bytes.  Under Noesis
+// Phase Y NEAT evolution that fired ~80 dev_alloc / dev_free per
+// genome × 3-5 genomes/sec, producing ~10 MB/s sustained host RSS
+// growth (measured 16 MB → 1928 MB over 180 s = 10.6 MB/s).
+//
+// These statics are reused in-place, written into the moment before
+// each ioctl reads them out, so there's no concurrency concern: the
+// shim is single-threaded with respect to KFD ioctls.  Two separate
+// blocks because dev_free is sometimes called from inside a dev_alloc
+// retry path (range lookup) and we don't want one to clobber the
+// other mid-call.
+static uint64[8] _kfd_scratch_alloc      // h_slot, va_slot, mm_slot for ALLOC ioctl
+static uint64[8] _kfd_scratch_free       // h_slot, host_slot for FREE / lookup
 
 fn _kfd_alloc_track(uint64 va, uint64 handle, uint64 size, uint64 host_ptr) {
     _kfd_alloc_track_kind(va, handle, size, host_ptr, 0)
@@ -257,7 +276,7 @@ fn dev_try_alloc_vram(uint64 nbytes) -> uint64 {
     if _kfd_initialized == 0 { kfd_init() }
     uint32 flags = KFD_IOC_ALLOC_MEM_FLAGS_VRAM | KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE | KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE
     uint64 va_pref = _kfd_reserve_va(nbytes)
-    uint64 h_slot = alloc(8); uint64 va_slot = alloc(8); uint64 mm_slot = alloc(8)
+    uint64 h_slot = _kfd_scratch_alloc; uint64 va_slot = _kfd_scratch_alloc + 8; uint64 mm_slot = _kfd_scratch_alloc + 16
     uint32 r = raw_kfd_alloc_memory_of_gpu(_kfd_fd, _kfd_gpu_id, nbytes, va_pref, flags, h_slot, va_slot, mm_slot)
     if r != 0 { return 0 }
     uint64 handle = 0; unsafe { *(h_slot as uint64) -> handle }
@@ -285,7 +304,7 @@ fn dev_try_alloc_host_visible(uint64 nbytes) -> uint64 {
     if _kfd_initialized == 0 { kfd_init() }
     uint32 flags = KFD_IOC_ALLOC_MEM_FLAGS_GTT | KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE | KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE | KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC
     uint64 va_pref = _kfd_reserve_va(nbytes)
-    uint64 h_slot = alloc(8); uint64 va_slot = alloc(8); uint64 mm_slot = alloc(8)
+    uint64 h_slot = _kfd_scratch_alloc; uint64 va_slot = _kfd_scratch_alloc + 8; uint64 mm_slot = _kfd_scratch_alloc + 16
     uint32 r = raw_kfd_alloc_memory_of_gpu(_kfd_fd, _kfd_gpu_id, nbytes, va_pref, flags, h_slot, va_slot, mm_slot)
     if r != 0 { return 0 }
     uint64 handle = 0; unsafe { *(h_slot as uint64) -> handle }
@@ -329,7 +348,7 @@ fn dev_try_alloc_vram_hostvis(uint64 nbytes) -> uint64 {
     if _kfd_initialized == 0 { kfd_init() }
     uint32 flags = KFD_IOC_ALLOC_MEM_FLAGS_VRAM | KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE | KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE | KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC
     uint64 va_pref = _kfd_reserve_va(nbytes)
-    uint64 h_slot = alloc(8); uint64 va_slot = alloc(8); uint64 mm_slot = alloc(8)
+    uint64 h_slot = _kfd_scratch_alloc; uint64 va_slot = _kfd_scratch_alloc + 8; uint64 mm_slot = _kfd_scratch_alloc + 16
     uint32 r = raw_kfd_alloc_memory_of_gpu(_kfd_fd, _kfd_gpu_id, nbytes, va_pref, flags, h_slot, va_slot, mm_slot)
     if r != 0 { return 0 }
     uint64 handle = 0; unsafe { *(h_slot as uint64) -> handle }
@@ -388,7 +407,7 @@ fn dev_alloc_smart(uint64 nbytes) -> uint64 {
 // dev_alloc_vram leaves it at 0; dev_alloc_host_visible records the
 // mmap'd host pointer there.
 fn dev_alloc_is_vram(uint64 dev_va) -> uint64 {
-    uint64 h_slot = alloc(8); uint64 host_slot = alloc(8)
+    uint64 h_slot = _kfd_scratch_free; uint64 host_slot = _kfd_scratch_free + 8
     uint32 r = _kfd_alloc_lookup(dev_va, h_slot, host_slot)
     if r != 0 { return 0 }
     uint64 host = 0; unsafe { *(host_slot as uint64) -> host }
@@ -401,7 +420,7 @@ fn dev_alloc_vram_exec(uint64 nbytes) -> uint64 {
     if _kfd_initialized == 0 { kfd_init() }
     uint32 flags = KFD_IOC_ALLOC_MEM_FLAGS_VRAM | KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE | KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE | KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE
     uint64 va_pref = _kfd_reserve_va(nbytes)
-    uint64 h_slot = alloc(8); uint64 va_slot = alloc(8); uint64 mm_slot = alloc(8)
+    uint64 h_slot = _kfd_scratch_alloc; uint64 va_slot = _kfd_scratch_alloc + 8; uint64 mm_slot = _kfd_scratch_alloc + 16
     uint32 r = raw_kfd_alloc_memory_of_gpu(_kfd_fd, _kfd_gpu_id, nbytes, va_pref, flags, h_slot, va_slot, mm_slot)
     if r != 0 { kfd_die("dev_alloc_vram_exec: ALLOC_MEMORY_OF_GPU failed", r) }
     uint64 handle = 0; unsafe { *(h_slot as uint64) -> handle }
@@ -422,7 +441,7 @@ fn dev_alloc_qdesc(uint64 nbytes) -> uint64 {
     if _kfd_initialized == 0 { kfd_init() }
     uint32 flags = KFD_IOC_ALLOC_MEM_FLAGS_GTT | KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE | KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE | KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC | KFD_IOC_ALLOC_MEM_FLAGS_COHERENT | KFD_IOC_ALLOC_MEM_FLAGS_UNCACHED
     uint64 va_pref = _kfd_reserve_va(nbytes)
-    uint64 h_slot = alloc(8); uint64 va_slot = alloc(8); uint64 mm_slot = alloc(8)
+    uint64 h_slot = _kfd_scratch_alloc; uint64 va_slot = _kfd_scratch_alloc + 8; uint64 mm_slot = _kfd_scratch_alloc + 16
     uint32 r = raw_kfd_alloc_memory_of_gpu(_kfd_fd, _kfd_gpu_id, nbytes, va_pref, flags, h_slot, va_slot, mm_slot)
     if r != 0 { kfd_die("dev_alloc_qdesc: ALLOC_MEMORY_OF_GPU failed", r) }
     uint64 handle = 0; unsafe { *(h_slot as uint64) -> handle }
@@ -443,7 +462,7 @@ fn dev_alloc_kernel_image(uint64 nbytes) -> uint64 {
     if _kfd_initialized == 0 { kfd_init() }
     uint32 flags = KFD_IOC_ALLOC_MEM_FLAGS_GTT | KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE | KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE | KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC | KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE
     uint64 va_pref = _kfd_reserve_va(nbytes)
-    uint64 h_slot = alloc(8); uint64 va_slot = alloc(8); uint64 mm_slot = alloc(8)
+    uint64 h_slot = _kfd_scratch_alloc; uint64 va_slot = _kfd_scratch_alloc + 8; uint64 mm_slot = _kfd_scratch_alloc + 16
     uint32 r = raw_kfd_alloc_memory_of_gpu(_kfd_fd, _kfd_gpu_id, nbytes, va_pref, flags, h_slot, va_slot, mm_slot)
     if r != 0 { kfd_die("dev_alloc_kernel_image: ALLOC_MEMORY_OF_GPU failed", r) }
     uint64 handle = 0; unsafe { *(h_slot as uint64) -> handle }
@@ -470,7 +489,7 @@ fn dev_register_userptr(uint64 host_ptr, uint64 nbytes) -> uint64 {
     if _kfd_initialized == 0 { kfd_init() }
     uint32 flags = KFD_IOC_ALLOC_MEM_FLAGS_USERPTR | KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE | KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE
     uint64 va_pref = _kfd_reserve_va(nbytes)
-    uint64 h_slot = alloc(8); uint64 va_slot = alloc(8)
+    uint64 h_slot = _kfd_scratch_alloc; uint64 va_slot = _kfd_scratch_alloc + 8
     uint32 r = raw_kfd_alloc_userptr(_kfd_fd, _kfd_gpu_id, nbytes, host_ptr, va_pref, flags, h_slot, va_slot)
     if r != 0 { return 0 }
     uint64 handle = 0; unsafe { *(h_slot as uint64) -> handle }
@@ -499,7 +518,7 @@ fn dev_alloc_aql_ring(uint64 nbytes) -> uint64 {
     if _kfd_initialized == 0 { kfd_init() }
     uint32 flags = KFD_IOC_ALLOC_MEM_FLAGS_GTT | KFD_IOC_ALLOC_MEM_FLAGS_NO_SUBSTITUTE | KFD_IOC_ALLOC_MEM_FLAGS_WRITABLE | KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC | KFD_IOC_ALLOC_MEM_FLAGS_EXECUTABLE | KFD_IOC_ALLOC_MEM_FLAGS_COHERENT | KFD_IOC_ALLOC_MEM_FLAGS_UNCACHED
     uint64 va_pref = _kfd_reserve_va(nbytes)
-    uint64 h_slot = alloc(8); uint64 va_slot = alloc(8); uint64 mm_slot = alloc(8)
+    uint64 h_slot = _kfd_scratch_alloc; uint64 va_slot = _kfd_scratch_alloc + 8; uint64 mm_slot = _kfd_scratch_alloc + 16
     uint32 r = raw_kfd_alloc_memory_of_gpu(_kfd_fd, _kfd_gpu_id, nbytes, va_pref, flags, h_slot, va_slot, mm_slot)
     if r != 0 { kfd_die("dev_alloc_aql_ring: ALLOC_MEMORY_OF_GPU failed", r) }
     uint64 handle = 0; unsafe { *(h_slot as uint64) -> handle }
@@ -514,7 +533,7 @@ fn dev_alloc_aql_ring(uint64 nbytes) -> uint64 {
 }
 
 fn dev_host_ptr(uint64 dev_ptr) -> uint64 {
-    uint64 h_slot = alloc(8); uint64 host_slot = alloc(8)
+    uint64 h_slot = _kfd_scratch_free; uint64 host_slot = _kfd_scratch_free + 8
     uint32 r = _kfd_alloc_lookup(dev_ptr, h_slot, host_slot)
     if r != 0 { kfd_die("dev_host_ptr: dev ptr not tracked", dev_ptr) }
     uint64 host = 0; unsafe { *(host_slot as uint64) -> host }
@@ -524,12 +543,50 @@ fn dev_host_ptr(uint64 dev_ptr) -> uint64 {
 
 
 fn dev_free(uint64 dev_ptr) {
-    uint64 h_slot = alloc(8); uint64 host_slot = alloc(8)
+    uint64 h_slot = _kfd_scratch_free; uint64 host_slot = _kfd_scratch_free + 8
     uint32 r = _kfd_alloc_lookup(dev_ptr, h_slot, host_slot)
     if r != 0 { return }
     uint64 handle = 0; unsafe { *(h_slot as uint64) -> handle }
+    // Look up size + host_ptr + kind for this entry — needed to munmap the
+    // BAR1 / GTT host-mapped region before releasing the GPU memory.  Without
+    // the munmap, the kernel keeps the underlying VRAM/GTT pages pinned and
+    // raw_kfd_free_memory_of_gpu doesn't actually free them.  Symptom: VRAM
+    // climbs at ~14 MB/s under Noesis Phase Y NEAT evolution (1600 evals ×
+    // 66 host-vis allocs/eval ≈ 105 K mmap regions never unmapped) until
+    // VRAM exhausts and KFD spills to GTT, exhausting host RAM and OOM-killing
+    // unrelated processes (KWin observed 2026-05-04).
+    uint64 size = 0
+    uint64 host = 0
+    uint64 kind = 0
+    uint64 idx = 0
+    while idx < _kfd_alloc_tab_n {
+        uint64 p_va = _kfd_alloc_va + idx * 8
+        uint64 v = 0; unsafe { *(p_va as uint64) -> v }
+        if v == dev_ptr {
+            unsafe { *((_kfd_alloc_size + idx * 8) as uint64) -> size }
+            unsafe { *((_kfd_alloc_host + idx * 8) as uint64) -> host }
+            unsafe { *((_kfd_alloc_kind + idx * 8) as uint64) -> kind }
+            idx = _kfd_alloc_tab_n
+        } else {
+            idx = idx + 1
+        }
+    }
+    if host != 0 { munmap(host, size) }
     raw_kfd_unmap_memory_from_gpu(_kfd_fd, handle, _kfd_gpu_id)
     raw_kfd_free_memory_of_gpu(_kfd_fd, handle)
+    // Release the host-side VA reservation that _kfd_reserve_va made
+    // before ALLOC_MEMORY_OF_GPU.  KFD ALLOC honours the va_pref hint
+    // and assigns the GPU VA = dev_ptr, so the host-side anonymous
+    // PROT_NONE/NORESERVE mapping at dev_ptr is what we'd unmap.  For
+    // kind != 0 the mmap on the DRM fd above already supersedes that
+    // reservation (host == dev_ptr after KFD's mmap call), and the
+    // munmap(host, size) just above releases it.  For kind=0 (VRAM-
+    // only — host==0), the va_pref reservation persists indefinitely;
+    // each one is a 4 KiB-aligned anonymous VMA in the process's VM
+    // map, and Noesis NEAT was leaking ~80 of these per genome eval,
+    // which dominated the residual host RSS growth after the kernarg-
+    // slot fix landed.  Unmap explicitly here.
+    if host == 0 { munmap(dev_ptr, size) }
     // Remove the entry from the tracker by swapping the last entry into
     // its slot. Without this, the tracker grows monotonically across
     // every alloc/free cycle and hits the 1024-entry cap (long-running
@@ -1296,7 +1353,7 @@ fn kfd_signal_alloc() -> uint64 {
                    KFD_IOC_ALLOC_MEM_FLAGS_UNCACHED
     uint64 nbytes = 64
     uint64 va_pref = _kfd_reserve_va(nbytes)
-    uint64 h_slot = alloc(8); uint64 va_slot = alloc(8); uint64 mm_slot = alloc(8)
+    uint64 h_slot = _kfd_scratch_alloc; uint64 va_slot = _kfd_scratch_alloc + 8; uint64 mm_slot = _kfd_scratch_alloc + 16
     uint32 r = raw_kfd_alloc_memory_of_gpu(_kfd_fd, _kfd_gpu_id, nbytes, va_pref,
                                             flags, h_slot, va_slot, mm_slot)
     if r != 0 { kfd_die("kfd_signal_alloc: ALLOC_MEMORY_OF_GPU failed", r) }

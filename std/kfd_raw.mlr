@@ -18,6 +18,33 @@
 // O_RDWR | O_CLOEXEC
 static uint32 KFD_OPEN_FLAGS = 0x80002
 
+// Persistent scratch for ioctl args buffers.  Each MLRift `alloc(N)`
+// is an `mmap(0, N+8, PROT_RW, ANON|PRIVATE)` — kernel rounds N+8 up
+// to a 4 KB page, so even a 4-byte arg buf consumes a full page.
+// Without an explicit `dealloc` (which the ioctl wrappers below didn't
+// have), every ioctl call leaks one page.  Under Noesis Phase Y NEAT
+// evolution that fired ~3 ALLOC_MEMORY_OF_GPU + ~3 FREE_MEMORY_OF_GPU
+// + ~3 MAP × 2 + UNMAP × 2 + WAIT_EVENTS per kernel launch × hundreds
+// of launches per genome, producing ~4.6 MB/s sustained host RSS
+// growth (the residual after the std/kfd.mlr scratch + Noesis-side
+// coalesce fixes).  Strace confirmed: alloc(24)=65344 vs munmap(32)=6,
+// alloc(40)=many vs free=0, alloc(4)=many vs free=0.
+//
+// Layout: 16 × 8 = 128 bytes.  Largest ioctl arg is CREATE_QUEUE at
+// 88 bytes, so [0..87] is the primary args slot.  [96..103] is the
+// secondary dev_ids slot used by MAP_MEMORY_TO_GPU /
+// UNMAP_MEMORY_FROM_GPU which need TWO simultaneously-live buffers
+// (the args struct contains a pointer to dev_ids).
+//
+// Single-thread invariant: the KFD/DRM ioctl shim is called from one
+// thread (the genome-evaluation main loop in Noesis, the
+// hipModuleLaunchKernel host-stub in qwen3, etc.).  None of these
+// wrappers calls another wrapper recursively, so reusing one scratch
+// across them is safe.  If a multi-threaded caller appears later, it
+// must serialize at the std/kfd.mlr level (which already does for the
+// AQL ring write-pointer anyway).
+static uint64[16] _kfd_raw_scratch
+
 // --- Ioctl numbers (verified by examples/_kfd_verify.c) ---
 static uint64 AMDKFD_IOC_GET_VERSION                = 0x80084B01
 static uint64 AMDKFD_IOC_CREATE_QUEUE               = 0xC0584B02
@@ -101,7 +128,7 @@ static uint64 AMDGPU_CTX_STABLE_PSTATE_PEAK  = 4
 // Allocate a DRM context. Required input fd is the DRM render-node
 // fd already opened in std/kfd.mlr's kfd_init.
 fn raw_drm_ctx_alloc(uint32 drm_fd, uint64 out_ctx_id_slot) -> uint32 {
-    uint64 args = alloc(16)
+    uint64 args = _kfd_raw_scratch
     uint64 i = 0; while i < 16 { uint64 p = args + i; unsafe { *(p as uint8) = 0 }; i = i + 1 }
     uint32 op = AMDGPU_CTX_OP_ALLOC_CTX
     unsafe { *((args + 0x00) as uint32) = op }
@@ -116,7 +143,7 @@ fn raw_drm_ctx_alloc(uint32 drm_fd, uint64 out_ctx_id_slot) -> uint32 {
 
 // Free a DRM context.
 fn raw_drm_ctx_free(uint32 drm_fd, uint32 ctx_id) -> uint32 {
-    uint64 args = alloc(16)
+    uint64 args = _kfd_raw_scratch
     uint64 i = 0; while i < 16 { uint64 p = args + i; unsafe { *(p as uint8) = 0 }; i = i + 1 }
     uint32 op = AMDGPU_CTX_OP_FREE_CTX
     unsafe { *((args + 0x00) as uint32) = op }
@@ -127,7 +154,7 @@ fn raw_drm_ctx_free(uint32 drm_fd, uint32 ctx_id) -> uint32 {
 // Pin DPM to one of AMDGPU_CTX_STABLE_PSTATE_*. PEAK pins sclk/mclk
 // to the highest valid DPM levels for the lifetime of the context.
 fn raw_drm_ctx_set_stable_pstate(uint32 drm_fd, uint32 ctx_id, uint32 pstate_flags) -> uint32 {
-    uint64 args = alloc(16)
+    uint64 args = _kfd_raw_scratch
     uint64 i = 0; while i < 16 { uint64 p = args + i; unsafe { *(p as uint8) = 0 }; i = i + 1 }
     uint32 op = AMDGPU_CTX_OP_SET_STABLE_PSTATE
     unsafe { *((args + 0x00) as uint32) = op }
@@ -152,7 +179,7 @@ fn _kfd_ioctl(uint32 fd, uint64 cmd, uint64 args_ptr) -> uint32 {
 //   [0x00] major_version  (u32, from KFD)
 //   [0x04] minor_version  (u32, from KFD)
 fn raw_kfd_get_version(uint32 fd, uint64 out_major_slot, uint64 out_minor_slot) -> uint32 {
-    uint64 buf = alloc(8)
+    uint64 buf = _kfd_raw_scratch
     unsafe { *(buf as uint64) = 0 }
     uint32 r = _kfd_ioctl(fd, AMDKFD_IOC_GET_VERSION, buf)
     if r == 0 {
@@ -169,7 +196,7 @@ fn raw_kfd_get_version(uint32 fd, uint64 out_major_slot, uint64 out_minor_slot) 
 //   [0x00] drm_fd  (u32, to KFD)
 //   [0x04] gpu_id  (u32, to KFD)
 fn raw_kfd_acquire_vm(uint32 kfd_fd, uint32 drm_fd, uint32 gpu_id) -> uint32 {
-    uint64 buf = alloc(8)
+    uint64 buf = _kfd_raw_scratch
     uint64 p_drm = buf + 0; unsafe { *(p_drm as uint32) = drm_fd }
     uint64 p_gpu = buf + 4; unsafe { *(p_gpu as uint32) = gpu_id }
     uint32 r = _kfd_ioctl(kfd_fd, AMDKFD_IOC_ACQUIRE_VM, buf)
@@ -184,7 +211,7 @@ fn raw_kfd_acquire_vm(uint32 kfd_fd, uint32 drm_fd, uint32 gpu_id) -> uint32 {
 // mode_mask = 1 enables runtime; 0 disables. Required on Linux 6.17+
 // before CREATE_QUEUE.
 fn raw_kfd_runtime_enable(uint32 fd, uint32 mode_mask) -> uint32 {
-    uint64 buf = alloc(16)
+    uint64 buf = _kfd_raw_scratch
     uint64 p0 = buf + 0;  unsafe { *(p0 as uint64) = 0 }       // r_debug
     uint64 p8 = buf + 8;  unsafe { *(p8 as uint32) = mode_mask }
     uint64 pC = buf + 12; unsafe { *(pC as uint32) = 0 }       // capabilities
@@ -208,7 +235,7 @@ fn raw_kfd_runtime_enable(uint32 fd, uint32 mode_mask) -> uint32 {
 fn raw_kfd_set_memory_policy(uint32 fd, uint32 gpu_id,
                               uint32 default_policy, uint32 alternate_policy,
                               uint64 alt_base, uint64 alt_size) -> uint32 {
-    uint64 args = alloc(32)
+    uint64 args = _kfd_raw_scratch
     uint64 i = 0
     while i < 32 { uint64 p = args + i; unsafe { *(p as uint8) = 0 }; i = i + 1 }
     unsafe { *((args + 0x00) as uint64) = alt_base }
@@ -224,7 +251,7 @@ fn raw_kfd_set_memory_policy(uint32 fd, uint32 gpu_id,
 //   xnack_enabled = 1 → enable retries
 //   xnack_enabled = -1 → leave unchanged, return current state
 fn raw_kfd_set_xnack_mode(uint32 fd, int32 xnack_enabled) -> uint32 {
-    uint64 args = alloc(4)
+    uint64 args = _kfd_raw_scratch
     unsafe { *(args as int32) = xnack_enabled }
     return _kfd_ioctl(fd, AMDKFD_IOC_SET_XNACK_MODE, args)
 }
@@ -252,7 +279,7 @@ fn raw_kfd_create_event(uint32 fd, uint32 event_type, uint32 auto_reset,
                          uint32 node_id,
                          uint64 out_page_offset, uint64 out_trigger_data,
                          uint64 out_event_id, uint64 out_slot_index) -> uint32 {
-    uint64 args = alloc(32)
+    uint64 args = _kfd_raw_scratch
     uint64 i = 0
     while i < 32 { uint64 p = args + i; unsafe { *(p as uint8) = 0 }; i = i + 1 }
     unsafe { *((args + 0x0C) as uint32) = event_type }
@@ -274,7 +301,7 @@ fn raw_kfd_create_event(uint32 fd, uint32 event_type, uint32 auto_reset,
 
 // kfd_ioctl_destroy_event_args: 8 bytes (event_id + pad).
 fn raw_kfd_destroy_event(uint32 fd, uint32 event_id) -> uint32 {
-    uint64 args = alloc(8)
+    uint64 args = _kfd_raw_scratch
     unsafe { *((args + 0x00) as uint32) = event_id }
     unsafe { *((args + 0x04) as uint32) = 0 }
     return _kfd_ioctl(fd, AMDKFD_IOC_DESTROY_EVENT, args)
@@ -296,7 +323,7 @@ fn raw_kfd_destroy_event(uint32 fd, uint32 event_id) -> uint32 {
 fn raw_kfd_wait_events(uint32 fd, uint64 events_ptr, uint32 num_events,
                         uint32 wait_for_all, uint32 timeout_ms,
                         uint64 out_wait_result) -> uint32 {
-    uint64 args = alloc(24)
+    uint64 args = _kfd_raw_scratch
     uint64 i = 0
     while i < 24 { uint64 p = args + i; unsafe { *(p as uint8) = 0 }; i = i + 1 }
     unsafe { *((args + 0x00) as uint64) = events_ptr }
@@ -326,7 +353,7 @@ fn raw_kfd_wait_events(uint32 fd, uint64 events_ptr, uint32 num_events,
 fn raw_kfd_get_clock_counters(uint32 fd, uint32 gpu_id,
                                uint64 out_gpu_slot, uint64 out_cpu_slot,
                                uint64 out_sys_slot,  uint64 out_freq_slot) -> uint32 {
-    uint64 args = alloc(40)
+    uint64 args = _kfd_raw_scratch
     uint64 i = 0
     while i < 40 { uint64 p = args + i; unsafe { *(p as uint8) = 0 }; i = i + 1 }
     unsafe { *((args + 0x20) as uint32) = gpu_id }
@@ -355,7 +382,7 @@ fn raw_kfd_get_clock_counters(uint32 fd, uint32 gpu_id,
 // docs/SYNC_LAUNCH_GAP.md.
 fn raw_kfd_set_cu_mask(uint32 fd, uint32 queue_id, uint32 num_bits,
                         uint64 mask_ptr) -> uint32 {
-    uint64 args = alloc(16)
+    uint64 args = _kfd_raw_scratch
     unsafe { *((args + 0x00) as uint32) = queue_id }
     unsafe { *((args + 0x04) as uint32) = num_bits }
     unsafe { *((args + 0x08) as uint64) = mask_ptr }
@@ -372,7 +399,7 @@ fn raw_kfd_set_cu_mask(uint32 fd, uint32 queue_id, uint32 num_bits,
 // touch scratch (even ones that statically don't, since the firmware
 // doesn't know that at dispatch time).
 fn raw_kfd_set_scratch_backing_va(uint32 fd, uint32 gpu_id, uint64 va_addr) -> uint32 {
-    uint64 args = alloc(16)
+    uint64 args = _kfd_raw_scratch
     unsafe { *((args + 0x00) as uint64) = va_addr }
     unsafe { *((args + 0x08) as uint32) = gpu_id }
     unsafe { *((args + 0x0C) as uint32) = 0 }
@@ -396,7 +423,7 @@ fn raw_kfd_set_scratch_backing_va(uint32 fd, uint32 gpu_id, uint64 va_addr) -> u
 //   total 0x38 = 56 bytes per entry.
 fn raw_kfd_get_process_apertures_new(uint32 fd, uint64 apertures_buf,
                                       uint64 in_max_nodes, uint64 out_num_nodes_slot) -> uint32 {
-    uint64 args = alloc(16)
+    uint64 args = _kfd_raw_scratch
     uint64 p_ptr = args + 0;  unsafe { *(p_ptr as uint64) = apertures_buf }
     uint64 p_num = args + 8;  unsafe { *(p_num as uint32) = in_max_nodes }
     uint64 p_pad = args + 12; unsafe { *(p_pad as uint32) = 0 }
@@ -421,7 +448,7 @@ static uint64 KFD_APERTURE_GPU_ID_OFFSET = 0x30
 fn raw_kfd_alloc_memory_of_gpu(uint32 fd, uint32 gpu_id, uint64 size, uint64 va_addr,
                                 uint32 flags, uint64 out_handle_slot,
                                 uint64 out_va_slot, uint64 out_mmap_offset_slot) -> uint32 {
-    uint64 args = alloc(40)
+    uint64 args = _kfd_raw_scratch
     uint64 p0 = args + 0x00; unsafe { *(p0 as uint64) = va_addr }
     uint64 p1 = args + 0x08; unsafe { *(p1 as uint64) = size }
     uint64 p2 = args + 0x10; unsafe { *(p2 as uint64) = 0 }       // handle
@@ -449,7 +476,7 @@ fn raw_kfd_alloc_memory_of_gpu(uint32 fd, uint32 gpu_id, uint64 size, uint64 va_
 fn raw_kfd_alloc_userptr(uint32 fd, uint32 gpu_id, uint64 size, uint64 user_addr,
                           uint64 va_pref, uint32 flags,
                           uint64 out_handle_slot, uint64 out_va_slot) -> uint32 {
-    uint64 args = alloc(40)
+    uint64 args = _kfd_raw_scratch
     uint64 p0 = args + 0x00; unsafe { *(p0 as uint64) = va_pref }
     uint64 p1 = args + 0x08; unsafe { *(p1 as uint64) = size }
     uint64 p2 = args + 0x10; unsafe { *(p2 as uint64) = 0 }
@@ -468,7 +495,7 @@ fn raw_kfd_alloc_userptr(uint32 fd, uint32 gpu_id, uint64 size, uint64 user_addr
 
 // kfd_ioctl_free_memory_of_gpu_args (kfd_ioctl.h:437-439): one u64.
 fn raw_kfd_free_memory_of_gpu(uint32 fd, uint64 handle) -> uint32 {
-    uint64 args = alloc(8)
+    uint64 args = _kfd_raw_scratch
     unsafe { *(args as uint64) = handle }
     return _kfd_ioctl(fd, AMDKFD_IOC_FREE_MEMORY_OF_GPU, args)
 }
@@ -479,9 +506,12 @@ fn raw_kfd_free_memory_of_gpu(uint32 fd, uint64 handle) -> uint32 {
 //   [0x10] n_devices           (u32)
 //   [0x14] n_success           (u32, in/out)
 fn raw_kfd_map_memory_to_gpu(uint32 fd, uint64 handle, uint32 gpu_id) -> uint32 {
-    uint64 dev_ids = alloc(4)
+    // Two slots needed simultaneously (args.device_ids_array_ptr -> dev_ids).
+    // Use scratch offset 96 for dev_ids — past the 88-byte CREATE_QUEUE
+    // upper bound on the primary args slot.
+    uint64 dev_ids = _kfd_raw_scratch + 96
     unsafe { *(dev_ids as uint32) = gpu_id }
-    uint64 args = alloc(24)
+    uint64 args = _kfd_raw_scratch
     unsafe { *((args + 0x00) as uint64) = handle }
     unsafe { *((args + 0x08) as uint64) = dev_ids }
     unsafe { *((args + 0x10) as uint32) = 1 }
@@ -490,9 +520,9 @@ fn raw_kfd_map_memory_to_gpu(uint32 fd, uint64 handle, uint32 gpu_id) -> uint32 
 }
 
 fn raw_kfd_unmap_memory_from_gpu(uint32 fd, uint64 handle, uint32 gpu_id) -> uint32 {
-    uint64 dev_ids = alloc(4)
+    uint64 dev_ids = _kfd_raw_scratch + 96
     unsafe { *(dev_ids as uint32) = gpu_id }
-    uint64 args = alloc(24)
+    uint64 args = _kfd_raw_scratch
     unsafe { *((args + 0x00) as uint64) = handle }
     unsafe { *((args + 0x08) as uint64) = dev_ids }
     unsafe { *((args + 0x10) as uint32) = 1 }
@@ -536,7 +566,7 @@ fn raw_kfd_create_queue(uint32 fd,
                          uint64 out_doorbell_offset_slot,
                          uint64 out_write_ptr_va_slot,
                          uint64 out_read_ptr_va_slot) -> uint32 {
-    uint64 args = alloc(88)
+    uint64 args = _kfd_raw_scratch
     uint64 i = 0
     while i < 88 { uint64 p = args + i; unsafe { *(p as uint8) = 0 }; i = i + 1 }
     unsafe { *((args + 0x00) as uint64) = ring_base }
@@ -568,7 +598,7 @@ fn raw_kfd_create_queue(uint32 fd,
 
 // kfd_ioctl_destroy_queue_args: u32 queue_id + u32 pad (8 bytes).
 fn raw_kfd_destroy_queue(uint32 fd, uint32 queue_id) -> uint32 {
-    uint64 args = alloc(8)
+    uint64 args = _kfd_raw_scratch
     unsafe { *((args + 0) as uint32) = queue_id }
     unsafe { *((args + 4) as uint32) = 0 }
     return _kfd_ioctl(fd, AMDKFD_IOC_DESTROY_QUEUE, args)

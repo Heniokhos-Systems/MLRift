@@ -47,16 +47,20 @@ primitives:
 |-------------------------------|---------------------------------------------|
 | `hipSetDevice(0)`             | no-op (returns 0)                           |
 | `hipGetDeviceCount(*ct)`      | writes 1                                    |
-| `hipMalloc(*slot, n)`         | `dev_alloc_host_visible(n)` → `*slot`       |
+| `hipMalloc(*slot, n)`         | `dev_alloc_smart_hostvis(n)` (VRAM-host-vis → GTT fallback) — kept for back-compat; silently spills to GTT under BAR1 pressure |
+| `hipMallocVramOnly(*slot, n)` | `dev_try_alloc_vram(n)` — VRAM only (kind=0, no host pointer); fails hard if VRAM exhausted.  Use for buffers the CPU never touches after init |
+| `hipMallocAuto(*slot, n)`     | `dev_alloc_smart(n)` — VRAM-first, transparent system-RAM (GTT) spill on exhaustion.  Discriminate via `dev_alloc_kind(va)`: 0=VRAM, 2=GTT |
 | `hipFree(p)`                  | `dev_free(p)`                               |
-| `hipMemcpy(d, s, n, H2D=1)`   | `dev_copy_h2d`                              |
-| `hipMemcpy(d, s, n, D2H=2)`   | `dev_copy_d2h`                              |
+| `hipMemcpy(d, s, n, H2D=1)`   | `dev_copy_h2d` (requires host pointer; not safe on `hipMallocVramOnly` allocations) |
+| `hipMemcpyHostToVram(d, s, n)`| SDMA `COPY_LINEAR` via shared GTT staging slab; works on any KFD-mapped destination including VRAM-only |
+| `hipMemcpy(d, s, n, D2H=2)`   | `dev_copy_d2h` (host-view, fast for VRAM-host-vis) |
+| `hipMemcpyVramToHost(d, s, n)`| SDMA `COPY_LINEAR` reverse + memcpy; works on any KFD-mapped source incl. VRAM-only |
 | `hipMemcpy(d, s, n, D2D=3)`   | host-view-to-host-view memcpy               |
 | `hipMemcpy(d, s, n, H2H/4)`   | plain `memcpy`                              |
 | `hipModuleLoadData(*m, blob)` | `kernel_load_from_blob(blob, 0)` → `*m`     |
 | `hipModuleGetFunction(*f, m, name)` | wrapper `{kd_va, kernarg_size}` → `*f`|
 | `hipModuleLaunchKernel(...)`  | unmarshal ptr_table → kernarg blob, dispatch + busy-poll wait |
-| `hipDeviceSynchronize()`      | no-op (`hipModuleLaunchKernel` is synchronous) |
+| `hipDeviceSynchronize()`      | spins on the shared signal counter; `hipModuleLaunchKernel` is async so this drains the queue |
 
 A single AQL queue + signal + 4 KiB scratch kernarg buffer are
 lazy-initialised on first call and reused across every launch.

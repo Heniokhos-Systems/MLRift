@@ -415,3 +415,76 @@ path. Documented here only because the script
 `scripts/mlrift-gpu-perf-mode.sh` makes it easy to set
 `profile_peak`, and someone bisecting the boost queues against the
 DPM knob would hit it.
+
+## Per-call `alloc(8)` ioctl scratch slots leak whole 4 KiB pages
+
+**Symptom:** under any workload that calls `dev_alloc_*` /
+`dev_free` / `dev_host_ptr` / any `raw_kfd_*` wrapper at high
+frequency (Noesis NEAT evolution: ~80 such calls per genome × 3
+evals/sec), host RSS grows linearly at ~10 MB/s with no obvious
+source in the launcher's own `alloc(...)` calls. At 3 minutes the
+process is ~2 GB heavy. `dealloc()` works correctly — primitive
+verified by a 1 M-iter `alloc(16384) + write + dealloc` round-trip
+with flat RSS. Smaps shows thousands of leaked `rw-p` anonymous
+mappings of small sizes (12, 16, 32, 48 bytes — all rounded to 4 KiB
+pages by the kernel).
+
+**Cause:** every MLRift `alloc(N)` is a `mmap(NULL, N+8, PROT_RW,
+MAP_PRIVATE|MAP_ANON)` syscall. The kernel rounds `N+8` up to a page
+(4 KiB minimum). An `alloc(8)` for a single ioctl-outparam slot
+consumes a full 4 KiB of RSS. When such a slot leaks (no matching
+`dealloc()`), we lose 4 KiB per call, not 16 bytes.
+
+The pattern was historically present at every site that needed an
+ioctl outparam:
+
+```mlrift
+uint64 h_slot = alloc(8); uint64 va_slot = alloc(8); uint64 mm_slot = alloc(8)
+uint32 r = raw_kfd_alloc_memory_of_gpu(_kfd_fd, _kfd_gpu_id, n, va, flags,
+                                        h_slot, va_slot, mm_slot)
+```
+
+That's 12 KiB of RSS leaked per `dev_alloc_*` call. Across the
+shim's 17+ ioctl wrappers (`dev_try_alloc_vram`,
+`dev_try_alloc_host_visible`, `dev_alloc_qdesc`,
+`dev_alloc_kernel_image`, `dev_alloc_aql_ring`,
+`dev_alloc_vram_exec`, `dev_register_userptr`, `dev_alloc_is_vram`,
+`dev_host_ptr`, `dev_free`, plus every `raw_kfd_*` wrapper in
+`std/kfd_raw.mlr`), this dominates residual host-RSS growth once
+obvious launcher-side leaks are fixed.
+
+**Fix:** persistent `static uint64[N]` scratch buffers shared across
+all ioctl wrappers. Two cover `std/kfd.mlr`'s needs: one for the
+ALLOC family (`h_slot`, `va_slot`, `mm_slot`) and one for the FREE
+/ lookup family (`h_slot`, `host_slot`). Every `alloc(8)` becomes
+`_kfd_scratch_alloc + 0/8/16` (offsets into the shared buffer).
+Single-threaded invariant holds: none of these wrappers is
+recursively re-entered, and the shim is single-threaded with respect
+to KFD ioctls.
+
+Rolled out across:
+
+- `std/kfd.mlr` — `_kfd_scratch_alloc[8]` and `_kfd_scratch_free[8]`
+  cover all `dev_alloc_*` / `dev_free` / `dev_host_ptr`.
+- `std/kfd_raw.mlr` — `_kfd_raw_scratch[16]` (128 B) covers all 17
+  bare ioctl wrappers (`raw_kfd_alloc_memory_of_gpu`,
+  `raw_kfd_free_memory_of_gpu`, `raw_kfd_map_memory_to_gpu`,
+  `raw_kfd_unmap_memory_from_gpu`, `raw_kfd_wait_events`, etc.).
+  The 128-byte slab is partitioned: bytes 0..95 for the primary args
+  blob (largest is CREATE_QUEUE at ~88 B); bytes 96..127 for a
+  secondary `dev_ids` slot used by MAP/UNMAP that needs two
+  simultaneously-live buffers.
+
+End-to-end: Noesis Phase Y NEAT evolution went from **1928 MB at
+3 min** (10.6 MB/s leak) to **5.4 MB at 3 min** (~99.7% reduction,
+flat from t=1s onward) without any other change to the workload.
+
+**Where to look first when adding a new wrapper:** any new `dev_*`
+or `raw_kfd_*` function that needs ioctl-outparam slots MUST use the
+persistent scratch, not a fresh `alloc(8)`. When auditing leaks, the
+smaps signature is unmistakable: thousands of `rw-p` anonymous
+mappings of 4-12 KiB each (one or a few 4 KiB pages), all with
+`Anonymous: == Size` (fully committed). The diagnostic recipe is in
+`/tmp/_smaps_diff.sh` (size-class delta between two snapshots) plus
+`strace -e mmap,munmap -c` to attribute alloc/free counts by size.
+DPM knob would hit it.

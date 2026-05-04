@@ -834,6 +834,98 @@ fn hipFree(uint64 dev_ptr) -> uint32 {
     return 0
 }
 
+// Like hipMalloc, but VRAM-only: no PUBLIC flag, no host-vis mmap, no
+// silent GTT fallback.  Use this for buffers the CPU never reads or
+// writes after init — e.g. neuron-state arrays, weight tensors, K/V
+// caches.  Pair with hipMemcpyHostToVram() (below) for any seeding /
+// reset operations that need to push CPU values into the buffer.
+//
+// Why this matters: the default hipMalloc → dev_alloc_smart_hostvis
+// path silently spills to GTT (system RAM mapped over PCIe) whenever
+// the host-visible-VRAM (BAR1) attempt fails — which it does on any
+// system without ReBar enabled or once BAR1 is fragmented.  GTT works
+// correctly but reads/writes from the GPU at PCIe bandwidth (~32 GB/s
+// on x16 PCIe4) instead of HBM (~960 GB/s on gfx1100), so a workload
+// that fits in VRAM but accidentally lands in GTT runs ~30× slower.
+//
+// Returns 0 on success (writes the device VA into *dev_ptr_ptr), 2 on
+// out-of-memory.  The returned VA satisfies dev_alloc_kind == 0 (VRAM,
+// no host pointer).  hipMemcpy(dst, _, _, kind=H2D) on a buffer of
+// this kind would dereference NULL — use hipMemcpyHostToVram() instead.
+fn hipMallocVramOnly(uint64 dev_ptr_ptr, uint64 size) -> uint32 {
+    _hipkfd_lazy_init()
+    uint64 dptr = dev_try_alloc_vram(size)
+    if dptr == 0 { return 2 }
+    unsafe { *(dev_ptr_ptr as uint64) = dptr }
+    return 0
+}
+
+// hipMallocAuto: VRAM-first with system-RAM spill.  Tries dev_alloc_vram
+// first (HBM-resident, no BAR1 quota, no host pointer).  On failure
+// (VRAM exhausted, fragmented, or single-alloc too large), falls back
+// to host-visible GTT (system RAM mapped into the GPU's address space
+// — readable from CPU, accessible from GPU at PCIe bandwidth).
+//
+// Either branch returns a valid device VA that you can pass to a KFD
+// dispatch.  Use dev_alloc_kind(va) to discriminate after the fact:
+//     0 = VRAM-only (no host pointer)
+//     2 = GTT       (has host pointer, addressable from CPU via dev_host_ptr)
+//
+// The seed/copy helpers hipMemcpyHostToVram and hipMemcpyVramToHost
+// work on either kind — they go through SDMA + a single shared GTT
+// staging slab, which is correct regardless of where the destination
+// lives.  The staging round-trip costs an extra PCIe traversal vs.
+// memcpy-into-host-mapped-VRAM, but on a workload that's already
+// spilling there's nothing to lose.
+//
+// Returns 0 on success, 2 if BOTH VRAM and GTT are exhausted (i.e.
+// the system is genuinely out of memory).
+fn hipMallocAuto(uint64 dev_ptr_ptr, uint64 size) -> uint32 {
+    _hipkfd_lazy_init()
+    uint64 dptr = dev_alloc_smart(size)   // VRAM → GTT fallback chain
+    if dptr == 0 { return 2 }
+    unsafe { *(dev_ptr_ptr as uint64) = dptr }
+    return 0
+}
+
+// Public H2D copy targeting a VRAM-only destination (no host pointer).
+// Uses the shim's internal SDMA queue + GTT staging slab so the dst
+// doesn't need to be host-visible.  Sequence:
+//   memcpy CPU → staging.host_ptr  (→ staging.dev_va is the same pages)
+//   _kfd_fence (drain WC buffers so SDMA sees the staged bytes)
+//   SDMA COPY_LINEAR staging.dev_va → dst_va
+//
+// Synchronous: spins until SDMA retires the copy.  Returns 0 on
+// success, 1 if SDMA queue init failed, 2 if the staging slab couldn't
+// be grown.  The staging slab is persistent (one allocation reused
+// across calls), so this isn't a per-call alloc/free leak.
+fn hipMemcpyHostToVram(uint64 dst_va, uint64 src_host, uint64 size) -> uint32 {
+    _hipkfd_lazy_init()
+    if _hipkfd_sdma_ensure() == 0 { return 1 }
+    if _hipkfd_ensure_stage(size) == 0 { return 2 }
+    memcpy(_hipkfd_stage_h, src_host, size)
+    _kfd_fence()
+    kfd_sdma_copy(_hipkfd_sdma_q, _hipkfd_stage_va, dst_va, size)
+    return 0
+}
+
+// Public D2H copy reading from a VRAM-only source (no host pointer).
+// Mirror of hipMemcpyHostToVram for the read direction.  Sequence:
+//   SDMA COPY_LINEAR src_va → staging.dev_va
+//   memcpy staging.host_ptr → CPU dst
+//
+// kfd_sdma_copy is synchronous, so the staging buffer is fully written
+// before the memcpy reads.  Returns 0 / 1 / 2 with the same meaning as
+// hipMemcpyHostToVram.
+fn hipMemcpyVramToHost(uint64 host_dst, uint64 src_va, uint64 size) -> uint32 {
+    _hipkfd_lazy_init()
+    if _hipkfd_sdma_ensure() == 0 { return 1 }
+    if _hipkfd_ensure_stage(size) == 0 { return 2 }
+    kfd_sdma_copy(_hipkfd_sdma_q, src_va, _hipkfd_stage_va, size)
+    memcpy(host_dst, _hipkfd_stage_h, size)
+    return 0
+}
+
 // Run the registered _kfd_copy_u64 kernel: device-side u64 memcpy
 // from `src_va` (typically host-mapped VRAM) into `dst_va` (typically
 // GTT staging). nbytes must be 8-byte aligned. Returns 1 if the
