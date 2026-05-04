@@ -197,18 +197,42 @@ fn dev_alloc_kind(uint64 dev_va) -> uint64 {
 }
 
 fn _kfd_alloc_lookup(uint64 va, uint64 out_handle_slot, uint64 out_host_slot) -> uint32 {
+    return _kfd_alloc_lookup_range(va, out_handle_slot, out_host_slot)
+}
+
+// Range-based lookup: returns the entry whose [base, base+size) contains
+// `va`, with the host_ptr slot adjusted by (va - base) so callers see
+// the offset host pointer directly.  Lets launchers do `dev_va +
+// element_offset` for partial reads/writes (a common pattern in CPU-
+// originating launchers — e.g. Noesis's `hipMemcpy(h, d_fh + step*N,
+// N, 2)`).  Falls back to the previous exact-match semantics when the
+// pointer happens to equal a tracked base.
+fn _kfd_alloc_lookup_range(uint64 va, uint64 out_handle_slot, uint64 out_host_slot) -> uint32 {
     uint64 i = 0
     while i < _kfd_alloc_tab_n {
         uint64 p_va = _kfd_alloc_va + i * 8
         uint64 v = 0; unsafe { *(p_va as uint64) -> v }
-        if v == va {
-            uint64 p_h  = _kfd_alloc_handle + i * 8
-            uint64 p_hp = _kfd_alloc_host   + i * 8
-            uint64 hh = 0; unsafe { *(p_h as uint64) -> hh }
-            uint64 hp = 0; unsafe { *(p_hp as uint64) -> hp }
-            unsafe { *(out_handle_slot as uint64) = hh }
-            unsafe { *(out_host_slot as uint64) = hp }
-            return 0
+        if v <= va {
+            uint64 p_s = _kfd_alloc_size + i * 8
+            uint64 sz = 0; unsafe { *(p_s as uint64) -> sz }
+            if va < v + sz {
+                uint64 p_h  = _kfd_alloc_handle + i * 8
+                uint64 p_hp = _kfd_alloc_host   + i * 8
+                uint64 hh = 0; unsafe { *(p_h as uint64) -> hh }
+                uint64 hp = 0; unsafe { *(p_hp as uint64) -> hp }
+                unsafe { *(out_handle_slot as uint64) = hh }
+                // Adjust host_ptr by the same offset (only if host
+                // pointer is non-zero — kind=0 VRAM-only entries
+                // report host=0 and dev_host_ptr will reject them
+                // with "not host-visible" anyway).
+                if hp == 0 {
+                    unsafe { *(out_host_slot as uint64) = 0 }
+                } else {
+                    uint64 adj = hp + (va - v)
+                    unsafe { *(out_host_slot as uint64) = adj }
+                }
+                return 0
+            }
         }
         i = i + 1
     }
@@ -497,6 +521,7 @@ fn dev_host_ptr(uint64 dev_ptr) -> uint64 {
     if host == 0 { kfd_die("dev_host_ptr: not host-visible", dev_ptr) }
     return host
 }
+
 
 fn dev_free(uint64 dev_ptr) {
     uint64 h_slot = alloc(8); uint64 host_slot = alloc(8)
