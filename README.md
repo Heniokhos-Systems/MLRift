@@ -90,7 +90,7 @@ Token-id output of every MLRift row is bit-identical to HuggingFace
 | MLRift `--target=amdgpu-native` (matmul only, `MLRIFT_GPU_MATMUL_BF16=0`) | f32 / f32 | 35.2 | 1 920 | 0.85× vs ROCm fp32 |
 | **MLRift `--target=amdgpu-native` + `MLRIFT_GPU_FULL_FORWARD=1`** | bf16 / f32 | **55.4** | 1 920 | **1.33× vs ROCm fp32** |
 | **+ `MLRIFT_GPU_FLUSH_EVERY_N=28`** (slice 2 — drop per-layer sync) | bf16 / f32 | **60.4** | 1 920 | **1.45× vs ROCm fp32** |
-| **+ slice 2b** (fused `residual_rmsnorm` mid-layer) | bf16 / f32 | **60.7** | 1 920 | **1.46× vs ROCm fp32** |
+| **+ slice 2b** (fused `residual_rmsnorm` mid-layer + cross-layer) | bf16 / f32 | **61.4** | 1 920 | **1.48× vs ROCm fp32** |
 | **+ `MLRIFT_GPU_MATMUL_BF16=0`** (slice 3 — pure fp32 weights) | f32 / f32 | **59.1** | 2 480 | **1.42× vs ROCm fp32** |
 | **MLRift + `GPU_FULL_FORWARD` + `SPEC_K=4` + LONG-prompt (PLD)** | bf16 / f32 | **87.5** | 1 920 | **1.19× vs ROCm bf16** |
 

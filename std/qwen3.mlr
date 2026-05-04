@@ -1302,6 +1302,26 @@ fn qwen3_forward_layer_qkv_batched_gpu(u64 d_x_in_arr_ptr,
     return 0
 }
 
+// Slice 2b cross-layer fusion: chain layer L's final resid into
+// layer L+1's input_norm via one gpu_residual_rmsnorm dispatch.
+// Caller passes layer L's d_x_out (device residual buffer) and
+// layer L+1's input_norm_w (bf16 host pointer; gets cached as f32).
+// b_mid / b_ff_out / b_x_norm are pulled from the qwen3-gpu statics.
+// Returns 0 on success.  Falls back to plain resid + rmsnorm if the
+// fused .co isn't loaded — should never happen post-init.
+@export
+fn qwen3_gpu_chain_resid_to_next_norm(u64 d_x_out, u64 next_input_norm_w_bf16,
+                                       u64 batch_idx) -> u64 {
+    if _qwen3_gpu_pipeline_init() == 0 { return 1 }
+    u64 hidden = QWEN3_HIDDEN
+    u64 b_mid     = _gpuq_d_mid     + batch_idx * hidden * 4
+    u64 b_ff_out  = _gpuq_d_ff_out  + batch_idx * hidden * 4
+    u64 b_x_norm  = _gpuq_d_x_norm  + batch_idx * hidden * 4
+    u64 d_gamma = gpu_cache_bf16_as_f32(next_input_norm_w_bf16, hidden)
+    if d_gamma == 0 { return 1 }
+    return gpu_residual_rmsnorm_1024_to_dev(b_mid, b_ff_out, d_x_out, b_x_norm, d_gamma, 1)
+}
+
 // phase_mask bits:
 //   0x01  input_norm + qkv matmul       (steps 1-2)
 //   0x02  qkv_split + qknorm + rope + attn  (steps 3-8)
@@ -1319,6 +1339,12 @@ fn qwen3_forward_layer_qkv_batched_gpu(u64 d_x_in_arr_ptr,
 //   0x1000  inside 0x02, skip qkv_split   (caller batches it)
 //   0x2000  inside 0x02, skip qknorm K    (caller batches it via stage buffer)
 //   0x4000  inside 0x02, skip K-rope      (caller batches it via stage buffer)
+//   0x8000  inside 0x01, skip input_norm  (caller pre-populated b_x_norm
+//                                          via cross-layer fused
+//                                          residual_rmsnorm — slice 2b)
+//   0x10000 inside 0x80, skip final resid (caller chains it into the
+//                                          next layer's input_norm via
+//                                          fused residual_rmsnorm — slice 2b)
 // Legacy path uses 0xFF (no skip bits) — every sub-step runs inline.
 // Batched path uses 0x02|0x200, 0x08|0x100 plus the batched matmul +
 // post_norm + Q-rope calls dispatched separately by qwen3_generate.
@@ -1357,10 +1383,15 @@ fn qwen3_forward_layer_gpu(u64 d_x_in, u64 d_x_out,
     u64 b_ff_out   = _gpuq_d_ff_out   + batch_idx * hidden  * 4
 
     // 1+2.  input_norm + qkv matmul (gated by 0x01).
+    // Slice 2b cross-layer fusion: skip input_norm when 0x8000 is set
+    // (caller already produced b_x_norm via gpu_residual_rmsnorm chained
+    // off the previous layer's final resid).
     if (phase_mask & 0x01) != 0 {
-        u64 d_in_gamma = gpu_cache_bf16_as_f32(w.input_norm_w, hidden)
-        if d_in_gamma == 0 { return 1 }
-        if gpu_rmsnorm_1024_to_dev(b_x_norm, d_x_in, d_in_gamma, 1) != 0 { return 1 }
+        if (phase_mask & 0x8000) == 0 {
+            u64 d_in_gamma = gpu_cache_bf16_as_f32(w.input_norm_w, hidden)
+            if d_in_gamma == 0 { return 1 }
+            if gpu_rmsnorm_1024_to_dev(b_x_norm, d_x_in, d_in_gamma, 1) != 0 { return 1 }
+        }
         if gpu_matmul_to_dev(b_qkv, b_x_norm, w.q_proj_w, qkv_dim, hidden) != 0 { return 1 }
     }
 
@@ -1536,9 +1567,13 @@ fn qwen3_forward_layer_gpu(u64 d_x_in, u64 d_x_out,
     if (phase_mask & 0x40) != 0 {
         if gpu_matmul_to_dev(b_ff_out, b_ff, w.down_proj_w, hidden, ff) != 0 { return 1 }
     }
-    // Step 15: final resid (0x80).
+    // Step 15: final resid (0x80).  Slice 2b cross-layer fusion:
+    // skip when 0x10000 is set (caller chains it into the next
+    // layer's input_norm via fused residual_rmsnorm).
     if (phase_mask & 0x80) != 0 {
-        if gpu_resid_add_to_dev(d_x_out, b_mid, b_ff_out, hidden) != 0 { return 1 }
+        if (phase_mask & 0x10000) == 0 {
+            if gpu_resid_add_to_dev(d_x_out, b_mid, b_ff_out, hidden) != 0 { return 1 }
+        }
     }
 
     // Sync 2 — drain before next layer reads d_x_out.  Skip when we

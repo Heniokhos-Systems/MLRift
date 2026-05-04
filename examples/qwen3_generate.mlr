@@ -833,12 +833,28 @@ fn main() {
                     // that doesn't accumulate the drifting state.
                     gpu_pipeline_flush()
                 } else {
-                    // M_eff == 1: legacy single-stream path with full mask.
+                    // M_eff == 1: legacy single-stream path.
+                    // Slice 2b cross-layer fusion: when N=1024 (qwen3-0.6B
+                    // hidden), chain layer L's final resid into layer L+1's
+                    // input_norm via gpu_residual_rmsnorm — saves 1 launch
+                    // per layer boundary.  Adds 0x10000 to skip the
+                    // intra-layer final resid for L < n-1, then issues the
+                    // fused dispatch with next layer's gamma; layer L+1
+                    // gets 0x8000 to skip its own input_norm.
                     u64 d_in_b  = 0; unsafe { *((d_in_arr  + 0) as u64) -> d_in_b }
                     u64 d_out_b = 0; unsafe { *((d_out_arr + 0) as u64) -> d_out_b }
                     u64 kc = k_cache + layer * batch_stride
                     u64 vc = v_cache + layer * batch_stride
-                    if qwen3_forward_layer_gpu(d_in_b, d_out_b, w, pos, kc, vc, num_workers, 0, 0xFF) != 0 { exit(1) }
+                    u64 mask_self = 0xFF
+                    if hidden == 1024 {
+                        if layer > 0 { mask_self = mask_self | 0x8000 }
+                        if layer < n_layers - 1 { mask_self = mask_self | 0x10000 }
+                    }
+                    if qwen3_forward_layer_gpu(d_in_b, d_out_b, w, pos, kc, vc, num_workers, 0, mask_self) != 0 { exit(1) }
+                    if hidden == 1024 && layer < n_layers - 1 {
+                        Qwen3LayerWeights w_next = layers_arr + (layer + 1) * 88
+                        if qwen3_gpu_chain_resid_to_next_norm(d_out_b, w_next.input_norm_w, 0) != 0 { exit(1) }
+                    }
                 }
                 // Swap ping-pong pointers — every M_eff row, not just the
                 // batch_size streams (in spec mode batch_size=1 but we have
