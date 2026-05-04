@@ -1448,24 +1448,46 @@ fn qwen3_forward_layer_gpu(u64 d_x_in, u64 d_x_out,
             if gpu_qkv_split_f32_to_dev(b_qkv, d_k_slot, d_v_slot) != 0 { return 1 }
         }
 
-        // 4b. qknorm: in-place RMSNorm on each Q head + each K head.
-        //     Q-side skippable by 0x800 (caller batches via extract_q +
-        //     batched qknorm).  K-side stays per-stream — K-cache slots
-        //     are non-contiguous across streams.
-        if (phase_mask & 0x800) == 0 {
-            if gpu_qknorm_f32_to_dev(b_q_attn, b_qkv, d_q_gamma, nh) != 0 { return 1 }
+        // 4b+c. Slice 2c fused qknorm+rope_qk: when none of the per-op
+        //       skip bits are set (Q-qknorm 0x800, K-qknorm 0x2000,
+        //       Q-rope 0x200, K-rope 0x4000), do an extract_q copy
+        //       (b_qkv → b_q_attn) followed by ONE fused launch over
+        //       (nh + nkv) WGs in place of four separate launches.
+        //       Net launches: 2 instead of 4, saving 2 launches/layer
+        //       (= 56/token at 28 layers).  Gated by 0x40000 so
+        //       benchmarks can compare on/off; default ON.
+        u64 want_fused = 1
+        if (phase_mask & 0x800)  != 0 { want_fused = 0 }
+        if (phase_mask & 0x2000) != 0 { want_fused = 0 }
+        if (phase_mask & 0x200)  != 0 { want_fused = 0 }
+        if (phase_mask & 0x4000) != 0 { want_fused = 0 }
+        if (phase_mask & 0x40000) != 0 { want_fused = 0 }    // explicit opt-out
+        u64 fused_done = 0
+        if want_fused != 0 {
+            // Copy Q-slab from b_qkv into b_q_attn first, then fused
+            // kernel does qknorm + rope_qk in place on b_q_attn and
+            // d_k_slot.
+            if gpu_extract_q_qwen3_f32_to_dev(b_qkv, b_q_attn, 1) != 0 { return 1 }
+            if gpu_qknorm_rope_qk_fused_to_dev(b_q_attn, d_k_slot,
+                                                d_q_gamma, d_k_gamma,
+                                                _gpuq_d_rope_cos, _gpuq_d_rope_sin,
+                                                nh, nkv) != 0 { return 1 }
+            fused_done = 1
         }
-        if (phase_mask & 0x2000) == 0 {
-            if gpu_qknorm_f32_to_dev(d_k_slot, d_k_slot, d_k_gamma, nkv) != 0 { return 1 }
-        }
-
-        // 4c. RoPE: in-place per-head rotation.  Q-rope skippable by
-        //     0x200, K-rope by 0x4000.
-        if (phase_mask & 0x200) == 0 {
-            if gpu_rope_f32_to_dev(b_q_attn, _gpuq_d_rope_cos, _gpuq_d_rope_sin, nh) != 0 { return 1 }
-        }
-        if (phase_mask & 0x4000) == 0 {
-            if gpu_rope_f32_to_dev(d_k_slot, _gpuq_d_rope_cos, _gpuq_d_rope_sin, nkv) != 0 { return 1 }
+        if fused_done == 0 {
+            // Legacy path: 4 separate launches.
+            if (phase_mask & 0x800) == 0 {
+                if gpu_qknorm_f32_to_dev(b_q_attn, b_qkv, d_q_gamma, nh) != 0 { return 1 }
+            }
+            if (phase_mask & 0x2000) == 0 {
+                if gpu_qknorm_f32_to_dev(d_k_slot, d_k_slot, d_k_gamma, nkv) != 0 { return 1 }
+            }
+            if (phase_mask & 0x200) == 0 {
+                if gpu_rope_f32_to_dev(b_q_attn, _gpuq_d_rope_cos, _gpuq_d_rope_sin, nh) != 0 { return 1 }
+            }
+            if (phase_mask & 0x4000) == 0 {
+                if gpu_rope_f32_to_dev(d_k_slot, _gpuq_d_rope_cos, _gpuq_d_rope_sin, nkv) != 0 { return 1 }
+            }
         }
 
         // 4d. Fused attention (skippable by 0x400 when caller batches).

@@ -650,6 +650,49 @@ fn gpu_rmsnorm_1024_to_dev(u64 d_out, u64 d_in, u64 d_gamma, u64 M) -> u64 {
     return gpu_rmsnorm_hidden_to_dev(d_out, d_in, d_gamma, M, 1024)
 }
 
+// Slice 2c — fused qknorm + rope_qk.  One launch over (nh_q + nh_k) WGs
+// instead of four separate launches (qknorm Q, qknorm K, rope Q, rope K).
+// Kernarg layout (must match the emit body):
+//   0x00 q_inout, 0x08 k_inout, 0x10 q_gamma, 0x18 k_gamma,
+//   0x20 cos_ptr, 0x28 sin_ptr, 0x30 nh_q, 0x38 nh_k
+// Grid = nh_q + nh_k, block_x = 128.  Loads /tmp/qknorm_rope_qk_fused_f32.co.
+static u64 _gpu_fh_qknorm_rope_qk      = 0
+static u64 _gpu_fh_qknorm_rope_qk_init = 0
+
+fn gpu_qknorm_rope_qk_fused_to_dev(u64 d_q_inout, u64 d_k_inout,
+                                     u64 d_q_gamma, u64 d_k_gamma,
+                                     u64 d_cos, u64 d_sin,
+                                     u64 nh_q, u64 nh_k) -> u64 {
+    if _gpu_fh_qknorm_rope_qk_init == 0 {
+        _gpu_fh_qknorm_rope_qk_init = 1
+        _gpu_fh_qknorm_rope_qk = _gpu_mm_load_co(
+            "/tmp/qknorm_rope_qk_fused_f32.co", "qknorm_rope_qk_fused_f32")
+    }
+    if _gpu_fh_qknorm_rope_qk == 0 { return 1 }
+    u64 g0 = alloc(8); unsafe { *(g0 as u64) = d_q_inout }
+    u64 g1 = alloc(8); unsafe { *(g1 as u64) = d_k_inout }
+    u64 g2 = alloc(8); unsafe { *(g2 as u64) = d_q_gamma }
+    u64 g3 = alloc(8); unsafe { *(g3 as u64) = d_k_gamma }
+    u64 g4 = alloc(8); unsafe { *(g4 as u64) = d_cos }
+    u64 g5 = alloc(8); unsafe { *(g5 as u64) = d_sin }
+    u64 g6 = alloc(8); unsafe { *(g6 as u64) = nh_q }
+    u64 g7 = alloc(8); unsafe { *(g7 as u64) = nh_k }
+    u64 kp = alloc(8 * 8)
+    unsafe { *(kp        as u64) = g0 }
+    unsafe { *((kp +  8) as u64) = g1 }
+    unsafe { *((kp + 16) as u64) = g2 }
+    unsafe { *((kp + 24) as u64) = g3 }
+    unsafe { *((kp + 32) as u64) = g4 }
+    unsafe { *((kp + 40) as u64) = g5 }
+    unsafe { *((kp + 48) as u64) = g6 }
+    unsafe { *((kp + 56) as u64) = g7 }
+    u32 grid32 = nh_q + nh_k
+    u32 err = hipModuleLaunchKernel(_gpu_fh_qknorm_rope_qk,
+                                     grid32, 1, 1, 128, 1, 1, 0, 0, kp, 0)
+    if err != 0 { return 1 }
+    return 0
+}
+
 // Slice 2b — fused residual_add + rmsnorm.  One launch instead of
 // two for the resid+post_norm pair (twice per qwen3 layer).
 // Kernarg layout (SGPR-reorder trick — must match the emit body):

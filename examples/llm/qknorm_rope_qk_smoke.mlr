@@ -1,0 +1,222 @@
+// Smoke test for slice 2c: fused qknorm + rope_qk over Q+K heads.
+// Loads /tmp/qknorm_rope_qk_fused_f32.co, runs at nh_q=16, nh_k=8 with
+// synthetic q/k/gamma/cos/sin, and verifies output vs CPU reference:
+//   per head h:
+//     x_norm[i] = x[h, i] * rsqrt(mean(x[h]²) + 1e-6) * gamma[i]
+//     out[h, i]    = x_norm[i]    * cos[i] - x_norm[i+64] * sin[i]   (i < 64)
+//     out[h, i+64] = x_norm[i]    * sin[i] + x_norm[i+64] * cos[i]
+// Both Q and K rotate in-place, sharing cos/sin tables.
+
+import "../../std/hip.mlr"
+import "../../std/io.mlr"
+import "../../std/fmt.mlr"
+import "../../std/string.mlr"
+
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn getenv(uint64 name) -> uint64
+
+fn die(uint64 msg, uint64 code) {
+    print_str(msg); print_str(" e="); u64 s = fmt_dec(code); print_str(s); dealloc(s); print_str("\n"); exit(1)
+}
+
+fn main() {
+    uint32 err = hipSetDevice(0); if err != 0 { die("setDev", err) }
+    u64 fd = file_open("/tmp/qknorm_rope_qk_fused_f32.co", 0)
+    if fd > 0xFFFFFFFFFFFFF000 { die("missing co", 0) }
+    u64 sz = file_size(fd); u64 blob = alloc(sz)
+    file_read(fd, blob, sz); file_close(fd)
+    u64 mod_slot = alloc(8)
+    err = hipModuleLoadData(mod_slot, blob); if err != 0 { die("LoadData", err) }
+    u64 mod = 0; unsafe { *(mod_slot as u64) -> mod }
+    u64 fh_slot = alloc(8)
+    err = hipModuleGetFunction(fh_slot, mod, "qknorm_rope_qk_fused_f32"); if err != 0 { die("getFn", err) }
+    u64 fh = 0; unsafe { *(fh_slot as u64) -> fh }
+
+    u64 hd = 128
+    u64 nh_q = 16
+    u64 nh_k = 8
+    u64 q_dim = nh_q * hd       // 2048
+    u64 k_dim = nh_k * hd       // 1024
+    u64 grid = nh_q + nh_k      // 24
+
+    // Allocate device buffers.
+    u64 d_q = 0; u64 d_k = 0; u64 d_qg = 0; u64 d_kg = 0; u64 d_cos = 0; u64 d_sin = 0
+    u64 slot
+    slot = alloc(8); err = hipMalloc(slot, q_dim*4); if err != 0 { die("mQ", err) }; unsafe { *(slot as u64) -> d_q }
+    slot = alloc(8); err = hipMalloc(slot, k_dim*4); if err != 0 { die("mK", err) }; unsafe { *(slot as u64) -> d_k }
+    slot = alloc(8); err = hipMalloc(slot, hd*4);    if err != 0 { die("mQg", err) }; unsafe { *(slot as u64) -> d_qg }
+    slot = alloc(8); err = hipMalloc(slot, hd*4);    if err != 0 { die("mKg", err) }; unsafe { *(slot as u64) -> d_kg }
+    slot = alloc(8); err = hipMalloc(slot, 64*4);    if err != 0 { die("mCos", err) }; unsafe { *(slot as u64) -> d_cos }
+    slot = alloc(8); err = hipMalloc(slot, 64*4);    if err != 0 { die("mSin", err) }; unsafe { *(slot as u64) -> d_sin }
+
+    // Synthetic data.
+    u64 h_q = alloc(q_dim*4); u64 h_k = alloc(k_dim*4)
+    u64 h_qg = alloc(hd*4); u64 h_kg = alloc(hd*4)
+    u64 h_cos = alloc(64*4); u64 h_sin = alloc(64*4)
+    u64 h_qref = alloc(q_dim*4); u64 h_kref = alloc(k_dim*4)
+    u64 h_qout = alloc(q_dim*4); u64 h_kout = alloc(k_dim*4)
+    u64 i = 0
+    while i < q_dim {
+        f64 v = (int_to_f64(i % 1009) * 0.001) - 0.4
+        unsafe { *((h_q + i*4) as f32) = f64_to_f32(v) }
+        i = i + 1
+    }
+    i = 0
+    while i < k_dim {
+        f64 v = (int_to_f64((i + 31) % 997) * 0.0008) - 0.3
+        unsafe { *((h_k + i*4) as f32) = f64_to_f32(v) }
+        i = i + 1
+    }
+    i = 0
+    while i < hd {
+        f64 vq = (int_to_f64(i % 53) * 0.01) + 0.5
+        f64 vk = (int_to_f64(i % 47) * 0.012) + 0.6
+        unsafe { *((h_qg + i*4) as f32) = f64_to_f32(vq) }
+        unsafe { *((h_kg + i*4) as f32) = f64_to_f32(vk) }
+        i = i + 1
+    }
+    i = 0
+    while i < 64 {
+        // Synthetic but unique cos/sin (not actual rope tables).
+        f64 vc = (int_to_f64(i) * 0.011) - 0.3
+        f64 vs = (int_to_f64(i) * 0.013) + 0.2
+        unsafe { *((h_cos + i*4) as f32) = f64_to_f32(vc) }
+        unsafe { *((h_sin + i*4) as f32) = f64_to_f32(vs) }
+        i = i + 1
+    }
+    err = hipMemcpy(d_q, h_q, q_dim*4, 1); if err != 0 { die("H2D q", err) }
+    err = hipMemcpy(d_k, h_k, k_dim*4, 1); if err != 0 { die("H2D k", err) }
+    err = hipMemcpy(d_qg, h_qg, hd*4, 1); if err != 0 { die("H2D qg", err) }
+    err = hipMemcpy(d_kg, h_kg, hd*4, 1); if err != 0 { die("H2D kg", err) }
+    err = hipMemcpy(d_cos, h_cos, 64*4, 1); if err != 0 { die("H2D cos", err) }
+    err = hipMemcpy(d_sin, h_sin, 64*4, 1); if err != 0 { die("H2D sin", err) }
+
+    // CPU reference: qknorm + rope.
+    u64 r = 0
+    while r < nh_q + nh_k {
+        u64 is_k = 0
+        u64 head_in_set = r
+        u64 in_ptr = h_q
+        u64 ref_ptr = h_qref
+        u64 g_ptr = h_qg
+        if r >= nh_q {
+            is_k = 1
+            head_in_set = r - nh_q
+            in_ptr = h_k
+            ref_ptr = h_kref
+            g_ptr = h_kg
+        }
+        f64 sumsq = 0.0
+        u64 c = 0
+        u64 base_off = head_in_set * hd
+        while c < hd {
+            f32 x = 0.0f; unsafe { *((in_ptr + (base_off + c)*4) as f32) -> x }
+            f64 xd = f32_to_f64(x)
+            sumsq = sumsq + xd * xd
+            c = c + 1
+        }
+        f64 mean = sumsq / int_to_f64(hd)
+        f64 me = mean + 0.000001
+        f64 rrms = 1.0 / sqrt_f64(me)
+        // x_norm scratch.
+        u64 h_xnorm = alloc(hd*4)
+        c = 0
+        while c < hd {
+            f32 x = 0.0f; unsafe { *((in_ptr + (base_off + c)*4) as f32) -> x }
+            f32 g = 0.0f; unsafe { *((g_ptr + c*4) as f32) -> g }
+            f64 xd = f32_to_f64(x)
+            f64 res = xd * rrms * f32_to_f64(g)
+            unsafe { *((h_xnorm + c*4) as f32) = f64_to_f32(res) }
+            c = c + 1
+        }
+        // rope rotation
+        c = 0
+        while c < 64 {
+            f32 a = 0.0f; unsafe { *((h_xnorm + c*4)       as f32) -> a }
+            f32 b = 0.0f; unsafe { *((h_xnorm + (c+64)*4)  as f32) -> b }
+            f32 cs = 0.0f; unsafe { *((h_cos + c*4) as f32) -> cs }
+            f32 sn = 0.0f; unsafe { *((h_sin + c*4) as f32) -> sn }
+            f64 ad = f32_to_f64(a); f64 bd = f32_to_f64(b)
+            f64 csd = f32_to_f64(cs); f64 snd = f32_to_f64(sn)
+            f64 ra = ad * csd - bd * snd
+            f64 rb = ad * snd + bd * csd
+            unsafe { *((ref_ptr + (base_off + c)*4)        as f32) = f64_to_f32(ra) }
+            unsafe { *((ref_ptr + (base_off + c + 64)*4)   as f32) = f64_to_f32(rb) }
+            c = c + 1
+        }
+        dealloc(h_xnorm)
+        r = r + 1
+    }
+
+    // Kernarg: q_inout, k_inout, q_gamma, k_gamma, cos, sin, nh_q, nh_k.
+    u64 g0 = alloc(8); unsafe { *(g0 as u64) = d_q }
+    u64 g1 = alloc(8); unsafe { *(g1 as u64) = d_k }
+    u64 g2 = alloc(8); unsafe { *(g2 as u64) = d_qg }
+    u64 g3 = alloc(8); unsafe { *(g3 as u64) = d_kg }
+    u64 g4 = alloc(8); unsafe { *(g4 as u64) = d_cos }
+    u64 g5 = alloc(8); unsafe { *(g5 as u64) = d_sin }
+    u64 g6 = alloc(8); unsafe { *(g6 as u64) = nh_q }
+    u64 g7 = alloc(8); unsafe { *(g7 as u64) = nh_k }
+    u64 kp = alloc(8*8)
+    unsafe { *(kp        as u64) = g0 }
+    unsafe { *((kp +  8) as u64) = g1 }
+    unsafe { *((kp + 16) as u64) = g2 }
+    unsafe { *((kp + 24) as u64) = g3 }
+    unsafe { *((kp + 32) as u64) = g4 }
+    unsafe { *((kp + 40) as u64) = g5 }
+    unsafe { *((kp + 48) as u64) = g6 }
+    unsafe { *((kp + 56) as u64) = g7 }
+
+    err = hipModuleLaunchKernel(fh, grid, 1, 1, 128, 1, 1, 0, 0, kp, 0)
+    if err != 0 { die("L", err) }
+    err = hipDeviceSynchronize(); if err != 0 { die("sync", err) }
+    err = hipMemcpy(h_qout, d_q, q_dim*4, 2); if err != 0 { die("D2H q", err) }
+    err = hipMemcpy(h_kout, d_k, k_dim*4, 2); if err != 0 { die("D2H k", err) }
+
+    // Verify.
+    u64 fail_q = 0; u64 fail_k = 0
+    f32 max_dq = 0.0f; f32 max_dk = 0.0f
+    u64 j = 0
+    while j < q_dim {
+        f32 ref = 0.0f; unsafe { *((h_qref + j*4) as f32) -> ref }
+        f32 dev = 0.0f; unsafe { *((h_qout + j*4) as f32) -> dev }
+        f32 d = dev - ref; if d < 0.0f { d = 0.0f - d }
+        if d > max_dq { max_dq = d }
+        if d > 0.001f { fail_q = fail_q + 1 }
+        j = j + 1
+    }
+    j = 0
+    while j < k_dim {
+        f32 ref = 0.0f; unsafe { *((h_kref + j*4) as f32) -> ref }
+        f32 dev = 0.0f; unsafe { *((h_kout + j*4) as f32) -> dev }
+        f32 d = dev - ref; if d < 0.0f { d = 0.0f - d }
+        if d > max_dk { max_dk = d }
+        if d > 0.001f { fail_k = fail_k + 1 }
+        j = j + 1
+    }
+    print_str("fail_q: "); u64 sf1 = fmt_dec(fail_q); print_str(sf1); dealloc(sf1); print_str("\n")
+    print_str("fail_k: "); u64 sf2 = fmt_dec(fail_k); print_str(sf2); dealloc(sf2); print_str("\n")
+    // Bucket abs-diff distribution.
+    u64 ulps_q = 0; u64 ulps_k = 0
+    j = 0
+    while j < q_dim {
+        f32 ref = 0.0f; unsafe { *((h_qref + j*4) as f32) -> ref }
+        f32 dev = 0.0f; unsafe { *((h_qout + j*4) as f32) -> dev }
+        f32 d = dev - ref; if d < 0.0f { d = 0.0f - d }
+        if d > 0.00001f { ulps_q = ulps_q + 1 }
+        j = j + 1
+    }
+    j = 0
+    while j < k_dim {
+        f32 ref = 0.0f; unsafe { *((h_kref + j*4) as f32) -> ref }
+        f32 dev = 0.0f; unsafe { *((h_kout + j*4) as f32) -> dev }
+        f32 d = dev - ref; if d < 0.0f { d = 0.0f - d }
+        if d > 0.00001f { ulps_k = ulps_k + 1 }
+        j = j + 1
+    }
+    print_str("d>1e-5 q: "); u64 sup1 = fmt_dec(ulps_q); print_str(sup1); dealloc(sup1); print_str("\n")
+    print_str("d>1e-5 k: "); u64 sup2 = fmt_dec(ulps_k); print_str(sup2); dealloc(sup2); print_str("\n")
+    if fail_q != 0 || fail_k != 0 { exit(1) }
+    print_str("PASS\n")
+    exit(0)
+}

@@ -9345,6 +9345,275 @@ fn _emit_residual_rmsnorm_f32_body_N_eps(uint64 args_desc, uint64 N, uint64 eps_
     uint64 a13 = args_desc + 104; unsafe { *(a13 as uint64) = AMD_ARG_KIND_BY_VALUE }
 }
 
+// Slice 2c — fused qknorm + rope_qk over Q+K heads in one launch.
+//
+// Replaces the four per-layer dispatches (qknorm Q, qknorm K, rope Q,
+// rope K) with one launch over (n_q_heads + n_kv_heads) WGs.  Saves 3
+// launches per qwen3 layer × 28 layers = 84 launches/token.
+//
+// Two-phase body:
+//   Phase 1: rmsnorm at N=128, eps=1e-6 — clones the body of
+//            _emit_rmsnorm_f32_body_N_eps but replaces the final
+//            global_store with an LDS store (staging for rope).
+//   s_barrier
+//   Phase 2: lanes 0..63 only.  Read pair (lane, lane+64) from LDS,
+//            multiply by cos/sin, store rotated (a*c-b*s, a*s+b*c)
+//            back to global at base+(head_in_set*128 + lane | +64)*4.
+//
+// Per-WG SGPR setup (after kernarg loads + cselects):
+//   s3            = wg_id_x stash (preserved through SMEM clobber)
+//   s4..s5        = chosen base (q_inout if !is_k else k_inout)
+//   s6..s7        = base copy (rmsnorm body uses s6..s7 for "out")
+//   s8..s9        = chosen gamma
+//   s10           = nh_q + nh_k (M for body's bound check)
+//   s12           = 128 (N for body's row-stride)
+//   s14           = scratch (rmsnorm's row*N + LDS reduce save_exec)
+//   s15           = head_in_set (replaces wg_id_x for body)
+//   s20..s21      = cos_ptr (preserved)
+//   s22..s23      = sin_ptr (preserved)
+//   s24           = nh_q (low 32, for is_k discriminator)
+//   s26           = nh_k (unused after total compute)
+//
+// VGPRs: same as rmsnorm body (v0..v13) plus v14..v17 for cos/sin
+// addr-pair build in phase 2, and v18..v21 for cos/sin loads + math.
+// rsrc1 bumped to 0xE0AF0042 (24 VGPR / 24 SGPR grant) — same as
+// slice 2b's residual_rmsnorm.  rsrc2 = 0x9E (USER_SGPR_COUNT=15,
+// WG_ID_X at s15 — we stash to s3 BEFORE the SMEM load that would
+// clobber s15).
+//
+// Every dword below is llvm-mc verified for gfx1100.
+fn _emit_qknorm_rope_qk_fused_f32_body(uint64 args_desc) {
+    asm_init()
+    uint64 N = 128
+    uint64 Np = 128
+    uint64 inv_n_bits = _f32_bits_recip(N)        // 0x3C000000 = 1/128
+    uint64 eps_bits = 0x358637BD                  // f32 bits of 1e-6
+
+    // ── Stash WG_ID_X (s15) into s3 before the second SMEM load
+    // (s_load_b128 s[20:23] doesn't clobber s15, but s_load_b256 ABOVE
+    // s15 would; here we keep the same pattern as the gemm s15-stash
+    // for safety against future kernarg-layout changes).
+    asm_u32_arch(0xBE83000F, 0xBE83030F) // s_mov_b32 s3, s15
+
+    // ── Kernarg loads (8 args × 8 bytes = 64 bytes)
+    //   0x00..0x1F → s[4:11]   (q_inout, k_inout, q_gamma, k_gamma)
+    //   0x20..0x2F → s[20:23]  (cos_ptr, sin_ptr)
+    //   0x30..0x3F → s[24:27]  (nh_q, nh_k)
+    asm_u32_arch(0xF40C0100, 0xF40C0100) // s_load_b256 s[4:11], s[0:1], 0x0
+    asm_u32_arch(0xF8000000, 0xFA000000)
+    asm_u32_arch(0xF4080500, 0xF4080500) // s_load_b128 s[20:23], s[0:1], 0x20
+    asm_u32_arch(0xF8000020, 0xFA000020)
+    asm_u32_arch(0xF4080600, 0xF4080600) // s_load_b128 s[24:27], s[0:1], 0x30
+    asm_u32_arch(0xF8000030, 0xFA000030)
+    asm_u32_arch(0xBF89FC07, 0xBF8CC07F) // s_waitcnt lgkmcnt(0)
+
+    // ── Compute is_k, head_in_set, chosen base/gamma ─────────────────
+    // s2 = head - nh_q  (candidate head_in_set when is_k).  Sets SCC,
+    // but we re-set SCC via s_cmp_ge_u32 below before any cselect.
+    asm_u32     (0x80821803)             // s_sub_u32 s2, s3, s24
+    // SCC = is_k = (head >= nh_q)
+    asm_u32     (0xBF091803)             // s_cmp_ge_u32 s3, s24
+    // Cselects all read the SCC set above and don't modify it.
+    asm_u32     (0x98040406)             // s_cselect_b32 s4, s6, s4   (base_lo)
+    asm_u32     (0x98050507)             // s_cselect_b32 s5, s7, s5   (base_hi)
+    asm_u32     (0x9808080A)             // s_cselect_b32 s8, s10, s8  (gamma_lo)
+    asm_u32     (0x9809090B)             // s_cselect_b32 s9, s11, s9  (gamma_hi)
+    asm_u32     (0x980F0302)             // s_cselect_b32 s15, s2, s3  (head_in_set)
+    // After cselects, s10/s11 are dead.  Compute s10 = nh_q + nh_k for
+    // the rmsnorm body's bound check.  s_add_u32 sets SCC but we no
+    // longer need the is_k value.
+    asm_u32     (0x800A1A18)             // s_add_u32 s10, s24, s26
+    // Copy chosen base into s6:s7 so the rmsnorm body's "out" pointer
+    // (which it computes from s6:s7) also points at chosen base.
+    asm_u32     (0xBE860004)             // s_mov_b32 s6, s4
+    asm_u32     (0xBE870005)             // s_mov_b32 s7, s5
+    // s12 = 128 (rmsnorm body's row stride).  s_mov_b32 with 7-bit
+    // inline imm: 0x80+n for 0..64, full literal otherwise.  128 doesn't
+    // fit in 7-bit inline; use 0xFF SSRC0 + 32-bit literal.
+    asm_u32_arch(0xBE8C00FF, 0xBE8C03FF) // s_mov_b32 s12, lit
+    asm_u32     (0x00000080)             // 128
+
+    // ── Phase 1: rmsnorm at N=128, eps=1e-6 (cloned from
+    //    _emit_rmsnorm_f32_body_N_eps body, lines 9117-9176).
+    asm_u32     (0xBF090A0F)             // s_cmp_ge_u32 s15, s10
+    uint64 cbranch_dword_idx = asm_text_len / 4
+    asm_u32_arch(0xBFA20000, 0xBF850000) // s_cbranch_scc1 → .Lend (patched)
+    asm_u32_arch(0x960E0C0F, 0x930E0C0F) // s_mul_i32 s14, s15, s12
+    asm_u32     (0x4A02000E)             // v_add_nc_u32 v1, s14, v0
+    asm_u32_arch(0x30080282, 0x34080282) // v_lshlrev_b32 v4, 2, v1
+    asm_u32     (0x7E060280)             // v_mov_b32 v3, 0
+    asm_u32_arch(0xD7006A02, 0xD70F6A02) // v_add_co_u32 v2, vcc_lo, s4, v4
+    asm_u32     (0x00020804)
+    asm_u32_arch(0xD5207C03, 0xD5287D03) // v_add_co_ci_u32 v3, null, s5, v3, vcc_lo
+    asm_u32     (0x01AA0605)
+    asm_u32     (0x7E1A0280)             // v_mov_b32 v13, 0
+    asm_u32_arch(0xD7006A0C, 0xD70F6A0C) // v_add_co_u32 v12, vcc_lo, s6, v4
+    asm_u32     (0x00020806)
+    asm_u32_arch(0xD5207C0D, 0xD5287D0D) // v_add_co_ci_u32 v13, null, s7, v13, vcc_lo
+    asm_u32     (0x01AA1A07)
+    // global_load_b32 v10 from v[2:3]  (N=Np=128, no gating)
+    asm_u32_arch(0xDC520000, 0xDC308000) // global_load v10
+    asm_u32_arch(0x0A7C0002, 0x0A7D0002)
+    asm_u32_arch(0xBF8903F7, 0xBF8C3F70) // s_waitcnt vmcnt(0)
+
+    asm_u32_arch(0x30040082, 0x34040082) // v_lshlrev_b32 v2, 2, v0  (gamma offset)
+    asm_u32     (0x7E060280)             // v_mov_b32 v3, 0
+    asm_u32_arch(0xD7006A02, 0xD70F6A02) // v_add_co_u32 v2, vcc_lo, s8, v2
+    asm_u32     (0x00020408)
+    asm_u32_arch(0xD5207C03, 0xD5287D03) // v_add_co_ci_u32 v3, null, s9, v3, vcc_lo
+    asm_u32     (0x01AA0609)
+    asm_u32_arch(0xDC520000, 0xDC308000) // global_load v11, gamma
+    asm_u32_arch(0x0B7C0002, 0x0B7D0002)
+    asm_u32_arch(0xBF8903F7, 0xBF8C3F70) // s_waitcnt vmcnt(0)
+
+    asm_u32     (0x100A150A)             // v_mul_f32 v5, v10, v10  (x²)
+    asm_u32_arch(0x300C0082, 0x340C0082) // v_lshlrev_b32 v6, 2, v0  (LDS off = lane*4)
+    asm_u32     (0x7E120280)             // v_mov_b32 v9, 0          (broadcast read addr)
+    asm_u32     (0xD8340000)             // ds_store v6, v5
+    asm_u32     (0x00000506)
+    asm_u32_arch(0xBF89FC07, 0xBF8CC07F) // s_waitcnt lgkmcnt(0)
+    asm_u32_arch(0xBFBD0000, 0xBF8A0000) // s_barrier
+
+    _emit_lds_reduce_pow2(Np, 0x060A0F05, 14)
+
+    asm_u32     (0xD8D80000)             // ds_load v8, v9
+    asm_u32     (0x08000009)
+    asm_u32_arch(0xBF89FC07, 0xBF8CC07F) // s_waitcnt lgkmcnt(0)
+    asm_u32_arch(0xBE8E00FF, 0xBE8E03FF) // s_mov_b32 s14, lit (inv_n)
+    asm_u32     (inv_n_bits)
+    asm_u32     (0x1010100E)             // v_mul_f32 v8, s14, v8
+    asm_u32_arch(0xBE8E00FF, 0xBE8E03FF) // s_mov_b32 s14, lit (eps)
+    asm_u32     (eps_bits)
+    asm_u32     (0x0610100E)             // v_add_f32 v8, s14, v8
+    asm_u32     (0x7E105D08)             // v_rsq_f32 v8, v8
+    asm_u32     (0x100A110A)             // v_mul_f32 v5, v10, v8   (x * rrms)
+    asm_u32     (0x100A1705)             // v_mul_f32 v5, v5, v11   (× gamma)
+
+    // ── Stage normalised value in LDS (replaces the rmsnorm body's
+    //    final global_store).  v6 = lane*4 (still valid from Phase 1
+    //    pre-reduce ds_store, because the reduce tree only touches
+    //    LDS via v6 with offsets and v9=0 for the broadcast — neither
+    //    overwrites v6).
+    asm_u32_arch(0xBF89FC07, 0xBF8CC07F) // s_waitcnt lgkmcnt(0)  (drain reduce ds traffic)
+    asm_u32     (0xD8340000)             // ds_store v6, v5
+    asm_u32     (0x00000506)
+    asm_u32_arch(0xBF89FC07, 0xBF8CC07F) // s_waitcnt lgkmcnt(0)
+    asm_u32_arch(0xBFBD0000, 0xBF8A0000) // s_barrier
+
+    // ── Phase 2: rope rotation, lanes 0..63 only ─────────────────────
+    // exec mask: lanes where v0 < 64.  s14 dead after the rrms compute
+    // (held inv_n / eps literals, and the rsqrt result went into v8).
+    asm_u32_arch(0xD449000E, 0xD4C1000E) // v_cmp_lt_u32_e64 s14, v0, 64
+    asm_u32     (0x00018100)             // src0=v0(0x100), src1=64(0x80+0x40 inline = 0xC0)? let's check
+    // (encoding above is the verified probe2 dword: 0x00018100 = src0=v0(0x100),
+    //  src1 = 64 (which encodes as inline constant 0x80 + 64 = 0xC0); shifted
+    //  src1 << 9 = 0x18000; v0 = 0x100 → low 9 bits = 0x100; total = 0x18100;
+    //  bit 16 set for omod0/abs etc. — verified by llvm-mc.)
+    asm_u32_arch(0xBE8E200E, 0xBE8E3C0E) // s_and_saveexec_b32 s14, s14
+
+    // ── LDS loads: a = LDS[lane*4], b = LDS[lane*4 + 256] ─────────────
+    asm_u32     (0xD8D80000)             // ds_load v7, v6
+    asm_u32     (0x07000006)
+    asm_u32     (0xD8D80100)             // ds_load v8, v6 offset:256
+    asm_u32     (0x08000006)
+    asm_u32_arch(0xBF89FC07, 0xBF8CC07F) // s_waitcnt lgkmcnt(0)
+
+    // ── cos/sin global loads at lane*4 offset (v6 still = lane*4). ────
+    // v[14:15] = cos_ptr (s20:21) + v6
+    asm_u32     (0x7E1E0280)             // v_mov_b32 v15, 0
+    asm_u32_arch(0xD7006A0E, 0xD70F6A0E) // v_add_co_u32 v14, vcc_lo, s20, v6
+    asm_u32     (0x00020C14)
+    asm_u32_arch(0xD5207C0F, 0xD5287D0F) // v_add_co_ci_u32 v15, null, s21, v15, vcc_lo
+    asm_u32     (0x01AA1E15)
+    // v[16:17] = sin_ptr (s22:23) + v6
+    asm_u32     (0x7E220280)             // v_mov_b32 v17, 0
+    asm_u32_arch(0xD7006A10, 0xD70F6A10) // v_add_co_u32 v16, vcc_lo, s22, v6
+    asm_u32     (0x00020C16)
+    asm_u32_arch(0xD5207C11, 0xD5287D11) // v_add_co_ci_u32 v17, null, s23, v17, vcc_lo
+    asm_u32     (0x01AA2217)
+    asm_u32_arch(0xDC520000, 0xDC308000) // global_load_b32 v18, v[14:15]
+    asm_u32_arch(0x127C000E, 0x127D000E)
+    asm_u32_arch(0xDC520000, 0xDC308000) // global_load_b32 v19, v[16:17]
+    asm_u32_arch(0x137C0010, 0x137D0010)
+    asm_u32_arch(0xBF8903F7, 0xBF8C3F70) // s_waitcnt vmcnt(0)
+
+    // ── Rotation math:  ra = a*c - b*s;  rb = a*s + b*c ──────────────
+    // a = v7, b = v8, c = v18, s = v19
+    asm_u32     (0x10282507)             // v_mul_f32 v20, v7, v18    (a*c)
+    asm_u32     (0x102A2708)             // v_mul_f32 v21, v8, v19    (b*s)
+    asm_u32     (0x08282B14)             // v_sub_f32 v20, v20, v21   (ra = a*c - b*s)
+    asm_u32     (0x102A2707)             // v_mul_f32 v21, v7, v19    (a*s)
+    asm_u32     (0x562A2508)             // v_fmac_f32 v21, v8, v18   (rb = a*s + b*c)
+
+    // ── Stores: v[12:13] still = chosen_base + (head_in_set*128 + lane)*4
+    //    from Phase 1 (lanes 0..63 had the original v0 = lane id, so
+    //    the addr is correct for lane = 0..63).
+    asm_u32_arch(0xDC6A0000, 0xDC708000) // global_store_b32 v[12:13], v20, off
+    asm_u32_arch(0x007C140C, 0x007D140C)
+    asm_u32_arch(0xDC6A0100, 0xDC708100) // global_store_b32 v[12:13], v21, off offset:256
+    asm_u32_arch(0x007C150C, 0x007D150C)
+    asm_u32_arch(0xBC7C0000, 0xBBFD0000) // s_waitcnt_vscnt null, 0
+    asm_u32_arch(0xBFB00000, 0xBF810000) // s_endpgm
+
+    uint64 total_dwords = asm_text_len / 4
+    uint64 simm16 = total_dwords - cbranch_dword_idx - 2
+    uint64 sccbr_top = 0xBFA20000
+    if _is_gfx10() != 0 { sccbr_top = 0xBF850000 }
+    asm_patch_u32(cbranch_dword_idx, sccbr_top | (simm16 & 0xFFFF))
+
+    uint64 a0 = args_desc + 0;    unsafe { *(a0 as uint64) = 8 }
+    uint64 a1 = args_desc + 8;    unsafe { *(a1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a2 = args_desc + 16;   unsafe { *(a2 as uint64) = 8 }
+    uint64 a3 = args_desc + 24;   unsafe { *(a3 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a4 = args_desc + 32;   unsafe { *(a4 as uint64) = 8 }
+    uint64 a5 = args_desc + 40;   unsafe { *(a5 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a6 = args_desc + 48;   unsafe { *(a6 as uint64) = 8 }
+    uint64 a7 = args_desc + 56;   unsafe { *(a7 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a8 = args_desc + 64;   unsafe { *(a8 as uint64) = 8 }
+    uint64 a9 = args_desc + 72;   unsafe { *(a9 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a10 = args_desc + 80;  unsafe { *(a10 as uint64) = 8 }
+    uint64 a11 = args_desc + 88;  unsafe { *(a11 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a12 = args_desc + 96;  unsafe { *(a12 as uint64) = 8 }
+    uint64 a13 = args_desc + 104; unsafe { *(a13 as uint64) = AMD_ARG_KIND_BY_VALUE }
+    uint64 a14 = args_desc + 112; unsafe { *(a14 as uint64) = 8 }
+    uint64 a15 = args_desc + 120; unsafe { *(a15 as uint64) = AMD_ARG_KIND_BY_VALUE }
+}
+
+// Slice 2c — fused qknorm + rope_qk code-object emit.
+// Block size at launch = 128, grid = nh_q + nh_k.  Kernarg layout is
+// 8 args (6 buffer ptrs + 2 by-value uint64) = 64 bytes.
+@export
+fn emit_amdgpu_qknorm_rope_qk_fused_f32_blob(uint64 out_path) -> uint64 {
+    uint64[16] args_desc
+    _emit_qknorm_rope_qk_fused_f32_body(args_desc)
+    // rsrc1 = 0xE0AF0042 — same as slice 2b: 24 VGPR / 24 SGPR grant.
+    // We use v0..v21 (22 VGPRs) and s0..s27 used + s14 saveexec
+    // (28 SGPRs).  Bump to 32 SGPR grant by setting bits 6..7 to 0x2:
+    // 0xE0AF0042 has bit6=1 (= 24-SGPR grant).  Need 32-SGPR: bits 6..7 = 0x2.
+    // Encoding: rsrc1 SGPRS field = bits 6..9 of low word (bits 6:9).
+    // Simpler: 0xE0AF0082 = 32 SGPRs / 24 VGPRs grant.
+    uint64 rsrc1 = 0xE0AF0082
+    // LDS bytes: 128 lanes × 4 bytes = 512 (rmsnorm reduce + rope staging
+    // share the same slab — the staging ds_store overwrites the post-
+    // reduce LDS contents which are dead by then).  Allocate 1024 to
+    // leave headroom and match slice 2b's allocation precedent.
+    uint64 lds_bytes = 1024
+    uint64 size = emit_amdgpu_code_object_lds("qknorm_rope_qk_fused_f32", 24,
+                                               asm_text_buf, asm_text_len,
+                                               64, 8, 32, 22,
+                                               rsrc1, 0x0000009E, 0x00000010, 0x0408,
+                                               args_desc, 8,
+                                               lds_bytes)
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_qknorm_rope_qk_fused_f32_blob: cannot open output\n", 62)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
 // Thread-coarsened rmsnorm body for N > 1024. Block size is fixed at
 // 1024 lanes (gfx11 max workgroup size); each lane processes K =
 // ceil(N / 1024) elements across two passes (reduce + apply) over the
@@ -14142,6 +14411,75 @@ fn amdgpu_lower_qknorm_f32_3b(uint64 fn_node, uint64 source,
     return 0
 }
 
+// Phase 3c — slice 2c: fused qknorm + rope_qk over Q+K heads.
+//
+// Discriminator: 8-param @kernel + Call to qknorm_rope_qk_marker() in
+// the body.  Routes BEFORE rmsnorm_3b / qknorm_3b / rope_qwen3_3c so the
+// fused marker wins when present.  Body emit ignores the AST and
+// produces a hardcoded gfx1100 ISA matching the .mlr semantics.
+fn amdgpu_lower_qknorm_rope_qk_3c(uint64 fn_node, uint64 source,
+                                    uint64 kname_ptr, uint64 nl) -> uint64 {
+    uint64 n_params = 0
+    uint64 wp = ast_child(fn_node)
+    while wp != 0 {
+        n_params = n_params + 1
+        wp = ast_next(wp)
+    }
+    if n_params != 8 { return 1 }
+
+    uint32 body = ast_data3(fn_node)
+    if body == 0 { return 1 }
+    if ast_kind(body) != 15 { return 1 }
+
+    uint64 saw_marker = 0
+    uint32 walk = ast_child(body)
+    while walk != 0 {
+        if ast_kind(walk) == 35 {
+            uint32 callee = ast_data1(walk)
+            if tok_matches(callee, "qknorm_rope_qk_marker", 21) != 0 { saw_marker = 1 }
+        }
+        if ast_kind(walk) == 10 {
+            uint32 init = ast_child(walk)
+            if init != 0 && ast_kind(init) == 35 {
+                uint32 callee = ast_data1(init)
+                if tok_matches(callee, "qknorm_rope_qk_marker", 21) != 0 { saw_marker = 1 }
+            }
+        }
+        walk = ast_next(walk)
+    }
+    if saw_marker == 0 { return 1 }
+
+    uint64 args_desc = alloc(16 * 16)
+    _emit_qknorm_rope_qk_fused_f32_body(args_desc)
+
+    uint64 k_text_size = asm_text_len
+    uint64 k_text_buf  = alloc(k_text_size)
+    uint64 ci = 0
+    while ci < k_text_size {
+        uint64 sp = asm_text_buf + ci
+        uint64 b = 0
+        unsafe { *(sp as uint8) -> b }
+        uint64 dp = k_text_buf + ci
+        uint8 b8 = b
+        unsafe { *(dp as uint8) = b8 }
+        ci = ci + 1
+    }
+
+    // KD: 32-SGPR / 24-VGPR grant, USER_SGPR_COUNT=15, LDS=1024 B,
+    // rsrc1=0xE0AF0082.  Matches emit_amdgpu_qknorm_rope_qk_fused_f32_blob.
+    uint64 rsrc1 = 0xE0AF0082
+    uint64 rsrc2 = 0x0000009E
+    uint64 rsrc3 = 0x00000010
+    uint64 props = 0x0408
+
+    kt_push_lds(kname_ptr, nl, k_text_buf, k_text_size,
+                args_desc, 8, 64,
+                32, 22,
+                rsrc1, rsrc2, rsrc3, props,
+                1024)
+    return 0
+}
+
 // Phase 3b-2-N128 — softmax_f32 parametric N=128.
 //
 // Discriminator: 4 params + softmax_N128_marker() Call.  Routes BEFORE
@@ -17541,6 +17879,11 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
     // bf16_to_f32.
     uint64 bf_rc = amdgpu_lower_bf16_to_f32_3a(fn_node, source, kname_ptr, nl)
     if bf_rc == 0 { return 0 }
+
+    // ── Slice 2c: AST-walking fused qknorm + rope_qk (8 params).  Must
+    //    run BEFORE qknorm_3b/rope_qwen3_3c so the marker wins.
+    uint64 qrf_rc = amdgpu_lower_qknorm_rope_qk_3c(fn_node, source, kname_ptr, nl)
+    if qrf_rc == 0 { return 0 }
 
     // ── Phase 3b-128: AST-walking qknorm (rmsnorm N=128, eps=1e-6) ────
     uint64 qkn_rc = amdgpu_lower_qknorm_f32_3b(fn_node, source, kname_ptr, nl)

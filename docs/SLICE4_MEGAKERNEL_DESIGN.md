@@ -5,24 +5,29 @@ multi-session piece.
 
 ## Why slice 4 is the only path to honest single-stream bf16 win
 
-After slices 1-3, qwen3-0.6B / RX 7800 XT decode is **launch-overhead
-bound**, not ALU-bound and not bandwidth-bound:
+After slices 1-3 + 2b + 2c, qwen3-0.6B / RX 7800 XT decode is
+**launch-overhead bound**, not ALU-bound and not bandwidth-bound:
 
 ```
 $ MLRIFT_GPU_MATMUL=1 MLRIFT_GPU_FULL_FORWARD=1 MLRIFT_GPU_FLUSH_EVERY_N=28 /tmp/q3
-  step N took 10 ms launches=421 syncs=2 sync_us=2300
-  total_decode_ms=329  generated_tokens=20  tok/s=60.7
+  step N took 7.4 ms launches=310 syncs=2 sync_us=2300
+  total_decode_ms=316  generated_tokens=20  tok/s=63.2
 ```
 
-- **421 dispatches per token** (28 layers × 15 ops + 1 lm_head).
+- **310 dispatches per token** (28 layers × ~11 ops + 1 lm_head + a few
+  extracts).  Down from 421 pre-fusion via slice 2b (resid+rmsnorm)
+  and slice 2c (qknorm+rope_qk).
 - **Only 2 syncs per token** (one trailing forward flush, one lm_head).
-- 10 ms GPU compute / 421 = **23.8 us per dispatch** effective.
-- 16.5 ms wall / token; ROCm bf16 ceiling = 13.6 ms / token.
+- 7.4 ms GPU compute / 310 = **23.9 us per dispatch** effective.
+- 15.8 ms wall / token; ROCm bf16 ceiling = 13.6 ms / token.
 
-We need to save ~3 ms / token to cross 73.7 tok/s.  Bandwidth-bound
+We need to save ~2.2 ms / token to cross 73.7 tok/s.  Bandwidth-bound
 matmuls (gemv_coop_bf16_f32) already run at the HBM ceiling for their
-shape.  The 3 ms is dispatch overhead spent on the 11 NON-matmul ops
-per layer (rmsnorm, qkv_split, qknorm, rope, attn, resid, silu).
+shape.  The 2.2 ms is dispatch overhead spent on the remaining
+NON-matmul ops per layer (qkv_split, attn, residuals, silu_mul).
+Slice 2b + 2c already fused (residual+rmsnorm) and (qknorm+rope_qk);
+the next opportunity is the full mega-kernel (slice 4) — collapse the
+remaining 11-ish ops per layer into one dispatch.
 
 ## Design
 
@@ -81,9 +86,12 @@ Phases inside the kernel (within one dispatch):
 18. End kernel.
 
 Per-token: 28 layer-mega-dispatches + 1 lm_head matmul = **29 launches**
-(vs 421 today).  Saves ~9 ms of launch overhead per token at the 24
-us-per-launch rate measured.  Step 16 ms - 9 ms = 7 ms = **143 tok/s**
-projected.
+(vs 310 today after slice 2b+2c, 421 pre-fusion).  Saves ~6.7 ms of
+launch overhead per token at the 24 us-per-launch rate measured.
+Step 15.8 ms − 6.7 ms = 9.1 ms = **~110 tok/s** projected (revised
+down from the 143 estimate that assumed pre-fusion 421-dispatch
+baseline).  Still 1.5× ROCm bf16 — slice 4 remains the path to a
+clear honest single-stream bf16 win.
 
 ## Hard parts
 
@@ -124,55 +132,73 @@ projected.
   are measured, the rest is execution.
 
 
-## Stepping stone: slice 2c (qknorm + rope_qk fusion)
+## Stepping stone: slice 2c (qknorm + rope_qk fusion) — SHIPPED
 
-The next intra-layer fusion after slice 2b.  Saves 3 launches per
-qwen3 layer (qknorm Q + qknorm K + rope Q + rope K → 1 fused launch
-over `nh_q + nh_k` WGs), or 84 launches/token at 25 µs ≈ 2.1 ms/token,
-projecting **61.4 → ~64.5 tok/s** honest single-stream.
+Status: **GREEN, bit-exact to PyTorch, end-to-end qwen3-0.6B**.
 
-- `examples/llm/qknorm_rope_qk_fused.mlr` — @kernel scaffolded.
-  Discriminator: `qknorm_rope_qk_marker()` Call.  8-param shape:
-  `(q_inout, k_inout, q_gamma, k_gamma, cos, sin, nh_q, nh_k)`.
-- Per WG: head_idx selects Q vs K (head < nh_q) and which gamma /
-  base pointer to use; phase 1 runs the existing rmsnorm body at
-  N=128 with eps=1e-6; LDS staging carries the normalised vector
-  to phase 2; phase 2 (lanes 0..63 only) loads pair (lane, lane+64)
-  from LDS, multiplies by cos/sin, writes back to global.
-- Block size = 128 (one lane per head element).  Grid = nh_q + nh_k
-  = 24 for qwen3-0.6B (16 + 8).
+Replaces qknorm Q + qknorm K + rope Q + rope K (4 sequential dispatches)
+with **one** fused launch over `nh_q + nh_k` WGs (= 24 for qwen3-0.6B,
+16 Q heads + 8 KV heads).
 
-Remaining work for slice 2c:
+Measured on RX 7800 XT, single-stream greedy 20-token decode:
 
-1. **Emit body.**  Two-phase, more complex than slice 2b's residual
-   prologue:
-   - Kernarg loads (8 args).
-   - Per-WG dispatch: compute head_in_set + base + gamma based on
-     `head < nh_q`.  Use a conditional move (`s_cselect_b32` or
-     equivalent) on the SGPR side rather than a branch.
-   - Phase 1: clone of `_emit_rmsnorm_f32_body_N_eps(args, 128,
-     eps_bits=0x358637BD)`.  Replaces the global store with an
-     LDS store for staging.
-   - `s_barrier`.
-   - Phase 2: clone of the rope rotation body (lanes 0..63 only):
-     `s_and_saveexec_b32` mask + LDS loads + cos/sin global loads
-     + 4 v_fma_f32 + 2 global stores.
-   - rsrc1 likely needs higher VGPR/SGPR grant than slice 2b
-     (more live ranges through the LDS sync).
-2. **AST recogniser** `amdgpu_lower_qknorm_rope_qk_3c`: gates on
-   8 params + `qknorm_rope_qk_marker()` + lds_reduce_sum_f32.
-   Routes BEFORE rmsnorm_3b (same precedence rule as slice 2b).
-3. **CLI flag** `--emit-amdgpu-qknorm-rope-qk-fused-f32=path`.
-4. **Launcher** `gpu_qknorm_rope_qk_fused_to_dev` in
-   `std/inference_gpu.mlr`.
-5. **Wire** in `qwen3_forward_layer_gpu`'s use_gpu_attn block —
-   replace the four sequential `gpu_qknorm_f32_to_dev` /
-   `gpu_rope_f32_to_dev` calls with one fused call.
+|  | Legacy (4 dispatches) | Slice 2c fused | Δ |
+|---|---|---|---|
+| **tok/s** (best of 3) | 62.1 | **63.2** | +1.7% |
+| **launches/step** | 366 | **310** | −56 (−2/layer × 28) |
+| **PyTorch token parity** | bit-exact | **bit-exact** | ✓ |
 
-Estimate: 3-4 hours for the dword-level emit (the multi-phase shape
-is genuinely harder than slice 2b's prologue insertion); +1-2 hours
-for AST recogniser, CLI flag, launcher, wiring, smoke test.  Best as
-a dedicated session.
+Smoke test: 3072 Q + 1024 K outputs match CPU reference within 1e-5
+absolute (effectively bit-exact at f32 precision).
+
+Implementation (143 dwords gfx1100, all llvm-mc verified):
+
+- **Emit body** `_emit_qknorm_rope_qk_fused_f32_body` and blob wrapper
+  `emit_amdgpu_qknorm_rope_qk_fused_f32_blob` in `src/format_amdgpu.mlr`.
+  Composes the existing rmsnorm@128 (eps=1e-6) body and rope_qwen3 body
+  via the SGPR-reorder pattern from slice 2b, plus an LDS-slab reuse
+  trick: the rmsnorm reduce-tree's LDS slab (lane*4 = 0..508) is dead
+  after the broadcast `ds_load v8, v9`, so the phase-1 staging
+  `ds_store v6, v5` reuses that same region.  LDS allocation is 1024 B
+  (with 512 B headroom).  rsrc1 = 0xE0AF0082 (32-SGPR grant — 24-SGPR
+  was insufficient because the kernel touches s0..s27 + saveexec stash).
+- **AST recogniser** `amdgpu_lower_qknorm_rope_qk_3c` in `src/format_amdgpu.mlr`,
+  gates on 8 params + presence of `qknorm_rope_qk_marker()` Call.
+  Routes BEFORE qknorm_3b and rope_qwen3_3c (so the fused recogniser
+  wins when both halves are present in the function body).
+- **CLI flag** `--emit-amdgpu-qknorm-rope-qk-fused-f32=path` in `src/main.mlr`.
+- **Launcher** `gpu_qknorm_rope_qk_fused_to_dev` in `std/inference_gpu.mlr`,
+  loads `/tmp/qknorm_rope_qk_fused_f32.co` lazily on first call, packs
+  8 kernarg pointers, dispatches grid = nh_q + nh_k, block = 128.
+- **Wire-in** in `qwen3_forward_layer_gpu` (`std/qwen3.mlr`): the four
+  sequential `gpu_qknorm_f32_to_dev` / `gpu_rope_f32_to_dev` calls are
+  replaced by `gpu_qknorm_rope_qk_fused_to_dev(...)`.  Gated by phase
+  mask bit 0x40000 for opt-out; `MLRIFT_NO_QKNORM_ROPE_FUSED=1` env in
+  `examples/qwen3_generate.mlr` forces the legacy path for A/B.
+- **Smoke test** at `examples/llm/qknorm_rope_qk_smoke.mlr` (195 lines)
+  — synthetic gamma + cos/sin tables, 4096-element output diff vs CPU
+  reference.  Ships with the standard `--target=amdgpu-native` build.
+
+The `/tmp/qknorm_rope_qk_fused_f32.co` produced by the AST-walked
+path (`build/mlrc --target=amdgpu-native examples/llm/qknorm_rope_qk_fused.mlr`)
+is byte-identical to the blob-emit path
+(`--emit-amdgpu-qknorm-rope-qk-fused-f32=...`) — single source of
+truth confirmed.
+
+**Gap to original 84-launch projection:** the design assumed an
+in-place Q path; we landed an out-of-place Q with one extra
+`extract_q` launch per layer.  Closing the gap to a +5% tok/s target
+requires extending the kernel to 9 args (separate Q-out pointer);
+~30 dwords of additional emit, optional follow-up.
+
+**Diagnostics worth keeping for future fusion work:**
+- `s_add_u32 s10, s24, s26` originally placed BEFORE the cselects
+  clobbered `s10 = k_gamma_lo`.  Bug-class: SGPR-cselect adjacency
+  in fused multi-source kernels.  Fix: order all 5 cselects first,
+  then the add.
+- WG_ID_X clobber by SMEM load — needed `s_mov_b32 s3, s15` BEFORE
+  the second `s_load_b256` (matches gemm_f32's pattern).  Without
+  it, any WG > 0 would silently use wrong head_idx.
 
 ## Stepping stone: slice 2b (residual+rmsnorm fusion)
 
