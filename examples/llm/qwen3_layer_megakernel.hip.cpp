@@ -122,9 +122,16 @@ void phase3_qkv_matmul(unsigned int wg_id, unsigned int lane,
         unsigned int row = wg_id + r_off * WG_PERSIST;
         if (row >= QKV_DIM) continue;
         float acc = 0.0f;
-        const unsigned short *w_row = qkv_w + row * HIDDEN;
-        for (unsigned int k = lane; k < HIDDEN; k += WAVE) {
-            acc += bf16_to_f32(w_row[k]) * b_x_norm_g[k];
+        // slice 4.12 #14: vectorized bf16-pair loads.  Read 2 bf16
+        // weights per VMEM op as u32, unpack to two f32 FMAs.  Halves
+        // the matmul VMEM instruction count → lifts effective bandwidth.
+        const unsigned int *w_row_u32 = reinterpret_cast<const unsigned int *>(qkv_w + row * HIDDEN);
+        for (unsigned int kp = lane; kp < HIDDEN / 2; kp += WAVE) {
+            unsigned int packed = w_row_u32[kp];
+            unsigned int k = kp * 2;
+            float w0 = bf16_to_f32((unsigned short)(packed & 0xFFFFu));
+            float w1 = bf16_to_f32((unsigned short)(packed >> 16));
+            acc += w0 * b_x_norm_g[k] + w1 * b_x_norm_g[k + 1];
         }
         for (int offset = WAVE / 2; offset > 0; offset >>= 1) {
             acc += __shfl_xor(acc, offset);
@@ -285,9 +292,13 @@ void phase9_oproj_residual(unsigned int wg_id, unsigned int lane,
         unsigned int row = wg_id + r_off * WG_PERSIST;
         if (row >= HIDDEN) continue;
         float acc = 0.0f;
-        const unsigned short *w_row = o_w + row * Q_DIM;
-        for (unsigned int k = lane; k < Q_DIM; k += WAVE) {
-            acc += bf16_to_f32(w_row[k]) * b_attn_out_g[k];
+        const unsigned int *w_row_u32 = reinterpret_cast<const unsigned int *>(o_w + row * Q_DIM);
+        for (unsigned int kp = lane; kp < Q_DIM / 2; kp += WAVE) {
+            unsigned int packed = w_row_u32[kp];
+            unsigned int k = kp * 2;
+            float w0 = bf16_to_f32((unsigned short)(packed & 0xFFFFu));
+            float w1 = bf16_to_f32((unsigned short)(packed >> 16));
+            acc += w0 * b_attn_out_g[k] + w1 * b_attn_out_g[k + 1];
         }
         for (int offset = WAVE / 2; offset > 0; offset >>= 1) {
             acc += __shfl_xor(acc, offset);
@@ -337,9 +348,13 @@ void phase13_gate_up_matmul(unsigned int wg_id, unsigned int lane,
         unsigned int row = wg_id + r_off * WG_PERSIST;
         if (row >= N_OUT) continue;
         float acc = 0.0f;
-        const unsigned short *w_row = gate_up_w + row * HIDDEN;
-        for (unsigned int k = lane; k < HIDDEN; k += WAVE) {
-            acc += bf16_to_f32(w_row[k]) * b_mid_norm_g[k];
+        const unsigned int *w_row_u32 = reinterpret_cast<const unsigned int *>(gate_up_w + row * HIDDEN);
+        for (unsigned int kp = lane; kp < HIDDEN / 2; kp += WAVE) {
+            unsigned int packed = w_row_u32[kp];
+            unsigned int k = kp * 2;
+            float w0 = bf16_to_f32((unsigned short)(packed & 0xFFFFu));
+            float w1 = bf16_to_f32((unsigned short)(packed >> 16));
+            acc += w0 * b_mid_norm_g[k] + w1 * b_mid_norm_g[k + 1];
         }
         for (int offset = WAVE / 2; offset > 0; offset >>= 1) {
             acc += __shfl_xor(acc, offset);
@@ -381,9 +396,13 @@ void phase17_down_residual(unsigned int wg_id, unsigned int lane,
         unsigned int row = wg_id + r_off * WG_PERSIST;
         if (row >= HIDDEN) continue;
         float acc = 0.0f;
-        const unsigned short *w_row = down_w + row * FF;
-        for (unsigned int k = lane; k < FF; k += WAVE) {
-            acc += bf16_to_f32(w_row[k]) * gu_scratch[k];
+        const unsigned int *w_row_u32 = reinterpret_cast<const unsigned int *>(down_w + row * FF);
+        for (unsigned int kp = lane; kp < FF / 2; kp += WAVE) {
+            unsigned int packed = w_row_u32[kp];
+            unsigned int k = kp * 2;
+            float w0 = bf16_to_f32((unsigned short)(packed & 0xFFFFu));
+            float w1 = bf16_to_f32((unsigned short)(packed >> 16));
+            acc += w0 * gu_scratch[k] + w1 * gu_scratch[k + 1];
         }
         for (int offset = WAVE / 2; offset > 0; offset >>= 1) {
             acc += __shfl_xor(acc, offset);
