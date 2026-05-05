@@ -1,0 +1,754 @@
+// Slice 4.7 — A/B bit-equivalence gate for the slice 4.6 mega-kernel.
+// Allocates random f32 input + bf16 weights from a fixed LCG seed,
+// runs the per-op chain (canonical reference: rmsnorm → gemv_bf16 →
+// extract_q+qkv_split+qknorm_rope_qk_fused → attn_decode → gemv_bf16
+// + residual_add → rmsnorm → gemv_bf16 → silu_mul → gemv_bf16 +
+// residual_add) and the slice 4.6 mega-kernel on the SAME inputs.
+// Compares out_residual element-wise; PASS if max-abs-err < 1e-3
+// (f32 FMA reordering tolerance).
+//
+// This is the GO/NO-GO gate before the mega-kernel is wired into the
+// full qwen3_generate forward path.  The two paths must consume bit-
+// identical bf16 weight bytes — both go through `unsigned short[N*K]`
+// row-major with the standard bf16 = (f32_bits >> 16) truncation.
+//
+// Build:
+//   hipcc --offload-arch=gfx1100 --genco -O3 \
+//       examples/llm/qwen3_layer_megakernel.hip.cpp \
+//       -o /tmp/qwen3_layer_megakernel.co            (already done)
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native \
+//       examples/llm/qwen3_layer_megakernel_ab.mlr \
+//       -o /tmp/qwen3_layer_megakernel_ab
+// Run:
+//   /tmp/qwen3_layer_megakernel_ab
+
+import "../../std/hip.mlr"
+import "../../std/time.mlr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn write(int32 fd, uint64 buf, uint64 n) -> int64
+@dynamic extern fn exit(uint64 code)
+
+fn u64_dec(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 { uint8 z = 48; unsafe { *(buf as uint8) = z }; return 1 }
+    uint64 n = 0; uint64 t = val
+    while t > 0 { n = n + 1; t = t / 10 }
+    uint64 i = n; t = val
+    while i > 0 {
+        i = i - 1
+        uint64 d = t - (t / 10) * 10
+        uint8 c = d + 48
+        uint64 p = buf + i; unsafe { *(p as uint8) = c }
+        t = t / 10
+    }
+    return n
+}
+fn put_kv(uint64 label, uint64 lab_len, uint64 v) {
+    uint64 buf = alloc(96)
+    uint64 i = 0
+    while i < lab_len {
+        uint64 sp = label + i; uint64 c = 0; unsafe { *(sp as uint8) -> c }
+        uint64 dp = buf + i; uint8 cb = c; unsafe { *(dp as uint8) = cb }
+        i = i + 1
+    }
+    uint64 sep_p = buf + lab_len; uint8 eq = 61; unsafe { *(sep_p as uint8) = eq }
+    uint64 num_p = buf + lab_len + 1
+    uint64 nl = u64_dec(v, num_p)
+    uint64 nul_p = buf + lab_len + 1 + nl; uint8 nul = 0; unsafe { *(nul_p as uint8) = nul }
+    puts(buf)
+}
+fn die(uint64 msg, uint64 code) { puts(msg); put_kv("err", 3, code); exit(1) }
+
+// LCG step (Knuth/MMIX constants).  Returns a fresh f32 in [-1,+1).
+// State is a u64 pointed to by `state_ptr`.
+fn lcg_step(uint64 state_ptr) -> f32 {
+    uint64 s = 0; unsafe { *(state_ptr as uint64) -> s }
+    s = s * 6364136223846793005 + 1442695040888963407
+    unsafe { *(state_ptr as uint64) = s }
+    // Take top 24 bits of the 64-bit state as a uniform fraction.
+    uint64 hi = s >> 40                     // 24-bit
+    f32 v = int_to_f32(hi) / 8388608.0f - 1.0f
+    return v
+}
+
+// Load a .co file as a hipModule, return the named function handle.
+fn load_co(uint64 path, uint64 fname) -> uint64 {
+    uint64 fd = file_open(path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 { return 0 }
+    uint64 sz = file_size(fd)
+    uint64 blob = alloc(sz)
+    file_read(fd, blob, sz)
+    file_close(fd)
+    uint64 mod_slot = alloc(8)
+    uint32 err = hipModuleLoadData(mod_slot, blob)
+    if err != 0 { return 0 }
+    uint64 mod = 0; unsafe { *(mod_slot as uint64) -> mod }
+    uint64 fh_slot = alloc(8)
+    err = hipModuleGetFunction(fh_slot, mod, fname)
+    if err != 0 { return 0 }
+    uint64 fh = 0; unsafe { *(fh_slot as uint64) -> fh }
+    return fh
+}
+
+// Allocate device buffer of `bytes` bytes, return device VA.
+fn dmalloc(uint64 bytes) -> uint64 {
+    uint64 slot = alloc(8)
+    uint32 err = hipMalloc(slot, bytes)
+    if err != 0 { die("hipMalloc", err) }
+    uint64 va = 0; unsafe { *(slot as uint64) -> va }
+    dealloc(slot)
+    return va
+}
+
+// Build a void**-style kernarg pointer-array (kp) from a packed
+// kernarg buffer (k_buf).  Returns the kp pointer.
+fn build_kp(uint64 k_buf, uint64 n) -> uint64 {
+    uint64 kp = alloc(n * 8)
+    uint64 j = 0
+    while j < n {
+        uint64 slot_ptr = k_buf + j * 8
+        unsafe { *((kp + j * 8) as uint64) = slot_ptr }
+        j = j + 1
+    }
+    return kp
+}
+
+// Print a phrase + an f32 value as raw f32 bits (u32) for compact
+// hex-style debug output (decimal-printed, but bit-stable).
+fn put_f32_bits(uint64 label, uint64 lab_len, f32 v) {
+    uint64 tmp = alloc(4); unsafe { *(tmp as f32) = v }
+    uint32 b = 0; unsafe { *(tmp as uint32) -> b }
+    dealloc(tmp)
+    uint64 b64 = b
+    put_kv(label, lab_len, b64)
+}
+
+// Qwen3-0.6B shape constants (must match the .hip.cpp).
+static uint64 HIDDEN     = 1024
+static uint64 HEAD_DIM   = 128
+static uint64 N_HEADS    = 16
+static uint64 N_KV_HEADS = 8
+static uint64 Q_DIM      = 2048
+static uint64 KV_DIM     = 1024
+static uint64 QKV_DIM    = 4096
+static uint64 FF         = 3072
+static uint64 WG_PERSIST = 64
+static uint64 MAX_SEQ    = 64
+
+fn main() {
+    uint32 err = hipSetDevice(0); if err != 0 { die("setDev", err) }
+
+    // ───────────────────────────────────────────────────────
+    // 1.  Load every kernel module we need.
+    // ───────────────────────────────────────────────────────
+    uint64 fh_mega = load_co("/tmp/qwen3_layer_megakernel.co", "qwen3_layer_megakernel")
+    if fh_mega == 0 { die("load mega", 0) }
+
+    uint64 fh_rmsnorm = load_co("/tmp/rmsnorm_f32_1024.co", "rmsnorm_f32")
+    if fh_rmsnorm == 0 { die("load rmsnorm", 0) }
+
+    uint64 fh_gemv_bf16 = load_co("/tmp/gemv_coop_bf16_f32.co", "gemv_coop_bf16_f32")
+    if fh_gemv_bf16 == 0 { die("load gemv_bf16", 0) }
+
+    uint64 fh_extract_q = load_co("/tmp/extract_q_qwen3_f32.co", "extract_q_qwen3_f32")
+    if fh_extract_q == 0 { die("load extract_q", 0) }
+
+    uint64 fh_qkv_split = load_co("/tmp/qkv_split_f32.co", "qkv_split_f32")
+    if fh_qkv_split == 0 { die("load qkv_split", 0) }
+
+    uint64 fh_qknorm_rope = load_co("/tmp/qknorm_rope_qk_fused_f32.co", "qknorm_rope_qk_fused_f32")
+    if fh_qknorm_rope == 0 { die("load qknorm_rope", 0) }
+
+    uint64 fh_attn = load_co("/tmp/attn_decode_f32.co", "attn_decode_f32")
+    if fh_attn == 0 { die("load attn", 0) }
+
+    uint64 fh_residual = load_co("/tmp/residual_add_f32.co", "residual_add_f32")
+    if fh_residual == 0 { die("load residual_add", 0) }
+
+    uint64 fh_silu_mul = load_co("/tmp/silu_mul_f32.co", "silu_mul_f32")
+    if fh_silu_mul == 0 { die("load silu_mul", 0) }
+
+    puts("modules loaded")
+
+    // ───────────────────────────────────────────────────────
+    // 2.  Allocate host buffers and fill from a fixed LCG.
+    //     Both paths must consume IDENTICAL bytes — bf16 weights
+    //     are written once on the host as `(f32_bits >> 16)` then
+    //     copied to BOTH the per-op and mega-kernel device slabs.
+    // ───────────────────────────────────────────────────────
+    uint64 in_resid_bytes = HIDDEN * 4
+    uint64 qkv_w_bytes    = QKV_DIM * HIDDEN * 2
+    uint64 o_w_bytes      = HIDDEN * Q_DIM * 2
+    uint64 gateup_bytes   = 2 * FF * HIDDEN * 2
+    uint64 down_w_bytes   = HIDDEN * FF * 2
+    uint64 in_norm_bytes  = HIDDEN * 4
+    uint64 post_norm_bytes= HIDDEN * 4
+    uint64 q_norm_bytes   = HEAD_DIM * 4
+    uint64 k_norm_bytes   = HEAD_DIM * 4
+    uint64 cos_sin_bytes  = (HEAD_DIM / 2) * 4
+    uint64 kv_bytes       = MAX_SEQ * KV_DIM * 4
+
+    uint64 h_in_resid    = alloc(in_resid_bytes)
+    uint64 h_qkv_w       = alloc(qkv_w_bytes)
+    uint64 h_o_w         = alloc(o_w_bytes)
+    uint64 h_gate_up_w   = alloc(gateup_bytes)
+    uint64 h_down_w      = alloc(down_w_bytes)
+    uint64 h_in_norm_g   = alloc(in_norm_bytes)
+    uint64 h_post_norm_g = alloc(post_norm_bytes)
+    uint64 h_q_norm_g    = alloc(q_norm_bytes)
+    uint64 h_k_norm_g    = alloc(k_norm_bytes)
+    uint64 h_rope_cos    = alloc(cos_sin_bytes)
+    uint64 h_rope_sin    = alloc(cos_sin_bytes)
+
+    uint64 seed_slot = alloc(8)
+    unsafe { *(seed_slot as uint64) = 0xDEADBEEFCAFE1234 }
+
+    // f32 input residual — random in [-1, +1).
+    uint64 i = 0
+    while i < HIDDEN {
+        f32 v = lcg_step(seed_slot)
+        unsafe { *((h_in_resid + i * 4) as f32) = v }
+        i = i + 1
+    }
+    // f32 norm gammas — random in [+0.5, +1.5] (matches real gamma
+    // distributions, all positive so rmsnorm scale doesn't get sign-
+    // flipped negative).
+    i = 0
+    while i < HIDDEN {
+        f32 v = lcg_step(seed_slot)
+        f32 g = v * 0.5f + 1.0f
+        unsafe { *((h_in_norm_g + i * 4) as f32) = g }
+        i = i + 1
+    }
+    i = 0
+    while i < HIDDEN {
+        f32 v = lcg_step(seed_slot)
+        f32 g = v * 0.5f + 1.0f
+        unsafe { *((h_post_norm_g + i * 4) as f32) = g }
+        i = i + 1
+    }
+    i = 0
+    while i < HEAD_DIM {
+        f32 v = lcg_step(seed_slot)
+        f32 g = v * 0.5f + 1.0f
+        unsafe { *((h_q_norm_g + i * 4) as f32) = g }
+        i = i + 1
+    }
+    i = 0
+    while i < HEAD_DIM {
+        f32 v = lcg_step(seed_slot)
+        f32 g = v * 0.5f + 1.0f
+        unsafe { *((h_k_norm_g + i * 4) as f32) = g }
+        i = i + 1
+    }
+    // pos=0 → cos=1, sin=0 for all freqs (matches qwen3_rope_compute).
+    i = 0
+    while i < (HEAD_DIM / 2) {
+        f32 one_f = 1.0f
+        f32 zero_f = 0.0f
+        unsafe { *((h_rope_cos + i * 4) as f32) = one_f }
+        unsafe { *((h_rope_sin + i * 4) as f32) = zero_f }
+        i = i + 1
+    }
+
+    // bf16 weights — store as truncated `(f32_bits >> 16)` u16.
+    // Use a small-magnitude scale (×0.03) to keep matmul outputs in
+    // a sensible range; otherwise the qkv pre-rmsnorm values explode
+    // the f32 dynamic range and the relative error blows up.
+    f32 wscale = 0.03f
+
+    // qkv_w[QKV_DIM, HIDDEN]
+    i = 0
+    while i < QKV_DIM * HIDDEN {
+        f32 v = lcg_step(seed_slot)
+        f32 fw = v * wscale
+        uint64 tmp = alloc(4); unsafe { *(tmp as f32) = fw }
+        uint32 fb = 0; unsafe { *(tmp as uint32) -> fb }
+        dealloc(tmp)
+        uint16 bf = fb >> 16
+        unsafe { *((h_qkv_w + i * 2) as uint16) = bf }
+        i = i + 1
+    }
+    // o_w[HIDDEN, Q_DIM]
+    i = 0
+    while i < HIDDEN * Q_DIM {
+        f32 v = lcg_step(seed_slot)
+        f32 fw = v * wscale
+        uint64 tmp = alloc(4); unsafe { *(tmp as f32) = fw }
+        uint32 fb = 0; unsafe { *(tmp as uint32) -> fb }
+        dealloc(tmp)
+        uint16 bf = fb >> 16
+        unsafe { *((h_o_w + i * 2) as uint16) = bf }
+        i = i + 1
+    }
+    // gate_up_w[2*FF, HIDDEN]
+    i = 0
+    while i < 2 * FF * HIDDEN {
+        f32 v = lcg_step(seed_slot)
+        f32 fw = v * wscale
+        uint64 tmp = alloc(4); unsafe { *(tmp as f32) = fw }
+        uint32 fb = 0; unsafe { *(tmp as uint32) -> fb }
+        dealloc(tmp)
+        uint16 bf = fb >> 16
+        unsafe { *((h_gate_up_w + i * 2) as uint16) = bf }
+        i = i + 1
+    }
+    // down_w[HIDDEN, FF]
+    i = 0
+    while i < HIDDEN * FF {
+        f32 v = lcg_step(seed_slot)
+        f32 fw = v * wscale
+        uint64 tmp = alloc(4); unsafe { *(tmp as f32) = fw }
+        uint32 fb = 0; unsafe { *(tmp as uint32) -> fb }
+        dealloc(tmp)
+        uint16 bf = fb >> 16
+        unsafe { *((h_down_w + i * 2) as uint16) = bf }
+        i = i + 1
+    }
+
+    puts("host buffers filled")
+
+    // ───────────────────────────────────────────────────────
+    // 3.  Allocate device buffers (shared inputs + per-path
+    //     state).  Inputs (in_resid, weights, gammas, rope) are
+    //     read-only on both paths so we share one set.  KV
+    //     cache and out_residual are path-private (each path
+    //     writes them).
+    // ───────────────────────────────────────────────────────
+    uint64 d_in_resid    = dmalloc(in_resid_bytes)
+    uint64 d_qkv_w       = dmalloc(qkv_w_bytes)
+    uint64 d_o_w         = dmalloc(o_w_bytes)
+    uint64 d_gate_up_w   = dmalloc(gateup_bytes)
+    uint64 d_down_w      = dmalloc(down_w_bytes)
+    uint64 d_in_norm_g   = dmalloc(in_norm_bytes)
+    uint64 d_post_norm_g = dmalloc(post_norm_bytes)
+    uint64 d_q_norm_g    = dmalloc(q_norm_bytes)
+    uint64 d_k_norm_g    = dmalloc(k_norm_bytes)
+    uint64 d_rope_cos    = dmalloc(cos_sin_bytes)
+    uint64 d_rope_sin    = dmalloc(cos_sin_bytes)
+
+    err = hipMemcpy(d_in_resid,    h_in_resid,    in_resid_bytes,  1); if err != 0 { die("H2D in_r", err) }
+    err = hipMemcpy(d_qkv_w,       h_qkv_w,       qkv_w_bytes,     1); if err != 0 { die("H2D qkv_w", err) }
+    err = hipMemcpy(d_o_w,         h_o_w,         o_w_bytes,       1); if err != 0 { die("H2D o_w", err) }
+    err = hipMemcpy(d_gate_up_w,   h_gate_up_w,   gateup_bytes,    1); if err != 0 { die("H2D gu_w", err) }
+    err = hipMemcpy(d_down_w,      h_down_w,      down_w_bytes,    1); if err != 0 { die("H2D dn_w", err) }
+    err = hipMemcpy(d_in_norm_g,   h_in_norm_g,   in_norm_bytes,   1); if err != 0 { die("H2D in_g", err) }
+    err = hipMemcpy(d_post_norm_g, h_post_norm_g, post_norm_bytes, 1); if err != 0 { die("H2D pn_g", err) }
+    err = hipMemcpy(d_q_norm_g,    h_q_norm_g,    q_norm_bytes,    1); if err != 0 { die("H2D q_g", err) }
+    err = hipMemcpy(d_k_norm_g,    h_k_norm_g,    k_norm_bytes,    1); if err != 0 { die("H2D k_g", err) }
+    err = hipMemcpy(d_rope_cos,    h_rope_cos,    cos_sin_bytes,   1); if err != 0 { die("H2D rc", err) }
+    err = hipMemcpy(d_rope_sin,    h_rope_sin,    cos_sin_bytes,   1); if err != 0 { die("H2D rs", err) }
+
+    // Per-path private device buffers.
+    // REF path:
+    uint64 d_kc_ref      = dmalloc(kv_bytes)
+    uint64 d_vc_ref      = dmalloc(kv_bytes)
+    uint64 d_out_ref     = dmalloc(in_resid_bytes)
+    uint64 d_b_x_norm    = dmalloc(HIDDEN  * 4)
+    uint64 d_b_qkv       = dmalloc(QKV_DIM * 4)
+    uint64 d_b_q_attn    = dmalloc(Q_DIM   * 4)
+    uint64 d_b_attn_out  = dmalloc(Q_DIM   * 4)
+    uint64 d_b_o         = dmalloc(HIDDEN  * 4)
+    uint64 d_b_mid       = dmalloc(HIDDEN  * 4)
+    uint64 d_b_mid_norm  = dmalloc(HIDDEN  * 4)
+    uint64 d_b_gate_up   = dmalloc(2 * FF  * 4)
+    uint64 d_b_silu_mul  = dmalloc(FF      * 4)
+    uint64 d_b_ff_out    = dmalloc(HIDDEN  * 4)
+
+    // MEGA path:
+    uint64 d_kc_mega     = dmalloc(kv_bytes)
+    uint64 d_vc_mega     = dmalloc(kv_bytes)
+    uint64 d_out_mega    = dmalloc(in_resid_bytes)
+    uint64 d_barrier     = dmalloc(4)
+    uint64 d_gu_scratch  = dmalloc(2 * FF * 4)
+    uint64 d_b_x_norm_g  = dmalloc(HIDDEN  * 4)
+    uint64 d_b_qkv_g     = dmalloc(QKV_DIM * 4)
+    uint64 d_b_attn_q_g  = dmalloc(Q_DIM   * 4)
+    uint64 d_b_mid_g     = dmalloc(HIDDEN  * 4)
+    uint64 d_b_mid_norm_g= dmalloc(HIDDEN  * 4)
+
+    // Zero KV caches and barrier (kernel spin-load assumes counter
+    // starts at 0; zero the rest of KV slots for a clean slate).
+    uint64 h_zerobig = alloc(kv_bytes)
+    uint64 zi = 0
+    while zi < kv_bytes { uint8 zb = 0; unsafe { *((h_zerobig + zi) as uint8) = zb }; zi = zi + 1 }
+    err = hipMemcpy(d_kc_ref,  h_zerobig, kv_bytes, 1); if err != 0 { die("zero kc_ref", err) }
+    err = hipMemcpy(d_vc_ref,  h_zerobig, kv_bytes, 1); if err != 0 { die("zero vc_ref", err) }
+    err = hipMemcpy(d_kc_mega, h_zerobig, kv_bytes, 1); if err != 0 { die("zero kc_mega", err) }
+    err = hipMemcpy(d_vc_mega, h_zerobig, kv_bytes, 1); if err != 0 { die("zero vc_mega", err) }
+    err = hipMemcpy(d_barrier, h_zerobig, 4,        1); if err != 0 { die("zero barrier", err) }
+
+    puts("device buffers seeded")
+
+    // ───────────────────────────────────────────────────────
+    // 4.  REFERENCE PATH — per-op chain.
+    // ───────────────────────────────────────────────────────
+    // Phase 1: rmsnorm(in_resid, in_norm_g) -> b_x_norm
+    uint64 kb_p1 = alloc(5 * 8)
+    unsafe { *((kb_p1 +  0) as uint64) = d_in_resid }
+    unsafe { *((kb_p1 +  8) as uint64) = d_b_x_norm }
+    unsafe { *((kb_p1 + 16) as uint64) = d_in_norm_g }
+    unsafe { *((kb_p1 + 24) as uint64) = 1 }
+    unsafe { *((kb_p1 + 32) as uint64) = HIDDEN }
+    uint64 kp_p1 = build_kp(kb_p1, 5)
+    err = hipModuleLaunchKernel(fh_rmsnorm, 1, 1, 1, 1024, 1, 1, 0, 0, kp_p1, 0)
+    if err != 0 { die("REF rmsnorm1", err) }
+
+    // Phase 3: gemv_coop_bf16_f32 — qkv_w[QKV_DIM, HIDDEN] @ b_x_norm[HIDDEN]
+    //   -> b_qkv[QKV_DIM]
+    uint64 kb_p3 = alloc(5 * 8)
+    unsafe { *((kb_p3 +  0) as uint64) = d_qkv_w }
+    unsafe { *((kb_p3 +  8) as uint64) = d_b_x_norm }
+    unsafe { *((kb_p3 + 16) as uint64) = d_b_qkv }
+    unsafe { *((kb_p3 + 24) as uint64) = QKV_DIM }
+    unsafe { *((kb_p3 + 32) as uint64) = HIDDEN }
+    uint64 kp_p3 = build_kp(kb_p3, 5)
+    uint32 grid_p3 = QKV_DIM
+    err = hipModuleLaunchKernel(fh_gemv_bf16, grid_p3, 1, 1, 32, 1, 1, 0, 0, kp_p3, 0)
+    if err != 0 { die("REF qkv mm", err) }
+
+    // Phase 5a: extract_q (b_qkv -> b_q_attn)
+    uint64 kb_p5a = alloc(2 * 8)
+    unsafe { *((kb_p5a + 0) as uint64) = d_b_qkv }
+    unsafe { *((kb_p5a + 8) as uint64) = d_b_q_attn }
+    uint64 kp_p5a = build_kp(kb_p5a, 2)
+    uint32 grid_p5a_x = N_HEADS
+    uint32 grid_p5a_y = 1
+    err = hipModuleLaunchKernel(fh_extract_q, grid_p5a_x, grid_p5a_y, 1, 128, 1, 1, 0, 0, kp_p5a, 0)
+    if err != 0 { die("REF extract_q", err) }
+
+    // Phase 5b: qkv_split — copy K and V slices from b_qkv into kc_ref+0, vc_ref+0
+    uint64 d_k_slot_ref = d_kc_ref
+    uint64 d_v_slot_ref = d_vc_ref
+    uint64 kb_p5b = alloc(3 * 8)
+    unsafe { *((kb_p5b +  0) as uint64) = d_b_qkv }
+    unsafe { *((kb_p5b +  8) as uint64) = d_k_slot_ref }
+    unsafe { *((kb_p5b + 16) as uint64) = d_v_slot_ref }
+    uint64 kp_p5b = build_kp(kb_p5b, 3)
+    err = hipModuleLaunchKernel(fh_qkv_split, 8, 1, 1, 128, 1, 1, 0, 0, kp_p5b, 0)
+    if err != 0 { die("REF qkv_split", err) }
+
+    // Phase 5c: qknorm + rope_qk fused on (b_q_attn, k_slot).
+    uint64 kb_p5c = alloc(8 * 8)
+    unsafe { *((kb_p5c +  0) as uint64) = d_b_q_attn }
+    unsafe { *((kb_p5c +  8) as uint64) = d_k_slot_ref }
+    unsafe { *((kb_p5c + 16) as uint64) = d_q_norm_g }
+    unsafe { *((kb_p5c + 24) as uint64) = d_k_norm_g }
+    unsafe { *((kb_p5c + 32) as uint64) = d_rope_cos }
+    unsafe { *((kb_p5c + 40) as uint64) = d_rope_sin }
+    unsafe { *((kb_p5c + 48) as uint64) = N_HEADS }
+    unsafe { *((kb_p5c + 56) as uint64) = N_KV_HEADS }
+    uint64 kp_p5c = build_kp(kb_p5c, 8)
+    uint32 grid_p5c = N_HEADS + N_KV_HEADS
+    err = hipModuleLaunchKernel(fh_qknorm_rope, grid_p5c, 1, 1, 128, 1, 1, 0, 0, kp_p5c, 0)
+    if err != 0 { die("REF qknorm_rope", err) }
+
+    // Phase 7: attn_decode_f32(d_q, d_kc, d_vc, d_out, pos+1=1)
+    uint64 kb_p7 = alloc(5 * 8)
+    unsafe { *((kb_p7 +  0) as uint64) = d_b_q_attn }
+    unsafe { *((kb_p7 +  8) as uint64) = d_kc_ref }
+    unsafe { *((kb_p7 + 16) as uint64) = d_vc_ref }
+    unsafe { *((kb_p7 + 24) as uint64) = d_b_attn_out }
+    unsafe { *((kb_p7 + 32) as uint64) = 1 }
+    uint64 kp_p7 = build_kp(kb_p7, 5)
+    uint32 grid_p7 = N_HEADS
+    err = hipModuleLaunchKernel(fh_attn, grid_p7, 1, 1, 32, 1, 1, 0, 0, kp_p7, 0)
+    if err != 0 { die("REF attn", err) }
+
+    // Phase 9a: o_w[HIDDEN, Q_DIM] @ b_attn_out[Q_DIM] -> b_o
+    uint64 kb_p9a = alloc(5 * 8)
+    unsafe { *((kb_p9a +  0) as uint64) = d_o_w }
+    unsafe { *((kb_p9a +  8) as uint64) = d_b_attn_out }
+    unsafe { *((kb_p9a + 16) as uint64) = d_b_o }
+    unsafe { *((kb_p9a + 24) as uint64) = HIDDEN }
+    unsafe { *((kb_p9a + 32) as uint64) = Q_DIM }
+    uint64 kp_p9a = build_kp(kb_p9a, 5)
+    uint32 grid_p9a = HIDDEN
+    err = hipModuleLaunchKernel(fh_gemv_bf16, grid_p9a, 1, 1, 32, 1, 1, 0, 0, kp_p9a, 0)
+    if err != 0 { die("REF o mm", err) }
+
+    // Phase 9b: residual_add — b_mid = b_o + in_resid
+    uint64 kb_p9b = alloc(4 * 8)
+    unsafe { *((kb_p9b +  0) as uint64) = d_in_resid }
+    unsafe { *((kb_p9b +  8) as uint64) = d_b_o }
+    unsafe { *((kb_p9b + 16) as uint64) = d_b_mid }
+    unsafe { *((kb_p9b + 24) as uint64) = HIDDEN }
+    uint64 kp_p9b = build_kp(kb_p9b, 4)
+    uint32 grid_p9b = (HIDDEN + 255) / 256
+    err = hipModuleLaunchKernel(fh_residual, grid_p9b, 1, 1, 256, 1, 1, 0, 0, kp_p9b, 0)
+    if err != 0 { die("REF resid1", err) }
+
+    // Phase 11: rmsnorm(b_mid, post_norm_g) -> b_mid_norm
+    uint64 kb_p11 = alloc(5 * 8)
+    unsafe { *((kb_p11 +  0) as uint64) = d_b_mid }
+    unsafe { *((kb_p11 +  8) as uint64) = d_b_mid_norm }
+    unsafe { *((kb_p11 + 16) as uint64) = d_post_norm_g }
+    unsafe { *((kb_p11 + 24) as uint64) = 1 }
+    unsafe { *((kb_p11 + 32) as uint64) = HIDDEN }
+    uint64 kp_p11 = build_kp(kb_p11, 5)
+    err = hipModuleLaunchKernel(fh_rmsnorm, 1, 1, 1, 1024, 1, 1, 0, 0, kp_p11, 0)
+    if err != 0 { die("REF rmsnorm2", err) }
+
+    // Phase 13: gate_up matmul.  b_gate_up[2*FF] = gate_up_w[2*FF, HIDDEN] @ b_mid_norm
+    uint64 kb_p13 = alloc(5 * 8)
+    unsafe { *((kb_p13 +  0) as uint64) = d_gate_up_w }
+    unsafe { *((kb_p13 +  8) as uint64) = d_b_mid_norm }
+    unsafe { *((kb_p13 + 16) as uint64) = d_b_gate_up }
+    unsafe { *((kb_p13 + 24) as uint64) = 2 * FF }
+    unsafe { *((kb_p13 + 32) as uint64) = HIDDEN }
+    uint64 kp_p13 = build_kp(kb_p13, 5)
+    uint32 grid_p13 = 2 * FF
+    err = hipModuleLaunchKernel(fh_gemv_bf16, grid_p13, 1, 1, 32, 1, 1, 0, 0, kp_p13, 0)
+    if err != 0 { die("REF gu mm", err) }
+
+    // Phase 15: silu_mul(gate=b_gate_up[0..FF], up=b_gate_up[FF..2*FF]) -> b_silu_mul[FF]
+    uint64 kb_p15 = alloc(4 * 8)
+    unsafe { *((kb_p15 +  0) as uint64) = d_b_gate_up }
+    unsafe { *((kb_p15 +  8) as uint64) = d_b_gate_up + FF * 4 }
+    unsafe { *((kb_p15 + 16) as uint64) = d_b_silu_mul }
+    unsafe { *((kb_p15 + 24) as uint64) = FF }
+    uint64 kp_p15 = build_kp(kb_p15, 4)
+    uint32 grid_p15 = (FF + 255) / 256
+    err = hipModuleLaunchKernel(fh_silu_mul, grid_p15, 1, 1, 256, 1, 1, 0, 0, kp_p15, 0)
+    if err != 0 { die("REF silu", err) }
+
+    // Phase 17a: down matmul.  b_ff_out[HIDDEN] = down_w[HIDDEN, FF] @ b_silu_mul
+    uint64 kb_p17a = alloc(5 * 8)
+    unsafe { *((kb_p17a +  0) as uint64) = d_down_w }
+    unsafe { *((kb_p17a +  8) as uint64) = d_b_silu_mul }
+    unsafe { *((kb_p17a + 16) as uint64) = d_b_ff_out }
+    unsafe { *((kb_p17a + 24) as uint64) = HIDDEN }
+    unsafe { *((kb_p17a + 32) as uint64) = FF }
+    uint64 kp_p17a = build_kp(kb_p17a, 5)
+    uint32 grid_p17a = HIDDEN
+    err = hipModuleLaunchKernel(fh_gemv_bf16, grid_p17a, 1, 1, 32, 1, 1, 0, 0, kp_p17a, 0)
+    if err != 0 { die("REF down mm", err) }
+
+    // Phase 17b: residual_add — out_ref = b_mid + b_ff_out
+    uint64 kb_p17b = alloc(4 * 8)
+    unsafe { *((kb_p17b +  0) as uint64) = d_b_mid }
+    unsafe { *((kb_p17b +  8) as uint64) = d_b_ff_out }
+    unsafe { *((kb_p17b + 16) as uint64) = d_out_ref }
+    unsafe { *((kb_p17b + 24) as uint64) = HIDDEN }
+    uint64 kp_p17b = build_kp(kb_p17b, 4)
+    uint32 grid_p17b = (HIDDEN + 255) / 256
+    err = hipModuleLaunchKernel(fh_residual, grid_p17b, 1, 1, 256, 1, 1, 0, 0, kp_p17b, 0)
+    if err != 0 { die("REF resid2", err) }
+
+    err = hipDeviceSynchronize(); if err != 0 { die("REF sync", err) }
+    puts("REF path complete")
+
+    // ───────────────────────────────────────────────────────
+    // 5.  MEGA PATH — slice 4.6 mega-kernel, sweep max_phase 0..7
+    //     and compare the matching intermediate against the REF
+    //     buffer to bisect divergence.  We rerun the full mega-
+    //     kernel each iteration with KV cache + barrier reset,
+    //     bumping max_phase one step at a time.
+    // ───────────────────────────────────────────────────────
+    // Map of (max_phase, ref_buf, mega_buf, n_floats):
+    //   max_phase=0 → b_x_norm  vs b_x_norm_g  (HIDDEN)
+    //   max_phase=1 → b_qkv     vs b_qkv_g     (QKV_DIM)
+    //   max_phase=2 → b_q_attn  vs b_attn_q_g  (Q_DIM)  (pre-attn Q)
+    //   max_phase=3 → b_attn_out vs b_attn_q_g  (Q_DIM)  (post-attn)
+    //   max_phase=4 → b_mid     vs b_mid_g     (HIDDEN)
+    //   max_phase=5 → b_mid_norm vs b_mid_norm_g (HIDDEN)
+    //   max_phase=6 → b_gate_up vs gu_scratch  (2*FF)
+    //   max_phase=7 → out_ref   vs out_mega    (HIDDEN)
+
+    // Slice 4.7 fix: 24-arg blob — added b_attn_out_g (slot 22) so
+    // phase 7's writes don't clobber the Q input it's still reading.
+    uint64 d_b_attn_out_g = dmalloc(Q_DIM * 4)
+    uint64 kb_m = alloc(24 * 8)
+    unsafe { *((kb_m +  0 * 8) as uint64) = d_in_resid }
+    unsafe { *((kb_m +  1 * 8) as uint64) = d_out_mega }
+    unsafe { *((kb_m +  2 * 8) as uint64) = d_qkv_w }
+    unsafe { *((kb_m +  3 * 8) as uint64) = d_o_w }
+    unsafe { *((kb_m +  4 * 8) as uint64) = d_gate_up_w }
+    unsafe { *((kb_m +  5 * 8) as uint64) = d_down_w }
+    unsafe { *((kb_m +  6 * 8) as uint64) = d_in_norm_g }
+    unsafe { *((kb_m +  7 * 8) as uint64) = d_post_norm_g }
+    unsafe { *((kb_m +  8 * 8) as uint64) = d_q_norm_g }
+    unsafe { *((kb_m +  9 * 8) as uint64) = d_k_norm_g }
+    unsafe { *((kb_m + 10 * 8) as uint64) = d_rope_cos }
+    unsafe { *((kb_m + 11 * 8) as uint64) = d_rope_sin }
+    unsafe { *((kb_m + 12 * 8) as uint64) = d_kc_mega }
+    unsafe { *((kb_m + 13 * 8) as uint64) = d_vc_mega }
+    uint64 pos_val = 0
+    unsafe { *((kb_m + 14 * 8) as uint64) = pos_val }
+    unsafe { *((kb_m + 15 * 8) as uint64) = d_barrier }
+    unsafe { *((kb_m + 16 * 8) as uint64) = d_gu_scratch }
+    unsafe { *((kb_m + 17 * 8) as uint64) = d_b_x_norm_g }
+    unsafe { *((kb_m + 18 * 8) as uint64) = d_b_qkv_g }
+    unsafe { *((kb_m + 19 * 8) as uint64) = d_b_attn_q_g }
+    unsafe { *((kb_m + 20 * 8) as uint64) = d_b_mid_g }
+    unsafe { *((kb_m + 21 * 8) as uint64) = d_b_mid_norm_g }
+    unsafe { *((kb_m + 22 * 8) as uint64) = d_b_attn_out_g }
+    uint64 kp_m = build_kp(kb_m, 24)
+
+    // Per-phase ref/mega buffer pairs and float counts.  Stored as
+    // parallel arrays indexed by max_phase.
+    uint64[8] ref_buf_arr
+    uint64[8] mega_buf_arr
+    uint64[8] n_floats_arr
+
+    unsafe { *((ref_buf_arr   + 0 * 8) as uint64) = d_b_x_norm }
+    unsafe { *((mega_buf_arr  + 0 * 8) as uint64) = d_b_x_norm_g }
+    unsafe { *((n_floats_arr  + 0 * 8) as uint64) = HIDDEN }
+
+    unsafe { *((ref_buf_arr   + 1 * 8) as uint64) = d_b_qkv }
+    unsafe { *((mega_buf_arr  + 1 * 8) as uint64) = d_b_qkv_g }
+    unsafe { *((n_floats_arr  + 1 * 8) as uint64) = QKV_DIM }
+
+    unsafe { *((ref_buf_arr   + 2 * 8) as uint64) = d_b_q_attn }
+    unsafe { *((mega_buf_arr  + 2 * 8) as uint64) = d_b_attn_q_g }
+    unsafe { *((n_floats_arr  + 2 * 8) as uint64) = Q_DIM }
+
+    unsafe { *((ref_buf_arr   + 3 * 8) as uint64) = d_b_attn_out }
+    // Slice 4.7 fix: phase 7 now writes to b_attn_out_g, not b_attn_q_g
+    // (separate slab eliminates the read-after-write hazard).
+    unsafe { *((mega_buf_arr  + 3 * 8) as uint64) = d_b_attn_out_g }
+    unsafe { *((n_floats_arr  + 3 * 8) as uint64) = Q_DIM }
+
+    unsafe { *((ref_buf_arr   + 4 * 8) as uint64) = d_b_mid }
+    unsafe { *((mega_buf_arr  + 4 * 8) as uint64) = d_b_mid_g }
+    unsafe { *((n_floats_arr  + 4 * 8) as uint64) = HIDDEN }
+
+    unsafe { *((ref_buf_arr   + 5 * 8) as uint64) = d_b_mid_norm }
+    unsafe { *((mega_buf_arr  + 5 * 8) as uint64) = d_b_mid_norm_g }
+    unsafe { *((n_floats_arr  + 5 * 8) as uint64) = HIDDEN }
+
+    unsafe { *((ref_buf_arr   + 6 * 8) as uint64) = d_b_gate_up }
+    unsafe { *((mega_buf_arr  + 6 * 8) as uint64) = d_gu_scratch }
+    unsafe { *((n_floats_arr  + 6 * 8) as uint64) = 2 * FF }
+
+    unsafe { *((ref_buf_arr   + 7 * 8) as uint64) = d_out_ref }
+    unsafe { *((mega_buf_arr  + 7 * 8) as uint64) = d_out_mega }
+    unsafe { *((n_floats_arr  + 7 * 8) as uint64) = HIDDEN }
+
+    uint64 h_zero4 = alloc(4)
+    uint32 z32 = 0; unsafe { *(h_zero4 as uint32) = z32 }
+
+    f32 tol = 0.001f
+    uint64 first_bad_phase = 0xFF
+    uint64 mp = 0
+    while mp <= 7 {
+        // Reset barrier counter and KV mega cache before each launch.
+        err = hipMemcpy(d_barrier, h_zero4, 4, 1); if err != 0 { die("zero barrier", err) }
+        err = hipMemcpy(d_kc_mega, h_zerobig, kv_bytes, 1); if err != 0 { die("zero kc_mega2", err) }
+        err = hipMemcpy(d_vc_mega, h_zerobig, kv_bytes, 1); if err != 0 { die("zero vc_mega2", err) }
+
+        unsafe { *((kb_m + 23 * 8) as uint64) = mp }   // slice 4.7: max_phase moved to slot 23 (slot 22 = b_attn_out_g)
+        uint32 grid_m = WG_PERSIST
+        err = hipModuleLaunchKernel(fh_mega, grid_m, 1, 1, 32, 1, 1, 0, 0, kp_m, 0)
+        if err != 0 { die("MEGA launch", err) }
+        err = hipDeviceSynchronize(); if err != 0 { die("MEGA sync", err) }
+
+        // Read back ref + mega for this phase.
+        uint64 nf = 0; unsafe { *((n_floats_arr  + mp * 8) as uint64) -> nf }
+        uint64 d_ref = 0; unsafe { *((ref_buf_arr  + mp * 8) as uint64) -> d_ref }
+        uint64 d_meg = 0; unsafe { *((mega_buf_arr + mp * 8) as uint64) -> d_meg }
+
+        uint64 buf_bytes = nf * 4
+        uint64 hr = alloc(buf_bytes)
+        uint64 hm = alloc(buf_bytes)
+        err = hipMemcpy(hr, d_ref, buf_bytes, 2); if err != 0 { die("D2H ref_buf", err) }
+        err = hipMemcpy(hm, d_meg, buf_bytes, 2); if err != 0 { die("D2H mega_buf", err) }
+
+        f32 max_abs = 0.0f
+        f32 max_rel = 0.0f
+        uint64 bad = 0
+        uint64 first_idx = 0xFFFFFFFFFFFFFFFF
+        f32 first_a = 0.0f
+        f32 first_b = 0.0f
+        uint64 k = 0
+        while k < nf {
+            f32 a = 0.0f; unsafe { *((hr + k * 4) as f32) -> a }
+            f32 b = 0.0f; unsafe { *((hm + k * 4) as f32) -> b }
+            f32 d = a - b
+            if d < 0.0f { d = 0.0f - d }
+            if d > max_abs { max_abs = d }
+            f32 ax = a; if ax < 0.0f { ax = 0.0f - ax }
+            f32 rel = d / (ax + 0.000001f)
+            if rel > max_rel { max_rel = rel }
+            if d > tol {
+                bad = bad + 1
+                if first_idx == 0xFFFFFFFFFFFFFFFF {
+                    first_idx = k
+                    first_a = a
+                    first_b = b
+                }
+            }
+            k = k + 1
+        }
+
+        puts("---")
+        put_kv("max_phase", 9, mp)
+        put_kv("n_floats", 8, nf)
+        put_kv("bad_count", 9, bad)
+        put_f32_bits("max_abs_bits", 12, max_abs)
+        put_f32_bits("max_rel_bits", 12, max_rel)
+        if bad > 0 {
+            put_kv("first_idx", 9, first_idx)
+            put_f32_bits("ref",  3, first_a)
+            put_f32_bits("mega", 4, first_b)
+            if first_bad_phase == 0xFF { first_bad_phase = mp }
+        }
+
+        dealloc(hr); dealloc(hm)
+
+        // EXTRA DIAGNOSTIC at max_phase=2: also compare K and V at slot 0
+        // (these are the inputs attn_decode reads).  Mismatch here means
+        // the bug is in qknorm_rope_qk_fused (K) or qkv_split (V).
+        if mp == 2 {
+            uint64 kv_slot_bytes = KV_DIM * 4
+            uint64 hkr = alloc(kv_slot_bytes); uint64 hkm = alloc(kv_slot_bytes)
+            uint64 hvr = alloc(kv_slot_bytes); uint64 hvm = alloc(kv_slot_bytes)
+            err = hipMemcpy(hkr, d_kc_ref,  kv_slot_bytes, 2); if err != 0 { die("D2H kc_ref",  err) }
+            err = hipMemcpy(hkm, d_kc_mega, kv_slot_bytes, 2); if err != 0 { die("D2H kc_mega", err) }
+            err = hipMemcpy(hvr, d_vc_ref,  kv_slot_bytes, 2); if err != 0 { die("D2H vc_ref",  err) }
+            err = hipMemcpy(hvm, d_vc_mega, kv_slot_bytes, 2); if err != 0 { die("D2H vc_mega", err) }
+
+            f32 kmax = 0.0f; uint64 kbad = 0; uint64 kfi = 0xFFFFFFFFFFFFFFFF
+            f32 vmax = 0.0f; uint64 vbad = 0; uint64 vfi = 0xFFFFFFFFFFFFFFFF
+            uint64 kk = 0
+            while kk < KV_DIM {
+                f32 a = 0.0f; unsafe { *((hkr + kk * 4) as f32) -> a }
+                f32 b = 0.0f; unsafe { *((hkm + kk * 4) as f32) -> b }
+                f32 d = a - b; if d < 0.0f { d = 0.0f - d }
+                if d > kmax { kmax = d }
+                if d > tol { kbad = kbad + 1; if kfi == 0xFFFFFFFFFFFFFFFF { kfi = kk } }
+                f32 av = 0.0f; unsafe { *((hvr + kk * 4) as f32) -> av }
+                f32 bv = 0.0f; unsafe { *((hvm + kk * 4) as f32) -> bv }
+                f32 dv = av - bv; if dv < 0.0f { dv = 0.0f - dv }
+                if dv > vmax { vmax = dv }
+                if dv > tol { vbad = vbad + 1; if vfi == 0xFFFFFFFFFFFFFFFF { vfi = kk } }
+                kk = kk + 1
+            }
+            put_kv("K_bad", 5, kbad); put_f32_bits("K_max_abs_bits", 14, kmax)
+            put_kv("V_bad", 5, vbad); put_f32_bits("V_max_abs_bits", 14, vmax)
+            if kbad > 0 { put_kv("K_first_bad", 11, kfi) }
+            if vbad > 0 { put_kv("V_first_bad", 11, vfi) }
+
+            // Also dump the actual V[0][0][32] value from each path —
+            // attn_decode at q_head=0, i=32 should output exactly V[0][0][32]
+            // (single-token softmax = 1.0).
+            f32 v32_ref  = 0.0f; unsafe { *((hvr + 32 * 4) as f32) -> v32_ref }
+            f32 v32_mega = 0.0f; unsafe { *((hvm + 32 * 4) as f32) -> v32_mega }
+            put_f32_bits("V[0][0][32]_ref",  15, v32_ref)
+            put_f32_bits("V[0][0][32]_mega", 16, v32_mega)
+
+            dealloc(hkr); dealloc(hkm); dealloc(hvr); dealloc(hvm)
+        }
+        mp = mp + 1
+    }
+
+    puts("===")
+    if first_bad_phase == 0xFF {
+        puts("PASS")
+        exit(0)
+    } else {
+        put_kv("first_bad_phase", 15, first_bad_phase)
+        puts("FAIL")
+        exit(1)
+    }
+}

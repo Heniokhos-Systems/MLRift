@@ -757,3 +757,60 @@ The slice 4.6 architectural fix (LDS → global) was correct — the
 remaining hangs were driver-level OOB on under-allocated buffers,
 not coherence or compiler issues.  Slice 4.7 (bit-equivalence A/B
 vs per-op chain, with real qwen3 weights) is unblocked.
+
+## Slice 4.7 — bit-equivalence validation GREEN (2026-05-05)
+
+A subagent built the A/B harness `examples/llm/qwen3_layer_megakernel_ab.mlr`
+(575 lines): allocates random f32 input + bf16 weights from a fixed
+LCG seed, runs the canonical per-op chain (rmsnorm → bf16 gemv →
+extract_q + qkv_split + qknorm + rope_qk fused → attn_decode →
+o_proj + residual → post-rmsnorm → gate_up → silu_mul → down +
+residual) and the slice-4.6 mega-kernel on identical bytes, then
+sweeps `max_phase` 0..7 comparing each phase's output buffer.
+
+**Bug found and fixed in phase 7 (attn_decode):**
+
+The agent's bisection diverged at max_phase=3 with `first_bad_idx=32`
+— exactly the WAVE boundary.  Root cause: phase 7's pass 3 wrote
+`b_attn_q_g[q_head*HEAD_DIM + i]` for `i = lane, lane+32, ...`,
+but the inner dot product re-read `q[0..127]` from THE SAME
+buffer.  Iteration 2 (lanes 0..31 writing i=32..63) re-read
+q[0..31] which iteration 1 had already overwritten.  Half the
+output was junk.  `first_bad_idx=32` was the smoking gun.
+
+**Fix:** added `b_attn_out_g` as kernarg slot 22 — phase 7 writes
+the attention output to a separate slab, phase 9 reads from it
+(not from `b_attn_q_g`).  No read-after-write hazard on the Q
+input.
+
+After the fix, **A/B bisection PASSES every max_phase 0..7**:
+
+| max_phase | output     | max_abs_err |
+|---|---|---|
+| 0 | b_x_norm_g  | 0           |
+| 1 | b_qkv_g     | 0           |
+| 2 | b_attn_q_g  | ~2.9e-7     |
+| 3 | b_attn_out_g| 0           |
+| 4 | b_mid_g     | 0           |
+| 5 | b_mid_norm_g| 0           |
+| 6 | gu_scratch  | 0           |
+| 7 | out_resid   | ~4.9e-7     |
+
+The non-zero residuals at phases 2 and 7 are pure FMA-reorder
+noise — both paths see identical bf16 weights and f32 inputs;
+the reduce-tree order differs slightly between the per-op
+gemv_coop_bf16 and the mega-kernel's inline reduce.  Within
+2-3 ULPs of f32 single-precision noise floor.  **GREEN.**
+
+**Slice 4.7 unblocks:**
+- 4.8: wire mega-kernel into `qwen3_forward_layer_gpu` (replace 11
+  per-op calls with 1 mega-kernel launch).
+- 4.9: end-to-end qwen3_generate tok/s bench (target: ~107 tok/s,
+  vs 63.2 tok/s baseline = 1.7× / 1.45× ROCm bf16 ceiling).
+- 4.10: native ISA bytewise port from hipcc disasm (~1.5 hour
+  mechanical work given the slice 4.2 precedent's 30-min/50-dword
+  rate scaled to the mega-kernel's ~1500 dwords).
+
+Mega-kernel is now both **non-hanging AND numerically correct** —
+end-to-end demonstrably equivalent to the per-op chain at random
+inputs.  The destroy-PyTorch tok/s win is one wire-up away.

@@ -203,13 +203,22 @@ void phase5_qkv_split_qknorm_rope(unsigned int wg_id, unsigned int lane,
 
 // ────────────────────────────────────────────────────────────────
 // Phase 7 — attn_decode.  WGs 0..15 each compute one Q head's attn.
-// Reads Q from b_attn_q_g, K/V from caches, writes back to b_attn_q_g
-// (the post-attn output overwrites the rope-Q input).
+// Reads Q from b_attn_q_g, K/V from caches, writes attn output to a
+// SEPARATE buffer b_attn_out_g.
+//
+// Slice 4.7 fix: an earlier version wrote pass-3 output back into
+// b_attn_q_g, overwriting the Q input.  But pass 3 strides outer-i
+// by WAVE — iteration 2 (lanes write i=32..63) re-reads q[0..127]
+// for each dot product, including q[0..31] which iteration 1 had
+// already overwritten.  Result: garbage in lane-{0..31}'s outputs at
+// i ≥ 32.  Bisection at first_bad_idx=32 was the smoking gun.
+// Separate output slab avoids the read-after-write hazard.
 // ────────────────────────────────────────────────────────────────
 __device__ __forceinline__
 void phase7_attn_decode(unsigned int wg_id, unsigned int lane,
-                        float *b_attn_q_g,
+                        const float *b_attn_q_g,
                         const float *kc_layer, const float *vc_layer,
+                        float *b_attn_out_g,
                         unsigned long long pos) {
     if (wg_id >= N_HEADS) return;
     unsigned int q_head = wg_id;
@@ -245,7 +254,7 @@ void phase7_attn_decode(unsigned int wg_id, unsigned int lane,
     }
     float inv_sum = 1.0f / ssum;
 
-    // Pass 3: weighted V.  Overwrite b_attn_q_g[q_head] with output.
+    // Pass 3: weighted V.  Write to SEPARATE output slab.
     for (unsigned int i = lane; i < HEAD_DIM; i += WAVE) {
         float acc = 0.0f;
         for (unsigned long long t = 0; t <= pos; t++) {
@@ -256,18 +265,19 @@ void phase7_attn_decode(unsigned int wg_id, unsigned int lane,
             const float *v = vc_layer + t * KV_DIM + kv_head * HEAD_DIM;
             acc += w * v[i];
         }
-        b_attn_q_g[q_head * HEAD_DIM + i] = acc;
+        b_attn_out_g[q_head * HEAD_DIM + i] = acc;
     }
 }
 
 // ────────────────────────────────────────────────────────────────
 // Phase 9 — o_proj matmul + residual.  Each WG handles ceil(HIDDEN/256)
-// = 4 rows.  Reads b_attn_q_g + in_residual, writes b_mid_g.
+// = 4 rows.  Reads b_attn_out_g (phase 7's output, NOT the rope-Q
+// input) + in_residual, writes b_mid_g.
 // ────────────────────────────────────────────────────────────────
 __device__ __forceinline__
 void phase9_oproj_residual(unsigned int wg_id, unsigned int lane,
                             const unsigned short *o_w,
-                            const float *b_attn_q_g,
+                            const float *b_attn_out_g,
                             const float *in_residual,
                             float *b_mid_g) {
     constexpr unsigned int ROWS_PER_WG = (HIDDEN + WG_PERSIST - 1) / WG_PERSIST;
@@ -277,7 +287,7 @@ void phase9_oproj_residual(unsigned int wg_id, unsigned int lane,
         float acc = 0.0f;
         const unsigned short *w_row = o_w + row * Q_DIM;
         for (unsigned int k = lane; k < Q_DIM; k += WAVE) {
-            acc += bf16_to_f32(w_row[k]) * b_attn_q_g[k];
+            acc += bf16_to_f32(w_row[k]) * b_attn_out_g[k];
         }
         for (int offset = WAVE / 2; offset > 0; offset >>= 1) {
             acc += __shfl_xor(acc, offset);
@@ -411,7 +421,10 @@ void qwen3_layer_megakernel(
     float                *b_attn_q_g,            // 19  [Q_DIM]   — phase 5 → 7 → 9 (NEW)
     float                *b_mid_g,               // 20  [HIDDEN] — phase 9 → 11 → 17 (NEW)
     float                *b_mid_norm_g,          // 21  [HIDDEN] — phase 11 → 13 (NEW)
-    unsigned long long    max_phase              // 22  bisection: kernel exits after phase max_phase
+    float                *b_attn_out_g,          // 22  [Q_DIM] — phase 7 → 9 (slice 4.7 fix:
+                                                  //              separate from b_attn_q_g to avoid
+                                                  //              read-after-write hazard in pass 3)
+    unsigned long long    max_phase              // 23  bisection: kernel exits after phase max_phase
 ) {
     unsigned int wg_id = blockIdx.x;
     unsigned int lane  = threadIdx.x;
@@ -431,11 +444,12 @@ void qwen3_layer_megakernel(
     mega_barrier(barrier_counter, 2);
     if (max_phase < 3) return;
 
-    phase7_attn_decode(wg_id, lane, b_attn_q_g, kc_layer, vc_layer, pos);
+    phase7_attn_decode(wg_id, lane, b_attn_q_g, kc_layer, vc_layer,
+                       b_attn_out_g, pos);
     mega_barrier(barrier_counter, 3);
     if (max_phase < 4) return;
 
-    phase9_oproj_residual(wg_id, lane, o_w, b_attn_q_g, in_residual, b_mid_g);
+    phase9_oproj_residual(wg_id, lane, o_w, b_attn_out_g, in_residual, b_mid_g);
     mega_barrier(barrier_counter, 4);
     if (max_phase < 5) return;
 

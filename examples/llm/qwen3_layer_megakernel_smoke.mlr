@@ -115,6 +115,7 @@ fn main() {
     uint64 b_attn_q_g   = 0
     uint64 b_mid_g      = 0
     uint64 b_mid_norm_g = 0
+    uint64 b_attn_out_g = 0   // slice 4.7 fix: phase 7 output ≠ input
 
     uint64 slot = alloc(8)
 
@@ -139,6 +140,7 @@ fn main() {
     err = hipMalloc(slot, Q_DIM * 4);             if err != 0 { die("a b_attn_q_g",  err) }; unsafe { *(slot as uint64) -> b_attn_q_g }
     err = hipMalloc(slot, HIDDEN * 4);            if err != 0 { die("a b_mid_g",     err) }; unsafe { *(slot as uint64) -> b_mid_g }
     err = hipMalloc(slot, HIDDEN * 4);            if err != 0 { die("a b_mid_norm_g",err) }; unsafe { *(slot as uint64) -> b_mid_norm_g }
+    err = hipMalloc(slot, Q_DIM * 4);             if err != 0 { die("a b_attn_out_g",err) }; unsafe { *(slot as uint64) -> b_attn_out_g }
 
     // Zero the barrier counter (kernel's spin-load assumes counter
     // starts at 0).
@@ -183,13 +185,14 @@ fn main() {
     err = hipMemcpy(b_attn_q_g,   h_zeroW, Q_DIM * 4,     1); if err != 0 { die("zero b_attn_q_g",   err) }
     err = hipMemcpy(b_mid_g,      h_zeroW, HIDDEN * 4,    1); if err != 0 { die("zero b_mid_g",      err) }
     err = hipMemcpy(b_mid_norm_g, h_zeroW, HIDDEN * 4,    1); if err != 0 { die("zero b_mid_norm_g", err) }
+    err = hipMemcpy(b_attn_out_g, h_zeroW, Q_DIM * 4,     1); if err != 0 { die("zero b_attn_out_g", err) }
     err = hipMemcpy(gu_scratch,   h_zeroW, 2 * FF * 4,    1); if err != 0 { die("zero gu_scratch",   err) }
     err = hipMemcpy(kc,           h_zeroW, MAX_SEQ * KV_DIM * 4, 1); if err != 0 { die("zero kc",    err) }
     err = hipMemcpy(vc,           h_zeroW, MAX_SEQ * KV_DIM * 4, 1); if err != 0 { die("zero vc",    err) }
 
-    // Build the 23-kernarg blob (slice 4.6 added 5 global scratch
-    // slabs for cross-phase carries that previously lived in LDS).
-    uint64 k_buf = alloc(23 * 8)
+    // Build the 24-kernarg blob (slice 4.7 added b_attn_out_g for the
+    // phase-7 read-after-write hazard fix).
+    uint64 k_buf = alloc(24 * 8)
     unsafe { *((k_buf +  0 * 8) as uint64) = in_resid    }
     unsafe { *((k_buf +  1 * 8) as uint64) = out_resid   }
     unsafe { *((k_buf +  2 * 8) as uint64) = qkv_w       }
@@ -213,13 +216,14 @@ fn main() {
     unsafe { *((k_buf + 19 * 8) as uint64) = b_attn_q_g   }
     unsafe { *((k_buf + 20 * 8) as uint64) = b_mid_g      }
     unsafe { *((k_buf + 21 * 8) as uint64) = b_mid_norm_g }
-    // Slot 22 (max_phase) set per-iteration in the bisection sweep below.
+    unsafe { *((k_buf + 22 * 8) as uint64) = b_attn_out_g }
+    // Slot 23 (max_phase) set per-iteration in the bisection sweep below.
 
     // KFD shim's hipModuleLaunchKernel expects void** (array of
     // pointers to 8-byte slots).  Build that.
-    uint64 kp = alloc(23 * 8)
+    uint64 kp = alloc(24 * 8)
     uint64 j = 0
-    while j < 23 {
+    while j < 24 {
         uint64 slot_ptr = k_buf + j * 8
         unsafe { *((kp + j * 8) as uint64) = slot_ptr }
         j = j + 1
@@ -245,7 +249,7 @@ fn main() {
     while mp <= 7 {
         // Re-zero barrier counter
         err = hipMemcpy(barrier_ctr, h_zero4, 4, 1); if err != 0 { die("clear barrier", err) }
-        unsafe { *((k_buf + 22 * 8) as uint64) = mp }   // max_phase
+        unsafe { *((k_buf + 23 * 8) as uint64) = mp }   // max_phase
 
         puts("---")
         put_kv("max_phase", 9, mp)
@@ -277,6 +281,6 @@ fn main() {
     hipFree(q_norm_g); hipFree(k_norm_g); hipFree(rope_cos); hipFree(rope_sin)
     hipFree(kc); hipFree(vc); hipFree(barrier_ctr); hipFree(gu_scratch)
     hipFree(b_x_norm_g); hipFree(b_qkv_g); hipFree(b_attn_q_g)
-    hipFree(b_mid_g); hipFree(b_mid_norm_g)
+    hipFree(b_mid_g); hipFree(b_mid_norm_g); hipFree(b_attn_out_g)
     exit(0)
 }
