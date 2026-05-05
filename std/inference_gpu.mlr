@@ -78,6 +78,9 @@ static u64 _gpu_fh_attn_decode_speck4  = 0  // multi-Q attn for spec_K=4
 static u64 _gpu_fh_attn_decode_14b      = 0  // 14B variant: kv_ratio=5 (nh=40, nkv=8)
 static u64 _gpu_fh_qkv_split_14b        = 0  // 14B variant: q_dim=5120
 static u64 _gpu_fh_qkv_split_batched_14b = 0  // 14B batched variant
+// Slice 4.8: full-layer mega-kernel.  Single dispatch replaces 11 per-op
+// calls per qwen3 layer.  Best-effort load; absence falls back to per-op.
+static u64 _gpu_fh_qwen3_megakernel     = 0
 
 // Arch mirrors — set by gpu_set_arch() (called from qwen3_set_arch).
 // inference_gpu.mlr imports BEFORE qwen3.mlr, so we can't read
@@ -226,6 +229,8 @@ fn _gpu_mm_init_once() {
     _gpu_fh_attn_decode_14b   = _gpu_mm_load_co("/tmp/attn_decode_f32_14b.co", "attn_decode_f32_14b")
     _gpu_fh_attn_decode_batched = _gpu_mm_load_co("/tmp/attn_decode_f32_batched.co", "attn_decode_f32_batched")
     _gpu_fh_attn_decode_speck4  = _gpu_mm_load_co("/tmp/attn_decode_f32_speck4.co", "attn_decode_f32_speck4")
+    // Slice 4.8 mega-kernel — best-effort load; absence falls back to per-op.
+    _gpu_fh_qwen3_megakernel    = _gpu_mm_load_co("/tmp/qwen3_layer_megakernel.co", "qwen3_layer_megakernel")
     if _gpu_mm_fh_dq == 0 || _gpu_mm_fh_gemv == 0 { return }
 
     _gpu_mm_cache_keys = alloc(_gpu_mm_cache_cap * 8)
@@ -1381,4 +1386,109 @@ fn gpu_pipeline_ready() -> u64 {
     if _gpu_fh_silu_mul == 0 { return 0 }
     if _gpu_fh_rmsnorm_1024 == 0 { return 0 }
     return 1
+}
+
+// Slice 4.8 — public accessor to upload (or look up cached) device bf16
+// weight for a host bf16 pointer.  Used by the mega-kernel launcher to
+// share the SAME device bf16 slab as gpu_matmul_to_dev's bf16-direct
+// path (when MLRIFT_GPU_MATMUL_BF16=1).  The mega-kernel always reads
+// bf16 weights directly (no f32 dequant variant), so we always go
+// through this cache.  Returns 0 on failure or if GPU is disabled.
+fn gpu_get_or_upload_bf16_weight(u64 w_bf16_host, u64 K, u64 N) -> u64 {
+    if gpu_matmul_enabled() == 0 { return 0 }
+    return _gpu_mm_get_or_upload_bf16(w_bf16_host, K, N)
+}
+
+// Slice 4.8 — probe whether the qwen3 mega-kernel module loaded.
+fn gpu_qwen3_megakernel_ready() -> u64 {
+    if gpu_matmul_enabled() == 0 { return 0 }
+    if _gpu_fh_qwen3_megakernel == 0 { return 0 }
+    return 1
+}
+
+// Slice 4.8 — single-dispatch full-qwen3-layer launcher.  Replaces the
+// 11 per-op calls in qwen3_forward_layer_gpu with one mega-kernel
+// dispatch.  All 24 kernarg device pointers must already be allocated
+// and populated by the caller; this function only zeroes the barrier
+// counter (via the host-mapped GTT pointer) and queues the launch.
+//
+// Grid = (WG_PERSIST=64, 1, 1), block = (32, 1, 1).
+// max_phase = 7 runs the full layer; lower values bisect for debug.
+//
+// Returns 0 on success, 1 on launch failure (caller should fall back).
+@export
+fn gpu_qwen3_layer_megakernel_to_dev(u64 d_in_residual,    u64 d_out_residual,
+                                       u64 d_qkv_w,         u64 d_o_w,
+                                       u64 d_gate_up_w,     u64 d_down_w,
+                                       u64 d_in_norm_g,     u64 d_post_norm_g,
+                                       u64 d_q_norm_g,      u64 d_k_norm_g,
+                                       u64 d_rope_cos,      u64 d_rope_sin,
+                                       u64 d_kc_layer,      u64 d_vc_layer,
+                                       u64 pos,
+                                       u64 d_barrier_ctr,   u64 h_barrier_ctr,
+                                       u64 d_gu_scratch,
+                                       u64 d_b_x_norm_g,    u64 d_b_qkv_g,
+                                       u64 d_b_attn_q_g,    u64 d_b_mid_g,
+                                       u64 d_b_mid_norm_g,  u64 d_b_attn_out_g,
+                                       u64 max_phase) -> u64 {
+    if _gpu_fh_qwen3_megakernel == 0 { return 1 }
+
+    // Zero the barrier counter via the host-mapped GTT pointer.  GTT is
+    // CPU-coherent so this write is visible to the GPU on next launch.
+    if h_barrier_ctr != 0 {
+        u32 z = 0
+        unsafe { *(h_barrier_ctr as u32) = z }
+    } else {
+        // Fall back to D2D memset via H2D — slower path.
+        u64 zbuf = alloc(4)
+        u32 zv = 0; unsafe { *(zbuf as u32) = zv }
+        u32 cerr = hipMemcpy(d_barrier_ctr, zbuf, 4, 1)
+        if cerr != 0 { return 1 }
+        dealloc(zbuf)
+    }
+
+    // Build kernarg blob (24 × u64 packed) using arena to avoid mmap.
+    _gpu_kp_reset()
+    u64 k_buf = _gpu_kp_bump(24 * 8)
+    unsafe { *((k_buf +  0 * 8) as u64) = d_in_residual    }
+    unsafe { *((k_buf +  1 * 8) as u64) = d_out_residual   }
+    unsafe { *((k_buf +  2 * 8) as u64) = d_qkv_w          }
+    unsafe { *((k_buf +  3 * 8) as u64) = d_o_w            }
+    unsafe { *((k_buf +  4 * 8) as u64) = d_gate_up_w      }
+    unsafe { *((k_buf +  5 * 8) as u64) = d_down_w         }
+    unsafe { *((k_buf +  6 * 8) as u64) = d_in_norm_g      }
+    unsafe { *((k_buf +  7 * 8) as u64) = d_post_norm_g    }
+    unsafe { *((k_buf +  8 * 8) as u64) = d_q_norm_g       }
+    unsafe { *((k_buf +  9 * 8) as u64) = d_k_norm_g       }
+    unsafe { *((k_buf + 10 * 8) as u64) = d_rope_cos       }
+    unsafe { *((k_buf + 11 * 8) as u64) = d_rope_sin       }
+    unsafe { *((k_buf + 12 * 8) as u64) = d_kc_layer       }
+    unsafe { *((k_buf + 13 * 8) as u64) = d_vc_layer       }
+    unsafe { *((k_buf + 14 * 8) as u64) = pos              }
+    unsafe { *((k_buf + 15 * 8) as u64) = d_barrier_ctr    }
+    unsafe { *((k_buf + 16 * 8) as u64) = d_gu_scratch     }
+    unsafe { *((k_buf + 17 * 8) as u64) = d_b_x_norm_g     }
+    unsafe { *((k_buf + 18 * 8) as u64) = d_b_qkv_g        }
+    unsafe { *((k_buf + 19 * 8) as u64) = d_b_attn_q_g     }
+    unsafe { *((k_buf + 20 * 8) as u64) = d_b_mid_g        }
+    unsafe { *((k_buf + 21 * 8) as u64) = d_b_mid_norm_g   }
+    unsafe { *((k_buf + 22 * 8) as u64) = d_b_attn_out_g   }
+    unsafe { *((k_buf + 23 * 8) as u64) = max_phase        }
+
+    // Build void**-style pointer array.
+    u64 kp = _gpu_kp_bump(24 * 8)
+    u64 j = 0
+    while j < 24 {
+        u64 slot_ptr = k_buf + j * 8
+        unsafe { *((kp + j * 8) as u64) = slot_ptr }
+        j = j + 1
+    }
+
+    u32 grid_x = 64        // WG_PERSIST
+    u32 block_x = 32       // wave-aligned
+    u32 err = hipModuleLaunchKernel(_gpu_fh_qwen3_megakernel,
+                                     grid_x, 1, 1, block_x, 1, 1,
+                                     0, 0, kp, 0)
+    if err != 0 { return 1 }
+    return 0
 }

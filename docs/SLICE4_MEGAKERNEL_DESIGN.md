@@ -814,3 +814,66 @@ gemv_coop_bf16 and the mega-kernel's inline reduce.  Within
 Mega-kernel is now both **non-hanging AND numerically correct** —
 end-to-end demonstrably equivalent to the per-op chain at random
 inputs.  The destroy-PyTorch tok/s win is one wire-up away.
+
+## Slice 4.8 — wire-up GREEN (2026-05-05)
+
+A subagent threaded the slice-4.7 mega-kernel into the qwen3
+inference pipeline. When `MLRIFT_QWEN3_MEGAKERNEL=1` is set,
+`qwen3_forward_layer_gpu` replaces its 11 per-op dispatches with
+one `gpu_qwen3_layer_megakernel_to_dev` call per layer.
+
+**Token output: bit-identical to per-op + PyTorch reference.**
+
+```
+14990, 14582, 284, 330, 9707, 11, 4337, 17199, 1350, 3203, 4791,
+14582, 692, 2, 1173, 279, 1156, 3409, 198, 1350, 3203
+```
+matches both the existing per-op path and the PyTorch reference
+exactly, on Qwen3-0.6B default prompt.
+
+**Per-step launch counters:**
+- Per-op:        310 launches / step (the slice 2c baseline)
+- Mega-kernel:    29 launches / step (28 layers × 1 dispatch + 1 lm_head)
+
+281 launches saved per token — the design's projected dispatch-
+overhead reduction is empirically realized.
+
+**Wire-up scope (3 files, +292 / -2):**
+
+`std/inference_gpu.mlr`:
+- `_gpu_fh_qwen3_megakernel` static + best-effort `.co` load.
+- `gpu_get_or_upload_bf16_weight()` public accessor (shares the
+  bf16 weight cache between mega-kernel and per-op paths).
+- `gpu_qwen3_megakernel_ready()` probe.
+- `gpu_qwen3_layer_megakernel_to_dev()` launcher: builds the
+  24-kernarg blob, zeroes the host-mapped barrier counter,
+  dispatches (64,1,1)×(32,1,1).
+
+`std/qwen3.mlr`:
+- 8 new `_gpuq_d_megak_*` statics (7 inter-phase scratch slabs +
+  barrier counter, host-visible GTT for the barrier).
+- Pipeline-init reserves them.
+- `qwen3_forward_layer_gpu` env-cached gate at top.  Fires only
+  when: env set, module loaded, batch_size==1, batch_idx==0,
+  hidden==1024 (0.6B-only), pos<64, phase mask 0xFF (cross-layer
+  fusion bits 0x8000/0x10000 cause fall-through to per-op).
+- Resolves bf16 weights via shared cache, gammas via
+  `gpu_cache_bf16_as_f32`, refreshes rope cos/sin, computes
+  KV-cache device slabs, dispatches with `max_phase=7`.
+
+`examples/qwen3_generate.mlr`:
+- When the env is set, suppress cross-layer fusion bits and skip
+  `qwen3_gpu_chain_resid_to_next_norm` (mega-kernel handles input
+  rmsnorm and final residual internally).
+
+**Slice 4 status:**
+- 4.1-4.7 ✓ (barrier, native skeleton, 7-phase HIP, LDS root
+  cause + global-scratch fix, bit-equivalence GREEN)
+- 4.8 ✓ **wire-up GREEN, tokens bit-identical to PyTorch**
+- 4.9: end-to-end tok/s bench on an idle GPU (the launch-saving
+  win expected here; current measurement under user's concurrent
+  GPU workload not interpretable).
+- 4.10: native ISA bytewise port from hipcc disasm.
+
+The mega-kernel is now an opt-in path in production qwen3 inference.
+Throughput validation pending an idle-GPU window.

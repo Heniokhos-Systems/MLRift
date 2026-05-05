@@ -1173,6 +1173,23 @@ static u64 _gpuq_flush_every_n     = 0
 static u64 _gpuq_flush_every_n_init = 0
 static u64 _gpuq_flush_skip_count   = 0
 
+// Slice 4.8 mega-kernel scratch slabs.  Single-stream (batch=1) only.
+// All sized for qwen3-0.6B: HIDDEN=1024, QKV_DIM=4096, Q_DIM=2048, FF=3072.
+// _gpuq_d_megak_barrier_ctr is host-visible (GTT) so the launcher can
+// zero it directly via the host pointer between launches without an H2D
+// hipMemcpy.  Allocated once in _qwen3_gpu_pipeline_init.
+static u64 _gpuq_d_megak_b_x_norm_g    = 0
+static u64 _gpuq_d_megak_b_qkv_g       = 0
+static u64 _gpuq_d_megak_b_attn_q_g    = 0
+static u64 _gpuq_d_megak_b_mid_g       = 0
+static u64 _gpuq_d_megak_b_mid_norm_g  = 0
+static u64 _gpuq_d_megak_b_attn_out_g  = 0
+static u64 _gpuq_d_megak_gu_scratch    = 0
+static u64 _gpuq_d_megak_barrier_ctr   = 0
+static u64 _gpuq_d_megak_barrier_h     = 0   // host-mapped pointer to barrier
+static u64 _gpuq_megak_env_init        = 0
+static u64 _gpuq_megak_use             = 0    // cached env decision
+
 @export
 fn qwen3_gpu_set_kv_cache_dev(u64 k_dev_base, u64 v_dev_base,
                                u64 layer_stride, u64 batch_size) {
@@ -1219,6 +1236,29 @@ fn _qwen3_gpu_pipeline_init() -> u64 {
     // K-stage buffer: [batch, kv_dim] f32 for the extract-k → qknorm K
     // → K-rope → insert-k pipeline.  At batch=1 the buffer is unused.
     _gpuq_d_k_stage = gpu_buf_reserve(B * kv_dim * 4, 0)
+
+    // Slice 4.8 mega-kernel scratch slabs.  Single-stream (batch=1)
+    // only — all sized for one stream.  Reserved unconditionally so
+    // the env can be flipped on at runtime without re-init.
+    _gpuq_d_megak_b_x_norm_g    = gpu_buf_reserve(hidden  * 4, 0)
+    _gpuq_d_megak_b_qkv_g       = gpu_buf_reserve(qkv_dim * 4, 0)
+    _gpuq_d_megak_b_attn_q_g    = gpu_buf_reserve(q_dim   * 4, 0)
+    _gpuq_d_megak_b_mid_g       = gpu_buf_reserve(hidden  * 4, 0)
+    _gpuq_d_megak_b_mid_norm_g  = gpu_buf_reserve(hidden  * 4, 0)
+    _gpuq_d_megak_b_attn_out_g  = gpu_buf_reserve(q_dim   * 4, 0)
+    _gpuq_d_megak_gu_scratch    = gpu_buf_reserve(2 * ff  * 4, 0)
+    // barrier_counter — 4 B but rounded up by gpu_buf_reserve. Host-
+    // visible so the launcher zeros it via *(h_ptr) = 0 each call.
+    u64 barrier_h_slot = alloc(8)
+    _gpuq_d_megak_barrier_ctr   = gpu_buf_reserve(64, barrier_h_slot)
+    if _gpuq_d_megak_barrier_ctr != 0 {
+        unsafe { *(barrier_h_slot as u64) -> _gpuq_d_megak_barrier_h }
+        // Zero it now too.
+        if _gpuq_d_megak_barrier_h != 0 {
+            u32 z = 0
+            unsafe { *(_gpuq_d_megak_barrier_h as u32) = z }
+        }
+    }
 
     if _gpuq_d_x_norm == 0 { return 0 }
     if _gpuq_d_qkv == 0 { return 0 }
@@ -1363,6 +1403,133 @@ fn qwen3_forward_layer_gpu(u64 d_x_in, u64 d_x_out,
     u64 kv_dim  = QWEN3_KV_DIM
     u64 ff      = QWEN3_INTERMEDIATE
     u64 qkv_dim = q_dim + 2 * kv_dim
+
+    // Slice 4.8 — MLRIFT_QWEN3_MEGAKERNEL=1 fuses the entire layer into
+    // one dispatch.  Only fires when:
+    //   - env set and != "0"
+    //   - module loaded (_gpu_fh_qwen3_megakernel != 0)
+    //   - single-stream batch=1, batch_idx=0 (no batched/spec support)
+    //   - hidden=1024 (qwen3-0.6B; kernel shape constants are baked in)
+    //   - phase_mask is "full layer": 0xFF (all phases on, no fusion).
+    //     The cross-layer fusion bits 0x8000 (skip input_norm) and
+    //     0x10000 (skip final resid) conflict with the mega-kernel's
+    //     internal flow — when set, we fall through to per-op so the
+    //     existing cross-layer fusion stays correct.  Caller can
+    //     suppress those bits when MLRIFT_QWEN3_MEGAKERNEL=1.
+    //   - pos < MAX_SEQ=64 (kernel's KV-cache extent).
+    if _gpuq_megak_env_init == 0 {
+        _gpuq_megak_env_init = 1
+        u64 ev_megak = getenv("MLRIFT_QWEN3_MEGAKERNEL")
+        if ev_megak != 0 {
+            u8 c0 = 0; unsafe { *(ev_megak as u8) -> c0 }
+            if c0 != 48 { _gpuq_megak_use = 1 }
+        }
+    }
+    if _gpuq_megak_use != 0 {
+        if gpu_qwen3_megakernel_ready() != 0 {
+            if _gpuq_batch_size == 1 && batch_idx == 0 && hidden == 1024 && pos < 64 {
+                // Strip the 0x40000 (qknorm-rope-fused opt-out) bit; it
+                // doesn't apply to the mega-kernel path.
+                u64 mp = phase_mask & ~0x40000
+                if mp == 0xFF {
+                    if _gpuq_d_megak_b_x_norm_g == 0 { return 1 }
+                    if _gpuq_d_megak_barrier_ctr == 0 { return 1 }
+
+                    // Resolve device weight pointers.  Mega-kernel reads
+                    // bf16 weights directly (no f32 dequant variant),
+                    // so we always go through the bf16 cache.
+                    u64 d_qkv_w     = gpu_get_or_upload_bf16_weight(w.q_proj_w,    hidden, qkv_dim)
+                    if d_qkv_w == 0 { return 1 }
+                    u64 d_o_w       = gpu_get_or_upload_bf16_weight(w.o_proj_w,    q_dim,  hidden)
+                    if d_o_w == 0 { return 1 }
+                    u64 d_gate_up_w = gpu_get_or_upload_bf16_weight(w.gate_proj_w, hidden, 2 * ff)
+                    if d_gate_up_w == 0 { return 1 }
+                    u64 d_down_w    = gpu_get_or_upload_bf16_weight(w.down_proj_w, ff,     hidden)
+                    if d_down_w == 0 { return 1 }
+
+                    u64 d_in_gamma   = gpu_cache_bf16_as_f32(w.input_norm_w, hidden)
+                    if d_in_gamma == 0 { return 1 }
+                    u64 d_post_gamma = gpu_cache_bf16_as_f32(w.post_norm_w,  hidden)
+                    if d_post_gamma == 0 { return 1 }
+                    u64 d_q_gamma    = gpu_cache_bf16_as_f32(w.q_norm_w,     hd)
+                    if d_q_gamma == 0 { return 1 }
+                    u64 d_k_gamma    = gpu_cache_bf16_as_f32(w.k_norm_w,     hd)
+                    if d_k_gamma == 0 { return 1 }
+
+                    // Refresh cos/sin tables when pos has advanced (same
+                    // logic as the per-op gpu attn path).
+                    if _gpuq_rope_cache_pos != pos {
+                        f64 theta = 1000000.0
+                        qwen3_rope_compute(_gpuq_d_rope_cos_h, _gpuq_d_rope_sin_h, pos, hd, theta)
+                        _gpuq_rope_cache_pos = pos
+                    }
+
+                    // Resolve KV-cache device slabs (4D layout — same
+                    // math as the use_gpu_attn path below).
+                    u64 d_kc_layer = 0
+                    u64 d_vc_layer = 0
+                    if _gpuq_kv_k_dev_base != 0 && _gpuq_kv_v_dev_base != 0 {
+                        u64 host_base = dev_host_ptr(_gpuq_kv_k_dev_base) + batch_idx * _gpuq_kv_layer_stride
+                        u64 layer_idx = (k_cache_layer - host_base) / _gpuq_kv_batch_stride
+                        d_kc_layer = _gpuq_kv_k_dev_base + layer_idx * _gpuq_kv_batch_stride
+                                                          + batch_idx * _gpuq_kv_layer_stride
+                        d_vc_layer = _gpuq_kv_v_dev_base + layer_idx * _gpuq_kv_batch_stride
+                                                          + batch_idx * _gpuq_kv_layer_stride
+                    } else {
+                        // No GPU KV cache → mega-kernel can't run; fall back.
+                        // (Mega-kernel writes K/V directly; CPU KV cache
+                        // path doesn't expose device pointers.)
+                    }
+                    if d_kc_layer == 0 || d_vc_layer == 0 {
+                        // Fall through to per-op path below.
+                    } else {
+                        u64 max_phase = 7
+                        if gpu_qwen3_layer_megakernel_to_dev(
+                                d_x_in, d_x_out,
+                                d_qkv_w, d_o_w, d_gate_up_w, d_down_w,
+                                d_in_gamma, d_post_gamma, d_q_gamma, d_k_gamma,
+                                _gpuq_d_rope_cos, _gpuq_d_rope_sin,
+                                d_kc_layer, d_vc_layer,
+                                pos,
+                                _gpuq_d_megak_barrier_ctr, _gpuq_d_megak_barrier_h,
+                                _gpuq_d_megak_gu_scratch,
+                                _gpuq_d_megak_b_x_norm_g, _gpuq_d_megak_b_qkv_g,
+                                _gpuq_d_megak_b_attn_q_g, _gpuq_d_megak_b_mid_g,
+                                _gpuq_d_megak_b_mid_norm_g, _gpuq_d_megak_b_attn_out_g,
+                                max_phase) != 0 {
+                            return 1
+                        }
+                        // Honour the same per-layer flush throttle as
+                        // the per-op tail.  Sync at end so next layer's
+                        // d_x_out read (or D2H) sees the result.
+                        if _gpuq_flush_every_n_init == 0 {
+                            _gpuq_flush_every_n_init = 1
+                            u64 ev_n = getenv("MLRIFT_GPU_FLUSH_EVERY_N")
+                            if ev_n != 0 {
+                                u64 parsed = 0; u64 i = 0
+                                u8 c = 0; unsafe { *(ev_n as u8) -> c }
+                                while c >= 48 && c <= 57 {
+                                    parsed = parsed * 10 + (c - 48)
+                                    i = i + 1
+                                    unsafe { *((ev_n + i) as u8) -> c }
+                                }
+                                if parsed > 0 { _gpuq_flush_every_n = parsed }
+                            }
+                        }
+                        _gpuq_flush_skip_count = _gpuq_flush_skip_count + 1
+                        u64 N_eff = _gpuq_flush_every_n
+                        if N_eff == 0 { N_eff = 1 }
+                        if _gpuq_flush_skip_count >= N_eff {
+                            gpu_pipeline_flush()
+                            _gpuq_flush_skip_count = 0
+                        }
+                        return 0
+                    }
+                }
+            }
+        }
+    }
+    // Mega-kernel didn't fire — fall through to per-op chain below.
 
     // Phase 1 batched-decode: each chained intermediate is sized
     // [batch, dim].  Stream `batch_idx`'s slab is at base + batch_idx
