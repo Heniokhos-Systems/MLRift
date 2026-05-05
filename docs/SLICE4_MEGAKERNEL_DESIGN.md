@@ -661,3 +661,51 @@ Per-token HBM cost of moving carries to global:
 mechanical: thread 5 new pointer kernargs through the kernel + the
 launcher, replace `lds.X[i]` with `X_g[i]` in cross-phase read/write
 sites, bump WG_PERSIST back to 256, retest.
+
+## Slice 4.6 — global-scratch carries (PARTIAL, 2026-05-05)
+
+Implemented the fix from slice 4.5's diagnosis: all inter-phase
+carries moved from per-WG LDS to global scratch slabs.  Kernel now
+takes 22 kernargs (5 new global slabs: `b_x_norm_g`, `b_qkv_g`,
+`b_attn_q_g`, `b_mid_g`, `b_mid_norm_g`).  LDS shrunk from 29 KB to
+4 B (`wave_tmp[1]`).  Confirmed via kernel descriptor:
+`group_segment_fixed_size: 4`, `vgpr_count: 55`.  Occupancy
+returned to gfx1100 max — WG_PERSIST=256 is now LDS-feasible
+(though the matmul phase still hangs at multi-row, see below).
+
+**Smoke test results (zero-init buffers, WG_PERSIST=64):**
+
+| max_phase | shape                            | result |
+|---|---|---|
+| 0 | phase 1 only                     | PASS |
+| 1 | + phase 3, 48 rows × 1024 K      | HANG |
+| 1 | + phase 3, 1 row × 1024 K        | PASS |
+| 2 | + phase 5 (with 1-row phase 3)   | HANG |
+
+**Slice 4.6 diagnostic:** the LDS-to-global fix DID help at the
+single-row matmul case (phase 3 with 1 row + global b_x_norm_g
+read passes; same shape with LDS read in slice 4.5 passed too).
+But the multi-row matmul still hangs even with global scratch +
+zero-init buffers + `__threadfence()` around the barrier.  And
+phase 5 now hangs at max_phase=2 — a new, different failure mode.
+
+The fix is real but incomplete.  Two open frontiers for slice 4.7:
+1. **Phase 3 multi-row hang:** 48 rows × 1024 K × 64 WGs × 2 memory
+   reads per FMA somehow wedges the GPU.  Adding `__threadfence()`
+   didn't help.  Possibly compiler scheduling, possibly L0/L1 cache
+   thrash, possibly something about how the `acc * b_x_norm_g[k]`
+   product is materialised when both come from memory.
+2. **Phase 5 hang at max_phase=2:** even with 1-row phase 3 (which
+   works), enabling phase 5 hangs.  Different root cause; phase 5
+   only needs 32 head sub-tasks (24 Q+K + 8 V) at 1 WG each, so
+   shouldn't be a parallelism issue.
+
+**Files updated:**
+- `examples/llm/qwen3_layer_megakernel.hip.cpp` — full rewrite for
+  global-scratch carries + threadfence in mega_barrier
+- `examples/llm/qwen3_layer_megakernel_smoke.mlr` — 23-kernarg blob,
+  pre-zeroes all weight + scratch buffers (eliminates NaN-from-uninit
+  concern)
+
+Slice 4.6 is shipped as a partial fix.  Slice 4.7 picks up the
+two remaining hang frontiers.
