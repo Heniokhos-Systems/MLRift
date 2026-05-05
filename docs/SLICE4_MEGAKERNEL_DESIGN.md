@@ -709,3 +709,51 @@ The fix is real but incomplete.  Two open frontiers for slice 4.7:
 
 Slice 4.6 is shipped as a partial fix.  Slice 4.7 picks up the
 two remaining hang frontiers.
+
+## Slice 4.6 — DEBUGGED + GREEN (2026-05-05)
+
+Subagent bisection found the actual root cause for both hangs: a
+**kernarg-allocation/kernel-shape mismatch** on KV_DIM.
+
+The launcher hardcoded `KV_DIM = 512` and `QKV_DIM = 3072`, but
+the kernel macro `KV_DIM = N_KV_HEADS * HEAD_DIM = 8 * 128 = 1024`
+(the inline comment `// 512` was wrong) and `QKV_DIM = Q_DIM +
+2*KV_DIM = 4096`.  So the launcher under-allocated `b_qkv_g` by
+1024 floats and `kc/vc_layer` by 4 KB per token.
+
+**HANG 1 (phase 3 multi-row):** Multi-row write `b_qkv_g[row]` for
+row = 0..QKV_DIM-1 = 0..4095 OOB-wrote 1024 floats past the
+3072-float allocation.  At 1 row × WG_PERSIST=64, indices 0..63
+fit within both 3072 and 4096 → no OOB → PASS.  Multi-row at 48
+rows → indices up to ~3008 (still under 3072 in some cases) → not
+quite OOB on writes, but the actual OOB was on phase 5's reads
+described next.  Combined with the OOB the GPU's MMU eventually
+wedged the wave.
+
+**HANG 2 (phase 5 max_phase=2):** With pos=0, the V-branch pointer
+arithmetic `b_qkv_g + Q_DIM + KV_DIM + head*HEAD_DIM + i` reached
+indices 3072..3199 (correct range for the kernel's QKV_DIM=4096)
+in a 3072-float buffer (launcher's wrong size) → OOB read → wave
+hangs on RDNA3.  Bisection: Q-branch alone PASSED (read range
+0..2047, in-bounds); V-branch alone HUNG (read range 3072..3199,
+OOB on the under-allocated buffer).  V-branch with trivial-write
+PASSED — confirming the OOB *read* was the trigger.
+
+**Fix applied:**
+- `qwen3_layer_megakernel_smoke.mlr`: `KV_DIM` 512→1024, `QKV_DIM`
+  3072→4096.
+- `qwen3_layer_megakernel.hip.cpp`: corrected misleading inline
+  comments (`// 1024`, `// 4096`); restored phase 3 multi-row form
+  with correct ROWS_PER_WG.
+
+**Verification (WG_PERSIST=64, all-zero buffers):**
+```
+max_phase=0..7  →  ALL PASS
+counter_final=512 (= 8 × 64)
+total kernel time (max_phase=7) ≈ 2.2 ms
+```
+
+The slice 4.6 architectural fix (LDS → global) was correct — the
+remaining hangs were driver-level OOB on under-allocated buffers,
+not coherence or compiler issues.  Slice 4.7 (bit-equivalence A/B
+vs per-op chain, with real qwen3 weights) is unblocked.

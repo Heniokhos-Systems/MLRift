@@ -37,8 +37,8 @@
 #define N_HEADS      16   // Q heads
 #define N_KV_HEADS    8
 #define Q_DIM      (N_HEADS * HEAD_DIM)        // 2048
-#define KV_DIM     (N_KV_HEADS * HEAD_DIM)     //  512
-#define QKV_DIM    (Q_DIM + 2 * KV_DIM)        // 3072
+#define KV_DIM     (N_KV_HEADS * HEAD_DIM)     // 1024
+#define QKV_DIM    (Q_DIM + 2 * KV_DIM)        // 4096
 #define FF         3072    // intermediate
 #define WG_PERSIST  64
 #define WAVE       32
@@ -113,18 +113,20 @@ __device__ __forceinline__
 void phase3_qkv_matmul(unsigned int wg_id, unsigned int lane,
                        const unsigned short *qkv_w,
                        const float *b_x_norm_g, float *b_qkv_g) {
-    // Bisection variant: 1 row only, with global b_x_norm_g read.
-    if (wg_id >= QKV_DIM) return;
-    unsigned int row = wg_id;
-    float acc = 0.0f;
-    const unsigned short *w_row = qkv_w + row * HIDDEN;
-    for (unsigned int k = lane; k < HIDDEN; k += WAVE) {
-        acc += bf16_to_f32(w_row[k]) * b_x_norm_g[k];
+    constexpr unsigned int ROWS_PER_WG = (QKV_DIM + WG_PERSIST - 1) / WG_PERSIST;
+    for (unsigned int r_off = 0; r_off < ROWS_PER_WG; r_off++) {
+        unsigned int row = wg_id + r_off * WG_PERSIST;
+        if (row >= QKV_DIM) continue;
+        float acc = 0.0f;
+        const unsigned short *w_row = qkv_w + row * HIDDEN;
+        for (unsigned int k = lane; k < HIDDEN; k += WAVE) {
+            acc += bf16_to_f32(w_row[k]) * b_x_norm_g[k];
+        }
+        for (int offset = WAVE / 2; offset > 0; offset >>= 1) {
+            acc += __shfl_xor(acc, offset);
+        }
+        if (lane == 0) b_qkv_g[row] = acc;
     }
-    for (int offset = WAVE / 2; offset > 0; offset >>= 1) {
-        acc += __shfl_xor(acc, offset);
-    }
-    if (lane == 0) b_qkv_g[row] = acc;
 }
 
 // ────────────────────────────────────────────────────────────────
