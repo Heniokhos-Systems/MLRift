@@ -40,12 +40,15 @@
 #define KV_DIM     (N_KV_HEADS * HEAD_DIM)     // 1024
 #define QKV_DIM    (Q_DIM + 2 * KV_DIM)        // 4096
 #define FF         3072    // intermediate
-#define WG_PERSIST  64
+#define WG_PERSIST  512   // slice 4.10/4.11: 64→512 sweet spot
 #define WAVE       32
 
 // LDS — only intra-phase reductions.  Inter-phase carries go through
 // global scratch (see kernel signature below).
-__shared__ float wave_tmp[1];   // single broadcast slot for rmsnorm scale
+__shared__ float wave_tmp[1];     // single broadcast slot for rmsnorm scale
+__shared__ float attn_w_lds[64];  // slice 4.11 d2: cached softmax weights
+                                   // (one per pos≤63) so phase 7 pass 3
+                                   // skips the redundant Q·K dot product
 
 // ────────────────────────────────────────────────────────────────
 // Cross-WG barrier protocol (slice 4.1 validated, 0.45 µs at WG=256)
@@ -69,8 +72,9 @@ void mega_barrier(unsigned int *counter_ptr, unsigned int phase_idx) {
         unsigned int expected = (phase_idx + 1) * WG_PERSIST;
         while (__atomic_load_n(counter_ptr, __ATOMIC_ACQUIRE) < expected) {}
     }
+    // Slice 4.11 d2: trailing __threadfence dropped — leading fence orders
+    // writer stores; ACQUIRE on counter load orders later loads.
     __syncthreads();
-    __threadfence();
 }
 
 __device__ __forceinline__ float bf16_to_f32(unsigned short b) {
@@ -202,27 +206,22 @@ void phase5_qkv_split_qknorm_rope(unsigned int wg_id, unsigned int lane,
 }
 
 // ────────────────────────────────────────────────────────────────
-// Phase 7 — attn_decode.  WGs 0..15 each compute one Q head's attn.
-// Reads Q from b_attn_q_g, K/V from caches, writes attn output to a
-// SEPARATE buffer b_attn_out_g.
-//
-// Slice 4.7 fix: an earlier version wrote pass-3 output back into
-// b_attn_q_g, overwriting the Q input.  But pass 3 strides outer-i
-// by WAVE — iteration 2 (lanes write i=32..63) re-reads q[0..127]
-// for each dot product, including q[0..31] which iteration 1 had
-// already overwritten.  Result: garbage in lane-{0..31}'s outputs at
-// i ≥ 32.  Bisection at first_bad_idx=32 was the smoking gun.
-// Separate output slab avoids the read-after-write hazard.
+// Phase 7 — attn_decode.  Slice 4.11 e1: cooperative WGs per head
+// (ATTN_COOP=4 → 64 active WGs) + cached softmax weights in LDS so
+// pass 3 skips the redundant Q·K dot product.  Slice 4.7 fix: separate
+// output slab vs Q input.
 // ────────────────────────────────────────────────────────────────
+#define ATTN_COOP 4
 __device__ __forceinline__
 void phase7_attn_decode(unsigned int wg_id, unsigned int lane,
                         const float *b_attn_q_g,
                         const float *kc_layer, const float *vc_layer,
                         float *b_attn_out_g,
                         unsigned long long pos) {
-    if (wg_id >= N_HEADS) return;
-    unsigned int q_head = wg_id;
-    unsigned int kv_head = q_head / (N_HEADS / N_KV_HEADS);
+    if (wg_id >= N_HEADS * ATTN_COOP) return;
+    unsigned int q_head   = wg_id / ATTN_COOP;
+    unsigned int coop_idx = wg_id % ATTN_COOP;
+    unsigned int kv_head  = q_head / (N_HEADS / N_KV_HEADS);
     const float *q = b_attn_q_g + q_head * HEAD_DIM;
     constexpr float scale_attn = 1.0f / 11.31370849898f;   // 1/sqrt(128)
 
@@ -240,28 +239,29 @@ void phase7_attn_decode(unsigned int wg_id, unsigned int lane,
         if (other > m) m = other;
     }
 
-    // Pass 2: sum exp
+    // Pass 2: cache exp(dot-m) in LDS, accumulate sum.
     float ssum = 0.0f;
     for (unsigned long long t = lane; t <= pos; t += WAVE) {
         const float *k = kc_layer + t * KV_DIM + kv_head * HEAD_DIM;
         float dot = 0.0f;
         for (unsigned int i = 0; i < HEAD_DIM; i++) dot += q[i] * k[i];
-        dot *= scale_attn;
-        ssum += __expf(dot - m);
+        float w = __expf(dot * scale_attn - m);
+        attn_w_lds[t] = w;
+        ssum += w;
     }
     for (int offset = WAVE / 2; offset > 0; offset >>= 1) {
         ssum += __shfl_xor(ssum, offset);
     }
     float inv_sum = 1.0f / ssum;
+    __syncthreads();
 
-    // Pass 3: weighted V.  Write to SEPARATE output slab.
-    for (unsigned int i = lane; i < HEAD_DIM; i += WAVE) {
+    // Pass 3 — cooperative: HEAD_DIM/ATTN_COOP=32 dims/WG, 1 dim/lane.
+    constexpr unsigned int OUT_PER_WG = HEAD_DIM / ATTN_COOP;
+    if (lane < OUT_PER_WG) {
+        unsigned int i = coop_idx * OUT_PER_WG + lane;
         float acc = 0.0f;
         for (unsigned long long t = 0; t <= pos; t++) {
-            const float *k = kc_layer + t * KV_DIM + kv_head * HEAD_DIM;
-            float dot = 0.0f;
-            for (unsigned int ii = 0; ii < HEAD_DIM; ii++) dot += q[ii] * k[ii];
-            float w = __expf(dot * scale_attn - m) * inv_sum;
+            float w = attn_w_lds[t] * inv_sum;
             const float *v = vc_layer + t * KV_DIM + kv_head * HEAD_DIM;
             acc += w * v[i];
         }
