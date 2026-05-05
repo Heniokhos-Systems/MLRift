@@ -160,12 +160,36 @@ static uint32 KFD_VA_FLAGS    = 0x4022   // MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESE
 //   0 = VRAM-only (no host pointer)
 //   1 = host-visible VRAM (PUBLIC flag, mmap'd via DRM render fd)
 //   2 = GTT  (host-visible system RAM mapped to GPU)
-static uint64 _kfd_alloc_tab_n = 0
-static uint64[1024] _kfd_alloc_va
-static uint64[1024] _kfd_alloc_handle
-static uint64[1024] _kfd_alloc_size
-static uint64[1024] _kfd_alloc_host
-static uint64[1024] _kfd_alloc_kind
+// Cap raised from 1024 → 65536 (2026-05-04). Noesis P4big NEAT can hold
+// ~235 outstanding dev allocs per genome × 16 genomes (~3760 peak); add
+// headroom for 64-area / 256-path GENOME_MAX-shaped brains plus persistent
+// shim allocs.
+//
+// Storage is heap-backed (lazy mmap on first track) rather than `static
+// uint64[N]` because MLRift writes static arrays raw into the ELF .data
+// section, which would push the compiler's edyn_buf past 256 KB for a
+// 5×65536×8 = 2.5 MB tracker.  Heap allocation costs the same RSS at
+// runtime and stays out of the binary on disk.  If we ever blow 65536,
+// swap the linear scan in _kfd_alloc_lookup_range / dev_free for a hash
+// table — at that N the O(N) walk per ioctl becomes the bottleneck.
+static uint64 _kfd_alloc_tab_n   = 0
+static uint64 _kfd_alloc_tab_cap = 0
+static uint64 _kfd_alloc_va      = 0
+static uint64 _kfd_alloc_handle  = 0
+static uint64 _kfd_alloc_size    = 0
+static uint64 _kfd_alloc_host    = 0
+static uint64 _kfd_alloc_kind    = 0
+
+fn _kfd_alloc_tab_ensure() {
+    if _kfd_alloc_tab_cap != 0 { return }
+    uint64 cap = 65536
+    _kfd_alloc_va     = alloc(cap * 8)
+    _kfd_alloc_handle = alloc(cap * 8)
+    _kfd_alloc_size   = alloc(cap * 8)
+    _kfd_alloc_host   = alloc(cap * 8)
+    _kfd_alloc_kind   = alloc(cap * 8)
+    _kfd_alloc_tab_cap = cap
+}
 
 // Persistent ioctl-scratch slots shared across all dev_alloc_* / dev_free
 // / dev_host_ptr calls.  Each `alloc(N)` in MLRift becomes a separate
@@ -190,7 +214,8 @@ fn _kfd_alloc_track(uint64 va, uint64 handle, uint64 size, uint64 host_ptr) {
 }
 
 fn _kfd_alloc_track_kind(uint64 va, uint64 handle, uint64 size, uint64 host_ptr, uint64 kind) {
-    if _kfd_alloc_tab_n >= 1024 { kfd_die("kfd: alloc table full (max 1024)", _kfd_alloc_tab_n) }
+    _kfd_alloc_tab_ensure()
+    if _kfd_alloc_tab_n >= _kfd_alloc_tab_cap { kfd_die("kfd: alloc table full (max 65536)", _kfd_alloc_tab_n) }
     uint64 i = _kfd_alloc_tab_n
     uint64 p_va  = _kfd_alloc_va     + i * 8; unsafe { *(p_va as uint64) = va }
     uint64 p_h   = _kfd_alloc_handle + i * 8; unsafe { *(p_h as uint64) = handle }
