@@ -516,3 +516,35 @@ mega-kernel's ~1500-dword body.
   slice 4.2 where the 50-dword bytewise port took ~30 min vs
   multi-hour from-scratch native authoring.
 - Native emit is the optimization target, not the development path.
+
+## Slice 4.4 — phases 11-17 added (HIP-source) (SHIPPED 2026-05-05)
+
+`examples/llm/qwen3_layer_megakernel.hip.cpp` now implements the
+full 7-phase mega-kernel:
+
+- **Phase 11** (post-attn rmsnorm): WG 0 reduce-tree, reads b_mid
+  from LDS, writes b_mid_norm to LDS (reuses dead b_attn_q slab).
+- **Phase 13** (gate_up matmul): all 256 WGs grid-stride 24 rows
+  each, output spilled to GLOBAL `gu_scratch`.  LDS budget would
+  require 24 KB for in-LDS b_gu; that crashes WG_PERSIST=256
+  co-residence on gfx1100 (LDS-per-WG ≤ ~16 KB to keep ≥ 256 wave32s
+  in flight).  HBM round-trip for the spill is cheap relative to
+  the 6 MB weight read.
+- **Phase 15** (silu_mul): pointwise on FF=3072 elements via grid
+  stride.  In-place: writes back to `gu_scratch[0..FF]` overwriting
+  the gate region, which becomes b_ff for phase 17.
+- **Phase 17** (down + final residual): each WG handles 4 rows of
+  `out = b_mid + down_w · b_ff`.  Reads b_mid from LDS (still live
+  from phase 9 — phase 11 wrote to a different slab).
+
+Kernel signature now takes 17 kernargs (added `gu_scratch` —
+`float *gu_scratch[2*FF]` zero-tracked outside the kernel).
+Compiles GREEN to gfx1100 (27200-byte `.co`).
+
+**Pending in slice 4.5:**
+- A/B bit-equivalence test against the per-op chain at random inputs
+  (the GO/NO-GO gate before any tok/s claim).  Reuses
+  qwen3_generate's prompt-prefill weights + synthetic random
+  position-0 hidden state.
+- Wire-up in `qwen3_forward_layer_gpu` once correctness GREEN.
+- Native ISA bytewise port (slice 4.6).

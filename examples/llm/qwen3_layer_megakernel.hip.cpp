@@ -330,10 +330,138 @@ void phase9_oproj_residual(unsigned int wg_id, unsigned int lane,
     }
 }
 
-// (Phases 11/13/15/17 follow the same shape as 1/3/3+silu/3+resid;
-// elided here for slice 4.3 first-cut.  The HIP source compiles +
-// runs phases 1, 3, 5, 7, 9.  Slice 4.4 will fill in 11-17 and
-// validate output bit-equivalence against the per-op chain.)
+// ────────────────────────────────────────────────────────────────
+// Phase 11 — post-attention rmsnorm.  Reads b_mid (post-o_proj
+// residual) from LDS, writes b_mid_norm to LDS.  WG 0 only.
+//
+// Reuses the dead `b_attn_q` slab (8 KB) for b_mid_norm — only
+// needs hidden=1024 elts = 4 KB so headroom is fine.
+// ────────────────────────────────────────────────────────────────
+__device__ __forceinline__
+void phase11_post_norm(unsigned int wg_id, unsigned int lane,
+                       const float *post_norm_g,
+                       const float *b_mid_lds, float *b_mid_norm_lds) {
+    if (wg_id != 0) return;
+
+    float ssq = 0.0f;
+    for (unsigned int i = lane; i < HIDDEN; i += WAVE) {
+        float v = b_mid_lds[i];
+        ssq += v * v;
+    }
+    for (int offset = WAVE / 2; offset > 0; offset >>= 1) {
+        ssq += __shfl_xor(ssq, offset);
+    }
+    if (lane == 0) {
+        reduce_tmp[0] = rsqrtf(ssq / float(HIDDEN) + 1e-5f);
+    }
+    __syncthreads();
+    float scale = reduce_tmp[0];
+    for (unsigned int i = lane; i < HIDDEN; i += WAVE) {
+        b_mid_norm_lds[i] = b_mid_lds[i] * scale * post_norm_g[i];
+    }
+}
+
+// ────────────────────────────────────────────────────────────────
+// Phase 13 — gate_up matmul.  Each WG handles ceil(2*FF / 256) = 24
+// output rows of `b_gu = gate_up_w · b_mid_norm`.  bf16 weights, f32
+// accum.
+//
+// Output goes to GLOBAL scratch (`gu_scratch`) — too big (24 KB) to
+// hold in LDS while keeping WG_PERSIST=256 co-resident on gfx1100
+// (LDS budget per-WG ≤ 16 KB).  The HBM round-trip for the b_gu
+// spill is cheap relative to the weight read (3072×1024×2 = 6 MB
+// in vs 24 KB out).
+// ────────────────────────────────────────────────────────────────
+__device__ __forceinline__
+void phase13_gate_up_matmul(unsigned int wg_id, unsigned int lane,
+                             const unsigned short *gate_up_w,
+                             const float *b_mid_norm_lds,
+                             float *gu_scratch) {
+    constexpr unsigned int N_OUT = 2 * FF;
+    constexpr unsigned int ROWS_PER_WG = (N_OUT + WG_PERSIST - 1) / WG_PERSIST;
+    for (unsigned int r_off = 0; r_off < ROWS_PER_WG; r_off++) {
+        unsigned int row = wg_id + r_off * WG_PERSIST;
+        if (row >= N_OUT) continue;
+
+        float acc = 0.0f;
+        const unsigned short *w_row = gate_up_w + row * HIDDEN;
+        for (unsigned int k = lane; k < HIDDEN; k += WAVE) {
+            acc += bf16_to_f32(w_row[k]) * b_mid_norm_lds[k];
+        }
+        for (int offset = WAVE / 2; offset > 0; offset >>= 1) {
+            acc += __shfl_xor(acc, offset);
+        }
+        if (lane == 0) {
+            gu_scratch[row] = acc;
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────
+// Phase 15 — silu_mul: `b_ff[i] = silu(gate[i]) * up[i]` where
+// `gate = gu_scratch[0..FF]` and `up = gu_scratch[FF..2*FF]`.
+//
+// Writes back to `gu_scratch[0..FF]` (overwriting the gate region;
+// the up region is read-only-once and dies here).  Phase 17 reads
+// `b_ff = gu_scratch[0..FF]`.
+//
+// Each WG handles ceil(FF / 256) = 12 elements via grid stride.
+// Pure pointwise — no LDS, no cross-WG dependency until next barrier.
+// ────────────────────────────────────────────────────────────────
+__device__ __forceinline__
+void phase15_silu_mul(unsigned int wg_id, unsigned int lane,
+                       float *gu_scratch) {
+    constexpr unsigned int ELEMS_PER_WG = (FF + WG_PERSIST - 1) / WG_PERSIST;
+    // Grid-stride: WG `wg_id` handles indices wg_id, wg_id+256, ...
+    // Each WG's 32 lanes process 32 consecutive elements at a time.
+    for (unsigned int e_off = 0; e_off < ELEMS_PER_WG; e_off++) {
+        unsigned int base = (wg_id + e_off * WG_PERSIST);
+        // Inside one WG-slot, all 32 lanes work on a 32-elt run.
+        // For the strided pattern we'd actually want index =
+        // wg_id*WAVE + e_off*WG_PERSIST*WAVE + lane.  Simpler: have
+        // each lane of each WG handle exactly one element.
+        unsigned int idx = (wg_id * WAVE + lane) + e_off * WG_PERSIST * WAVE;
+        if (idx >= FF) continue;
+        float g = gu_scratch[idx];
+        float u = gu_scratch[FF + idx];
+        // silu(g) = g * sigmoid(g) = g / (1 + e^-g)
+        float s = g / (1.0f + __expf(-g));
+        gu_scratch[idx] = s * u;
+    }
+}
+
+// ────────────────────────────────────────────────────────────────
+// Phase 17 — down matmul + final residual.  Each WG handles
+// ceil(HIDDEN / 256) = 4 rows of `out = b_mid + down_w · b_ff`
+// where `b_mid` is the post-o_proj residual sitting in LDS.
+//
+// Output goes directly to `out_residual` (the layer's external
+// output buffer).
+// ────────────────────────────────────────────────────────────────
+__device__ __forceinline__
+void phase17_down_residual(unsigned int wg_id, unsigned int lane,
+                            const unsigned short *down_w,
+                            const float *gu_scratch,
+                            const float *b_mid_lds,
+                            float *out_residual) {
+    constexpr unsigned int ROWS_PER_WG = (HIDDEN + WG_PERSIST - 1) / WG_PERSIST;
+    for (unsigned int r_off = 0; r_off < ROWS_PER_WG; r_off++) {
+        unsigned int row = wg_id + r_off * WG_PERSIST;
+        if (row >= HIDDEN) continue;
+
+        float acc = 0.0f;
+        const unsigned short *w_row = down_w + row * FF;
+        for (unsigned int k = lane; k < FF; k += WAVE) {
+            acc += bf16_to_f32(w_row[k]) * gu_scratch[k];
+        }
+        for (int offset = WAVE / 2; offset > 0; offset >>= 1) {
+            acc += __shfl_xor(acc, offset);
+        }
+        if (lane == 0) {
+            out_residual[row] = b_mid_lds[row] + acc;
+        }
+    }
+}
 
 // ────────────────────────────────────────────────────────────────
 // MEGA-KERNEL ENTRY
@@ -355,7 +483,8 @@ void qwen3_layer_megakernel(
     float                *kc_layer,              // 12 K-cache layer slab
     float                *vc_layer,              // 13 V-cache layer slab
     unsigned long long    pos,                   // 14
-    unsigned int         *barrier_counter        // 15 zero'd by launcher
+    unsigned int         *barrier_counter,       // 15 zero'd by launcher
+    float                *gu_scratch             // 16 [2*FF] global scratch (b_gu spill — see phase 13 comment)
 ) {
     unsigned int wg_id = blockIdx.x;
     unsigned int lane  = threadIdx.x;
@@ -384,14 +513,24 @@ void qwen3_layer_megakernel(
     phase9_oproj_residual(wg_id, lane, o_w, in_residual, b_mid_lds);
     mega_barrier(barrier_counter, 4);
 
-    // Phases 11-17: TBD slice 4.4.  For now write b_mid out to
-    // out_residual so the caller can A/B against per-op output.
-    if (wg_id == 0) {
-        for (unsigned int i = lane; i < HIDDEN; i += WAVE) {
-            out_residual[i] = b_mid_lds[i];
-        }
-    }
-    // Final barrier so all WGs settle before kernel exit.
+    // Phase 11: post_norm → b_mid_norm in LDS (reuses dead b_attn_q slab)
+    float *b_mid_norm_lds = lds.b_attn_q;
+    phase11_post_norm(wg_id, lane, post_norm_g, b_mid_lds, b_mid_norm_lds);
     mega_barrier(barrier_counter, 5);
+
+    // Phase 13: gate_up → gu_scratch in GLOBAL (24 KB too big for LDS at WG=256)
+    phase13_gate_up_matmul(wg_id, lane, gate_up_w, b_mid_norm_lds, gu_scratch);
     mega_barrier(barrier_counter, 6);
+
+    // Phase 15: silu_mul → overwrites gu_scratch[0..FF] in place
+    phase15_silu_mul(wg_id, lane, gu_scratch);
+    mega_barrier(barrier_counter, 7);
+
+    // Phase 17: down + final residual → out_residual.  b_mid_lds (the
+    // post-o_proj residual) is still live in LDS (phase 11 read it but
+    // didn't overwrite — wrote to a different slab b_attn_q).
+    phase17_down_residual(wg_id, lane, down_w, gu_scratch,
+                           b_mid_lds, out_residual);
+    // No barrier after phase 17 — kernel exits, AQL packet handles ordering
+    // for the next mega-layer dispatch.
 }
