@@ -38,7 +38,14 @@
 #define KV_DIM     (N_KV_HEADS * HEAD_DIM)     //  512
 #define QKV_DIM    (Q_DIM + 2 * KV_DIM)        // 3072
 #define FF         3072    // intermediate
-#define WG_PERSIST  256
+// WG_PERSIST=64.  The mega-kernel uses ~29 KB LDS per WG (b_qkv 12 KB +
+// b_attn_q 8 KB + b_x_norm 4 KB + reduce scratch 1 KB + struct padding).
+// gfx1100 has 64 KB LDS per CU → only 2 wave32s/CU = 120 co-resident
+// at this LDS footprint.  Launching > 120 WGs deadlocks the cross-WG
+// barrier (the queued WGs can't start because the resident ones are
+// spinning).  64 keeps a 2× safety margin and still saturates the
+// matmul phases (each WG just iterates 4× more rows).
+#define WG_PERSIST  64
 #define WAVE       32
 
 // LDS buffer layout (must total ≤ 32 KB for gfx1100 max-occupancy

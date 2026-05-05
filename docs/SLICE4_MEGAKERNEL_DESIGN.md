@@ -548,3 +548,56 @@ Compiles GREEN to gfx1100 (27200-byte `.co`).
   position-0 hidden state.
 - Wire-up in `qwen3_forward_layer_gpu` once correctness GREEN.
 - Native ISA bytewise port (slice 4.6).
+
+## Slice 4.5 — smoke launcher (WIP, hang at first launch)
+
+`examples/llm/qwen3_layer_megakernel_smoke.mlr` — allocates all 17
+device buffers (zero-filled), builds kernarg blob, launches kernel,
+reads back the barrier counter to verify all phases reached every
+barrier.
+
+**Status: HANGS at hipDeviceSynchronize timeout.**  Diagnosis:
+
+1. **First attempt at WG_PERSIST=256:** kernel uses 29696 B LDS / WG.
+   gfx1100 has 64 KB LDS per CU → only 2 wave32s/CU = 120 co-resident.
+   Launching 256 WGs deadlocks the cross-WG barrier (resident WGs
+   spin waiting for counter==256, queued WGs can't start until the
+   resident ones retire).
+2. **Reduced to WG_PERSIST=64:** still hangs.  64 << 120 co-resident
+   cap so it shouldn't deadlock.  Suspected causes:
+   - **VGPR pressure:** kernel uses 223 VGPRs/wave32 (per kernel
+     descriptor metadata).  At WG=64 should still fit (60 CUs × ≥6
+     waves/CU at 223 VGPR = 360 in flight) but the scheduler may
+     be more conservative.  Unverified.
+   - **All-zero data path:** with zero weights / inputs, every
+     matmul produces 0, every rmsnorm divides by sqrt(eps), every
+     softmax has uniform weights = 1/(pos+1).  Possibly some phase
+     hits a slow path (denormal handling, exp underflow).
+   - **Phase 7 attn at pos=0** with all-zero V cache might do
+     unbounded work in pass 3's HEAD_DIM × t-range × HEAD_DIM
+     triple-nested loop.  With pos=0 inner loop is t=0 only, but
+     verify the `for unsigned long long t = 0; t <= pos; t++`
+     terminates correctly.
+   - **Barrier counter not pre-initialised across all WGs:** the
+     launcher zeroes `barrier_ctr` before the kernel, but if any
+     WG reads it before the H2D commits, the spin-load may see
+     non-zero and either return immediately (skipping work) or
+     spin forever.
+
+**Triage plan for next session:**
+1. Disable phases 5-17 progressively (single barrier at a time)
+   to isolate which phase hangs.
+2. Replace all-zero buffers with valid synthetic data (random
+   weights from a fixed seed) — eliminates the zero-path slowness
+   hypothesis.
+3. Add a conservative `__threadfence()` between barrier counter
+   zero and kernel launch to ensure counter visibility.
+4. Run with `MLRIFT_USE_SDMA=1` to use SDMA for the counter zero
+   (eliminates host-vis-VRAM coherence races).
+
+The core insight from the hang attempt: **WG_PERSIST is bound by
+LDS budget, not just by the barrier microbench's 256-WG sweet
+spot.**  With a 29 KB LDS footprint, max safe WG_PERSIST is
+LDS_per_CU / LDS_per_WG × N_CUs = 64/29 × 60 = 120.  Production
+should set WG_PERSIST=64 (50% margin) until LDS is reduced via
+spilling more inter-phase carries to global memory.
