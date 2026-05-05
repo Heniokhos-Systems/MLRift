@@ -134,9 +134,9 @@ fn main() {
     uint32 z32 = 0; unsafe { *(h_zero4 as uint32) = z32 }
     err = hipMemcpy(barrier_ctr, h_zero4, 4, 1); if err != 0 { die("clear barrier", err) }
 
-    // Build the 17-kernarg blob.  Each slot 8 bytes (low bits hold
+    // Build the 18-kernarg blob.  Each slot 8 bytes (low bits hold
     // the value for u32/u64 args; pointers are full 64-bit).
-    uint64 k_buf = alloc(17 * 8)
+    uint64 k_buf = alloc(18 * 8)
     unsafe { *((k_buf +  0 * 8) as uint64) = in_resid    }
     unsafe { *((k_buf +  1 * 8) as uint64) = out_resid   }
     unsafe { *((k_buf +  2 * 8) as uint64) = qkv_w       }
@@ -155,49 +155,64 @@ fn main() {
     unsafe { *((k_buf + 14 * 8) as uint64) = pos_val     }
     unsafe { *((k_buf + 15 * 8) as uint64) = barrier_ctr }
     unsafe { *((k_buf + 16 * 8) as uint64) = gu_scratch  }
+    // Slot 17 (max_phase) set per-iteration in the bisection sweep below.
 
     // KFD shim's hipModuleLaunchKernel expects void** (array of
     // pointers to 8-byte slots).  Build that.
-    uint64 kp = alloc(17 * 8)
+    uint64 kp = alloc(18 * 8)
     uint64 j = 0
-    while j < 17 {
+    while j < 18 {
         uint64 slot_ptr = k_buf + j * 8
         unsafe { *((kp + j * 8) as uint64) = slot_ptr }
         j = j + 1
     }
 
-    puts("=== slice 4.5 mega-kernel smoke test ===")
+    puts("=== slice 4.5 mega-kernel bisection ===")
     put_kv("WG_PERSIST", 10, WG_PERSIST)
-    put_kv("HIDDEN",      6, HIDDEN)
-    put_kv("QKV_DIM",     7, QKV_DIM)
-    put_kv("FF",          2, FF)
 
-    uint64 t0 = time_now()
-    err = hipModuleLaunchKernel(fh, WG_PERSIST, 1, 1, 32, 1, 1, 0, 0, kp, 0)
-    if err != 0 { die("launch", err) }
-    err = hipDeviceSynchronize()
-    if err != 0 { die("sync", err) }
-    uint64 elapsed_ns = time_elapsed(t0)
+    // Bisection sweep: max_phase ∈ {0..7}.  After each launch the
+    // barrier counter accumulates phase ack counts; we read and zero
+    // it between iterations to interpret each launch independently.
+    //
+    // Phase mapping:
+    //   max_phase=0 → phase 1 only         (1 barrier × WG_PERSIST acks)
+    //   max_phase=1 → +phase 3             (2 barriers)
+    //   max_phase=2 → +phase 5             (3 barriers)
+    //   max_phase=3 → +phase 7             (4 barriers)
+    //   max_phase=4 → +phase 9             (5 barriers)
+    //   max_phase=5 → +phase 11            (6 barriers)
+    //   max_phase=6 → +phase 13            (7 barriers)
+    //   max_phase=7 → +phase 15 + phase 17 (8 barriers, full kernel)
+    uint64 mp = 0
+    while mp <= 7 {
+        // Re-zero barrier counter
+        err = hipMemcpy(barrier_ctr, h_zero4, 4, 1); if err != 0 { die("clear barrier", err) }
+        unsafe { *((k_buf + 17 * 8) as uint64) = mp }
 
-    put_kv("kernel_ns", 9, elapsed_ns)
-    uint64 elapsed_us = elapsed_ns / 1000
-    put_kv("kernel_us", 9, elapsed_us)
-    puts("(reference: skeleton w/ 7 barriers ≈ 30 µs at WG=256;")
-    puts(" mega-kernel adds ~6.5 ms of phase work per design projection.)")
+        puts("---")
+        put_kv("max_phase", 9, mp)
 
-    // Read back the barrier counter — should be exactly 7 * WG_PERSIST = 1792.
-    uint64 h_ctr_buf = alloc(4)
-    err = hipMemcpy(h_ctr_buf, barrier_ctr, 4, 2); if err != 0 { die("D2H ctr", err) }
-    uint32 ctr_val = 0; unsafe { *(h_ctr_buf as uint32) -> ctr_val }
-    uint64 ctr_u64 = ctr_val
-    put_kv("counter_final", 13, ctr_u64)
-    uint64 expected = 7 * WG_PERSIST   // 7 barriers × WG_PERSIST WGs (no barrier after phase 17)
-    // Mega-kernel has barriers 0..6 — 7 barriers total → counter
-    // should equal 7 × WG_PERSIST = 1792 if every WG ack'd every
-    // barrier.
-    put_kv("counter_expected", 16, expected)
-    if ctr_u64 == expected { puts("PASS: all WGs ack'd all barriers cleanly") }
-    else                   { puts("FAIL: barrier counter mismatch") }
+        uint64 t0 = time_now()
+        err = hipModuleLaunchKernel(fh, WG_PERSIST, 1, 1, 32, 1, 1, 0, 0, kp, 0)
+        if err != 0 { die("launch", err) }
+        err = hipDeviceSynchronize()
+        if err != 0 { die("sync", err) }
+        uint64 elapsed_ns = time_elapsed(t0)
+        put_kv("kernel_ns", 9, elapsed_ns)
+
+        // Read back barrier counter — expected = (mp+1) * WG_PERSIST
+        // (one barrier per phase enabled, all WGs ack each).
+        uint64 h_ctr_buf = alloc(4)
+        err = hipMemcpy(h_ctr_buf, barrier_ctr, 4, 2); if err != 0 { die("D2H ctr", err) }
+        uint32 ctr_val = 0; unsafe { *(h_ctr_buf as uint32) -> ctr_val }
+        uint64 ctr_u64 = ctr_val
+        uint64 expected = (mp + 1) * WG_PERSIST
+        put_kv("counter_final", 13, ctr_u64)
+        put_kv("counter_expected", 16, expected)
+        if ctr_u64 == expected { puts("PASS") } else { puts("FAIL") }
+        dealloc(h_ctr_buf)
+        mp = mp + 1
+    }
 
     hipFree(in_resid); hipFree(out_resid); hipFree(qkv_w); hipFree(o_w)
     hipFree(gate_up_w); hipFree(down_w); hipFree(in_norm_g); hipFree(post_norm_g)

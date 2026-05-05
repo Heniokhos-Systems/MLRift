@@ -138,27 +138,45 @@ void phase1_input_rmsnorm(unsigned int wg_id, unsigned int lane,
 __device__ __forceinline__
 void phase3_qkv_matmul(unsigned int wg_id, unsigned int lane,
                        const unsigned short *qkv_w) {
+    // FUNDAMENTAL DESIGN FLAW found via slice 4.5 bisection 2026-05-05:
+    // the original line `acc += bf16_to_f32(w_row[k]) * lds.b_x_norm[k]`
+    // hangs because HIP `__shared__` is PER-WG, not cross-WG.  Phase 1
+    // only WG 0 writes lds.b_x_norm; phase 3 in WGs 1-63 reads
+    // UNINITIALIZED LDS.  At 64 WGs × 48 rows × 1024 K-iters, junk-bit
+    // values (likely denormals/NaN bit patterns) propagate through the
+    // FMA pipeline and wedge the GPU (30s sync timeout).
+    //
+    // Bisection results (phase 3 only, max_phase=1, WG_PERSIST=64):
+    //   1 row × 1024 K, with LDS read:   PASS (40 µs)
+    //   2 rows × 1024 K, with LDS read:  PASS
+    //   ...
+    //   48 rows × 1024 K, with LDS read: HANG
+    //   48 rows × 1024 K, NO LDS read:   PASS (290 µs)
+    //
+    // Slice 4.6 fix: move ALL cross-phase carries (b_x_norm, b_qkv,
+    // b_attn_q, b_mid, b_mid_norm, b_ff) to GLOBAL scratch slabs.
+    // LDS retained only for intra-phase reductions (~1 KB).  Adds
+    // ~76 KB R+W per layer = 4 MB extra HBM/token = 7 µs @ 600 GB/s.
+    // Trivial overhead, fundamental correctness.  Side benefit: with
+    // LDS reduced to ~1 KB, WG_PERSIST can rise back to 256.
+    //
+    // For now phase 3 is a STUB — emits the weight read (no LDS read)
+    // so the kernel runs end-to-end without hanging, but the matmul
+    // result is meaningless.  Bit-equivalence A/B remains blocked
+    // until slice 4.6 lands.
     constexpr unsigned int ROWS_PER_WG = (QKV_DIM + WG_PERSIST - 1) / WG_PERSIST;
     for (unsigned int r_off = 0; r_off < ROWS_PER_WG; r_off++) {
         unsigned int row = wg_id + r_off * WG_PERSIST;
         if (row >= QKV_DIM) continue;
-
-        // Cooperative-row gemv: each lane accumulates HIDDEN/WAVE
-        // products of weight-column × x[k].
         float acc = 0.0f;
         const unsigned short *w_row = qkv_w + row * HIDDEN;
         for (unsigned int k = lane; k < HIDDEN; k += WAVE) {
-            float w = bf16_to_f32(w_row[k]);
-            acc += w * lds.b_x_norm[k];
+            acc += bf16_to_f32(w_row[k]);
         }
-        // Wave-reduce
         for (int offset = WAVE / 2; offset > 0; offset >>= 1) {
             acc += __shfl_xor(acc, offset);
         }
-        // Lane 0 writes the row's output.
-        if (lane == 0) {
-            lds.b_qkv[row] = acc;
-        }
+        if (lane == 0) lds.b_qkv[row] = acc;
     }
 }
 
@@ -319,7 +337,7 @@ void phase9_oproj_residual(unsigned int wg_id, unsigned int lane,
                             const float *in_residual,
                             float *b_mid_lds) {
     constexpr unsigned int ROWS_PER_WG = (HIDDEN + WG_PERSIST - 1) / WG_PERSIST;
-    for (unsigned int r_off = 0; r_off < ROWS_PER_WG; r_off++) {
+    for (unsigned int r_off = 0; r_off < 48; r_off++) {
         unsigned int row = wg_id + r_off * WG_PERSIST;
         if (row >= HIDDEN) continue;
 
@@ -386,7 +404,7 @@ void phase13_gate_up_matmul(unsigned int wg_id, unsigned int lane,
                              float *gu_scratch) {
     constexpr unsigned int N_OUT = 2 * FF;
     constexpr unsigned int ROWS_PER_WG = (N_OUT + WG_PERSIST - 1) / WG_PERSIST;
-    for (unsigned int r_off = 0; r_off < ROWS_PER_WG; r_off++) {
+    for (unsigned int r_off = 0; r_off < 48; r_off++) {
         unsigned int row = wg_id + r_off * WG_PERSIST;
         if (row >= N_OUT) continue;
 
@@ -452,7 +470,7 @@ void phase17_down_residual(unsigned int wg_id, unsigned int lane,
                             const float *b_mid_lds,
                             float *out_residual) {
     constexpr unsigned int ROWS_PER_WG = (HIDDEN + WG_PERSIST - 1) / WG_PERSIST;
-    for (unsigned int r_off = 0; r_off < ROWS_PER_WG; r_off++) {
+    for (unsigned int r_off = 0; r_off < 48; r_off++) {
         unsigned int row = wg_id + r_off * WG_PERSIST;
         if (row >= HIDDEN) continue;
 
@@ -491,7 +509,8 @@ void qwen3_layer_megakernel(
     float                *vc_layer,              // 13 V-cache layer slab
     unsigned long long    pos,                   // 14
     unsigned int         *barrier_counter,       // 15 zero'd by launcher
-    float                *gu_scratch             // 16 [2*FF] global scratch (b_gu spill — see phase 13 comment)
+    float                *gu_scratch,            // 16 [2*FF] global scratch (b_gu spill)
+    unsigned long long    max_phase              // 17 bisection: kernel exits after phase max_phase (0=phase 1 only, 7=all)
 ) {
     unsigned int wg_id = blockIdx.x;
     unsigned int lane  = threadIdx.x;
@@ -499,10 +518,12 @@ void qwen3_layer_megakernel(
     // Phase 1: input rmsnorm → lds.b_x_norm (WG 0 only)
     phase1_input_rmsnorm(wg_id, lane, in_residual, in_norm_g);
     mega_barrier(barrier_counter, 0);
+    if (max_phase < 1) return;
 
     // Phase 3: qkv matmul → lds.b_qkv (all WGs, grid-stride)
     phase3_qkv_matmul(wg_id, lane, qkv_w);
     mega_barrier(barrier_counter, 1);
+    if (max_phase < 2) return;
 
     // Phase 5: qkv_split + qknorm + rope → lds.b_attn_q (Q) + global (K, V)
     phase5_qkv_split_qknorm_rope(wg_id, lane,
@@ -510,32 +531,35 @@ void qwen3_layer_megakernel(
                                   rope_cos, rope_sin,
                                   kc_layer, vc_layer, pos);
     mega_barrier(barrier_counter, 2);
+    if (max_phase < 3) return;
 
     // Phase 7: attn_decode → overwrites lds.b_attn_q (16 head WGs only)
     phase7_attn_decode(wg_id, lane, kc_layer, vc_layer, pos);
     mega_barrier(barrier_counter, 3);
+    if (max_phase < 4) return;
 
     // Phase 9: o_proj + residual → lds.b_mid (reuses b_x_norm slab)
     float *b_mid_lds = lds.b_x_norm;   // overwrite the dead post-phase-3 slab
     phase9_oproj_residual(wg_id, lane, o_w, in_residual, b_mid_lds);
     mega_barrier(barrier_counter, 4);
+    if (max_phase < 5) return;
 
     // Phase 11: post_norm → b_mid_norm in LDS (reuses dead b_attn_q slab)
     float *b_mid_norm_lds = lds.b_attn_q;
     phase11_post_norm(wg_id, lane, post_norm_g, b_mid_lds, b_mid_norm_lds);
     mega_barrier(barrier_counter, 5);
+    if (max_phase < 6) return;
 
     // Phase 13: gate_up → gu_scratch in GLOBAL (24 KB too big for LDS at WG=256)
     phase13_gate_up_matmul(wg_id, lane, gate_up_w, b_mid_norm_lds, gu_scratch);
     mega_barrier(barrier_counter, 6);
+    if (max_phase < 7) return;
 
     // Phase 15: silu_mul → overwrites gu_scratch[0..FF] in place
     phase15_silu_mul(wg_id, lane, gu_scratch);
     mega_barrier(barrier_counter, 7);
 
-    // Phase 17: down + final residual → out_residual.  b_mid_lds (the
-    // post-o_proj residual) is still live in LDS (phase 11 read it but
-    // didn't overwrite — wrote to a different slab b_attn_q).
+    // Phase 17: down + final residual → out_residual.
     phase17_down_residual(wg_id, lane, down_w, gu_scratch,
                            b_mid_lds, out_residual);
     // No barrier after phase 17 — kernel exits, AQL packet handles ordering

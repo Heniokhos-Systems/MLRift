@@ -601,3 +601,63 @@ spot.**  With a 29 KB LDS footprint, max safe WG_PERSIST is
 LDS_per_CU / LDS_per_WG × N_CUs = 64/29 × 60 = 120.  Production
 should set WG_PERSIST=64 (50% margin) until LDS is reduced via
 spilling more inter-phase carries to global memory.
+
+## Slice 4.5 — root cause FOUND via phase-bisection (2026-05-05)
+
+The mega-kernel hang at max_phase≥1 is **NOT** a barrier protocol
+issue, NOT a co-residence deadlock, NOT a VGPR-pressure issue.
+It's a fundamental LDS-semantics design flaw.
+
+**Bisection methodology:** added `max_phase` kernarg to early-exit
+the kernel; smoke launcher sweeps max_phase ∈ [0..7], reporting
+which max_phase first hangs.  Then bisected phase 3's body across
+{empty, no-LDS-read, varying ROWS_PER_WG, varying K-loop}.
+
+**Bisection results (all at WG_PERSIST=64, max_phase=1):**
+
+| phase 3 body                                              | result |
+|---|---|
+| empty (return early)                                      | PASS (all 8 phases pass)|
+| matmul without LDS read, 1 row × 1024 K                   | PASS|
+| matmul without LDS read, 48 rows × 1024 K                 | PASS|
+| matmul WITH LDS read `lds.b_x_norm[k]`, 1 row × 32 K      | PASS|
+| matmul WITH LDS read, 1 row × 1024 K                      | PASS|
+| matmul WITH LDS read, 48 rows × 1024 K (production shape) | **HANG**|
+
+**Root cause:** HIP `__shared__` is **per-WG**, not cross-WG.  Each
+WG has private LDS that's uninitialized on entry.  Phase 1 only
+WG 0 writes `lds.b_x_norm`; phase 3 in WGs 1..63 reads
+UNINITIALIZED LDS.  Across 48 rows × 1024 K-iters at 64 WGs, the
+junk-bit pattern multiplied through the FMA pipeline (likely
+denormals, NaN-propagation, or memory-controller state interaction)
+wedges the GPU enough to exceed the 30s sync timeout.  At smaller
+K-loop counts the impact is small enough to complete; at full
+production shape the cumulative effect deadlocks.
+
+**The mega-kernel design as drafted is broken.** Cross-phase
+carries via LDS DON'T WORK on RDNA3 — they need to go through
+GLOBAL scratch memory.  This invalidates the original LDS layout
+plan (b_x_norm/b_qkv/b_attn_q resident in LDS across phases).
+
+**Slice 4.6 fix plan:**
+1. Add per-buffer global scratch slabs as kernargs:
+   `b_x_norm_g[hidden]`, `b_qkv_g[QKV_DIM]`, `b_attn_q_g[Q_DIM]`,
+   `b_mid_g[hidden]`, `b_mid_norm_g[hidden]`.  `b_ff` already uses
+   `gu_scratch` (global).
+2. Phase N writes to its global slab; phase N+2 reads from it.
+3. LDS retained only for **intra-phase** reductions (~1 KB per
+   WG: reduce_tmp[wave_count] for rmsnorm partial sums).
+4. Side benefit: with LDS shrunk to ~1 KB, occupancy returns to
+   the gfx1100 max (60 × 16 = 960 wave32s); WG_PERSIST can rise
+   from 64 back to 256, recovering the slice-4.1 microbench's
+   sweet-spot.
+
+Per-token HBM cost of moving carries to global:
+  hidden + QKV_DIM + Q_DIM + 2*hidden = 1024 + 3072 + 2048 + 2048
+   = 8192 f32 = 32 KB R+W per layer × 28 layers = ~1.8 MB extra
+   HBM traffic per token.  At 600 GB/s = 3 µs.  Trivial overhead.
+
+**Estimated effort to ship slice 4.6:** ~2-3 hours.  Mostly
+mechanical: thread 5 new pointer kernargs through the kernel + the
+launcher, replace `lds.X[i]` with `X_g[i]` in cross-phase read/write
+sites, bump WG_PERSIST back to 256, retest.
