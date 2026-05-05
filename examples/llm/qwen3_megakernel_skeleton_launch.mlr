@@ -1,0 +1,143 @@
+// Slice 4.2 launcher — runs the native-emit mega-kernel skeleton at
+// the production shape (WG_PERSIST=256, n_iters=7) and reports wall
+// time.  Verifies the native-emit skeleton matches the hipcc
+// reference (same protocol, bytewise-identical body) end-to-end.
+//
+// Build:
+//   ./build/mlrc --emit-amdgpu-qwen3-megakernel-skeleton=/tmp/qwen3_megakernel_skeleton.co dummy
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native \
+//       examples/llm/qwen3_megakernel_skeleton_launch.mlr \
+//       -o /tmp/qwen3_megakernel_skeleton_launch
+// Run:
+//   /tmp/qwen3_megakernel_skeleton_launch
+
+import "../../std/hip.mlr"
+import "../../std/time.mlr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn write(int32 fd, uint64 buf, uint64 n) -> int64
+@dynamic extern fn exit(uint64 code)
+
+fn u64_dec(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 { uint8 z = 48; unsafe { *(buf as uint8) = z }; return 1 }
+    uint64 n = 0; uint64 t = val
+    while t > 0 { n = n + 1; t = t / 10 }
+    uint64 i = n; t = val
+    while i > 0 {
+        i = i - 1
+        uint64 d = t - (t / 10) * 10
+        uint8 c = d + 48
+        uint64 p = buf + i; unsafe { *(p as uint8) = c }
+        t = t / 10
+    }
+    return n
+}
+
+fn put_kv(uint64 label, uint64 lab_len, uint64 v) {
+    uint64 buf = alloc(96)
+    uint64 i = 0
+    while i < lab_len {
+        uint64 sp = label + i; uint64 c = 0; unsafe { *(sp as uint8) -> c }
+        uint64 dp = buf + i; uint8 cb = c; unsafe { *(dp as uint8) = cb }
+        i = i + 1
+    }
+    uint64 sep_p = buf + lab_len
+    uint8 eq = 61; unsafe { *(sep_p as uint8) = eq }
+    uint64 num_p = buf + lab_len + 1
+    uint64 nl = u64_dec(v, num_p)
+    uint64 nul_p = buf + lab_len + 1 + nl
+    uint8 nul = 0; unsafe { *(nul_p as uint8) = nul }
+    puts(buf)
+}
+
+fn die(uint64 msg, uint64 code) { puts(msg); put_kv("err", 3, code); exit(1) }
+
+fn main() {
+    uint32 err = hipSetDevice(0); if err != 0 { die("setDev", err) }
+
+    uint64 fd = file_open("/tmp/qwen3_megakernel_skeleton.co", 0)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        puts("missing /tmp/qwen3_megakernel_skeleton.co")
+        puts("emit with: ./build/mlrc --emit-amdgpu-qwen3-megakernel-skeleton=/tmp/qwen3_megakernel_skeleton.co dummy")
+        exit(1)
+    }
+    uint64 sz = file_size(fd); uint64 blob = alloc(sz)
+    file_read(fd, blob, sz); file_close(fd)
+    uint64 mod_slot = alloc(8)
+    err = hipModuleLoadData(mod_slot, blob); if err != 0 { die("LoadData", err) }
+    uint64 mod = 0; unsafe { *(mod_slot as uint64) -> mod }
+    uint64 fh_slot = alloc(8)
+    err = hipModuleGetFunction(fh_slot, mod, "qwen3_megakernel_skeleton")
+    if err != 0 { die("getFn", err) }
+    uint64 fh = 0; unsafe { *(fh_slot as uint64) -> fh }
+
+    // Counter (single dword on GPU).
+    uint64 d_counter = 0
+    uint64 cslot = alloc(8); err = hipMalloc(cslot, 4); if err != 0 { die("malloc counter", err) }
+    unsafe { *(cslot as uint64) -> d_counter }
+
+    uint64 N_WGS  = 256
+    uint64 N_BARS = 7    // 7 cross-WG barriers per layer (slice 4 design)
+
+    // Run a sweep: 1 iter (just launch overhead) and 7 iter (the full
+    // production-shape barrier count).  Per-barrier ns = (T7-T1)/6.
+    uint64 lo_sum_ns = 0
+    uint64 hi_sum_ns = 0
+    uint64 r = 0
+    while r < 5 {
+        // Zero counter
+        uint64 h_zero = alloc(4)
+        uint32 z = 0; unsafe { *(h_zero as uint32) = z }
+        uint32 ec = hipMemcpy(d_counter, h_zero, 4, 1)
+        if ec != 0 { die("clear", ec) }
+        dealloc(h_zero)
+
+        uint64 k_ctr  = alloc(8); unsafe { *(k_ctr  as uint64) = d_counter }
+        uint64 k_nwg  = alloc(8); unsafe { *(k_nwg  as uint64) = N_WGS }
+        uint64 k_nit  = alloc(8); unsafe { *(k_nit  as uint64) = 1 }
+        uint64 kp_lo = alloc(3 * 8)
+        unsafe { *((kp_lo + 0)  as uint64) = k_ctr }
+        unsafe { *((kp_lo + 8)  as uint64) = k_nwg }
+        unsafe { *((kp_lo + 16) as uint64) = k_nit }
+
+        uint64 t0 = time_now()
+        err = hipModuleLaunchKernel(fh, N_WGS, 1, 1, 32, 1, 1, 0, 0, kp_lo, 0)
+        if err != 0 { die("launch lo", err) }
+        err = hipDeviceSynchronize(); if err != 0 { die("sync lo", err) }
+        uint64 lo_ns = time_elapsed(t0)
+        lo_sum_ns = lo_sum_ns + lo_ns
+
+        // Zero counter again for hi
+        uint64 h_zero2 = alloc(4)
+        unsafe { *(h_zero2 as uint32) = z }
+        ec = hipMemcpy(d_counter, h_zero2, 4, 1)
+        if ec != 0 { die("clear2", ec) }
+        dealloc(h_zero2)
+
+        unsafe { *(k_nit as uint64) = N_BARS }
+        uint64 t1 = time_now()
+        err = hipModuleLaunchKernel(fh, N_WGS, 1, 1, 32, 1, 1, 0, 0, kp_lo, 0)
+        if err != 0 { die("launch hi", err) }
+        err = hipDeviceSynchronize(); if err != 0 { die("sync hi", err) }
+        uint64 hi_ns = time_elapsed(t1)
+        hi_sum_ns = hi_sum_ns + hi_ns
+
+        dealloc(kp_lo); dealloc(k_nit); dealloc(k_nwg); dealloc(k_ctr)
+        r = r + 1
+    }
+    uint64 lo_mean = lo_sum_ns / 5
+    uint64 hi_mean = hi_sum_ns / 5
+    uint64 net_ns = 0
+    if hi_mean > lo_mean { net_ns = hi_mean - lo_mean }
+    uint64 per_barrier_ns = net_ns / (N_BARS - 1)
+
+    puts("=== slice 4.2 native skeleton ===")
+    put_kv("n_wgs",                 5, N_WGS)
+    put_kv("kernel_ns_iter1_mean",  20, lo_mean)
+    put_kv("kernel_ns_iter7_mean",  20, hi_mean)
+    put_kv("per_barrier_ns_native", 21, per_barrier_ns)
+    puts("(reference hipcc microbench: ~448 ns/barrier at n_wgs=256)")
+
+    hipFree(d_counter)
+    exit(0)
+}

@@ -1786,6 +1786,15 @@ fn asm_buffer_gl0_inv() {
     asm_u32(0x00000000)
 }
 
+// buffer_gl1_inv — invalidate the L1 cache.  Used in cross-WG
+// signal-poll barriers (slice 4 mega-kernel) so that a post-atomic
+// spin-load on the counter sees the value committed by other WGs'
+// atomic_adds rather than a stale L1 line.
+fn asm_buffer_gl1_inv() {
+    asm_u32(0xE0B00000)
+    asm_u32(0x00000000)
+}
+
 // global_store_b64 v_addr, v[vdata_pair:+1], s[saddr_pair:+1]  (op 0x1B)
 // Stores the VGPR pair starting at vdata_pair to (s[saddr]+v_addr).
 // Verified against llvm-mc:
@@ -18680,5 +18689,137 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
             args_desc, n_args, kernarg_size,
             sgpr_count, vgpr_count_k,
             rsrc1, rsrc2, rsrc3, props)
+    return 0
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Slice 4.2 — qwen3 mega-kernel skeleton (cross-WG barrier scaffold).
+//
+// Bytewise port of the slice 4.1 hipcc microbench (validated GREEN at
+// 0.45 µs/barrier on RX 7800 XT, see docs/SLICE4_MEGAKERNEL_DESIGN.md).
+// Native-emitted so subsequent slices (4.3+) can substitute phase
+// work between the barriers without going through hipcc.
+//
+// Kernel signature (matches slice 4.1 microbench so launchers are
+// drop-in compatible):
+//   void qwen3_megakernel_skeleton(u32 *counter_ptr, u64 n_wgs, u64 n_iters)
+//
+// The body is bytewise identical to the hipcc -O3 disassembly of
+// `examples/llm/mega_barrier_microbench.hip.cpp` for gfx1100.  Each
+// raw `asm_u32` call below is annotated with its disassembled
+// instruction and offset (relative to text start).
+fn _emit_qwen3_megakernel_skeleton_body() {
+    asm_init()
+
+    // ── PROLOGUE: lane-0 gating ──
+    asm_u32(0xBE82007E)   // 0x00 s_mov_b32 s2, exec_lo  (save full exec)
+    asm_u32(0x7D940080)   // 0x04 v_cmpx_eq_u32_e32 0, v0   ⇒ exec_lo &= (v0==0)
+    asm_u32(0xBFA5002D)   // 0x08 s_cbranch_execz +45 (skip to s_endpgm)
+
+    // ── PROLOGUE: kernarg load ──
+    asm_u32(0xF4040100); asm_u32(0xF8000010)  // 0x0C s_load_b64 s[4:5], s[0:1], 0x10  (n_iters)
+    asm_u32(0xBF89FC07)   // 0x14 s_waitcnt lgkmcnt(0)
+    asm_u32(0xBF068004)   // 0x18 s_cmp_eq_u32 s4, 0
+    asm_u32(0xBFA20028)   // 0x1C s_cbranch_scc1 +40  (n_iters==0 → end)
+
+    asm_u32(0xF4080000); asm_u32(0xF8000000)  // 0x20 s_load_b128 s[0:3], s[0:1], null  (counter_ptr + n_wgs)
+    asm_u32(0x7E000280)   // 0x28 v_mov_b32_e32 v0, 0  (vaddr offset)
+    asm_u32(0xBF89FC07)   // 0x2C s_waitcnt lgkmcnt(0)
+    asm_u32(0xBE830080)   // 0x30 s_mov_b32 s3, 0  (i = 0)
+    asm_u32(0xBF800000)   // 0x34 s_nop 0
+    asm_u32(0xBF800000)   // 0x38 s_nop 0
+    asm_u32(0xBF800000)   // 0x3C s_nop 0
+
+    // ── LOOP_HEAD (offset 0x40): one barrier iteration ──
+    asm_u32(0xBE86007E)   // 0x40 s_mov_b32 s6, exec_lo
+    asm_u32(0xBE85007E)   // 0x44 s_mov_b32 s5, exec_lo
+    asm_u32(0xD71F0001); asm_u32(0x00010006)  // 0x48 v_mbcnt_lo_u32_b32 v1, s6, 0
+    asm_u32(0xBF870001)   // 0x50 s_delay_alu instid0(VALU_DEP_1)
+    asm_u32(0x7D940280)   // 0x54 v_cmpx_eq_u32_e32 0, v1  (gate to first active lane)
+    asm_u32(0xBFA5000A)   // 0x58 s_cbranch_execz +10  (skip atomic if no first-lane)
+
+    asm_u32(0xBE861806)   // 0x5C s_bcnt1_i32_b32 s6, s6  (s6 = popcount of saved exec)
+    asm_u32(0xBF870009)   // 0x60 s_delay_alu instid0(SALU_CYCLE_1)
+    asm_u32(0x7E020206)   // 0x64 v_mov_b32_e32 v1, s6
+    asm_u32(0xDCD60000); asm_u32(0x00000100)  // 0x68 global_atomic_add_u32 v0, v1, s[0:1]
+    asm_u32(0xBC7C0000)   // 0x70 s_waitcnt_vscnt null, 0x0
+    asm_u32(0xE0B00000); asm_u32(0x00000000)  // 0x74 buffer_gl1_inv
+    asm_u32(0xE0AC0000); asm_u32(0x00000000)  // 0x7C buffer_gl0_inv
+
+    // ── SKIP_ATOMIC (offset 0x84): expected-value compute ──
+    asm_u32(0x8C7E057E)   // 0x84 s_or_b32 exec_lo, exec_lo, s5  (restore full exec)
+    asm_u32(0x81038103)   // 0x88 s_add_i32 s3, s3, 1  (i++)
+    asm_u32(0xBF870009)   // 0x8C s_delay_alu instid0(SALU_CYCLE_1)
+    asm_u32(0x96050203)   // 0x90 s_mul_i32 s5, s3, s2  (expected = (i+1) * n_wgs … s2=n_wgs from kernarg)
+
+    // ── SPIN (offset 0x94): wait for counter ≥ expected ──
+    asm_u32(0xDC524000); asm_u32(0x01000000)  // 0x94 global_load_b32 v1, v0, s[0:1] glc
+    asm_u32(0xBF8903F7)   // 0x9C s_waitcnt vmcnt(0)
+    asm_u32(0xE0B00000); asm_u32(0x00000000)  // 0xA0 buffer_gl1_inv
+    asm_u32(0xE0AC0000); asm_u32(0x00000000)  // 0xA8 buffer_gl0_inv
+    asm_u32(0x7C980205)   // 0xB0 v_cmp_gt_u32_e32 vcc_lo, s5, v1  (vcc = expected > value)
+    asm_u32(0xBFA4FFF7)   // 0xB4 s_cbranch_vccnz -9  (loop back to global_load_b32)
+
+    // ── LOOP_TAIL (offset 0xB8) ──
+    asm_u32(0xBF070403)   // 0xB8 s_cmp_lg_u32 s3, s4
+    asm_u32(0xBFA2FFE0)   // 0xBC s_cbranch_scc1 -32  (loop back to LOOP_HEAD)
+
+    // ── END (offset 0xC0) ──
+    asm_u32(0xBFB00000)   // 0xC0 s_endpgm
+}
+
+// Public emit: writes a code-object containing exactly one kernel
+// `qwen3_megakernel_skeleton` with the body above, packaged as a
+// gfx1100 amdhsa ELF.  Used by the slice 4.2 launcher to verify the
+// native-emit barrier path matches the hipcc reference (timing-wise
+// and bytewise after llvm-objdump diff).
+fn emit_amdgpu_qwen3_megakernel_skeleton_blob(uint64 out_path) -> uint64 {
+    uint64 kname = "qwen3_megakernel_skeleton"
+    uint64 klen  = 25
+
+    _emit_qwen3_megakernel_skeleton_body()
+
+    // rsrc1/rsrc2/rsrc3 — match the WMMA / atomic-add precedents.
+    // 24 SGPRs (s0..s7 + COv5 hidden args), 7 VGPRs (v0..v6 used).
+    // rsrc1 0xE0AF0000: float_round=0, fp denorm modes default, dx10
+    // clamp on, ieee=on, priority=0, vgpr_count_field = 0x07/8-1 = 0,
+    // sgpr_count_field = 0x16 (24 sgprs).
+    // rsrc2 0x9E: enable wg_id_x in s15 (matches gemm_f32 / qknorm).
+    // rsrc3 0x10: WGP mode disabled (CU mode), inst_pref_size = 16.
+    // properties 0x0408: kernarg_size 64 / 8 = 8 dwords reserved by
+    // the wrapper for COv5 hidden args; explicit kernargs = 24 bytes.
+    uint64 rsrc1 = 0xE0AF0000
+    uint64 rsrc2 = 0x0000009E
+    uint64 rsrc3 = 0x00000010
+    uint64 props = 0x0408
+
+    // Three explicit kernargs:
+    //   [0] counter_ptr  — GLOBAL_BUFFER (u32 *), 8 B
+    //   [1] n_wgs        — BY_VALUE u64, 8 B
+    //   [2] n_iters      — BY_VALUE u64, 8 B
+    uint64[6] args_desc
+    uint64 a0 = args_desc + 0;   unsafe { *(a0 as uint64) = 8 }
+    uint64 a1 = args_desc + 8;   unsafe { *(a1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a2 = args_desc + 16;  unsafe { *(a2 as uint64) = 8 }
+    uint64 a3 = args_desc + 24;  unsafe { *(a3 as uint64) = AMD_ARG_KIND_BY_VALUE }
+    uint64 a4 = args_desc + 32;  unsafe { *(a4 as uint64) = 8 }
+    uint64 a5 = args_desc + 40;  unsafe { *(a5 as uint64) = AMD_ARG_KIND_BY_VALUE }
+
+    uint64 size = emit_amdgpu_code_object(kname, klen,
+                                           asm_text_buf, asm_text_len,
+                                           24,      // explicit kernarg_size (3 × 8 B)
+                                           8,       // kernarg_align
+                                           24,      // sgpr_count (s0..s23 incl COv5 hidden)
+                                           7,       // vgpr_count (v0..v6)
+                                           rsrc1, rsrc2, rsrc3, props,
+                                           args_desc, 3)
+
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_qwen3_megakernel_skeleton_blob: cannot open output\n", 63)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
     return 0
 }
