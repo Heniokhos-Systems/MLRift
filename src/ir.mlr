@@ -4686,6 +4686,53 @@ static uint64 ir_used_callee_mask = 0
 // bytes plus the return address to reach the caller's stack args.
 static uint64 ir_callee_save_bytes = 0
 
+// Briggs-conservative copy coalescing. A candidate `dst = src` is
+// merged only if the combined interference set has fewer than
+// K = IR_NUM_REGS neighbours of significant degree (>= K). That keeps
+// the merged node K-colourable in isolation, so coalescing never forces
+// a spill that wouldn't have happened otherwise. ir_uf_deg caches
+// per-vreg neighbour counts and is updated incrementally as merges
+// happen. Enabled by default; --no-coalesce disables.
+static uint64 ir_uf_parent = 0
+static uint64 ir_uf_cap = 0
+static uint64 ir_uf_deg = 0
+static uint64 ir_uf_deg_cap = 0
+static uint64 ir_coalesce_enabled = 1
+
+@export fn ir_set_coalesce(uint64 v) { ir_coalesce_enabled = v }
+
+// Popcount of one 64-bit word, branchless.
+fn ir_popcount64(uint64 x) -> uint64 {
+    x = x - ((x >> 1) & 0x5555555555555555)
+    x = (x & 0x3333333333333333) + ((x >> 2) & 0x3333333333333333)
+    x = (x + (x >> 4)) & 0x0F0F0F0F0F0F0F0F
+    return (x * 0x0101010101010101) >> 56
+}
+
+fn ir_uf_find(uint64 v) -> uint64 {
+    uint64 cur = v
+    while 1 == 1 {
+        uint64 pp = ir_uf_parent + cur * 4
+        uint32 pw = 0
+        unsafe { *(pp as uint32) -> pw }
+        uint64 par = pw
+        if par == cur { break }
+        cur = par
+    }
+    // Path compression — flatten so future lookups are O(1).
+    uint64 walk = v
+    while walk != cur {
+        uint64 pp2 = ir_uf_parent + walk * 4
+        uint32 pw2 = 0
+        unsafe { *(pp2 as uint32) -> pw2 }
+        uint64 next = pw2
+        uint32 cw = cur
+        unsafe { *(pp2 as uint32) = cw }
+        walk = next
+    }
+    return cur
+}
+
 fn ir_regalloc_init() {
     if ir_phys_regs == 0 { ir_phys_regs = alloc(10 * 8) }
     uint64 p0 = ir_phys_regs
@@ -4923,8 +4970,234 @@ fn ir_graph_color() {
         bi = bi + 1
     }
 
+    // ----- Copy coalescing (Briggs + George, default-on) -----
+    // For each IR_COPY (op 61) with a real src1 (i.e. reg-reg copy, not
+    // a param load), if dest and src1 don't already interfere AND the
+    // Briggs/George heuristic would let the merged class stay
+    // K-colourable, union them in ir_uf_parent so the greedy colorer
+    // assigns them the same colour. The redundant `mov rN, rN` is
+    // dropped by the emitter's dst==src short-circuit.
+    if ir_uf_cap < vcount {
+        if ir_uf_parent != 0 { dealloc(ir_uf_parent) }
+        ir_uf_cap = vcount
+        if ir_uf_cap < 64 { ir_uf_cap = 64 }
+        ir_uf_parent = alloc(ir_uf_cap * 4)
+    }
+    uint64 ufi = 0
+    while ufi < vcount {
+        uint64 ufp = ir_uf_parent + ufi * 4
+        uint32 ufv = ufi
+        unsafe { *(ufp as uint32) = ufv }
+        ufi = ufi + 1
+    }
+
+    // Degree cache for Briggs: deg[v] = popcount(row[v]). Followers'
+    // entries are kept in sync with their rep until they're absorbed.
+    if ir_uf_deg_cap < vcount {
+        if ir_uf_deg != 0 { dealloc(ir_uf_deg) }
+        ir_uf_deg_cap = vcount
+        if ir_uf_deg_cap < 64 { ir_uf_deg_cap = 64 }
+        ir_uf_deg = alloc(ir_uf_deg_cap * 4)
+    }
+    uint64 dgi = 0
+    while dgi < vcount {
+        uint64 dsum = 0
+        uint64 dw = 0
+        while dw < row_words {
+            uint64 dpp = ig + dgi * row_bytes + dw * 8
+            uint64 dvv = 0
+            unsafe { *(dpp as uint64) -> dvv }
+            dsum = dsum + ir_popcount64(dvv)
+            dw = dw + 1
+        }
+        uint64 dgp = ir_uf_deg + dgi * 4
+        uint32 dg32 = dsum
+        unsafe { *(dgp as uint32) = dg32 }
+        dgi = dgi + 1
+    }
+
+    uint64 cii = 0
+    while cii < ir_insn_count && ir_coalesce_enabled != 0 {
+        uint64 cop = ir_insn_opcode(cii)
+        if cop == 61 {
+            uint64 cdv = ir_insn_dest(cii)
+            uint64 csv = ir_insn_src1(cii)
+            if cdv != 0 && csv != 0 && cdv < vcount && csv < vcount {
+                uint64 crd = ir_uf_find(cdv)
+                uint64 crs = ir_uf_find(csv)
+                if crd != crs {
+                    // Test interference: bit (crs & 63) in row[crd] word (crs/64).
+                    uint64 cip = ig + crd * row_bytes + (crs / 64) * 8
+                    uint64 civ = 0
+                    unsafe { *(cip as uint64) -> civ }
+                    uint64 inter = (civ >> (crs & 63)) & 1
+                    if inter == 0 {
+                        // Always make the LOWER vreg the rep so it gets
+                        // coloured first in the sequential walk below.
+                        // Otherwise, when greedy colours an intermediate
+                        // vreg vN with crs < vN < crd as a neighbour of
+                        // crs, ir_uf_find(crs) returns crd which is still
+                        // 0xFFFFFFFF — the constraint is missed and vN
+                        // can collide with crd's eventual colour.
+                        uint64 keep = crd
+                        uint64 drop = crs
+                        if crs < crd { keep = crs; drop = crd }
+
+                        // Briggs conservative gate: count neighbours of
+                        // (row[keep] | row[drop]) whose current degree is
+                        // >= K. If fewer than K such neighbours, the merged
+                        // node is K-colourable on its own — safe to merge.
+                        // Followers' own deg slots are stale (zeroed at
+                        // drop time), so every degree lookup goes through
+                        // ir_uf_find first.
+                        uint64 hd = 0
+                        uint64 bw = 0
+                        while bw < row_words {
+                            uint64 ba = ig + keep * row_bytes + bw * 8
+                            uint64 bav = 0
+                            unsafe { *(ba as uint64) -> bav }
+                            uint64 bb = ig + drop * row_bytes + bw * 8
+                            uint64 bbv = 0
+                            unsafe { *(bb as uint64) -> bbv }
+                            uint64 cb = bav | bbv
+                            if (bw == keep / 64) { cb = cb & ~(1 << (keep & 63)) }
+                            if (bw == drop / 64) { cb = cb & ~(1 << (drop & 63)) }
+                            while cb != 0 {
+                                uint64 sp = 0
+                                uint64 st = cb
+                                while (st & 1) == 0 { st = st >> 1; sp = sp + 1 }
+                                uint64 nidx = bw * 64 + sp
+                                if nidx < vcount {
+                                    uint64 nrep = ir_uf_find(nidx)
+                                    uint64 ndp = ir_uf_deg + nrep * 4
+                                    uint32 ndg32 = 0
+                                    unsafe { *(ndp as uint32) -> ndg32 }
+                                    if ndg32 >= IR_NUM_REGS { hd = hd + 1 }
+                                }
+                                cb = cb & ~(1 << sp)
+                            }
+                            bw = bw + 1
+                        }
+                        if hd >= IR_NUM_REGS {
+                            // George fallback: less conservative than Briggs.
+                            // Skip when K is small (x86: K=6) — empirically
+                            // George's extra merges cost more than they save
+                            // when K < 8.
+                            if IR_NUM_REGS < 8 {
+                                cii = cii + 1
+                                continue
+                            }
+                            uint64 g_a = keep; uint64 g_b = drop
+                            uint64 g_pass = 0
+                            uint64 g_try = 0
+                            while g_try < 2 {
+                                uint64 ok = 1
+                                uint64 gw = 0
+                                while gw < row_words {
+                                    uint64 gap = ig + g_a * row_bytes + gw * 8
+                                    uint64 gav = 0
+                                    unsafe { *(gap as uint64) -> gav }
+                                    uint64 gbp = ig + g_b * row_bytes + gw * 8
+                                    uint64 gbv = 0
+                                    unsafe { *(gbp as uint64) -> gbv }
+                                    if gw == g_b / 64 { gav = gav & ~(1 << (g_b & 63)) }
+                                    if gw == g_a / 64 { gav = gav & ~(1 << (g_a & 63)) }
+                                    while gav != 0 && ok != 0 {
+                                        uint64 sp = 0
+                                        uint64 st = gav
+                                        while (st & 1) == 0 { st = st >> 1; sp = sp + 1 }
+                                        uint64 nidx = gw * 64 + sp
+                                        if nidx < vcount {
+                                            uint64 in_b = (gbv >> sp) & 1
+                                            uint64 nrep = ir_uf_find(nidx)
+                                            uint64 ndp = ir_uf_deg + nrep * 4
+                                            uint32 ndg = 0
+                                            unsafe { *(ndp as uint32) -> ndg }
+                                            if in_b == 0 && ndg >= IR_NUM_REGS { ok = 0 }
+                                        }
+                                        gav = gav & ~(1 << sp)
+                                    }
+                                    if ok == 0 { gw = row_words } else { gw = gw + 1 }
+                                }
+                                if ok != 0 { g_pass = 1; g_try = 2 }
+                                else {
+                                    g_a = drop; g_b = keep
+                                    g_try = g_try + 1
+                                }
+                            }
+                            if g_pass == 0 {
+                                cii = cii + 1
+                                continue
+                            }
+                        }
+
+                        // Merge: row[keep] |= row[drop]; for every neighbor
+                        // n in row[drop], set IG[n][keep] so foreign rows
+                        // also see keep as a neighbor. Update degree cache:
+                        // for each common neighbour, decrement deg[n] (the
+                        // two edges to keep and drop collapse to one).
+                        uint64 new_keep_deg = 0
+                        uint64 mw = 0
+                        while mw < row_words {
+                            uint64 sa = ig + drop * row_bytes + mw * 8
+                            uint64 sav = 0
+                            unsafe { *(sa as uint64) -> sav }
+                            uint64 da = ig + keep * row_bytes + mw * 8
+                            uint64 dav = 0
+                            unsafe { *(da as uint64) -> dav }
+                            uint64 common = sav & dav
+                            if sav != 0 {
+                                unsafe { *(da as uint64) = dav | sav }
+                                uint64 sb = sav
+                                while sb != 0 {
+                                    uint64 sp = 0
+                                    uint64 st = sb
+                                    while (st & 1) == 0 { st = st >> 1; sp = sp + 1 }
+                                    uint64 nidx = mw * 64 + sp
+                                    if nidx != keep && nidx < vcount {
+                                        uint64 nrp = ig + nidx * row_bytes + (keep / 64) * 8
+                                        uint64 nrv = 0
+                                        unsafe { *(nrp as uint64) -> nrv }
+                                        nrv = nrv | (1 << (keep & 63))
+                                        unsafe { *(nrp as uint64) = nrv }
+                                        if ((common >> sp) & 1) != 0 {
+                                            uint64 ndp = ir_uf_deg + nidx * 4
+                                            uint32 ndg = 0
+                                            unsafe { *(ndp as uint32) -> ndg }
+                                            if ndg > 0 { ndg = ndg - 1 }
+                                            unsafe { *(ndp as uint32) = ndg }
+                                        }
+                                    }
+                                    sb = sb & ~(1 << sp)
+                                }
+                            }
+                            uint64 da2 = ig + keep * row_bytes + mw * 8
+                            uint64 da2v = 0
+                            unsafe { *(da2 as uint64) -> da2v }
+                            new_keep_deg = new_keep_deg + ir_popcount64(da2v)
+                            mw = mw + 1
+                        }
+                        uint64 dkp = ir_uf_deg + keep * 4
+                        uint32 dk32 = new_keep_deg
+                        unsafe { *(dkp as uint32) = dk32 }
+                        uint64 ddp = ir_uf_deg + drop * 4
+                        uint32 dd32 = 0
+                        unsafe { *(ddp as uint32) = dd32 }
+
+                        // Union: parent[drop] = keep (high → low)
+                        uint64 ufpp = ir_uf_parent + drop * 4
+                        uint32 ufpw = keep
+                        unsafe { *(ufpp as uint32) = ufpw }
+                    }
+                }
+            }
+        }
+        cii = cii + 1
+    }
+
     // Greedy coloring: for each vreg, assign the lowest color not used
-    // by any interfering neighbor.
+    // by any interfering neighbor. Followers (uf_find(vi) != vi) are
+    // skipped; their colour is propagated from their rep below.
     uint64 vi = 0
     while vi < vcount {
         uint64 rp = ir_reg_assign + vi * 4
@@ -4935,6 +5208,10 @@ fn ir_graph_color() {
 
     vi = 1
     while vi < vcount {
+        if ir_uf_find(vi) != vi {
+            vi = vi + 1
+            continue
+        }
         // Collect colors used by interfering neighbors
         uint64 used_colors = 0
         uint64 nw = 0
@@ -4948,7 +5225,10 @@ fn ir_graph_color() {
                 while (bt & 1) == 0 { bt = bt >> 1; bp = bp + 1 }
                 uint64 neighbor = nw * 64 + bp
                 if neighbor < vcount {
-                    uint64 nrp = ir_reg_assign + neighbor * 4
+                    // Look up rep's colour — followers haven't been
+                    // assigned yet but their rep may have been.
+                    uint64 nrep = ir_uf_find(neighbor)
+                    uint64 nrp = ir_reg_assign + nrep * 4
                     uint32 nc = 0
                     unsafe { *(nrp as uint32) -> nc }
                     uint64 wnc = nc
@@ -4973,6 +5253,21 @@ fn ir_graph_color() {
             color = color + 1
         }
 
+        vi = vi + 1
+    }
+
+    // Propagate rep colours to followers so ir_get_phys_reg works
+    // uniformly for every vreg.
+    vi = 1
+    while vi < vcount {
+        uint64 rep = ir_uf_find(vi)
+        if rep != vi {
+            uint64 rrp = ir_reg_assign + rep * 4
+            uint32 rc = 0
+            unsafe { *(rrp as uint32) -> rc }
+            uint64 frp = ir_reg_assign + vi * 4
+            unsafe { *(frp as uint32) = rc }
+        }
         vi = vi + 1
     }
 

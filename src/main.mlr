@@ -9,6 +9,7 @@ import "format_archive.mlr"
 import "format_android.mlr"
 import "bcj.mlr"
 import "analysis.mlr"
+import "inliner.mlr"
 import "living.mlr"
 import "runtime.mlr"
 import "formatter.mlr"
@@ -2331,8 +2332,18 @@ fn compile(uint64 input_path, uint64 output_path, uint64 arch, uint64 emit_mode)
         }
     }
 
+    // Inliner: fold pure single-expression callees into their call
+    // sites so DCE can drop the originals (executable emit modes).
+    // Translation-unit emit modes (.o / asm / IR dump) keep every
+    // top-level fn live so the original definitions still appear in
+    // the output.
+    inline_pass(root)
+
     // Dead code elimination: scan AST for reachable functions
     dce_init()
+    if emit_mode == 3 || emit_mode == 5 || emit_mode == 6 {
+        dce_set_keep_all(1)
+    }
     dce_scan(root)
 
     // IR dump: lower each function to IR and print, then exit early
@@ -3272,7 +3283,8 @@ fn compile_fat(uint64 input_path, uint64 output_path) {
         exit(1)
     }
 
-    // Dead code elimination
+    // Inline + Dead code elimination
+    inline_pass(root)
     dce_init()
     dce_scan(root)
 
@@ -3390,7 +3402,8 @@ fn compile_fat(uint64 input_path, uint64 output_path) {
     parser_init(my_tokens, saved_tcount)
     uint64 root2 = parse_module()
 
-    // Re-run DCE for fresh AST
+    // Re-run inliner + DCE for fresh AST
+    inline_pass(root2)
     dce_init()
     dce_scan(root2)
 
@@ -3492,6 +3505,7 @@ fn compile_fat(uint64 input_path, uint64 output_path) {
     ast_init(524288)
     parser_init(my_tokens, saved_tcount)
     uint64 root3 = parse_module()
+    inline_pass(root3)
     dce_init()
     dce_scan(root3)
 
@@ -3598,6 +3612,7 @@ fn compile_fat(uint64 input_path, uint64 output_path) {
     ast_init(524288)
     parser_init(my_tokens, saved_tcount)
     uint64 root4 = parse_module()
+    inline_pass(root4)
     dce_init()
     dce_scan(root4)
 
@@ -3726,6 +3741,7 @@ fn compile_fat(uint64 input_path, uint64 output_path) {
     ast_init(524288)
     parser_init(my_tokens, saved_tcount)
     uint64 root5 = parse_module()
+    inline_pass(root5)
     dce_init()
     dce_scan(root5)
 
@@ -3823,6 +3839,7 @@ fn compile_fat(uint64 input_path, uint64 output_path) {
     ast_init(524288)
     parser_init(my_tokens, saved_tcount)
     uint64 root6 = parse_module()
+    inline_pass(root6)
     dce_init()
     dce_scan(root6)
 
@@ -3955,6 +3972,7 @@ fn compile_fat(uint64 input_path, uint64 output_path) {
     ast_init(524288)
     parser_init(my_tokens, saved_tcount)
     uint64 root8 = parse_module()
+    inline_pass(root8)
     dce_init()
     dce_scan(root8)
 
@@ -4070,6 +4088,7 @@ fn compile_fat(uint64 input_path, uint64 output_path) {
     ast_init(524288)
     parser_init(my_tokens, saved_tcount)
     uint64 root7 = parse_module()
+    inline_pass(root7)
     dce_init()
     dce_scan(root7)
 
@@ -5507,26 +5526,48 @@ fn main() {
                     exit(1)
                 }
             } else if str_starts_with(arg, "--help", 6) != 0 || str_eq_full(arg, "-h") != 0 {
-                write(1, "usage: mlrc [options] <file.mlr> [-o output]\n\n", 46)
-                write(1, "options:\n", 9)
-                write(1, "  --arch=x86_64|arm64\n", 22)
-                write(1, "  --emit=elfexe|macho|pe|obj|android|asm\n", 41)
-                write(1, "  -c                        emit relocatable .o\n", 48)
-                write(1, "  --target=linux|macos|windows\n", 31)
-                write(1, "  --target-arch=<gfx1030|gfx1031|gfx1033|gfx1100|gfx1101|gfx1200>\n", 66)
-                write(1, "  --targets=<list>          custom fat binary (e.g. linux-x64,macos-arm64)\n", 75)
-                write(1, "  --freestanding            no startup code\n", 44)
-                write(1, "  --debug                   runtime safety checks\n", 51)
-                write(1, "  -g                        emit DWARF debug info\n", 50)
+                write(1, "usage: mlrc [options] <file.mlr> [-o output]\n", 45)
+                write(1, "       mlrc <command> <file.mlr> [options]\n\n", 44)
+                write(1, "default: emit a .mlrbo fat binary covering the supported CPU targets\n", 69)
+                write(1, "(linux/macos/windows/android x x86_64/arm64). The mlr runner extracts\n", 70)
+                write(1, "and execs the matching slice at startup. AMDGPU code objects are\n", 65)
+                write(1, "emitted via the --emit-amdgpu-* family of flags.\n\n", 50)
+
+                write(1, "output:\n", 8)
+                write(1, "  --arch=x86_64|arm64       single-arch binary (no fat-binary wrap)\n", 68)
+                write(1, "  --target=linux|macos|windows|android   single-target binary\n", 62)
+                write(1, "  --target-arch=<gfxNNNN>   AMDGPU sub-target (gfx1030/1100/1200/...)\n", 70)
+                write(1, "  --targets=<list>         custom fat binary subset\n", 52)
+                write(1, "                              e.g. linux-x64,macos-arm64,win-x64\n", 65)
+                write(1, "  --emit=elfexe|macho|pe|android        single-target executable\n", 65)
+                write(1, "  --emit=obj                relocatable .o (.obj on Windows)\n", 61)
+                write(1, "  --emit=asm                annotated assembly listing\n", 55)
+                write(1, "  --emit=ir                 dump SSA IR per function\n", 53)
+                write(1, "  --emit-amdgpu-*=<spec>    emit a specific AMDGPU code object\n", 63)
+                write(1, "  -c                        shorthand for --emit=obj\n", 53)
+                write(1, "  -o <path>                 output path\n\n", 41)
+
+                write(1, "code generation:\n", 17)
+                write(1, "  --ir                      force IR backend (default)\n", 55)
+                write(1, "  --legacy                  legacy direct codegen path\n", 55)
+                write(1, "  --coalesce                Briggs/George copy coalescing (default on)\n", 71)
+                write(1, "  --no-coalesce             disable copy coalescing\n", 52)
+                write(1, "  --O0                      disable IR optimizations (CF/DCE/CSE/LICM)\n", 71)
+                write(1, "  --freestanding            no startup code, no libc\n", 53)
+                write(1, "  --debug                   runtime safety checks (bounds, null)\n", 65)
+                write(1, "  -g                        emit DWARF debug info\n\n", 51)
+
+                write(1, "commands (living compiler):\n", 28)
+                write(1, "  check <file.mlr>          safety analysis\n", 44)
+                write(1, "  lc <file.mlr>             propose / classify changes\n", 55)
+                write(1, "  fmt <file.mlr>            auto-format source\n\n", 48)
+
+                write(1, "info:\n", 6)
                 write(1, "  --version                 show version\n", 41)
-                write(1, "  --help, -h                show this help\n\n", 44)
-                write(1, "commands:\n", 10)
-                write(1, "  check <file.mlr>  safety analysis\n", 36)
-                write(1, "  lc <file.mlr>     living compiler\n", 36)
-                write(1, "  fmt <file.mlr>    auto-format source\n", 39)
+                write(1, "  --help, -h                show this help\n", 43)
                 exit(0)
             } else if str_starts_with(arg, "--version", 9) != 0 {
-                uint64 msg = "mlrc 0.1.0 (MLRift — built on KernRift v2.8.15)\n"
+                uint64 msg = "mlrc 0.1.1 (MLRift — built on KernRift v2.8.24)\n"
                 write(1, msg, 50)
                 exit(0)
             } else if str_starts_with(arg, "--freestanding", 14) != 0 {
@@ -5537,6 +5578,10 @@ fn main() {
                 emit_ir_mode = 2
             } else if str_starts_with(arg, "--O0", 4) != 0 {
                 ir_opt_level = 0
+            } else if str_starts_with(arg, "--no-coalesce", 13) != 0 {
+                ir_set_coalesce(0)
+            } else if str_starts_with(arg, "--coalesce", 10) != 0 {
+                ir_set_coalesce(1)
             } else if str_starts_with(arg, "--debug", 7) != 0 {
                 debug_mode = 1
             } else if str_starts_with(arg, "-g", 2) != 0 {

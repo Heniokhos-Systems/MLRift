@@ -13,7 +13,7 @@ DIST_DIR = dist
 SRCS = src/lexer.mlr src/ast.mlr src/parser.mlr src/codegen.mlr \
        src/codegen_aarch64.mlr src/ir.mlr src/ir_aarch64.mlr src/ir_hip.mlr \
        src/format_macho.mlr src/format_pe.mlr src/format_hip.mlr src/format_amdgpu.mlr src/format_elf_dyn.mlr src/dyn_sym_registry.mlr \
-       src/format_archive.mlr src/format_android.mlr src/bcj.mlr src/analysis.mlr src/living.mlr \
+       src/format_archive.mlr src/format_android.mlr src/bcj.mlr src/analysis.mlr src/inliner.mlr src/living.mlr \
        src/runtime.mlr src/formatter.mlr src/main.mlr
 
 .PHONY: all build mlr-runner test install dist clean bootstrap
