@@ -274,6 +274,15 @@ fn qwen3_set_fuse_qkv(u64 on) { qwen3_fuse_qkv = on }
 static u64 qwen3_matmul_kind = 0
 fn qwen3_set_matmul_kind(u64 kind) { qwen3_matmul_kind = kind }
 
+// Q8_0 bit-exact mode. When 1, the Q8_0 weight path goes through
+// matmul_q8_0_q8_0_f32 (per-block-quantizes the activation, int8×int8
+// dot, scale by d_w*d_x) instead of the dequant-FMA fast path. Output
+// matches llama.cpp byte-for-byte. Used by examples/llama3_generate.mlr
+// to validate against `llama-completion`. Default 0 keeps the existing
+// 14B Q8_0 fast path untouched.
+static u64 qwen3_q8_bitexact = 0
+fn qwen3_set_q8_bitexact(u64 on) { qwen3_q8_bitexact = on }
+
 // Norm-weight dtype selector. 0 = BF16 (0.6B), 1 = F32 (14B GGUF ships
 // all rms_norm.weight tensors as F32). Applies to input_norm, post_norm,
 // final_norm, and the QK-norm 128-entry tensors.
@@ -309,6 +318,13 @@ fn qwen3_set_rope_freqs(u64 ptr) { qwen3_rope_freqs_ptr = ptr }
 static u64 qwen3_rmsnorm_eps_override_bits = 0
 fn qwen3_set_rmsnorm_eps_bits(u64 bits) { qwen3_rmsnorm_eps_override_bits = bits }
 
+// RoPE pair layout. 0 = NEOX (split-half: rotate x[i], x[i+half] —
+// Qwen3 / GPT-NeoX / Falcon / most modern models). 1 = NORM (consecutive
+// pairs: rotate x[2k], x[2k+1] — Llama-1/2/3, Mistral, Granite). Default
+// 0 keeps Qwen3 behaviour. Llama callers set 1.
+static u64 qwen3_rope_pair_layout = 0
+fn qwen3_set_rope_pair_layout(u64 mode) { qwen3_rope_pair_layout = mode }
+
 // Dispatch helper used by qwen3_forward_layer everywhere it used to call
 // matmul_bf16_weights_f32 directly. Q8_0 path ignores `use_kahan` (no
 // Kahan variant yet) — residual-stream drift at 14B hasn't been tuned.
@@ -323,7 +339,11 @@ fn qwen3_main_matmul(u64 out_ptr, u64 x_ptr, u64 w_ptr,
         if matmul_bf16_weights_f32_gpu(out_ptr, x_ptr, w_ptr, M, N, K) == 0 { return }
         matmul_bf16_weights_f32(out_ptr, x_ptr, w_ptr, M, N, K, num_workers, use_kahan)
     } else {
-        matmul_q8_0_weights_f32(out_ptr, x_ptr, w_ptr, M, N, K, num_workers)
+        if qwen3_q8_bitexact == 1 {
+            matmul_q8_0_q8_0_f32(out_ptr, x_ptr, w_ptr, M, N, K, num_workers)
+        } else {
+            matmul_q8_0_weights_f32(out_ptr, x_ptr, w_ptr, M, N, K, num_workers)
+        }
     }
 }
 
@@ -422,20 +442,46 @@ fn qwen3_rope_apply(u64 x_ptr, u64 cos_ptr, u64 sin_ptr, u64 n_heads, u64 head_d
     while h < n_heads {
         u64 row = x_ptr + h * head_dim * 4
         u64 i = 0
-        while i < half {
-            f32 x1 = 0.0f
-            f32 x2 = 0.0f
-            unsafe { *((row + i * 4) as f32) -> x1 }
-            unsafe { *((row + (i + half) * 4) as f32) -> x2 }
-            f32 c = 0.0f
-            f32 s = 0.0f
-            unsafe { *((cos_ptr + i * 4) as f32) -> c }
-            unsafe { *((sin_ptr + i * 4) as f32) -> s }
-            f32 y1 = x1 * c - x2 * s
-            f32 y2 = x1 * s + x2 * c
-            unsafe { *((row + i * 4) as f32) = y1 }
-            unsafe { *((row + (i + half) * 4) as f32) = y2 }
-            i = i + 1
+        if qwen3_rope_pair_layout == 0 {
+            // NEOX split-half: rotate (row[i], row[i+half]) for i = 0..half.
+            while i < half {
+                f32 x1 = 0.0f
+                f32 x2 = 0.0f
+                unsafe { *((row + i * 4) as f32) -> x1 }
+                unsafe { *((row + (i + half) * 4) as f32) -> x2 }
+                f32 c = 0.0f
+                f32 s = 0.0f
+                unsafe { *((cos_ptr + i * 4) as f32) -> c }
+                unsafe { *((sin_ptr + i * 4) as f32) -> s }
+                f32 y1 = x1 * c - x2 * s
+                f32 y2 = x1 * s + x2 * c
+                unsafe { *((row + i * 4) as f32) = y1 }
+                unsafe { *((row + (i + half) * 4) as f32) = y2 }
+                i = i + 1
+            }
+        } else {
+            // NORM consecutive pairs: rotate (row[2k], row[2k+1]) for
+            // k = 0..half. Llama / Mistral / Granite use this. The cos/sin
+            // tables are still indexed by k (one entry per pair); they are
+            // arch-independent — only the *which two channels we rotate*
+            // changes between modes.
+            u64 k = 0
+            while k < half {
+                u64 i0 = 2 * k
+                f32 x1 = 0.0f
+                f32 x2 = 0.0f
+                unsafe { *((row + i0 * 4) as f32) -> x1 }
+                unsafe { *((row + (i0 + 1) * 4) as f32) -> x2 }
+                f32 c = 0.0f
+                f32 s = 0.0f
+                unsafe { *((cos_ptr + k * 4) as f32) -> c }
+                unsafe { *((sin_ptr + k * 4) as f32) -> s }
+                f32 y1 = x1 * c - x2 * s
+                f32 y2 = x1 * s + x2 * c
+                unsafe { *((row + i0 * 4) as f32) = y1 }
+                unsafe { *((row + (i0 + 1) * 4) as f32) = y2 }
+                k = k + 1
+            }
         }
         h = h + 1
     }

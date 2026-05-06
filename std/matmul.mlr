@@ -720,3 +720,369 @@ fn matmul_q8_0_weights_f32(u64 out_ptr, u64 x_ptr, u64 w_ptr,
     }
     thread_pool_wait()
 }
+
+// ---------------------------------------------------------------------------
+// Bit-exact Q8_0 × Q8_0 → f32 matmul (matches llama.cpp byte-for-byte).
+//
+// The standard `matmul_q8_0_weights_f32` above dequantizes Q8_0 weights to
+// f32 then does f32×f32 FMA against an f32 activation. That's a correct
+// Q8_0 matmul but its f32 outputs differ from llama.cpp on the same model
+// because llama.cpp's Q8_0 matmul:
+//
+//   1. Quantizes the f32 activation to Q8_0 too (`quantize_row_q8_0_ref`).
+//   2. Per 32-element block, computes int8×int8 → int32 dot exactly.
+//   3. Multiplies the int32 by the *product of both block scales* (in f32).
+//   4. Accumulates per-block contributions into a single f32.
+//
+// On a 16-layer Llama-3.2-1B that systematic per-block delta lifts to a
+// 0.36-logit gap between the top-1 and top-2 candidates by decode pos 2,
+// which flips the argmax. Token IDs only match if we use llama.cpp's
+// algorithm bit-for-bit.
+//
+// New entry point: `matmul_q8_0_q8_0_f32(out, x_f32, w_q8_0, M, N, K, nw)`.
+// `qwen3.mlr` flips to it via `qwen3_set_q8_bitexact(1)`. Performance is
+// secondary (scalar int8×int8 is fine for a first cut).
+// ---------------------------------------------------------------------------
+
+// Activation Q8_0 buffer (grows on demand to fit M * (K/32) * 34 bytes).
+static u64 mm_q8q8_actq_buf  = 0
+static u64 mm_q8q8_actq_cap  = 0   // bytes capacity
+
+// Separate 16-byte scratch used ONLY for the f32↔u32 bit reinterprets
+// inside _q8q8_fp32_to_fp16_rne. Must not alias the activation buffer
+// (otherwise quantize_row_q8_0's fp16-RNE side-call clobbers the Q8_0
+// blocks it just wrote — happens whenever K > 32 because the fp16
+// helper writes to byte 0 of `mm_q8q8_actq_buf` in between blocks).
+static u64 mm_q8q8_bits_scratch = 0
+
+// Lazily grow the activation Q8_0 buffer to fit M * (K/32) * 34 bytes.
+fn mm_q8q8_actq_reserve(u64 m, u64 k) {
+    u64 need = m * (k / 32) * 34
+    if mm_q8q8_actq_cap >= need { return }
+    if mm_q8q8_actq_buf != 0 { dealloc(mm_q8q8_actq_buf) }
+    // Round up to 64-byte multiple to keep cache lines clean.
+    u64 rounded = (need + 63) & ~63
+    mm_q8q8_actq_buf = alloc(rounded)
+    mm_q8q8_actq_cap = rounded
+}
+
+// FP32 → FP16 round-to-nearest-even using the Maratyszcza FP16 algorithm
+// (https://github.com/Maratyszcza/FP16). This matches llama.cpp's
+// `ggml_compute_fp32_to_fp16` byte-for-byte. Returns the 16 bits as a u64.
+//
+// The trick: scale |f| by 2^112 then 2^-110 to put the f32 mantissa into
+// a position where IEEE-754 rounding-on-cast produces the correct
+// 10-bit f16 mantissa. Then re-pack the exponent and reattach the sign.
+fn _q8q8_fp32_to_fp16_rne(f32 f) -> u64 {
+    if mm_q8q8_bits_scratch == 0 {
+        mm_q8q8_bits_scratch = alloc(16)
+    }
+    u64 scratch = mm_q8q8_bits_scratch
+    // Scaling factors as bit patterns.
+    //   scale_to_inf  = 0x77800000 (2^112)
+    //   scale_to_zero = 0x08800000 (2^-110)
+    u32 sti_bits = 0x77800000
+    unsafe { *(scratch as uint32) = sti_bits }
+    f32 scale_to_inf = 0.0f
+    unsafe { *(scratch as f32) -> scale_to_inf }
+    u32 stz_bits = 0x08800000
+    unsafe { *(scratch as uint32) = stz_bits }
+    f32 scale_to_zero = 0.0f
+    unsafe { *(scratch as f32) -> scale_to_zero }
+    // Get the bit pattern of f.
+    unsafe { *(scratch as f32) = f }
+    u32 w32 = 0
+    unsafe { *(scratch as uint32) -> w32 }
+    u64 w = w32
+    u64 sign = w & 0x80000000
+    // |f| via masking off the sign bit.
+    u32 absf_bits = w32 & 0x7FFFFFFF
+    unsafe { *(scratch as uint32) = absf_bits }
+    f32 absf = 0.0f
+    unsafe { *(scratch as f32) -> absf }
+    f32 base = (absf * scale_to_inf) * scale_to_zero
+    u64 shl1_w = (w + w) & 0xFFFFFFFF
+    u64 bias = shl1_w & 0xFF000000
+    if bias < 0x71000000 { bias = 0x71000000 }
+    // Compute fp32_from_bits((bias >> 1) + 0x07800000), add to base.
+    u32 b2 = (bias >> 1) + 0x07800000
+    unsafe { *(scratch as uint32) = b2 }
+    f32 b2f = 0.0f
+    unsafe { *(scratch as f32) -> b2f }
+    base = base + b2f
+    // base now holds the rounded f16 value in its f32 representation.
+    unsafe { *(scratch as f32) = base }
+    u32 bits32 = 0
+    unsafe { *(scratch as uint32) -> bits32 }
+    u64 bits = bits32
+    u64 exp_bits = (bits >> 13) & 0x00007C00
+    u64 mantissa_bits = bits & 0x00000FFF
+    u64 nonsign = exp_bits + mantissa_bits
+    u64 result = sign >> 16
+    if shl1_w > 0xFF000000 {
+        result = result | 0x7E00
+    } else {
+        result = result | nonsign
+    }
+    return result & 0xFFFF
+}
+
+// FP16 → FP32 (RNE-equivalent — bit-exact match with
+// ggml_compute_fp16_to_fp32). We already have gguf_f16_to_f32_exact in
+// std/gguf.mlr but it goes through a slightly different algorithm; this
+// inlined helper uses the same Maratyszcza scaling trick as the encoder
+// for symmetry. Both produce the same f32 for all f16 inputs (bit-exact).
+fn _q8q8_fp16_to_fp32(u64 h) -> f32 {
+    return gguf_f16_to_f32_exact(h)
+}
+
+// Round f32 to nearest int (half-away-from-zero, matching C99 `roundf`).
+// Uses cvttss2si (truncation) on x ± 0.5 to get half-away-from-zero.
+fn _q8q8_roundf_i32(f32 x) -> u64 {
+    f32 half = 0.5f
+    f32 nhalf = 0.0f - half
+    if x >= 0.0f {
+        f32 y = x + half
+        u64 i = f32_to_int(y)
+        return i
+    }
+    f32 y = x + nhalf
+    // f32_to_int truncates toward zero; for negative y it yields ceil(y).
+    u64 i = f32_to_int(y)
+    return i
+}
+
+// quantize_row_q8_0 — per 32-element block:
+//   amax = max(|x[j]|)
+//   d    = amax / 127.0
+//   id   = (d != 0) ? 1.0/d : 0.0
+//   block.d  = f16_rne(d)
+//   block.qs[j] = (int8) roundf(x[j] * id)
+fn quantize_row_q8_0(u64 out_ptr, u64 x_ptr, u64 k) {
+    u64 nb = k / 32
+    u64 i = 0
+    while i < nb {
+        u64 base_in  = x_ptr + i * 32 * 4
+        u64 base_out = out_ptr + i * 34
+        // amax = max |x|.
+        f32 amax = 0.0f
+        u64 j = 0
+        while j < 32 {
+            f32 v = 0.0f
+            unsafe { *((base_in + j * 4) as f32) -> v }
+            f32 av = v
+            if av < 0.0f { av = 0.0f - av }
+            if av > amax { amax = av }
+            j = j + 1
+        }
+        // d = amax / 127.0
+        f32 c127 = 127.0f
+        f32 d = amax / c127
+        // id = (d != 0) ? 1/d : 0
+        f32 id = 0.0f
+        if d != 0.0f {
+            f32 one = 1.0f
+            id = one / d
+        }
+        // Store f16 scale (RNE).
+        u64 d_f16 = _q8q8_fp32_to_fp16_rne(d)
+        u8 lo_b = d_f16 & 0xFF
+        u8 hi_b = (d_f16 >> 8) & 0xFF
+        store8(base_out + 0, lo_b)
+        store8(base_out + 1, hi_b)
+        // Store 32 int8 quantized samples.
+        j = 0
+        while j < 32 {
+            f32 v = 0.0f
+            unsafe { *((base_in + j * 4) as f32) -> v }
+            f32 q = v * id
+            u64 qi = _q8q8_roundf_i32(q)
+            // Mask to 8 bits — qi is signed in [-128, 127] but stored as
+            // u64 (sign-extended); & 0xFF gives the byte representation.
+            u8 qb = qi & 0xFF
+            store8(base_out + 2 + j, qb)
+            j = j + 1
+        }
+        i = i + 1
+    }
+}
+
+// Q8_0×Q8_0 worker — scalar reference. Loops over rows [start_n, end_n)
+// and for each row, sums all blocks: int32_dot * (d_w * d_x). Outputs
+// f32 to out_ptr[m * N + n]. Uses ctx slots:
+//   [0] out_ptr
+//   [8] x_q8 ptr (M * K/32 * 34 bytes — pre-quantized activation)
+//   [16] w_q8 ptr (N * K/32 * 34 bytes)
+//   [24] M
+//   [32] N
+//   [40] K
+fn mm_worker_q8_0_q8_0_f32_scalar(u64 start_n, u64 end_n, u64 ctx_ptr) {
+    u64 out_ptr = 0
+    unsafe { *(ctx_ptr as u64) -> out_ptr }
+    u64 xq_ptr = 0
+    unsafe { *((ctx_ptr + 8) as u64) -> xq_ptr }
+    u64 wq_ptr = 0
+    unsafe { *((ctx_ptr + 16) as u64) -> wq_ptr }
+    u64 M = 0
+    unsafe { *((ctx_ptr + 24) as u64) -> M }
+    u64 N = 0
+    unsafe { *((ctx_ptr + 32) as u64) -> N }
+    u64 K = 0
+    unsafe { *((ctx_ptr + 40) as u64) -> K }
+    // [48] = per-worker scratch (64 bytes, owned by mm_init). Use first 8
+    // bytes as two u32 slots for f16→f32 bit reinterprets so we don't race
+    // with peer workers on a shared static (gguf_f16_to_f32_exact is NOT
+    // thread-safe — its 4-byte scratch is a process-wide static).
+    u64 scratch_base = 0
+    unsafe { *((ctx_ptr + 48) as u64) -> scratch_base }
+    u64 dw_slot = scratch_base
+    u64 dx_slot = scratch_base + 4
+
+    u64 nb = K / 32
+    u64 row_bytes = nb * 34
+
+    u64 m = 0
+    while m < M {
+        u64 x_row = xq_ptr + m * row_bytes
+        u64 o_row = out_ptr + m * N * 4
+        u64 n = start_n
+        while n < end_n {
+            u64 w_row = wq_ptr + n * row_bytes
+            f32 sumf = 0.0f
+            u64 ib = 0
+            while ib < nb {
+                u64 wblk = w_row + ib * 34
+                u64 xblk = x_row + ib * 34
+                // Load f16 scales (16-bit LE) and decode inline. Real
+                // weight scales are always f16-normal in GGUF blobs (no
+                // subnormals/inf — GGUF rejects those at quantize time)
+                // so the fast normal-path branch covers everything.
+                u64 dw_lo = load8(wblk)
+                u64 dw_hi = load8(wblk + 1)
+                u64 dw_bits = dw_lo | (dw_hi << 8)
+                u64 dx_lo = load8(xblk)
+                u64 dx_hi = load8(xblk + 1)
+                u64 dx_bits = dx_lo | (dx_hi << 8)
+                // Inline f16→f32 (normal-path widen + sign apply). Same
+                // algorithm as gguf_f16_to_f32_exact, but writes to the
+                // per-worker scratch slot so we don't race.
+                f32 d_w = _q8q8_f16_decode(dw_bits, dw_slot)
+                f32 d_x = _q8q8_f16_decode(dx_bits, dx_slot)
+                // Integer dot of 32 int8 × int8 → int32. We accumulate
+                // into u64 (sign-extending each product) since MLRift's
+                // int arithmetic on u64 is two's complement.
+                u64 sumi = 0
+                u64 j = 0
+                while j < 32 {
+                    u64 wb = load8(wblk + 2 + j)
+                    u64 xb = load8(xblk + 2 + j)
+                    // Sign-extend to u64.
+                    if (wb & 0x80) != 0 { wb = wb | 0xFFFFFFFFFFFFFF00 }
+                    if (xb & 0x80) != 0 { xb = xb | 0xFFFFFFFFFFFFFF00 }
+                    u64 prod = wb * xb
+                    sumi = sumi + prod
+                    j = j + 1
+                }
+                // Convert sumi (signed in u64 two's-complement) to f32.
+                f64 sumi_f64 = int_to_f64(sumi)
+                f32 sumi_f = f64_to_f32(sumi_f64)
+                sumf = sumf + sumi_f * (d_w * d_x)
+                ib = ib + 1
+            }
+            unsafe { *((o_row + n * 4) as f32) = sumf }
+            n = n + 1
+        }
+        m = m + 1
+    }
+}
+
+// Per-worker thread-safe f16→f32. Same as gguf_f16_to_f32_exact's normal
+// path but writes the bit-reinterpret blob to the caller-owned 4-byte
+// `slot`, not a process-wide static. Subnormal / inf branches included for
+// completeness; in practice GGUF block scales are always f16-normal.
+fn _q8q8_f16_decode(u64 bits, u64 slot) -> f32 {
+    u64 sign = (bits >> 15) & 1
+    u64 exp  = (bits >> 10) & 0x1F
+    u64 mant = bits & 0x3FF
+    f32 result = 0.0f
+    if exp == 0 {
+        if mant == 0 {
+            result = 0.0f
+        } else {
+            // Subnormal: value = mant × 2^-24. f64-route avoids needing a
+            // second scratch slot for the constant 2^-24.
+            f64 mantd = int_to_f64(mant)
+            f64 denom = int_to_f64(16777216)
+            result = f64_to_f32(mantd / denom)
+        }
+    } else if exp == 31 {
+        result = 0.0f   // map inf/NaN → 0 (same as gguf_f16_to_f32_exact)
+    } else {
+        u64 fbits = ((exp + 112) << 23) | (mant << 13)
+        u32 bits32 = fbits
+        unsafe { *(slot as uint32) = bits32 }
+        unsafe { *(slot as f32) -> result }
+    }
+    if sign != 0 {
+        f32 neg = 0.0f - result
+        result = neg
+    }
+    return result
+}
+
+// Public entry: out[M, N] = x[M, K] · Wᵀ where W is Q8_0[N, K].
+// Quantizes the f32 activation to Q8_0 once (single-threaded — at decode
+// M=1, K≤8192, this is ~256 blocks, microseconds), then fans out the
+// row-loop across `num_workers` threads using the scalar Q8×Q8 worker.
+fn matmul_q8_0_q8_0_f32(u64 out_ptr, u64 x_ptr, u64 w_ptr,
+                        u64 M, u64 N, u64 K,
+                        u64 num_workers) {
+    if mm_ctx_base == 0 || num_workers > mm_max_workers {
+        mm_init(num_workers)
+    }
+    // Ensure activation Q8_0 scratch has room for M * K/32 * 34 bytes.
+    mm_q8q8_actq_reserve(M, K)
+    u64 xq_ptr = mm_q8q8_actq_buf
+    // Quantize each row of the activation. M is typically 1 (decode).
+    u64 m = 0
+    while m < M {
+        u64 row_bytes = (K / 32) * 34
+        quantize_row_q8_0(xq_ptr + m * row_bytes,
+                          x_ptr + m * K * 4,
+                          K)
+        m = m + 1
+    }
+    // Wire ctx slots — [8] now points at the quantized activation, not
+    // the raw f32 (other slots match the f32 path).
+    u64 w = 0
+    while w < num_workers {
+        u64 ctx_w = mm_ctx_base + w * 64
+        unsafe { *(ctx_w as u64) = out_ptr }
+        u64 p8 = ctx_w + 8
+        unsafe { *(p8 as u64) = xq_ptr }
+        u64 p16 = ctx_w + 16
+        unsafe { *(p16 as u64) = w_ptr }
+        u64 p24 = ctx_w + 24
+        unsafe { *(p24 as u64) = M }
+        u64 p32 = ctx_w + 32
+        unsafe { *(p32 as u64) = N }
+        u64 p40 = ctx_w + 40
+        unsafe { *(p40 as u64) = K }
+        w = w + 1
+    }
+    u64 fn_ptr = fn_addr("mm_worker_q8_0_q8_0_f32_scalar")
+    u64 chunk = N / num_workers
+    w = 0
+    while w + 1 < num_workers {
+        u64 start_n = w * chunk
+        u64 end_n   = start_n + chunk
+        u64 ctx_w = mm_ctx_base + w * 64
+        thread_pool_submit(w, fn_ptr, start_n, end_n, ctx_w)
+        w = w + 1
+    }
+    u64 main_start = (num_workers - 1) * chunk
+    u64 main_end   = N
+    u64 main_ctx   = mm_ctx_base + (num_workers - 1) * 64
+    mm_worker_q8_0_q8_0_f32_scalar(main_start, main_end, main_ctx)
+    thread_pool_wait()
+}

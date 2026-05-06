@@ -1,0 +1,68 @@
+// Quantizes two f32 vectors W and X (length K, multiple of 32) to Q8_0,
+// runs the bit-exact dot product, dumps the resulting f32 to disk.
+// Companion C tool /tmp/q8_ref does the same via ggml. They must match.
+import "../std/io.mlr"
+import "../std/matmul.mlr"
+
+fn main() {
+    u64 fd = file_open("/tmp/q8_dot_in.bin", 0)
+    if fd == 0 { print_str("open in fail\n"); exit(1) }
+    u64 nbuf = alloc(4)
+    if file_read(fd, nbuf, 4) != 4 { print_str("read N fail\n"); exit(1) }
+    u32 N32 = 0
+    unsafe { *(nbuf as uint32) -> N32 }
+    u64 N = N32
+    u64 nbytes = N * 4
+
+    u64 w_f32 = alloc(nbytes)
+    u64 x_f32 = alloc(nbytes)
+    if file_read(fd, w_f32, nbytes) != nbytes { print_str("read W fail\n"); exit(1) }
+    if file_read(fd, x_f32, nbytes) != nbytes { print_str("read X fail\n"); exit(1) }
+    file_close(fd)
+
+    u64 nb = N / 32
+    u64 row_bytes = nb * 34
+    u64 wq = alloc(row_bytes)
+    u64 xq = alloc(row_bytes)
+    quantize_row_q8_0(wq, w_f32, N)
+    quantize_row_q8_0(xq, x_f32, N)
+
+    // Manual dot using the same logic as the worker (single row).
+    f32 sumf = 0.0f
+    u64 ib = 0
+    while ib < nb {
+        u64 wblk = wq + ib * 34
+        u64 xblk = xq + ib * 34
+        u64 dw_lo = load8(wblk)
+        u64 dw_hi = load8(wblk + 1)
+        u64 dw_bits = dw_lo | (dw_hi << 8)
+        u64 dx_lo = load8(xblk)
+        u64 dx_hi = load8(xblk + 1)
+        u64 dx_bits = dx_lo | (dx_hi << 8)
+        f32 d_w = gguf_f16_to_f32_exact(dw_bits)
+        f32 d_x = gguf_f16_to_f32_exact(dx_bits)
+        u64 sumi = 0
+        u64 j = 0
+        while j < 32 {
+            u64 wb = load8(wblk + 2 + j)
+            u64 xb = load8(xblk + 2 + j)
+            if (wb & 0x80) != 0 { wb = wb | 0xFFFFFFFFFFFFFF00 }
+            if (xb & 0x80) != 0 { xb = xb | 0xFFFFFFFFFFFFFF00 }
+            u64 prod = wb * xb
+            sumi = sumi + prod
+            j = j + 1
+        }
+        f64 sumi_f64 = int_to_f64(sumi)
+        f32 sumi_f = f64_to_f32(sumi_f64)
+        sumf = sumf + sumi_f * (d_w * d_x)
+        ib = ib + 1
+    }
+
+    u64 fdo = file_open("/tmp/q8_dot_mlrift.bin", 1)
+    u64 sbuf = alloc(4)
+    unsafe { *(sbuf as f32) = sumf }
+    file_write(fdo, sbuf, 4)
+    file_close(fdo)
+    print_str("ok\n")
+    exit(0)
+}

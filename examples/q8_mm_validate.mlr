@@ -1,0 +1,48 @@
+// End-to-end validation of matmul_q8_0_q8_0_f32 against ggml.
+// Reads from /tmp/q8_mm_in.bin: int32 M, int32 N, int32 K, then K f32
+// activation, then N*K f32 weights. Runs:
+//   1. Quantize the weights to Q8_0 (using our own quantize_row_q8_0).
+//   2. Call matmul_q8_0_q8_0_f32(out, x, w_q8_0, M=1, N, K, num_workers).
+//   3. Write N f32 outputs to /tmp/q8_mm_mlrift.bin.
+import "../std/io.mlr"
+import "../std/matmul.mlr"
+import "../std/thread.mlr"
+
+fn main() {
+    thread_pool_init(24)
+
+    u64 fd = file_open("/tmp/q8_mm_in.bin", 0)
+    if fd == 0 { print_str("open in fail\n"); exit(1) }
+    u64 hdr = alloc(12)
+    if file_read(fd, hdr, 12) != 12 { print_str("read hdr fail\n"); exit(1) }
+    u32 M32 = 0; u32 N32 = 0; u32 K32 = 0
+    unsafe { *(hdr as uint32) -> M32 }
+    unsafe { *((hdr + 4) as uint32) -> N32 }
+    unsafe { *((hdr + 8) as uint32) -> K32 }
+    u64 M = M32; u64 N = N32; u64 K = K32
+
+    u64 x_f32 = alloc(M * K * 4)
+    u64 w_f32 = alloc(N * K * 4)
+    if file_read(fd, x_f32, M * K * 4) != M * K * 4 { print_str("read x fail\n"); exit(1) }
+    if file_read(fd, w_f32, N * K * 4) != N * K * 4 { print_str("read w fail\n"); exit(1) }
+    file_close(fd)
+
+    // Quantize weight rows to Q8_0.
+    u64 row_bytes = (K / 32) * 34
+    u64 w_q8 = alloc(N * row_bytes)
+    u64 n = 0
+    while n < N {
+        quantize_row_q8_0(w_q8 + n * row_bytes, w_f32 + n * K * 4, K)
+        n = n + 1
+    }
+
+    u64 out_buf = alloc(M * N * 4)
+    matmul_q8_0_q8_0_f32(out_buf, x_f32, w_q8, M, N, K, 24)
+
+    u64 fdo = file_open("/tmp/q8_mm_mlrift.bin", 1)
+    file_write(fdo, out_buf, M * N * 4)
+    file_close(fdo)
+    print_str("ok\n")
+    thread_pool_shutdown()
+    exit(0)
+}
