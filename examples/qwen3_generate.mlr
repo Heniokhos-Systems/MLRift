@@ -327,9 +327,9 @@ fn main() {
             eout("[qwen3_generate] spec_K > 1 requires batch_size = 1; got batch_size=")
             eu64(batch_size); eout("\n"); exit(1)
         }
-        if spec_K != 4 && spec_K != 8 {
+        if spec_K != 4 && spec_K != 8 && spec_K != 16 {
             eout("[qwen3_generate] spec_K = "); eu64(spec_K)
-            eout(" — only spec_K=4 or 8 supported (attn kernel grid hardcoded)\n"); exit(1)
+            eout(" — only spec_K=4, 8, or 16 supported (attn kernel grid hardcoded)\n"); exit(1)
         }
     }
     u64 M_eff = batch_size
@@ -746,8 +746,59 @@ fn main() {
                     }
                 }
             }
+            // Slice 4.18 — speck16 mega-kernel: spec_K=16 path.
+            // LDS cap: kernel only caches softmax weights for the first 64
+            // KV positions, so pos + M_eff must stay within 64.
+            u64 use_mks16 = 0
+            if is_spec != 0 {
+                if M_eff == 16 {
+                    if qwen3_megakernel_speck16_use() != 0 {
+                        if qwen3_megakernel_speck16_ready() != 0 {
+                            if hidden == 1024 {
+                                if pos + 16 <= 64 {
+                                    use_mks16 = 1
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             while layer < n_layers {
                 Qwen3LayerWeights w = layers_arr + layer * 88
+                if use_mks16 != 0 {
+                    u64 kc_l = k_cache + layer * batch_stride
+                    u64 vc_l = v_cache + layer * batch_stride
+                    if qwen3_forward_layer_megakernel_speck16_gpu(
+                            d_in_arr, d_out_arr, w, pos, kc_l, vc_l, layer) != 0 { exit(1) }
+                    // Ping-pong pointers (same as mks8 path).
+                    u64 b_sw16 = 0
+                    while b_sw16 < M_eff {
+                        u64 di = 0; unsafe { *((d_in_arr   + b_sw16 * 8) as u64) -> di }
+                        u64 do_ = 0; unsafe { *((d_out_arr  + b_sw16 * 8) as u64) -> do_ }
+                        u64 dih = 0; unsafe { *((d_in_h_arr + b_sw16 * 8) as u64) -> dih }
+                        u64 doh = 0
+                        if do_ != 0 {
+                            u64 b_lk = 0
+                            while b_lk < M_eff {
+                                u64 dxa  = 0; unsafe { *((d_x_a_arr   + b_lk * 8) as u64) -> dxa }
+                                u64 dxah = 0; unsafe { *((d_x_a_h_arr + b_lk * 8) as u64) -> dxah }
+                                u64 dxb  = 0; unsafe { *((d_x_b_arr   + b_lk * 8) as u64) -> dxb }
+                                u64 dxbh = 0; unsafe { *((d_x_b_h_arr + b_lk * 8) as u64) -> dxbh }
+                                if b_lk == b_sw16 {
+                                    if do_ == dxa { doh = dxah }
+                                    if do_ == dxb { doh = dxbh }
+                                }
+                                b_lk = b_lk + 1
+                            }
+                        }
+                        unsafe { *((d_in_arr   + b_sw16 * 8) as u64) = do_ }
+                        unsafe { *((d_out_arr  + b_sw16 * 8) as u64) = di }
+                        unsafe { *((d_in_h_arr + b_sw16 * 8) as u64) = doh }
+                        b_sw16 = b_sw16 + 1
+                    }
+                    layer = layer + 1
+                    continue
+                }
                 if use_mks8 != 0 {
                     u64 kc_l = k_cache + layer * batch_stride
                     u64 vc_l = v_cache + layer * batch_stride

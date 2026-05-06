@@ -1230,6 +1230,26 @@ static u64 _gpuq_mks8_env_init         = 0
 static u64 _gpuq_mks8_use              = 0
 static u64 _gpuq_mks8_rope_cache_pos   = 0xFFFFFFFFFFFFFFFF
 
+// Slice 4.18 mega-kernel speck16 scratch slabs (M_EFF=16 packed).
+static u64 _gpuq_d_mks16_in_resid      = 0   // [16, hidden]
+static u64 _gpuq_d_mks16_in_resid_h    = 0
+static u64 _gpuq_d_mks16_out_resid     = 0   // [16, hidden]
+static u64 _gpuq_d_mks16_out_resid_h   = 0
+static u64 _gpuq_d_mks16_b_x_norm_g    = 0
+static u64 _gpuq_d_mks16_b_qkv_g       = 0
+static u64 _gpuq_d_mks16_b_attn_q_g    = 0
+static u64 _gpuq_d_mks16_b_mid_g       = 0
+static u64 _gpuq_d_mks16_b_mid_norm_g  = 0
+static u64 _gpuq_d_mks16_b_attn_out_g  = 0
+static u64 _gpuq_d_mks16_gu_scratch    = 0
+static u64 _gpuq_d_mks16_rope_cos      = 0   // [16, head_dim/2]
+static u64 _gpuq_d_mks16_rope_cos_h    = 0
+static u64 _gpuq_d_mks16_rope_sin      = 0   // [16, head_dim/2]
+static u64 _gpuq_d_mks16_rope_sin_h    = 0
+static u64 _gpuq_mks16_env_init        = 0
+static u64 _gpuq_mks16_use             = 0
+static u64 _gpuq_mks16_rope_cache_pos  = 0xFFFFFFFFFFFFFFFF
+
 @export
 fn qwen3_gpu_set_kv_cache_dev(u64 k_dev_base, u64 v_dev_base,
                                u64 layer_stride, u64 batch_size) {
@@ -1354,6 +1374,33 @@ fn _qwen3_gpu_pipeline_init() -> u64 {
     _gpuq_d_mks8_rope_sin       = gpu_buf_reserve(mks8_M * (QWEN3_HEAD_DIM / 2) * 4, 0)
     if _gpuq_d_mks8_rope_sin != 0 {
         _gpuq_d_mks8_rope_sin_h = dev_host_ptr(_gpuq_d_mks8_rope_sin)
+    }
+
+    // Slice 4.18 mega-kernel speck16 scratch slabs (M_EFF=16).  Same shape
+    // as the speck8 slabs but ×16 the M=1 size (or ×2 the speck8 size).
+    u64 mks16_M = 16
+    _gpuq_d_mks16_in_resid       = gpu_buf_reserve(mks16_M * hidden * 4, 0)
+    if _gpuq_d_mks16_in_resid != 0 {
+        _gpuq_d_mks16_in_resid_h = dev_host_ptr(_gpuq_d_mks16_in_resid)
+    }
+    _gpuq_d_mks16_out_resid      = gpu_buf_reserve(mks16_M * hidden * 4, 0)
+    if _gpuq_d_mks16_out_resid != 0 {
+        _gpuq_d_mks16_out_resid_h = dev_host_ptr(_gpuq_d_mks16_out_resid)
+    }
+    _gpuq_d_mks16_b_x_norm_g     = gpu_buf_reserve(mks16_M * hidden  * 4, 0)
+    _gpuq_d_mks16_b_qkv_g        = gpu_buf_reserve(mks16_M * qkv_dim * 4, 0)
+    _gpuq_d_mks16_b_attn_q_g     = gpu_buf_reserve(mks16_M * q_dim   * 4, 0)
+    _gpuq_d_mks16_b_mid_g        = gpu_buf_reserve(mks16_M * hidden  * 4, 0)
+    _gpuq_d_mks16_b_mid_norm_g   = gpu_buf_reserve(mks16_M * hidden  * 4, 0)
+    _gpuq_d_mks16_b_attn_out_g   = gpu_buf_reserve(mks16_M * q_dim   * 4, 0)
+    _gpuq_d_mks16_gu_scratch     = gpu_buf_reserve(mks16_M * 2 * ff  * 4, 0)
+    _gpuq_d_mks16_rope_cos       = gpu_buf_reserve(mks16_M * (QWEN3_HEAD_DIM / 2) * 4, 0)
+    if _gpuq_d_mks16_rope_cos != 0 {
+        _gpuq_d_mks16_rope_cos_h = dev_host_ptr(_gpuq_d_mks16_rope_cos)
+    }
+    _gpuq_d_mks16_rope_sin       = gpu_buf_reserve(mks16_M * (QWEN3_HEAD_DIM / 2) * 4, 0)
+    if _gpuq_d_mks16_rope_sin != 0 {
+        _gpuq_d_mks16_rope_sin_h = dev_host_ptr(_gpuq_d_mks16_rope_sin)
     }
 
     if _gpuq_d_x_norm == 0 { return 0 }
@@ -2194,6 +2241,143 @@ fn qwen3_forward_layer_megakernel_speck8_gpu(
             memcpy(h_out_m, src_h, hidden * 4)
         } else {
             u32 cer2 = hipMemcpy(d_out_m, _gpuq_d_mks8_out_resid + m2 * hidden * 4,
+                                   hidden * 4, 3)
+            if cer2 != 0 { return 1 }
+        }
+        m2 = m2 + 1
+    }
+
+    return 0
+}
+
+// Slice 4.18 — env probe + wrapper for the M_EFF=16 mega-kernel.
+@export
+fn qwen3_megakernel_speck16_use() -> u64 {
+    if _gpuq_mks16_env_init == 0 {
+        _gpuq_mks16_env_init = 1
+        u64 ev = getenv("MLRIFT_QWEN3_MEGAKERNEL_SPECK16")
+        if ev != 0 {
+            u8 c0 = 0; unsafe { *(ev as u8) -> c0 }
+            if c0 != 48 { _gpuq_mks16_use = 1 }
+        }
+    }
+    return _gpuq_mks16_use
+}
+
+@export
+fn qwen3_megakernel_speck16_ready() -> u64 {
+    if _qwen3_gpu_pipeline_init() == 0 { return 0 }
+    if gpu_qwen3_megakernel_speck16_ready() == 0 { return 0 }
+    if _gpuq_d_mks16_in_resid == 0 { return 0 }
+    if _gpuq_d_mks16_in_resid_h == 0 { return 0 }
+    if _gpuq_d_mks16_out_resid == 0 { return 0 }
+    if _gpuq_d_mks16_out_resid_h == 0 { return 0 }
+    if _gpuq_d_megak_barrier_ctr == 0 { return 0 }
+    if _gpuq_d_mks16_rope_cos_h == 0 { return 0 }
+    if _gpuq_d_mks16_rope_sin_h == 0 { return 0 }
+    return 1
+}
+
+// Run ONE layer of qwen3 via the M_EFF=16 mega-kernel.
+@export
+fn qwen3_forward_layer_megakernel_speck16_gpu(
+        u64 d_in_arr, u64 d_out_arr,
+        Qwen3LayerWeights w, u64 pos_base,
+        u64 k_cache_layer, u64 v_cache_layer,
+        u64 layer_idx_hint) -> u64 {
+    if _qwen3_gpu_pipeline_init() == 0 { return 1 }
+    if qwen3_megakernel_speck16_ready() == 0 { return 1 }
+
+    u64 hidden  = QWEN3_HIDDEN
+    u64 hd      = QWEN3_HEAD_DIM
+    u64 q_dim   = QWEN3_Q_DIM
+    u64 kv_dim  = QWEN3_KV_DIM
+    u64 ff      = QWEN3_INTERMEDIATE
+    u64 qkv_dim = q_dim + 2 * kv_dim
+    u64 M_EFF   = 16
+
+    u64 m = 0
+    while m < M_EFF {
+        u64 d_in_m = 0; unsafe { *((d_in_arr + m * 8) as u64) -> d_in_m }
+        u64 h_in_m = dev_host_ptr(d_in_m)
+        u64 dst_h = _gpuq_d_mks16_in_resid_h + m * hidden * 4
+        if h_in_m != 0 {
+            memcpy(dst_h, h_in_m, hidden * 4)
+        } else {
+            u32 cer = hipMemcpy(_gpuq_d_mks16_in_resid + m * hidden * 4,
+                                  d_in_m, hidden * 4, 3)
+            if cer != 0 { return 1 }
+        }
+        m = m + 1
+    }
+
+    u64 d_qkv_w = gpu_get_or_upload_bf16_weight_padded(w.q_proj_w, hidden, qkv_dim, 1152)
+    if d_qkv_w == 0 { return 1 }
+    u64 d_o_w = gpu_get_or_upload_bf16_weight_padded(w.o_proj_w, q_dim, hidden, 2176)
+    if d_o_w == 0 { return 1 }
+    u64 d_gate_up_w = gpu_get_or_upload_bf16_weight_padded(w.gate_proj_w, hidden, 2 * ff, 1152)
+    if d_gate_up_w == 0 { return 1 }
+    u64 d_down_w = gpu_get_or_upload_bf16_weight_padded(w.down_proj_w, ff, hidden, 3200)
+    if d_down_w == 0 { return 1 }
+
+    u64 d_in_gamma   = gpu_cache_bf16_as_f32(w.input_norm_w, hidden)
+    if d_in_gamma == 0 { return 1 }
+    u64 d_post_gamma = gpu_cache_bf16_as_f32(w.post_norm_w, hidden)
+    if d_post_gamma == 0 { return 1 }
+    u64 d_q_gamma    = gpu_cache_bf16_as_f32(w.q_norm_w, hd)
+    if d_q_gamma == 0 { return 1 }
+    u64 d_k_gamma    = gpu_cache_bf16_as_f32(w.k_norm_w, hd)
+    if d_k_gamma == 0 { return 1 }
+
+    if _gpuq_mks16_rope_cache_pos != pos_base {
+        f64 theta = 1000000.0
+        u64 mm = 0
+        while mm < M_EFF {
+            u64 c_h = _gpuq_d_mks16_rope_cos_h + mm * (hd / 2) * 4
+            u64 s_h = _gpuq_d_mks16_rope_sin_h + mm * (hd / 2) * 4
+            qwen3_rope_compute(c_h, s_h, pos_base + mm, hd, theta)
+            mm = mm + 1
+        }
+        _gpuq_mks16_rope_cache_pos = pos_base
+    }
+
+    u64 d_kc_layer = 0
+    u64 d_vc_layer = 0
+    if _gpuq_kv_k_dev_base != 0 && _gpuq_kv_v_dev_base != 0 {
+        u64 host_base = dev_host_ptr(_gpuq_kv_k_dev_base)
+        u64 layer_idx = (k_cache_layer - host_base) / _gpuq_kv_batch_stride
+        d_kc_layer = _gpuq_kv_k_dev_base + layer_idx * _gpuq_kv_batch_stride
+        d_vc_layer = _gpuq_kv_v_dev_base + layer_idx * _gpuq_kv_batch_stride
+    }
+    if d_kc_layer == 0 || d_vc_layer == 0 { return 1 }
+
+    u64 max_phase = 7
+    if gpu_qwen3_layer_megakernel_speck16_to_dev(
+            _gpuq_d_mks16_in_resid, _gpuq_d_mks16_out_resid,
+            d_qkv_w, d_o_w, d_gate_up_w, d_down_w,
+            d_in_gamma, d_post_gamma, d_q_gamma, d_k_gamma,
+            _gpuq_d_mks16_rope_cos, _gpuq_d_mks16_rope_sin,
+            d_kc_layer, d_vc_layer,
+            pos_base,
+            _gpuq_d_megak_barrier_ctr, _gpuq_d_megak_barrier_h,
+            _gpuq_d_mks16_gu_scratch,
+            _gpuq_d_mks16_b_x_norm_g, _gpuq_d_mks16_b_qkv_g,
+            _gpuq_d_mks16_b_attn_q_g, _gpuq_d_mks16_b_mid_g,
+            _gpuq_d_mks16_b_mid_norm_g, _gpuq_d_mks16_b_attn_out_g,
+            max_phase) != 0 {
+        return 1
+    }
+    gpu_pipeline_flush()
+
+    u64 m2 = 0
+    while m2 < M_EFF {
+        u64 d_out_m = 0; unsafe { *((d_out_arr + m2 * 8) as u64) -> d_out_m }
+        u64 h_out_m = dev_host_ptr(d_out_m)
+        u64 src_h = _gpuq_d_mks16_out_resid_h + m2 * hidden * 4
+        if h_out_m != 0 {
+            memcpy(h_out_m, src_h, hidden * 4)
+        } else {
+            u32 cer2 = hipMemcpy(d_out_m, _gpuq_d_mks16_out_resid + m2 * hidden * 4,
                                    hidden * 4, 3)
             if cer2 != 0 { return 1 }
         }
