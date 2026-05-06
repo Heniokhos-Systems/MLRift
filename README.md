@@ -91,7 +91,9 @@ Token-id output of every MLRift row is bit-identical to HuggingFace
 | **MLRift `--target=amdgpu-native` + `MLRIFT_GPU_FULL_FORWARD=1`** | bf16 / f32 | **55.4** | 1 920 | **1.33× vs ROCm fp32** |
 | **+ `MLRIFT_GPU_FLUSH_EVERY_N=28`** (slice 2 — drop per-layer sync) | bf16 / f32 | **60.4** | 1 920 | **1.45× vs ROCm fp32** |
 | **+ slice 2b** (fused `residual_rmsnorm` mid-layer + cross-layer) | bf16 / f32 | **61.4** | 1 920 | **1.48× vs ROCm fp32** |
-| **+ `MLRIFT_GPU_MATMUL_BF16=0`** (slice 3 — pure fp32 weights) | f32 / f32 | **59.1** | 2 480 | **1.42× vs ROCm fp32** |
+| **+ `MLRIFT_GPU_MATMUL_BF16=0`** (slice 3 — pure fp32 weights) | f32 / f32 | **56.1** | 2 480 | **1.35× vs ROCm fp32** |
+| **+ slice 2c** (fused `qknorm + rope_qk`) | bf16 / f32 | **69.9** | 1 920 | **0.95× vs ROCm bf16** |
+| **+ `MLRIFT_QWEN3_MEGAKERNEL=1`** (slice 4 — one dispatch per layer; mega-kernel slices 4.10–4.13) | bf16 / f32 | **88.0** | 2 010 | **1.19× vs ROCm bf16** |
 | **MLRift + `GPU_FULL_FORWARD` + `SPEC_K=4` + LONG-prompt (PLD)** | bf16 / f32 | **87.5** | 1 920 | **1.19× vs ROCm bf16** |
 
 The matmul-only rows route only the matmul + lm_head through native
@@ -102,6 +104,14 @@ ROCm fp32 by 33 % at honest single-stream decode**, bit-identical
 output.  The PLD row uses a synthetic prefill that the prefix-lookup
 draft proposer hits at ~2 tok/step accept; **beats ROCm bf16 by 19 %**
 on that workload.
+
+The **mega-kernel** (`MLRIFT_QWEN3_MEGAKERNEL=1`) collapses the 28-layer
+chain into one dispatch per layer (29 launches/token vs the per-op chain's
+310) and lands at **88.0 tok/s — +19 % over PyTorch ROCm bf16 on fp32
+weights**, bit-identical to the reference.  See
+[`docs/SLICE4_MEGAKERNEL_DESIGN.md`](docs/SLICE4_MEGAKERNEL_DESIGN.md)
+for the slice 4.10–4.13 progression (WG bump → cooperative phase 7
+→ vectorised bf16x2 loads → channel-repacked padded rows).
 
 **Dtype clarification.** All MLRift rows above use `bf16 weights /
 f32 compute` — weights stream from VRAM as bf16 and widen to f32
@@ -140,26 +150,26 @@ Roadmap to extend the lead, ranked by ceiling:
 | 2b. ✅ Fused `residual_rmsnorm` (mid + cross-layer) | 56 launches/token saved | **61.4** | **1.48× ROCm fp32** |
 | 3. ✅ **Pure fp32 path** (`MLRIFT_GPU_MATMUL_BF16=0`) | f32 weight VRAM, f32 GEMM accum (apples-to-apples vs ROCm fp32) | **59.1** | **1.42× ROCm fp32** |
 | 2c. ✅ Fused `qknorm + rope_qk` (Q+K heads in one launch) | 1 dispatch replaces qknorm Q + qknorm K + rope Q + rope K; 366 → 310 launches/step (−56 = −2/layer × 28); 143 dwords gfx1100 ISA, smoke-test bit-exact, end-to-end PyTorch parity | **63.2** | **1.52× ROCm fp32** |
-| 4. **Mega-kernel** (one dispatch per layer; collapses ~15 ops) — design + measurement complete, see [`docs/SLICE4_MEGAKERNEL_DESIGN.md`](docs/SLICE4_MEGAKERNEL_DESIGN.md) | 366 → ~29 dispatches/token; saves 9 ms of launch overhead | **143 (projected)** | **1.94× ROCm bf16** |
+| 4.8 ✅ **Mega-kernel wire-up** (one dispatch per layer; collapses 15 ops into 1) | 310 → 29 launches/token; baseline at WG=64 | 18.9 | 0.46× ROCm fp32 |
+| 4.10 ✅ WG_PERSIST 64 → 512 (recover gemv_coop row parallelism) | 8× wider WG fan-out for matmul phases | **46.0** | **1.10× ROCm fp32** |
+| 4.11 ✅ Cooperative phase 7 (ATTN_COOP=4) + cached softmax LDS + dropped trailing fence | 4 WGs/head, 32-dim/lane pass 3; weights cached, no Q·K redo; mega ≈ per-op | **54.1** | **1.30× ROCm fp32** |
+| 4.12 ✅ bf16x2 packed matmul loads (`u32 = 2 bf16`) | halves matmul VMEM count, +20 % | **64.9** | **0.88× ROCm bf16** |
+| **4.13 ✅** **Channel-repacked padded weights (HIDDEN_PAD=1152, Q_DIM_PAD=2176, FF_PAD=3200)** | break GDDR6 16-channel × 256 B cycle so consecutive rows hit distinct channels (was 2/16 → now 16/16) | **88.0** | **1.19× ROCm bf16** |
 | 4b. WMMA bf16 GEMV through `gpu_matmul` (M ≥ 4) | 2× on prefill / spec_K matmuls (gfx1100 tensor cores) | 100–120 PLD | 1.4–1.6× ROCm bf16 |
 
-WMMA at honest M=1 decode is dropped from the critical path: profile
-shows we're now **launch-overhead bound**, not ALU-bound (310 launches
-× ~24 µs ≈ 7.4 ms/step after slice 2c; only 2.3 ms is sync wait).
-WMMA accelerates ALU on a workload that's bandwidth-bound — no help
-at M=1.  It still matters for prefill / `SPEC_K=4` mode where M_eff ≥
-4 hits the tensor core efficiently.
+WMMA at honest M=1 decode remains off the single-stream critical
+path: at slice 4.13 we are **bandwidth-bound on the matmul k-loop
+VMEM**, not ALU-bound, even after channel repacking.  WMMA still
+matters for prefill / `SPEC_K=4` mode where M_eff ≥ 4 hits the
+tensor core efficiently — see slice 4b.
 
-Single-stream **bf16 win** has to come from launch-count reduction
-(slice 4 mega-kernel).  The mega-kernel collapses the 15-op layer
-into 1 dispatch — saves ~14 launches/layer × 28 layers × ~10 µs =
-3.9 ms/token, taking step time from 10 ms → 6 ms ≈ 165 tok/s ceiling.
-
-Memory roofline on this card (624 GB/s ÷ 600 MB bf16 weights) is
-≈1 040 tok/s; we are at **6 % single-stream / 8 % with PLD** today,
-ROCm bf16 is at 7 %.  Nothing here is blocked on hardware.  Tracking
-as tasks #178–#181 with the full methodology and per-slice notes in
-`project_destroy_pytorch_roadmap.md`.
+Memory roofline on this card (624 GB/s ÷ ~880 MB bf16 weights/token)
+is ≈ 700 tok/s.  We are at **13 % single-stream** today (slice 4.13
+at 88 tok/s); PyTorch ROCm bf16 is at ~10 %.  Nothing here is blocked
+on hardware.  Tracking as tasks #178–#181 with the full methodology
+and per-slice notes in `project_destroy_pytorch_roadmap.md` and the
+mega-kernel slice 4.10–4.13 progression in
+[`docs/SLICE4_MEGAKERNEL_DESIGN.md`](docs/SLICE4_MEGAKERNEL_DESIGN.md).
 
 ### Pure fp32 win — fully apples-to-apples vs PyTorch ROCm fp32
 

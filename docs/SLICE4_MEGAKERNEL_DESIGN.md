@@ -869,11 +869,138 @@ overhead reduction is empirically realized.
 **Slice 4 status:**
 - 4.1-4.7 ✓ (barrier, native skeleton, 7-phase HIP, LDS root
   cause + global-scratch fix, bit-equivalence GREEN)
-- 4.8 ✓ **wire-up GREEN, tokens bit-identical to PyTorch**
-- 4.9: end-to-end tok/s bench on an idle GPU (the launch-saving
-  win expected here; current measurement under user's concurrent
-  GPU workload not interpretable).
-- 4.10: native ISA bytewise port from hipcc disasm.
+- 4.8 ✓ **wire-up GREEN, tokens bit-identical to PyTorch** (18.9 tok/s baseline)
+- 4.10–4.13 ✓ **88.0 tok/s, +19 % over PyTorch ROCm bf16 on fp32 weights**
 
-The mega-kernel is now an opt-in path in production qwen3 inference.
-Throughput validation pending an idle-GPU window.
+## Slices 4.10–4.13 — closing the per-op gap and breaking past PyTorch bf16
+
+Slice 4.8 landed correct but slow: idle-GPU bench showed 18.9 tok/s
+vs the per-op baseline of 54.7.  Five subsequent slices moved the
+mega-kernel from 18.9 → 88.0 tok/s (4.65×) — **+19 % over PyTorch
+ROCm bf16 (~74 tok/s) on fp32 weights**, fully bit-identical.
+
+| Slice | unlock | tok/s | step ms |
+|---|---|---:|---:|
+| HEAD slice 4.8 | wired in but WG=64, single barrier counter | 18.9 | 52 |
+| 4.10 | WG_PERSIST 64 → 512 (recover gemv_coop row parallelism) | 46.0 | 21 |
+| 4.11 | cooperative phase-7 (ATTN_COOP=4) + cached softmax in LDS + dropped trailing `__threadfence` | 54.1 | 18 |
+| 4.12 | bf16x2 vectorised matmul loads (read u32 = 2 bf16, halves VMEM count) | 64.9 | 15 |
+| **4.13** | **channel-repacked padded weights (HIDDEN_PAD=1152, Q_DIM_PAD=2176, FF_PAD=3200)** | **88.0** | **11** |
+
+### 4.10 — WG_PERSIST 64 → 512
+
+The slice 4.8 grid was 64 wave-WGs.  Per-op `gemv_coop` launches at
+`grid_x = N rows` (4 096–6 144 wave-WGs), saturating all 240 SIMDs;
+the mega-kernel left 73 % of the GPU idle.  Bumping `WG_PERSIST` to
+512 spread matmul rows 8× wider.  Higher (1 024 / 2 048) regressed:
+1024 hits atomic-counter contention, ≥ 2 048 deadlocks because not
+all WGs run concurrently on RX 7800 XT (occupancy cap ~1 500 wave-WGs).
+
+### 4.11 — cooperative phase 7 + cached softmax + fence drop
+
+Phase 7 (`attn_decode`) used 16 of 512 WGs (one per Q head).
+Cooperative redesign: 16 heads × 4 cooperating WGs split HEAD_DIM=128
+output dims (32 dims, 1 lane each).  Pass 2 caches softmax weights
+in `attn_w_lds[64]` so pass 3 skips the redundant Q·K dot product
+(was 128× per head per t).  Trailing `__threadfence()` in
+`mega_barrier` dropped — leading fence already orders writer stores;
+ACQUIRE on the counter load orders later loads.
+
+### 4.12 — bf16x2 vectorised loads
+
+Clang/HIP was emitting `buffer_load_ushort` per element in the matmul
+k-loop.  Hand-pack two bf16 weights as a `u32` and unpack to two f32
+FMAs:
+
+```cpp
+const unsigned int *w_row_u32 = reinterpret_cast<const unsigned int *>(qkv_w + row * HIDDEN);
+for (unsigned int kp = lane; kp < HIDDEN / 2; kp += WAVE) {
+    unsigned int packed = w_row_u32[kp];
+    unsigned int k = kp * 2;
+    float w0 = bf16_to_f32((unsigned short)(packed & 0xFFFFu));
+    float w1 = bf16_to_f32((unsigned short)(packed >> 16));
+    acc += w0 * x[k] + w1 * x[k + 1];
+}
+```
+
+Halves the matmul VMEM instruction count.  Effective DRAM bandwidth
+~50 % → ~62 % of peak.  +20 % tok/s.  Mega first beats per-op here.
+
+### 4.13 — channel-repacked padded weights
+
+Bandwidth math:
+
+```
+RX 7800 XT GDDR6: 16 channels × ~256 B stripe = 4096 B channel cycle
+Naive bf16 weight rows:
+  qkv_w     row = 1024 ushort = 2048 B  → gcd(2048,4096) = 2048 → only 2 distinct row-start channels
+  o_proj    row = 2048 ushort = 4096 B  → gcd(4096,4096) = 4096 → only 1 distinct channel
+  gate_up   row = 1024 ushort = 2048 B  → 2 channels
+  down      row = 3072 ushort = 6144 B  → 2 channels
+```
+
+Concurrent WGs reading consecutive rows banged on the same 1–2 of 16
+channels, capping aggregate bandwidth at ~12.5 % of peak.  Fix: pad
+each row by 128 ushorts (256 B) so `row_pad_bytes mod 4096 = 256`,
+distributing rows across all 16 channels:
+
+```
+HIDDEN_PAD = 1152 ushort (qkv, gate_up):  row=2304 B, gcd=256 → 16 channels
+Q_DIM_PAD  = 2176 ushort (o_proj):        row=4352 B, gcd=256 → 16 channels
+FF_PAD     = 3200 ushort (down):          row=6400 B, gcd=256 → 16 channels
+```
+
+Implementation: parallel padded-row bf16 cache in `std/inference_gpu.mlr`
+(`_gpu_mm_get_or_upload_bf16_padded`), allocated once per (host_ptr,
+K_pad).  CPU-side strided fill into a host pad buffer + ONE bulk
+hipMemcpy (vs ~140 k per-row syncs which would dominate cold-start
+at ~1.4 s).  `qwen3_forward_layer_gpu`'s mega-kernel branch swaps in
+the `_padded` variant for all four matmuls; the kernel uses the
+`*_PAD` constants as the row-stride multiplier in phases 3/9/13/17.
+
+`examples/qwen3_generate.mlr` adds a pre-decode warmup pass that
+walks every layer and triggers the padded uploader BEFORE
+`decode_start_ns`.  Without it, first inference's per-step time is
+dominated by 28 layers × 4 matmul cold-start uploads (~3 s).
+
+Memory cost: ~12.5 % larger weight slabs (per-layer 31.5 → 34.6 MB,
+total 880 → 970 MB).  Per-op caches are unchanged.
+
+**Final bench (3-run median, RX 7800 XT, qwen3-0.6B, bf16 weights /
+fp32 compute, 20 new tokens, default seed):**
+
+```
+mega slice 4.13      :  88.0 tok/s   [tokens bit-identical to PyTorch]
+per-op bf16          :  69.9 tok/s
+per-op pure fp32     :  56.1 tok/s
+PyTorch ROCm bf16    :  ~74  tok/s   →  mega is +19 %
+PyTorch ROCm fp32    :  41   tok/s   →  mega is +115 %
+```
+
+### What didn't work (explicit negative results)
+
+Recorded so future slices don't redo them:
+- **Persistent counter** (slice 4.9): cross-layer L0/L1 cache coherence
+  on RDNA3 isn't guaranteed by AQL ordering alone; tokens diverged.
+  Reverted.
+- **Partitioned-counter barrier** (32 slots, hashed by wg_id):
+  at WG=512 the single-counter atomic isn't the bottleneck;
+  partitioning costs sequential master polls.  Neutral.
+- **Phase 13+15 fusion** (gate_up + silu_mul, "Idea G"): interleaved
+  gate/up VMEM rows hurt coalescing.  −4 tok/s.  Reverted.
+- **Phase 1+3 / 11+13 fusion + per-WG `xs[32]` register-stash**: wins
+  on a slice-4.8 base but interacts badly with slice 4.11's phase-7
+  LDS / VGPR pressure.  Net −2 tok/s when stacked.
+- **`__builtin_prefetch`** in HIP source: clang doesn't lower it for
+  AMDGPU; sequential VMEM is auto-prefetched by the GPU front-end.
+  No effect.
+
+### Outstanding follow-ups
+- AB harness (`qwen3_layer_megakernel_ab.mlr`) still allocates
+  unpadded buffers; padded-row layout makes it OOB-read.  Update
+  needed: strided LCG fill into K_pad-stride rows.  Smoke is already
+  padded.
+- Per-op `gemv_coop_bf16` doesn't use padded layout.  Same trick
+  should lift per-op proportionally (currently 69.9 tok/s).
+- Cold-start uploader is row-by-row CPU memcpy → bulk hipMemcpy.
+  `hipMemcpy2D` (not in the shim today) would skip the host stage.
