@@ -1,0 +1,237 @@
+// Slice 4.15 smoke test for qwen3_layer_megakernel_speck8 (M_EFF=8).
+// Same pattern as qwen3_layer_megakernel_smoke.mlr: zero-fill all
+// buffers and bisect-verify each phase counter increment.  Validates
+// kernarg layout + barrier protocol + LDS sizing for the M=8 variant.
+//
+// Build:
+//   hipcc --offload-arch=gfx1100 --genco -O3 \
+//       examples/llm/qwen3_layer_megakernel_speck8.hip.cpp \
+//       -o /tmp/qwen3_layer_megakernel_speck8.co
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native \
+//       examples/llm/qwen3_layer_megakernel_speck8_smoke.mlr \
+//       -o /tmp/megak_speck8_smoke
+// Run:
+//   /tmp/megak_speck8_smoke
+
+import "../../std/hip.mlr"
+import "../../std/time.mlr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn write(int32 fd, uint64 buf, uint64 n) -> int64
+@dynamic extern fn exit(uint64 code)
+
+fn u64_dec(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 { uint8 z = 48; unsafe { *(buf as uint8) = z }; return 1 }
+    uint64 n = 0; uint64 t = val
+    while t > 0 { n = n + 1; t = t / 10 }
+    uint64 i = n; t = val
+    while i > 0 {
+        i = i - 1
+        uint64 d = t - (t / 10) * 10
+        uint8 c = d + 48
+        uint64 p = buf + i; unsafe { *(p as uint8) = c }
+        t = t / 10
+    }
+    return n
+}
+fn put_kv(uint64 label, uint64 lab_len, uint64 v) {
+    uint64 buf = alloc(96)
+    uint64 i = 0
+    while i < lab_len {
+        uint64 sp = label + i; uint64 c = 0; unsafe { *(sp as uint8) -> c }
+        uint64 dp = buf + i; uint8 cb = c; unsafe { *(dp as uint8) = cb }
+        i = i + 1
+    }
+    uint64 sep_p = buf + lab_len; uint8 eq = 61; unsafe { *(sep_p as uint8) = eq }
+    uint64 num_p = buf + lab_len + 1
+    uint64 nl = u64_dec(v, num_p)
+    uint64 nul_p = buf + lab_len + 1 + nl; uint8 nul = 0; unsafe { *(nul_p as uint8) = nul }
+    puts(buf)
+}
+fn die(uint64 msg, uint64 code) { puts(msg); put_kv("err", 3, code); exit(1) }
+
+static uint64 HIDDEN     = 1024
+static uint64 HEAD_DIM   = 128
+static uint64 N_HEADS    = 16
+static uint64 N_KV_HEADS = 8
+static uint64 Q_DIM      = 2048
+static uint64 KV_DIM     = 1024
+static uint64 QKV_DIM    = 4096
+static uint64 FF         = 3072
+static uint64 WG_PERSIST = 512
+static uint64 MAX_SEQ    = 64
+static uint64 M_EFF      = 8
+
+fn main() {
+    uint32 err = hipSetDevice(0); if err != 0 { die("setDev", err) }
+
+    uint64 fd = file_open("/tmp/qwen3_layer_megakernel_speck8.co", 0)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        puts("missing /tmp/qwen3_layer_megakernel_speck8.co — build via:")
+        puts("  hipcc --offload-arch=gfx1100 --genco -O3 examples/llm/qwen3_layer_megakernel_speck8.hip.cpp -o /tmp/qwen3_layer_megakernel_speck8.co")
+        exit(1)
+    }
+    uint64 sz = file_size(fd); uint64 blob = alloc(sz)
+    file_read(fd, blob, sz); file_close(fd)
+    uint64 mod_slot = alloc(8)
+    err = hipModuleLoadData(mod_slot, blob); if err != 0 { die("LoadData", err) }
+    uint64 mod = 0; unsafe { *(mod_slot as uint64) -> mod }
+    uint64 fh_slot = alloc(8)
+    err = hipModuleGetFunction(fh_slot, mod, "qwen3_layer_megakernel_speck8")
+    if err != 0 { die("getFn", err) }
+    uint64 fh = 0; unsafe { *(fh_slot as uint64) -> fh }
+
+    uint64 in_resid     = 0
+    uint64 out_resid    = 0
+    uint64 qkv_w        = 0
+    uint64 o_w          = 0
+    uint64 gate_up_w    = 0
+    uint64 down_w       = 0
+    uint64 in_norm_g    = 0
+    uint64 post_norm_g  = 0
+    uint64 q_norm_g     = 0
+    uint64 k_norm_g     = 0
+    uint64 rope_cos     = 0
+    uint64 rope_sin     = 0
+    uint64 kc           = 0
+    uint64 vc           = 0
+    uint64 barrier_ctr  = 0
+    uint64 gu_scratch   = 0
+    uint64 b_x_norm_g   = 0
+    uint64 b_qkv_g      = 0
+    uint64 b_attn_q_g   = 0
+    uint64 b_mid_g      = 0
+    uint64 b_mid_norm_g = 0
+    uint64 b_attn_out_g = 0
+
+    uint64 slot = alloc(8)
+
+    // M_EFF-scaled scratch: each per-stream buffer is [M_EFF, ...].
+    err = hipMalloc(slot, M_EFF * HIDDEN * 4);            if err != 0 { die("a in_resid",    err) }; unsafe { *(slot as uint64) -> in_resid }
+    err = hipMalloc(slot, M_EFF * HIDDEN * 4);            if err != 0 { die("a out_resid",   err) }; unsafe { *(slot as uint64) -> out_resid }
+    err = hipMalloc(slot, QKV_DIM * 1152 * 2);            if err != 0 { die("a qkv_w",       err) }; unsafe { *(slot as uint64) -> qkv_w }
+    err = hipMalloc(slot, HIDDEN * 2176 * 2);             if err != 0 { die("a o_w",         err) }; unsafe { *(slot as uint64) -> o_w }
+    err = hipMalloc(slot, 2 * FF * 1152 * 2);             if err != 0 { die("a gate_up_w",   err) }; unsafe { *(slot as uint64) -> gate_up_w }
+    err = hipMalloc(slot, HIDDEN * 3200 * 2);             if err != 0 { die("a down_w",      err) }; unsafe { *(slot as uint64) -> down_w }
+    err = hipMalloc(slot, HIDDEN * 4);                    if err != 0 { die("a in_norm_g",   err) }; unsafe { *(slot as uint64) -> in_norm_g }
+    err = hipMalloc(slot, HIDDEN * 4);                    if err != 0 { die("a post_norm_g", err) }; unsafe { *(slot as uint64) -> post_norm_g }
+    err = hipMalloc(slot, HEAD_DIM * 4);                  if err != 0 { die("a q_norm_g",    err) }; unsafe { *(slot as uint64) -> q_norm_g }
+    err = hipMalloc(slot, HEAD_DIM * 4);                  if err != 0 { die("a k_norm_g",    err) }; unsafe { *(slot as uint64) -> k_norm_g }
+    err = hipMalloc(slot, M_EFF * (HEAD_DIM / 2) * 4);    if err != 0 { die("a rope_cos",    err) }; unsafe { *(slot as uint64) -> rope_cos }
+    err = hipMalloc(slot, M_EFF * (HEAD_DIM / 2) * 4);    if err != 0 { die("a rope_sin",    err) }; unsafe { *(slot as uint64) -> rope_sin }
+    err = hipMalloc(slot, MAX_SEQ * KV_DIM * 4);          if err != 0 { die("a kc",          err) }; unsafe { *(slot as uint64) -> kc }
+    err = hipMalloc(slot, MAX_SEQ * KV_DIM * 4);          if err != 0 { die("a vc",          err) }; unsafe { *(slot as uint64) -> vc }
+    err = hipMalloc(slot, 4);                             if err != 0 { die("a barrier",     err) }; unsafe { *(slot as uint64) -> barrier_ctr }
+    err = hipMalloc(slot, M_EFF * 2 * FF * 4);            if err != 0 { die("a gu_scratch",  err) }; unsafe { *(slot as uint64) -> gu_scratch }
+    err = hipMalloc(slot, M_EFF * HIDDEN * 4);            if err != 0 { die("a b_x_norm_g",  err) }; unsafe { *(slot as uint64) -> b_x_norm_g }
+    err = hipMalloc(slot, M_EFF * QKV_DIM * 4);           if err != 0 { die("a b_qkv_g",     err) }; unsafe { *(slot as uint64) -> b_qkv_g }
+    err = hipMalloc(slot, M_EFF * Q_DIM * 4);             if err != 0 { die("a b_attn_q_g",  err) }; unsafe { *(slot as uint64) -> b_attn_q_g }
+    err = hipMalloc(slot, M_EFF * HIDDEN * 4);            if err != 0 { die("a b_mid_g",     err) }; unsafe { *(slot as uint64) -> b_mid_g }
+    err = hipMalloc(slot, M_EFF * HIDDEN * 4);            if err != 0 { die("a b_mid_norm_g",err) }; unsafe { *(slot as uint64) -> b_mid_norm_g }
+    err = hipMalloc(slot, M_EFF * Q_DIM * 4);             if err != 0 { die("a b_attn_out_g",err) }; unsafe { *(slot as uint64) -> b_attn_out_g }
+
+    uint64 h_zero4 = alloc(4)
+    uint32 z32 = 0; unsafe { *(h_zero4 as uint32) = z32 }
+    err = hipMemcpy(barrier_ctr, h_zero4, 4, 1); if err != 0 { die("clear barrier", err) }
+
+    // Zero a large host scratch and use it for every device buffer.
+    uint64 max_w_bytes = 2 * FF * 1152 * 2   // gate_up_w padded ~14 MB
+    uint64 h_zeroW = alloc(max_w_bytes)
+    uint64 zwi = 0
+    while zwi < max_w_bytes { uint8 zb = 0; unsafe { *((h_zeroW + zwi) as uint8) = zb }; zwi = zwi + 1 }
+
+    err = hipMemcpy(in_resid,     h_zeroW, M_EFF * HIDDEN * 4, 1); if err != 0 { die("zero in_resid",     err) }
+    err = hipMemcpy(in_norm_g,    h_zeroW, HIDDEN * 4, 1); if err != 0 { die("zero in_norm_g",    err) }
+    err = hipMemcpy(post_norm_g,  h_zeroW, HIDDEN * 4, 1); if err != 0 { die("zero post_norm_g",  err) }
+    err = hipMemcpy(q_norm_g,     h_zeroW, HEAD_DIM * 4, 1); if err != 0 { die("zero q_norm_g",   err) }
+    err = hipMemcpy(k_norm_g,     h_zeroW, HEAD_DIM * 4, 1); if err != 0 { die("zero k_norm_g",   err) }
+    err = hipMemcpy(rope_cos,     h_zeroW, M_EFF * (HEAD_DIM/2) * 4, 1); if err != 0 { die("zero rope_cos", err) }
+    err = hipMemcpy(rope_sin,     h_zeroW, M_EFF * (HEAD_DIM/2) * 4, 1); if err != 0 { die("zero rope_sin", err) }
+    err = hipMemcpy(qkv_w,     h_zeroW, QKV_DIM * 1152 * 2, 1); if err != 0 { die("zero qkv_w",     err) }
+    err = hipMemcpy(o_w,       h_zeroW, HIDDEN * 2176 * 2,  1); if err != 0 { die("zero o_w",       err) }
+    err = hipMemcpy(gate_up_w, h_zeroW, 2 * FF * 1152 * 2,  1); if err != 0 { die("zero gate_up_w", err) }
+    err = hipMemcpy(down_w,    h_zeroW, HIDDEN * 3200 * 2,  1); if err != 0 { die("zero down_w",    err) }
+    err = hipMemcpy(b_x_norm_g,   h_zeroW, M_EFF * HIDDEN * 4,  1); if err != 0 { die("zero b_x_norm_g",   err) }
+    err = hipMemcpy(b_qkv_g,      h_zeroW, M_EFF * QKV_DIM * 4, 1); if err != 0 { die("zero b_qkv_g",      err) }
+    err = hipMemcpy(b_attn_q_g,   h_zeroW, M_EFF * Q_DIM * 4,   1); if err != 0 { die("zero b_attn_q_g",   err) }
+    err = hipMemcpy(b_mid_g,      h_zeroW, M_EFF * HIDDEN * 4,  1); if err != 0 { die("zero b_mid_g",      err) }
+    err = hipMemcpy(b_mid_norm_g, h_zeroW, M_EFF * HIDDEN * 4,  1); if err != 0 { die("zero b_mid_norm_g", err) }
+    err = hipMemcpy(b_attn_out_g, h_zeroW, M_EFF * Q_DIM * 4,   1); if err != 0 { die("zero b_attn_out_g", err) }
+    err = hipMemcpy(gu_scratch,   h_zeroW, M_EFF * 2 * FF * 4,  1); if err != 0 { die("zero gu_scratch",   err) }
+    err = hipMemcpy(kc,           h_zeroW, MAX_SEQ * KV_DIM * 4, 1); if err != 0 { die("zero kc",    err) }
+    err = hipMemcpy(vc,           h_zeroW, MAX_SEQ * KV_DIM * 4, 1); if err != 0 { die("zero vc",    err) }
+
+    uint64 k_buf = alloc(24 * 8)
+    unsafe { *((k_buf +  0 * 8) as uint64) = in_resid    }
+    unsafe { *((k_buf +  1 * 8) as uint64) = out_resid   }
+    unsafe { *((k_buf +  2 * 8) as uint64) = qkv_w       }
+    unsafe { *((k_buf +  3 * 8) as uint64) = o_w         }
+    unsafe { *((k_buf +  4 * 8) as uint64) = gate_up_w   }
+    unsafe { *((k_buf +  5 * 8) as uint64) = down_w      }
+    unsafe { *((k_buf +  6 * 8) as uint64) = in_norm_g   }
+    unsafe { *((k_buf +  7 * 8) as uint64) = post_norm_g }
+    unsafe { *((k_buf +  8 * 8) as uint64) = q_norm_g    }
+    unsafe { *((k_buf +  9 * 8) as uint64) = k_norm_g    }
+    unsafe { *((k_buf + 10 * 8) as uint64) = rope_cos    }
+    unsafe { *((k_buf + 11 * 8) as uint64) = rope_sin    }
+    unsafe { *((k_buf + 12 * 8) as uint64) = kc          }
+    unsafe { *((k_buf + 13 * 8) as uint64) = vc          }
+    uint64 pos_val = 0
+    unsafe { *((k_buf + 14 * 8) as uint64) = pos_val     }
+    unsafe { *((k_buf + 15 * 8) as uint64) = barrier_ctr }
+    unsafe { *((k_buf + 16 * 8) as uint64) = gu_scratch   }
+    unsafe { *((k_buf + 17 * 8) as uint64) = b_x_norm_g   }
+    unsafe { *((k_buf + 18 * 8) as uint64) = b_qkv_g      }
+    unsafe { *((k_buf + 19 * 8) as uint64) = b_attn_q_g   }
+    unsafe { *((k_buf + 20 * 8) as uint64) = b_mid_g      }
+    unsafe { *((k_buf + 21 * 8) as uint64) = b_mid_norm_g }
+    unsafe { *((k_buf + 22 * 8) as uint64) = b_attn_out_g }
+
+    uint64 kp = alloc(24 * 8)
+    uint64 j = 0
+    while j < 24 {
+        uint64 slot_ptr = k_buf + j * 8
+        unsafe { *((kp + j * 8) as uint64) = slot_ptr }
+        j = j + 1
+    }
+
+    puts("=== slice 4.14 mega-kernel speck8 bisection ===")
+    put_kv("WG_PERSIST", 10, WG_PERSIST)
+    put_kv("M_EFF",      5, M_EFF)
+
+    uint64 mp = 0
+    while mp <= 7 {
+        err = hipMemcpy(barrier_ctr, h_zero4, 4, 1); if err != 0 { die("clear barrier", err) }
+        unsafe { *((k_buf + 23 * 8) as uint64) = mp }
+
+        puts("---")
+        put_kv("max_phase", 9, mp)
+
+        uint64 t0 = time_now()
+        err = hipModuleLaunchKernel(fh, WG_PERSIST, 1, 1, 32, 1, 1, 0, 0, kp, 0)
+        if err != 0 { die("launch", err) }
+        err = hipDeviceSynchronize()
+        if err != 0 { die("sync", err) }
+        uint64 elapsed_ns = time_elapsed(t0)
+        put_kv("kernel_ns", 9, elapsed_ns)
+
+        uint64 h_ctr_buf = alloc(4)
+        err = hipMemcpy(h_ctr_buf, barrier_ctr, 4, 2); if err != 0 { die("D2H ctr", err) }
+        uint32 ctr_val = 0; unsafe { *(h_ctr_buf as uint32) -> ctr_val }
+        uint64 ctr_u64 = ctr_val
+        uint64 expected = (mp + 1) * WG_PERSIST
+        put_kv("counter_final", 13, ctr_u64)
+        put_kv("counter_expected", 16, expected)
+        if ctr_u64 == expected { puts("PASS") } else { puts("FAIL") }
+        dealloc(h_ctr_buf)
+        mp = mp + 1
+    }
+
+    hipFree(in_resid); hipFree(out_resid); hipFree(qkv_w); hipFree(o_w)
+    hipFree(gate_up_w); hipFree(down_w); hipFree(in_norm_g); hipFree(post_norm_g)
+    hipFree(q_norm_g); hipFree(k_norm_g); hipFree(rope_cos); hipFree(rope_sin)
+    hipFree(kc); hipFree(vc); hipFree(barrier_ctr); hipFree(gu_scratch)
+    hipFree(b_x_norm_g); hipFree(b_qkv_g); hipFree(b_attn_q_g)
+    hipFree(b_mid_g); hipFree(b_mid_norm_g); hipFree(b_attn_out_g)
+    exit(0)
+}
