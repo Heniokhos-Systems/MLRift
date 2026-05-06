@@ -35,6 +35,10 @@
 __shared__ float wave_tmp[1];
 __shared__ float attn_w_lds[M_EFF * 64];
 
+// WMMA fragment vector typedefs (gfx1100 wave32).
+typedef float  v8f  __attribute__((ext_vector_type(8)));
+typedef short  v16s __attribute__((ext_vector_type(16)));
+
 __device__ __forceinline__
 void mega_barrier(unsigned int *counter_ptr, unsigned int phase_idx) {
     __threadfence();
@@ -353,45 +357,87 @@ void phase11_post_norm_speck8(unsigned int wg_id, unsigned int lane,
 }
 
 // ────────────────────────────────────────────────────────────────
-// Phase 13 — gate_up matmul.  M_EFF amortized.
+// Phase 13 — gate_up matmul.  WMMA tensor-core path (gfx1100 wave32).
+//
+// Output: gu_scratch_8[m, row]  (m in [0, M_EFF), row in [0, N_OUT)).
+// We compute one 16×16 output tile per WG.  N_OUT=6144 → 384 tiles.
+// WG_PERSIST=512 → WGs in [384, 512) idle (still hit the barrier in
+// the entry function, but produce no output here).
+//
+// Per-tile: WMMA matrix layout (gfx1100 v_wmma_f32_16x16x16_bf16, w32):
+//   A = weight tile  : 16 rows × K=16 cols (bf16).
+//                      A[i, k] = gate_up_w[row_base + i, k_base + k]
+//                      lane L holds row L%16 of A as 16 bf16.
+//   B = input tile   : K=16 rows × 16 cols (bf16; cols 8..15 unused).
+//                      B[k, j] = bf16(b_mid_norm_g_8[j, k_base + k])
+//                      lane L holds col L%16 of B as 16 bf16.
+//                      For L%16 >= M_EFF the col is unused; we clamp
+//                      the row index to 0 to keep the load in-bounds.
+//   C = output tile  : 16 rows × 16 cols (f32 accumulator).
+//                      lane L holds 8 f32 = column L%16 of C, with
+//                      slot s containing row 2*s + L/16.
+//
+// K-loop iterates k_base = 0, 16, 32, ..., 1008 (HIDDEN/16 = 64 calls).
+// At store time, only columns L%16 < M_EFF map to real output cols.
 // ────────────────────────────────────────────────────────────────
+__device__ __forceinline__ unsigned short f32_to_bf16_trunc(float v) {
+    unsigned int u = *reinterpret_cast<unsigned int *>(&v);
+    return (unsigned short)(u >> 16);
+}
+
 __device__ __forceinline__
 void phase13_gate_up_matmul_speck8(unsigned int wg_id, unsigned int lane,
                                     const unsigned short *gate_up_w,
                                     const float *b_mid_norm_g_8,
                                     float *gu_scratch_8) {
     constexpr unsigned int N_OUT = 2 * FF;
-    constexpr unsigned int ROWS_PER_WG = (N_OUT + WG_PERSIST - 1) / WG_PERSIST;
-    for (unsigned int r_off = 0; r_off < ROWS_PER_WG; r_off++) {
-        unsigned int row = wg_id + r_off * WG_PERSIST;
-        if (row >= N_OUT) continue;
-        float acc[M_EFF];
+    constexpr unsigned int N_TILES = N_OUT / 16;          // 384
+    if (wg_id >= N_TILES) return;
+
+    unsigned int tile_idx = wg_id;
+    unsigned int row_base = tile_idx * 16;
+    unsigned int a_row    = lane & 15u;                    // L%16
+    unsigned int b_col    = lane & 15u;                    // L%16
+    unsigned int b_row    = (b_col < M_EFF) ? b_col : 0u;  // clamp OOB
+
+    // Pointers (advance k_base in the loop).
+    const unsigned short *a_ptr = gate_up_w + (row_base + a_row) * HIDDEN_PAD;
+    const float          *b_ptr = b_mid_norm_g_8 + b_row * HIDDEN;
+
+    v8f c = {0, 0, 0, 0, 0, 0, 0, 0};
+
+    #pragma unroll 1
+    for (unsigned int k_base = 0; k_base < HIDDEN; k_base += 16) {
+        // Load 16 bf16 weights for A: 8 dwords = 2× b128 loads.
+        v16s a;
+        const unsigned int *aw = reinterpret_cast<const unsigned int *>(
+            a_ptr + k_base);
         #pragma unroll
-        for (int m = 0; m < M_EFF; m++) acc[m] = 0.0f;
-        const unsigned int *w_row_u32 =
-            reinterpret_cast<const unsigned int *>(gate_up_w + row * HIDDEN_PAD);
-        for (unsigned int kp = lane; kp < HIDDEN / 2; kp += WAVE) {
-            unsigned int packed = w_row_u32[kp];
-            unsigned int k = kp * 2;
-            float w0 = bf16_to_f32((unsigned short)(packed & 0xFFFFu));
-            float w1 = bf16_to_f32((unsigned short)(packed >> 16));
-            #pragma unroll
-            for (int m = 0; m < M_EFF; m++) {
-                acc[m] += w0 * b_mid_norm_g_8[m * HIDDEN + k]
-                       +  w1 * b_mid_norm_g_8[m * HIDDEN + k + 1];
-            }
+        for (int p = 0; p < 8; p++) {
+            unsigned int packed = aw[p];
+            a[2 * p]     = (short)(packed & 0xFFFFu);
+            a[2 * p + 1] = (short)(packed >> 16);
         }
-        for (int offset = WAVE / 2; offset > 0; offset >>= 1) {
-            #pragma unroll
-            for (int m = 0; m < M_EFF; m++) {
-                acc[m] += __shfl_xor(acc[m], offset);
-            }
+        // Load 16 f32 inputs for B, convert to bf16 (truncate).
+        v16s b;
+        const float *bp = b_ptr + k_base;
+        #pragma unroll
+        for (int k = 0; k < 16; k++) {
+            b[k] = (short)f32_to_bf16_trunc(bp[k]);
         }
-        if (lane == 0) {
-            #pragma unroll
-            for (int m = 0; m < M_EFF; m++) {
-                gu_scratch_8[m * N_OUT + row] = acc[m];
-            }
+        c = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, c);
+    }
+
+    // Store: lane L holds column (L%16) of the 16×16 tile, with slot s
+    // mapped to row 2*s + (L/16).  Only L%16 < M_EFF is a real output.
+    if (b_col < M_EFF) {
+        unsigned int hi = lane >> 4;                     // 0 or 1
+        unsigned int m  = b_col;                         // input row index
+        float *dst = gu_scratch_8 + m * N_OUT + row_base;
+        #pragma unroll
+        for (int s = 0; s < 8; s++) {
+            unsigned int r = 2u * (unsigned int)s + hi;
+            dst[r] = c[s];
         }
     }
 }
