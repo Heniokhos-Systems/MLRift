@@ -1276,3 +1276,125 @@ acceptance is 16/16 every step on the LONG_PROMPT alternating prefix.
   applied.
 - Memory: ~800 MB additional GPU scratch at M=16.  Fits comfortably
   on the 16 GB card.
+
+
+## Slice 4.20 — VRAM chase, mks-K cap correction, mks16 LDS bump (2026-05-06)
+
+Two-part audit.  Part one: chase the unidentified ~1.1 GiB VRAM delta
+between M=1 mega (1.7 GiB peak) and mks-K (3.7 GiB peak).  Part two:
+discover that mks4/mks8/mks16 were silently falling back to per-op
+mid-decode (a stale cap from before slice 4.17), then fix.
+
+### Part 1 — the cap was stale (lever 1)
+
+`examples/qwen3_generate.mlr:761/776/793` gated mks4/mks8/mks16 on
+`pos + M_eff <= 64`.  Slice 4.17 had already bumped mks4 and mks8 to
+`attn_w_lds[M_EFF * 128]`; the host-side gate was never relaxed.
+
+Symptom under `LONG_PROMPT` (prefill=16) + `spec_K=4`, max_new=20:
+
+- Steps 0–11: mks4 fires, 32 launches/step.
+- **Step 12** (pos=63): gate `63+4 > 64` flips, fall through to
+  per-op chain.  Launches jump 32 → 592.  Per-op uploads 112 unpadded
+  bf16 weights (~880 MiB) into a separate cache from the mega-kernel's
+  padded cache.  VRAM: 2869 → 3709 MiB.
+
+Fix: bump mks4 / mks8 gates to `pos + M_eff <= 128` (matches the
+kernel-side `attn_w_lds[M_EFF * 128]` allocation).  mks16 stays at 64
+for now (kernel-side `MAX_SEQ_LDS=64`, addressed in part 3).
+
+Result (`MLRIFT_QWEN3_MEGAKERNEL_SPECK4=1 SPEC_K=4 LONG_PROMPT=1`):
+
+| metric | before lever 1 | after lever 1 |
+|---|---:|---:|
+| tok/s | 107.0 | **168.9** (+58 %) |
+| peak VRAM | 3709 MiB | 2869 MiB (−840 MiB) |
+| mks4 launches/step (steady) | 32→592 at step 12 | 32 throughout |
+| PLD acceptance | 4/4 every step | 4/4 every step |
+
+mks4 was always capable of ~170 tok/s; the prior 107 number was the
+post-fallback degraded path.
+
+### Part 2 — kill the duplicate weight caches (lever 2)
+
+After lever 1, peak VRAM still sat at 2869 MiB vs M=1 mega's 1.7 GiB.
+Tracing showed the gap came from `matmul_bf16_weights_f32_gpu`
+(`std/inference_gpu.mlr:638`) calling `_gpu_mm_get_or_dequant`
+**unconditionally**, even when the bf16-direct path was about to
+override its result.  Each prefill matmul uploaded BOTH a bf16 and a
+f32 copy of the same weight to the device.  At qwen3-0.6B the f32
+cache held ~750 MiB of redundant tensors.
+
+Fix:
+1. Hoist `use_coop` / `use_bf16` selection above the dequant call;
+   skip the dequant when bf16-direct will fire.
+2. Add `gpu_mm_drop_f32_cache()` mirroring `gpu_mm_drop_bf16_cache()`,
+   wired into the post-warmup drop in `examples/qwen3_generate.mlr`.
+
+Result:
+
+| metric | after lever 1 | after lever 2 |
+|---|---:|---:|
+| pre-warmup VRAM | 1909 MiB | **798 MiB** (−1111 MiB) |
+| post-warmup VRAM | 2835 MiB | 1707 MiB (−1128 MiB) |
+| pre-decode VRAM | 2327 MiB | 1155 MiB |
+| steady decode VRAM | 2869 MiB | **1749 MiB** |
+| peak VRAM | 2869 MiB | **2046 MiB** |
+| tok/s | 168.9 | **168.6** (unchanged — the dequant was wasted work) |
+| f32 cache entries dropped | n/a | 0 (correctly never allocated) |
+
+mks-K's steady-state VRAM is now within 40 MiB of M=1 mega's
+1.71 GiB — essentially as memory-efficient as the single-stream path
+while running at 5–7× the throughput.
+
+### Part 3 — mks16 cap bump 64 → 96
+
+mks16's `MAX_SEQ_LDS` was 64 (slice 4.18 LDS-cap), giving only 3
+useful spec_K=16 steps before fallback (pos=15 → 31 → 47 → 63 → cap).
+
+Bumping `MAX_SEQ_LDS` to 128 (8 KB LDS / WG) **deadlocks** at
+launch.  gfx1100's per-CU LDS budget caps concurrent WGs at 8 with
+8 KB each; total active grid drops to 60 × 8 = 480 < the 512 the
+persistent-WG cross-barrier needs to reach for phase rotation.  The
+kernel hangs with `hipDeviceSynchronize: timeout draining queue`.
+
+Settled on `MAX_SEQ_LDS = 96` (6 KB / WG): 60 × 10 = 600 active-WG
+capacity, well above 512.  Host gate updated to `pos + 16 <= 96`.
+
+Result: 5 useful mks16 steps (was 3), 79 tokens generated, 99 % PLD
+acceptance.  Throughput **216.4 tok/s** — new peak across all mks-K
+variants.
+
+### Final 4.20 bench (RX 7800 XT, qwen3-0.6B, sysfs VRAM)
+
+3-second cooldown between runs, `MLRIFT_LONG_PROMPT=1` for spec
+variants.  Wall numbers from `tokens_per_sec_x1000 / 1000`.
+
+| Config | Weights → GEMM | tok/s | tokens | peak VRAM | RSS |
+|---|---|---:|---:|---:|---:|
+| MLRift CPU | bf16 → f32 | 24.1 | 20 | 174 MiB | 1.67 GiB |
+| MLRift GPU per-op | bf16 → f32 | 54.8 | 20 | 2801 MiB | 1.82 GiB |
+| PyTorch ROCm fp32 | f32 → f32 | 40.2 | 20 | 3533 MiB | 4.92 GiB |
+| PyTorch ROCm bf16 | bf16 → bf16 (WMMA) | 62.5 | 20 | 2091 MiB | 4.52 GiB |
+| MLRift M=1 mega | bf16 → f32 | 87.5 | 20 | 2046 MiB | 1.67 GiB |
+| MLRift mks4 | bf16 → f32 | 169.3 | 80 | 2046 MiB | 1.70 GiB |
+| MLRift mks8 | bf16 → f32 | 201.6 | 112 | 2046 MiB | 1.70 GiB |
+| **MLRift mks16** | bf16 → f32 | **216.4** | 79 | 2046 MiB | 1.69 GiB |
+
+Headline:
+
+- **mks16 = 3.46× PyTorch bf16, 5.38× PyTorch fp32, 9.0× MLRift CPU.**
+- VRAM: MLRift's mega paths use **less VRAM than PyTorch bf16** (and
+  42 % less than PyTorch fp32), with f32 GEMM accuracy on bf16 weights.
+- RSS: MLRift carries ~1.7 GiB total RSS (mmap'd safetensors); PyTorch
+  carries 4.5–5.0 GiB (Python + transformers + tensor metadata).
+
+### Outstanding (slice 4.20)
+
+- `step < max_new` semantics — the loop counts steps, not tokens.
+  spec_K=8 × max_new=20 wants 160 tokens but max_seq=128 caps it.
+  Fix: track tokens generated per step and break when total tokens
+  ≥ target.  Tracked separately from this slice.
+- mks8 gen=112 in the 4.20 table reflects the 14-step run inside the
+  max_seq budget (14 × 8 = 112).  Fairly comparable since tok/s is
+  steady-state.

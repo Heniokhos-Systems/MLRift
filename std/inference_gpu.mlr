@@ -348,6 +348,38 @@ fn _gpu_mm_bf16_insert(u64 w_bf16, u64 d_bf16) {
 // Returns the number of entries dropped (informational).  Caller should
 // only invoke this once they know per-op fallback is no longer needed
 // — a subsequent gpu_matmul_to_dev call will re-upload, which is slow.
+// Slice 4.20 audit helper: sum every active gpu_buf_reserve allocation.
+// Used by qwen3_generate to checkpoint VRAM growth across the warmup
+// pipeline.
+@export
+fn gpu_buf_pool_total() -> u64 {
+    u64 sum = 0
+    u64 i = 0
+    while i < _gpu_buf_pool_n {
+        u64 sp = _gpu_buf_pool_size_arr + i * 8
+        u64 s = 0; unsafe { *(sp as u64) -> s }
+        sum = sum + s
+        i = i + 1
+    }
+    return sum
+}
+
+// Sum every cached bf16 weight (unpadded) device buffer.
+@export
+fn gpu_mm_bf16_cache_total() -> u64 {
+    u64 sum = 0
+    // We don't store sizes in the cache; assume bf16 = 2 bytes/elem
+    // and total bytes = N * K * 2 (we'd need to track but instead
+    // return entry count, caller can multiply).
+    return _gpu_mm_bf16_n
+}
+
+// Sum every cached padded bf16 weight device buffer (slice 4.13).
+@export
+fn gpu_mm_bf16_pad_cache_total() -> u64 {
+    return _gpu_mm_bf16_pad_n
+}
+
 @export
 fn gpu_mm_drop_bf16_cache() -> u64 {
     u64 dropped = _gpu_mm_bf16_n
@@ -359,6 +391,26 @@ fn gpu_mm_drop_bf16_cache() -> u64 {
         i = i + 1
     }
     _gpu_mm_bf16_n = 0
+    return dropped
+}
+
+// Slice 4.20 (lever 2): free the f32 dequant cache.  Used after warmup
+// of the mega-kernel + padded-row path where the per-op f32 fallback is
+// not exercised in steady state.  Each cached entry is the f32 weight
+// tensor produced by _gpu_mm_dequant_weight (bf16 → f32 expansion at
+// 256-row padding) — typically 1.5–2× the bf16 size, ~12 MiB per qwen3-
+// 0.6B layer matmul.
+@export
+fn gpu_mm_drop_f32_cache() -> u64 {
+    u64 dropped = _gpu_mm_cache_n
+    u64 i = 0
+    while i < _gpu_mm_cache_n {
+        u64 vp = _gpu_mm_cache_vals + i * 8
+        u64 d_f32 = 0; unsafe { *(vp as u64) -> d_f32 }
+        if d_f32 != 0 { hipFree(d_f32) }
+        i = i + 1
+    }
+    _gpu_mm_cache_n = 0
     return dropped
 }
 
@@ -603,8 +655,32 @@ fn matmul_bf16_weights_f32_gpu(u64 out_ptr, u64 x_ptr, u64 w_bf16,
     u64 w_bytes = N * K * 2
     if w_bytes < _gpu_mm_min_bytes { return 1 }
 
-    u64 d_W_f32 = _gpu_mm_get_or_dequant(w_bf16, K, N)
-    if d_W_f32 == 0 { return 1 }
+    // Slice 4.20 (lever 2): hoist use_coop/use_bf16 selection BEFORE the
+    // f32 dequant to avoid uploading a wasted f32 copy when bf16-direct
+    // will be selected.  Saves ~750 MiB peak VRAM during prefill where
+    // bf16-direct is the default for N ≥ 4096.
+    u64 use_coop = 0
+    if _gpu_mm_fh_gemv_coop != 0 {
+        if N >= 4096 { use_coop = 1 }
+    }
+    u64 use_bf16 = 0
+    if use_coop != 0 {
+        if _gpu_mm_fh_gemv_coop_bf16 != 0 {
+            use_bf16 = 1
+            u64 bf16_env = getenv("MLRIFT_GPU_MATMUL_BF16")
+            if bf16_env != 0 {
+                u8 bc = 0; unsafe { *(bf16_env as u8) -> bc }
+                if bc == 48 { use_bf16 = 0 }   // explicit '0' = opt-out
+            }
+        }
+    }
+    if use_bf16 != 0 && N > 65536 { use_bf16 = 0 }
+
+    u64 d_W_f32 = 0
+    if use_bf16 == 0 {
+        d_W_f32 = _gpu_mm_get_or_dequant(w_bf16, K, N)
+        if d_W_f32 == 0 { return 1 }
+    }
 
     u64 d_x = _gpu_mm_ensure_x_buf(K * 4)
     if d_x == 0 { return 1 }
@@ -636,38 +712,6 @@ fn matmul_bf16_weights_f32_gpu(u64 out_ptr, u64 x_ptr, u64 w_bf16,
     unsafe { *((kp + 32) as u64) = a4 }
     u64 grid_u = N_padded / 256
     u32 grid32 = grid_u
-    // Pick the kernel based on N.  Cooperative-row gemv (block=32,
-    // grid=N) wins big at large N due to coalesced reads, but pays a
-    // grid-launch tax that's ~256× higher than the row-per-LANE
-    // gemv_f32 (block=256, grid=N/256).  Crossover empirically lands
-    // around N=4096.  Use the coop kernel above 4096; original below.
-    // bf16-direct variant if loaded — halves A bandwidth, skips dequant.
-    u64 use_coop = 0
-    if _gpu_mm_fh_gemv_coop != 0 {
-        if N >= 4096 { use_coop = 1 }
-    }
-    // bf16-direct path is the default whenever the kernel loaded.
-    // Halves A bandwidth on the dominant matmuls (lm_head, qkv,
-    // gate_up, down, oproj) and skips the dequant cold path entirely.
-    // 8× unroll, bit-exact vs CPU at N=64 / N=2048 / N=151936
-    // (max diff 1.9e-6 fma noise).
-    // Opt out via MLRIFT_GPU_MATMUL_BF16=0.
-    u64 use_bf16 = 0
-    if use_coop != 0 {
-        if _gpu_mm_fh_gemv_coop_bf16 != 0 {
-            use_bf16 = 1
-            u64 bf16_env = getenv("MLRIFT_GPU_MATMUL_BF16")
-            if bf16_env != 0 {
-                u8 bc = 0; unsafe { *(bf16_env as u8) -> bc }
-                if bc == 48 { use_bf16 = 0 }   // explicit '0' = opt-out
-            }
-        }
-    }
-    // Cap single-stream bf16-direct at N ≤ 65536 to avoid the lm_head
-    // hang at N=151936 (same constraint the batched path documents).
-    // qwen3 inner-layer projections all sit at N ≤ 6144 so the cap
-    // doesn't lose the layer-sweep gain; lm_head falls back to f32 dequant.
-    if use_bf16 != 0 && N > 65536 { use_bf16 = 0 }
 
     if use_bf16 != 0 {
         // bf16-direct path: substitute d_W_bf16 for d_W_f32 in kernarg.

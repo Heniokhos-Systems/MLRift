@@ -602,6 +602,16 @@ fn main() {
         if c0w != 48 { want_warmup = 1 }
     }
     if want_warmup != 0 {
+        u64 ev_vt0 = getenv("MLRIFT_VRAM_TRACE")
+        u64 want_vt0 = 0
+        if ev_vt0 != 0 { u8 cv0 = 0; unsafe { *(ev_vt0 as u8) -> cv0 } if cv0 != 48 { want_vt0 = 1 } }
+        if want_vt0 != 0 {
+            u64 vmb_pre = gpu_buf_pool_total() / 1048576
+            u64 nu_pre = gpu_mm_bf16_cache_total()
+            u64 np_pre = gpu_mm_bf16_pad_cache_total()
+            eout("[vram] pre-warmup buf_pool="); eu64(vmb_pre); eout(" MiB unpad_cache="); eu64(nu_pre); eout(" pad_cache="); eu64(np_pre); eout("\n")
+        }
+
         u64 lyr = 0
         while lyr < n_layers {
             Qwen3LayerWeights w = layers_arr + lyr * 88
@@ -612,6 +622,13 @@ fn main() {
             lyr = lyr + 1
         }
         eout("[qwen3_generate] padded-row weight cache warmed for "); eu64(n_layers); eout(" layers\n")
+
+        if want_vt0 != 0 {
+            u64 vmb_post = gpu_buf_pool_total() / 1048576
+            u64 nu_post = gpu_mm_bf16_cache_total()
+            u64 np_post = gpu_mm_bf16_pad_cache_total()
+            eout("[vram] post-warmup buf_pool="); eu64(vmb_post); eout(" MiB unpad_cache="); eu64(nu_post); eout(" pad_cache="); eu64(np_post); eout("\n")
+        }
     }
 
     // Slice 4.19 memory optimisation: when the mega-kernel path is the
@@ -630,8 +647,19 @@ fn main() {
     if want_warmup != 0 {
         if keep_perop == 0 {
             u64 dropped = gpu_mm_drop_bf16_cache()
-            eout("[qwen3_generate] dropped per-op bf16 cache ("); eu64(dropped); eout(" entries) to reclaim ~880 MiB\n")
+            u64 dropped_f32 = gpu_mm_drop_f32_cache()
+            eout("[qwen3_generate] dropped per-op bf16 cache ("); eu64(dropped); eout(" entries) + f32 dequant cache ("); eu64(dropped_f32); eout(" entries) to reclaim ~880 MiB\n")
         }
+    }
+
+    u64 ev_vt1 = getenv("MLRIFT_VRAM_TRACE")
+    u64 want_vt1 = 0
+    if ev_vt1 != 0 { u8 cv1 = 0; unsafe { *(ev_vt1 as u8) -> cv1 } if cv1 != 48 { want_vt1 = 1 } }
+    if want_vt1 != 0 {
+        u64 vmb_dec = gpu_buf_pool_total() / 1048576
+        u64 nu_dec = gpu_mm_bf16_cache_total()
+        u64 np_dec = gpu_mm_bf16_pad_cache_total()
+        eout("[vram] pre-decode buf_pool="); eu64(vmb_dec); eout(" MiB unpad_cache="); eu64(nu_dec); eout(" pad_cache="); eu64(np_dec); eout("\n")
     }
 
     decode_start_ns = time_now()
@@ -743,7 +771,8 @@ fn main() {
                     if qwen3_megakernel_speck4_use() != 0 {
                         if qwen3_megakernel_speck4_ready() != 0 {
                             if hidden == 1024 {
-                                if pos + 4 <= 64 {
+                                // mks4 LDS: attn_w_lds[M_EFF*128] → pos cap 128.
+                                if pos + 4 <= 128 {
                                     use_mks4 = 1
                                 }
                             }
@@ -758,7 +787,8 @@ fn main() {
                     if qwen3_megakernel_speck8_use() != 0 {
                         if qwen3_megakernel_speck8_ready() != 0 {
                             if hidden == 1024 {
-                                if pos + 8 <= 64 {
+                                // mks8 LDS: attn_w_lds[M_EFF*128] → pos cap 128.
+                                if pos + 8 <= 128 {
                                     use_mks8 = 1
                                 }
                             }
@@ -767,15 +797,20 @@ fn main() {
                 }
             }
             // Slice 4.18 — speck16 mega-kernel: spec_K=16 path.
-            // LDS cap: kernel only caches softmax weights for the first 64
-            // KV positions, so pos + M_eff must stay within 64.
+            // Slice 4.20: LDS cap bumped from 64 to 96 (kernel constant
+            // MAX_SEQ_LDS=96, attn_w_lds size 6 KB).  Tried 128 (8 KB)
+            // but it deadlocked: gfx1100 LDS budget caps concurrent
+            // WGs/CU at 8 with 8 KB LDS, dropping total active grid
+            // below 512 — the persistent-WG cross-barrier never reaches
+            // the 512 expected count.  6 KB allows ~10 WGs/CU = 600
+            // capacity, comfortably above the 512 needed.
             u64 use_mks16 = 0
             if is_spec != 0 {
                 if M_eff == 16 {
                     if qwen3_megakernel_speck16_use() != 0 {
                         if qwen3_megakernel_speck16_ready() != 0 {
                             if hidden == 1024 {
-                                if pos + 16 <= 64 {
+                                if pos + 16 <= 96 {
                                     use_mks16 = 1
                                 }
                             }
@@ -1292,6 +1327,17 @@ fn main() {
         eout(" syncs="); eu64(step_syncs)
         eout(" sync_us="); eu64(step_sync_us)
         eout(" sync_busy="); eu64(step_sync_busy); eout("\n")
+        // Slice 4.20 chase prints (kept off by default; flip MLRIFT_VRAM_TRACE
+        // to capture per-step cache counts when investigating leaks).
+        u64 ev_vt = getenv("MLRIFT_VRAM_TRACE")
+        u64 want_vt = 0
+        if ev_vt != 0 { u8 cv = 0; unsafe { *(ev_vt as u8) -> cv } if cv != 48 { want_vt = 1 } }
+        if want_vt != 0 {
+            u64 vmb_si = gpu_buf_pool_total() / 1048576
+            u64 nu_si = gpu_mm_bf16_cache_total()
+            u64 np_si = gpu_mm_bf16_pad_cache_total()
+            eout("[vram] post-step"); eu64(step); eout(" buf_pool="); eu64(vmb_si); eout(" MiB unpad_cache="); eu64(nu_si); eout(" pad_cache="); eu64(np_si); eout("\n")
+        }
         step = step + 1
     }
     u64 total_decode_ns = time_elapsed(decode_start_ns)

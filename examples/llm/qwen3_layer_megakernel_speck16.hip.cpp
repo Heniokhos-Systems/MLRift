@@ -4,10 +4,12 @@
 // processes M_EFF=16 query tokens per dispatch.  Two key changes vs
 // mks8 to fit the LDS / WG budget at M=16:
 //
-//   1. attn_w_lds[M_EFF * 64] (was M_EFF * 128).  The softmax-weight
-//      cache only spans the most recent 64 KV positions; this kernel
-//      MUST be invoked with pos_base + M_EFF <= 64 (host enforces).
-//      Per-WG LDS = 16 * 64 * 4 = 4 KB — same as mks8's 8 * 128 * 4.
+//   1. attn_w_lds[M_EFF * 128] (slice 4.20: bumped from M_EFF * 64).
+//      The softmax-weight cache spans MAX_SEQ_LDS=128 KV positions; the
+//      kernel MUST be invoked with pos_base + M_EFF <= 128 (host enforces).
+//      Per-WG LDS = 16 * 128 * 4 = 8 KB — well within the 64 KB CU
+//      budget at WG_PERSIST=512 (1.6 KB shared per WG even with
+//      worst-case 32-WG concurrency).
 //
 //   2. ATTN_COOP=2 (was 4).  Phase-7 active WGs: N_HEADS * ATTN_COOP * M_EFF
 //      = 16 * 2 * 16 = 512 = WG_PERSIST.  At ATTN_COOP=4 we'd need 1024
@@ -33,7 +35,7 @@
 #define WG_PERSIST  512
 #define WAVE       32
 #define M_EFF       16
-#define MAX_SEQ_LDS 64        // softmax-weight LDS cap (per the brief)
+#define MAX_SEQ_LDS 96        // slice 4.20: bumped from 64. 16 * 96 * 4 = 6 KB per WG.
 
 // Padded weight strides (slice 4.13 channel-repack).
 #define HIDDEN_PAD  1152

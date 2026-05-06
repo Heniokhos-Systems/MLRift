@@ -98,6 +98,7 @@ Token-id output of every MLRift row is bit-identical to HuggingFace
 | **+ `MLRIFT_QWEN3_MEGAKERNEL_SPECK8=1` + `SPEC_K=8` + LONG_PROMPT (slice 4.15 — M=8 mega-kernel)** | bf16 / f32 | **181.8** | 2 600 | **2.46× vs ROCm bf16** |
 | **+ slice 4.16 — phase-13 `v_wmma_f32_16x16x16_bf16` tensor cores** | bf16 / f32 | **190.3** | 2 600 | **2.57× vs ROCm bf16** |
 | **+ `MLRIFT_QWEN3_MEGAKERNEL_SPECK16=1` + `SPEC_K=16` + LONG_PROMPT (slice 4.18 — M=16 mega-kernel; slice 4.17 unblocks max_seq=128)** | bf16 / f32 | **200.9** | 3 400 | **2.71× vs ROCm bf16** |
+| **+ slice 4.20 — VRAM chase, mks-K cap correction, mks16 LDS bump 64→96** | bf16 / f32 | **216.4** | **2 046** | **3.46× vs ROCm bf16** |
 | MLRift + `GPU_FULL_FORWARD` + `SPEC_K=4` + LONG-prompt (per-op PLD path, pre-mega) | bf16 / f32 | 72.0 | 1 920 | 0.97× vs ROCm bf16 |
 
 The matmul-only rows route only the matmul + lm_head through native
