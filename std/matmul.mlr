@@ -527,24 +527,6 @@ fn mm_worker_q8_0_f32_avx2(u64 start_n, u64 end_n, u64 ctx_ptr) {
             u64 bi = 0
             while bi < n_blocks {
                 u64 block = w_row + bi * 34
-                // INLINED f16→f32 of the block scale. The old path called
-                // gguf_f16_to_f32_exact, which allocated a fresh `uint64[1]
-                // tmp` stack slot per call — at 51 200 calls/worker this
-                // dominated the kernel (~2.6 s per matmul on a 5120×5120
-                // Q8_0 weight). Writing the bit pattern directly into the
-                // per-worker scale_buf sidesteps both the function call and
-                // the stack-slot mmap. Subnormal + Inf/NaN halves aren't
-                // expected for Q8_0 scales (they're bounded and ~1e-3..1e-1
-                // in practice), so we hardcode the normal-number fast path.
-                u64 sb_lo = load8(block)
-                u64 sb_hi = load8(block + 1)
-                u64 sbits = sb_lo | (sb_hi << 8)
-                u64 exp_f16 = (sbits >> 10) & 0x1F
-                u64 mant_f16 = sbits & 0x3FF
-                u64 sign_f16 = (sbits >> 15) & 1
-                u64 f32_bits = ((exp_f16 + 112) << 23) | (mant_f16 << 13) | (sign_f16 << 31)
-                u32 f32_u32 = f32_bits
-                unsafe { *(scale_buf as uint32) = f32_u32 }
 
                 u64 x_b = x_row + bi * 32 * 4
                 asm {
@@ -556,8 +538,13 @@ fn mm_worker_q8_0_f32_avx2(u64 start_n, u64 end_n, u64 ctx_ptr) {
                     "0xC5 0xD4 0x57 0xED"
                     // vxorps ymm6, ymm6, ymm6
                     "0xC5 0xCC 0x57 0xF6"
-                    // vbroadcastss ymm3, [rcx]         ; broadcast scale
-                    "0xC4 0xE2 0x7D 0x18 0x19"
+                    // INLINE f16-scale → f32 broadcast. Replaces the old
+                    // MLRift integer unpack (10+ ops) + L1 store/load
+                    // round-trip via scale_buf. F16C native on Zen 4.
+                    // vpbroadcastw xmm3, [rdi]         ; broadcast f16 scale
+                    "0xC4 0xE2 0x79 0x79 0x1F"
+                    // vcvtph2ps ymm3, xmm3             ; 8 f16 → 8 f32 (all same)
+                    "0xC4 0xE2 0x7D 0x13 0xDB"
                     // -- chunk 0 → ymm0: weights [rdi+2..+9], x [rsi..] --
                     // vpmovsxbd ymm1, [rdi+2]          ; 8 int8 → 8 int32
                     "0xC4 0xE2 0x7D 0x21 0x4F 0x02"
