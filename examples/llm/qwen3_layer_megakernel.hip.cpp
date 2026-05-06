@@ -43,6 +43,15 @@
 #define WG_PERSIST  512   // slice 4.10/4.11: 64→512 sweet spot
 #define WAVE       32
 
+// Slice 4.13: padded row strides for the bf16 matmul weights.  Each
+// matmul reads HIDDEN/Q_DIM/FF bf16 elements per row, but the device
+// buffer has K_PAD elements of stride per row so consecutive rows
+// hit distinct GDDR6 channels.  K_PAD - K = 128 ushorts = 256 bytes
+// breaks the gcd with the 16-channel × 256-byte cycle.
+#define HIDDEN_PAD  1152   // qkv, gate_up: HIDDEN + 128
+#define Q_DIM_PAD   2176   // o_proj:       Q_DIM + 128
+#define FF_PAD      3200   // down:         FF + 128
+
 // LDS — only intra-phase reductions.  Inter-phase carries go through
 // global scratch (see kernel signature below).
 __shared__ float wave_tmp[1];     // single broadcast slot for rmsnorm scale
@@ -125,7 +134,7 @@ void phase3_qkv_matmul(unsigned int wg_id, unsigned int lane,
         // slice 4.12 #14: vectorized bf16-pair loads.  Read 2 bf16
         // weights per VMEM op as u32, unpack to two f32 FMAs.  Halves
         // the matmul VMEM instruction count → lifts effective bandwidth.
-        const unsigned int *w_row_u32 = reinterpret_cast<const unsigned int *>(qkv_w + row * HIDDEN);
+        const unsigned int *w_row_u32 = reinterpret_cast<const unsigned int *>(qkv_w + row * HIDDEN_PAD);
         for (unsigned int kp = lane; kp < HIDDEN / 2; kp += WAVE) {
             unsigned int packed = w_row_u32[kp];
             unsigned int k = kp * 2;
@@ -292,7 +301,7 @@ void phase9_oproj_residual(unsigned int wg_id, unsigned int lane,
         unsigned int row = wg_id + r_off * WG_PERSIST;
         if (row >= HIDDEN) continue;
         float acc = 0.0f;
-        const unsigned int *w_row_u32 = reinterpret_cast<const unsigned int *>(o_w + row * Q_DIM);
+        const unsigned int *w_row_u32 = reinterpret_cast<const unsigned int *>(o_w + row * Q_DIM_PAD);
         for (unsigned int kp = lane; kp < Q_DIM / 2; kp += WAVE) {
             unsigned int packed = w_row_u32[kp];
             unsigned int k = kp * 2;
@@ -348,7 +357,7 @@ void phase13_gate_up_matmul(unsigned int wg_id, unsigned int lane,
         unsigned int row = wg_id + r_off * WG_PERSIST;
         if (row >= N_OUT) continue;
         float acc = 0.0f;
-        const unsigned int *w_row_u32 = reinterpret_cast<const unsigned int *>(gate_up_w + row * HIDDEN);
+        const unsigned int *w_row_u32 = reinterpret_cast<const unsigned int *>(gate_up_w + row * HIDDEN_PAD);
         for (unsigned int kp = lane; kp < HIDDEN / 2; kp += WAVE) {
             unsigned int packed = w_row_u32[kp];
             unsigned int k = kp * 2;
@@ -396,7 +405,7 @@ void phase17_down_residual(unsigned int wg_id, unsigned int lane,
         unsigned int row = wg_id + r_off * WG_PERSIST;
         if (row >= HIDDEN) continue;
         float acc = 0.0f;
-        const unsigned int *w_row_u32 = reinterpret_cast<const unsigned int *>(down_w + row * FF);
+        const unsigned int *w_row_u32 = reinterpret_cast<const unsigned int *>(down_w + row * FF_PAD);
         for (unsigned int kp = lane; kp < FF / 2; kp += WAVE) {
             unsigned int packed = w_row_u32[kp];
             unsigned int k = kp * 2;
