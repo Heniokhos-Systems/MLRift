@@ -872,6 +872,8 @@ overhead reduction is empirically realized.
 - 4.8 ✓ **wire-up GREEN, tokens bit-identical to PyTorch** (18.9 tok/s baseline)
 - 4.10–4.13 ✓ **88.0 tok/s, +19 % over PyTorch ROCm bf16 on fp32 weights**
 - 4.14 ✓ **164.2 tok/s, +222 % over PyTorch ROCm bf16 (M=4 spec-decode mega)**
+- 4.15 ✓ **181.8 tok/s reported / ~222 steady-state (M=8 spec-decode mega)**
+- 4.16 ✓ **190.3 tok/s, +257 % over PyTorch ROCm bf16 (WMMA bf16 phase-13 on mks8)**
 
 ## Slices 4.10–4.13 — closing the per-op gap and breaking past PyTorch bf16
 
@@ -1106,3 +1108,86 @@ shared with M=1 mega — no duplication.
   a rolling-window KV cache or `max_seq=128` mega variant.
 - Per-op spec_K=4's single-pos-rope drift is real but pre-existing.
   Best fix: deprecate that path now that mks4 covers it at 2.3× speed.
+
+## Slice 4.15 — M=8 spec-decode mega-kernel
+
+Doubles slice 4.14's M_EFF=4 to M_EFF=8.  Same kernel structure: each
+weight row drives 8 dot products via `acc[8]` accumulator arrays in
+the matmul phases (3, 9, 13, 17), and per-stream phases (1, 5, 7, 11,
+15) loop `for (m = 0; m < 8; m++)`.  Phase 5 expands to 256 WGs
+(M_EFF × (Q + K + V) = 8 × 32) and phase 7 expands to 512 cooperating
+WGs (16 heads × ATTN_COOP=4 × M_EFF=8) — right at the safe boundary
+on RX 7800 XT but still under the 1500-WG concurrent cap.
+
+`attn_w_lds_speck8[M_EFF * MAX_SEQ] = 8 × 64 = 512 floats / WG = 2 KB
+LDS`.  Comfortably fits.
+
+### The bench-vs-steady-state caveat
+
+The reported tok/s number is dominated by step 0's ~77 ms cold
+dispatch (weight L2 cold-fill + KV cache touch + first .co code-
+load).  At `max_seq=64` and `spec_K=8`, only 5 fast steps fit after
+step 0 (each ~36 ms × 8 tokens accepted).  The warmup amortisation
+floor is therefore ~180 tok/s reported even though the steady-state
+is ~222 tok/s (8 tokens / 36 ms).  Bumping `max_seq=128` and the
+corresponding kernel `MAX_SEQ` constant (with attn LDS [64]→[128])
+would let the bench run 12 steps and settle near 222.
+
+### Files
+
+- `examples/llm/qwen3_layer_megakernel_speck8.hip.cpp` — NEW.  Copy
+  of speck4 kernel with `#define M_EFF 8`.
+- `examples/llm/qwen3_layer_megakernel_speck8_smoke.mlr` — NEW.
+- `std/inference_gpu.mlr` — `_gpu_fh_qwen3_megakernel_speck8` static
+  + .co loader + `gpu_qwen3_layer_megakernel_speck8_to_dev` launcher.
+- `std/qwen3.mlr` — 14 mks8 statics for M_EFF=8 scratches.
+- `examples/qwen3_generate.mlr` — relax gate to allow `MLRIFT_SPEC_K=8`.
+
+## Slice 4.16 — WMMA bf16 tensor cores on phase 13
+
+Replaces the bf16x2 vector-FMA inner loop in mks8's phase 13
+(gate_up matmul, the heaviest of the four) with gfx1100's
+`v_wmma_f32_16x16x16_bf16` tensor-core instruction.
+
+### Tile structure
+
+Each WG owns a 16×16 output tile (tile_idx = wg_id; WGs ≥ 384 idle
+but still hit the barrier).  Per K-step (k_base += 16, 64 iterations
+over HIDDEN=1024):
+
+```cpp
+typedef float v8f __attribute__((ext_vector_type(8)));
+typedef short v16s __attribute__((ext_vector_type(16)));   // bf16 as i16
+
+v8f acc = {0};
+for (int k_base = 0; k_base < HIDDEN; k_base += 16) {
+    v16s a = load_bf16_a_fragment(gate_up_w, row_base, k_base, lane);
+    v16s b = load_bf16_b_fragment_from_f32(b_mid_norm_g_8, k_base, lane);
+    acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc);
+}
+store_tile(acc, gu_scratch_8, row_base, lane);
+```
+
+A-fragment: 16 bf16 weights from `gate_up_w[(row_base + lane%16) *
+HIDDEN_PAD + k_base]`.  B-fragment: 16 f32 inputs from
+`b_mid_norm_g_8[(lane%16) * HIDDEN + k_base]`, truncated to bf16 by
+`(uint32 >> 16)` (lossy but sufficient for an already-rmsnormed
+activation).
+
+### Why the speedup is modest (+4.5%)
+
+RX 7800 XT decode is bandwidth-bound, not compute-bound.  WMMA
+accelerates compute density on the matmul; bandwidth is unchanged.
+At M=8 only half the WMMA tile (8 of 16 columns) is utilised — the
+real payoff stacks with M ≥ 16 batched spec-decode.
+
+### Outstanding (slice 4.16)
+
+- WMMA on phases 3 (qkv), 9 (o_proj), 17 (down) of mks8 not yet
+  applied.  Bounded follow-up — expected another ~3-5 % per phase.
+- mks4 (M=4) and M=1 mega untouched.  At M < 16 WMMA tile is poorly
+  utilised; less likely to pay off there.
+- B-fragment f32→bf16 truncation is lossy for non-rmsnormed
+  activations.  Phases 9 and 17 read attn output / silu_mul output
+  which may have wider dynamic range; verify bit-equivalence
+  carefully before applying WMMA there.

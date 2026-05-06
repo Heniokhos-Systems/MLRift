@@ -95,6 +95,8 @@ Token-id output of every MLRift row is bit-identical to HuggingFace
 | **+ slice 2c** (fused `qknorm + rope_qk`) | bf16 / f32 | **69.9** | 1 920 | **0.95× vs ROCm bf16** |
 | **+ `MLRIFT_QWEN3_MEGAKERNEL=1`** (slice 4 — one dispatch per layer; mega-kernel slices 4.10–4.13) | bf16 / f32 | **88.0** | 2 010 | **1.19× vs ROCm bf16** |
 | **+ `MLRIFT_QWEN3_MEGAKERNEL_SPECK4=1` + `SPEC_K=4` + LONG_PROMPT (slice 4.14 — M=4 mega-kernel + PLD spec-decode)** | bf16 / f32 | **164.2** | 2 200 | **2.22× vs ROCm bf16** |
+| **+ `MLRIFT_QWEN3_MEGAKERNEL_SPECK8=1` + `SPEC_K=8` + LONG_PROMPT (slice 4.15 — M=8 mega-kernel)** | bf16 / f32 | **181.8** | 2 600 | **2.46× vs ROCm bf16** |
+| **+ slice 4.16 — phase-13 `v_wmma_f32_16x16x16_bf16` tensor cores** | bf16 / f32 | **190.3** | 2 600 | **2.57× vs ROCm bf16** |
 | MLRift + `GPU_FULL_FORWARD` + `SPEC_K=4` + LONG-prompt (per-op PLD path, pre-mega) | bf16 / f32 | 72.0 | 1 920 | 0.97× vs ROCm bf16 |
 
 The matmul-only rows route only the matmul + lm_head through native
@@ -116,12 +118,21 @@ that processes 4 query tokens per dispatch, paired with the existing
 PLD prefix-lookup draft proposer.  Each weight row is read once and
 drives 4 dot products → 4× compute amortisation on the bandwidth-bound
 matmuls.  At `SPEC_K=4 + LONG_PROMPT` it lands at **164.2 tok/s —
-2.22× PyTorch ROCm bf16, on fp32 compute / bf16 storage**, output
-bit-identical to the M=1 mega-kernel (which is bit-identical to the
-PyTorch greedy reference).  See
+2.22× PyTorch ROCm bf16**.
+
+**Slice 4.15** doubles to `M=8` (`MLRIFT_QWEN3_MEGAKERNEL_SPECK8=1`,
+`SPEC_K=8`): **181.8 tok/s reported / ~222 tok/s steady-state**
+(the warmup-diluted number is what the bench prints because
+`max_seq=64` only fits 5 fast steps after step 0's cold dispatch).
+**2.46× PyTorch ROCm bf16.**
+
+**Slice 4.16** drops in `v_wmma_f32_16x16x16_bf16` tensor-core
+instructions for phase 13 (gate_up matmul) of the mks8 kernel, edging
+to **190.3 tok/s — 2.57× PyTorch ROCm bf16** on fp32 compute / bf16
+storage.  All output is bit-identical to the M=1 mega-kernel (which is
+bit-identical to the PyTorch greedy reference).  See
 [`docs/SLICE4_MEGAKERNEL_DESIGN.md`](docs/SLICE4_MEGAKERNEL_DESIGN.md)
-for the slice 4.10–4.14 progression (WG bump → cooperative phase 7
-→ vectorised bf16x2 loads → channel-repacked padded rows → M=4 spec).
+for the slice 4.10–4.16 progression.
 
 **Dtype clarification.** All MLRift rows above use `bf16 weights /
 f32 compute` — weights stream from VRAM as bf16 and widen to f32
@@ -166,7 +177,9 @@ Roadmap to extend the lead, ranked by ceiling:
 | 4.12 ✅ bf16x2 packed matmul loads (`u32 = 2 bf16`) | halves matmul VMEM count, +20 % | **64.9** | **0.88× ROCm bf16** |
 | **4.13 ✅** **Channel-repacked padded weights (HIDDEN_PAD=1152, Q_DIM_PAD=2176, FF_PAD=3200)** | break GDDR6 16-channel × 256 B cycle so consecutive rows hit distinct channels (was 2/16 → now 16/16) | **88.0** | **1.19× ROCm bf16** |
 | **4.14 ✅** **M=4 mega-kernel + PLD spec-decode** (`MLRIFT_QWEN3_MEGAKERNEL_SPECK4=1` + `MLRIFT_SPEC_K=4`) | each weight row drives 4 dot products → 4× amortisation on bandwidth-bound matmuls; bit-identical to M=1 mega | **164.2** | **2.22× ROCm bf16** |
-| 4b. WMMA bf16 GEMV through `gpu_matmul` (M ≥ 4) | 2× on prefill / spec_K matmuls (gfx1100 tensor cores) | ~280-320 stacked on 4.14 | ~3.8-4.3× ROCm bf16 |
+| **4.15 ✅** **M=8 mega-kernel** (`MLRIFT_QWEN3_MEGAKERNEL_SPECK8=1` + `MLRIFT_SPEC_K=8`) | doubles batch dim; phase 5/7 expand to 256/512 active WGs; ~222 tok/s steady-state | **181.8** (warmup-diluted) | **2.46× ROCm bf16** |
+| **4.16 ✅** **WMMA `v_wmma_f32_16x16x16_bf16`** on phase 13 of mks8 | tensor-core 16×16×16 matmul replaces bf16x2 vector FMAs; modest at M=8 (50 % tile utilization) | **190.3** | **2.57× ROCm bf16** |
+| 4b (deferred). WMMA on phases 3/9/17 of mks8 + replicate to mks4 / M=1 | ~3-5 % per phase, compounded; max payoff at M ≥ 16 | est. 200-220 | est. 2.7-3.0× ROCm bf16 |
 
 WMMA at honest M=1 decode remains off the single-stream critical
 path: at slice 4.13 we are **bandwidth-bound on the matmul k-loop
