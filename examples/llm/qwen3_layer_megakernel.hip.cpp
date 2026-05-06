@@ -55,7 +55,7 @@
 // LDS — only intra-phase reductions.  Inter-phase carries go through
 // global scratch (see kernel signature below).
 __shared__ float wave_tmp[1];     // single broadcast slot for rmsnorm scale
-__shared__ float attn_w_lds[64];  // slice 4.11 d2: cached softmax weights
+__shared__ float attn_w_lds[128]; // slice 4.17: max_seq 64 → 128 (cached softmax weights)
                                    // (one per pos≤63) so phase 7 pass 3
                                    // skips the redundant Q·K dot product
 

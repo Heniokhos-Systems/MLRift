@@ -33,7 +33,7 @@
 
 // LDS — small.  attn_w_lds now holds M_EFF×64 weights = 2 KB at M=8.
 __shared__ float wave_tmp[1];
-__shared__ float attn_w_lds[M_EFF * 64];
+__shared__ float attn_w_lds[M_EFF * 128];
 
 // WMMA fragment vector typedefs (gfx1100 wave32).
 typedef float  v8f  __attribute__((ext_vector_type(8)));
@@ -236,7 +236,7 @@ void phase7_attn_decode_speck8(unsigned int wg_id, unsigned int lane,
     for (int m = 0; m < M_EFF; m++) {
         unsigned long long pos_m = pos_base + (unsigned long long)m;
         const float *q = b_attn_q_g_8 + m * Q_DIM + q_head * HEAD_DIM;
-        float *w_lds = &attn_w_lds[m * 64];
+        float *w_lds = &attn_w_lds[m * 128];
 
         // Pass 1: max
         float max_v = -1e30f;
