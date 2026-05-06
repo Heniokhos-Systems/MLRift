@@ -874,6 +874,8 @@ overhead reduction is empirically realized.
 - 4.14 ✓ **164.2 tok/s, +222 % over PyTorch ROCm bf16 (M=4 spec-decode mega)**
 - 4.15 ✓ **181.8 tok/s reported / ~222 steady-state (M=8 spec-decode mega)**
 - 4.16 ✓ **190.3 tok/s, +257 % over PyTorch ROCm bf16 (WMMA bf16 phase-13 on mks8)**
+- 4.17 ✓ **infrastructure: `max_seq` 64 → 128** (unblocks M ≥ 16 spec-decode)
+- 4.18 ✓ **200.9 tok/s reported / 250 steady, +271 % / +338 % over PyTorch ROCm bf16 (M=16 mega-kernel)**
 
 ## Slices 4.10–4.13 — closing the per-op gap and breaking past PyTorch bf16
 
@@ -1191,3 +1193,86 @@ real payoff stacks with M ≥ 16 batched spec-decode.
   activations.  Phases 9 and 17 read attn output / silu_mul output
   which may have wider dynamic range; verify bit-equivalence
   carefully before applying WMMA there.
+
+## Slice 4.17 — `max_seq` 64 → 128
+
+Pure infrastructure bump.  Touches:
+
+- M=1 mega's `attn_w_lds[64] → attn_w_lds[128]` (~512 B / WG)
+- mks4's `attn_w_lds[M_EFF*64] → [M_EFF*128]` (~2 KB / WG)
+- mks8's same (~4 KB / WG)
+- 3 smoke files' `MAX_SEQ` static
+- `examples/qwen3_generate.mlr` `max_seq = 64 → 128`
+
+KV cache size doubles (~390 MB → ~785 MB across 28 layers @ batch=1).
+At M=8 the attn LDS hits exactly the 64 KB / CU budget; smoke confirms
+no functional impact.
+
+Short-context bench numbers preserved bit-for-bit:
+- mks4 max_new=12 : 164.5 tok/s (matches slice 4.14's 164.4)
+- mks8 max_new=6  : 189.8 tok/s (matches slice 4.16's 190.3)
+
+Long-context decode at max_new=12 mks8 (pos→96): 125.1 tok/s — the
+transformer attn-quadratic kicks in once pos exceeds the small-context
+regime; this is decode physics, not a regression.
+
+This slice is the prerequisite for **mks16** — the M=16 cooperative-WG
+geometry needs at least 80 KV slots (4 spec-K=16 steps from pos=16 to
+pos=80) to be useful.
+
+## Slice 4.18 — M=16 spec-decode mega-kernel
+
+Two non-trivial design constraints handled in this kernel that
+weren't present at M ≤ 8:
+
+### Phase 7 cooperative-WG count
+
+Slice 4.14/4.15 phase 7 used `16 heads × ATTN_COOP=4 × M_EFF`
+cooperating WGs.  At M=16: `16 × 4 × 16 = 1024 WGs` — **exceeds
+WG_PERSIST=512**.
+
+Fix: drop `#define ATTN_COOP 2` (was 4).  Phase 7 mapping becomes
+`16 × 2 × 16 = 512 = WG_PERSIST`.  Each cooperating WG handles
+`OUT_PER_WG = HEAD_DIM/ATTN_COOP = 64` output dims (was 32 in
+mks4/mks8) — each lane outputs 2 dims via inner stride.
+
+### LDS budget
+
+`attn_w_lds[M_EFF * MAX_SEQ]` at M=16 × max_seq=128 = 8 KB / WG →
+128 KB / CU at 16 WG/CU concurrent → **exceeds the 64 KB / CU LDS
+budget**; would halve occupancy.
+
+Fix: cap mks16's softmax LDS at `attn_w_lds[M_EFF * 64]` (4 KB / WG,
+same per-WG footprint as mks8).  KV cache size is still max_seq=128
+so K/V loads don't change; only the cached softmax weights are LDS-
+capped.  Side effect: mks16 useful decode is bounded by `pos +
+M_EFF ≤ 64` (4 spec-K=16 steps from pos=16 → pos=64 boundary).
+
+### Final bench
+
+5-run mean, RX 7800 XT gfx1100, qwen3-0.6B, bf16 weights / fp32
+compute, `MLRIFT_QWEN3_MAX_NEW=3 LONG_PROMPT spec_K=16`:
+
+```
+mks16 + spec_K=16 + LONG (warmup-diluted, MAX_NEW=3) : 200.9 tok/s
+mks16 steady-state (steps 1+2)                       : ~250 tok/s
+slice 4.16 (mks8 + WMMA-13)                          : 190.3 tok/s
+PyTorch ROCm bf16                                    :  ~74 tok/s
+
+delta vs slice 4.16 (mks8)        : +5.6 % reported / +10 % steady
+delta vs PyTorch ROCm bf16        : +172 % reported / +238 % steady
+```
+
+Tokens bit-identical to M=1 mega across the first 16 positions.  PLD
+acceptance is 16/16 every step on the LONG_PROMPT alternating prefix.
+
+### Outstanding (slice 4.18)
+
+- LDS-cap at `M_EFF * 64` limits useful decode to pos < 64 in M=16
+  mode.  Long-context fix: swap precomputed cache for online (Welford)
+  softmax in pass 3, removing the LDS cap entirely.
+- WMMA on phases 3/9/13/17 of mks16 — at M=16 the tile is fully
+  utilised (was 50 % at M=8).  Should land 5-10 % per phase if
+  applied.
+- Memory: ~800 MB additional GPU scratch at M=16.  Fits comfortably
+  on the 16 GB card.

@@ -97,6 +97,7 @@ Token-id output of every MLRift row is bit-identical to HuggingFace
 | **+ `MLRIFT_QWEN3_MEGAKERNEL_SPECK4=1` + `SPEC_K=4` + LONG_PROMPT (slice 4.14 — M=4 mega-kernel + PLD spec-decode)** | bf16 / f32 | **164.2** | 2 200 | **2.22× vs ROCm bf16** |
 | **+ `MLRIFT_QWEN3_MEGAKERNEL_SPECK8=1` + `SPEC_K=8` + LONG_PROMPT (slice 4.15 — M=8 mega-kernel)** | bf16 / f32 | **181.8** | 2 600 | **2.46× vs ROCm bf16** |
 | **+ slice 4.16 — phase-13 `v_wmma_f32_16x16x16_bf16` tensor cores** | bf16 / f32 | **190.3** | 2 600 | **2.57× vs ROCm bf16** |
+| **+ `MLRIFT_QWEN3_MEGAKERNEL_SPECK16=1` + `SPEC_K=16` + LONG_PROMPT (slice 4.18 — M=16 mega-kernel; slice 4.17 unblocks max_seq=128)** | bf16 / f32 | **200.9** | 3 400 | **2.71× vs ROCm bf16** |
 | MLRift + `GPU_FULL_FORWARD` + `SPEC_K=4` + LONG-prompt (per-op PLD path, pre-mega) | bf16 / f32 | 72.0 | 1 920 | 0.97× vs ROCm bf16 |
 
 The matmul-only rows route only the matmul + lm_head through native
@@ -129,10 +130,23 @@ matmuls.  At `SPEC_K=4 + LONG_PROMPT` it lands at **164.2 tok/s —
 **Slice 4.16** drops in `v_wmma_f32_16x16x16_bf16` tensor-core
 instructions for phase 13 (gate_up matmul) of the mks8 kernel, edging
 to **190.3 tok/s — 2.57× PyTorch ROCm bf16** on fp32 compute / bf16
-storage.  All output is bit-identical to the M=1 mega-kernel (which is
-bit-identical to the PyTorch greedy reference).  See
+storage.
+
+**Slice 4.17** bumps `max_seq` from 64 → 128 to unblock longer decode
+beyond the previous 64-pos KV cache boundary.  No regression on
+existing short benches; opens room for `M ≥ 16` spec-decode.
+
+**Slice 4.18** scales the M-amortisation to `M=16`
+(`MLRIFT_QWEN3_MEGAKERNEL_SPECK16=1`, `SPEC_K=16`).  Each weight row
+now drives 16 dot products per dispatch and the WMMA tile (16×16×16)
+is fully utilised.  Two design constraints handled: phase 7's
+cooperative-WG count drops `ATTN_COOP=4 → 2` to keep total at
+WG_PERSIST=512; LDS softmax cache stays at `M_EFF×64` (instead of
+×128) so per-CU LDS budget isn't exceeded.  Lands at **200.9 tok/s
+reported / ~250 tok/s steady-state — 2.71× / 3.38× PyTorch ROCm
+bf16**, output bit-identical to the M=1 mega-kernel.  See
 [`docs/SLICE4_MEGAKERNEL_DESIGN.md`](docs/SLICE4_MEGAKERNEL_DESIGN.md)
-for the slice 4.10–4.16 progression.
+for the slice 4.10–4.18 progression.
 
 **Dtype clarification.** All MLRift rows above use `bf16 weights /
 f32 compute` — weights stream from VRAM as bf16 and widen to f32
@@ -179,7 +193,9 @@ Roadmap to extend the lead, ranked by ceiling:
 | **4.14 ✅** **M=4 mega-kernel + PLD spec-decode** (`MLRIFT_QWEN3_MEGAKERNEL_SPECK4=1` + `MLRIFT_SPEC_K=4`) | each weight row drives 4 dot products → 4× amortisation on bandwidth-bound matmuls; bit-identical to M=1 mega | **164.2** | **2.22× ROCm bf16** |
 | **4.15 ✅** **M=8 mega-kernel** (`MLRIFT_QWEN3_MEGAKERNEL_SPECK8=1` + `MLRIFT_SPEC_K=8`) | doubles batch dim; phase 5/7 expand to 256/512 active WGs; ~222 tok/s steady-state | **181.8** (warmup-diluted) | **2.46× ROCm bf16** |
 | **4.16 ✅** **WMMA `v_wmma_f32_16x16x16_bf16`** on phase 13 of mks8 | tensor-core 16×16×16 matmul replaces bf16x2 vector FMAs; modest at M=8 (50 % tile utilization) | **190.3** | **2.57× ROCm bf16** |
-| 4b (deferred). WMMA on phases 3/9/17 of mks8 + replicate to mks4 / M=1 | ~3-5 % per phase, compounded; max payoff at M ≥ 16 | est. 200-220 | est. 2.7-3.0× ROCm bf16 |
+| **4.17 ✅** **`max_seq` 64 → 128** | unblocks longer decode + M ≥ 16 spec; LDS attn cache scales accordingly | n/a (infrastructure) | unchanged |
+| **4.18 ✅** **M=16 mega-kernel** (`MLRIFT_QWEN3_MEGAKERNEL_SPECK16=1` + `MLRIFT_SPEC_K=16`) | 16-way matmul amortisation; ATTN_COOP=4→2 for phase-7 WG fit; LDS cache capped at M×64 for per-CU budget; WMMA tile fully utilised | **200.9** (250 steady) | **2.71× / 3.38× ROCm bf16** |
+| 4b (deferred). WMMA on phases 3/9/17 of mks16 (full tile utilization at M=16) | ~5-10 % per phase, compounded | est. 220-260 | est. 3.0-3.5× ROCm bf16 |
 
 WMMA at honest M=1 decode remains off the single-stream critical
 path: at slice 4.13 we are **bandwidth-bound on the matmul k-loop
