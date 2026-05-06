@@ -142,10 +142,17 @@ fn qwen3_rmsnorm_eps_init() {
     if qwen3_rmsnorm_eps_bits != 0 { return }
     qwen3_rmsnorm_eps_bits = alloc(4)
     u64 p = qwen3_rmsnorm_eps_bits
-    // 1e-6f = 0x358637BD ≈ 9.999999e-7. Below was 0x35861861 in the
-    // previous code; both round to 1e-6 at f32 precision and match the
-    // PyTorch rms_norm_eps=1e-6 config identically.
-    u8 e0 = 0x61; u8 e1 = 0x18; u8 e2 = 0x86; u8 e3 = 0x35
+    // Default: 1e-6f = 0x358637BD ≈ 9.999999e-7 (Qwen3, Mistral, Phi-3).
+    // Override via qwen3_set_rmsnorm_eps_bits — Llama-3.x sets 0x3727C5AC
+    // for 1e-5f.
+    u64 bits = 0x358637BD
+    if qwen3_rmsnorm_eps_override_bits != 0 {
+        bits = qwen3_rmsnorm_eps_override_bits
+    }
+    u8 e0 = bits & 0xFF
+    u8 e1 = (bits >> 8) & 0xFF
+    u8 e2 = (bits >> 16) & 0xFF
+    u8 e3 = (bits >> 24) & 0xFF
     store8(p + 0, e0); store8(p + 1, e1); store8(p + 2, e2); store8(p + 3, e3)
     f32 e = 0.0f
     unsafe { *(p as f32) -> e }
@@ -273,6 +280,35 @@ fn qwen3_set_matmul_kind(u64 kind) { qwen3_matmul_kind = kind }
 static u64 qwen3_norm_kind = 0
 fn qwen3_set_norm_kind(u64 kind) { qwen3_norm_kind = kind }
 
+// Q/K-Norm gate. Qwen3 normalises each query / key head before RoPE
+// (Qwen3 paper §3.1); Llama / Mistral / Phi do not. Default 1 keeps
+// the existing Qwen3 behaviour. Llama callers set 0 before forward.
+static u64 qwen3_use_qknorm = 1
+fn qwen3_set_qknorm(u64 on) { qwen3_use_qknorm = on }
+
+// RoPE base (theta). Qwen3 ships theta = 1e6; Llama-3.x uses 5e5;
+// older Llama-2 / Mistral use 1e4; Phi-3 uses 1e4. Stored as integer
+// to avoid f64-static literal subtleties; widened with int_to_f64
+// at the call site.
+static u64 qwen3_rope_theta_int = 1000000
+fn qwen3_set_rope_base(u64 theta) { qwen3_rope_theta_int = theta }
+
+// Optional NTK-aware RoPE inv_freq scaling factors. Llama-3.1+ ships
+// a `rope_freqs.weight` tensor of length head_dim/2 holding f32
+// divisors that stretch high-frequency channels for extended context
+// (effectively YaRN with the long_factor / short_factor table folded
+// into one vector). When set, qwen3_rope_compute divides each per-i
+// inv_freq by qwen3_rope_freqs[i] before computing the angle. Default
+// 0 = identity (Qwen3 / Mistral / Phi-3 don't ship this tensor).
+static u64 qwen3_rope_freqs_ptr = 0
+fn qwen3_set_rope_freqs(u64 ptr) { qwen3_rope_freqs_ptr = ptr }
+
+// RMSNorm eps override. Default 1e-6 (Qwen3 family, Phi-3, Mistral);
+// Llama-3.x ships 1e-5 in its config. Pass the f32 bit pattern: e.g.
+// 1e-5f = 0x3727C5AC, 1e-6f = 0x358637BD.
+static u64 qwen3_rmsnorm_eps_override_bits = 0
+fn qwen3_set_rmsnorm_eps_bits(u64 bits) { qwen3_rmsnorm_eps_override_bits = bits }
+
 // Dispatch helper used by qwen3_forward_layer everywhere it used to call
 // matmul_bf16_weights_f32 directly. Q8_0 path ignores `use_kahan` (no
 // Kahan variant yet) — residual-stream drift at 14B hasn't been tuned.
@@ -360,6 +396,15 @@ fn qwen3_rope_compute(u64 cos_out, u64 sin_out, u64 position, u64 rope_dim, f64 
         f64 exponent = int_to_f64(2 * i) / int_to_f64(rope_dim)
         f64 denom = pow_f64(theta_base, exponent)
         f64 inv_freq = int_to_f64(1) / denom
+        // Llama-3.1+ NTK scaling: divide inv_freq by per-channel factor
+        // from rope_freqs.weight (1.0 for low-freq, up to 32.0 for high-
+        // freq on llama3.2-1b; matches llama.cpp's rope-freq-scale).
+        if qwen3_rope_freqs_ptr != 0 {
+            f32 scale_f32 = 0.0f
+            unsafe { *((qwen3_rope_freqs_ptr + i * 4) as f32) -> scale_f32 }
+            f64 scale_f64 = f32_to_f64(scale_f32)
+            inv_freq = inv_freq / scale_f64
+        }
         f64 angle = int_to_f64(position) * inv_freq
         f32 c = f64_to_f32(cos_f64(angle))
         f32 s = f64_to_f32(sin_f64(angle))
@@ -951,36 +996,40 @@ fn qwen3_forward_layer(u64 x_out, u64 x_in,
     // QK-Norm. BF16-norm models need a one-off widen of w.q_norm_w /
     // w.k_norm_w into an f32 scratch before the per-head RMSNorm. F32-
     // norm models (14B Q8_0) can point the RMSNorm at the weight
-    // directly — no widen, no scratch.
-    u64 qk_w_q = 0
-    u64 qk_w_k = 0
-    u64 qk_w_f32 = 0
-    if qwen3_norm_kind == 0 {
-        qk_w_f32 = alloc(hd * 4)
-        qwen3_bf16_row_to_f32(qk_w_f32, w.q_norm_w, hd)
-        qk_w_q = qk_w_f32
-    } else {
-        qk_w_q = w.q_norm_w
-    }
+    // directly — no widen, no scratch. Llama/Mistral/Phi skip the
+    // entire block via qwen3_set_qknorm(0).
     u64 h = 0
-    while h < nh {
-        u64 q_slice = q_buf + h * hd * 4
-        qwen3_rmsnorm_f32_weights(q_slice, q_slice, qk_w_q, hd)
-        h = h + 1
+    if qwen3_use_qknorm != 0 {
+        u64 qk_w_q = 0
+        u64 qk_w_k = 0
+        u64 qk_w_f32 = 0
+        if qwen3_norm_kind == 0 {
+            qk_w_f32 = alloc(hd * 4)
+            qwen3_bf16_row_to_f32(qk_w_f32, w.q_norm_w, hd)
+            qk_w_q = qk_w_f32
+        } else {
+            qk_w_q = w.q_norm_w
+        }
+        h = 0
+        while h < nh {
+            u64 q_slice = q_buf + h * hd * 4
+            qwen3_rmsnorm_f32_weights(q_slice, q_slice, qk_w_q, hd)
+            h = h + 1
+        }
+        if qwen3_norm_kind == 0 {
+            qwen3_bf16_row_to_f32(qk_w_f32, w.k_norm_w, hd)
+            qk_w_k = qk_w_f32
+        } else {
+            qk_w_k = w.k_norm_w
+        }
+        h = 0
+        while h < nkv {
+            u64 k_slice = k_row + h * hd * 4
+            qwen3_rmsnorm_f32_weights(k_slice, k_slice, qk_w_k, hd)
+            h = h + 1
+        }
+        if qwen3_norm_kind == 0 { dealloc(qk_w_f32) }
     }
-    if qwen3_norm_kind == 0 {
-        qwen3_bf16_row_to_f32(qk_w_f32, w.k_norm_w, hd)
-        qk_w_k = qk_w_f32
-    } else {
-        qk_w_k = w.k_norm_w
-    }
-    h = 0
-    while h < nkv {
-        u64 k_slice = k_row + h * hd * 4
-        qwen3_rmsnorm_f32_weights(k_slice, k_slice, qk_w_k, hd)
-        h = h + 1
-    }
-    if qwen3_norm_kind == 0 { dealloc(qk_w_f32) }
     // qwen3_dump5("q_norm", q_buf)
     // qwen3_dump5("q_norm_h0_64", q_buf + 64 * 4)
     // qwen3_dump5("q_norm_h1", q_buf + 128 * 4)
@@ -996,7 +1045,7 @@ fn qwen3_forward_layer(u64 x_out, u64 x_in,
         qwen3_rope_sin_cache = alloc((hd / 2) * 4)
     }
     if qwen3_rope_cache_pos != pos {
-        f64 theta = 1000000.0
+        f64 theta = int_to_f64(qwen3_rope_theta_int)
         qwen3_rope_compute(qwen3_rope_cos_cache, qwen3_rope_sin_cache, pos, hd, theta)
         qwen3_rope_cache_pos = pos
     }

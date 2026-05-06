@@ -1,0 +1,350 @@
+// Llama-3.2-1B greedy decode — first non-Qwen3 LLM through the MLRift
+// pipeline. Reads the GGUF blob that `ollama pull llama3.2:1b` left on
+// disk and runs CPU greedy decode through std/qwen3.mlr's forward path
+// with three arch knobs flipped:
+//
+//   qwen3_set_qknorm(0)       Llama-3 has no per-head Q/K RMSNorm.
+//   qwen3_set_rope_base(500000)  Llama-3 RoPE theta is 5e5 (Qwen3 = 1e6).
+//   qwen3_set_arch(2048, 64, 32, 8, 8192)
+//                              hidden=2048, head_dim=64, n_heads=32,
+//                              n_kv_heads=8 (GQA 4:1), ff=8192.
+//
+// Llama-3.2-1B specifics (from GGUF metadata):
+//   architecture            = llama
+//   layers                  = 16
+//   embedding_length        = 2048
+//   feed_forward_length     = 8192
+//   attention.head_count    = 32
+//   attention.head_count_kv = 8
+//   attention.key_length    = 64       (head_dim, full RoPE)
+//   attention.layer_norm_rms_epsilon = 1e-5
+//   rope.freq_base          = 500000.0
+//   vocab_size              = 128256
+//   tokenizer.ggml.bos      = 128000
+//   tokenizer.ggml.eos      = 128009
+//   tie_word_embeddings     = true     (no separate output.weight)
+//   quantization            = Q8_0
+//
+// Tensor naming (Llama GGUF convention — same as Qwen3-14B Q8_0):
+//   blk.N.attn_norm / attn_q / attn_k / attn_v / attn_output
+//   blk.N.ffn_norm / ffn_gate / ffn_up / ffn_down
+//   token_embd / output_norm           (no output.weight — tied)
+//
+// First-cut bench: hardcoded seed token id 15339 ("hello" in the Llama-3
+// tiktoken vocab), 20-token greedy decode, print token IDs only. Cross-
+// reference against `ollama run llama3.2:1b "hello"` greedy output for
+// correctness validation. Tokenizer integration is a follow-up slice.
+//
+// Build:
+//   ./build/mlrc --emit=elfexe examples/llama3_generate.mlr -o /tmp/llama32_1b
+//   /tmp/llama32_1b
+
+import "../std/qwen3.mlr"
+import "../std/gguf.mlr"
+import "../std/matmul.mlr"
+import "../std/inference.mlr"
+import "../std/io.mlr"
+import "../std/fmt.mlr"
+import "../std/string.mlr"
+import "../std/thread.mlr"
+import "../std/time.mlr"
+
+static u64 g_fd = 0
+fn eout(u64 s) {
+    print_str(s)
+    if g_fd != 0 {
+        u64 n = str_len(s)
+        file_write(g_fd, s, n)
+    }
+}
+fn eu64(u64 v) {
+    u64 s = fmt_dec(v)
+    eout(s)
+    dealloc(s)
+}
+
+fn main() {
+    u64 num_workers = 16
+    thread_pool_init(num_workers)
+    g_fd = file_open("/tmp/llama32_1b_gen.out", 1)
+
+    // --- Reconfigure qwen3.mlr for Llama-3.2-1B Q8_0 ---
+    qwen3_set_arch(2048, 64, 32, 8, 8192)   // hidden, head_dim, nh, nkv, ff
+    qwen3_set_matmul_kind(1)                // Q8_0
+    qwen3_set_norm_kind(1)                  // F32 norms (Llama)
+    qwen3_set_fuse_qkv(0)                   // no weight duplication
+    qwen3_set_qknorm(0)                     // Llama: no per-head Q/K RMSNorm
+    qwen3_set_rope_base(500000)             // Llama-3.x theta = 5e5
+    qwen3_set_rmsnorm_eps_bits(0x3727C5AC)  // Llama: rms_norm_eps = 1e-5 (Qwen3 = 1e-6)
+
+    u64 path = "/usr/share/ollama/.ollama/models/blobs/sha256-74701a8c35f6c8d9a4b91f3f3497643001d63e0c7a84e085bed452548fa88d45"
+    eout("[llama32_1b] loading weights from ollama blob\n")
+    u64 load_start_ns = time_now()
+    GGUFFile gf = gguf_open(path)
+    if gf.file_size == 0 {
+        eout("open fail\n")
+        thread_pool_shutdown(); file_close(g_fd); exit(1)
+    }
+
+    u64 hidden    = QWEN3_HIDDEN
+    u64 kv_dim    = QWEN3_KV_DIM
+    u64 n_layers  = 16
+    u64 vocab     = 128256
+    u64 max_seq   = 64        // tight; bench is short
+    u64 max_new   = 20
+
+    // ---- Get top-level tensors ----
+    GGUFTensor embed_t = gguf_get(gf, "token_embd.weight")
+    if embed_t.ptr == 0 {
+        eout("missing token_embd.weight\n")
+        gguf_free(gf); thread_pool_shutdown(); file_close(g_fd); exit(1)
+    }
+    GGUFTensor norm_t = gguf_get(gf, "output_norm.weight")
+    if norm_t.ptr == 0 {
+        eout("missing output_norm.weight\n")
+        gguf_free(gf); thread_pool_shutdown(); file_close(g_fd); exit(1)
+    }
+    // Llama-3.2-1B has tie_word_embeddings=true, so the lm_head matmul
+    // reuses token_embd.weight directly. matmul_q8_0_weights_f32 reads
+    // a [N=vocab, K=hidden] Q8_0 row-blocked tensor; token_embd's shape
+    // is exactly [hidden, vocab] in GGUF dim order, which matches our
+    // expected [vocab, hidden] row-major layout (vocab as the outer dim
+    // means each "row" is one token's hidden-dim embedding, exactly
+    // what the lm_head matmul wants for c[v] = embed[v, :] @ x).
+    u64 lmhead_ptr = embed_t.ptr
+
+    // Llama-3.1+ ships rope_freqs.weight (head_dim/2 = 32 f32 entries)
+    // for NTK-aware long-context inv_freq scaling. Wire it through; on
+    // llama3.2-1b the values are [1×15, 1.65, 3.29, 9.67, 32×14] which
+    // stretch the highest-frequency channels by 32× for the extended
+    // 128k context. Without this, even pos=1 RoPE differs from
+    // llama.cpp / Ollama and decoded tokens diverge after the first.
+    GGUFTensor rope_freqs_t = gguf_get(gf, "rope_freqs.weight")
+    if rope_freqs_t.ptr != 0 {
+        qwen3_set_rope_freqs(rope_freqs_t.ptr)
+        eout("[llama32_1b] rope_freqs.weight wired (NTK-scaled inv_freq)\n")
+    }
+
+    // Per-layer weight pointer table. 11 u64 pointers × 8 = 88 bytes
+    // (matches Qwen3LayerWeights). Slots 4 (q_norm) and 5 (k_norm) stay
+    // at 0 — Llama has no qknorm and qwen3_set_qknorm(0) gates the
+    // forward path so the null pointers are never dereferenced.
+    u64 layers_arr = alloc(n_layers * 88)
+    u64 li = 0
+    while li < n_layers {
+        u64 base = layers_arr + li * 88
+        u64 li_s = fmt_dec(li)
+        u64 pre0 = str_cat("blk.", li_s)
+        u64 prefix = str_cat(pre0, ".")
+        dealloc(li_s); dealloc(pre0)
+
+        u64 n01 = str_cat(prefix, "attn_norm.weight")
+        GGUFTensor t01 = gguf_get(gf, n01)
+        unsafe { *((base + 0 * 8) as u64) = t01.ptr }
+        dealloc(n01)
+
+        u64 n02 = str_cat(prefix, "attn_q.weight")
+        GGUFTensor t02 = gguf_get(gf, n02)
+        unsafe { *((base + 1 * 8) as u64) = t02.ptr }
+        dealloc(n02)
+
+        u64 n03 = str_cat(prefix, "attn_k.weight")
+        GGUFTensor t03 = gguf_get(gf, n03)
+        unsafe { *((base + 2 * 8) as u64) = t03.ptr }
+        dealloc(n03)
+
+        u64 n04 = str_cat(prefix, "attn_v.weight")
+        GGUFTensor t04 = gguf_get(gf, n04)
+        unsafe { *((base + 3 * 8) as u64) = t04.ptr }
+        dealloc(n04)
+
+        // Slots 4 (q_norm), 5 (k_norm) — leave at 0 for Llama.
+        unsafe { *((base + 4 * 8) as u64) = 0 }
+        unsafe { *((base + 5 * 8) as u64) = 0 }
+
+        u64 n07 = str_cat(prefix, "attn_output.weight")
+        GGUFTensor t07 = gguf_get(gf, n07)
+        unsafe { *((base + 6 * 8) as u64) = t07.ptr }
+        dealloc(n07)
+
+        u64 n08 = str_cat(prefix, "ffn_norm.weight")
+        GGUFTensor t08 = gguf_get(gf, n08)
+        unsafe { *((base + 7 * 8) as u64) = t08.ptr }
+        dealloc(n08)
+
+        u64 n09 = str_cat(prefix, "ffn_gate.weight")
+        GGUFTensor t09 = gguf_get(gf, n09)
+        unsafe { *((base + 8 * 8) as u64) = t09.ptr }
+        dealloc(n09)
+
+        u64 n10 = str_cat(prefix, "ffn_up.weight")
+        GGUFTensor t10 = gguf_get(gf, n10)
+        unsafe { *((base + 9 * 8) as u64) = t10.ptr }
+        dealloc(n10)
+
+        u64 n11 = str_cat(prefix, "ffn_down.weight")
+        GGUFTensor t11 = gguf_get(gf, n11)
+        unsafe { *((base + 10 * 8) as u64) = t11.ptr }
+        dealloc(n11)
+
+        dealloc(prefix)
+        li = li + 1
+    }
+    u64 load_elapsed_ns = time_elapsed(load_start_ns)
+    eout("[llama32_1b] 16 layers indexed; load_ms=")
+    eu64(load_elapsed_ns / 1000000); eout("\n")
+
+    // ---- KV cache + scratch buffers ----
+    u64 kv_row_bytes = kv_dim * 4
+    u64 layer_stride = max_seq * kv_row_bytes
+    u64 total_cache  = n_layers * layer_stride
+    u64 k_cache = alloc(total_cache)
+    u64 v_cache = alloc(total_cache)
+    eout("[llama32_1b] KV cache allocated (")
+    eu64(total_cache * 2); eout(" bytes)\n")
+
+    u64 x_cur     = alloc(hidden * 4)
+    u64 x_nxt     = alloc(hidden * 4)
+    u64 final_out = alloc(hidden * 4)
+    u64 logits    = alloc(vocab * 4)
+
+    // Per-row Q8_0 decode geometry for the embedding lookup.
+    u64 embed_base = embed_t.ptr
+    u64 row_blocks = hidden / 32
+    u64 row_bytes  = row_blocks * 34
+    eout("[llama32_1b] embed row decoded on demand ("); eu64(row_bytes); eout(" B/row)\n")
+
+    // ---- Hardcoded prompt (no tokenizer integration this slice) ----
+    // Llama-3 chat models implicitly prepend BOS=128000 to plain text
+    // (Ollama's raw=true mode does this too — `prompt_eval_count: 2` for
+    // a 1-character prompt confirms it). Feed [BOS, hello] so our pos-0
+    // K/V matches the reference exactly. 15339 = "hello".
+    u64 prompt_count = 2
+    u64 seq_cap = prompt_count + max_new
+    u64 seq_ids32 = alloc(seq_cap * 4)
+    u32 t0 = 128000   // BOS
+    u32 t1 = 15339    // "hello"
+    unsafe { *((seq_ids32 + 0 * 4) as uint32) = t0 }
+    unsafe { *((seq_ids32 + 1 * 4) as uint32) = t1 }
+    u64 seq_len = prompt_count
+
+    eout("[llama32_1b] prompt_tokens="); eu64(prompt_count); eout(" ids=[128000, 15339] (\"<|begin_of_text|>hello\")\n")
+
+    // ---- Prompt prefill: every prompt token except the last needs the
+    // layer stack run over it so its K/V is cached. The LAST prompt
+    // token's forward pass produces the first generation logits, so we
+    // fold that into the decode loop (step 0). ----
+    u64 pos = 0
+    u64 prefill_start_ns = time_now()
+    while pos + 1 < prompt_count {
+        u32 pt32 = 0
+        unsafe { *((seq_ids32 + pos * 4) as uint32) -> pt32 }
+        u64 pt = pt32
+        gguf_deq_q8_0(x_cur, embed_base + pt * row_bytes, hidden)
+        u64 layer = 0
+        while layer < n_layers {
+            Qwen3LayerWeights w = layers_arr + layer * 88
+            u64 kc = k_cache + layer * layer_stride
+            u64 vc = v_cache + layer * layer_stride
+            qwen3_forward_layer(x_nxt, x_cur, w, pos, kc, vc, num_workers)
+            u64 tmp = x_cur
+            x_cur = x_nxt
+            x_nxt = tmp
+            layer = layer + 1
+        }
+        pos = pos + 1
+    }
+    u64 prefill_ns = time_elapsed(prefill_start_ns)
+    eout("[llama32_1b] prefill_ms="); eu64(prefill_ns / 1000000); eout("\n")
+
+    // Load the last prompt token's embedding — the decode loop will run
+    // its forward pass as step 0 and argmax the result.
+    u32 last_pt32 = 0
+    unsafe { *((seq_ids32 + (prompt_count - 1) * 4) as uint32) -> last_pt32 }
+    u64 last_pt = last_pt32
+    gguf_deq_q8_0(x_cur, embed_base + last_pt * row_bytes, hidden)
+
+    u64 step = 0
+    u64 decode_start_ns = time_now()
+    while step < max_new {
+        u64 step_start_ns = time_now()
+        eout("step "); eu64(step); eout(" pos="); eu64(pos); eout("\n")
+
+        u64 layer = 0
+        while layer < n_layers {
+            Qwen3LayerWeights w = layers_arr + layer * 88
+            u64 kc = k_cache + layer * layer_stride
+            u64 vc = v_cache + layer * layer_stride
+            qwen3_forward_layer(x_nxt, x_cur, w, pos, kc, vc, num_workers)
+            u64 tmp = x_cur
+            x_cur = x_nxt
+            x_nxt = tmp
+            layer = layer + 1
+        }
+
+        // Final F32 RMSNorm + lm_head against the tied embedding matrix.
+        qwen3_rmsnorm_f32_weights(final_out, x_cur, norm_t.ptr, hidden)
+        matmul_q8_0_weights_f32(logits, final_out, lmhead_ptr, 1, vocab, hidden, num_workers)
+
+        // Greedy argmax.
+        u64 best_id = 0
+        f32 best_val = 0.0f
+        u64 first = 1
+        u64 j = 0
+        while j < vocab {
+            f32 v = 0.0f
+            unsafe { *((logits + j * 4) as f32) -> v }
+            if first == 1 {
+                best_val = v; best_id = j; first = 0
+            } else {
+                if v > best_val { best_val = v; best_id = j }
+            }
+            j = j + 1
+        }
+        u64 step_elapsed_ns = time_elapsed(step_start_ns)
+        eout("  -> next_id = "); eu64(best_id); eout(" logit=")
+        u64 lvs = fmt_f32(best_val, 4); eout(lvs); dealloc(lvs)
+        eout(" step_ms="); eu64(step_elapsed_ns / 1000000); eout("\n")
+
+        u32 best_id32 = best_id
+        unsafe { *((seq_ids32 + seq_len * 4) as uint32) = best_id32 }
+        seq_len = seq_len + 1
+
+        gguf_deq_q8_0(x_cur, embed_base + best_id * row_bytes, hidden)
+        pos = pos + 1
+        step = step + 1
+    }
+    u64 total_decode_ns = time_elapsed(decode_start_ns)
+    u64 total_ms = total_decode_ns / 1000000
+    u64 tokps_milli = 0
+    if total_decode_ns != 0 {
+        tokps_milli = (max_new * 1000 * 1000000000) / total_decode_ns
+    }
+
+    eout("\n=== GENERATED IDs ===\n")
+    u64 gi = 0
+    while gi < seq_len {
+        if gi != 0 { eout(", ") }
+        u32 gid32 = 0
+        unsafe { *((seq_ids32 + gi * 4) as uint32) -> gid32 }
+        u64 gid = gid32
+        eu64(gid)
+        gi = gi + 1
+    }
+    eout("\n")
+
+    eout("\n=== TIMING ===\n")
+    eout("prompt_tokens="); eu64(prompt_count); eout("\n")
+    eout("prefill_ms="); eu64(prefill_ns / 1000000); eout("\n")
+    eout("total_decode_ms="); eu64(total_ms); eout("\n")
+    eout("tokens_per_sec_x1000="); eu64(tokps_milli); eout("\n")
+    eout("tokens_generated="); eu64(max_new); eout("\n")
+
+    dealloc(x_cur); dealloc(x_nxt); dealloc(final_out); dealloc(logits)
+    dealloc(seq_ids32); dealloc(layers_arr)
+    dealloc(k_cache); dealloc(v_cache)
+    gguf_free(gf)
+    thread_pool_shutdown()
+    file_close(g_fd)
+    exit(0)
+}
