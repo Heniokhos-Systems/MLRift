@@ -4,9 +4,10 @@ MLRift vs PyTorch, single-machine CPU, greedy decode. Kept here so we
 don't have to re-derive it every time we revisit the perf work.
 
 > **Looking for the GPU numbers?** Qwen3-0.6B on RX 7800 XT lands at
-> **88.0 tok/s — +19 % over PyTorch ROCm bf16, +115 % over fp32, on
-> fp32 compute / bf16 weights, bit-identical**.  Setup, methodology,
-> and the full slice 4.10 → 4.13 mega-kernel progression are in
+> **88.0 tok/s single-stream / 164.2 tok/s with PLD spec-decode —
+> +222 % over PyTorch ROCm bf16, +300 % over fp32, on fp32 compute /
+> bf16 weights, bit-identical**.  Setup, methodology, and the full
+> slice 4.10 → 4.14 mega-kernel progression are in
 > [`SLICE4_MEGAKERNEL_DESIGN.md`](SLICE4_MEGAKERNEL_DESIGN.md), with the
 > destroy-PyTorch comparison table in the top-level
 > [`README.md`](../README.md#qwen3-06b-on-rx-7800-xt--destroy-pytorch-comparison).

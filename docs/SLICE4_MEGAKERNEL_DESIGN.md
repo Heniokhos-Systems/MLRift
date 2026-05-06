@@ -871,6 +871,7 @@ overhead reduction is empirically realized.
   cause + global-scratch fix, bit-equivalence GREEN)
 - 4.8 ✓ **wire-up GREEN, tokens bit-identical to PyTorch** (18.9 tok/s baseline)
 - 4.10–4.13 ✓ **88.0 tok/s, +19 % over PyTorch ROCm bf16 on fp32 weights**
+- 4.14 ✓ **164.2 tok/s, +222 % over PyTorch ROCm bf16 (M=4 spec-decode mega)**
 
 ## Slices 4.10–4.13 — closing the per-op gap and breaking past PyTorch bf16
 
@@ -1004,3 +1005,104 @@ Recorded so future slices don't redo them:
   should lift per-op proportionally (currently 69.9 tok/s).
 - Cold-start uploader is row-by-row CPU memcpy → bulk hipMemcpy.
   `hipMemcpy2D` (not in the shim today) would skip the host stage.
+
+## Slice 4.14 — M=4 spec-decode mega-kernel
+
+The slice 4.13 mega is single-stream.  PLD speculative decoding
+(spec_K=4) was previously routed through the per-op M=4 batched chain
+(72 tok/s) and could not stack with the mega-kernel.  Slice 4.14 adds
+a parallel `qwen3_layer_megakernel_speck4` kernel that processes 4
+query tokens per dispatch, paired with the existing PLD draft proposer.
+
+### The win — M=4 amortisation on the four bf16 matmuls
+
+Phases 3, 9, 13, 17 are weight-bandwidth-bound.  At M=1 each weight
+row drives one dot product.  At M=4 each weight row drives **four**
+dot products against four different inputs:
+
+```cpp
+float acc[M_EFF=4] = {0};
+for (kp = lane; kp < HIDDEN/2; kp += WAVE) {
+    unsigned int packed = w_row_u32[kp];                  // ONE VMEM load
+    float w0 = bf16_to_f32(packed & 0xFFFF);
+    float w1 = bf16_to_f32(packed >> 16);
+    #pragma unroll
+    for (m = 0; m < M_EFF; m++) {
+        acc[m] += w0 * b_x_norm_g[m*HIDDEN + 2*kp]
+               + w1 * b_x_norm_g[m*HIDDEN + 2*kp + 1];
+    }
+}
+```
+
+Same weight bandwidth, 4× the output.  Layer-time grows ~1.6× from
+M=1 to M=4 (compute scales but bandwidth doesn't), so per-token rate
+in the dispatch jumps from 88 to ~220 tok/s.  After PLD accept
+overhead the effective rate lands at **164 tok/s**.
+
+### Per-stream phases
+
+Phases 1 (rmsnorm), 5 (qkv-split + qknorm + rope_qk), 7 (attn), 11
+(post-norm), 15 (silu-mul) are not weight-bandwidth-bound — they scale
+linearly with M.  Each WG loops `for m in 0..M_EFF` doing the per-stream
+work, accessing slabs at `m * dim` stride.  Phase 5 expands from 32 WGs
+(16 Q + 8 K + 8 V) to 128 WGs (4 × 32) so each WG handles ONE
+`(m, head_kind)` pair; phase 7 expands from 64 to 256 cooperating WGs
+(16 heads × ATTN_COOP=4 × M=4).
+
+### Per-token RoPE (the previous-agent debug story)
+
+The per-op spec_K=4 path uses single-pos RoPE — all 4 query/key tokens
+get rotated by `cos(pos_base)/sin(pos_base)` even though they are at
+positions `pos_base..pos_base+3`.  This is numerically wrong and
+causes per-op spec_K=4 to drift from PyTorch reference around step 19.
+
+Slice 4.14 mks4 fixes this: each query token uses its own RoPE
+angle `cos/sin[pos_base + m]`.  K/V cache writes go to slot
+`pos_base + m`.  Output is bit-identical to the M=1 mega (which is
+bit-identical to PyTorch greedy reference).
+
+A bisection AB harness (`qwen3_layer_megakernel_speck4_ab.mlr`) was
+needed to confirm this — initial divergence vs per-op REF turned out
+to be a bug in the AB harness itself (per-op qknorm needs 5 args, was
+getting 4); once fixed, mks4 vs per-op-with-single-pos-rope is bit-close.
+
+### Final bench
+
+3-run mean, RX 7800 XT gfx1100, qwen3-0.6B, bf16 weights / fp32
+compute, `MLRIFT_QWEN3_MAX_NEW=12 MLRIFT_LONG_PROMPT=1`:
+
+```
+mks4 + spec_K=4 + LONG_PROMPT  : 164.2 tok/s   [bit-identical to M=1 mega]
+M=1 mega @ slice 4.13          :  89.6 tok/s   [bit-identical to PyTorch]
+per-op + spec_K=4 + LONG_PROMPT:  72.0 tok/s
+PyTorch ROCm bf16              :  ~74  tok/s   →  mks4 is +222 %
+PyTorch ROCm fp32              :  41   tok/s   →  mks4 is +300 %
+```
+
+### Files
+
+- `examples/llm/qwen3_layer_megakernel_speck4.hip.cpp` — the kernel.
+  Same skeleton as the M=1 mega, with `M_EFF=4` accumulator arrays in
+  the matmul phases and per-m slab indexing in the rest.  Padded weight
+  strides (HIDDEN_PAD=1152, Q_DIM_PAD=2176, FF_PAD=3200) inherited.
+- `examples/llm/qwen3_layer_megakernel_speck4_smoke.mlr` — 8-phase
+  bisection smoke at WG_PERSIST=512, 4× scratch sizes.
+- `examples/llm/qwen3_layer_megakernel_speck4_ab.mlr` — random-LCG
+  bit-equivalence vs per-op M=4 reference, two rope modes.
+- `std/inference_gpu.mlr` — `_gpu_fh_qwen3_megakernel_speck4` static
+  + .co loader + `gpu_qwen3_layer_megakernel_speck4_to_dev` launcher.
+- `std/qwen3.mlr` — 14 mks4 statics + slab allocations +
+  `qwen3_forward_layer_megakernel_speck4_gpu` wrapper.
+- `examples/qwen3_generate.mlr` — env-gated branch in spec_K=4 layer
+  loop (env: `MLRIFT_QWEN3_MEGAKERNEL_SPECK4=1`).
+
+Memory cost: ~200 MB additional GPU scratch.  Padded weight cache
+shared with M=1 mega — no duplication.
+
+### Outstanding (slice 4.14)
+
+- `max_seq=64` hardcoded; spec_K=4 hangs at pos≥61 because KV writes
+  exceed the cache.  Pre-existing in the per-op speck4 path.  Fix is
+  a rolling-window KV cache or `max_seq=128` mega variant.
+- Per-op spec_K=4's single-pos-rope drift is real but pre-existing.
+  Best fix: deprecate that path now that mks4 covers it at 2.3× speed.

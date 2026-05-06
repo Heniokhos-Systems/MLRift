@@ -94,7 +94,8 @@ Token-id output of every MLRift row is bit-identical to HuggingFace
 | **+ `MLRIFT_GPU_MATMUL_BF16=0`** (slice 3 — pure fp32 weights) | f32 / f32 | **56.1** | 2 480 | **1.35× vs ROCm fp32** |
 | **+ slice 2c** (fused `qknorm + rope_qk`) | bf16 / f32 | **69.9** | 1 920 | **0.95× vs ROCm bf16** |
 | **+ `MLRIFT_QWEN3_MEGAKERNEL=1`** (slice 4 — one dispatch per layer; mega-kernel slices 4.10–4.13) | bf16 / f32 | **88.0** | 2 010 | **1.19× vs ROCm bf16** |
-| **MLRift + `GPU_FULL_FORWARD` + `SPEC_K=4` + LONG-prompt (PLD)** | bf16 / f32 | **87.5** | 1 920 | **1.19× vs ROCm bf16** |
+| **+ `MLRIFT_QWEN3_MEGAKERNEL_SPECK4=1` + `SPEC_K=4` + LONG_PROMPT (slice 4.14 — M=4 mega-kernel + PLD spec-decode)** | bf16 / f32 | **164.2** | 2 200 | **2.22× vs ROCm bf16** |
+| MLRift + `GPU_FULL_FORWARD` + `SPEC_K=4` + LONG-prompt (per-op PLD path, pre-mega) | bf16 / f32 | 72.0 | 1 920 | 0.97× vs ROCm bf16 |
 
 The matmul-only rows route only the matmul + lm_head through native
 gfx1100 ISA; qknorm, rope, attn, residuals still run CPU.  The
@@ -108,10 +109,19 @@ on that workload.
 The **mega-kernel** (`MLRIFT_QWEN3_MEGAKERNEL=1`) collapses the 28-layer
 chain into one dispatch per layer (29 launches/token vs the per-op chain's
 310) and lands at **88.0 tok/s — +19 % over PyTorch ROCm bf16 on fp32
-weights**, bit-identical to the reference.  See
+weights**, bit-identical to the reference.
+
+**Slice 4.14** adds an `M=4` variant (`MLRIFT_QWEN3_MEGAKERNEL_SPECK4=1`)
+that processes 4 query tokens per dispatch, paired with the existing
+PLD prefix-lookup draft proposer.  Each weight row is read once and
+drives 4 dot products → 4× compute amortisation on the bandwidth-bound
+matmuls.  At `SPEC_K=4 + LONG_PROMPT` it lands at **164.2 tok/s —
+2.22× PyTorch ROCm bf16, on fp32 compute / bf16 storage**, output
+bit-identical to the M=1 mega-kernel (which is bit-identical to the
+PyTorch greedy reference).  See
 [`docs/SLICE4_MEGAKERNEL_DESIGN.md`](docs/SLICE4_MEGAKERNEL_DESIGN.md)
-for the slice 4.10–4.13 progression (WG bump → cooperative phase 7
-→ vectorised bf16x2 loads → channel-repacked padded rows).
+for the slice 4.10–4.14 progression (WG bump → cooperative phase 7
+→ vectorised bf16x2 loads → channel-repacked padded rows → M=4 spec).
 
 **Dtype clarification.** All MLRift rows above use `bf16 weights /
 f32 compute` — weights stream from VRAM as bf16 and widen to f32
@@ -155,7 +165,8 @@ Roadmap to extend the lead, ranked by ceiling:
 | 4.11 ✅ Cooperative phase 7 (ATTN_COOP=4) + cached softmax LDS + dropped trailing fence | 4 WGs/head, 32-dim/lane pass 3; weights cached, no Q·K redo; mega ≈ per-op | **54.1** | **1.30× ROCm fp32** |
 | 4.12 ✅ bf16x2 packed matmul loads (`u32 = 2 bf16`) | halves matmul VMEM count, +20 % | **64.9** | **0.88× ROCm bf16** |
 | **4.13 ✅** **Channel-repacked padded weights (HIDDEN_PAD=1152, Q_DIM_PAD=2176, FF_PAD=3200)** | break GDDR6 16-channel × 256 B cycle so consecutive rows hit distinct channels (was 2/16 → now 16/16) | **88.0** | **1.19× ROCm bf16** |
-| 4b. WMMA bf16 GEMV through `gpu_matmul` (M ≥ 4) | 2× on prefill / spec_K matmuls (gfx1100 tensor cores) | 100–120 PLD | 1.4–1.6× ROCm bf16 |
+| **4.14 ✅** **M=4 mega-kernel + PLD spec-decode** (`MLRIFT_QWEN3_MEGAKERNEL_SPECK4=1` + `MLRIFT_SPEC_K=4`) | each weight row drives 4 dot products → 4× amortisation on bandwidth-bound matmuls; bit-identical to M=1 mega | **164.2** | **2.22× ROCm bf16** |
+| 4b. WMMA bf16 GEMV through `gpu_matmul` (M ≥ 4) | 2× on prefill / spec_K matmuls (gfx1100 tensor cores) | ~280-320 stacked on 4.14 | ~3.8-4.3× ROCm bf16 |
 
 WMMA at honest M=1 decode remains off the single-stream critical
 path: at slice 4.13 we are **bandwidth-bound on the matmul k-loop
