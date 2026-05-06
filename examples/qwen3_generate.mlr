@@ -713,8 +713,60 @@ fn main() {
             }
 
             u64 layer = 0
+            // Slice 4.14 — speck4 mega-kernel: at spec_K=4 + env, replaces
+            // the entire per-op M_eff=4 chain with a single kernel dispatch
+            // per layer.  Falls through to per-op when env unset / kernel
+            // missing / shape unsupported.
+            u64 use_mks4 = 0
+            if is_spec != 0 {
+                if M_eff == 4 {
+                    if qwen3_megakernel_speck4_use() != 0 {
+                        if qwen3_megakernel_speck4_ready() != 0 {
+                            if hidden == 1024 {
+                                if pos + 4 <= 64 {
+                                    use_mks4 = 1
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             while layer < n_layers {
                 Qwen3LayerWeights w = layers_arr + layer * 88
+                if use_mks4 != 0 {
+                    u64 kc_l = k_cache + layer * batch_stride
+                    u64 vc_l = v_cache + layer * batch_stride
+                    if qwen3_forward_layer_megakernel_speck4_gpu(
+                            d_in_arr, d_out_arr, w, pos, kc_l, vc_l, layer) != 0 { exit(1) }
+                    // Ping-pong pointers.
+                    u64 b_sw = 0
+                    while b_sw < M_eff {
+                        u64 di = 0; unsafe { *((d_in_arr   + b_sw * 8) as u64) -> di }
+                        u64 do_ = 0; unsafe { *((d_out_arr  + b_sw * 8) as u64) -> do_ }
+                        u64 dih = 0; unsafe { *((d_in_h_arr + b_sw * 8) as u64) -> dih }
+                        u64 doh = 0
+                        if do_ != 0 {
+                            u64 b_lk = 0
+                            while b_lk < M_eff {
+                                u64 dxa  = 0; unsafe { *((d_x_a_arr   + b_lk * 8) as u64) -> dxa }
+                                u64 dxah = 0; unsafe { *((d_x_a_h_arr + b_lk * 8) as u64) -> dxah }
+                                u64 dxb  = 0; unsafe { *((d_x_b_arr   + b_lk * 8) as u64) -> dxb }
+                                u64 dxbh = 0; unsafe { *((d_x_b_h_arr + b_lk * 8) as u64) -> dxbh }
+                                if b_lk == b_sw {
+                                    if do_ == dxa { doh = dxah }
+                                    if do_ == dxb { doh = dxbh }
+                                }
+                                b_lk = b_lk + 1
+                            }
+                        }
+                        unsafe { *((d_in_arr   + b_sw * 8) as u64) = do_ }
+                        unsafe { *((d_out_arr  + b_sw * 8) as u64) = di }
+                        unsafe { *((d_in_h_arr + b_sw * 8) as u64) = doh }
+                        b_sw = b_sw + 1
+                    }
+                    layer = layer + 1
+                    continue
+                }
                 if M_eff > 1 {
                     if qwen3_forward_layer_qkv_batched_gpu(d_in_arr, w, M_eff) != 0 { exit(1) }
                     // Refresh GPU rope cos/sin for the current pos.  The

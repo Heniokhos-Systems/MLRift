@@ -1,0 +1,894 @@
+// Slice 4.14 AB — bisection harness for the M_EFF=4 (speck4) mega-kernel.
+// Runs the per-op M=4 chain (qkv_split_speck4, qknorm/rope, attn_decode_speck4,
+// etc.) on identical bf16/f32 inputs as the mega-kernel and reports the FIRST
+// phase whose output diverges between the two paths.
+//
+// Per-op reference faithfully replicates qwen3_generate's spec_K=4 path:
+//   - QKV matmul:       gemv_coop_bf16_f32_batched, batch=4, output [M_EFF, QKV_DIM]
+//   - qkv_split:        qkv_split_f32_speck4 (writes K/V at slots pos_base..pos_base+3)
+//   - extract_q:        extract_q_qwen3_f32 (M_EFF=4)
+//   - qknorm Q:         qknorm_f32 over M_EFF*N_HEADS heads
+//   - rope Q:           rope_qwen3_f32 over M_EFF*N_HEADS heads, SINGLE pos table
+//   - extract_k:        extract_k_qwen3_f32_speck4
+//   - qknorm K:         qknorm_f32 over M_EFF*N_KV_HEADS heads
+//   - rope K:           rope_qwen3_f32 over M_EFF*N_KV_HEADS heads, SINGLE pos table
+//   - insert_k:         insert_k_qwen3_f32_speck4
+//   - attn_decode:      attn_decode_f32_speck4 with kv_len = pos_base + M_EFF
+//   - o_proj matmul:    gemv_coop_bf16_f32_batched on [M_EFF, q_dim] -> [M_EFF, hidden]
+//   - residual_add:     b_o + in_resid -> b_mid (each stream)
+//   - post_norm:        rmsnorm_f32 (each stream)
+//   - gate_up matmul:   gemv_coop_bf16_f32_batched
+//   - silu_mul:         silu_mul_f32 (each stream)
+//   - down matmul:      gemv_coop_bf16_f32_batched
+//   - residual_add:     b_mid + b_ff_out -> out_resid (each stream)
+//
+// CRITICAL: the per-op path uses ONE shared rope cos/sin table at pos_base for
+// all 4 query positions (matches qwen3_generate's behavior).  The mega-kernel
+// must match that to produce bit-identical tokens; per-position rope (one table
+// per m) would be more accurate but diverges from per-op numerics.
+//
+// Build:
+//   hipcc --offload-arch=gfx1100 --genco -O3 examples/llm/qwen3_layer_megakernel_speck4.hip.cpp \
+//       -o /tmp/qwen3_layer_megakernel_speck4.co
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/qwen3_layer_megakernel_speck4_ab.mlr \
+//       -o /tmp/megak_speck4_ab
+// Run:
+//   /tmp/megak_speck4_ab
+
+import "../../std/hip.mlr"
+import "../../std/time.mlr"
+import "../../std/math_float.mlr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn write(int32 fd, uint64 buf, uint64 n) -> int64
+@dynamic extern fn exit(uint64 code)
+
+fn u64_dec(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 { uint8 z = 48; unsafe { *(buf as uint8) = z }; return 1 }
+    uint64 n = 0; uint64 t = val
+    while t > 0 { n = n + 1; t = t / 10 }
+    uint64 i = n; t = val
+    while i > 0 {
+        i = i - 1
+        uint64 d = t - (t / 10) * 10
+        uint8 c = d + 48
+        uint64 p = buf + i; unsafe { *(p as uint8) = c }
+        t = t / 10
+    }
+    return n
+}
+fn put_kv(uint64 label, uint64 lab_len, uint64 v) {
+    uint64 buf = alloc(96)
+    uint64 i = 0
+    while i < lab_len {
+        uint64 sp = label + i; uint64 c = 0; unsafe { *(sp as uint8) -> c }
+        uint64 dp = buf + i; uint8 cb = c; unsafe { *(dp as uint8) = cb }
+        i = i + 1
+    }
+    uint64 sep_p = buf + lab_len; uint8 eq = 61; unsafe { *(sep_p as uint8) = eq }
+    uint64 num_p = buf + lab_len + 1
+    uint64 nl = u64_dec(v, num_p)
+    uint64 nul_p = buf + lab_len + 1 + nl; uint8 nul = 0; unsafe { *(nul_p as uint8) = nul }
+    puts(buf)
+}
+fn die(uint64 msg, uint64 code) { puts(msg); put_kv("err", 3, code); exit(1) }
+
+fn lcg_step(uint64 state_ptr) -> f32 {
+    uint64 s = 0; unsafe { *(state_ptr as uint64) -> s }
+    s = s * 6364136223846793005 + 1442695040888963407
+    unsafe { *(state_ptr as uint64) = s }
+    uint64 hi = s >> 40
+    f32 v = int_to_f32(hi) / 8388608.0f - 1.0f
+    return v
+}
+
+fn load_co(uint64 path, uint64 fname) -> uint64 {
+    uint64 fd = file_open(path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 { return 0 }
+    uint64 sz = file_size(fd)
+    uint64 blob = alloc(sz)
+    file_read(fd, blob, sz)
+    file_close(fd)
+    uint64 mod_slot = alloc(8)
+    uint32 err = hipModuleLoadData(mod_slot, blob)
+    if err != 0 { return 0 }
+    uint64 mod = 0; unsafe { *(mod_slot as uint64) -> mod }
+    uint64 fh_slot = alloc(8)
+    err = hipModuleGetFunction(fh_slot, mod, fname)
+    if err != 0 { return 0 }
+    uint64 fh = 0; unsafe { *(fh_slot as uint64) -> fh }
+    return fh
+}
+
+fn dmalloc(uint64 bytes) -> uint64 {
+    uint64 slot = alloc(8)
+    uint32 err = hipMalloc(slot, bytes)
+    if err != 0 { die("hipMalloc", err) }
+    uint64 va = 0; unsafe { *(slot as uint64) -> va }
+    dealloc(slot)
+    return va
+}
+
+fn build_kp(uint64 k_buf, uint64 n) -> uint64 {
+    uint64 kp = alloc(n * 8)
+    uint64 j = 0
+    while j < n {
+        uint64 slot_ptr = k_buf + j * 8
+        unsafe { *((kp + j * 8) as uint64) = slot_ptr }
+        j = j + 1
+    }
+    return kp
+}
+
+fn put_f32_bits(uint64 label, uint64 lab_len, f32 v) {
+    uint64 tmp = alloc(4); unsafe { *(tmp as f32) = v }
+    uint32 b = 0; unsafe { *(tmp as uint32) -> b }
+    dealloc(tmp)
+    uint64 b64 = b
+    put_kv(label, lab_len, b64)
+}
+
+// Local copy of qwen3_rope_compute (std/qwen3.mlr's is non-exported).
+// Computes cos/sin tables for one position into f32 host buffers of length rope_dim/2.
+fn rope_compute_local(uint64 cos_out, uint64 sin_out, uint64 position, uint64 rope_dim, f64 theta_base) {
+    uint64 half = rope_dim / 2
+    if position == 0 {
+        f32 one_f = 1.0f
+        f32 zero_f = 0.0f
+        uint64 i = 0
+        while i < half {
+            unsafe { *((cos_out + i * 4) as f32) = one_f }
+            unsafe { *((sin_out + i * 4) as f32) = zero_f }
+            i = i + 1
+        }
+        return
+    }
+    uint64 i = 0
+    while i < half {
+        f64 exponent = int_to_f64(2 * i) / int_to_f64(rope_dim)
+        f64 denom = pow_f64(theta_base, exponent)
+        f64 inv_freq = int_to_f64(1) / denom
+        f64 angle = int_to_f64(position) * inv_freq
+        f32 c = f64_to_f32(cos_f64(angle))
+        f32 s = f64_to_f32(sin_f64(angle))
+        unsafe { *((cos_out + i * 4) as f32) = c }
+        unsafe { *((sin_out + i * 4) as f32) = s }
+        i = i + 1
+    }
+}
+
+// Strided H2D for padded bf16 weights.  Mirrors _gpu_mm_get_or_upload_bf16_padded.
+fn pad_h2d(uint64 d_dst, uint64 h_src, uint64 N_rows, uint64 K_unp, uint64 K_pad) {
+    uint64 host_pad = alloc(N_rows * K_pad * 2)
+    uint64 zi = 0
+    while zi < N_rows * K_pad * 2 {
+        uint8 zb = 0; unsafe { *((host_pad + zi) as uint8) = zb }
+        zi = zi + 1
+    }
+    uint64 row = 0
+    while row < N_rows {
+        uint64 src_row = h_src + row * K_unp * 2
+        uint64 dst_row = host_pad + row * K_pad * 2
+        uint64 j = 0
+        while j < K_unp * 2 {
+            uint64 sp = src_row + j; uint8 sb = 0; unsafe { *(sp as uint8) -> sb }
+            uint64 dp = dst_row + j; unsafe { *(dp as uint8) = sb }
+            j = j + 1
+        }
+        row = row + 1
+    }
+    uint32 cer = hipMemcpy(d_dst, host_pad, N_rows * K_pad * 2, 1)
+    if cer != 0 { puts("pad H2D fail"); exit(1) }
+    dealloc(host_pad)
+}
+
+// Qwen3-0.6B shape constants.
+static uint64 HIDDEN     = 1024
+static uint64 HEAD_DIM   = 128
+static uint64 N_HEADS    = 16
+static uint64 N_KV_HEADS = 8
+static uint64 Q_DIM      = 2048
+static uint64 KV_DIM     = 1024
+static uint64 QKV_DIM    = 4096
+static uint64 FF         = 3072
+static uint64 WG_PERSIST = 512
+static uint64 MAX_SEQ    = 64
+static uint64 M_EFF      = 4
+// pos_base must be small enough that pos_base + M_EFF <= MAX_SEQ.
+// 0 keeps rope as identity (cos=1, sin=0) which doesn't exercise rope —
+// pick a non-zero base to also catch rope bugs.
+static uint64 POS_BASE   = 0
+
+fn main() {
+    uint32 err = hipSetDevice(0); if err != 0 { die("setDev", err) }
+
+    // ───────────────────────────────────────────────────────
+    // 1.  Load every kernel module we need.
+    // ───────────────────────────────────────────────────────
+    uint64 fh_mks4 = load_co("/tmp/qwen3_layer_megakernel_speck4.co",
+                             "qwen3_layer_megakernel_speck4")
+    if fh_mks4 == 0 { die("load mks4", 0) }
+
+    uint64 fh_rmsnorm = load_co("/tmp/rmsnorm_f32_1024.co", "rmsnorm_f32")
+    if fh_rmsnorm == 0 { die("load rmsnorm", 0) }
+
+    uint64 fh_gemv_bf16_b = load_co("/tmp/gemv_coop_bf16_f32_batched.co",
+                                     "gemv_coop_bf16_f32_batched")
+    if fh_gemv_bf16_b == 0 { die("load gemv_bf16_batched", 0) }
+
+    uint64 fh_extract_q = load_co("/tmp/extract_q_qwen3_f32.co", "extract_q_qwen3_f32")
+    if fh_extract_q == 0 { die("load extract_q", 0) }
+
+    uint64 fh_qkv_split = load_co("/tmp/qkv_split_f32_speck4.co", "qkv_split_f32_speck4")
+    if fh_qkv_split == 0 { die("load qkv_split_speck4", 0) }
+
+    uint64 fh_qknorm = load_co("/tmp/qknorm_f32.co", "rmsnorm_f32")
+    if fh_qknorm == 0 { die("load qknorm", 0) }
+
+    uint64 fh_rope = load_co("/tmp/rope_qwen3_f32.co", "rope_qwen3_f32")
+    if fh_rope == 0 { die("load rope", 0) }
+
+    uint64 fh_extract_k = load_co("/tmp/extract_k_qwen3_f32_speck4.co",
+                                   "extract_k_qwen3_f32_speck4")
+    if fh_extract_k == 0 { die("load extract_k_speck4", 0) }
+
+    uint64 fh_insert_k = load_co("/tmp/insert_k_qwen3_f32_speck4.co",
+                                  "insert_k_qwen3_f32_speck4")
+    if fh_insert_k == 0 { die("load insert_k_speck4", 0) }
+
+    uint64 fh_attn = load_co("/tmp/attn_decode_f32_speck4.co", "attn_decode_f32_speck4")
+    if fh_attn == 0 { die("load attn_speck4", 0) }
+
+    uint64 fh_residual = load_co("/tmp/residual_add_f32.co", "residual_add_f32")
+    if fh_residual == 0 { die("load residual_add", 0) }
+
+    uint64 fh_silu_mul = load_co("/tmp/silu_mul_f32.co", "silu_mul_f32")
+    if fh_silu_mul == 0 { die("load silu_mul", 0) }
+
+    puts("modules loaded")
+
+    // ───────────────────────────────────────────────────────
+    // 2.  Allocate host buffers and fill from a fixed LCG.
+    // ───────────────────────────────────────────────────────
+    uint64 in_resid_bytes_4 = M_EFF * HIDDEN * 4
+    uint64 qkv_w_bytes      = QKV_DIM * HIDDEN * 2
+    uint64 qkv_w_bytes_pad  = QKV_DIM * 1152 * 2
+    uint64 o_w_bytes        = HIDDEN * Q_DIM * 2
+    uint64 o_w_bytes_pad    = HIDDEN * 2176 * 2
+    uint64 gateup_bytes     = 2 * FF * HIDDEN * 2
+    uint64 gateup_bytes_pad = 2 * FF * 1152 * 2
+    uint64 down_w_bytes     = HIDDEN * FF * 2
+    uint64 down_w_bytes_pad = HIDDEN * 3200 * 2
+    uint64 in_norm_bytes    = HIDDEN * 4
+    uint64 post_norm_bytes  = HIDDEN * 4
+    uint64 q_norm_bytes     = HEAD_DIM * 4
+    uint64 k_norm_bytes     = HEAD_DIM * 4
+    uint64 cos_sin_bytes_1  = (HEAD_DIM / 2) * 4
+    uint64 cos_sin_bytes_4  = M_EFF * (HEAD_DIM / 2) * 4
+    uint64 kv_bytes         = MAX_SEQ * KV_DIM * 4
+
+    uint64 h_in_resid_4  = alloc(in_resid_bytes_4)
+    uint64 h_qkv_w       = alloc(qkv_w_bytes)
+    uint64 h_o_w         = alloc(o_w_bytes)
+    uint64 h_gate_up_w   = alloc(gateup_bytes)
+    uint64 h_down_w      = alloc(down_w_bytes)
+    uint64 h_in_norm_g   = alloc(in_norm_bytes)
+    uint64 h_post_norm_g = alloc(post_norm_bytes)
+    uint64 h_q_norm_g    = alloc(q_norm_bytes)
+    uint64 h_k_norm_g    = alloc(k_norm_bytes)
+    uint64 h_rope_cos_1  = alloc(cos_sin_bytes_1)
+    uint64 h_rope_sin_1  = alloc(cos_sin_bytes_1)
+    uint64 h_rope_cos_4  = alloc(cos_sin_bytes_4)
+    uint64 h_rope_sin_4  = alloc(cos_sin_bytes_4)
+
+    uint64 seed_slot = alloc(8)
+    unsafe { *(seed_slot as uint64) = 0xDEADBEEFCAFE1234 }
+
+    // 4 input residuals — random in [-1, +1).
+    uint64 i = 0
+    while i < M_EFF * HIDDEN {
+        f32 v = lcg_step(seed_slot)
+        unsafe { *((h_in_resid_4 + i * 4) as f32) = v }
+        i = i + 1
+    }
+    // gammas — random in [+0.5, +1.5].
+    i = 0
+    while i < HIDDEN {
+        f32 v = lcg_step(seed_slot)
+        f32 g = v * 0.5f + 1.0f
+        unsafe { *((h_in_norm_g + i * 4) as f32) = g }
+        i = i + 1
+    }
+    i = 0
+    while i < HIDDEN {
+        f32 v = lcg_step(seed_slot)
+        f32 g = v * 0.5f + 1.0f
+        unsafe { *((h_post_norm_g + i * 4) as f32) = g }
+        i = i + 1
+    }
+    i = 0
+    while i < HEAD_DIM {
+        f32 v = lcg_step(seed_slot)
+        f32 g = v * 0.5f + 1.0f
+        unsafe { *((h_q_norm_g + i * 4) as f32) = g }
+        i = i + 1
+    }
+    i = 0
+    while i < HEAD_DIM {
+        f32 v = lcg_step(seed_slot)
+        f32 g = v * 0.5f + 1.0f
+        unsafe { *((h_k_norm_g + i * 4) as f32) = g }
+        i = i + 1
+    }
+    // RoPE cos/sin: per-op uses a SINGLE table at pos_base.  mks4 uses 4
+    // per-position tables.  We compute both — the AB compares mks4 with
+    // either layout to bisect.
+    f64 theta_base = 1000000.0
+    rope_compute_local(h_rope_cos_1, h_rope_sin_1, POS_BASE, HEAD_DIM, theta_base)
+    uint64 mm = 0
+    while mm < M_EFF {
+        uint64 c_h = h_rope_cos_4 + mm * (HEAD_DIM / 2) * 4
+        uint64 s_h = h_rope_sin_4 + mm * (HEAD_DIM / 2) * 4
+        rope_compute_local(c_h, s_h, POS_BASE + mm, HEAD_DIM, theta_base)
+        mm = mm + 1
+    }
+
+    // bf16 weights — store as truncated `(f32_bits >> 16)` u16, scale=0.03.
+    f32 wscale = 0.03f
+    i = 0
+    while i < QKV_DIM * HIDDEN {
+        f32 v = lcg_step(seed_slot)
+        f32 fw = v * wscale
+        uint64 tmp = alloc(4); unsafe { *(tmp as f32) = fw }
+        uint32 fb = 0; unsafe { *(tmp as uint32) -> fb }
+        dealloc(tmp)
+        uint16 bf = fb >> 16
+        unsafe { *((h_qkv_w + i * 2) as uint16) = bf }
+        i = i + 1
+    }
+    i = 0
+    while i < HIDDEN * Q_DIM {
+        f32 v = lcg_step(seed_slot)
+        f32 fw = v * wscale
+        uint64 tmp = alloc(4); unsafe { *(tmp as f32) = fw }
+        uint32 fb = 0; unsafe { *(tmp as uint32) -> fb }
+        dealloc(tmp)
+        uint16 bf = fb >> 16
+        unsafe { *((h_o_w + i * 2) as uint16) = bf }
+        i = i + 1
+    }
+    i = 0
+    while i < 2 * FF * HIDDEN {
+        f32 v = lcg_step(seed_slot)
+        f32 fw = v * wscale
+        uint64 tmp = alloc(4); unsafe { *(tmp as f32) = fw }
+        uint32 fb = 0; unsafe { *(tmp as uint32) -> fb }
+        dealloc(tmp)
+        uint16 bf = fb >> 16
+        unsafe { *((h_gate_up_w + i * 2) as uint16) = bf }
+        i = i + 1
+    }
+    i = 0
+    while i < HIDDEN * FF {
+        f32 v = lcg_step(seed_slot)
+        f32 fw = v * wscale
+        uint64 tmp = alloc(4); unsafe { *(tmp as f32) = fw }
+        uint32 fb = 0; unsafe { *(tmp as uint32) -> fb }
+        dealloc(tmp)
+        uint16 bf = fb >> 16
+        unsafe { *((h_down_w + i * 2) as uint16) = bf }
+        i = i + 1
+    }
+
+    puts("host buffers filled")
+
+    // ───────────────────────────────────────────────────────
+    // 3.  Allocate device buffers.  bf16 weights need TWO copies:
+    //   - unpadded [N, K] for per-op (gemv_coop_bf16_f32_batched)
+    //   - padded  [N, K_pad] for mks4
+    // We allocate both; same source bytes.
+    // ───────────────────────────────────────────────────────
+    uint64 d_in_resid_4 = dmalloc(in_resid_bytes_4)
+
+    // unpadded weights (per-op uses these via gemv_coop_bf16_f32_batched)
+    uint64 d_qkv_w_unp     = dmalloc(qkv_w_bytes)
+    uint64 d_o_w_unp       = dmalloc(o_w_bytes)
+    uint64 d_gate_up_w_unp = dmalloc(gateup_bytes)
+    uint64 d_down_w_unp    = dmalloc(down_w_bytes)
+
+    // padded weights (mks4)
+    uint64 d_qkv_w_pad     = dmalloc(qkv_w_bytes_pad)
+    uint64 d_o_w_pad       = dmalloc(o_w_bytes_pad)
+    uint64 d_gate_up_w_pad = dmalloc(gateup_bytes_pad)
+    uint64 d_down_w_pad    = dmalloc(down_w_bytes_pad)
+
+    uint64 d_in_norm_g   = dmalloc(in_norm_bytes)
+    uint64 d_post_norm_g = dmalloc(post_norm_bytes)
+    uint64 d_q_norm_g    = dmalloc(q_norm_bytes)
+    uint64 d_k_norm_g    = dmalloc(k_norm_bytes)
+    uint64 d_rope_cos_1  = dmalloc(cos_sin_bytes_1)
+    uint64 d_rope_sin_1  = dmalloc(cos_sin_bytes_1)
+    uint64 d_rope_cos_4  = dmalloc(cos_sin_bytes_4)
+    uint64 d_rope_sin_4  = dmalloc(cos_sin_bytes_4)
+
+    err = hipMemcpy(d_in_resid_4, h_in_resid_4, in_resid_bytes_4, 1)
+    if err != 0 { die("H2D in_r", err) }
+
+    err = hipMemcpy(d_qkv_w_unp,     h_qkv_w,     qkv_w_bytes,     1); if err != 0 { die("H2D qkv_w_unp", err) }
+    err = hipMemcpy(d_o_w_unp,       h_o_w,       o_w_bytes,       1); if err != 0 { die("H2D o_w_unp",   err) }
+    err = hipMemcpy(d_gate_up_w_unp, h_gate_up_w, gateup_bytes,    1); if err != 0 { die("H2D gu_w_unp",  err) }
+    err = hipMemcpy(d_down_w_unp,    h_down_w,    down_w_bytes,    1); if err != 0 { die("H2D dn_w_unp",  err) }
+
+    pad_h2d(d_qkv_w_pad,     h_qkv_w,     QKV_DIM, HIDDEN, 1152)
+    pad_h2d(d_o_w_pad,       h_o_w,       HIDDEN,  Q_DIM,  2176)
+    pad_h2d(d_gate_up_w_pad, h_gate_up_w, 2 * FF,  HIDDEN, 1152)
+    pad_h2d(d_down_w_pad,    h_down_w,    HIDDEN,  FF,     3200)
+
+    err = hipMemcpy(d_in_norm_g,   h_in_norm_g,   in_norm_bytes,   1); if err != 0 { die("H2D in_g", err) }
+    err = hipMemcpy(d_post_norm_g, h_post_norm_g, post_norm_bytes, 1); if err != 0 { die("H2D pn_g", err) }
+    err = hipMemcpy(d_q_norm_g,    h_q_norm_g,    q_norm_bytes,    1); if err != 0 { die("H2D q_g",  err) }
+    err = hipMemcpy(d_k_norm_g,    h_k_norm_g,    k_norm_bytes,    1); if err != 0 { die("H2D k_g",  err) }
+    err = hipMemcpy(d_rope_cos_1,  h_rope_cos_1,  cos_sin_bytes_1, 1); if err != 0 { die("H2D rc1",  err) }
+    err = hipMemcpy(d_rope_sin_1,  h_rope_sin_1,  cos_sin_bytes_1, 1); if err != 0 { die("H2D rs1",  err) }
+    err = hipMemcpy(d_rope_cos_4,  h_rope_cos_4,  cos_sin_bytes_4, 1); if err != 0 { die("H2D rc4",  err) }
+    err = hipMemcpy(d_rope_sin_4,  h_rope_sin_4,  cos_sin_bytes_4, 1); if err != 0 { die("H2D rs4",  err) }
+
+    // Per-path private device buffers.
+    // REF path:
+    uint64 d_kc_ref      = dmalloc(kv_bytes)
+    uint64 d_vc_ref      = dmalloc(kv_bytes)
+    uint64 d_b_x_norm_4  = dmalloc(M_EFF * HIDDEN  * 4)
+    uint64 d_b_qkv_4     = dmalloc(M_EFF * QKV_DIM * 4)
+    uint64 d_b_q_attn_4  = dmalloc(M_EFF * Q_DIM   * 4)
+    uint64 d_b_k_stage_4 = dmalloc(M_EFF * KV_DIM  * 4)
+    uint64 d_b_attn_4    = dmalloc(M_EFF * Q_DIM   * 4)
+    uint64 d_b_o_4       = dmalloc(M_EFF * HIDDEN  * 4)
+    uint64 d_b_mid_4     = dmalloc(M_EFF * HIDDEN  * 4)
+    uint64 d_b_mid_norm_4= dmalloc(M_EFF * HIDDEN  * 4)
+    uint64 d_b_gate_up_4 = dmalloc(M_EFF * 2 * FF  * 4)
+    uint64 d_b_silu_mul_4= dmalloc(M_EFF * FF      * 4)
+    uint64 d_b_ff_out_4  = dmalloc(M_EFF * HIDDEN  * 4)
+    uint64 d_out_ref_4   = dmalloc(M_EFF * HIDDEN  * 4)
+
+    // MEGA path:
+    uint64 d_kc_mega     = dmalloc(kv_bytes)
+    uint64 d_vc_mega     = dmalloc(kv_bytes)
+    uint64 d_out_mega_4  = dmalloc(M_EFF * HIDDEN  * 4)
+    uint64 d_barrier     = dmalloc(64)
+    uint64 d_gu_scratch_4= dmalloc(M_EFF * 2 * FF * 4)
+    uint64 d_b_x_norm_g_4= dmalloc(M_EFF * HIDDEN  * 4)
+    uint64 d_b_qkv_g_4   = dmalloc(M_EFF * QKV_DIM * 4)
+    uint64 d_b_attn_q_g_4= dmalloc(M_EFF * Q_DIM   * 4)
+    uint64 d_b_mid_g_4   = dmalloc(M_EFF * HIDDEN  * 4)
+    uint64 d_b_mid_norm_g_4= dmalloc(M_EFF * HIDDEN * 4)
+    uint64 d_b_attn_out_g_4= dmalloc(M_EFF * Q_DIM * 4)
+
+    // Zero KV caches and barrier; KV at slots [0, POS_BASE) starts as
+    // pre-existing history (we leave them zero — zero K means score=0,
+    // softmax distributes evenly across history).  Both paths see the
+    // same zero history → same result.  Slots [POS_BASE, POS_BASE+M_EFF)
+    // are written by phase 5 of each path.
+    uint64 h_zerobig = alloc(kv_bytes)
+    uint64 zi = 0
+    while zi < kv_bytes { uint8 zb = 0; unsafe { *((h_zerobig + zi) as uint8) = zb }; zi = zi + 1 }
+    err = hipMemcpy(d_kc_ref,  h_zerobig, kv_bytes, 1); if err != 0 { die("zero kc_ref", err) }
+    err = hipMemcpy(d_vc_ref,  h_zerobig, kv_bytes, 1); if err != 0 { die("zero vc_ref", err) }
+    err = hipMemcpy(d_kc_mega, h_zerobig, kv_bytes, 1); if err != 0 { die("zero kc_mega", err) }
+    err = hipMemcpy(d_vc_mega, h_zerobig, kv_bytes, 1); if err != 0 { die("zero vc_mega", err) }
+    err = hipMemcpy(d_barrier, h_zerobig, 64,       1); if err != 0 { die("zero barrier", err) }
+
+    puts("device buffers seeded")
+
+    // ───────────────────────────────────────────────────────
+    // 4.  REFERENCE PATH — per-op M=4 chain, mirrors qwen3_generate.
+    // ───────────────────────────────────────────────────────
+    // Phase 1: per-stream rmsnorm.  rmsnorm_f32 batches via grid_x.
+    uint64 kb_p1 = alloc(5 * 8)
+    unsafe { *((kb_p1 +  0) as uint64) = d_in_resid_4 }
+    unsafe { *((kb_p1 +  8) as uint64) = d_b_x_norm_4 }
+    unsafe { *((kb_p1 + 16) as uint64) = d_in_norm_g }
+    unsafe { *((kb_p1 + 24) as uint64) = M_EFF }
+    unsafe { *((kb_p1 + 32) as uint64) = HIDDEN }
+    uint64 kp_p1 = build_kp(kb_p1, 5)
+    err = hipModuleLaunchKernel(fh_rmsnorm, M_EFF, 1, 1, 1024, 1, 1, 0, 0, kp_p1, 0)
+    if err != 0 { die("REF rmsnorm1", err) }
+
+    // Phase 3: gemv_coop_bf16_f32_batched (grid=(N, batch), block=32)
+    //   out[batch, N] = w_bf16[N, K] @ x[batch, K]^T
+    uint64 kb_p3 = alloc(5 * 8)
+    unsafe { *((kb_p3 +  0) as uint64) = d_qkv_w_unp }
+    unsafe { *((kb_p3 +  8) as uint64) = d_b_x_norm_4 }
+    unsafe { *((kb_p3 + 16) as uint64) = d_b_qkv_4 }
+    unsafe { *((kb_p3 + 24) as uint64) = QKV_DIM }
+    unsafe { *((kb_p3 + 32) as uint64) = HIDDEN }
+    uint64 kp_p3 = build_kp(kb_p3, 5)
+    err = hipModuleLaunchKernel(fh_gemv_bf16_b, QKV_DIM, M_EFF, 1, 32, 1, 1, 0, 0, kp_p3, 0)
+    if err != 0 { die("REF qkv mm", err) }
+
+    // Phase 5a: qkv_split_speck4 — grid (8, M_EFF, 1), block (128).
+    // Writes K[m] at kc_layer + (POS_BASE + m) * KV_DIM*4.
+    uint64 d_k_pos_b = d_kc_ref + POS_BASE * KV_DIM * 4
+    uint64 d_v_pos_b = d_vc_ref + POS_BASE * KV_DIM * 4
+    uint64 kb_p5a = alloc(3 * 8)
+    unsafe { *((kb_p5a + 0) as uint64) = d_b_qkv_4 }
+    unsafe { *((kb_p5a + 8) as uint64) = d_k_pos_b }
+    unsafe { *((kb_p5a + 16) as uint64) = d_v_pos_b }
+    uint64 kp_p5a = build_kp(kb_p5a, 3)
+    err = hipModuleLaunchKernel(fh_qkv_split, 8, M_EFF, 1, 128, 1, 1, 0, 0, kp_p5a, 0)
+    if err != 0 { die("REF qkv_split", err) }
+
+    // Phase 5b: extract_q (b_qkv -> b_q_attn) for M_EFF batches.
+    uint64 kb_p5b = alloc(3 * 8)
+    unsafe { *((kb_p5b + 0) as uint64) = d_b_qkv_4 }
+    unsafe { *((kb_p5b + 8) as uint64) = d_b_q_attn_4 }
+    unsafe { *((kb_p5b + 16) as uint64) = M_EFF }
+    uint64 kp_p5b = build_kp(kb_p5b, 3)
+    err = hipModuleLaunchKernel(fh_extract_q, N_HEADS, M_EFF, 1, 128, 1, 1, 0, 0, kp_p5b, 0)
+    if err != 0 { die("REF extract_q", err) }
+
+    // Phase 5c: qknorm Q over M_EFF * N_HEADS heads.  Kernel sig: (in, out, gamma, m, n)
+    uint64 kb_p5c = alloc(5 * 8)
+    unsafe { *((kb_p5c +  0) as uint64) = d_b_q_attn_4 }
+    unsafe { *((kb_p5c +  8) as uint64) = d_b_q_attn_4 }
+    unsafe { *((kb_p5c + 16) as uint64) = d_q_norm_g }
+    unsafe { *((kb_p5c + 24) as uint64) = M_EFF * N_HEADS }
+    unsafe { *((kb_p5c + 32) as uint64) = HEAD_DIM }
+    uint64 kp_p5c = build_kp(kb_p5c, 5)
+    err = hipModuleLaunchKernel(fh_qknorm, M_EFF * N_HEADS, 1, 1, 128, 1, 1, 0, 0, kp_p5c, 0)
+    if err != 0 { die("REF qknorm Q", err) }
+
+    // Phase 5d: rope Q.  SINGLE pos table applied to all M_EFF*N_HEADS heads.
+    uint64 kb_p5d = alloc(4 * 8)
+    unsafe { *((kb_p5d + 0) as uint64) = d_b_q_attn_4 }
+    unsafe { *((kb_p5d + 8) as uint64) = d_rope_cos_1 }
+    unsafe { *((kb_p5d + 16) as uint64) = d_rope_sin_1 }
+    unsafe { *((kb_p5d + 24) as uint64) = M_EFF * N_HEADS }
+    uint64 kp_p5d = build_kp(kb_p5d, 4)
+    err = hipModuleLaunchKernel(fh_rope, M_EFF * N_HEADS, 1, 1, 64, 1, 1, 0, 0, kp_p5d, 0)
+    if err != 0 { die("REF rope Q", err) }
+
+    // Phase 5e: extract_k_speck4 (kc -> b_k_stage) for M_EFF.
+    uint64 kb_p5e = alloc(3 * 8)
+    unsafe { *((kb_p5e + 0) as uint64) = d_k_pos_b }
+    unsafe { *((kb_p5e + 8) as uint64) = d_b_k_stage_4 }
+    unsafe { *((kb_p5e + 16) as uint64) = M_EFF }
+    uint64 kp_p5e = build_kp(kb_p5e, 3)
+    err = hipModuleLaunchKernel(fh_extract_k, N_KV_HEADS, M_EFF, 1, 128, 1, 1, 0, 0, kp_p5e, 0)
+    if err != 0 { die("REF extract_k", err) }
+
+    // Phase 5f: qknorm K.  Kernel sig: (in, out, gamma, m, n).
+    uint64 kb_p5f = alloc(5 * 8)
+    unsafe { *((kb_p5f +  0) as uint64) = d_b_k_stage_4 }
+    unsafe { *((kb_p5f +  8) as uint64) = d_b_k_stage_4 }
+    unsafe { *((kb_p5f + 16) as uint64) = d_k_norm_g }
+    unsafe { *((kb_p5f + 24) as uint64) = M_EFF * N_KV_HEADS }
+    unsafe { *((kb_p5f + 32) as uint64) = HEAD_DIM }
+    uint64 kp_p5f = build_kp(kb_p5f, 5)
+    err = hipModuleLaunchKernel(fh_qknorm, M_EFF * N_KV_HEADS, 1, 1, 128, 1, 1, 0, 0, kp_p5f, 0)
+    if err != 0 { die("REF qknorm K", err) }
+
+    // Phase 5g: rope K.  SINGLE pos table.
+    uint64 kb_p5g = alloc(4 * 8)
+    unsafe { *((kb_p5g + 0) as uint64) = d_b_k_stage_4 }
+    unsafe { *((kb_p5g + 8) as uint64) = d_rope_cos_1 }
+    unsafe { *((kb_p5g + 16) as uint64) = d_rope_sin_1 }
+    unsafe { *((kb_p5g + 24) as uint64) = M_EFF * N_KV_HEADS }
+    uint64 kp_p5g = build_kp(kb_p5g, 4)
+    err = hipModuleLaunchKernel(fh_rope, M_EFF * N_KV_HEADS, 1, 1, 64, 1, 1, 0, 0, kp_p5g, 0)
+    if err != 0 { die("REF rope K", err) }
+
+    // Phase 5h: insert_k_speck4 (b_k_stage -> kc).
+    uint64 kb_p5h = alloc(3 * 8)
+    unsafe { *((kb_p5h + 0) as uint64) = d_b_k_stage_4 }
+    unsafe { *((kb_p5h + 8) as uint64) = d_k_pos_b }
+    unsafe { *((kb_p5h + 16) as uint64) = M_EFF }
+    uint64 kp_p5h = build_kp(kb_p5h, 3)
+    err = hipModuleLaunchKernel(fh_insert_k, N_KV_HEADS, M_EFF, 1, 128, 1, 1, 0, 0, kp_p5h, 0)
+    if err != 0 { die("REF insert_k", err) }
+
+    // Phase 7: attn_decode_speck4.  Grid (N_HEADS, M_EFF), kv_len = POS_BASE + M_EFF.
+    uint64 kv_len_total = POS_BASE + M_EFF
+    uint64 kb_p7 = alloc(5 * 8)
+    unsafe { *((kb_p7 +  0) as uint64) = d_b_q_attn_4 }
+    unsafe { *((kb_p7 +  8) as uint64) = d_kc_ref }
+    unsafe { *((kb_p7 + 16) as uint64) = d_vc_ref }
+    unsafe { *((kb_p7 + 24) as uint64) = d_b_attn_4 }
+    unsafe { *((kb_p7 + 32) as uint64) = kv_len_total }
+    uint64 kp_p7 = build_kp(kb_p7, 5)
+    err = hipModuleLaunchKernel(fh_attn, N_HEADS, M_EFF, 1, 32, 1, 1, 0, 0, kp_p7, 0)
+    if err != 0 { die("REF attn", err) }
+
+    // Phase 9a: o_w[HIDDEN, Q_DIM] @ b_attn_4[M_EFF, Q_DIM] -> b_o_4[M_EFF, HIDDEN]
+    uint64 kb_p9a = alloc(5 * 8)
+    unsafe { *((kb_p9a +  0) as uint64) = d_o_w_unp }
+    unsafe { *((kb_p9a +  8) as uint64) = d_b_attn_4 }
+    unsafe { *((kb_p9a + 16) as uint64) = d_b_o_4 }
+    unsafe { *((kb_p9a + 24) as uint64) = HIDDEN }
+    unsafe { *((kb_p9a + 32) as uint64) = Q_DIM }
+    uint64 kp_p9a = build_kp(kb_p9a, 5)
+    err = hipModuleLaunchKernel(fh_gemv_bf16_b, HIDDEN, M_EFF, 1, 32, 1, 1, 0, 0, kp_p9a, 0)
+    if err != 0 { die("REF o mm", err) }
+
+    // Phase 9b: residual_add — b_mid_4 = b_o_4 + in_resid_4 (M_EFF * HIDDEN floats).
+    uint64 kb_p9b = alloc(4 * 8)
+    unsafe { *((kb_p9b +  0) as uint64) = d_in_resid_4 }
+    unsafe { *((kb_p9b +  8) as uint64) = d_b_o_4 }
+    unsafe { *((kb_p9b + 16) as uint64) = d_b_mid_4 }
+    unsafe { *((kb_p9b + 24) as uint64) = M_EFF * HIDDEN }
+    uint64 kp_p9b = build_kp(kb_p9b, 4)
+    err = hipModuleLaunchKernel(fh_residual, (M_EFF * HIDDEN + 255) / 256, 1, 1, 256, 1, 1, 0, 0, kp_p9b, 0)
+    if err != 0 { die("REF resid1", err) }
+
+    // Phase 11: rmsnorm batched (grid_x = M_EFF).
+    uint64 kb_p11 = alloc(5 * 8)
+    unsafe { *((kb_p11 +  0) as uint64) = d_b_mid_4 }
+    unsafe { *((kb_p11 +  8) as uint64) = d_b_mid_norm_4 }
+    unsafe { *((kb_p11 + 16) as uint64) = d_post_norm_g }
+    unsafe { *((kb_p11 + 24) as uint64) = M_EFF }
+    unsafe { *((kb_p11 + 32) as uint64) = HIDDEN }
+    uint64 kp_p11 = build_kp(kb_p11, 5)
+    err = hipModuleLaunchKernel(fh_rmsnorm, M_EFF, 1, 1, 1024, 1, 1, 0, 0, kp_p11, 0)
+    if err != 0 { die("REF rmsnorm2", err) }
+
+    // Phase 13: gate_up matmul batched.
+    uint64 kb_p13 = alloc(5 * 8)
+    unsafe { *((kb_p13 +  0) as uint64) = d_gate_up_w_unp }
+    unsafe { *((kb_p13 +  8) as uint64) = d_b_mid_norm_4 }
+    unsafe { *((kb_p13 + 16) as uint64) = d_b_gate_up_4 }
+    unsafe { *((kb_p13 + 24) as uint64) = 2 * FF }
+    unsafe { *((kb_p13 + 32) as uint64) = HIDDEN }
+    uint64 kp_p13 = build_kp(kb_p13, 5)
+    err = hipModuleLaunchKernel(fh_gemv_bf16_b, 2 * FF, M_EFF, 1, 32, 1, 1, 0, 0, kp_p13, 0)
+    if err != 0 { die("REF gu mm", err) }
+
+    // Phase 15: silu_mul per-stream.  Layout for the per-op path:
+    //   d_b_gate_up_4 = [M_EFF, 2*FF].  Per-batch slot has gate at offset
+    //   m*2*FF, up at offset m*2*FF + FF.  Output d_b_silu_mul_4[M_EFF, FF].
+    // silu_mul kernel signature: (gate, up, out, n).  Loop M_EFF times.
+    uint64 m_silu = 0
+    while m_silu < M_EFF {
+        uint64 kb_p15 = alloc(4 * 8)
+        unsafe { *((kb_p15 +  0) as uint64) = d_b_gate_up_4 + m_silu * 2 * FF * 4 }
+        unsafe { *((kb_p15 +  8) as uint64) = d_b_gate_up_4 + m_silu * 2 * FF * 4 + FF * 4 }
+        unsafe { *((kb_p15 + 16) as uint64) = d_b_silu_mul_4 + m_silu * FF * 4 }
+        unsafe { *((kb_p15 + 24) as uint64) = FF }
+        uint64 kp_p15 = build_kp(kb_p15, 4)
+        err = hipModuleLaunchKernel(fh_silu_mul, (FF + 255) / 256, 1, 1, 256, 1, 1, 0, 0, kp_p15, 0)
+        if err != 0 { die("REF silu", err) }
+        m_silu = m_silu + 1
+    }
+
+    // Phase 17a: down matmul batched.  Inputs: d_b_silu_mul_4[M_EFF, FF].
+    uint64 kb_p17a = alloc(5 * 8)
+    unsafe { *((kb_p17a +  0) as uint64) = d_down_w_unp }
+    unsafe { *((kb_p17a +  8) as uint64) = d_b_silu_mul_4 }
+    unsafe { *((kb_p17a + 16) as uint64) = d_b_ff_out_4 }
+    unsafe { *((kb_p17a + 24) as uint64) = HIDDEN }
+    unsafe { *((kb_p17a + 32) as uint64) = FF }
+    uint64 kp_p17a = build_kp(kb_p17a, 5)
+    err = hipModuleLaunchKernel(fh_gemv_bf16_b, HIDDEN, M_EFF, 1, 32, 1, 1, 0, 0, kp_p17a, 0)
+    if err != 0 { die("REF down mm", err) }
+
+    // Phase 17b: residual_add — out_ref_4 = b_mid_4 + b_ff_out_4.
+    uint64 kb_p17b = alloc(4 * 8)
+    unsafe { *((kb_p17b +  0) as uint64) = d_b_mid_4 }
+    unsafe { *((kb_p17b +  8) as uint64) = d_b_ff_out_4 }
+    unsafe { *((kb_p17b + 16) as uint64) = d_out_ref_4 }
+    unsafe { *((kb_p17b + 24) as uint64) = M_EFF * HIDDEN }
+    uint64 kp_p17b = build_kp(kb_p17b, 4)
+    err = hipModuleLaunchKernel(fh_residual, (M_EFF * HIDDEN + 255) / 256, 1, 1, 256, 1, 1, 0, 0, kp_p17b, 0)
+    if err != 0 { die("REF resid2", err) }
+
+    err = hipDeviceSynchronize(); if err != 0 { die("REF sync", err) }
+    puts("REF path complete")
+
+    // ───────────────────────────────────────────────────────
+    // 5.  MEGA PATH — sweep max_phase 0..7.  Two passes:
+    //     pass 0 (rope_mode=0): mks4 fed with per-position rope tables (current behavior)
+    //     pass 1 (rope_mode=1): mks4 fed with single-pos rope replicated 4×
+    // For each rope_mode, sweep max_phase 0..7 and report the first divergent phase.
+    // ───────────────────────────────────────────────────────
+    // Build replicated rope tables: copy pos_base (h_rope_cos_1) into all 4 m slots.
+    uint64 h_rope_cos_4_rep = alloc(cos_sin_bytes_4)
+    uint64 h_rope_sin_4_rep = alloc(cos_sin_bytes_4)
+    uint64 mr = 0
+    while mr < M_EFF {
+        uint64 c_dst = h_rope_cos_4_rep + mr * (HEAD_DIM / 2) * 4
+        uint64 s_dst = h_rope_sin_4_rep + mr * (HEAD_DIM / 2) * 4
+        uint64 cb = 0
+        while cb < (HEAD_DIM / 2) * 4 {
+            uint8 c = 0; unsafe { *((h_rope_cos_1 + cb) as uint8) -> c }; unsafe { *((c_dst + cb) as uint8) = c }
+            uint8 s = 0; unsafe { *((h_rope_sin_1 + cb) as uint8) -> s }; unsafe { *((s_dst + cb) as uint8) = s }
+            cb = cb + 1
+        }
+        mr = mr + 1
+    }
+    uint64 d_rope_cos_4_rep = dmalloc(cos_sin_bytes_4)
+    uint64 d_rope_sin_4_rep = dmalloc(cos_sin_bytes_4)
+    err = hipMemcpy(d_rope_cos_4_rep, h_rope_cos_4_rep, cos_sin_bytes_4, 1)
+    if err != 0 { die("H2D rcrep", err) }
+    err = hipMemcpy(d_rope_sin_4_rep, h_rope_sin_4_rep, cos_sin_bytes_4, 1)
+    if err != 0 { die("H2D rsrep", err) }
+
+    uint64 kb_m = alloc(24 * 8)
+    unsafe { *((kb_m +  0 * 8) as uint64) = d_in_resid_4 }
+    unsafe { *((kb_m +  1 * 8) as uint64) = d_out_mega_4 }
+    unsafe { *((kb_m +  2 * 8) as uint64) = d_qkv_w_pad }
+    unsafe { *((kb_m +  3 * 8) as uint64) = d_o_w_pad }
+    unsafe { *((kb_m +  4 * 8) as uint64) = d_gate_up_w_pad }
+    unsafe { *((kb_m +  5 * 8) as uint64) = d_down_w_pad }
+    unsafe { *((kb_m +  6 * 8) as uint64) = d_in_norm_g }
+    unsafe { *((kb_m +  7 * 8) as uint64) = d_post_norm_g }
+    unsafe { *((kb_m +  8 * 8) as uint64) = d_q_norm_g }
+    unsafe { *((kb_m +  9 * 8) as uint64) = d_k_norm_g }
+    // slots 10/11 set per-mode below
+    unsafe { *((kb_m + 12 * 8) as uint64) = d_kc_mega }
+    unsafe { *((kb_m + 13 * 8) as uint64) = d_vc_mega }
+    unsafe { *((kb_m + 14 * 8) as uint64) = POS_BASE }
+    unsafe { *((kb_m + 15 * 8) as uint64) = d_barrier }
+    unsafe { *((kb_m + 16 * 8) as uint64) = d_gu_scratch_4 }
+    unsafe { *((kb_m + 17 * 8) as uint64) = d_b_x_norm_g_4 }
+    unsafe { *((kb_m + 18 * 8) as uint64) = d_b_qkv_g_4 }
+    unsafe { *((kb_m + 19 * 8) as uint64) = d_b_attn_q_g_4 }
+    unsafe { *((kb_m + 20 * 8) as uint64) = d_b_mid_g_4 }
+    unsafe { *((kb_m + 21 * 8) as uint64) = d_b_mid_norm_g_4 }
+    unsafe { *((kb_m + 22 * 8) as uint64) = d_b_attn_out_g_4 }
+    uint64 kp_m = build_kp(kb_m, 24)
+
+    // Per-phase ref/mega buffer pairs and float counts.
+    uint64[8] ref_buf_arr
+    uint64[8] mega_buf_arr
+    uint64[8] n_floats_arr
+
+    unsafe { *((ref_buf_arr   + 0 * 8) as uint64) = d_b_x_norm_4 }
+    unsafe { *((mega_buf_arr  + 0 * 8) as uint64) = d_b_x_norm_g_4 }
+    unsafe { *((n_floats_arr  + 0 * 8) as uint64) = M_EFF * HIDDEN }
+
+    unsafe { *((ref_buf_arr   + 1 * 8) as uint64) = d_b_qkv_4 }
+    unsafe { *((mega_buf_arr  + 1 * 8) as uint64) = d_b_qkv_g_4 }
+    unsafe { *((n_floats_arr  + 1 * 8) as uint64) = M_EFF * QKV_DIM }
+
+    // After phase 5: per-op produces b_q_attn_4 (post qknorm + rope Q).  mks4
+    // produces b_attn_q_g_4 via fused phase5 (qknorm + rope Q).  Compare both.
+    unsafe { *((ref_buf_arr   + 2 * 8) as uint64) = d_b_q_attn_4 }
+    unsafe { *((mega_buf_arr  + 2 * 8) as uint64) = d_b_attn_q_g_4 }
+    unsafe { *((n_floats_arr  + 2 * 8) as uint64) = M_EFF * Q_DIM }
+
+    // Phase 7: per-op produces b_attn_4 (attn output).  mks4 → b_attn_out_g_4.
+    unsafe { *((ref_buf_arr   + 3 * 8) as uint64) = d_b_attn_4 }
+    unsafe { *((mega_buf_arr  + 3 * 8) as uint64) = d_b_attn_out_g_4 }
+    unsafe { *((n_floats_arr  + 3 * 8) as uint64) = M_EFF * Q_DIM }
+
+    unsafe { *((ref_buf_arr   + 4 * 8) as uint64) = d_b_mid_4 }
+    unsafe { *((mega_buf_arr  + 4 * 8) as uint64) = d_b_mid_g_4 }
+    unsafe { *((n_floats_arr  + 4 * 8) as uint64) = M_EFF * HIDDEN }
+
+    unsafe { *((ref_buf_arr   + 5 * 8) as uint64) = d_b_mid_norm_4 }
+    unsafe { *((mega_buf_arr  + 5 * 8) as uint64) = d_b_mid_norm_g_4 }
+    unsafe { *((n_floats_arr  + 5 * 8) as uint64) = M_EFF * HIDDEN }
+
+    // Phase 6 (max_phase=6): mks4 has gate_up matmul output in gu_scratch
+    // [M_EFF, 2*FF].  per-op has it in d_b_gate_up_4 [M_EFF, 2*FF].  Same layout.
+    unsafe { *((ref_buf_arr   + 6 * 8) as uint64) = d_b_gate_up_4 }
+    unsafe { *((mega_buf_arr  + 6 * 8) as uint64) = d_gu_scratch_4 }
+    unsafe { *((n_floats_arr  + 6 * 8) as uint64) = M_EFF * 2 * FF }
+
+    unsafe { *((ref_buf_arr   + 7 * 8) as uint64) = d_out_ref_4 }
+    unsafe { *((mega_buf_arr  + 7 * 8) as uint64) = d_out_mega_4 }
+    unsafe { *((n_floats_arr  + 7 * 8) as uint64) = M_EFF * HIDDEN }
+
+    uint64 h_zero4 = alloc(4)
+    uint32 z32 = 0; unsafe { *(h_zero4 as uint32) = z32 }
+
+    // Tolerance: f32 FMA reorder bound is ~1e-6 (~7 ULP at unit magnitude).
+    // 1e-3 is loose; pick tighter for better diagnostics.
+    f32 tol = 0.001f
+    uint64 rope_mode = 0
+    uint64 overall_first_bad = 0xFF
+    uint64 overall_first_bad_mode = 0xFF
+    while rope_mode <= 1 {
+        puts("######################")
+        if rope_mode == 0 {
+            puts("rope_mode=0  (mks4 fed per-position rope tables [pos_base..pos_base+3])")
+            unsafe { *((kb_m + 10 * 8) as uint64) = d_rope_cos_4 }
+            unsafe { *((kb_m + 11 * 8) as uint64) = d_rope_sin_4 }
+        } else {
+            puts("rope_mode=1  (mks4 fed single-pos rope replicated 4x)")
+            unsafe { *((kb_m + 10 * 8) as uint64) = d_rope_cos_4_rep }
+            unsafe { *((kb_m + 11 * 8) as uint64) = d_rope_sin_4_rep }
+        }
+
+        uint64 first_bad_phase = 0xFF
+        uint64 mp = 0
+        while mp <= 7 {
+            err = hipMemcpy(d_barrier, h_zero4, 4, 1); if err != 0 { die("zero barrier", err) }
+            err = hipMemcpy(d_kc_mega, h_zerobig, kv_bytes, 1); if err != 0 { die("zero kc_mega2", err) }
+            err = hipMemcpy(d_vc_mega, h_zerobig, kv_bytes, 1); if err != 0 { die("zero vc_mega2", err) }
+
+            unsafe { *((kb_m + 23 * 8) as uint64) = mp }
+            err = hipModuleLaunchKernel(fh_mks4, WG_PERSIST, 1, 1, 32, 1, 1, 0, 0, kp_m, 0)
+            if err != 0 { die("MKS4 launch", err) }
+            err = hipDeviceSynchronize(); if err != 0 { die("MKS4 sync", err) }
+
+            uint64 nf = 0; unsafe { *((n_floats_arr  + mp * 8) as uint64) -> nf }
+            uint64 d_ref = 0; unsafe { *((ref_buf_arr  + mp * 8) as uint64) -> d_ref }
+            uint64 d_meg = 0; unsafe { *((mega_buf_arr + mp * 8) as uint64) -> d_meg }
+
+            uint64 buf_bytes = nf * 4
+            uint64 hr = alloc(buf_bytes)
+            uint64 hm = alloc(buf_bytes)
+            err = hipMemcpy(hr, d_ref, buf_bytes, 2); if err != 0 { die("D2H ref_buf", err) }
+            err = hipMemcpy(hm, d_meg, buf_bytes, 2); if err != 0 { die("D2H mega_buf", err) }
+
+            f32 max_abs = 0.0f
+            f32 max_rel = 0.0f
+            uint64 bad = 0
+            uint64 first_idx = 0xFFFFFFFFFFFFFFFF
+            f32 first_a = 0.0f
+            f32 first_b = 0.0f
+            uint64 k = 0
+            while k < nf {
+                f32 a = 0.0f; unsafe { *((hr + k * 4) as f32) -> a }
+                f32 b = 0.0f; unsafe { *((hm + k * 4) as f32) -> b }
+                f32 d = a - b
+                if d < 0.0f { d = 0.0f - d }
+                if d > max_abs { max_abs = d }
+                f32 ax = a; if ax < 0.0f { ax = 0.0f - ax }
+                f32 rel = d / (ax + 0.000001f)
+                if rel > max_rel { max_rel = rel }
+                if d > tol {
+                    bad = bad + 1
+                    if first_idx == 0xFFFFFFFFFFFFFFFF {
+                        first_idx = k
+                        first_a = a
+                        first_b = b
+                    }
+                }
+                k = k + 1
+            }
+
+            puts("---")
+            put_kv("max_phase", 9, mp)
+            put_kv("n_floats", 8, nf)
+            put_kv("bad_count", 9, bad)
+            put_f32_bits("max_abs_bits", 12, max_abs)
+            put_f32_bits("max_rel_bits", 12, max_rel)
+            if bad > 0 {
+                put_kv("first_idx", 9, first_idx)
+                put_f32_bits("ref",  3, first_a)
+                put_f32_bits("mega", 4, first_b)
+                if first_bad_phase == 0xFF { first_bad_phase = mp }
+            }
+            // For phase 2, dump per-stream diagnostic: first ref/mega values
+            // at each stream's head=0 j=0 (idx = m * 2048).
+
+            dealloc(hr); dealloc(hm)
+            mp = mp + 1
+        }
+
+        puts("===")
+        if first_bad_phase == 0xFF {
+            puts("rope_mode pass: PASS")
+        } else {
+            put_kv("first_bad_phase", 15, first_bad_phase)
+            puts("rope_mode pass: FAIL")
+            if overall_first_bad == 0xFF {
+                overall_first_bad = first_bad_phase
+                overall_first_bad_mode = rope_mode
+            }
+        }
+
+        rope_mode = rope_mode + 1
+    }
+
+    puts("######################")
+    if overall_first_bad == 0xFF {
+        puts("OVERALL: PASS (both rope_modes)")
+        exit(0)
+    } else {
+        put_kv("overall_first_bad_mode", 22, overall_first_bad_mode)
+        put_kv("overall_first_bad_phase", 23, overall_first_bad)
+        puts("OVERALL: FAIL")
+        exit(1)
+    }
+}

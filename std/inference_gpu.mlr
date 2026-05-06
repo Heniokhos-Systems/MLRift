@@ -81,6 +81,8 @@ static u64 _gpu_fh_qkv_split_batched_14b = 0  // 14B batched variant
 // Slice 4.8: full-layer mega-kernel.  Single dispatch replaces 11 per-op
 // calls per qwen3 layer.  Best-effort load; absence falls back to per-op.
 static u64 _gpu_fh_qwen3_megakernel     = 0
+// Slice 4.14: M_EFF=4 mega-kernel for spec_K=4 PLD path.
+static u64 _gpu_fh_qwen3_megakernel_speck4 = 0
 
 // Arch mirrors — set by gpu_set_arch() (called from qwen3_set_arch).
 // inference_gpu.mlr imports BEFORE qwen3.mlr, so we can't read
@@ -239,6 +241,7 @@ fn _gpu_mm_init_once() {
     _gpu_fh_attn_decode_speck4  = _gpu_mm_load_co("/tmp/attn_decode_f32_speck4.co", "attn_decode_f32_speck4")
     // Slice 4.8 mega-kernel — best-effort load; absence falls back to per-op.
     _gpu_fh_qwen3_megakernel    = _gpu_mm_load_co("/tmp/qwen3_layer_megakernel.co", "qwen3_layer_megakernel")
+    _gpu_fh_qwen3_megakernel_speck4 = _gpu_mm_load_co("/tmp/qwen3_layer_megakernel_speck4.co", "qwen3_layer_megakernel_speck4")
     if _gpu_mm_fh_dq == 0 || _gpu_mm_fh_gemv == 0 { return }
 
     _gpu_mm_cache_keys = alloc(_gpu_mm_cache_cap * 8)
@@ -1573,6 +1576,91 @@ fn gpu_qwen3_layer_megakernel_to_dev(u64 d_in_residual,    u64 d_out_residual,
     u32 grid_x = 512       // WG_PERSIST (slice 4.11 partitioned)
     u32 block_x = 32       // wave-aligned
     u32 err = hipModuleLaunchKernel(_gpu_fh_qwen3_megakernel,
+                                     grid_x, 1, 1, block_x, 1, 1,
+                                     0, 0, kp, 0)
+    if err != 0 { return 1 }
+    return 0
+}
+
+// Slice 4.14 — M_EFF=4 mega-kernel launcher (spec_K=4 PLD path).
+// Same kernarg layout as the M=1 launcher but the per-stream slabs
+// (in_residual, out_residual, all carry buffers, gu_scratch, rope_cos/sin)
+// must be sized [M_EFF, ...].  pos parameter is pos_base; the kernel
+// extends to pos_base+M_EFF-1 internally.
+@export
+fn gpu_qwen3_megakernel_speck4_ready() -> u64 {
+    if gpu_matmul_enabled() == 0 { return 0 }
+    if _gpu_fh_qwen3_megakernel_speck4 == 0 { return 0 }
+    return 1
+}
+
+@export
+fn gpu_qwen3_layer_megakernel_speck4_to_dev(
+        u64 d_in_residual_4, u64 d_out_residual_4,
+        u64 d_qkv_w,         u64 d_o_w,
+        u64 d_gate_up_w,     u64 d_down_w,
+        u64 d_in_norm_g,     u64 d_post_norm_g,
+        u64 d_q_norm_g,      u64 d_k_norm_g,
+        u64 d_rope_cos_4,    u64 d_rope_sin_4,
+        u64 d_kc_layer,      u64 d_vc_layer,
+        u64 pos_base,
+        u64 d_barrier_ctr,   u64 h_barrier_ctr,
+        u64 d_gu_scratch_4,
+        u64 d_b_x_norm_g_4,    u64 d_b_qkv_g_4,
+        u64 d_b_attn_q_g_4,    u64 d_b_mid_g_4,
+        u64 d_b_mid_norm_g_4,  u64 d_b_attn_out_g_4,
+        u64 max_phase) -> u64 {
+    if _gpu_fh_qwen3_megakernel_speck4 == 0 { return 1 }
+
+    if h_barrier_ctr != 0 {
+        u32 z = 0
+        unsafe { *(h_barrier_ctr as u32) = z }
+    } else {
+        u64 zbuf = alloc(4)
+        u32 zv = 0; unsafe { *(zbuf as u32) = zv }
+        u32 cerr = hipMemcpy(d_barrier_ctr, zbuf, 4, 1)
+        if cerr != 0 { return 1 }
+        dealloc(zbuf)
+    }
+
+    _gpu_kp_reset()
+    u64 k_buf = _gpu_kp_bump(24 * 8)
+    unsafe { *((k_buf +  0 * 8) as u64) = d_in_residual_4    }
+    unsafe { *((k_buf +  1 * 8) as u64) = d_out_residual_4   }
+    unsafe { *((k_buf +  2 * 8) as u64) = d_qkv_w            }
+    unsafe { *((k_buf +  3 * 8) as u64) = d_o_w              }
+    unsafe { *((k_buf +  4 * 8) as u64) = d_gate_up_w        }
+    unsafe { *((k_buf +  5 * 8) as u64) = d_down_w           }
+    unsafe { *((k_buf +  6 * 8) as u64) = d_in_norm_g        }
+    unsafe { *((k_buf +  7 * 8) as u64) = d_post_norm_g      }
+    unsafe { *((k_buf +  8 * 8) as u64) = d_q_norm_g         }
+    unsafe { *((k_buf +  9 * 8) as u64) = d_k_norm_g         }
+    unsafe { *((k_buf + 10 * 8) as u64) = d_rope_cos_4       }
+    unsafe { *((k_buf + 11 * 8) as u64) = d_rope_sin_4       }
+    unsafe { *((k_buf + 12 * 8) as u64) = d_kc_layer         }
+    unsafe { *((k_buf + 13 * 8) as u64) = d_vc_layer         }
+    unsafe { *((k_buf + 14 * 8) as u64) = pos_base           }
+    unsafe { *((k_buf + 15 * 8) as u64) = d_barrier_ctr      }
+    unsafe { *((k_buf + 16 * 8) as u64) = d_gu_scratch_4     }
+    unsafe { *((k_buf + 17 * 8) as u64) = d_b_x_norm_g_4     }
+    unsafe { *((k_buf + 18 * 8) as u64) = d_b_qkv_g_4        }
+    unsafe { *((k_buf + 19 * 8) as u64) = d_b_attn_q_g_4     }
+    unsafe { *((k_buf + 20 * 8) as u64) = d_b_mid_g_4        }
+    unsafe { *((k_buf + 21 * 8) as u64) = d_b_mid_norm_g_4   }
+    unsafe { *((k_buf + 22 * 8) as u64) = d_b_attn_out_g_4   }
+    unsafe { *((k_buf + 23 * 8) as u64) = max_phase          }
+
+    u64 kp = _gpu_kp_bump(24 * 8)
+    u64 j = 0
+    while j < 24 {
+        u64 slot_ptr = k_buf + j * 8
+        unsafe { *((kp + j * 8) as u64) = slot_ptr }
+        j = j + 1
+    }
+
+    u32 grid_x = 512
+    u32 block_x = 32
+    u32 err = hipModuleLaunchKernel(_gpu_fh_qwen3_megakernel_speck4,
                                      grid_x, 1, 1, block_x, 1, 1,
                                      0, 0, kp, 0)
     if err != 0 { return 1 }
