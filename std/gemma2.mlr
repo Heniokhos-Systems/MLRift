@@ -60,22 +60,22 @@ fn gemma2_set_sliding_window(u64 win)     { gemma2_sliding_window = win }
 fn gemma2_set_rope_base(u64 theta)        { gemma2_rope_theta_int = theta }
 
 // ─── Per-layer weight struct ────────────────────────────────────────
-// 11 pointer slots × 8 = 88 bytes/layer. Field names are namespaced with
-// `g2_` to avoid collision with Qwen3LayerWeights field names — MLRift's
-// struct field resolver is global, so identical field names across two
-// structs cause silently-mis-resolved derefs (segfault).
+// 11 pointer slots × 8 = 88 bytes/layer. Several field names overlap
+// with Qwen3LayerWeights (q_proj_w, k_proj_w, etc.) — that's fine since
+// the struct_var_table is now per-function (see fix in src/ir.mlr +
+// src/codegen.mlr's var_reset on 2026-05-07).
 struct Gemma2LayerWeights {
-    u64 g2_attn_norm_w        // pre-attention RMSNorm (already +1 baked)
-    u64 g2_q_proj_w
-    u64 g2_k_proj_w
-    u64 g2_v_proj_w
-    u64 g2_o_proj_w
-    u64 g2_post_attn_norm_w   // post-attention RMSNorm (already +1 baked)
-    u64 g2_ffn_norm_w         // pre-FFN RMSNorm (already +1 baked)
-    u64 g2_gate_proj_w
-    u64 g2_up_proj_w
-    u64 g2_down_proj_w
-    u64 g2_post_ffn_norm_w    // post-FFN RMSNorm (already +1 baked)
+    u64 attn_norm_w           // pre-attention RMSNorm (already +1 baked)
+    u64 q_proj_w
+    u64 k_proj_w
+    u64 v_proj_w
+    u64 o_proj_w
+    u64 post_attn_norm_w      // post-attention RMSNorm (already +1 baked)
+    u64 ffn_norm_w            // pre-FFN RMSNorm (already +1 baked)
+    u64 gate_proj_w
+    u64 up_proj_w
+    u64 down_proj_w
+    u64 post_ffn_norm_w       // post-FFN RMSNorm (already +1 baked)
 }
 
 // ─── (1 + w) RMSNorm weight pre-bake ────────────────────────────────
@@ -247,13 +247,11 @@ fn gemma2_attn_cached_softcap(u64 out_ptr,
 // `is_sliding = bool((layer_idx + 1) % 2)`, which is true when layer_idx
 // is even.)
 //
-// `w_base` is a raw 88-byte/layer pointer; slot offsets follow the
-// Gemma2LayerWeights struct order. We deref via raw pointer arithmetic
-// instead of struct fields because MLRift's struct field resolver is
-// global across structs (silently mis-resolves names that collide with
-// Qwen3LayerWeights).
+// `w` is a Gemma2LayerWeights struct laid out at the caller's per-layer
+// offset (88 bytes/layer). Field names overlap Qwen3LayerWeights; that's
+// fine since struct_var_table is per-function (fix landed 2026-05-07).
 fn gemma2_forward_layer(u64 x_out, u64 x_in,
-                        u64 w_base,
+                        Gemma2LayerWeights w,
                         u64 pos,
                         u64 k_cache_layer, u64 v_cache_layer,
                         u64 num_workers, u64 layer_idx) {
@@ -274,35 +272,12 @@ fn gemma2_forward_layer(u64 x_out, u64 x_in,
     memcpy(resid, x_in, hidden * 4)
 
     u64 x_norm = alloc(hidden * 4)
-    u64 _wp_an = 0
-    unsafe { *(w_base as u64) -> _wp_an }
-    u64 _wp_q = 0
-    unsafe { *((w_base + 8) as u64) -> _wp_q }
-    u64 _wp_k = 0
-    unsafe { *((w_base + 16) as u64) -> _wp_k }
-    u64 _wp_v = 0
-    unsafe { *((w_base + 24) as u64) -> _wp_v }
-    u64 _wp_o = 0
-    unsafe { *((w_base + 32) as u64) -> _wp_o }
-    u64 _wp_pan = 0
-    unsafe { *((w_base + 40) as u64) -> _wp_pan }
-    u64 _wp_fn = 0
-    unsafe { *((w_base + 48) as u64) -> _wp_fn }
-    u64 _wp_g = 0
-    unsafe { *((w_base + 56) as u64) -> _wp_g }
-    u64 _wp_u = 0
-    unsafe { *((w_base + 64) as u64) -> _wp_u }
-    u64 _wp_d = 0
-    unsafe { *((w_base + 72) as u64) -> _wp_d }
-    u64 _wp_pfn = 0
-    unsafe { *((w_base + 80) as u64) -> _wp_pfn }
-
-    qwen3_rmsnorm_f32_weights(x_norm, x_in, _wp_an, hidden)
+    qwen3_rmsnorm_f32_weights(x_norm, x_in, w.attn_norm_w, hidden)
 
     u64 q_buf = alloc(q_dim * 4)
-    qwen3_main_matmul(q_buf, x_norm, _wp_q, 1, q_dim,  hidden, num_workers, 0)
-    qwen3_main_matmul(k_row, x_norm, _wp_k, 1, kv_dim, hidden, num_workers, 0)
-    qwen3_main_matmul(v_row, x_norm, _wp_v, 1, kv_dim, hidden, num_workers, 0)
+    qwen3_main_matmul(q_buf, x_norm, w.q_proj_w, 1, q_dim,  hidden, num_workers, 0)
+    qwen3_main_matmul(k_row, x_norm, w.k_proj_w, 1, kv_dim, hidden, num_workers, 0)
+    qwen3_main_matmul(v_row, x_norm, w.v_proj_w, 1, kv_dim, hidden, num_workers, 0)
 
     // RoPE on Q and K (NEOX layout, theta = gemma2_rope_theta_int).
     if qwen3_rope_cos_cache == 0 {
@@ -327,11 +302,11 @@ fn gemma2_forward_layer(u64 x_out, u64 x_in,
 
     // o_proj (q_dim → hidden).
     u64 o_buf = alloc(hidden * 4)
-    qwen3_main_matmul(o_buf, attn_out, _wp_o, 1, hidden, q_dim, num_workers, 0)
+    qwen3_main_matmul(o_buf, attn_out, w.o_proj_w, 1, hidden, q_dim, num_workers, 0)
 
     // Post-attention RMSNorm wraps the block output BEFORE the residual add.
     u64 o_post = alloc(hidden * 4)
-    qwen3_rmsnorm_f32_weights(o_post, o_buf, _wp_pan, hidden)
+    qwen3_rmsnorm_f32_weights(o_post, o_buf, w.post_attn_norm_w, hidden)
 
     // Residual: mid = resid + o_post.
     u64 mid = alloc(hidden * 4)
@@ -345,22 +320,22 @@ fn gemma2_forward_layer(u64 x_out, u64 x_in,
 
     // ── FFN path ──
     u64 mid_norm = alloc(hidden * 4)
-    qwen3_rmsnorm_f32_weights(mid_norm, mid, _wp_fn, hidden)
+    qwen3_rmsnorm_f32_weights(mid_norm, mid, w.ffn_norm_w, hidden)
 
     u64 gate_buf = alloc(ff * 4)
     u64 up_buf   = alloc(ff * 4)
-    qwen3_main_matmul(gate_buf, mid_norm, _wp_g, 1, ff, hidden, num_workers, 0)
-    qwen3_main_matmul(up_buf,   mid_norm, _wp_u, 1, ff, hidden, num_workers, 0)
+    qwen3_main_matmul(gate_buf, mid_norm, w.gate_proj_w, 1, ff, hidden, num_workers, 0)
+    qwen3_main_matmul(up_buf,   mid_norm, w.up_proj_w,   1, ff, hidden, num_workers, 0)
 
     u64 ff_buf = alloc(ff * 4)
     gemma2_gelu_mul(ff_buf, gate_buf, up_buf, ff)
 
     u64 ff_out = alloc(hidden * 4)
-    qwen3_main_matmul(ff_out, ff_buf, _wp_d, 1, hidden, ff, num_workers, 0)
+    qwen3_main_matmul(ff_out, ff_buf, w.down_proj_w, 1, hidden, ff, num_workers, 0)
 
     // Post-FFN RMSNorm.
     u64 ff_post = alloc(hidden * 4)
-    qwen3_rmsnorm_f32_weights(ff_post, ff_out, _wp_pfn, hidden)
+    qwen3_rmsnorm_f32_weights(ff_post, ff_out, w.post_ffn_norm_w, hidden)
 
     // Second residual: x_out = mid + ff_post.
     i = 0
