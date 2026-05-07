@@ -96,13 +96,34 @@ fn gemma2_bake_1plus_w(u64 src_w_f32, u64 dim) -> u64 {
 // ─── tanh + soft-cap ────────────────────────────────────────────────
 // Stable formulation:  tanh(x) = sign(x) * (1 - 2 / (exp(2|x|) + 1))
 // avoids overflow for very negative x.
+//
+// Uses f64 exp_f64 (10-term Taylor + range reduction, ~5e-9 relative
+// error) rather than the qwen3 exp_f32_fast (5-term minimax, ~2e-6).
+// The qwen3 path's ~2e-6 was fine for sigmoid in SiLU (one tanh per
+// FFN), but Gemma2 fires this on the lm_head softcap (256k vocab) +
+// attn softcap + GeLU per token. Accumulated drift was enough to flip
+// the argmax at decode position 18 vs llama.cpp reference. f64 path
+// is ~5× slower per call but only invoked off the hot matmul path.
 fn gemma2_tanh_f32(f32 x) -> f32 {
-    f32 ax = x
-    f32 sgn = 1.0f
-    if ax < 0.0f { ax = 0.0f - ax; sgn = -1.0f }
-    f32 e2 = exp_f32_fast(2.0f * ax)
-    f32 t = 1.0f - 2.0f / (e2 + 1.0f)
-    return sgn * t
+    f64 xd = f32_to_f64(x)
+    f64 zero = int_to_f64(0)
+    f64 one  = int_to_f64(1)
+    f64 two  = int_to_f64(2)
+    f64 ax   = xd
+    f64 sgn  = one
+    if ax < zero {
+        ax  = zero - ax
+        sgn = zero - one
+    }
+    // tanh saturates well within f32 precision for |x| > ~9.
+    // Use 20 as a conservative cap; avoids any f64 overflow concerns.
+    f64 cap = int_to_f64(20)
+    if ax > cap {
+        return f64_to_f32(sgn)
+    }
+    f64 e2 = exp_f64(two * ax)
+    f64 t  = one - two / (e2 + one)
+    return f64_to_f32(sgn * t)
 }
 
 fn gemma2_softcap_f32(f32 x, f32 cap) -> f32 {
@@ -140,20 +161,62 @@ fn gemma2_scale_embed_inplace(u64 buf_ptr, u64 hidden) {
 // gelu_tanh(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
 // Out[i] = gelu_tanh(gate[i]) * up[i] for i in [0, dim).
 //
-// Scalar implementation; AVX2 fastpath can come later. For 2304-dim ff
-// hot path this is the single biggest CPU cost on Gemma2-2B; if perf is
-// limiting we'll port to AVX2 like qwen3_silu_mul_avx2.
-fn gemma2_gelu_mul(u64 out_ptr, u64 gate_ptr, u64 up_ptr, u64 dim) {
+// llama.cpp matches their `ggml_vec_geglu_f32` with `GGML_GELU_FP16`
+// always defined: GeLU is computed via a precomputed 65536-entry fp16
+// LUT. To match bit-exactly, we mirror that LUT — for x in (-10, 10),
+// quantize x to fp16, look up table[fp16_bits], cast back to f32. Out
+// of range x: 0 (saturated tanh = -1) or x*g (saturated tanh = +1).
+//
+// Without the LUT, our exact-tanh GeLU produces slightly different
+// per-element values than llama.cpp; the systematic bias accumulates
+// across 26 layers × 9216 ff units and flips the argmax around decode
+// position 18 vs the llama.cpp reference (Mistral / Llama-3 use SiLU
+// without a LUT, so they match without this trick).
+static u64 gemma2_gelu_table = 0   // 65536 × u16, indexed by fp16 bits
+
+fn gemma2_gelu_table_init() {
+    if gemma2_gelu_table != 0 { return }
+    u64 tbl = alloc(65536 * 2)
     f32 c0 = 0.7978845608028654f       // sqrt(2/pi)
     f32 c1 = 0.044715f
+    u64 i = 0
+    while i < 65536 {
+        f32 x = gguf_f16_to_f32_exact(i)
+        // gelu(x) = 0.5 * x * (1 + tanh(c0 * x * (1 + c1 * x * x)))
+        // Match llama.cpp's expression order (vec.h:987) so the f32
+        // intermediate before fp16 quantize is bit-identical.
+        f32 inner = c0 * x * (1.0f + c1 * x * x)
+        f32 t = gemma2_tanh_f32(inner)
+        f32 y = 0.5f * x * (1.0f + t)
+        u64 y_f16 = _q8q8_fp32_to_fp16_rne(y)
+        u8 lo = y_f16 & 0xFF
+        u8 hi = (y_f16 >> 8) & 0xFF
+        store8(tbl + i * 2 + 0, lo)
+        store8(tbl + i * 2 + 1, hi)
+        i = i + 1
+    }
+    gemma2_gelu_table = tbl
+}
+
+fn gemma2_gelu_mul(u64 out_ptr, u64 gate_ptr, u64 up_ptr, u64 dim) {
+    if gemma2_gelu_table == 0 { gemma2_gelu_table_init() }
+    u64 tbl = gemma2_gelu_table
     u64 i = 0
     while i < dim {
         f32 g = 0.0f; unsafe { *((gate_ptr + i * 4) as f32) -> g }
         f32 u = 0.0f; unsafe { *((up_ptr   + i * 4) as f32) -> u }
-        f32 g3 = g * g * g
-        f32 inner = c0 * (g + c1 * g3)
-        f32 t = gemma2_tanh_f32(inner)
-        f32 act = 0.5f * g * (1.0f + t)
+        f32 act = 0.0f
+        if g <= -10.0f {
+            act = 0.0f
+        } else if g >= 10.0f {
+            act = g
+        } else {
+            u64 g_f16 = _q8q8_fp32_to_fp16_rne(g)
+            u64 lo = load8(tbl + g_f16 * 2 + 0)
+            u64 hi = load8(tbl + g_f16 * 2 + 1)
+            u64 y_f16 = lo | (hi << 8)
+            act = gguf_f16_to_f32_exact(y_f16)
+        }
         unsafe { *((out_ptr + i * 4) as f32) = act * u }
         i = i + 1
     }
