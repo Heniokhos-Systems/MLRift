@@ -1,13 +1,12 @@
-// Slice 4.19.1 — A/B gate harness for the v2 mega-kernel (phase 1 rmsnorm).
+// Slice 4.19.2 — A/B gate harness for the v2 mega-kernel (phase 1 + phase 3).
 //
 // Loads BOTH the v1 byte-wrapper .co and the v2 AST-walker .co,
 // dispatches each with the same kernarg blob and MAX_PHASE value,
 // and byte-diffs every output slab.
 //
-// Slice-4.19.1-specific gate (MAX_PHASE=0):
-//   v2 phase 1 now emits real inline rmsnorm ISA (WG-0 gated, N=1024).
-//   Both v1 and v2 should write the same b_x_norm_g output.
-//   Expected at MAX_PHASE=0: ALL output slabs match (n_mismatch==0).
+// Slice-4.19.2-specific gate:
+//   MAX_PHASE=0: v2 phase 1 (rmsnorm) — ALL slabs match.
+//   MAX_PHASE=1: v2 phase 3 (QKV matmul, b_qkv_g) — ALL slabs match.
 //   PASS = both .co files load + dispatch without hang, ALL slabs match.
 //
 // Build:
@@ -17,14 +16,13 @@
 //   ./build/mlrc examples/llm/qwen3_layer_megakernel_v1v2_ab.mlr \
 //       -o /tmp/v1v2_ab --arch=x86_64 --target=linux --emit=elfexe
 // Run:
-//   MAX_PHASE=0 /tmp/v1v2_ab
-// Expected output (MAX_PHASE=0):
+//   MAX_PHASE=0 /tmp/v1v2_ab   → PASS -- slice 4.19.2 gate (MAX_PHASE=0)
+//   MAX_PHASE=1 /tmp/v1v2_ab   → PASS -- slice 4.19.2 gate (MAX_PHASE=1)
+// Expected output (MAX_PHASE=1):
 //   v1 .bin fletcher-32 pin: PASS
 //   v1 load: PASS  /  v2 load: PASS
-//   OK out_residual
-//   OK kc_layer
-//   ... (all 10 slabs OK)
-//   PASS -- slice 4.19.1 gate
+//   OK out_residual  OK kc_layer  ... (all 10 slabs OK)
+//   PASS -- slice 4.19.2 gate (MAX_PHASE=1)
 // Exit: 0
 //
 // Implementation note on D2H buffer pre-allocation:
@@ -67,6 +65,7 @@ static uint64 Q_DIM       = 2048      // N_HEADS * HEAD_DIM
 static uint64 KV_DIM      = 1024      // N_KV_HEADS * HEAD_DIM
 static uint64 QKV_DIM     = 4096      // (N_HEADS + 2*N_KV_HEADS) * HEAD_DIM
 static uint64 FF          = 3072
+static uint64 HIDDEN_PAD  = 1152     // padded row stride for qkv_w (from .hip.cpp #define HIDDEN_PAD 1152)
 static uint64 WG_PERSIST_V1 = 512    // v1 native HIP kernel (#define WG_PERSIST 512 in .hip.cpp)
 static uint64 WG_PERSIST_V2 = 512    // v2 AST-walker (matches v1 and HIP source)
 static uint64 MAX_SEQ     = 64
@@ -202,35 +201,11 @@ fn check_v1_bin_pin(uint64 bin_path) {
 
 // ── DispatchPath struct helpers (heap uint64[34] array) ──────────────────
 // Slot accessors for the DispatchPath struct (see header comment for layout).
+// Only dp_fh and dp_wg are used by dispatch/copy_outputs_d2h (the rest
+// of the struct is addressed via dp_slot with magic indices).
 fn dp_fh(uint64 p) -> uint64 { uint64 v = 0; unsafe { *(p as uint64) -> v }; return v }
 fn dp_wg(uint64 p) -> uint64 { uint64 v = 0; unsafe { *((p + 8) as uint64) -> v }; return v }
 fn dp_slot(uint64 p, uint64 s) -> uint64 { uint64 v = 0; unsafe { *((p + s * 8) as uint64) -> v }; return v }
-
-// Named per-field accessors (carry-forward item 3 from slice 4.19.0 review).
-// Device-side pointers:
-fn dp_d_in_resid(uint64 p)    -> uint64 { return dp_slot(p,  2) }
-fn dp_d_out_resid(uint64 p)   -> uint64 { return dp_slot(p,  3) }
-fn dp_d_kc(uint64 p)          -> uint64 { return dp_slot(p, 14) }
-fn dp_d_vc(uint64 p)          -> uint64 { return dp_slot(p, 15) }
-fn dp_d_barrier(uint64 p)     -> uint64 { return dp_slot(p, 16) }
-fn dp_d_gu_scratch(uint64 p)  -> uint64 { return dp_slot(p, 17) }
-fn dp_d_bxnorm(uint64 p)      -> uint64 { return dp_slot(p, 18) }
-fn dp_d_bqkv(uint64 p)        -> uint64 { return dp_slot(p, 19) }
-fn dp_d_battnq(uint64 p)      -> uint64 { return dp_slot(p, 20) }
-fn dp_d_bmid(uint64 p)        -> uint64 { return dp_slot(p, 21) }
-fn dp_d_bmidnorm(uint64 p)    -> uint64 { return dp_slot(p, 22) }
-fn dp_d_battnout(uint64 p)    -> uint64 { return dp_slot(p, 23) }
-// Host-side output buffers (pre-allocated before hipSetDevice):
-fn dp_ha_out_resid(uint64 p)  -> uint64 { return dp_slot(p, 24) }
-fn dp_ha_kc(uint64 p)         -> uint64 { return dp_slot(p, 25) }
-fn dp_ha_vc(uint64 p)         -> uint64 { return dp_slot(p, 26) }
-fn dp_ha_gu_scratch(uint64 p) -> uint64 { return dp_slot(p, 27) }
-fn dp_ha_bxnorm(uint64 p)     -> uint64 { return dp_slot(p, 28) }
-fn dp_ha_bqkv(uint64 p)       -> uint64 { return dp_slot(p, 29) }
-fn dp_ha_battnq(uint64 p)     -> uint64 { return dp_slot(p, 30) }
-fn dp_ha_bmid(uint64 p)       -> uint64 { return dp_slot(p, 31) }
-fn dp_ha_bmidnorm(uint64 p)   -> uint64 { return dp_slot(p, 32) }
-fn dp_ha_battnout(uint64 p)   -> uint64 { return dp_slot(p, 33) }
 
 // Output slab sizes: in_resid_b, kv_b, gu_b, norm_b, b_qkv_b, b_q_b.
 // Shared input device buffers: d_in_resid .. d_rope_sin (slots 2-13, no dmalloc needed).
@@ -326,9 +301,17 @@ fn dispatch(uint64 dp, uint64 max_phase,
     unsafe { *((kb + 23 * 8) as uint64) = max_phase }
     uint64 kp = build_kp(kb, 24)
     err = hipModuleLaunchKernel(dp_fh(dp), dp_wg(dp), 1, 1, 32, 1, 1, 0, 0, kp, 0)
-    if err != 0 { die("launch failed") }
+    if err != 0 {
+        uint64 errmsg = hipGetErrorString(err)
+        puts(errmsg)
+        die("launch failed")
+    }
     err = hipDeviceSynchronize()
-    if err != 0 { die("sync failed -- possible deadlock") }
+    if err != 0 {
+        uint64 errmsg = hipGetErrorString(err)
+        puts(errmsg)
+        die("sync failed -- possible deadlock")
+    }
 }
 
 // Copy all output slabs D2H into the path's host buffers.
@@ -381,7 +364,7 @@ fn diff_slab(uint64 name_ptr, uint64 name_len, uint64 ha, uint64 hb, uint64 n_by
 fn main() {
     // ── Size constants (bytes) ────────────────────────────────────────────
     uint64 in_resid_b   = HIDDEN * 4
-    uint64 qkv_w_b      = QKV_DIM * HIDDEN * 2
+    uint64 qkv_w_b      = QKV_DIM * HIDDEN_PAD * 2   // padded row stride: HIDDEN_PAD=1152 u16 per row
     uint64 o_w_b        = HIDDEN * Q_DIM * 2
     uint64 gateup_b     = 2 * FF * HIDDEN * 2
     uint64 down_b       = HIDDEN * FF * 2
@@ -560,14 +543,21 @@ fn main() {
     uint64 r8 = diff_slab("b_mid_norm_g", 12, dp_slot(dp_v1,32), dp_slot(dp_v2,32), norm_b)
     uint64 r9 = diff_slab("b_attn_out_g", 12, dp_slot(dp_v1,33), dp_slot(dp_v2,33), b_q_b)
 
-    // Slice-4.19.1 gate: at MAX_PHASE=0 ALL slabs must match.
-    // v2 now emits real phase-1 rmsnorm so b_x_norm_g output should agree
-    // with v1.  Any mismatch means the inline ISA emitter has a bug.
+    // Slice-4.19.2 gate: at MAX_PHASE=0 and MAX_PHASE=1 ALL slabs must match.
+    //   MAX_PHASE=0: v2 phase 1 (rmsnorm) produces b_x_norm_g; all others zero = match.
+    //   MAX_PHASE=1: v2 phase 3 (QKV matmul) produces b_qkv_g; must match v1.
+    // At MAX_PHASE>=2, phases 5+ are still stubs so downstream slabs will mismatch v1
+    // (expected; those mismatches are informational, not failures).
     uint64 n_mismatch = r0 + r1 + r2 + r3 + r4 + r5 + r6 + r7 + r8 + r9
 
     if max_phase == 0 {
-        if n_mismatch != 0 { puts("FAIL -- slice 4.19.1 gate: expected all slabs to match but got mismatch(es)"); exit(1) }
-        puts("PASS -- slice 4.19.1 gate")
+        if n_mismatch != 0 { puts("FAIL -- slice 4.19.2 gate (MAX_PHASE=0): expected all slabs to match"); exit(1) }
+        puts("PASS -- slice 4.19.2 gate (MAX_PHASE=0)")
+        exit(0)
+    }
+    if max_phase == 1 {
+        if n_mismatch != 0 { puts("FAIL -- slice 4.19.2 gate (MAX_PHASE=1): expected all slabs to match"); exit(1) }
+        puts("PASS -- slice 4.19.2 gate (MAX_PHASE=1)")
         exit(0)
     }
     put_kv("mismatch_slabs", 14, n_mismatch)
