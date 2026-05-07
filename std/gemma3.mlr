@@ -1,0 +1,334 @@
+// Gemma-3 forward path. Forks Gemma-2's residual structure (post-attn +
+// post-ffn RMSNorms with (1+w) baked at conversion time, GeLU FFN, and
+// final-logit soft-cap), and adds the Gemma-3 deltas:
+//
+//   * Per-head Q/K RMSNorm before RoPE (head_dim weight, Qwen3-style).
+//   * NO attention soft-cap (only the lm_head soft-cap remains).
+//   * Per-layer RoPE base: sliding-window layers use rope.local.freq_base
+//     (default 10 000), global layers use rope.global.freq_base
+//     (default 1 000 000).
+//   * Sliding-window pattern with period 6: layers where
+//     (layer_idx % swa_period) == (swa_period - 1) are global; the
+//     other 5/6 are sliding-window. (Default 512-token window.)
+//   * Embedding scale by sqrt(hidden) — same as Gemma-2.
+//
+// We reuse Gemma-2's gemma2_tanh_f32 (f64 internal), gemma2_softcap_f32,
+// gemma2_softcap_logits, gemma2_scale_embed_inplace and especially
+// gemma2_gelu_mul (the fp16-LUT GeLU that's the load-bearing fix for
+// matching llama.cpp's GGML_GELU_FP16 table). Importing gemma2.mlr
+// pulls in all of those plus its qwen3.mlr import, giving us the
+// matmul / dot / axpy / RMSNorm / qknorm helpers too.
+
+import "gemma2.mlr"
+
+// ─── Arch knobs ──────────────────────────────────────────────────────
+static u64 GEMMA3_HIDDEN     = 0
+static u64 GEMMA3_HEAD_DIM   = 0
+static u64 GEMMA3_N_HEADS    = 0
+static u64 GEMMA3_N_KV_HEADS = 0
+static u64 GEMMA3_Q_DIM      = 0
+static u64 GEMMA3_KV_DIM     = 0
+static u64 GEMMA3_FF         = 0
+
+// Final-logit soft-cap (gemma3-1B sets this to 30 in GGUF metadata).
+// Gemma-3 dropped the attention soft-cap.
+static f32 gemma3_lm_softcap = 0.0f
+
+// Sliding-window length for SWA layers. 0 disables (treat all layers as
+// global). Gemma3-1B sets this to 512 in GGUF metadata.
+static u64 gemma3_sliding_window = 0
+
+// SWA pattern period. With period N, layers where
+// (layer_idx % N) == (N - 1) are global, the rest are SWA. Gemma3
+// default is 6 (5 SWA + 1 global per cycle).
+static u64 gemma3_swa_period = 6
+
+// Per-layer RoPE freq-base. local applies to SWA layers, global to
+// global layers. Gemma3-1B defaults: local=10 000, global=1 000 000.
+static u64 gemma3_rope_local_base_int  = 10000
+static u64 gemma3_rope_global_base_int = 1000000
+
+fn gemma3_set_arch(u64 hidden, u64 head_dim, u64 n_heads, u64 n_kv_heads, u64 ff) {
+    GEMMA3_HIDDEN     = hidden
+    GEMMA3_HEAD_DIM   = head_dim
+    GEMMA3_N_HEADS    = n_heads
+    GEMMA3_N_KV_HEADS = n_kv_heads
+    GEMMA3_Q_DIM      = n_heads    * head_dim
+    GEMMA3_KV_DIM     = n_kv_heads * head_dim
+    GEMMA3_FF         = ff
+}
+
+fn gemma3_set_lm_softcap(f32 cap)         { gemma3_lm_softcap = cap }
+fn gemma3_set_sliding_window(u64 win)     { gemma3_sliding_window = win }
+fn gemma3_set_swa_period(u64 p)           { gemma3_swa_period = p }
+fn gemma3_set_rope_bases(u64 local_base, u64 global_base) {
+    gemma3_rope_local_base_int  = local_base
+    gemma3_rope_global_base_int = global_base
+}
+
+// ─── Per-layer weight struct ────────────────────────────────────────
+// 13 u64 slots × 8 bytes = 104 bytes/layer. Driver fills these from
+// the GGUF tensor index. We keep field names that overlap Qwen3's
+// (q_proj_w, k_proj_w, etc.) — the struct_var_table fix in 7a5ef80
+// resets per-function so cross-struct collisions are no longer a bug.
+struct Gemma3LayerWeights {
+    u64 attn_norm_w        // slot 0  — pre-attn  RMSNorm (1+w baked)
+    u64 q_proj_w           // slot 1
+    u64 k_proj_w           // slot 2
+    u64 v_proj_w           // slot 3
+    u64 o_proj_w           // slot 4
+    u64 q_norm_w           // slot 5  — per-head Q RMSNorm  (head_dim)
+    u64 k_norm_w           // slot 6  — per-head K RMSNorm  (head_dim)
+    u64 post_attn_norm_w   // slot 7  — post-attn RMSNorm (1+w baked)
+    u64 ffn_norm_w         // slot 8  — pre-ffn RMSNorm (1+w baked)
+    u64 gate_proj_w        // slot 9
+    u64 up_proj_w          // slot 10
+    u64 down_proj_w        // slot 11
+    u64 post_ffn_norm_w    // slot 12 — post-ffn RMSNorm (1+w baked)
+}
+
+// ─── RoPE caches: separate local (SWA) + global tables ──────────────
+static u64 gemma3_rope_cache_pos_local  = 0xFFFFFFFFFFFFFFFF
+static u64 gemma3_rope_cos_cache_local  = 0
+static u64 gemma3_rope_sin_cache_local  = 0
+static u64 gemma3_rope_cache_pos_global = 0xFFFFFFFFFFFFFFFF
+static u64 gemma3_rope_cos_cache_global = 0
+static u64 gemma3_rope_sin_cache_global = 0
+
+// ─── Attention with optional sliding-window mask, no soft-cap ───────
+// Mirrors gemma2_attn_cached_softcap minus the soft-cap branch.
+fn gemma3_attn_cached(u64 out_ptr,
+                     u64 q_ptr, u64 k_cache, u64 v_cache,
+                     u64 seq_len,
+                     u64 n_heads, u64 n_kv_heads, u64 head_dim,
+                     u64 apply_sliding) {
+    f32 scale = 1.0f / sqrt_f32(int_to_f32(head_dim))
+    u64 kv_row_bytes = n_kv_heads * head_dim * 4
+
+    u64 t_lo = 0
+    if apply_sliding != 0 {
+        u64 win = gemma3_sliding_window
+        if win > 0 {
+            if seq_len > win { t_lo = seq_len - win }
+        }
+    }
+
+    u64 h = 0
+    while h < n_heads {
+        u64 kvh = (h * n_kv_heads) / n_heads
+        u64 q_row = q_ptr   + h * head_dim * 4
+        u64 o_row = out_ptr + h * head_dim * 4
+
+        // Pass 1: max raw score.
+        f32 max_score = 0.0f
+        u64 first = 1
+        u64 t = t_lo
+        while t < seq_len {
+            u64 k_row = k_cache + t * kv_row_bytes + kvh * head_dim * 4
+            f32 s = qwen3_dot_avx2(q_row, k_row, head_dim) * scale
+            if first == 1 {
+                max_score = s; first = 0
+            } else {
+                if s > max_score { max_score = s }
+            }
+            t = t + 1
+        }
+
+        f32 zero = 0.0f
+        u64 d0 = 0
+        while d0 < head_dim {
+            unsafe { *((o_row + d0 * 4) as f32) = zero }
+            d0 = d0 + 1
+        }
+
+        // Pass 2: weighted V accumulate.
+        f32 sum_exp = 0.0f
+        t = t_lo
+        while t < seq_len {
+            u64 k_row = k_cache + t * kv_row_bytes + kvh * head_dim * 4
+            u64 v_row = v_cache + t * kv_row_bytes + kvh * head_dim * 4
+            f32 s = qwen3_dot_avx2(q_row, k_row, head_dim) * scale
+            f32 e = exp_f32_fast(s - max_score)
+            sum_exp = sum_exp + e
+            qwen3_axpy_avx2(o_row, v_row, e, head_dim)
+            t = t + 1
+        }
+
+        f32 inv_sum = 1.0f / sum_exp
+        u64 dn = 0
+        while dn < head_dim {
+            f32 ov = 0.0f; unsafe { *((o_row + dn * 4) as f32) -> ov }
+            unsafe { *((o_row + dn * 4) as f32) = ov * inv_sum }
+            dn = dn + 1
+        }
+
+        h = h + 1
+    }
+}
+
+// ─── Per-head Q/K RMSNorm (in place) ────────────────────────────────
+// Mirrors qwen3_forward_layer's QK-Norm pass. Each Q head and each K
+// head gets RMSNorm'd against the same head_dim weight.
+fn gemma3_qknorm_apply(u64 q_buf, u64 k_row,
+                       u64 q_norm_w, u64 k_norm_w,
+                       u64 n_heads, u64 n_kv_heads, u64 head_dim) {
+    u64 h = 0
+    while h < n_heads {
+        u64 q_slice = q_buf + h * head_dim * 4
+        qwen3_rmsnorm_f32_weights(q_slice, q_slice, q_norm_w, head_dim)
+        h = h + 1
+    }
+    h = 0
+    while h < n_kv_heads {
+        u64 k_slice = k_row + h * head_dim * 4
+        qwen3_rmsnorm_f32_weights(k_slice, k_slice, k_norm_w, head_dim)
+        h = h + 1
+    }
+}
+
+// ─── Forward layer (CPU) ────────────────────────────────────────────
+// SWA pattern: layer is GLOBAL when (layer_idx % swa_period) ==
+// (swa_period - 1); otherwise SWA. With period 6 over 26 layers:
+// layers 5, 11, 17, 23 are global; rest are SWA.
+fn gemma3_forward_layer(u64 x_out, u64 x_in,
+                        Gemma3LayerWeights w,
+                        u64 pos,
+                        u64 k_cache_layer, u64 v_cache_layer,
+                        u64 num_workers,
+                        u64 layer_idx) {
+    u64 hidden = GEMMA3_HIDDEN
+    u64 hd     = GEMMA3_HEAD_DIM
+    u64 nh     = GEMMA3_N_HEADS
+    u64 nkv    = GEMMA3_N_KV_HEADS
+    u64 q_dim  = GEMMA3_Q_DIM
+    u64 kv_dim = GEMMA3_KV_DIM
+    u64 ff     = GEMMA3_FF
+
+    u64 kv_row_bytes = nkv * hd * 4
+    u64 k_row = k_cache_layer + pos * kv_row_bytes
+    u64 v_row = v_cache_layer + pos * kv_row_bytes
+
+    // SWA decision: GLOBAL when (layer_idx % period) == (period-1).
+    u64 is_swa = 1
+    u64 period = gemma3_swa_period
+    if period > 0 {
+        u64 mod = layer_idx % period
+        if mod == (period - 1) { is_swa = 0 }
+    }
+
+    // ── Pre-attention path ──
+    u64 resid = alloc(hidden * 4)
+    memcpy(resid, x_in, hidden * 4)
+
+    u64 x_norm = alloc(hidden * 4)
+    qwen3_rmsnorm_f32_weights(x_norm, x_in, w.attn_norm_w, hidden)
+
+    u64 q_buf = alloc(q_dim * 4)
+    qwen3_main_matmul(q_buf, x_norm, w.q_proj_w, 1, q_dim,  hidden, num_workers, 0)
+    qwen3_main_matmul(k_row, x_norm, w.k_proj_w, 1, kv_dim, hidden, num_workers, 0)
+    qwen3_main_matmul(v_row, x_norm, w.v_proj_w, 1, kv_dim, hidden, num_workers, 0)
+
+    // QK-Norm (per-head RMSNorm against head_dim weight).
+    gemma3_qknorm_apply(q_buf, k_row, w.q_norm_w, w.k_norm_w, nh, nkv, hd)
+
+    // RoPE — pick local vs global cache by SWA flag.
+    if is_swa != 0 {
+        if gemma3_rope_cos_cache_local == 0 {
+            gemma3_rope_cos_cache_local = alloc((hd / 2) * 4)
+            gemma3_rope_sin_cache_local = alloc((hd / 2) * 4)
+        }
+        if gemma3_rope_cache_pos_local != pos {
+            f64 theta = int_to_f64(gemma3_rope_local_base_int)
+            qwen3_rope_compute(gemma3_rope_cos_cache_local, gemma3_rope_sin_cache_local, pos, hd, theta)
+            gemma3_rope_cache_pos_local = pos
+        }
+        qwen3_rope_apply(q_buf, gemma3_rope_cos_cache_local, gemma3_rope_sin_cache_local, nh,  hd)
+        qwen3_rope_apply(k_row, gemma3_rope_cos_cache_local, gemma3_rope_sin_cache_local, nkv, hd)
+    } else {
+        if gemma3_rope_cos_cache_global == 0 {
+            gemma3_rope_cos_cache_global = alloc((hd / 2) * 4)
+            gemma3_rope_sin_cache_global = alloc((hd / 2) * 4)
+        }
+        if gemma3_rope_cache_pos_global != pos {
+            f64 theta = int_to_f64(gemma3_rope_global_base_int)
+            qwen3_rope_compute(gemma3_rope_cos_cache_global, gemma3_rope_sin_cache_global, pos, hd, theta)
+            gemma3_rope_cache_pos_global = pos
+        }
+        qwen3_rope_apply(q_buf, gemma3_rope_cos_cache_global, gemma3_rope_sin_cache_global, nh,  hd)
+        qwen3_rope_apply(k_row, gemma3_rope_cos_cache_global, gemma3_rope_sin_cache_global, nkv, hd)
+    }
+
+    // Attention (no soft-cap on Gemma3; sliding flag follows is_swa).
+    u64 attn_out = alloc(q_dim * 4)
+    gemma3_attn_cached(attn_out, q_buf,
+                       k_cache_layer, v_cache_layer,
+                       pos + 1, nh, nkv, hd, is_swa)
+
+    // o_proj (q_dim → hidden).
+    u64 o_buf = alloc(hidden * 4)
+    qwen3_main_matmul(o_buf, attn_out, w.o_proj_w, 1, hidden, q_dim, num_workers, 0)
+
+    // Post-attn RMSNorm wraps the block output BEFORE the residual add.
+    u64 o_post = alloc(hidden * 4)
+    qwen3_rmsnorm_f32_weights(o_post, o_buf, w.post_attn_norm_w, hidden)
+
+    // Residual: mid = resid + o_post.
+    u64 mid = alloc(hidden * 4)
+    u64 i = 0
+    while i < hidden {
+        f32 a = 0.0f; unsafe { *((resid + i * 4) as f32) -> a }
+        f32 b = 0.0f; unsafe { *((o_post + i * 4) as f32) -> b }
+        unsafe { *((mid + i * 4) as f32) = a + b }
+        i = i + 1
+    }
+
+    // ── FFN path ──
+    u64 mid_norm = alloc(hidden * 4)
+    qwen3_rmsnorm_f32_weights(mid_norm, mid, w.ffn_norm_w, hidden)
+
+    u64 gate_buf = alloc(ff * 4)
+    u64 up_buf   = alloc(ff * 4)
+    qwen3_main_matmul(gate_buf, mid_norm, w.gate_proj_w, 1, ff, hidden, num_workers, 0)
+    qwen3_main_matmul(up_buf,   mid_norm, w.up_proj_w,   1, ff, hidden, num_workers, 0)
+
+    u64 ff_buf = alloc(ff * 4)
+    gemma2_gelu_mul(ff_buf, gate_buf, up_buf, ff)   // fp16 LUT, matches llama.cpp
+
+    u64 ff_out = alloc(hidden * 4)
+    qwen3_main_matmul(ff_out, ff_buf, w.down_proj_w, 1, hidden, ff, num_workers, 0)
+
+    // Post-FFN RMSNorm wraps before second residual.
+    u64 ff_post = alloc(hidden * 4)
+    qwen3_rmsnorm_f32_weights(ff_post, ff_out, w.post_ffn_norm_w, hidden)
+
+    i = 0
+    while i < hidden {
+        f32 a = 0.0f; unsafe { *((mid    + i * 4) as f32) -> a }
+        f32 b = 0.0f; unsafe { *((ff_post + i * 4) as f32) -> b }
+        unsafe { *((x_out + i * 4) as f32) = a + b }
+        i = i + 1
+    }
+
+    dealloc(resid); dealloc(x_norm)
+    dealloc(q_buf)
+    dealloc(attn_out); dealloc(o_buf); dealloc(o_post)
+    dealloc(mid); dealloc(mid_norm)
+    dealloc(gate_buf); dealloc(up_buf); dealloc(ff_buf); dealloc(ff_out); dealloc(ff_post)
+}
+
+// ─── Final-logit soft-cap (delegates to gemma2_softcap_logits) ──────
+// Gemma3 has the same lm_head soft-cap shape as Gemma2 — tanh(x/cap)*cap
+// per logit. We re-export through gemma3_lm_softcap so the driver calls
+// gemma3_softcap_logits naturally.
+fn gemma3_softcap_logits(u64 logits_ptr, u64 n) {
+    f32 cap = gemma3_lm_softcap
+    if cap <= 0.0f { return }
+    u64 i = 0
+    while i < n {
+        f32 v = 0.0f
+        unsafe { *((logits_ptr + i * 4) as f32) -> v }
+        f32 c = gemma2_softcap_f32(v, cap)
+        unsafe { *((logits_ptr + i * 4) as f32) = c }
+        i = i + 1
+    }
+}
