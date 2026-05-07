@@ -1,0 +1,457 @@
+// Llama-3.2-1B Q8_0 — GPU-matmul-offload greedy decode driver.
+//
+// Mirror of examples/llama3_generate.mlr (CPU-only Q8_0 path), but with
+// the heavy matmul ops (qkv, o_proj, gate/up, down_proj) offloaded to
+// the GPU via the existing qwen3_main_matmul → matmul_bf16_weights_f32_gpu
+// dispatch.  Layout-wise the trick is simple:
+//
+//   * The CPU driver feeds Q8_0 weight pointers into Qwen3LayerWeights
+//     and sets qwen3_set_matmul_kind(1) so qwen3_main_matmul calls
+//     matmul_q8_0_q8_0_f32 (CPU).
+//   * This driver dequantises Q8_0 → bf16 in HOST memory once at load
+//     time, hands those bf16 pointers to Qwen3LayerWeights, and sets
+//     qwen3_set_matmul_kind(0).  qwen3_main_matmul then dispatches via
+//     matmul_bf16_weights_f32_gpu (env-gated by MLRIFT_GPU_MATMUL).
+//   * Embedding lookup + lm_head stay on Q8_0 host pointers — they are
+//     not routed through qwen3_main_matmul.  Embedding is a single-row
+//     dequant per step; lm_head is matmul_q8_0_q8_0_f32 against the
+//     tied-embedding tensor.  lm_head is the dominant cost per step
+//     (~190 ms / 225 ms total) and porting it to GPU is the next slice.
+//
+// Arch knobs are identical to the CPU driver:
+//   qwen3_set_arch(2048, 64, 32, 8, 8192)
+//   qwen3_set_qknorm(0)            — Llama: no per-head Q/K RMSNorm
+//   qwen3_set_rope_base(500000)    — Llama-3 theta
+//   qwen3_set_rope_pair_layout(1)  — NORM consecutive-pair RoPE
+//   qwen3_set_rmsnorm_eps_bits(0x3727C5AC)  — 1e-5
+//   qwen3_set_norm_kind(1)         — F32 norm weights (Llama GGUF)
+//   qwen3_set_fuse_qkv(0)          — three matmuls per QKV
+//   qwen3_set_matmul_kind(0)       — *** bf16 (GPU dispatcher) ***
+//
+// CORRECTNESS STATUS (2026-05-07):
+//   * CPU bf16 path (MLRIFT_GPU_MATMUL_MIN_BYTES=999999999 to suppress
+//     GPU dispatch entirely): bit-exact 20/20 match against
+//     llama3_generate (CPU Q8_0 reference).  Determinism perfect.
+//     4.16 tok/s — 4× speedup over CPU Q8_0 baseline (1.0 tok/s).
+//   * GPU bf16 dequant-to-f32 (default with MLRIFT_GPU_MATMUL=1):
+//     non-deterministic across runs.  Tokens drift even at step 0.
+//     4.43 tok/s.  Likely a determinism bug in
+//     std/inference_gpu.mlr:matmul_bf16_weights_f32_gpu — the same
+//     dispatcher works deterministically for Qwen3-0.6B (different
+//     matmul shape mix) but not for Llama-1B's 5-matmul-per-layer mix.
+//     Tracked separately; not blocking this driver landing.
+//   * GPU bf16-direct (MLRIFT_GPU_MATMUL_BF16=1): same non-determinism.
+//     4.37 tok/s.
+//
+// vs PyTorch ROCm bf16 baseline 51.3 tok/s: ~12× behind.  Bottleneck
+// is the CPU lm_head (Q8_0 × hidden=2048 × vocab=128256 ≈ 525 MiB, MT
+// AVX2).  Porting lm_head onto the GPU bf16 gemv_coop_bf16 path would
+// likely close ~50 % of the gap.
+//
+// Build:
+//   ./build/mlrc --target=amdgpu-native --emit=elfexe examples/llama3_1b_gpu_generate.mlr \
+//                -o /tmp/llama32_1b_gpu
+//   # Bit-exact (CPU bf16, GPU init only):
+//   MLRIFT_GPU_MATMUL=1 MLRIFT_GPU_MATMUL_MIN_BYTES=999999999 /tmp/llama32_1b_gpu
+//   # Best perf (GPU dispatch, accept token drift):
+//   MLRIFT_GPU_MATMUL=1 /tmp/llama32_1b_gpu
+
+import "../std/qwen3.mlr"
+import "../std/gguf.mlr"
+import "../std/matmul.mlr"
+import "../std/inference.mlr"
+import "../std/inference_gpu.mlr"
+import "../std/io.mlr"
+import "../std/fmt.mlr"
+import "../std/string.mlr"
+import "../std/thread.mlr"
+import "../std/time.mlr"
+
+static u64 g_fd = 0
+fn eout(u64 s) {
+    print_str(s)
+    if g_fd != 0 {
+        u64 n = str_len(s)
+        file_write(g_fd, s, n)
+    }
+}
+fn eu64(u64 v) {
+    u64 s = fmt_dec(v)
+    eout(s)
+    dealloc(s)
+}
+
+// Dequantise a Q8_0 tensor of `n_elements` total values into a freshly
+// allocated bf16 buffer (2 bytes per element).  Q8_0 layout: 32-element
+// blocks of [f16 scale | int8 qs[32]] = 34 bytes each.  Output bf16:
+// upper 16 bits of f32 = scale * qs[i] (truncation; rounding to nearest
+// even is a wash at f32→bf16 for our purposes — argmax is stable).
+fn q8_0_to_bf16_alloc(u64 src_q8, u64 n_elements) -> u64 {
+    u64 dst_bf16 = alloc(n_elements * 2)
+    u64 n_blocks = n_elements / 32
+    // Single-element f32 scratch for bit-cast.
+    u64 scratch = alloc(4)
+    u64 bi = 0
+    while bi < n_blocks {
+        u64 block = src_q8 + bi * 34
+        u64 lo = load8(block)
+        u64 hi = load8(block + 1)
+        u64 dbits = lo | (hi << 8)
+        f32 d = gguf_f16_to_f32_exact(dbits)
+        u64 qs_base = block + 2
+        u64 j = 0
+        while j < 32 {
+            u64 bval = load8(qs_base + j)
+            f32 q = 0.0f
+            if bval >= 128 {
+                f32 pos = int_to_f32_gguf(256 - bval)
+                q = 0.0f - pos
+            } else {
+                q = int_to_f32_gguf(bval)
+            }
+            f32 out_val = d * q
+            // Bit-cast f32 → upper 16 bits = bf16 (truncation).
+            unsafe { *(scratch as f32) = out_val }
+            // Read bytes 2,3 of scratch (the upper-16 of LE f32).
+            u64 b0 = load8(scratch + 2)
+            u64 b1 = load8(scratch + 3)
+            u64 dst_off = (bi * 32 + j) * 2
+            u8 b0_8 = b0
+            u8 b1_8 = b1
+            unsafe { *((dst_bf16 + dst_off + 0) as u8) = b0_8 }
+            unsafe { *((dst_bf16 + dst_off + 1) as u8) = b1_8 }
+            j = j + 1
+        }
+        bi = bi + 1
+    }
+    dealloc(scratch)
+    return dst_bf16
+}
+
+fn main() {
+    u64 num_workers = 24
+    thread_pool_init(num_workers)
+    g_fd = file_open("/tmp/llama32_1b_gpu_gen.out", 1)
+
+    // --- Reconfigure qwen3.mlr for Llama-3.2-1B GPU bf16 matmul path ---
+    qwen3_set_arch(2048, 64, 32, 8, 8192)
+    qwen3_set_matmul_kind(0)                // *** bf16 (GPU dispatcher) ***
+    qwen3_set_norm_kind(1)                  // F32 norms (Llama)
+    qwen3_set_fuse_qkv(0)                   // separate q/k/v + gate/up matmuls
+    qwen3_set_qknorm(0)                     // Llama: no per-head Q/K RMSNorm
+    qwen3_set_rope_base(500000)             // Llama-3 theta = 5e5
+    qwen3_set_rmsnorm_eps_bits(0x3727C5AC)  // Llama: rms_norm_eps = 1e-5
+    qwen3_set_rope_pair_layout(1)           // NORM consecutive-pair RoPE
+
+    // Force-init the GPU matmul dispatcher early so gpu_pipeline_ready()
+    // and matmul_bf16_weights_f32_gpu work without first being touched
+    // through the chained path.
+    u64 gpu_ok = gpu_matmul_enabled()
+    eout("[llama32_1b_gpu] gpu_matmul_enabled="); eu64(gpu_ok); eout("\n")
+
+    // Force the HIP/KFD lazy init to fire NOW (before we allocate the
+    // ~1.86 GiB of bf16 host weights).  After heavy alloc()s the heap
+    // is fragmented and ACQUIRE_VM occasionally fails with errno=-1 —
+    // doing a 64 B dummy hipMalloc first makes the GPU claim its VA
+    // range cleanly while the address space is uncluttered.
+    u64 _dummy_slot = alloc(8)
+    u32 _dummy_err = hipMalloc(_dummy_slot, 64)
+    if _dummy_err == 0 {
+        u64 _dummy_va = 0
+        unsafe { *(_dummy_slot as u64) -> _dummy_va }
+        hipFree(_dummy_va)
+        eout("[llama32_1b_gpu] hip/kfd lazy-init OK (dummy hipMalloc)\n")
+    } else {
+        eout("[llama32_1b_gpu] hip/kfd lazy-init FAILED err="); eu64(_dummy_err); eout("\n")
+    }
+
+    u64 path = "/usr/share/ollama/.ollama/models/blobs/sha256-74701a8c35f6c8d9a4b91f3f3497643001d63e0c7a84e085bed452548fa88d45"
+    eout("[llama32_1b_gpu] loading weights from ollama blob\n")
+    u64 load_start_ns = time_now()
+    GGUFFile gf = gguf_open(path)
+    if gf.file_size == 0 {
+        eout("open fail\n")
+        thread_pool_shutdown(); file_close(g_fd); exit(1)
+    }
+
+    u64 hidden    = QWEN3_HIDDEN
+    u64 q_dim     = QWEN3_Q_DIM
+    u64 kv_dim    = QWEN3_KV_DIM
+    u64 ff        = QWEN3_INTERMEDIATE
+    u64 n_layers  = 16
+    u64 vocab     = 128256
+    u64 max_seq   = 64
+    u64 max_new   = 20
+
+    GGUFTensor embed_t = gguf_get(gf, "token_embd.weight")
+    if embed_t.ptr == 0 {
+        eout("missing token_embd.weight\n")
+        gguf_free(gf); thread_pool_shutdown(); file_close(g_fd); exit(1)
+    }
+    GGUFTensor norm_t = gguf_get(gf, "output_norm.weight")
+    if norm_t.ptr == 0 {
+        eout("missing output_norm.weight\n")
+        gguf_free(gf); thread_pool_shutdown(); file_close(g_fd); exit(1)
+    }
+    u64 lmhead_ptr = embed_t.ptr   // tied embedding (Q8_0)
+
+    GGUFTensor rope_freqs_t = gguf_get(gf, "rope_freqs.weight")
+    if rope_freqs_t.ptr != 0 {
+        qwen3_set_rope_freqs(rope_freqs_t.ptr)
+        eout("[llama32_1b_gpu] rope_freqs.weight wired\n")
+    }
+
+    // Per-layer weight pointer table — same 11-slot layout.  Slot 4
+    // (q_norm) and 5 (k_norm) stay 0; qwen3_set_qknorm(0) gates them.
+    // Slots 1,2,3 (q/k/v), 6 (o), 8 (gate), 9 (up), 10 (down) hold
+    // bf16 host pointers (dequantised from the GGUF Q8_0 tensors).
+    // Slots 0 (input_norm) and 7 (post_norm) hold the original f32
+    // pointers (Llama GGUF stores those as F32).
+    u64 layers_arr = alloc(n_layers * 88)
+
+    u64 q_elems    = q_dim  * hidden            // 2048×2048
+    u64 kv_elems   = kv_dim * hidden            //  512×2048
+    u64 o_elems    = hidden * q_dim             // 2048×2048
+    u64 gate_elems = ff     * hidden            // 8192×2048
+    u64 up_elems   = ff     * hidden
+    u64 down_elems = hidden * ff
+
+    eout("[llama32_1b_gpu] dequantising 16 layers of Q8_0 → bf16 (host) — this is one-time...\n")
+    u64 li = 0
+    while li < n_layers {
+        u64 base = layers_arr + li * 88
+        u64 li_s = fmt_dec(li)
+        u64 pre0 = str_cat("blk.", li_s)
+        u64 prefix = str_cat(pre0, ".")
+        dealloc(li_s); dealloc(pre0)
+
+        u64 n01 = str_cat(prefix, "attn_norm.weight")
+        GGUFTensor t01 = gguf_get(gf, n01)
+        unsafe { *((base + 0 * 8) as u64) = t01.ptr }
+        dealloc(n01)
+
+        u64 n02 = str_cat(prefix, "attn_q.weight")
+        GGUFTensor t02 = gguf_get(gf, n02)
+        u64 q_bf16 = q8_0_to_bf16_alloc(t02.ptr, q_elems)
+        unsafe { *((base + 1 * 8) as u64) = q_bf16 }
+        dealloc(n02)
+
+        u64 n03 = str_cat(prefix, "attn_k.weight")
+        GGUFTensor t03 = gguf_get(gf, n03)
+        u64 k_bf16 = q8_0_to_bf16_alloc(t03.ptr, kv_elems)
+        unsafe { *((base + 2 * 8) as u64) = k_bf16 }
+        dealloc(n03)
+
+        u64 n04 = str_cat(prefix, "attn_v.weight")
+        GGUFTensor t04 = gguf_get(gf, n04)
+        u64 v_bf16 = q8_0_to_bf16_alloc(t04.ptr, kv_elems)
+        unsafe { *((base + 3 * 8) as u64) = v_bf16 }
+        dealloc(n04)
+
+        unsafe { *((base + 4 * 8) as u64) = 0 }
+        unsafe { *((base + 5 * 8) as u64) = 0 }
+
+        u64 n07 = str_cat(prefix, "attn_output.weight")
+        GGUFTensor t07 = gguf_get(gf, n07)
+        u64 o_bf16 = q8_0_to_bf16_alloc(t07.ptr, o_elems)
+        unsafe { *((base + 6 * 8) as u64) = o_bf16 }
+        dealloc(n07)
+
+        u64 n08 = str_cat(prefix, "ffn_norm.weight")
+        GGUFTensor t08 = gguf_get(gf, n08)
+        unsafe { *((base + 7 * 8) as u64) = t08.ptr }
+        dealloc(n08)
+
+        u64 n09 = str_cat(prefix, "ffn_gate.weight")
+        GGUFTensor t09 = gguf_get(gf, n09)
+        u64 g_bf16 = q8_0_to_bf16_alloc(t09.ptr, gate_elems)
+        unsafe { *((base + 8 * 8) as u64) = g_bf16 }
+        dealloc(n09)
+
+        u64 n10 = str_cat(prefix, "ffn_up.weight")
+        GGUFTensor t10 = gguf_get(gf, n10)
+        u64 u_bf16 = q8_0_to_bf16_alloc(t10.ptr, up_elems)
+        unsafe { *((base + 9 * 8) as u64) = u_bf16 }
+        dealloc(n10)
+
+        u64 n11 = str_cat(prefix, "ffn_down.weight")
+        GGUFTensor t11 = gguf_get(gf, n11)
+        u64 d_bf16 = q8_0_to_bf16_alloc(t11.ptr, down_elems)
+        unsafe { *((base + 10 * 8) as u64) = d_bf16 }
+        dealloc(n11)
+
+        dealloc(prefix)
+        if (li & 3) == 3 {
+            eout("  layer "); eu64(li); eout(" done\n")
+        }
+        li = li + 1
+    }
+    u64 load_elapsed_ns = time_elapsed(load_start_ns)
+    eout("[llama32_1b_gpu] 16 layers indexed + dequantised; load_ms=")
+    eu64(load_elapsed_ns / 1000000); eout("\n")
+
+    // KV cache + scratch buffers (host — CPU attn path consumes this).
+    u64 kv_row_bytes = kv_dim * 4
+    u64 layer_stride = max_seq * kv_row_bytes
+    u64 total_cache  = n_layers * layer_stride
+    u64 k_cache = alloc(total_cache)
+    u64 v_cache = alloc(total_cache)
+
+    u64 x_cur     = alloc(hidden * 4)
+    u64 x_nxt     = alloc(hidden * 4)
+    u64 final_out = alloc(hidden * 4)
+    u64 logits    = alloc(vocab * 4)
+
+    // Per-row Q8_0 decode geometry for the embedding lookup (CPU path).
+    u64 embed_base = embed_t.ptr
+    u64 row_blocks = hidden / 32
+    u64 row_bytes  = row_blocks * 34
+
+    u64 prompt_count = 2
+    u64 seq_cap = prompt_count + max_new
+    u64 seq_ids32 = alloc(seq_cap * 4)
+    u32 t0 = 128000   // BOS
+    u32 t1 = 15339    // "hello"
+    unsafe { *((seq_ids32 + 0 * 4) as uint32) = t0 }
+    unsafe { *((seq_ids32 + 1 * 4) as uint32) = t1 }
+    u64 seq_len = prompt_count
+
+    eout("[llama32_1b_gpu] prompt=[128000, 15339] (\"<|begin_of_text|>hello\")\n")
+
+    // Smoke-test the GPU matmul on a single layer-0 q-proj BEFORE the
+    // prefill, so any KFD / dispatch failure surfaces with a clear log
+    // (instead of mid-prefill where it looks like a forward-layer bug).
+    eout("[llama32_1b_gpu] smoke-test: layer-0 gate-proj GPU matmul (above default threshold)\n")
+    u64 smoke_x  = alloc(hidden * 4)
+    u64 smoke_y  = alloc(ff     * 4)
+    u64 sx_i = 0
+    while sx_i < hidden { unsafe { *((smoke_x + sx_i * 4) as f32) = 0.5f }; sx_i = sx_i + 1 }
+    Qwen3LayerWeights w0 = layers_arr + 0 * 88
+    u64 smoke_rc = matmul_bf16_weights_f32_gpu(smoke_y, smoke_x, w0.gate_proj_w, 1, ff, hidden)
+    if smoke_rc != 0 {
+        eout("[llama32_1b_gpu] smoke matmul rc="); eu64(smoke_rc); eout(" (probably below threshold; ok)\n")
+    } else {
+        eout("[llama32_1b_gpu] smoke matmul OK rc=0\n")
+    }
+    dealloc(smoke_x); dealloc(smoke_y)
+
+    // Prefill: every prompt token but the last needs a forward pass to
+    // populate K/V at its position.  Last prompt token's forward becomes
+    // step 0 of the decode loop (its logits feed the first argmax).
+    u64 pos = 0
+    u64 prefill_start_ns = time_now()
+    while pos + 1 < prompt_count {
+        u32 pt32 = 0
+        unsafe { *((seq_ids32 + pos * 4) as uint32) -> pt32 }
+        u64 pt = pt32
+        gguf_deq_q8_0(x_cur, embed_base + pt * row_bytes, hidden)
+        u64 layer = 0
+        while layer < n_layers {
+            Qwen3LayerWeights w = layers_arr + layer * 88
+            u64 kc = k_cache + layer * layer_stride
+            u64 vc = v_cache + layer * layer_stride
+            qwen3_forward_layer(x_nxt, x_cur, w, pos, kc, vc, num_workers)
+            u64 tmp = x_cur
+            x_cur = x_nxt
+            x_nxt = tmp
+            layer = layer + 1
+        }
+        pos = pos + 1
+    }
+    u64 prefill_ns = time_elapsed(prefill_start_ns)
+    eout("[llama32_1b_gpu] prefill_ms="); eu64(prefill_ns / 1000000); eout("\n")
+
+    // Load last prompt token's embedding for step 0.
+    u32 last_pt32 = 0
+    unsafe { *((seq_ids32 + (prompt_count - 1) * 4) as uint32) -> last_pt32 }
+    u64 last_pt = last_pt32
+    gguf_deq_q8_0(x_cur, embed_base + last_pt * row_bytes, hidden)
+
+    qwen3_profile_reset()
+    u64 step = 0
+    u64 decode_start_ns = time_now()
+    while step < max_new {
+        u64 step_start_ns = time_now()
+        eout("step "); eu64(step); eout(" pos="); eu64(pos); eout("\n")
+
+        u64 layer = 0
+        while layer < n_layers {
+            Qwen3LayerWeights w = layers_arr + layer * 88
+            u64 kc = k_cache + layer * layer_stride
+            u64 vc = v_cache + layer * layer_stride
+            qwen3_forward_layer(x_nxt, x_cur, w, pos, kc, vc, num_workers)
+            u64 tmp = x_cur
+            x_cur = x_nxt
+            x_nxt = tmp
+            layer = layer + 1
+        }
+
+        // Final RMSNorm + lm_head against the tied Q8_0 embedding matrix
+        // (CPU; lm_head stays Q8_0 to avoid +500 MiB bf16 inflation of
+        // the 128 256-row vocab table).
+        qwen3_rmsnorm_f32_weights(final_out, x_cur, norm_t.ptr, hidden)
+        matmul_q8_0_q8_0_f32(logits, final_out, lmhead_ptr, 1, vocab, hidden, num_workers)
+
+        // Greedy argmax.
+        u64 best_id = 0
+        f32 best_val = 0.0f
+        u64 first = 1
+        u64 j = 0
+        while j < vocab {
+            f32 v = 0.0f
+            unsafe { *((logits + j * 4) as f32) -> v }
+            if first == 1 {
+                best_val = v; best_id = j; first = 0
+            } else {
+                if v > best_val { best_val = v; best_id = j }
+            }
+            j = j + 1
+        }
+        u64 step_elapsed_ns = time_elapsed(step_start_ns)
+        eout("  -> next_id = "); eu64(best_id); eout(" logit=")
+        u64 lvs = fmt_f32(best_val, 4); eout(lvs); dealloc(lvs)
+        eout(" step_ms="); eu64(step_elapsed_ns / 1000000); eout("\n")
+
+        u32 best_id32 = best_id
+        unsafe { *((seq_ids32 + seq_len * 4) as uint32) = best_id32 }
+        seq_len = seq_len + 1
+
+        gguf_deq_q8_0(x_cur, embed_base + best_id * row_bytes, hidden)
+        pos = pos + 1
+        step = step + 1
+    }
+    u64 total_decode_ns = time_elapsed(decode_start_ns)
+    u64 total_ms = total_decode_ns / 1000000
+    u64 tokps_milli = 0
+    if total_decode_ns != 0 {
+        tokps_milli = (max_new * 1000 * 1000000000) / total_decode_ns
+    }
+
+    eout("\n=== GENERATED IDs ===\n")
+    u64 gi = 0
+    while gi < seq_len {
+        if gi != 0 { eout(", ") }
+        u32 gid32 = 0
+        unsafe { *((seq_ids32 + gi * 4) as uint32) -> gid32 }
+        u64 gid = gid32
+        eu64(gid)
+        gi = gi + 1
+    }
+    eout("\n")
+
+    eout("\n=== TIMING ===\n")
+    eout("prompt_tokens="); eu64(prompt_count); eout("\n")
+    eout("prefill_ms="); eu64(prefill_ns / 1000000); eout("\n")
+    eout("total_decode_ms="); eu64(total_ms); eout("\n")
+    eout("tokens_per_sec_x1000="); eu64(tokps_milli); eout("\n")
+    eout("tokens_generated="); eu64(max_new); eout("\n")
+    qwen3_profile_dump()
+
+    dealloc(x_cur); dealloc(x_nxt); dealloc(final_out); dealloc(logits)
+    dealloc(seq_ids32); dealloc(layers_arr)
+    dealloc(k_cache); dealloc(v_cache)
+    gguf_free(gf)
+    thread_pool_shutdown()
+    file_close(g_fd)
+    exit(0)
+}
