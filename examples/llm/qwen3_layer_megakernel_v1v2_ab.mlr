@@ -1,14 +1,14 @@
-// Slice 4.19.0 — A/B gate harness for the v2 stub mega-kernel.
+// Slice 4.19.1 — A/B gate harness for the v2 mega-kernel (phase 1 rmsnorm).
 //
-// Loads BOTH the v1 byte-wrapper .co and the v2 AST-walker stub .co,
+// Loads BOTH the v1 byte-wrapper .co and the v2 AST-walker .co,
 // dispatches each with the same kernarg blob and MAX_PHASE value,
 // and byte-diffs every output slab.
 //
-// Slice-4.19.0-specific gate (MAX_PHASE=0):
-//   v1 phase 1 (real rmsnorm) writes b_x_norm_g.
-//   v2 phase 1 (s_nop stub) does NOT write b_x_norm_g.
-//   Expected: b_x_norm_g MISMATCH; all other output slabs match (both zero).
-//   PASS = both .co files load + dispatch without hang, ONLY b_x_norm_g differs.
+// Slice-4.19.1-specific gate (MAX_PHASE=0):
+//   v2 phase 1 now emits real inline rmsnorm ISA (WG-0 gated, N=1024).
+//   Both v1 and v2 should write the same b_x_norm_g output.
+//   Expected at MAX_PHASE=0: ALL output slabs match (n_mismatch==0).
+//   PASS = both .co files load + dispatch without hang, ALL slabs match.
 //
 // Build:
 //   ./build/mlrc --emit-amdgpu-qwen3-megakernel=/tmp/qwen3_layer_megakernel_v1.co dummy
@@ -21,8 +21,10 @@
 // Expected output (MAX_PHASE=0):
 //   v1 .bin fletcher-32 pin: PASS
 //   v1 load: PASS  /  v2 load: PASS
-//   MISMATCH b_x_norm_g at byte 0: A=<hex> B=00
-//   PASS -- slice 4.19.0 gate
+//   OK out_residual
+//   OK kc_layer
+//   ... (all 10 slabs OK)
+//   PASS -- slice 4.19.1 gate
 // Exit: 0
 //
 // Implementation note on D2H buffer pre-allocation:
@@ -203,6 +205,32 @@ fn check_v1_bin_pin(uint64 bin_path) {
 fn dp_fh(uint64 p) -> uint64 { uint64 v = 0; unsafe { *(p as uint64) -> v }; return v }
 fn dp_wg(uint64 p) -> uint64 { uint64 v = 0; unsafe { *((p + 8) as uint64) -> v }; return v }
 fn dp_slot(uint64 p, uint64 s) -> uint64 { uint64 v = 0; unsafe { *((p + s * 8) as uint64) -> v }; return v }
+
+// Named per-field accessors (carry-forward item 3 from slice 4.19.0 review).
+// Device-side pointers:
+fn dp_d_in_resid(uint64 p)    -> uint64 { return dp_slot(p,  2) }
+fn dp_d_out_resid(uint64 p)   -> uint64 { return dp_slot(p,  3) }
+fn dp_d_kc(uint64 p)          -> uint64 { return dp_slot(p, 14) }
+fn dp_d_vc(uint64 p)          -> uint64 { return dp_slot(p, 15) }
+fn dp_d_barrier(uint64 p)     -> uint64 { return dp_slot(p, 16) }
+fn dp_d_gu_scratch(uint64 p)  -> uint64 { return dp_slot(p, 17) }
+fn dp_d_bxnorm(uint64 p)      -> uint64 { return dp_slot(p, 18) }
+fn dp_d_bqkv(uint64 p)        -> uint64 { return dp_slot(p, 19) }
+fn dp_d_battnq(uint64 p)      -> uint64 { return dp_slot(p, 20) }
+fn dp_d_bmid(uint64 p)        -> uint64 { return dp_slot(p, 21) }
+fn dp_d_bmidnorm(uint64 p)    -> uint64 { return dp_slot(p, 22) }
+fn dp_d_battnout(uint64 p)    -> uint64 { return dp_slot(p, 23) }
+// Host-side output buffers (pre-allocated before hipSetDevice):
+fn dp_ha_out_resid(uint64 p)  -> uint64 { return dp_slot(p, 24) }
+fn dp_ha_kc(uint64 p)         -> uint64 { return dp_slot(p, 25) }
+fn dp_ha_vc(uint64 p)         -> uint64 { return dp_slot(p, 26) }
+fn dp_ha_gu_scratch(uint64 p) -> uint64 { return dp_slot(p, 27) }
+fn dp_ha_bxnorm(uint64 p)     -> uint64 { return dp_slot(p, 28) }
+fn dp_ha_bqkv(uint64 p)       -> uint64 { return dp_slot(p, 29) }
+fn dp_ha_battnq(uint64 p)     -> uint64 { return dp_slot(p, 30) }
+fn dp_ha_bmid(uint64 p)       -> uint64 { return dp_slot(p, 31) }
+fn dp_ha_bmidnorm(uint64 p)   -> uint64 { return dp_slot(p, 32) }
+fn dp_ha_battnout(uint64 p)   -> uint64 { return dp_slot(p, 33) }
 
 // Output slab sizes: in_resid_b, kv_b, gu_b, norm_b, b_qkv_b, b_q_b.
 // Shared input device buffers: d_in_resid .. d_rope_sin (slots 2-13, no dmalloc needed).
@@ -532,15 +560,14 @@ fn main() {
     uint64 r8 = diff_slab("b_mid_norm_g", 12, dp_slot(dp_v1,32), dp_slot(dp_v2,32), norm_b)
     uint64 r9 = diff_slab("b_attn_out_g", 12, dp_slot(dp_v1,33), dp_slot(dp_v2,33), b_q_b)
 
-    // Slice-4.19.0 gate: ONLY b_x_norm_g (r4) expected to mismatch.
+    // Slice-4.19.1 gate: at MAX_PHASE=0 ALL slabs must match.
+    // v2 now emits real phase-1 rmsnorm so b_x_norm_g output should agree
+    // with v1.  Any mismatch means the inline ISA emitter has a bug.
     uint64 n_mismatch = r0 + r1 + r2 + r3 + r4 + r5 + r6 + r7 + r8 + r9
-    uint64 unexpected = r0 + r1 + r2 + r3 + r5 + r6 + r7 + r8 + r9
 
     if max_phase == 0 {
-        if n_mismatch == 0 { puts("FAIL -- slice 4.19.0 gate: expected b_x_norm_g mismatch but all slabs matched"); exit(1) }
-        if unexpected != 0 { puts("FAIL -- slice 4.19.0 gate: unexpected slab(s) mismatched"); exit(1) }
-        if r4 == 0 { puts("FAIL -- slice 4.19.0 gate: b_x_norm_g matched but should differ"); exit(1) }
-        puts("PASS -- slice 4.19.0 gate")
+        if n_mismatch != 0 { puts("FAIL -- slice 4.19.1 gate: expected all slabs to match but got mismatch(es)"); exit(1) }
+        puts("PASS -- slice 4.19.1 gate")
         exit(0)
     }
     put_kv("mismatch_slabs", 14, n_mismatch)

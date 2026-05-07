@@ -4,6 +4,11 @@
 // and emits a stub kernel (9 × s_nop phases + 8 working cross-WG barriers
 // + max_phase early-exit checks).
 //
+// Slice 4.19.1: phase 1 (input rmsnorm, WG-0 gated).  Adds
+// recognize_phase_rmsnorm_wg_gated and _emit_phase1_rmsnorm_inline;
+// replaces the phase-1 s_nop stub with the real inline rmsnorm ISA when
+// the source has the rmsnorm_wg0_marker call in its phase-1 block.
+//
 // Top-level: recognize_megakernel_swiglu_dense_gqa(fn_node, source, kname_ptr, nl)
 // walks the function body parameter list and body shape, then delegates to
 // mega_emit_stub_kernel which produces a real .co that loads, launches, and
@@ -61,8 +66,12 @@ static uint64 AST_KIND_BLOCK = 15
 // Register conventions: s[8:9]=counter_ptr, vcc_lo=lane-0 mask, s3=saved-exec,
 // v0=lane id (hardware), v1=vaddr(0), v2=data/spin.
 fn mega_emit_barrier_isa(uint64 phase_idx, uint64 wg_persist) {
-    // Compile-time overflow check: per spec line 238-240.
-    // If (phase_idx+1)*wg_persist would overflow a 16-bit counter, exit.
+    // 16-bit cap: the spin-poll comparison uses s_movk_i32 which only
+    // accepts a 16-bit immediate field.  (phase_idx+1)*wg_persist must
+    // fit in 16 bits for the branch encoding to be correct.  At slice
+    // 4.19.x sizes (max phase_idx=7, wg_persist=512) the max threshold
+    // is 8*512 = 4096 which is well within 0xFFFF.  If this limit is
+    // ever exceeded a wider emit (s_mov_b32 + literal) will be needed.
     uint64 threshold = (phase_idx + 1) * wg_persist
     if threshold > 0xFFFF {
         write(2, "mega_emit_barrier_isa: barrier counter overflow: (phase+1)*wg_persist > 0xFFFF\n", 80)
@@ -147,19 +156,330 @@ fn mega_emit_barrier_isa(uint64 phase_idx, uint64 wg_persist) {
     asm_u32(0x8C7E037E)
 }
 
-// Emit the stub mega-kernel body into the kernel table.
+// ── Phase 1 inline ISA emitter ────────────────────────────────────────────
 //
-// The stub kernel:
+// _emit_phase1_rmsnorm_inline — emits the WG-0-gated input rmsnorm ISA
+// INLINE into the ongoing asm buffer (no asm_init, no s_endpgm).
+//
+// Mega-kernel SGPR context on entry:
+//   s[0:1]  = kernarg ptr
+//   s[8:9]  = barrier_counter ptr (already loaded by prologue)
+//   s[10:11]= max_phase value (already loaded by prologue)
+//   s15     = wg_id_x
+//
+// Phase 1 adds to context:
+//   s[2:3]  = in_residual ptr (kernarg offset 0x00)
+//   s[4:5]  = in_norm_g ptr   (kernarg offset 0x30)
+//   s[6:7]  = b_x_norm_g ptr  (kernarg offset 0x88)
+//   s12     = loop counter / saved exec_lo (reused each section)
+//   s14     = float literal scratch (1/1024, eps)
+//
+// VGPR context (all locals, not preserved past phase 1):
+//   v0  = lane id (hardware, must be preserved)
+//   v2  = ssq accumulator → scale broadcast
+//   v3:v4 = pointer pair (advances during loops)
+//   v5:v6 = second pointer pair (in_norm_g / scratch)
+//   v7:v8 = third pointer pair (b_x_norm_g out)
+//   v9  = lane * 4 (constant byte offset, computed once)
+//   v10, v11 = load temporaries for output loop
+//
+// LDS layout (must match HIP source attn_w_lds[128]+wave_tmp[1]):
+//   offset 0..511   = attn_w_lds[128] (512 bytes)
+//   offset 512..515 = wave_tmp[0] (4 bytes) — used for scale broadcast
+//
+// Hardware: gfx1100 (RDNA3) wave32.  N=HIDDEN=1024, WAVE=32 → 32 iters.
+fn _emit_phase1_rmsnorm_inline() {
+    // Record the dword index of the s_cmp before the skip branch so
+    // we can patch the simm16 after measuring the body size.
+    uint64 gate_cmp_pos = asm_text_len / 4   // position of s_cmp_lg_u32
+
+    // ── WG-0 gate ─────────────────────────────────────────────────────
+    // s_cmp_lg_u32 s15, 0   (SCC=1 if wg_id != 0)
+    // SOPC op 0x07: word = 0xBF | (0x07<<16) | (ssrc1<<8) | ssrc0
+    //   ssrc0=s15=0x0F, ssrc1=inline-0=0x80
+    asm_u32(0xBF07800F)
+    // s_cbranch_scc1 .skip_phase1  — placeholder simm16=0 (patched below)
+    asm_s_cbranch_scc1(0)
+
+    // ── Load 3 pointer args ────────────────────────────────────────────
+    // s_load_b64 s[2:3], s[0:1], 0x00   (in_residual, arg 0)
+    asm_s_load_b64_off(1, 0, 0x00)
+    // s_load_b64 s[4:5], s[0:1], 0x30   (in_norm_g, arg 6)
+    asm_s_load_b64_off(2, 0, 0x30)
+    // s_load_b64 s[6:7], s[0:1], 0x88   (b_x_norm_g, arg 17)
+    asm_s_load_b64_off(3, 0, 0x88)
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // ── Init ──────────────────────────────────────────────────────────
+    // v2 = 0.0f  (ssq accumulator; inline-0 = f32 0.0)
+    asm_v_mov_b32_inline_u(2, 0)
+    // v9 = lane * 4  (constant byte offset per thread)
+    asm_v_lshlrev_b32_imm(9, 2, 0)
+    // v4 = 0  (hi-word zero for initial ptr setup)
+    asm_v_mov_b32_inline_u(4, 0)
+    // v3 = in_residual_lo + v9  (in_residual ptr lo)
+    asm_v_add_co_u32_vcc_sv(3, 2, 9)
+    // v4 = in_residual_hi + carry  (v4 was 0; reuse as carry target)
+    asm_v_add_co_ci_u32_null_sv_vcc(4, 3, 4)
+    // s12 = 32   (SSQ loop counter)
+    asm_s_mov_b32_inline_imm(12, 32)
+
+    // ── SSQ loop (32 iters: ssq += in_residual[lane + i*32]^2) ─────────
+    // Loop runs while s12 > 0.  Per iteration: load, fmac, advance ptr,
+    // decrement counter, compare-zero, branch-if-not-zero.
+    uint64 loop_ssq_top = asm_text_len / 4   // dword index of loop top
+
+    // global_load_b32 v5, v[3:4], off
+    // word1=0xDC520000, word2=(vdst<<24)|(0x7C<<16)|vaddr_lo
+    asm_u32(0xDC520000)
+    asm_u32(0x057C0003)    // vdst=5, saddr=0x7C(off), vaddr=3
+    asm_s_waitcnt_vmcnt_zero()
+    // v_fmac_f32_e32 v2, v5, v5   (ssq += v5 * v5)
+    asm_v_fmac_f32_e32_vv(2, 5, 5)
+    // Advance ptr by 128 bytes (32 floats × 4 bytes):
+    // v_add_co_u32 v3, vcc_lo, 128, v3  — VOP3B with literal
+    //   word1=0xD7006A03, word2=(src1=v3<<9)|src0=0xFF, word3=128
+    asm_u32(0xD7006A03)
+    asm_u32(0x000206FF)
+    asm_u32(128)
+    // v_add_co_ci_u32_e64 v4, null, 0, v4, vcc_lo
+    //   word1=0xD5207C04, word2=(vcc_lo<<18)|(v4<<9)|inline-0
+    //   = (0x6A<<18)|(0x104<<9)|0x80 = 0x01A80000|0x00020800|0x80 = 0x01AA0880
+    asm_u32(0xD5207C04)
+    asm_u32(0x01AA0880)
+    // s_sub_u32 s12, s12, 1
+    asm_s_sub_u32_imm(12, 12, 1)
+    // s_cmp_eq_u32 s12, 0
+    asm_s_cmp_eq_u32(12, 0x80)
+    // s_cbranch_scc0 loop_ssq (branch if s12 != 0)
+    uint64 loop_ssq_dwords = (asm_text_len / 4) - loop_ssq_top   // body dwords emitted
+    // simm16 = -(loop_ssq_dwords + 1)  (back-branch, including this instruction)
+    uint64 back_simm16 = (0 - loop_ssq_dwords - 1) & 0xFFFF
+    asm_s_cbranch_scc0(back_simm16)
+
+    // ── Wave XOR reduce (5 levels: offsets 16, 8, 4, 2, 1) ─────────────
+    // Each level: v6 = (lane XOR offset)*4; ds_bpermute v7, v6, v2;
+    //             v2 += v7.
+    // VOP2 v_xor_b32_e32: op=0x1D, word=(0x1D<<25)|(vdst<<17)|(vsrc1<<9)|src0
+    // v_xor_b32_e32 v6, 16, v0 → (0x1D<<25)|(6<<17)|(0<<9)|(0x80+16)
+    //   = 0x3A000000|0x000C0000|0x00000000|0x90 = 0x3A0C0090
+    asm_u32(0x3A0C0090)                    // v_xor_b32_e32 v6, 16, v0
+    asm_v_lshlrev_b32_imm(6, 2, 6)        // v6 = v6 * 4
+    asm_ds_bpermute_b32(7, 6, 2)
+    asm_s_waitcnt_lgkmcnt_zero()
+    asm_u32(0x06040F02)                    // v_add_f32_e32 v2, v2, v7 = (3<<25)|(2<<17)|(7<<9)|(0x100|2) = 0x06040F02
+    // offset 8
+    asm_u32(0x3A0C0088)                    // v_xor_b32_e32 v6, 8, v0
+    asm_v_lshlrev_b32_imm(6, 2, 6)
+    asm_ds_bpermute_b32(7, 6, 2)
+    asm_s_waitcnt_lgkmcnt_zero()
+    asm_u32(0x06040F02)
+    // offset 4
+    asm_u32(0x3A0C0084)                    // v_xor_b32_e32 v6, 4, v0
+    asm_v_lshlrev_b32_imm(6, 2, 6)
+    asm_ds_bpermute_b32(7, 6, 2)
+    asm_s_waitcnt_lgkmcnt_zero()
+    asm_u32(0x06040F02)
+    // offset 2
+    asm_u32(0x3A0C0082)                    // v_xor_b32_e32 v6, 2, v0
+    asm_v_lshlrev_b32_imm(6, 2, 6)
+    asm_ds_bpermute_b32(7, 6, 2)
+    asm_s_waitcnt_lgkmcnt_zero()
+    asm_u32(0x06040F02)
+    // offset 1
+    asm_u32(0x3A0C0081)                    // v_xor_b32_e32 v6, 1, v0
+    asm_v_lshlrev_b32_imm(6, 2, 6)
+    asm_ds_bpermute_b32(7, 6, 2)
+    asm_s_waitcnt_lgkmcnt_zero()
+    asm_u32(0x06040F02)
+
+    // ── Lane-0: compute scale, store to LDS[512] ─────────────────────
+    // Save exec; gate to lane 0; compute rsqrt; write LDS.
+    // s_mov_b32 s12, exec_lo   (save full exec)
+    asm_s_mov_b32(12, 0x7E)
+    // v_cmpx_eq_u32_e32 0, v0  (exec = {lanes where v0==0} = lane 0 only)
+    asm_u32(0x7D940080)
+    // s_mov_b32 s14, 0x3A800000  (1/1024.0f = 0x3A800000)
+    asm_s_mov_b32_lit32(14, 0x3A800000)
+    // v_mul_f32 v2, s14, v2  (v2 = ssq / 1024)
+    // VOP2: (8<<25)|(2<<17)|(2<<9)|14 = 0x10000000|0x00040000|0x00000400|14 = 0x1004040E
+    asm_u32(0x1004040E)
+    // s_mov_b32 s14, 0x3727C5AC  (eps = 1e-5f bits)
+    asm_s_mov_b32_lit32(14, 0x3727C5AC)
+    // v_add_f32 v2, s14, v2  (v2 = ssq/1024 + eps)
+    // VOP2: (3<<25)|(2<<17)|(2<<9)|14 = 0x06000000|0x00040000|0x00000400|14 = 0x0604040E
+    asm_u32(0x0604040E)
+    // v_rsq_f32 v2, v2  (v2 = rsqrt(ssq/1024+eps))
+    // VOP1: (0x3F<<25)|(2<<17)|(0x2E<<9)|(0x100|2)
+    //   = 0x7E000000|0x00040000|0x00005C00|0x102 = 0x7E045D02
+    asm_u32(0x7E045D02)
+    // v_mov_b32 v8, 0  (LDS store address = 0, offset:512 encoded in word1)
+    asm_v_mov_b32_inline_u(8, 0)
+    // ds_store_b32 v8, v2 offset:512
+    // word1=0xD8340000|(512&0xFFFF)=0xD8340200, word2=(vdata<<8)|vaddr=(2<<8)|8=0x0208
+    asm_u32(0xD8340200)
+    asm_u32(0x00000208)
+    // s_mov_b32 exec_lo, s12  (restore full exec)
+    asm_s_mov_b32(0x7E, 12)
+
+    // ── Barrier + LDS broadcast ───────────────────────────────────────
+    asm_s_waitcnt_lgkmcnt_zero()
+    asm_s_barrier()
+    // v_mov_b32 v8, 0  (LDS load address)
+    asm_v_mov_b32_inline_u(8, 0)
+    // ds_load_b32 v2, v8 offset:512
+    // word1=0xD8D80000|(512)=0xD8D80200, word2=(vdst<<24)|vaddr=(2<<24)|8=0x02000008
+    asm_u32(0xD8D80200)
+    asm_u32(0x02000008)
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // ── Output loop (32 iters: b_x_norm_g[i]=in_r[i]*scale*in_norm[i]) ─
+    // Re-setup pointers from saved lane*4 (v9) and loaded SGPRs.
+    // in_residual ptr: v3:v4
+    asm_v_mov_b32_inline_u(4, 0)
+    asm_v_add_co_u32_vcc_sv(3, 2, 9)
+    asm_v_add_co_ci_u32_null_sv_vcc(4, 3, 4)
+    // in_norm_g ptr: v5:v6
+    asm_v_mov_b32_inline_u(6, 0)
+    asm_v_add_co_u32_vcc_sv(5, 4, 9)
+    asm_v_add_co_ci_u32_null_sv_vcc(6, 5, 6)
+    // b_x_norm_g ptr: v7:v8
+    asm_v_mov_b32_inline_u(8, 0)
+    asm_v_add_co_u32_vcc_sv(7, 6, 9)
+    asm_v_add_co_ci_u32_null_sv_vcc(8, 7, 8)
+    // s12 = 32  (output loop counter)
+    asm_s_mov_b32_inline_imm(12, 32)
+
+    uint64 loop_out_top = asm_text_len / 4
+
+    // global_load_b32 v10, v[3:4], off  (in_residual[i])
+    asm_u32(0xDC520000)
+    asm_u32(0x0A7C0003)    // vdst=10=0x0A, saddr=0x7C, vaddr=3
+    // global_load_b32 v11, v[5:6], off  (in_norm_g[i])
+    asm_u32(0xDC520000)
+    asm_u32(0x0B7C0005)    // vdst=11=0x0B, saddr=0x7C, vaddr=5
+    asm_s_waitcnt_vmcnt_zero()
+    // v_mul_f32 v10, v2, v10  (scale * in_resid[i])
+    // VOP2: (8<<25)|(10<<17)|(10<<9)|(0x100|2)
+    //   src1=v10=10 (8-bit VGPR field), src0=v2=0x102 (VGPR bit)
+    //   = 0x10000000|0x00140000|0x00001400|0x102 = 0x10141502
+    asm_u32(0x10141502)
+    // v_mul_f32 v10, v10, v11  (result * in_norm_g[i])
+    // VOP2: (8<<25)|(10<<17)|(11<<9)|(0x100|10)
+    //   src1=v11=11, src0=v10=0x10A
+    //   = 0x10000000|0x00140000|0x00001600|0x10A = 0x1014170A
+    asm_u32(0x1014170A)
+    // global_store_b32 v[7:8], v10, off
+    // word1=0xDC6A0000, word2=(0x7C<<16)|(vdata<<8)|vaddr=(0x7C<<16)|(10<<8)|7=0x007C0A07
+    asm_u32(0xDC6A0000)
+    asm_u32(0x007C0A07)
+    // Advance in_residual ptr by 128 bytes
+    asm_u32(0xD7006A03)
+    asm_u32(0x000206FF)
+    asm_u32(128)
+    asm_u32(0xD5207C04)
+    asm_u32(0x01AA0880)
+    // Advance in_norm_g ptr by 128 bytes (v5:v6)
+    asm_u32(0xD7006A05)
+    asm_u32(0x00020AFF)
+    asm_u32(128)
+    // v_add_co_ci_u32_e64 v6, null, 0, v6, vcc_lo
+    // word1=0xD5207C06, word2=(0x6A<<18)|(0x106<<9)|0x80=0x01A80000|0x000C0C00|0x80=?
+    // 0x106<<9 = 0x20C00 → 0x01A80000|0x0020C00|0x80... wait:
+    // (0x6A<<18) = 0x01A80000
+    // (0x106<<9) = 0x106*512 = 532*512... no: 0x106 = 262 decimal, *512 = 134144 = 0x20C00
+    // word2 = 0x01A80000 | 0x00020C00 | 0x80 = 0x01AA0C80
+    asm_u32(0xD5207C06)
+    asm_u32(0x01AA0C80)
+    // Advance b_x_norm_g ptr by 128 bytes (v7:v8)
+    asm_u32(0xD7006A07)
+    asm_u32(0x00020EFF)
+    asm_u32(128)
+    // v_add_co_ci_u32_e64 v8, null, 0, v8, vcc_lo
+    // word2 = (0x6A<<18)|(0x108<<9)|0x80 = 0x01A80000|0x00021000|0x80 = 0x01AA1080
+    asm_u32(0xD5207C08)
+    asm_u32(0x01AA1080)
+    // s_sub_u32 s12, s12, 1
+    asm_s_sub_u32_imm(12, 12, 1)
+    // s_cmp_eq_u32 s12, 0
+    asm_s_cmp_eq_u32(12, 0x80)
+    // s_cbranch_scc0 loop_out
+    uint64 loop_out_dwords = (asm_text_len / 4) - loop_out_top
+    uint64 back_out_simm16 = (0 - loop_out_dwords - 1) & 0xFFFF
+    asm_s_cbranch_scc0(back_out_simm16)
+
+    // ── Patch the WG-0 skip-branch simm16 ─────────────────────────────
+    // Target of the gate branch = current position (after all phase-1 body).
+    uint64 body_dwords = (asm_text_len / 4) - (gate_cmp_pos + 2)
+    asm_patch_u32(gate_cmp_pos + 1, 0xBFA20000 | (body_dwords & 0xFFFF))
+}
+
+// Sub-recognizer: phase 1 / phase 11 — rmsnorm gated to WG 0 only.
+//
+// Walks the mega-kernel function body block looking for a Call to
+// `rmsnorm_wg0_marker` anywhere in the phase-1 `if wg_id == 0 { ... }`
+// block.  If found, the phase is emitted via _emit_phase1_rmsnorm_inline;
+// otherwise the caller should fall through to the stub emitter.
+//
+// Returns 1 if the marker is found, 0 if not found.
+fn _body_has_rmsnorm_wg0_marker(uint64 body_node) -> uint64 {
+    uint32 stmt = ast_child(body_node)
+    while stmt != 0 {
+        // Look for `if wg_id == 0 { ... }` (AST_KIND_IF = 13)
+        if ast_kind(stmt) == 13 {
+            uint32 then_blk = ast_data1(stmt)
+            if then_blk != 0 {
+                uint32 inner = ast_child(then_blk)
+                while inner != 0 {
+                    // Check for ExprStmt(Call(rmsnorm_wg0_marker)) — bare call statement.
+                    // A bare fn call in statement position is wrapped in ExprStmt (kind 16),
+                    // with the child being the Call expression (kind 35).
+                    if ast_kind(inner) == 16 {
+                        uint32 expr = ast_child(inner)
+                        if expr != 0 && ast_kind(expr) == 35 {
+                            uint32 callee = ast_data1(expr)
+                            if tok_matches(callee, "rmsnorm_wg0_marker", 18) != 0 {
+                                return 1
+                            }
+                        }
+                    }
+                    // Also check for VarDecl whose init is a Call to rmsnorm_wg0_marker
+                    // (in case someone writes `uint64 _ = rmsnorm_wg0_marker()`)
+                    if ast_kind(inner) == 10 {
+                        uint32 init = ast_child(inner)
+                        if init != 0 && ast_kind(init) == 35 {
+                            uint32 callee = ast_data1(init)
+                            if tok_matches(callee, "rmsnorm_wg0_marker", 18) != 0 {
+                                return 1
+                            }
+                        }
+                    }
+                    inner = ast_next(inner)
+                }
+            }
+        }
+        stmt = ast_next(stmt)
+    }
+    return 0
+}
+
+// Emit the mega-kernel body into the kernel table.
+//
+// Slice 4.19.1: when body_node contains rmsnorm_wg0_marker() in the
+// phase-1 if-block, the real inline rmsnorm ISA is emitted instead of a
+// stub s_nop.  All other phases remain stubs (s_nop 0) in this slice.
+//
+// The kernel:
 //  - Loads barrier_counter ptr (arg 15) and max_phase value (arg 23)
-//  - Runs 9 phase stubs (each is just s_nop 0)
+//  - Runs 9 phases (phase 1 real if marker found, others stub s_nop 0)
 //  - Runs 8 cross-WG barriers between phases
 //  - Has 7 early-exit checks (max_phase guards after barriers 0..6)
 //  - Ends with s_endpgm
 //
 // KD parameters match the v1 reference: MEGA_KERNARG_COUNT args, 192-byte
 // kernarg segment, rsrc2=0x9E (wg_id_x in s15), MEGA_WG_PERSIST=512.
-// LDS=0 (stub phases don't need LDS).
-fn mega_emit_stub_kernel(uint64 kname_ptr, uint64 nl) -> uint64 {
+// LDS=516 (set via kt_push_lds(516): wave_tmp[1]=4B at offset 512 + attn_w_lds[128]=512B).
+fn mega_emit_stub_kernel(uint64 kname_ptr, uint64 nl, uint64 body_node) -> uint64 {
     asm_init()
 
     // ── Prologue (5 dwords) ───────────────────────────────────────────────
@@ -194,8 +514,14 @@ fn mega_emit_stub_kernel(uint64 kname_ptr, uint64 nl) -> uint64 {
     //   Total = (6-k)*34 + 34 = (7-k)*34 dwords
     //   simm16 = (7-k)*34 - 1
 
-    // Barrier 0: phase 1 (wg==0 only in real; stub: s_nop 0)
-    asm_u32(0xBF800000)            // s_nop 0  (phase 1 stub)
+    // Phase 1: input rmsnorm (WG-0 gated).
+    // If body_node contains rmsnorm_wg0_marker() in the phase-1 if-block,
+    // emit the real inline rmsnorm ISA; otherwise fall back to s_nop stub.
+    if _body_has_rmsnorm_wg0_marker(body_node) != 0 {
+        _emit_phase1_rmsnorm_inline()
+    } else {
+        asm_u32(0xBF800000)        // s_nop 0  (phase 1 stub)
+    }
     mega_emit_barrier_isa(0, MEGA_WG_PERSIST)
     // max_phase < 1 check: s_cmp_lt_u32 s10, inline_1; s_cbranch_scc1 .Lend
     // simm16 = (7-0)*34 - 1 = 237
@@ -286,12 +612,14 @@ fn mega_emit_stub_kernel(uint64 kname_ptr, uint64 nl) -> uint64 {
         ai = ai + 1
     }
 
-    // KD: rsrc1 = 0xE0AF0000 (8 VGPRs, 16 SGPRs — minimal for stub)
+    // KD: rsrc1 = 0xE0AF0006 (56 VGPRs = (6+1)*8, matches v1 HIP-compiled kernel)
+    // Phase 1 uses v0..v11 (12 VGPRs); future phases will use more.
+    // Using 56 VGPRs here to match the v1 reference and leave room for all phases.
     // rsrc2 = 0x9E (USER_SGPR_COUNT=15, wg_id_x in s15)
     // rsrc3 = 0x10 (standard)
     // props = 0x0408 (wave32, kernarg_ptr)
     // LDS = 516 (matches v1: wave_tmp[1]=4B + attn_w_lds[128]=512B = 516B)
-    uint64 rsrc1 = 0xE0AF0000
+    uint64 rsrc1 = 0xE0AF0006
     uint64 rsrc2 = 0x0000009E
     uint64 rsrc3 = 0x00000010
     uint64 props = 0x0408
@@ -328,5 +656,5 @@ fn recognize_megakernel_swiglu_dense_gqa(uint64 fn_node, uint64 source,
     if body == 0 { return 1 }
     if ast_kind(body) != AST_KIND_BLOCK { return 1 }
 
-    return mega_emit_stub_kernel(kname_ptr, nl)
+    return mega_emit_stub_kernel(kname_ptr, nl, body)
 }
