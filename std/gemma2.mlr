@@ -174,6 +174,23 @@ fn gemma2_scale_embed_inplace(u64 buf_ptr, u64 hidden) {
 // without a LUT, so they match without this trick).
 static u64 gemma2_gelu_table = 0   // 65536 × u16, indexed by fp16 bits
 
+// libm tanhf — float SysV ABI (arg in xmm0, return in xmm0). Parser
+// detects the name and flags the symbol so codegen routes through
+// xmm regs and the driver adds libm.so.6 to DT_NEEDED. Used at
+// table-init time so the per-slot fp16 entries are bit-identical to
+// llama.cpp's `ggml_table_gelu_f16` (which is also seeded from libm
+// `tanhf`). Without this, our f64-Taylor-based tanh would produce
+// LUT entries that drift ~0.04 logit vs llama.cpp on some models.
+//
+// Requires a dynamic ELF — fat-binary slices are static, so the
+// LUT-init falls back to gemma2_tanh_f32 there. Driver picks the
+// right path via gemma2_set_gelu_table_use_libm.
+@dynamic extern fn tanhf(f32 x) -> f32
+
+static u64 gemma2_gelu_lut_use_libm = 0
+
+fn gemma2_set_gelu_table_use_libm(u64 v) { gemma2_gelu_lut_use_libm = v }
+
 fn gemma2_gelu_table_init() {
     if gemma2_gelu_table != 0 { return }
     u64 tbl = alloc(65536 * 2)
@@ -186,7 +203,12 @@ fn gemma2_gelu_table_init() {
         // Match llama.cpp's expression order (vec.h:987) so the f32
         // intermediate before fp16 quantize is bit-identical.
         f32 inner = c0 * x * (1.0f + c1 * x * x)
-        f32 t = gemma2_tanh_f32(inner)
+        f32 t = 0.0f
+        if gemma2_gelu_lut_use_libm != 0 {
+            t = tanhf(inner)               // libm — bit-exact vs llama.cpp
+        } else {
+            t = gemma2_tanh_f32(inner)     // f64 internal fallback (no libm)
+        }
         f32 y = 0.5f * x * (1.0f + t)
         u64 y_f16 = _q8q8_fp32_to_fp16_rne(y)
         u8 lo = y_f16 & 0xFF

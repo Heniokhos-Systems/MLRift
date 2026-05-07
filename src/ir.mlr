@@ -2571,17 +2571,34 @@ fn ir_lower_expr(uint64 node) -> uint64 {
             uint32 anxt = ast_next(warg)
             warg = anxt
         }
+        // Detect libm float-ABI callees (1-arg-1-return f32, args/return
+        // in xmm0). When matched, IR_ARG slots are tagged with imm 200+i
+        // so the codegen routes through `movd xmmN, gpreg32` instead of
+        // the integer SysV regs, and the IR_CALL handler reads the
+        // return from xmm0. See dyn_sym_register_with_abi in
+        // dyn_sym_registry.kr; parser.kr flags symbols by name match.
+        uint64 libm_dyn_idx_call = dyn_sym_lookup(callee_tok)
+        uint64 use_libm_abi_call = 0
+        if libm_dyn_idx_call != 0xFFFFFFFF {
+            if dyn_sym_abi_at(libm_dyn_idx_call) != 0 { use_libm_abi_call = 1 }
+        }
         // Now emit ARG instructions
         uint64 ai = 0
         while ai < arg_count {
             uint64 avp = call_arg_vregs + ai * 8
             uint64 av = 0
             unsafe { *(avp as uint64) -> av }
-            ir_emit(IR_ARG, 0, av, 0, ai, ir_current_bb)
+            uint64 arg_slot_imm = ai
+            if use_libm_abi_call != 0 { arg_slot_imm = 200 + ai }
+            ir_emit(IR_ARG, 0, av, 0, arg_slot_imm, ir_current_bb)
             ai = ai + 1
         }
         uint64 dest = ir_new_vreg()
-        ir_emit(IR_CALL, dest, arg_count, 0, callee_tok, ir_current_bb)
+        // src1 carries the libm-ABI flag (bit 8) alongside arg_count
+        // (low byte). The IR_CALL handler peels them apart.
+        uint64 call_src1 = arg_count
+        if use_libm_abi_call != 0 { call_src1 = arg_count | 0x100 }
+        ir_emit(IR_CALL, dest, call_src1, 0, callee_tok, ir_current_bb)
         // Propagate the callee's declared float return kind onto the
         // result vreg. Without this, `some_f64_fn() * local_f64` sees
         // fkind=0 on the LHS and picks IR_MUL (integer) instead of
@@ -7040,6 +7057,25 @@ fn ir_emit_x86_insn(uint64 ii) {
     if op == 51 {
         // IR_ARG: move src to the correct argument register
         // SysV ABI: rdi(7), rsi(6), rdx(2), rcx(1), r8(8), r9(9)
+        // Encoding of imm:
+        //   0..5     = SysV integer arg slots (rdi/rsi/rdx/rcx/r8/r9)
+        //   6..N     = stack-overflow arg slot N-6 (saved for IR_CALL)
+        //   100..    = direct GP physical reg (asm I/O constraint), reg = imm-100
+        //   200..207 = SysV float arg slot (xmm0..xmm7) — for libm float
+        //              ABI calls, see Call lowering above.
+        if imm >= 200 && imm < 208 {
+            uint64 xmm_n = imm - 200
+            uint64 src_reg = ir_resolve_src(s1_v, 0)
+            // movd xmmN, src_reg_low_32  →  66 [REX.B?] 0F 6E modRM
+            // ModR/M = 11 (xmm_n) (src_reg & 7); REX.B set when src>=8.
+            emit_byte(0x66)
+            if src_reg >= 8 { emit_byte(0x41) }
+            emit_byte(0x0F)
+            emit_byte(0x6E)
+            uint8 modRM_arg = 0xC0 | ((xmm_n & 7) << 3) | (src_reg & 7)
+            emit_byte(modRM_arg)
+            return
+        }
         uint64 target = 7
         if imm == 1 { target = 6 }
         if imm == 2 { target = 2 }
@@ -7089,9 +7125,19 @@ fn ir_emit_x86_insn(uint64 ii) {
     }
 
     if op == 50 {
-        // IR_CALL: call rel32 (will be resolved by fixup system)
-        // src1 = arg_count (0 for old-style calls with <=6 args)
-        uint64 call_arg_count = s1_v
+        // IR_CALL: call rel32 (will be resolved by fixup system).
+        // src1 encoding (set by Call lowering above):
+        //   bits 0..7 = arg_count (0 for old-style calls with <=6 args)
+        //   bit 8     = libm float ABI flag — when set, args go to
+        //               xmm0..xmm7 via IR_ARG with imm=200+i, and the
+        //               return is read from xmm0. We also emit
+        //               `sub rsp, 8` / `add rsp, 8` around the call to
+        //               guarantee 16-byte stack alignment at the call
+        //               site (libm leaf functions can use SSE that
+        //               assumes 16-aligned stack).
+        uint64 raw_s1 = s1_v
+        uint64 call_arg_count = raw_s1 & 0xFF
+        uint64 use_libm_call = (raw_s1 >> 8) & 1
         uint64 stack_args = 0
         if call_arg_count > 6 {
             stack_args = call_arg_count - 6
@@ -7194,6 +7240,15 @@ fn ir_emit_x86_insn(uint64 ii) {
                 oi = oi + 1
             }
         }
+        // libm float ABI: keep stack 16-byte aligned at the call site.
+        // Caller's rsp is 16-aligned at function entry (after `call`)
+        // minus our prologue, but the simplest robust pattern is one
+        // `sub rsp, 8` here and the matching `add rsp, 8` after the
+        // ret. Skip when libm flag is off so non-libm calls stay
+        // unchanged.
+        if use_libm_call != 0 {
+            emit_byte(0x48); emit_byte(0x83); emit_byte(0xEC); emit_byte(0x08)
+        }
         emit_byte(0xE8)
         uint64 call_patch = out_len
         emit_u32_le(0)
@@ -7231,12 +7286,37 @@ fn ir_emit_x86_insn(uint64 ii) {
         }
         // Reset overflow arg count
         ir_overflow_arg_count = 0
-        // Result in rax
-        if dst_r != 0xFFFFFFFF && dst_r != 0 {
-            ir_emit_mov_r64_r64(dst_r, 0)
+        // libm float ABI: undo the alignment adjustment we did before
+        // the call. Must happen before the dst_r read so any spill
+        // stores below see the correct rsp again.
+        if use_libm_call != 0 {
+            emit_byte(0x48); emit_byte(0x83); emit_byte(0xC4); emit_byte(0x08)
         }
-        if dst_r == 0xFFFFFFFF {
-            ir_emit_store_spill(0, dest_v)
+        // Result reg:
+        //   * Integer ABI (default): rax has the return; copy/spill it.
+        //   * libm float ABI: xmm0 has the f32 return; movd into the
+        //     destination GPR (low 32 bits, high zeroed). For spill we
+        //     stage into rax first via movd, then spill, since the
+        //     spill helpers are GPR-only.
+        if use_libm_call != 0 {
+            if dst_r != 0xFFFFFFFF {
+                emit_byte(0x66)
+                if dst_r >= 8 { emit_byte(0x41) }
+                emit_byte(0x0F); emit_byte(0x7E)
+                uint8 lc_modRM = 0xC0 | ((0 & 7) << 3) | (dst_r & 7)
+                emit_byte(lc_modRM)
+            } else {
+                // movd eax, xmm0
+                emit_byte(0x66); emit_byte(0x0F); emit_byte(0x7E); emit_byte(0xC0)
+                ir_emit_store_spill(0, dest_v)
+            }
+        } else {
+            if dst_r != 0xFFFFFFFF && dst_r != 0 {
+                ir_emit_mov_r64_r64(dst_r, 0)
+            }
+            if dst_r == 0xFFFFFFFF {
+                ir_emit_store_spill(0, dest_v)
+            }
         }
         return
     }
