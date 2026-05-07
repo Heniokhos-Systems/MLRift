@@ -1,0 +1,265 @@
+// qwen36_probe — dump Qwen3-VL ("Qwen3.6") GGUF metadata so we can wire the
+// driver: arch tag, dims, RoPE sections (Interleaved-MRoPE), DeepStack layer
+// count, tokenizer BOS, and a sample of the per-block tensor names (to
+// confirm `blk.N.*` for the LLM half + `v.blk.N.*` for the vision half).
+//
+// Usage:
+//   1. Find the GGUF blob path:   sudo ls /usr/share/ollama/.ollama/models/blobs/ | head
+//      (or check `ollama show qwen3.6:27b-q8_0 --modelfile`)
+//   2. Update `path` below.
+//   3. ./build/mlrc examples/qwen36_probe.mlr -o /tmp/qwen36_probe \
+//          --arch=x86_64 --target=linux --emit=elfexe
+//      /tmp/qwen36_probe
+
+import "../std/gguf.mlr"
+import "../std/io.mlr"
+import "../std/fmt.mlr"
+import "../std/string.mlr"
+
+fn print_u(u64 v) { u64 s = fmt_dec(v); print_str(s); dealloc(s) }
+fn print_bytes(u64 p, u64 l) { write(1, p, l) }
+
+fn main() {
+    // ─── EDIT ME ─────────────────────────────────────────────────────────
+    // Replace with the actual sha256 blob path once `ollama pull` finishes.
+    u64 path = "/home/pantelis/qwen35-0.8b/Qwen3.5-0.8B-Q8_0.gguf"
+    // ─────────────────────────────────────────────────────────────────────
+
+    print("[qwen36_probe] loading "); println_str(path)
+    GGUFFile gf = gguf_open(path)
+    if gf.file_size == 0 {
+        print("[qwen36_probe] open failed — update `path` to the real blob\n")
+        exit(1)
+    }
+
+    print("version         = "); print_u(gf.version);        print("\n")
+    print("tensor_count    = "); print_u(gf.tensor_count);   print("\n")
+    print("metadata_count  = "); print_u(gf.metadata_count); print("\n")
+    print("data_start      = "); print_u(gf.data_start);     print("\n")
+    print("file_size       = "); print_u(gf.file_size);      print("\n")
+
+    // ── 1. Architecture tag ──
+    uint64[1] sp_slot
+    uint64[1] sl_slot
+    u64 sp = sp_slot
+    u64 sl = sl_slot
+    gguf_meta_string(gf, "general.architecture", sp, sl)
+    u64 arch_p = 0; unsafe { *(sp as u64) -> arch_p }
+    u64 arch_l = 0; unsafe { *(sl as u64) -> arch_l }
+    print("\ngeneral.architecture = '")
+    if arch_l != 0 { print_bytes(arch_p, arch_l) }
+    print("'   (expect 'qwen3vl' or 'qwen3vlmoe')\n")
+
+    gguf_meta_string(gf, "general.name", sp, sl)
+    u64 name_p = 0; unsafe { *(sp as u64) -> name_p }
+    u64 name_l = 0; unsafe { *(sl as u64) -> name_l }
+    print("general.name         = '")
+    if name_l != 0 { print_bytes(name_p, name_l) }
+    print("'\n")
+
+    // ── 2. qwen35.* arch hparams ──
+    print("\n--- qwen3vl arch ---\n")
+    u64 ctx_len = gguf_meta_u32(gf, "qwen35.context_length", 0)
+    u64 emb_len = gguf_meta_u32(gf, "qwen35.embedding_length", 0)
+    u64 block_n = gguf_meta_u32(gf, "qwen35.block_count", 0)
+    u64 ff_len  = gguf_meta_u32(gf, "qwen35.feed_forward_length", 0)
+    u64 head_n  = gguf_meta_u32(gf, "qwen35.attention.head_count", 0)
+    u64 head_kv = gguf_meta_u32(gf, "qwen35.attention.head_count_kv", 0)
+    u64 rope_dim= gguf_meta_u32(gf, "qwen35.rope.dimension_count", 0)
+    u64 deep_n  = gguf_meta_u32(gf, "qwen35.n_deepstack_layers", 0)
+    print("context_length            = "); print_u(ctx_len);  print("\n")
+    print("embedding_length          = "); print_u(emb_len);  print("\n")
+    print("block_count               = "); print_u(block_n);  print("\n")
+    print("feed_forward_length       = "); print_u(ff_len);   print("\n")
+    print("attention.head_count      = "); print_u(head_n);   print("\n")
+    print("attention.head_count_kv   = "); print_u(head_kv);  print("\n")
+    print("rope.dimension_count      = "); print_u(rope_dim); print("\n")
+    print("n_deepstack_layers        = "); print_u(deep_n);   print("\n")
+
+    u64 rope_base_idx = gguf_meta_find(gf, "qwen35.rope.freq_base")
+    if rope_base_idx != 0xFFFFFFFFFFFFFFFF {
+        u64 vp = gguf_meta_value_ptr(gf, rope_base_idx)
+        u64 t = gguf_meta_type(gf, rope_base_idx)
+        // f32 = type 6
+        if t == 6 {
+            u64 bits = gg_read_u32(vp)
+            print("rope.freq_base (f32 bits) = "); print_u(bits); print("\n")
+        }
+    }
+
+    // RMS-eps (f32 type=6 — read raw bits for fingerprint)
+    u64 eps_idx = gguf_meta_find(gf, "qwen35.attention.layer_norm_rms_epsilon")
+    if eps_idx != 0xFFFFFFFFFFFFFFFF {
+        u64 vp = gguf_meta_value_ptr(gf, eps_idx)
+        u64 bits = gg_read_u32(vp)
+        print("rms_eps (f32 bits)        = "); print_u(bits); print("\n")
+    }
+
+    // ── Dump ALL metadata keys + types so we can spot the right key name ──
+    print("\n--- ALL metadata keys ---\n")
+    u64 mi = 0
+    while mi < gf.metadata_count {
+        u64 kp = 0; unsafe { *((gf.key_ptrs + mi * 8) as u64) -> kp }
+        u64 kl = 0; unsafe { *((gf.key_lens + mi * 8) as u64) -> kl }
+        u64 vt = 0; unsafe { *((gf.value_types + mi * 8) as u64) -> vt }
+        print("  ["); print_u(mi); print("] type="); print_u(vt); print(" key='")
+        print_bytes(kp, kl)
+        print("'\n")
+        mi = mi + 1
+    }
+
+    // ── 3. RoPE Interleaved-MRoPE sections (4-element u32 array) ──
+    u64 sec_idx = gguf_meta_find(gf, "qwen35.rope.dimension_sections")
+    if sec_idx != 0xFFFFFFFFFFFFFFFF {
+        u64 vp = gguf_meta_value_ptr(gf, sec_idx)
+        u64 elem_t = gg_read_u32(vp)
+        u64 count  = gg_read_u64(vp + 4)
+        u64 p = vp + 12
+        print("rope.dimension_sections   = elem_t="); print_u(elem_t)
+        print(" count=");  print_u(count); print(" [")
+        u64 i = 0
+        while i < count {
+            if i > 0 { print(", ") }
+            // Assume u32 elements (elem_t=4). If different, sizes will look funny.
+            u64 v = gg_read_u32(p + i * 4)
+            print_u(v)
+            i = i + 1
+        }
+        print("]\n")
+    } else {
+        print("rope.dimension_sections   = (absent)\n")
+    }
+
+    // ── SSM hparams (qwen35 hybrid GDN/attn arch) ──
+    print("\n--- SSM hparams ---\n")
+    u64 ssm_conv_k    = gguf_meta_u32(gf, "qwen35.ssm.conv_kernel",     0)
+    u64 ssm_state     = gguf_meta_u32(gf, "qwen35.ssm.state_size",      0)
+    u64 ssm_groups    = gguf_meta_u32(gf, "qwen35.ssm.group_count",     0)
+    u64 ssm_dt_rank   = gguf_meta_u32(gf, "qwen35.ssm.time_step_rank",  0)
+    u64 ssm_inner     = gguf_meta_u32(gf, "qwen35.ssm.inner_size",      0)
+    u64 full_attn_iv  = gguf_meta_u32(gf, "qwen35.full_attention_interval", 0)
+    u64 rope_dim_cnt  = gguf_meta_u32(gf, "qwen35.rope.dimension_count", 0)
+    u64 key_len       = gguf_meta_u32(gf, "qwen35.attention.key_length", 0)
+    u64 val_len       = gguf_meta_u32(gf, "qwen35.attention.value_length", 0)
+    print("ssm.conv_kernel           = "); print_u(ssm_conv_k);   print("\n")
+    print("ssm.state_size            = "); print_u(ssm_state);    print("\n")
+    print("ssm.group_count           = "); print_u(ssm_groups);   print("\n")
+    print("ssm.time_step_rank        = "); print_u(ssm_dt_rank);  print("\n")
+    print("ssm.inner_size            = "); print_u(ssm_inner);    print("\n")
+    print("full_attention_interval   = "); print_u(full_attn_iv); print("\n")
+    print("rope.dimension_count      = "); print_u(rope_dim_cnt); print("\n")
+    print("attention.key_length      = "); print_u(key_len);      print("\n")
+    print("attention.value_length    = "); print_u(val_len);      print("\n")
+
+    // ── blk.3 tensor names (first full-attn layer if interval=4) ──
+    print("\n--- blk.3 tensor names ---\n")
+    u64 mi3 = 0
+    u64 sshown = 0
+    while mi3 < gf.tensor_count {
+        u64 np = 0; unsafe { *((gf.tensor_name_ptrs + mi3 * 8) as u64) -> np }
+        u64 nl = 0; unsafe { *((gf.tensor_name_lens + mi3 * 8) as u64) -> nl }
+        if nl >= 6 {
+            if load8(np + 0) == 98  && load8(np + 1) == 108 &&
+               load8(np + 2) == 107 && load8(np + 3) == 46  &&
+               load8(np + 4) == 51  && load8(np + 5) == 46 {
+                print("  '"); write(1, np, nl); print("'\n")
+                sshown = sshown + 1
+                if sshown >= 20 { mi3 = gf.tensor_count }
+            }
+        }
+        mi3 = mi3 + 1
+    }
+
+    // ── 4. Tokenizer BOS / EOS ──
+    print("\n--- tokenizer ---\n")
+    u64 bos_id = gguf_meta_u32(gf, "tokenizer.ggml.bos_token_id", 0xFFFFFFFF)
+    u64 eos_id = gguf_meta_u32(gf, "tokenizer.ggml.eos_token_id", 0xFFFFFFFF)
+    print("bos_token_id              = "); print_u(bos_id); print("\n")
+    print("eos_token_id              = "); print_u(eos_id); print("\n")
+
+    // ── 5. Sample tensor names (first 20 + last 5) ──
+    print("\n--- first 20 tensor names ---\n")
+    u64 nshow = 20
+    if gf.tensor_count < nshow { nshow = gf.tensor_count }
+    u64 j = 0
+    while j < nshow {
+        u64 np = 0; unsafe { *((gf.tensor_name_ptrs + j * 8) as u64) -> np }
+        u64 nl = 0; unsafe { *((gf.tensor_name_lens + j * 8) as u64) -> nl }
+        print("  ["); print_u(j); print("] '")
+        print_bytes(np, nl)
+        print("'\n")
+        j = j + 1
+    }
+
+    // Look for `v.blk.0.*` to confirm vision half exists; report count.
+    print("\n--- vision tensor scan (v.blk.* + v.* prefixes) ---\n")
+    u64 v_count  = 0
+    u64 v_first  = 0xFFFFFFFFFFFFFFFF
+    u64 mm_count = 0  // mm_proj / mmproj — alternative naming
+    u64 k = 0
+    while k < gf.tensor_count {
+        u64 np = 0; unsafe { *((gf.tensor_name_ptrs + k * 8) as u64) -> np }
+        u64 nl = 0; unsafe { *((gf.tensor_name_lens + k * 8) as u64) -> nl }
+        if nl >= 6 {
+            // 'v.blk.' = 0x76 0x2E 0x62 0x6C 0x6B 0x2E
+            if load8(np + 0) == 118 && load8(np + 1) == 46 &&
+               load8(np + 2) == 98  && load8(np + 3) == 108 &&
+               load8(np + 4) == 107 && load8(np + 5) == 46 {
+                v_count = v_count + 1
+                if v_first == 0xFFFFFFFFFFFFFFFF { v_first = k }
+            }
+        }
+        if nl >= 3 {
+            // 'mm_' = 0x6D 0x6D 0x5F
+            if load8(np + 0) == 109 && load8(np + 1) == 109 && load8(np + 2) == 95 {
+                mm_count = mm_count + 1
+            }
+        }
+        k = k + 1
+    }
+    print("v.blk.* tensor count      = "); print_u(v_count);  print("\n")
+    print("mm_*    tensor count      = "); print_u(mm_count); print("\n")
+    if v_count > 0 && v_first != 0xFFFFFFFFFFFFFFFF {
+        u64 np = 0; unsafe { *((gf.tensor_name_ptrs + v_first * 8) as u64) -> np }
+        u64 nl = 0; unsafe { *((gf.tensor_name_lens + v_first * 8) as u64) -> nl }
+        print("first v.blk.* name        = '")
+        print_bytes(np, nl)
+        print("'\n")
+    }
+
+    // ── 6. Layer-0 LLM weight shapes (the dims we'll wire into the driver) ──
+    print("\n--- layer-0 LLM tensor shapes ---\n")
+    u64 nm0 = "blk.0.attn_q.weight"
+    GGUFTensor t = gguf_get(gf, nm0)
+    print("blk.0.attn_q.weight   ndim="); print_u(t.n_dims)
+    print(" dims=("); print_u(t.dim0); print(","); print_u(t.dim1)
+    print(","); print_u(t.dim2); print(","); print_u(t.dim3)
+    print(") gtype="); print_u(t.gtype); print("\n")
+
+    u64 nm1 = "blk.0.attn_k.weight"
+    GGUFTensor t1 = gguf_get(gf, nm1)
+    print("blk.0.attn_k.weight   ndim="); print_u(t1.n_dims)
+    print(" dims=("); print_u(t1.dim0); print(","); print_u(t1.dim1)
+    print(") gtype="); print_u(t1.gtype); print("\n")
+
+    u64 nm2 = "blk.0.attn_q_norm.weight"
+    GGUFTensor t2 = gguf_get(gf, nm2)
+    print("blk.0.attn_q_norm     ndim="); print_u(t2.n_dims)
+    print(" dim0="); print_u(t2.dim0); print(" gtype="); print_u(t2.gtype); print("\n")
+
+    u64 nm3 = "blk.0.ffn_gate.weight"
+    GGUFTensor t3 = gguf_get(gf, nm3)
+    print("blk.0.ffn_gate        ndim="); print_u(t3.n_dims)
+    print(" dims=("); print_u(t3.dim0); print(","); print_u(t3.dim1)
+    print(") gtype="); print_u(t3.gtype); print("\n")
+
+    u64 nm4 = "token_embd.weight"
+    GGUFTensor t4 = gguf_get(gf, nm4)
+    print("token_embd.weight     ndim="); print_u(t4.n_dims)
+    print(" dims=("); print_u(t4.dim0); print(","); print_u(t4.dim1)
+    print(") gtype="); print_u(t4.gtype); print("\n")
+
+    print("\n[qwen36_probe] done\n")
+    gguf_free(gf)
+    exit(0)
+}
