@@ -18991,28 +18991,98 @@ fn emit_amdgpu_qwen3_megakernel_blob(uint64 out_path) -> uint64 {
 // ─────────────────────────────────────────────────────────────────────
 // Slice 4.19.0 — qwen3-0.6B layer mega-kernel v2 (AST-walker stub).
 //
-// Emits a stub .co containing the v2 mega-kernel stub: 9 s_nop phases
-// + 8 working cross-WG barriers + max_phase early-exit guards.
-// The stub kernel launches correctly and exits without GPU hang at
-// max_phase=0; all real phase logic is deferred to later slices.
+// Emits a stub .co by:
+//   1. Parsing examples/llm/qwen3_layer_megakernel.mlr
+//   2. Locating the @kernel fn qwen3_layer_megakernel node in the AST
+//   3. Calling recognize_megakernel_swiglu_dense_gqa (THE Task-1 deliverable)
+//      which validates the 24-parameter signature + Block body shape, then
+//      delegates to mega_emit_stub_kernel (9 s_nop phases + 8 working
+//      cross-WG barriers + max_phase early-exit guards)
+//   4. Wrapping the emitted ISA bytes into a complete .co via the standard
+//      multi_code_object path
 //
-// Unlike v1 (which reads a pre-extracted .bin), this path calls
-// mega_emit_stub_kernel to build the ISA from scratch via asm_* helpers.
+// The recognizer path (step 3) is the AST→ISA path under development;
+// invoking it here exercises the actual code, not just the stub directly.
 //
-// Returns 0 on success, 1 on I/O failure.
+// Returns 0 on success, 1 on error.
 @export
 fn emit_amdgpu_qwen3_megakernel_blob_v2(uint64 out_path) -> uint64 {
     uint64 kname = "qwen3_layer_megakernel"
     uint64 klen  = 22
 
-    // Emit the stub kernel into the kernel table.
-    kt_reset()
-    uint64 emit_rc = mega_emit_stub_kernel(kname, klen)
-    if emit_rc != 0 {
-        write(2, "emit_amdgpu_qwen3_megakernel_blob_v2: emit failed\n", 50)
+    // ── Step 1: parse examples/llm/qwen3_layer_megakernel.mlr ──────────
+    uint64 mlr_path = "examples/llm/qwen3_layer_megakernel.mlr"
+    uint64 mlr_fd = file_open(mlr_path, 0)
+    if mlr_fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_qwen3_megakernel_blob_v2: cannot open examples/llm/qwen3_layer_megakernel.mlr\n", 89)
+        return 1
+    }
+    uint64 mlr_sz = file_size(mlr_fd)
+    if mlr_sz == 0 {
+        write(2, "emit_amdgpu_qwen3_megakernel_blob_v2: empty .mlr file\n", 54)
+        file_close(mlr_fd)
+        return 1
+    }
+    // Allocate a fresh source buffer; do NOT use import_buf (which may be
+    // in use by the caller's main parse pipeline).
+    uint64 v2_src = alloc(mlr_sz + 1)
+    file_read(mlr_fd, v2_src, mlr_sz)
+    file_close(mlr_fd)
+    // Null-terminate
+    uint64 v2_nul_p = v2_src + mlr_sz
+    uint8 v2_nul = 0
+    unsafe { *(v2_nul_p as uint8) = v2_nul }
+
+    // Lex the source
+    uint64 v2_max_tok = 65536
+    uint64 v2_tokens = alloc(v2_max_tok * 16)
+    lexer_init(v2_src, mlr_sz, v2_tokens, v2_max_tok)
+    uint64 v2_tcount = lexer_run()
+
+    // Parse into a fresh AST arena (does not disturb the main AST if any)
+    ast_init(65536)
+    codegen_init(1048576, v2_src, v2_tokens)
+    parser_init(v2_tokens, v2_tcount)
+    uint64 v2_root = parse_module()
+
+    // ── Step 2: find the @kernel fn qwen3_layer_megakernel node ────────
+    uint64 fn_node = 0
+    uint32 wc = ast_child(v2_root)
+    while wc != 0 {
+        uint32 k = ast_kind(wc)
+        if k == 2 {
+            if ast_fn_is_kernel(wc) != 0 {
+                uint32 name_tok = ast_data1(wc)
+                if tok_matches(name_tok, "qwen3_layer_megakernel", 22) != 0 {
+                    fn_node = wc
+                    wc = 0   // break
+                } else {
+                    uint32 nxt = ast_next(wc)
+                    wc = nxt
+                }
+            } else {
+                uint32 nxt = ast_next(wc)
+                wc = nxt
+            }
+        } else {
+            uint32 nxt = ast_next(wc)
+            wc = nxt
+        }
+    }
+    if fn_node == 0 {
+        write(2, "emit_amdgpu_qwen3_megakernel_blob_v2: @kernel fn qwen3_layer_megakernel not found in .mlr\n", 90)
         return 1
     }
 
+    // ── Step 3: run the recognizer (THE Task-1 deliverable) ────────────
+    kt_reset()
+    uint64 rec_rc = recognize_megakernel_swiglu_dense_gqa(fn_node, v2_src, kname, klen)
+    if rec_rc != 0 {
+        write(2, "emit_amdgpu_qwen3_megakernel_blob_v2: recognizer shape mismatch\n", 64)
+        return 1
+    }
+
+    // ── Step 4: wrap into .co and write ────────────────────────────────
     uint64 size = emit_amdgpu_multi_code_object()
 
     uint64 fd = file_open(out_path, 1)
