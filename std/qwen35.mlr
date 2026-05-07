@@ -332,30 +332,223 @@ fn qwen35_gdn_forward_layer_stub(u64 x_out, u64 x_in, Qwen35LayerWeights w, u64 
     memcpy(x_out, x_in, hidden * 4)
 }
 
-// ─── Full-attn forward (STUB — Slice A) ──────────────────────────────
+// ─── Sigmoid (in-place) ──────────────────────────────────────────────
 //
-// TODO Slice B+: implement Q+gate fused projection, per-head QK-norm, MRoPE,
-// scaled-dot-product attention with KV cache, output gating via sigmoid(gate),
-// then o_proj. For now identity-pass.
-fn qwen35_fullattn_forward_layer_stub(u64 x_out, u64 x_in, Qwen35LayerWeights w,
-                                      u64 pos, u64 k_cache_layer, u64 v_cache_layer) {
-    u64 _w00 = w.slot00
-    u64 _w01 = w.slot01
-    u64 _p   = pos
-    u64 _kc  = k_cache_layer
-    u64 _vc  = v_cache_layer
+// y = 1 / (1 + exp(-x)). Used to gate the post-attention output by `gate`
+// (the second half of the fused Q+gate projection — Qwen3.5/Next specific).
+// Reuses `exp_f32_fast` from std/qwen3.mlr.
+fn qwen35_sigmoid_inplace_f32(u64 x_ptr, u64 n) {
+    u64 i = 0
+    f32 one = 1.0f
+    while i < n {
+        f32 v = 0.0f
+        unsafe { *((x_ptr + i * 4) as f32) -> v }
+        f32 e = exp_f32_fast(0.0f - v)
+        f32 y = one / (one + e)
+        unsafe { *((x_ptr + i * 4) as f32) = y }
+        i = i + 1
+    }
+}
+
+// ─── Full-attn forward (Slice B) ─────────────────────────────────────
+//
+// Qwen3.5/Next full-attention layer with fused Q+gate projection +
+// per-head QK-norm + MRoPE + GQA SDPA + output gating + wo + residual +
+// post_attn_norm + SwiGLU FFN + residual.
+//
+// Differences from base qwen3_forward_layer (why we cannot reuse it):
+//   * wq is DOUBLE-WIDTH (head_dim*n_head*2 = 4096 floats) — outputs Q AND
+//     gate fused. Per-head layout: [Q_h(256), gate_h(256), Q_h+1(256), ...].
+//   * After SDPA: attn *= sigmoid(gate) elementwise, BEFORE wo.
+//
+// Q_full memory layout per token (matches llama.cpp's ggml_view_3d args):
+//   stride between heads = head_dim * 2 floats (Q+gate per head)
+//   so Q for head h: Q_full[h * head_dim * 2 + 0 .. h * head_dim * 2 + head_dim]
+//      gate for head h: Q_full[h * head_dim * 2 + head_dim .. h * head_dim * 2 + head_dim*2]
+//
+// Slot mapping (FULL-ATTN, see Qwen35LayerWeights doc above):
+//   [0]  attn_norm           [1]  attn_q (Q+gate fused, [hidden, head_dim*n_head*2])
+//   [2]  attn_k              [3]  attn_v
+//   [4]  attn_q_norm         [5]  attn_k_norm
+//   [6]  attn_output         [7]  post_attention_norm
+//   [8]  ffn_gate            [9]  ffn_up               [10] ffn_down
+fn qwen35_fullattn_forward_layer(u64 x_out, u64 x_in, Qwen35LayerWeights w,
+                                 u64 pos, u64 k_cache_layer, u64 v_cache_layer,
+                                 u64 num_workers) {
     u64 hidden = QWEN3_HIDDEN
-    memcpy(x_out, x_in, hidden * 4)
+    u64 hd     = QWEN3_HEAD_DIM
+    u64 nh     = QWEN3_N_HEADS
+    u64 nkv    = QWEN3_N_KV_HEADS
+    u64 q_dim  = QWEN3_Q_DIM           // = nh  * hd
+    u64 kv_dim = QWEN3_KV_DIM          // = nkv * hd
+    u64 ff     = QWEN3_INTERMEDIATE
+    u64 qg_dim = q_dim * 2              // fused Q+gate output width
+
+    u64 input_norm_w = w.slot00
+    u64 wq           = w.slot01         // [hidden, qg_dim]
+    u64 wk           = w.slot02         // [hidden, kv_dim]
+    u64 wv           = w.slot03         // [hidden, kv_dim]
+    u64 q_norm_w     = w.slot04         // [hd]
+    u64 k_norm_w     = w.slot05         // [hd]
+    u64 wo           = w.slot06         // [q_dim, hidden]
+    u64 post_norm_w  = w.slot07
+    u64 wg           = w.slot08         // ffn_gate [hidden, ff]
+    u64 wu           = w.slot09         // ffn_up   [hidden, ff]
+    u64 wd           = w.slot10         // ffn_down [ff, hidden]
+
+    u64 kv_row_bytes = kv_dim * 4
+    u64 k_row = k_cache_layer + pos * kv_row_bytes
+    u64 v_row = v_cache_layer + pos * kv_row_bytes
+
+    // Save residual for post-attention add.
+    u64 resid = alloc(hidden * 4)
+    memcpy(resid, x_in, hidden * 4)
+
+    // 1. Pre-attention RMSNorm.
+    u64 x_norm = alloc(hidden * 4)
+    qwen3_main_rmsnorm(x_norm, x_in, input_norm_w, hidden)
+
+    // 2. Fused Q+gate projection: qg_full = wq @ x_norm  (shape [qg_dim]).
+    u64 qg_full  = alloc(qg_dim * 4)
+    qwen3_main_matmul(qg_full, x_norm, wq, 1, qg_dim, hidden, num_workers, 0)
+
+    // Split per head: Q into q_buf (q_dim), gate into gate_buf (q_dim).
+    u64 q_buf    = alloc(q_dim * 4)
+    u64 gate_buf = alloc(q_dim * 4)
+    u64 hh = 0
+    while hh < nh {
+        u64 src_base = qg_full + hh * (hd * 2) * 4
+        u64 q_dst    = q_buf    + hh * hd * 4
+        u64 gate_dst = gate_buf + hh * hd * 4
+        memcpy(q_dst,    src_base,           hd * 4)
+        memcpy(gate_dst, src_base + hd * 4,  hd * 4)
+        hh = hh + 1
+    }
+    dealloc(qg_full)
+
+    // 3. K, V projections — write straight into the cache row at `pos`.
+    qwen3_main_matmul(k_row, x_norm, wk, 1, kv_dim, hidden, num_workers, 0)
+    qwen3_main_matmul(v_row, x_norm, wv, 1, kv_dim, hidden, num_workers, 0)
+
+    // 4. Per-head Q-RMSNorm + per-kv-head K-RMSNorm (weights are F32 [hd]).
+    u64 h2 = 0
+    while h2 < nh {
+        u64 q_slice = q_buf + h2 * hd * 4
+        qwen3_rmsnorm_f32_weights(q_slice, q_slice, q_norm_w, hd)
+        h2 = h2 + 1
+    }
+    h2 = 0
+    while h2 < nkv {
+        u64 k_slice = k_row + h2 * hd * 4
+        qwen3_rmsnorm_f32_weights(k_slice, k_slice, k_norm_w, hd)
+        h2 = h2 + 1
+    }
+
+    // 5. MRoPE on Q and K (partial — first qwen3_imrope_rope_dim of head_dim).
+    //    Reuses the cos/sin cache populated by std/qwen3.mlr's helpers.
+    if qwen3_rope_cos_cache == 0 {
+        qwen3_rope_cos_cache = alloc((hd / 2) * 4)
+        qwen3_rope_sin_cache = alloc((hd / 2) * 4)
+    }
+    if qwen3_rope_cache_pos != pos {
+        f64 theta = int_to_f64(qwen3_rope_theta_int)
+        if qwen3_use_imrope != 0 {
+            qwen3_rope_compute_imrope_text(qwen3_rope_cos_cache, qwen3_rope_sin_cache, pos, qwen3_imrope_rope_dim, theta)
+        } else {
+            qwen3_rope_compute(qwen3_rope_cos_cache, qwen3_rope_sin_cache, pos, hd, theta)
+        }
+        qwen3_rope_cache_pos = pos
+    }
+    if qwen3_use_imrope != 0 {
+        qwen3_rope_apply_partial(q_buf, qwen3_rope_cos_cache, qwen3_rope_sin_cache, nh,  hd, qwen3_imrope_rope_dim)
+        qwen3_rope_apply_partial(k_row, qwen3_rope_cos_cache, qwen3_rope_sin_cache, nkv, hd, qwen3_imrope_rope_dim)
+    } else {
+        qwen3_rope_apply(q_buf, qwen3_rope_cos_cache, qwen3_rope_sin_cache, nh,  hd)
+        qwen3_rope_apply(k_row, qwen3_rope_cos_cache, qwen3_rope_sin_cache, nkv, hd)
+    }
+
+    // 6. Cached SDPA over positions 0..pos. head_dim=256 — qwen3_attn_cached
+    //    uses qwen3_dot_avx2 which requires n % 8 == 0 (256 satisfies).
+    u64 attn_out = alloc(q_dim * 4)
+    qwen3_attn_cached(attn_out, q_buf,
+                      k_cache_layer, v_cache_layer,
+                      pos + 1, nh, nkv, hd)
+
+    // 7. Output gating: attn_out *= sigmoid(gate_buf) elementwise.
+    qwen35_sigmoid_inplace_f32(gate_buf, q_dim)
+    u64 ig = 0
+    while ig < q_dim {
+        f32 a = 0.0f
+        f32 g = 0.0f
+        unsafe { *((attn_out + ig * 4) as f32) -> a }
+        unsafe { *((gate_buf + ig * 4) as f32) -> g }
+        unsafe { *((attn_out + ig * 4) as f32) = a * g }
+        ig = ig + 1
+    }
+
+    // 8. Output projection: o = wo @ gated_attn  (shape [hidden]).
+    u64 o_buf = alloc(hidden * 4)
+    qwen3_main_matmul(o_buf, attn_out, wo, 1, hidden, q_dim, num_workers, 0)
+
+    // 9. First residual: mid = resid + o_buf.
+    u64 mid = alloc(hidden * 4)
+    u64 ri = 0
+    while ri < hidden {
+        f32 a = 0.0f
+        f32 b = 0.0f
+        unsafe { *((resid + ri * 4) as f32) -> a }
+        unsafe { *((o_buf + ri * 4) as f32) -> b }
+        f32 y = a + b
+        unsafe { *((mid + ri * 4) as f32) = y }
+        ri = ri + 1
+    }
+
+    // 10. Post-attention RMSNorm + SwiGLU FFN + second residual.
+    u64 mid_norm = alloc(hidden * 4)
+    qwen3_main_rmsnorm(mid_norm, mid, post_norm_w, hidden)
+
+    u64 gate_ffn = alloc(ff * 4)
+    u64 up_ffn   = alloc(ff * 4)
+    qwen3_main_matmul(gate_ffn, mid_norm, wg, 1, ff, hidden, num_workers, 0)
+    qwen3_main_matmul(up_ffn,   mid_norm, wu, 1, ff, hidden, num_workers, 0)
+
+    u64 ff_buf = alloc(ff * 4)
+    qwen3_silu_mul(ff_buf, gate_ffn, up_ffn, ff)
+
+    u64 ff_out = alloc(hidden * 4)
+    qwen3_main_matmul(ff_out, ff_buf, wd, 1, hidden, ff, num_workers, 0)
+
+    u64 fi = 0
+    while fi < hidden {
+        f32 a = 0.0f
+        f32 b = 0.0f
+        unsafe { *((mid + fi * 4) as f32) -> a }
+        unsafe { *((ff_out + fi * 4) as f32) -> b }
+        f32 y = a + b
+        unsafe { *((x_out + fi * 4) as f32) = y }
+        fi = fi + 1
+    }
+
+    dealloc(resid); dealloc(x_norm)
+    dealloc(q_buf); dealloc(gate_buf)
+    dealloc(attn_out); dealloc(o_buf)
+    dealloc(mid); dealloc(mid_norm)
+    dealloc(gate_ffn); dealloc(up_ffn); dealloc(ff_buf); dealloc(ff_out)
 }
 
 // Single dispatch entry — driver calls this for every layer regardless of
 // kind; it consults `qwen35_is_gdn_layer` and routes.
+//
+// `num_workers` is needed by the full-attn matmuls; the GDN path ignores it
+// for now (still stubbed; will be wired up in Slice C+D).
 fn qwen35_forward_layer(u64 x_out, u64 x_in, Qwen35LayerWeights w, u64 layer_idx,
-                        u64 pos, u64 k_cache_layer, u64 v_cache_layer, u64 gdn_state) {
+                        u64 pos, u64 k_cache_layer, u64 v_cache_layer,
+                        u64 gdn_state, u64 num_workers) {
     u64 is_gdn = qwen35_is_gdn_layer(layer_idx)
     if is_gdn != 0 {
         qwen35_gdn_forward_layer_stub(x_out, x_in, w, pos, gdn_state)
     } else {
-        qwen35_fullattn_forward_layer_stub(x_out, x_in, w, pos, k_cache_layer, v_cache_layer)
+        qwen35_fullattn_forward_layer(x_out, x_in, w, pos,
+                                      k_cache_layer, v_cache_layer, num_workers)
     }
 }
