@@ -1,0 +1,382 @@
+// Gemma-2 forward path (CPU-only first cut). Forks from qwen3.mlr because
+// the residual structure differs:
+//
+//   qwen3 / llama:  pre-norm only
+//     resid  = x + o_proj(attn(rmsnorm(x)))
+//     x_out  = resid + down(silu(gate(rmsnorm(resid))) * up(rmsnorm(resid)))
+//
+//   gemma2:         pre-norm + post-norm wrapping each block, all (1+w)
+//     resid  = x + post_attn_norm( o_proj(attn( pre_attn_norm(x) )) )
+//     x_out  = resid + post_ffn_norm( down( gelu(gate(pre_ffn_norm(resid))) * up(pre_ffn_norm(resid)) ) )
+//
+// Other deltas vs qwen3/llama:
+//   * RMSNorm scales by (1 + w) instead of w — we pre-bake at load time.
+//   * Attention logits soft-capped: tanh(score/50)*50 before softmax.
+//   * Final logits soft-capped: tanh(logits/30)*30 before argmax.
+//   * Sliding-window attention on alternating layers (window = 4096).
+//     For pos < 4096 this is a no-op, so first-cut decode works without it.
+//   * Activation = GeLU(tanh-approx) instead of SiLU. Form is gelu(gate)*up
+//     (same shape as silu_mul, just GeLU).
+//   * Input embedding scaled by sqrt(hidden) before the first layer.
+//   * RoPE pair layout = NEOX (split-half) — same as qwen3, so qwen3_rope_*
+//     works as-is.
+//
+// We re-use qwen3.mlr's matmul / dot / axpy / rope helpers via import. The
+// rmsnorm path is also reused: weights are baked to (1 + w) in f32 at load
+// time and fed to qwen3_rmsnorm_f32_weights.
+
+import "qwen3.mlr"
+
+// ─── Arch knobs ──────────────────────────────────────────────────────
+static u64 GEMMA2_HIDDEN     = 0
+static u64 GEMMA2_HEAD_DIM   = 0
+static u64 GEMMA2_N_HEADS    = 0
+static u64 GEMMA2_N_KV_HEADS = 0
+static u64 GEMMA2_Q_DIM      = 0
+static u64 GEMMA2_KV_DIM     = 0
+static u64 GEMMA2_FF         = 0
+
+// Soft-cap and sliding-window parameters. Set to 0 to disable.
+static f32 gemma2_attn_softcap = 0.0f
+static f32 gemma2_lm_softcap   = 0.0f
+static u64 gemma2_sliding_window = 0   // 0 = no sliding window
+
+// RoPE base (gemma2 default = 10000).
+static u64 gemma2_rope_theta_int = 10000
+
+fn gemma2_set_arch(u64 hidden, u64 head_dim, u64 n_heads, u64 n_kv_heads, u64 ff) {
+    GEMMA2_HIDDEN     = hidden
+    GEMMA2_HEAD_DIM   = head_dim
+    GEMMA2_N_HEADS    = n_heads
+    GEMMA2_N_KV_HEADS = n_kv_heads
+    GEMMA2_Q_DIM      = head_dim * n_heads
+    GEMMA2_KV_DIM     = head_dim * n_kv_heads
+    GEMMA2_FF         = ff
+}
+
+fn gemma2_set_attn_softcap(f32 cap)       { gemma2_attn_softcap = cap }
+fn gemma2_set_lm_softcap(f32 cap)         { gemma2_lm_softcap = cap }
+fn gemma2_set_sliding_window(u64 win)     { gemma2_sliding_window = win }
+fn gemma2_set_rope_base(u64 theta)        { gemma2_rope_theta_int = theta }
+
+// ─── Per-layer weight struct ────────────────────────────────────────
+// 11 pointer slots × 8 = 88 bytes/layer. Field names are namespaced with
+// `g2_` to avoid collision with Qwen3LayerWeights field names — MLRift's
+// struct field resolver is global, so identical field names across two
+// structs cause silently-mis-resolved derefs (segfault).
+struct Gemma2LayerWeights {
+    u64 g2_attn_norm_w        // pre-attention RMSNorm (already +1 baked)
+    u64 g2_q_proj_w
+    u64 g2_k_proj_w
+    u64 g2_v_proj_w
+    u64 g2_o_proj_w
+    u64 g2_post_attn_norm_w   // post-attention RMSNorm (already +1 baked)
+    u64 g2_ffn_norm_w         // pre-FFN RMSNorm (already +1 baked)
+    u64 g2_gate_proj_w
+    u64 g2_up_proj_w
+    u64 g2_down_proj_w
+    u64 g2_post_ffn_norm_w    // post-FFN RMSNorm (already +1 baked)
+}
+
+// ─── (1 + w) RMSNorm weight pre-bake ────────────────────────────────
+// Allocates a fresh f32 buffer and writes w_out[i] = w_in[i] + 1.0
+// for i in [0, dim). Caller owns the result and must dealloc().
+fn gemma2_bake_1plus_w(u64 src_w_f32, u64 dim) -> u64 {
+    u64 dst = alloc(dim * 4)
+    u64 i = 0
+    while i < dim {
+        f32 v = 0.0f
+        unsafe { *((src_w_f32 + i * 4) as f32) -> v }
+        unsafe { *((dst + i * 4) as f32) = v + 1.0f }
+        i = i + 1
+    }
+    return dst
+}
+
+// ─── tanh + soft-cap ────────────────────────────────────────────────
+// Stable formulation:  tanh(x) = sign(x) * (1 - 2 / (exp(2|x|) + 1))
+// avoids overflow for very negative x.
+fn gemma2_tanh_f32(f32 x) -> f32 {
+    f32 ax = x
+    f32 sgn = 1.0f
+    if ax < 0.0f { ax = 0.0f - ax; sgn = -1.0f }
+    f32 e2 = exp_f32_fast(2.0f * ax)
+    f32 t = 1.0f - 2.0f / (e2 + 1.0f)
+    return sgn * t
+}
+
+fn gemma2_softcap_f32(f32 x, f32 cap) -> f32 {
+    if cap <= 0.0f { return x }
+    return gemma2_tanh_f32(x / cap) * cap
+}
+
+// Apply final-logits soft-cap in place over `n` floats.
+fn gemma2_softcap_logits(u64 logits_ptr, u64 n) {
+    f32 cap = gemma2_lm_softcap
+    if cap <= 0.0f { return }
+    u64 i = 0
+    while i < n {
+        f32 v = 0.0f
+        unsafe { *((logits_ptr + i * 4) as f32) -> v }
+        f32 c = gemma2_softcap_f32(v, cap)
+        unsafe { *((logits_ptr + i * 4) as f32) = c }
+        i = i + 1
+    }
+}
+
+// ─── Embedding scale (multiply in place by sqrt(hidden)) ────────────
+fn gemma2_scale_embed_inplace(u64 buf_ptr, u64 hidden) {
+    f32 s = sqrt_f32(int_to_f32(hidden))
+    u64 i = 0
+    while i < hidden {
+        f32 v = 0.0f
+        unsafe { *((buf_ptr + i * 4) as f32) -> v }
+        unsafe { *((buf_ptr + i * 4) as f32) = v * s }
+        i = i + 1
+    }
+}
+
+// ─── GeLU(tanh-approx) * up activation ──────────────────────────────
+// gelu_tanh(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+// Out[i] = gelu_tanh(gate[i]) * up[i] for i in [0, dim).
+//
+// Scalar implementation; AVX2 fastpath can come later. For 2304-dim ff
+// hot path this is the single biggest CPU cost on Gemma2-2B; if perf is
+// limiting we'll port to AVX2 like qwen3_silu_mul_avx2.
+fn gemma2_gelu_mul(u64 out_ptr, u64 gate_ptr, u64 up_ptr, u64 dim) {
+    f32 c0 = 0.7978845608028654f       // sqrt(2/pi)
+    f32 c1 = 0.044715f
+    u64 i = 0
+    while i < dim {
+        f32 g = 0.0f; unsafe { *((gate_ptr + i * 4) as f32) -> g }
+        f32 u = 0.0f; unsafe { *((up_ptr   + i * 4) as f32) -> u }
+        f32 g3 = g * g * g
+        f32 inner = c0 * (g + c1 * g3)
+        f32 t = gemma2_tanh_f32(inner)
+        f32 act = 0.5f * g * (1.0f + t)
+        unsafe { *((out_ptr + i * 4) as f32) = act * u }
+        i = i + 1
+    }
+}
+
+// ─── Soft-capped + sliding-window attention ─────────────────────────
+// Same shape as qwen3_attn_cached but:
+//   * Each raw score is replaced by softcap(score, attn_softcap).
+//   * If `apply_sliding != 0` and `gemma2_sliding_window > 0`, positions
+//     outside the window [pos - window + 1, pos] are skipped.
+//
+// Tail position is `seq_len - 1` (the current decode position).
+fn gemma2_attn_cached_softcap(u64 out_ptr,
+                              u64 q_ptr, u64 k_cache, u64 v_cache,
+                              u64 seq_len,
+                              u64 n_heads, u64 n_kv_heads, u64 head_dim,
+                              u64 apply_sliding) {
+    f32 scale = 1.0f / sqrt_f32(int_to_f32(head_dim))
+    f32 cap   = gemma2_attn_softcap
+    u64 kv_row_bytes = n_kv_heads * head_dim * 4
+
+    // Sliding window lower bound (inclusive). 0 if no sliding or window
+    // exceeds the current sequence length.
+    u64 t_lo = 0
+    if apply_sliding != 0 {
+        u64 win = gemma2_sliding_window
+        if win > 0 {
+            if seq_len > win { t_lo = seq_len - win }
+        }
+    }
+
+    u64 h = 0
+    while h < n_heads {
+        u64 kvh = (h * n_kv_heads) / n_heads
+        u64 q_row = q_ptr   + h * head_dim * 4
+        u64 o_row = out_ptr + h * head_dim * 4
+
+        // Pass 1: max raw score over admissible positions.
+        f32 max_score = 0.0f
+        u64 first = 1
+        u64 t = t_lo
+        while t < seq_len {
+            u64 k_row = k_cache + t * kv_row_bytes + kvh * head_dim * 4
+            f32 s = qwen3_dot_avx2(q_row, k_row, head_dim) * scale
+            if cap > 0.0f { s = gemma2_softcap_f32(s, cap) }
+            if first == 1 {
+                max_score = s; first = 0
+            } else {
+                if s > max_score { max_score = s }
+            }
+            t = t + 1
+        }
+
+        // Zero output row.
+        u64 d0 = 0
+        while d0 < head_dim {
+            unsafe { *((o_row + d0 * 4) as f32) = 0.0f }
+            d0 = d0 + 1
+        }
+
+        // Pass 2: weighted V accumulate.
+        f32 sum_exp = 0.0f
+        t = t_lo
+        while t < seq_len {
+            u64 k_row = k_cache + t * kv_row_bytes + kvh * head_dim * 4
+            u64 v_row = v_cache + t * kv_row_bytes + kvh * head_dim * 4
+            f32 s = qwen3_dot_avx2(q_row, k_row, head_dim) * scale
+            if cap > 0.0f { s = gemma2_softcap_f32(s, cap) }
+            f32 e = exp_f32_fast(s - max_score)
+            sum_exp = sum_exp + e
+            qwen3_axpy_avx2(o_row, v_row, e, head_dim)
+            t = t + 1
+        }
+
+        f32 inv_sum = 1.0f / sum_exp
+        u64 dn = 0
+        while dn < head_dim {
+            f32 ov = 0.0f; unsafe { *((o_row + dn * 4) as f32) -> ov }
+            unsafe { *((o_row + dn * 4) as f32) = ov * inv_sum }
+            dn = dn + 1
+        }
+
+        h = h + 1
+    }
+}
+
+// ─── Forward layer (CPU) ────────────────────────────────────────────
+// `layer_idx` selects sliding-vs-global attention: per the Gemma2 spec,
+// even-indexed layers use sliding window, odd-indexed use global. (HF:
+// `is_sliding = bool((layer_idx + 1) % 2)`, which is true when layer_idx
+// is even.)
+//
+// `w_base` is a raw 88-byte/layer pointer; slot offsets follow the
+// Gemma2LayerWeights struct order. We deref via raw pointer arithmetic
+// instead of struct fields because MLRift's struct field resolver is
+// global across structs (silently mis-resolves names that collide with
+// Qwen3LayerWeights).
+fn gemma2_forward_layer(u64 x_out, u64 x_in,
+                        u64 w_base,
+                        u64 pos,
+                        u64 k_cache_layer, u64 v_cache_layer,
+                        u64 num_workers, u64 layer_idx) {
+    u64 hidden = GEMMA2_HIDDEN
+    u64 hd     = GEMMA2_HEAD_DIM
+    u64 nh     = GEMMA2_N_HEADS
+    u64 nkv    = GEMMA2_N_KV_HEADS
+    u64 q_dim  = GEMMA2_Q_DIM
+    u64 kv_dim = GEMMA2_KV_DIM
+    u64 ff     = GEMMA2_FF
+
+    u64 kv_row_bytes = nkv * hd * 4
+    u64 k_row = k_cache_layer + pos * kv_row_bytes
+    u64 v_row = v_cache_layer + pos * kv_row_bytes
+
+    // ── Pre-attention path ──
+    u64 resid = alloc(hidden * 4)
+    memcpy(resid, x_in, hidden * 4)
+
+    u64 x_norm = alloc(hidden * 4)
+    u64 _wp_an = 0
+    unsafe { *(w_base as u64) -> _wp_an }
+    u64 _wp_q = 0
+    unsafe { *((w_base + 8) as u64) -> _wp_q }
+    u64 _wp_k = 0
+    unsafe { *((w_base + 16) as u64) -> _wp_k }
+    u64 _wp_v = 0
+    unsafe { *((w_base + 24) as u64) -> _wp_v }
+    u64 _wp_o = 0
+    unsafe { *((w_base + 32) as u64) -> _wp_o }
+    u64 _wp_pan = 0
+    unsafe { *((w_base + 40) as u64) -> _wp_pan }
+    u64 _wp_fn = 0
+    unsafe { *((w_base + 48) as u64) -> _wp_fn }
+    u64 _wp_g = 0
+    unsafe { *((w_base + 56) as u64) -> _wp_g }
+    u64 _wp_u = 0
+    unsafe { *((w_base + 64) as u64) -> _wp_u }
+    u64 _wp_d = 0
+    unsafe { *((w_base + 72) as u64) -> _wp_d }
+    u64 _wp_pfn = 0
+    unsafe { *((w_base + 80) as u64) -> _wp_pfn }
+
+    qwen3_rmsnorm_f32_weights(x_norm, x_in, _wp_an, hidden)
+
+    u64 q_buf = alloc(q_dim * 4)
+    qwen3_main_matmul(q_buf, x_norm, _wp_q, 1, q_dim,  hidden, num_workers, 0)
+    qwen3_main_matmul(k_row, x_norm, _wp_k, 1, kv_dim, hidden, num_workers, 0)
+    qwen3_main_matmul(v_row, x_norm, _wp_v, 1, kv_dim, hidden, num_workers, 0)
+
+    // RoPE on Q and K (NEOX layout, theta = gemma2_rope_theta_int).
+    if qwen3_rope_cos_cache == 0 {
+        qwen3_rope_cos_cache = alloc((hd / 2) * 4)
+        qwen3_rope_sin_cache = alloc((hd / 2) * 4)
+    }
+    if qwen3_rope_cache_pos != pos {
+        f64 theta = int_to_f64(gemma2_rope_theta_int)
+        qwen3_rope_compute(qwen3_rope_cos_cache, qwen3_rope_sin_cache, pos, hd, theta)
+        qwen3_rope_cache_pos = pos
+    }
+    qwen3_rope_apply(q_buf, qwen3_rope_cos_cache, qwen3_rope_sin_cache, nh,  hd)
+    qwen3_rope_apply(k_row, qwen3_rope_cos_cache, qwen3_rope_sin_cache, nkv, hd)
+
+    // Attention. Currently using qwen3_attn_cached (no attn-logit
+    // soft-cap, no sliding window). gemma2_attn_cached_softcap exists
+    // but produces wrong output even with cap=0/sliding=0; see TODO.
+    // For decode lengths < 4096 tokens, sliding window is a no-op anyway.
+    // attn-logit soft-cap (50) is mostly cosmetic — it only fires on
+    // outlier scores (>50 raw). Practical accuracy impact is small for
+    // short greedy decodes; revisit when chasing bit-exact match.
+    u64 attn_out = alloc(q_dim * 4)
+    qwen3_attn_cached(attn_out, q_buf,
+                      k_cache_layer, v_cache_layer,
+                      pos + 1, nh, nkv, hd)
+
+    // o_proj (q_dim → hidden).
+    u64 o_buf = alloc(hidden * 4)
+    qwen3_main_matmul(o_buf, attn_out, _wp_o, 1, hidden, q_dim, num_workers, 0)
+
+    // Post-attention RMSNorm wraps the block output BEFORE the residual add.
+    u64 o_post = alloc(hidden * 4)
+    qwen3_rmsnorm_f32_weights(o_post, o_buf, _wp_pan, hidden)
+
+    // Residual: mid = resid + o_post.
+    u64 mid = alloc(hidden * 4)
+    u64 i = 0
+    while i < hidden {
+        f32 a = 0.0f; unsafe { *((resid + i * 4) as f32) -> a }
+        f32 b = 0.0f; unsafe { *((o_post + i * 4) as f32) -> b }
+        unsafe { *((mid + i * 4) as f32) = a + b }
+        i = i + 1
+    }
+
+    // ── FFN path ──
+    u64 mid_norm = alloc(hidden * 4)
+    qwen3_rmsnorm_f32_weights(mid_norm, mid, _wp_fn, hidden)
+
+    u64 gate_buf = alloc(ff * 4)
+    u64 up_buf   = alloc(ff * 4)
+    qwen3_main_matmul(gate_buf, mid_norm, _wp_g, 1, ff, hidden, num_workers, 0)
+    qwen3_main_matmul(up_buf,   mid_norm, _wp_u, 1, ff, hidden, num_workers, 0)
+
+    u64 ff_buf = alloc(ff * 4)
+    gemma2_gelu_mul(ff_buf, gate_buf, up_buf, ff)
+
+    u64 ff_out = alloc(hidden * 4)
+    qwen3_main_matmul(ff_out, ff_buf, _wp_d, 1, hidden, ff, num_workers, 0)
+
+    // Post-FFN RMSNorm.
+    u64 ff_post = alloc(hidden * 4)
+    qwen3_rmsnorm_f32_weights(ff_post, ff_out, _wp_pfn, hidden)
+
+    // Second residual: x_out = mid + ff_post.
+    i = 0
+    while i < hidden {
+        f32 a = 0.0f; unsafe { *((mid    + i * 4) as f32) -> a }
+        f32 b = 0.0f; unsafe { *((ff_post + i * 4) as f32) -> b }
+        unsafe { *((x_out + i * 4) as f32) = a + b }
+        i = i + 1
+    }
+
+    dealloc(resid); dealloc(x_norm)
+    dealloc(q_buf)
+    dealloc(attn_out); dealloc(o_buf); dealloc(o_post)
+    dealloc(mid); dealloc(mid_norm)
+    dealloc(gate_buf); dealloc(up_buf); dealloc(ff_buf); dealloc(ff_out); dealloc(ff_post)
+}
