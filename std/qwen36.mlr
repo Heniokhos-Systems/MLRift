@@ -1,0 +1,63 @@
+// Qwen3-VL ("Qwen3.6") text-only forward path. The LLM half is bit-for-
+// bit a Qwen3 dense block — separate Q/K/V projections, per-head Q/K
+// RMSNorm, SwiGLU FFN, tied lm_head, NO attention or final softcap —
+// with three deltas:
+//
+//   1. Interleaved-MRoPE (IMROPE) instead of standard NEOX RoPE.
+//      Sections array (4 ints) splits rope_dim/2 frequency pairs across
+//      t/h/w/extra axes. For text-only inputs the h/w/extra axis
+//      positions are 0, so only the t-section pairs (sector%3==0 within
+//      bound) actually rotate by token position; everything else gets
+//      cos=1, sin=0 — i.e., identity on those dims.
+//
+//   2. Partial RoPE: head_dim (128) > rope_dim (64), so only the first
+//      64 channels of each head get rotated; channels [64..128] pass
+//      through unmodified.
+//
+//   3. DeepStack vision-feature add at the first n_deepstack_layers
+//      layers. For text-only inference (no ViT, no image tokens) the
+//      DeepStack source slice is zeros, so we simply skip it — same
+//      end state as llama.cpp's `cur += zero_view`.
+//
+// Per llama.cpp's `src/models/qwen3vl.cpp`, sizes are 1.7B/4B/8B/32B
+// dense (28/36/36/64 layers). The 4B Q8_0 dump from the Qwen team's
+// HF repo carries:
+//   embedding_length      = 2560
+//   block_count           = 36
+//   feed_forward_length   = 9728
+//   attention.head_count  = 32   head_count_kv = 8   head_dim = 128
+//   rope.freq_base        = 5e6
+//   rms_eps               = 1e-6
+//   rope.dimension_sections = [24, 20, 20, 0]   (sum = 64 = rope_dim/2)
+//   n_deepstack_layers    = 3
+//
+// Ollama's `qwen3-vl:*-q8_0` blobs (and llama.cpp HEAD which is now
+// our oracle) require an Interleaved-MRoPE-aware loader; the older
+// blobs Ollama distributes for `qwen3.6:*` are actually `qwen35` arch
+// (Qwen3.5-Next hybrid SSM) — a separate, larger port. See the
+// "Multi-arch roadmap" section of the project memory.
+
+import "qwen3.mlr"
+
+// Reusable layer struct = Qwen3LayerWeights (same field set: input_norm,
+// q/k/v_proj, q_norm/k_norm, o_proj, post_norm, gate/up/down_proj). No
+// new fields; Qwen3-VL has no per-layer bias and no extra norms.
+//
+// One-shot configurator: dimensions + IMROPE knobs in a single call.
+//
+// `rope_dim` is the rope width passed to ggml_rope_multi as `n_dims`.
+// For Qwen3-VL this is the FULL head_dim (128) — the gguf has no
+// `rope.dimension_count` key, so llama.cpp defaults n_rot to head_dim
+// and rotates every channel. (Sect_dims = 64 = head_dim/2 just sets the
+// classifier wraparound modulus, not a rotation cap.) `sect_*` come
+// straight from the GGUF `rope.dimension_sections` array.
+fn qwen36_set_arch(u64 hidden, u64 head_dim, u64 n_heads, u64 n_kv_heads,
+                   u64 ff, u64 rope_dim, u64 rope_base,
+                   u64 sect_t, u64 sect_h, u64 sect_w, u64 sect_extra) {
+    qwen3_set_arch(hidden, head_dim, n_heads, n_kv_heads, ff)
+    qwen3_set_qknorm(1)             // per-head Q/K RMSNorm (Qwen3-style)
+    qwen3_set_rope_base(rope_base)
+    qwen3_set_use_imrope(1)
+    qwen3_set_imrope_rope_dim(rope_dim)
+    qwen3_set_imrope_sections(sect_t, sect_h, sect_w, sect_extra)
+}

@@ -325,6 +325,35 @@ fn qwen3_set_rmsnorm_eps_bits(u64 bits) { qwen3_rmsnorm_eps_override_bits = bits
 static u64 qwen3_rope_pair_layout = 0
 fn qwen3_set_rope_pair_layout(u64 mode) { qwen3_rope_pair_layout = mode }
 
+// Interleaved-MRoPE knobs (Qwen3-VL / Qwen3.5 family). When use_imrope=1
+// the rope step inside qwen3_forward_layer:
+//   * rotates the first imrope_rope_dim of head_dim. For Qwen3-VL the
+//     gguf has no `rope.dimension_count` so llama.cpp defaults to head_dim
+//     (128) — i.e. NO partial-RoPE truncation; the full head rotates.
+//   * for each pair index i in 0..imrope_rope_dim/2, classifies the
+//     pair into a section by sector%3 (0=t, 1=h, 2=w, else=extra) and
+//     bounds (sector < 3 * sections[k]). For TEXT-ONLY inputs llama.cpp's
+//     llm_graph_input_pos::set_input copies the 1D token position into
+//     the t/h/w slots and zeros only the 4th — so all of t/h/w produce
+//     the same angle as standard RoPE; only the "extra" sectors (those
+//     classified outside 3*sect[t/h/w]) become identity (cos=1, sin=0).
+// Sections sum to imrope_rope_dim/2 (sect_dims = sum is the wraparound
+// modulus). The compute helper assumes text-only (image positions = 0).
+static u64 qwen3_use_imrope        = 0
+static u64 qwen3_imrope_rope_dim   = 0
+static u64 qwen3_imrope_sect_t     = 0
+static u64 qwen3_imrope_sect_h     = 0
+static u64 qwen3_imrope_sect_w     = 0
+static u64 qwen3_imrope_sect_extra = 0
+fn qwen3_set_use_imrope(u64 on)             { qwen3_use_imrope = on }
+fn qwen3_set_imrope_rope_dim(u64 d)         { qwen3_imrope_rope_dim = d }
+fn qwen3_set_imrope_sections(u64 t, u64 h, u64 w, u64 e) {
+    qwen3_imrope_sect_t     = t
+    qwen3_imrope_sect_h     = h
+    qwen3_imrope_sect_w     = w
+    qwen3_imrope_sect_extra = e
+}
+
 // Dispatch helper used by qwen3_forward_layer everywhere it used to call
 // matmul_bf16_weights_f32 directly. Q8_0 path ignores `use_kahan` (no
 // Kahan variant yet) — residual-stream drift at 14B hasn't been tuned.
@@ -482,6 +511,101 @@ fn qwen3_rope_apply(u64 x_ptr, u64 cos_ptr, u64 sin_ptr, u64 n_heads, u64 head_d
                 unsafe { *((row + (i0 + 1) * 4) as f32) = y2 }
                 k = k + 1
             }
+        }
+        h = h + 1
+    }
+}
+
+// Interleaved-MRoPE cos/sin compute, text-only path. Walks pair indices
+// i in 0..rope_dim/2 and classifies each by `sector = i % sect_dims`
+// into a t/h/w/extra section. For text-only inputs llama.cpp's
+// llm_graph_input_pos::set_input copies the 1D token position into the
+// t/h/w slots and zeros only the "extra" (4th) slot — i.e. for text:
+//   p_t = p_h = p_w = pos,   p_e = 0.
+// So every pair classified into t/h/w gets the SAME angle as standard
+// RoPE: angle = pos * theta_scale^pair_idx. Only pairs that fall into
+// the "extra" sector (sector outside 3*sect[t/h/w] AND not matching the
+// preceding mod3 rules) become identity (cos=1, sin=0).
+//
+// Reference: ggml/src/ggml-cpu/ops.cpp::ggml_mrope_cache_init (the
+// `is_imrope` branch). We mirror its sector classification exactly.
+fn qwen3_rope_compute_imrope_text(u64 cos_out, u64 sin_out, u64 position, u64 rope_dim, f64 theta_base) {
+    u64 half = rope_dim / 2
+    if position == 0 {
+        f32 one_f  = 1.0f
+        f32 zero_f = 0.0f
+        u64 i = 0
+        while i < half {
+            unsafe { *((cos_out + i * 4) as f32) = one_f }
+            unsafe { *((sin_out + i * 4) as f32) = zero_f }
+            i = i + 1
+        }
+        return
+    }
+    u64 sect_dims = qwen3_imrope_sect_t + qwen3_imrope_sect_h + qwen3_imrope_sect_w + qwen3_imrope_sect_extra
+    u64 t_max = 3 * qwen3_imrope_sect_t
+    u64 h_max = 3 * qwen3_imrope_sect_h
+    u64 w_max = 3 * qwen3_imrope_sect_w
+    u64 i = 0
+    while i < half {
+        u64 sector = i
+        if sect_dims != 0 { sector = i % sect_dims }
+        u64 mod3 = sector % 3
+        // Classify pair: which of (t, h, w, extra) does it belong to?
+        // For text-only, t/h/w all use `position`; extra uses 0 → identity.
+        u64 use_pos = 0
+        if mod3 == 0 {
+            if sector < t_max { use_pos = 1 }
+        } else {
+            if mod3 == 1 {
+                if sector < h_max { use_pos = 1 }
+            } else {
+                if sector < w_max { use_pos = 1 }
+            }
+        }
+        f32 c = 1.0f
+        f32 s = 0.0f
+        if use_pos != 0 {
+            f64 exponent = int_to_f64(2 * i) / int_to_f64(rope_dim)
+            f64 denom    = pow_f64(theta_base, exponent)
+            f64 inv_freq = int_to_f64(1) / denom
+            f64 angle    = int_to_f64(position) * inv_freq
+            c = f64_to_f32(cos_f64(angle))
+            s = f64_to_f32(sin_f64(angle))
+        }
+        unsafe { *((cos_out + i * 4) as f32) = c }
+        unsafe { *((sin_out + i * 4) as f32) = s }
+        i = i + 1
+    }
+}
+
+// Apply NEOX-split RoPE to the first `rope_dim` of each head's `head_dim`
+// channels. The remaining (head_dim - rope_dim) dims are left untouched
+// (partial-RoPE — Qwen3-VL rotates 64 of 128). Pair structure mirrors
+// llama.cpp's IMROPE kernel: (row[i], row[i + rope_dim/2]) for
+// i in 0..rope_dim/2. NORM-pair-layout variants aren't supported here;
+// IMROPE callers always use NEOX split-half.
+fn qwen3_rope_apply_partial(u64 x_ptr, u64 cos_ptr, u64 sin_ptr,
+                            u64 n_heads, u64 head_dim, u64 rope_dim) {
+    u64 half = rope_dim / 2
+    u64 h = 0
+    while h < n_heads {
+        u64 row = x_ptr + h * head_dim * 4
+        u64 i = 0
+        while i < half {
+            f32 x1 = 0.0f
+            f32 x2 = 0.0f
+            unsafe { *((row + i * 4) as f32) -> x1 }
+            unsafe { *((row + (i + half) * 4) as f32) -> x2 }
+            f32 c = 0.0f
+            f32 s = 0.0f
+            unsafe { *((cos_ptr + i * 4) as f32) -> c }
+            unsafe { *((sin_ptr + i * 4) as f32) -> s }
+            f32 y1 = x1 * c - x2 * s
+            f32 y2 = x1 * s + x2 * c
+            unsafe { *((row + i * 4) as f32) = y1 }
+            unsafe { *((row + (i + half) * 4) as f32) = y2 }
+            i = i + 1
         }
         h = h + 1
     }
@@ -1092,11 +1216,20 @@ fn qwen3_forward_layer(u64 x_out, u64 x_in,
     }
     if qwen3_rope_cache_pos != pos {
         f64 theta = int_to_f64(qwen3_rope_theta_int)
-        qwen3_rope_compute(qwen3_rope_cos_cache, qwen3_rope_sin_cache, pos, hd, theta)
+        if qwen3_use_imrope != 0 {
+            qwen3_rope_compute_imrope_text(qwen3_rope_cos_cache, qwen3_rope_sin_cache, pos, qwen3_imrope_rope_dim, theta)
+        } else {
+            qwen3_rope_compute(qwen3_rope_cos_cache, qwen3_rope_sin_cache, pos, hd, theta)
+        }
         qwen3_rope_cache_pos = pos
     }
-    qwen3_rope_apply(q_buf, qwen3_rope_cos_cache, qwen3_rope_sin_cache, nh,  hd)
-    qwen3_rope_apply(k_row, qwen3_rope_cos_cache, qwen3_rope_sin_cache, nkv, hd)
+    if qwen3_use_imrope != 0 {
+        qwen3_rope_apply_partial(q_buf, qwen3_rope_cos_cache, qwen3_rope_sin_cache, nh,  hd, qwen3_imrope_rope_dim)
+        qwen3_rope_apply_partial(k_row, qwen3_rope_cos_cache, qwen3_rope_sin_cache, nkv, hd, qwen3_imrope_rope_dim)
+    } else {
+        qwen3_rope_apply(q_buf, qwen3_rope_cos_cache, qwen3_rope_sin_cache, nh,  hd)
+        qwen3_rope_apply(k_row, qwen3_rope_cos_cache, qwen3_rope_sin_cache, nkv, hd)
+    }
     qwen3_t_qknorm_rope = qwen3_t_qknorm_rope + time_elapsed(p_t2)
     // qwen3_dump5("q_rope", q_buf)
     // qwen3_dump5("k_rope_cur", k_row)
