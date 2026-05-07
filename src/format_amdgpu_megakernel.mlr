@@ -11,6 +11,22 @@
 //
 // Spec: docs/superpowers/specs/2026-05-07-megakernel-ast-walker-lift-design.md
 
+// ── Named constants ───────────────────────────────────────────────────────
+// MEGA_KERNARG_COUNT: number of kernel arguments in qwen3_layer_megakernel.
+//   24 = (in_residual, out_residual, qkv_w, o_w, gate_up_w, down_w,
+//         in_norm_g, post_norm_g, q_norm_g, k_norm_g, rope_cos, rope_sin,
+//         kc_layer, vc_layer, pos, barrier_counter, gu_scratch,
+//         b_x_norm_g, b_qkv_g, b_attn_q_g, b_mid_g, b_mid_norm_g,
+//         b_attn_out_g, max_phase)
+static uint64 MEGA_KERNARG_COUNT = 24
+
+// MEGA_WG_PERSIST: number of persistent workgroups in the v2 kernel.
+//   Matches the HIP source #define WG_PERSIST 512.
+static uint64 MEGA_WG_PERSIST = 512
+
+// AST_KIND_BLOCK: ast_kind() value for a Block node (used in recognizer).
+static uint64 AST_KIND_BLOCK = 15
+
 // ── ISA encoding constants ────────────────────────────────────────────────
 // SGPR layout for the stub kernel:
 //   s[0:1]  = kernarg ptr pair (COv5 implicit)
@@ -24,8 +40,8 @@
 //   v1  = scratch (vaddr=0 for global ops)
 //   v2  = barrier data (atomic addend or spin poll result)
 //
-// WG_PERSIST = 256 workgroups in the v2 stub kernel.
-// Each barrier increments a global counter; spins until (phase+1)*256.
+// MEGA_WG_PERSIST workgroups in the v2 kernel (=512, matches HIP source).
+// Each barrier increments a global counter; spins until (phase+1)*512.
 //
 // Barrier ISA sequence (30 dwords, gfx1100):
 //   threadfence (waitcnt + gl0/gl1 inv)
@@ -37,13 +53,21 @@
 //
 // All instructions are gfx11 (rsrc2=0x9E, target=gfx1100).
 
-// Emit one cross-WG barrier for a WG_PERSIST=256 grid.
+// Emit one cross-WG barrier for a given wg_persist grid size.
 //
-// phase_idx: 0..7.  threshold = (phase_idx+1) * 256 = 0x100..(0x800).
+// phase_idx:  0..7.  threshold = (phase_idx+1) * wg_persist.
+// wg_persist: number of persistent workgroups (must satisfy
+//             (phase_idx+1)*wg_persist <= 0xFFFF — checked below).
 // Register conventions: s[8:9]=counter_ptr, vcc_lo=lane-0 mask, s3=saved-exec,
 // v0=lane id (hardware), v1=vaddr(0), v2=data/spin.
-fn mega_emit_barrier_isa(uint64 phase_idx) {
-    uint64 threshold = (phase_idx + 1) * 256
+fn mega_emit_barrier_isa(uint64 phase_idx, uint64 wg_persist) {
+    // Compile-time overflow check: per spec line 238-240.
+    // If (phase_idx+1)*wg_persist would overflow a 16-bit counter, exit.
+    uint64 threshold = (phase_idx + 1) * wg_persist
+    if threshold > 0xFFFF {
+        write(2, "mega_emit_barrier_isa: barrier counter overflow: (phase+1)*wg_persist > 0xFFFF\n", 80)
+        exit(1)
+    }
 
     // ── threadfence ──────────────────────────────────────────────────────
     // Flush writer stores and invalidate caches before the atomic.
@@ -132,8 +156,8 @@ fn mega_emit_barrier_isa(uint64 phase_idx) {
 //  - Has 7 early-exit checks (max_phase guards after barriers 0..6)
 //  - Ends with s_endpgm
 //
-// KD parameters match the v1 reference: 24 args, 192-byte kernarg segment,
-// rsrc2=0x9E (wg_id_x in s15), WG_PERSIST=256 (differs from v1's 512).
+// KD parameters match the v1 reference: MEGA_KERNARG_COUNT args, 192-byte
+// kernarg segment, rsrc2=0x9E (wg_id_x in s15), MEGA_WG_PERSIST=512.
 // LDS=0 (stub phases don't need LDS).
 fn mega_emit_stub_kernel(uint64 kname_ptr, uint64 nl) -> uint64 {
     asm_init()
@@ -172,7 +196,7 @@ fn mega_emit_stub_kernel(uint64 kname_ptr, uint64 nl) -> uint64 {
 
     // Barrier 0: phase 1 (wg==0 only in real; stub: s_nop 0)
     asm_u32(0xBF800000)            // s_nop 0  (phase 1 stub)
-    mega_emit_barrier_isa(0)
+    mega_emit_barrier_isa(0, MEGA_WG_PERSIST)
     // max_phase < 1 check: s_cmp_lt_u32 s10, inline_1; s_cbranch_scc1 .Lend
     // simm16 = (7-0)*34 - 1 = 237
     asm_s_cmp_lt_u32(10, 0x81)     // ssrc0=s10=10, ssrc1=inline-1=0x81
@@ -180,49 +204,49 @@ fn mega_emit_stub_kernel(uint64 kname_ptr, uint64 nl) -> uint64 {
 
     // Barrier 1: phase 3
     asm_u32(0xBF800000)
-    mega_emit_barrier_isa(1)
+    mega_emit_barrier_isa(1, MEGA_WG_PERSIST)
     // max_phase < 2 check; simm16 = 6*34 - 1 = 203
     asm_s_cmp_lt_u32(10, 0x82)
     asm_s_cbranch_scc1(203)
 
     // Barrier 2: phase 5
     asm_u32(0xBF800000)
-    mega_emit_barrier_isa(2)
+    mega_emit_barrier_isa(2, MEGA_WG_PERSIST)
     // max_phase < 3 check; simm16 = 5*34 - 1 = 169
     asm_s_cmp_lt_u32(10, 0x83)
     asm_s_cbranch_scc1(169)
 
     // Barrier 3: phase 7
     asm_u32(0xBF800000)
-    mega_emit_barrier_isa(3)
+    mega_emit_barrier_isa(3, MEGA_WG_PERSIST)
     // max_phase < 4 check; simm16 = 4*34 - 1 = 135
     asm_s_cmp_lt_u32(10, 0x84)
     asm_s_cbranch_scc1(135)
 
     // Barrier 4: phase 9
     asm_u32(0xBF800000)
-    mega_emit_barrier_isa(4)
+    mega_emit_barrier_isa(4, MEGA_WG_PERSIST)
     // max_phase < 5 check; simm16 = 3*34 - 1 = 101
     asm_s_cmp_lt_u32(10, 0x85)
     asm_s_cbranch_scc1(101)
 
     // Barrier 5: phase 11
     asm_u32(0xBF800000)
-    mega_emit_barrier_isa(5)
+    mega_emit_barrier_isa(5, MEGA_WG_PERSIST)
     // max_phase < 6 check; simm16 = 2*34 - 1 = 67
     asm_s_cmp_lt_u32(10, 0x86)
     asm_s_cbranch_scc1(67)
 
     // Barrier 6: phase 13
     asm_u32(0xBF800000)
-    mega_emit_barrier_isa(6)
+    mega_emit_barrier_isa(6, MEGA_WG_PERSIST)
     // max_phase < 7 check; simm16 = 1*34 - 1 = 33
     asm_s_cmp_lt_u32(10, 0x87)
     asm_s_cbranch_scc1(33)
 
     // Barrier 7: phase 15 (no max_phase check after this)
     asm_u32(0xBF800000)
-    mega_emit_barrier_isa(7)
+    mega_emit_barrier_isa(7, MEGA_WG_PERSIST)
 
     // Phase 17 stub (no trailing barrier)
     asm_u32(0xBF800000)
@@ -244,11 +268,11 @@ fn mega_emit_stub_kernel(uint64 kname_ptr, uint64 nl) -> uint64 {
         ci = ci + 1
     }
 
-    // 24-arg descriptor: args 14 (pos) and 23 (max_phase) are by-value;
-    // all others are global_buffer pointers.
-    uint64 args_desc = alloc(24 * 16)
+    // MEGA_KERNARG_COUNT-arg descriptor: args 14 (pos) and 23 (max_phase) are
+    // by-value; all others are global_buffer pointers.
+    uint64 args_desc = alloc(MEGA_KERNARG_COUNT * 16)
     uint64 ai = 0
-    while ai < 24 {
+    while ai < MEGA_KERNARG_COUNT {
         uint64 sz_p   = args_desc + ai * 16
         uint64 kind_p = args_desc + ai * 16 + 8
         unsafe { *(sz_p as uint64) = 8 }
@@ -273,7 +297,7 @@ fn mega_emit_stub_kernel(uint64 kname_ptr, uint64 nl) -> uint64 {
     uint64 props = 0x0408
 
     kt_push_lds(kname_ptr, nl, k_text_buf, k_text_size,
-                args_desc, 24, 192,
+                args_desc, MEGA_KERNARG_COUNT, 192,
                 16, 3,
                 rsrc1, rsrc2, rsrc3, props,
                 516)
@@ -290,19 +314,19 @@ fn mega_emit_stub_kernel(uint64 kname_ptr, uint64 nl) -> uint64 {
 // should fall through to other recognizers).
 fn recognize_megakernel_swiglu_dense_gqa(uint64 fn_node, uint64 source,
                                           uint64 kname_ptr, uint64 nl) -> uint64 {
-    // ── shape: exactly 24 params ─────────────────────────────────────────
+    // ── shape: exactly MEGA_KERNARG_COUNT params ──────────────────────────
     uint64 n_params = 0
     uint64 wp = ast_child(fn_node)
     while wp != 0 {
         n_params = n_params + 1
         wp = ast_next(wp)
     }
-    if n_params != 24 { return 1 }
+    if n_params != MEGA_KERNARG_COUNT { return 1 }
 
     // ── shape: body is a non-empty Block ─────────────────────────────────
     uint32 body = ast_data3(fn_node)
     if body == 0 { return 1 }
-    if ast_kind(body) != 15 { return 1 }   // 15 = Block
+    if ast_kind(body) != AST_KIND_BLOCK { return 1 }
 
     return mega_emit_stub_kernel(kname_ptr, nl)
 }
