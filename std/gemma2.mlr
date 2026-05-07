@@ -175,8 +175,8 @@ fn gemma2_attn_cached_softcap(u64 out_ptr,
     f32 cap   = gemma2_attn_softcap
     u64 kv_row_bytes = n_kv_heads * head_dim * 4
 
-    // Sliding window lower bound (inclusive). 0 if no sliding or window
-    // exceeds the current sequence length.
+    // Sliding-window lower bound (inclusive). 0 if no sliding flag, no
+    // window set, or the current sequence length still fits in window.
     u64 t_lo = 0
     if apply_sliding != 0 {
         u64 win = gemma2_sliding_window
@@ -208,9 +208,10 @@ fn gemma2_attn_cached_softcap(u64 out_ptr,
         }
 
         // Zero output row.
+        f32 zero = 0.0f
         u64 d0 = 0
         while d0 < head_dim {
-            unsafe { *((o_row + d0 * 4) as f32) = 0.0f }
+            unsafe { *((o_row + d0 * 4) as f32) = zero }
             d0 = d0 + 1
         }
 
@@ -316,17 +317,13 @@ fn gemma2_forward_layer(u64 x_out, u64 x_in,
     qwen3_rope_apply(q_buf, qwen3_rope_cos_cache, qwen3_rope_sin_cache, nh,  hd)
     qwen3_rope_apply(k_row, qwen3_rope_cos_cache, qwen3_rope_sin_cache, nkv, hd)
 
-    // Attention. Currently using qwen3_attn_cached (no attn-logit
-    // soft-cap, no sliding window). gemma2_attn_cached_softcap exists
-    // but produces wrong output even with cap=0/sliding=0; see TODO.
-    // For decode lengths < 4096 tokens, sliding window is a no-op anyway.
-    // attn-logit soft-cap (50) is mostly cosmetic — it only fires on
-    // outlier scores (>50 raw). Practical accuracy impact is small for
-    // short greedy decodes; revisit when chasing bit-exact match.
+    // Attention with soft-cap + per-layer sliding flag.
+    u64 apply_sliding = 0
+    if (layer_idx % 2) == 0 { apply_sliding = 1 }
     u64 attn_out = alloc(q_dim * 4)
-    qwen3_attn_cached(attn_out, q_buf,
-                      k_cache_layer, v_cache_layer,
-                      pos + 1, nh, nkv, hd)
+    gemma2_attn_cached_softcap(attn_out, q_buf,
+                               k_cache_layer, v_cache_layer,
+                               pos + 1, nh, nkv, hd, apply_sliding)
 
     // o_proj (q_dim → hidden).
     u64 o_buf = alloc(hidden * 4)
