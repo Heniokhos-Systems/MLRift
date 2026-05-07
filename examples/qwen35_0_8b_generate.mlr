@@ -1,0 +1,460 @@
+// Qwen3.5-0.8B (Q8_0) hybrid Gated-DeltaNet + full-attention scaffold —
+// SLICE A. Most of the per-layer math is stubbed (identity pass-through);
+// this file is the load-and-dispatch skeleton that subsequent slices will
+// populate. See std/qwen35.mlr's header comment for the full GDN/full-attn
+// math sequences.
+//
+// Goals for this slice:
+//   1. Open the GGUF and verify all expected per-layer tensors are present
+//      across BOTH layer kinds (full-attn vs GDN, decided by
+//      `(layer_idx + 1) % full_attn_interval != 0`).
+//   2. Build a 24-row pointer table indexed by `Qwen35LayerWeights` slot
+//      conventions (see std/qwen35.mlr).
+//   3. Allocate per-layer GDN recurrent state (~1.07 MiB × 18 layers).
+//   4. Run a 20-step greedy decode loop. The model layers are stubs, so the
+//      generated tokens WILL NOT match the llama.cpp reference — that's
+//      expected. Validation: the binary doesn't crash and the loop completes.
+//
+// Reference (llama.cpp HEAD `dump-tokens`, prompt "hello", n=20, greedy):
+//   prompt_tokens = [14556]
+//   generated     = 11, 585, 599, 264, 3296, 883, 279, 2614, 1970, 25,
+//                   271, 71093, 12305, 198, 727, 281, 2007, 1590, 198, 262
+// (See memory/project_qwen35_slice_a.md for the full token text.)
+//
+// Build & run (libm float ABI required for IMROPE):
+//   ./build/mlrc examples/qwen35_0_8b_generate.mlr -o /tmp/qwen35_0_8b \
+//        --arch=x86_64 --target=linux --emit=elfexe
+//   /tmp/qwen35_0_8b
+
+import "../std/qwen3.mlr"
+import "../std/qwen35.mlr"
+import "../std/gguf.mlr"
+import "../std/matmul.mlr"
+import "../std/inference.mlr"
+import "../std/io.mlr"
+import "../std/fmt.mlr"
+import "../std/string.mlr"
+import "../std/thread.mlr"
+import "../std/time.mlr"
+import "../std/math_float.mlr"
+
+static u64 g_fd = 0
+fn eout(u64 s) {
+    print_str(s)
+    if g_fd != 0 {
+        u64 n = str_len(s)
+        file_write(g_fd, s, n)
+    }
+}
+fn eu64(u64 v) {
+    u64 s = fmt_dec(v)
+    eout(s)
+    dealloc(s)
+}
+fn ef32(f32 v) {
+    u64 s = fmt_f32(v, 4)
+    eout(s)
+    dealloc(s)
+}
+
+fn main() {
+    u64 num_workers = 16
+    thread_pool_init(num_workers)
+    g_fd = file_open("/tmp/qwen35_0_8b_gen.out", 1)
+
+    // ── Configure shared qwen3 dispatcher ──
+    qwen3_set_matmul_kind(1)                   // Q8_0
+    qwen3_set_norm_kind(1)                     // F32 norm weights
+    qwen3_set_rmsnorm_eps_bits(0x358637BD)     // 1e-6
+    qwen3_set_q8_bitexact(1)
+    qwen3_set_fuse_qkv(0)
+
+    // ── Configure Qwen3.5 specifics (probe: Qwen3.5-0.8B-Q8_0) ──
+    //   hidden = 1024  head_dim = 256  n_heads = 8  n_kv = 2  ff = 3584
+    //   rope_dim = 64 (partial)  rope_base = 1e7
+    //   sections = [11, 11, 10, 0]  (text-only IMROPE)
+    //   ssm: conv_kernel=4 state=128 n_k=16 n_v=16 inner=2048 full_intv=4
+    qwen35_set_arch(1024, 256, 8, 2, 3584, 64, 10000000,
+                    11, 11, 10, 0,
+                    4, 128, 16, 16, 2048, 4)
+
+    u64 path = "/home/pantelis/qwen35-0.8b/Qwen3.5-0.8B-Q8_0.gguf"
+    eout("[qwen35_0_8b] loading weights\n")
+    u64 load_start_ns = time_now()
+    GGUFFile gf = gguf_open(path)
+    if gf.file_size == 0 {
+        eout("open fail\n")
+        thread_pool_shutdown(); file_close(g_fd); exit(1)
+    }
+
+    u64 hidden    = 1024
+    u64 ff        = 3584
+    u64 n_layers  = 24
+    u64 vocab     = 248320
+    u64 max_seq   = 64
+    u64 max_new   = 20
+
+    GGUFTensor embed_t = gguf_get(gf, "token_embd.weight")
+    if embed_t.ptr == 0 {
+        eout("missing token_embd.weight\n")
+        gguf_free(gf); thread_pool_shutdown(); file_close(g_fd); exit(1)
+    }
+    GGUFTensor norm_t = gguf_get(gf, "output_norm.weight")
+    if norm_t.ptr == 0 {
+        eout("missing output_norm.weight\n")
+        gguf_free(gf); thread_pool_shutdown(); file_close(g_fd); exit(1)
+    }
+    u64 output_norm_w = norm_t.ptr
+
+    // Qwen3.5-0.8B has tied lm_head (no separate output.weight).
+    u64 lmhead_ptr = embed_t.ptr
+    GGUFTensor out_t = gguf_get(gf, "output.weight")
+    if out_t.ptr != 0 {
+        lmhead_ptr = out_t.ptr
+        eout("[qwen35_0_8b] using explicit output.weight (untied)\n")
+    } else {
+        eout("[qwen35_0_8b] using tied lm_head (token_embd.weight)\n")
+    }
+
+    // ── Per-layer weight pointer table ──
+    // Qwen35LayerWeights = 16 u64 slots × 8 = 128 B per layer.
+    u64 slot_stride = 128
+    u64 layers_arr = alloc(n_layers * slot_stride)
+    // Zero-init: the helper memzero is in std but easier to do a u64 loop here.
+    u64 zi = 0
+    while zi < n_layers * slot_stride / 8 {
+        unsafe { *((layers_arr + zi * 8) as u64) = 0 }
+        zi = zi + 1
+    }
+
+    u64 missing_count = 0
+
+    u64 li = 0
+    while li < n_layers {
+        u64 base = layers_arr + li * slot_stride
+        u64 li_s = fmt_dec(li)
+        u64 pre0 = str_cat("blk.", li_s)
+        u64 prefix = str_cat(pre0, ".")
+        dealloc(li_s); dealloc(pre0)
+
+        // attn_norm.weight → slot 0   (BOTH kinds)
+        u64 n_an = str_cat(prefix, "attn_norm.weight")
+        GGUFTensor t_an = gguf_get(gf, n_an)
+        unsafe { *((base + 0 * 8) as u64) = t_an.ptr }
+        if t_an.ptr == 0 { missing_count = missing_count + 1 }
+        dealloc(n_an)
+
+        u64 is_gdn = qwen35_is_gdn_layer(li)
+        if is_gdn != 0 {
+            // GDN layer (e.g. blk.0)
+            u64 n_qkv = str_cat(prefix, "attn_qkv.weight")
+            GGUFTensor t_qkv = gguf_get(gf, n_qkv)
+            unsafe { *((base + 1 * 8) as u64) = t_qkv.ptr }
+            if t_qkv.ptr == 0 { missing_count = missing_count + 1 }
+            dealloc(n_qkv)
+
+            u64 n_ag = str_cat(prefix, "attn_gate.weight")
+            GGUFTensor t_ag = gguf_get(gf, n_ag)
+            unsafe { *((base + 2 * 8) as u64) = t_ag.ptr }
+            if t_ag.ptr == 0 { missing_count = missing_count + 1 }
+            dealloc(n_ag)
+
+            u64 n_c = str_cat(prefix, "ssm_conv1d.weight")
+            GGUFTensor t_c = gguf_get(gf, n_c)
+            unsafe { *((base + 3 * 8) as u64) = t_c.ptr }
+            if t_c.ptr == 0 { missing_count = missing_count + 1 }
+            dealloc(n_c)
+
+            u64 n_dt = str_cat(prefix, "ssm_dt.bias")
+            GGUFTensor t_dt = gguf_get(gf, n_dt)
+            unsafe { *((base + 4 * 8) as u64) = t_dt.ptr }
+            if t_dt.ptr == 0 { missing_count = missing_count + 1 }
+            dealloc(n_dt)
+
+            // Note: ssm_a has NO ".weight" suffix in this model (probe confirms).
+            u64 n_a = str_cat(prefix, "ssm_a")
+            GGUFTensor t_a = gguf_get(gf, n_a)
+            unsafe { *((base + 5 * 8) as u64) = t_a.ptr }
+            if t_a.ptr == 0 { missing_count = missing_count + 1 }
+            dealloc(n_a)
+
+            u64 n_al = str_cat(prefix, "ssm_alpha.weight")
+            GGUFTensor t_al = gguf_get(gf, n_al)
+            unsafe { *((base + 6 * 8) as u64) = t_al.ptr }
+            if t_al.ptr == 0 { missing_count = missing_count + 1 }
+            dealloc(n_al)
+
+            u64 n_be = str_cat(prefix, "ssm_beta.weight")
+            GGUFTensor t_be = gguf_get(gf, n_be)
+            unsafe { *((base + 7 * 8) as u64) = t_be.ptr }
+            if t_be.ptr == 0 { missing_count = missing_count + 1 }
+            dealloc(n_be)
+
+            u64 n_sn = str_cat(prefix, "ssm_norm.weight")
+            GGUFTensor t_sn = gguf_get(gf, n_sn)
+            unsafe { *((base + 8 * 8) as u64) = t_sn.ptr }
+            if t_sn.ptr == 0 { missing_count = missing_count + 1 }
+            dealloc(n_sn)
+
+            u64 n_so = str_cat(prefix, "ssm_out.weight")
+            GGUFTensor t_so = gguf_get(gf, n_so)
+            unsafe { *((base + 9 * 8) as u64) = t_so.ptr }
+            if t_so.ptr == 0 { missing_count = missing_count + 1 }
+            dealloc(n_so)
+
+            u64 n_pn = str_cat(prefix, "post_attention_norm.weight")
+            GGUFTensor t_pn = gguf_get(gf, n_pn)
+            unsafe { *((base + 10 * 8) as u64) = t_pn.ptr }
+            if t_pn.ptr == 0 { missing_count = missing_count + 1 }
+            dealloc(n_pn)
+
+            u64 n_g = str_cat(prefix, "ffn_gate.weight")
+            GGUFTensor t_g = gguf_get(gf, n_g)
+            unsafe { *((base + 11 * 8) as u64) = t_g.ptr }
+            if t_g.ptr == 0 { missing_count = missing_count + 1 }
+            dealloc(n_g)
+
+            u64 n_u = str_cat(prefix, "ffn_up.weight")
+            GGUFTensor t_u = gguf_get(gf, n_u)
+            unsafe { *((base + 12 * 8) as u64) = t_u.ptr }
+            if t_u.ptr == 0 { missing_count = missing_count + 1 }
+            dealloc(n_u)
+
+            u64 n_d = str_cat(prefix, "ffn_down.weight")
+            GGUFTensor t_d = gguf_get(gf, n_d)
+            unsafe { *((base + 13 * 8) as u64) = t_d.ptr }
+            if t_d.ptr == 0 { missing_count = missing_count + 1 }
+            dealloc(n_d)
+        } else {
+            // Full-attention layer (e.g. blk.3)
+            u64 n_q = str_cat(prefix, "attn_q.weight")
+            GGUFTensor t_q = gguf_get(gf, n_q)
+            unsafe { *((base + 1 * 8) as u64) = t_q.ptr }
+            if t_q.ptr == 0 { missing_count = missing_count + 1 }
+            dealloc(n_q)
+
+            u64 n_k = str_cat(prefix, "attn_k.weight")
+            GGUFTensor t_k = gguf_get(gf, n_k)
+            unsafe { *((base + 2 * 8) as u64) = t_k.ptr }
+            if t_k.ptr == 0 { missing_count = missing_count + 1 }
+            dealloc(n_k)
+
+            u64 n_v = str_cat(prefix, "attn_v.weight")
+            GGUFTensor t_v = gguf_get(gf, n_v)
+            unsafe { *((base + 3 * 8) as u64) = t_v.ptr }
+            if t_v.ptr == 0 { missing_count = missing_count + 1 }
+            dealloc(n_v)
+
+            u64 n_qn = str_cat(prefix, "attn_q_norm.weight")
+            GGUFTensor t_qn = gguf_get(gf, n_qn)
+            unsafe { *((base + 4 * 8) as u64) = t_qn.ptr }
+            if t_qn.ptr == 0 { missing_count = missing_count + 1 }
+            dealloc(n_qn)
+
+            u64 n_kn = str_cat(prefix, "attn_k_norm.weight")
+            GGUFTensor t_kn = gguf_get(gf, n_kn)
+            unsafe { *((base + 5 * 8) as u64) = t_kn.ptr }
+            if t_kn.ptr == 0 { missing_count = missing_count + 1 }
+            dealloc(n_kn)
+
+            u64 n_o = str_cat(prefix, "attn_output.weight")
+            GGUFTensor t_o = gguf_get(gf, n_o)
+            unsafe { *((base + 6 * 8) as u64) = t_o.ptr }
+            if t_o.ptr == 0 { missing_count = missing_count + 1 }
+            dealloc(n_o)
+
+            u64 n_pn = str_cat(prefix, "post_attention_norm.weight")
+            GGUFTensor t_pn = gguf_get(gf, n_pn)
+            unsafe { *((base + 7 * 8) as u64) = t_pn.ptr }
+            if t_pn.ptr == 0 { missing_count = missing_count + 1 }
+            dealloc(n_pn)
+
+            u64 n_g = str_cat(prefix, "ffn_gate.weight")
+            GGUFTensor t_g = gguf_get(gf, n_g)
+            unsafe { *((base + 8 * 8) as u64) = t_g.ptr }
+            if t_g.ptr == 0 { missing_count = missing_count + 1 }
+            dealloc(n_g)
+
+            u64 n_u = str_cat(prefix, "ffn_up.weight")
+            GGUFTensor t_u = gguf_get(gf, n_u)
+            unsafe { *((base + 9 * 8) as u64) = t_u.ptr }
+            if t_u.ptr == 0 { missing_count = missing_count + 1 }
+            dealloc(n_u)
+
+            u64 n_d = str_cat(prefix, "ffn_down.weight")
+            GGUFTensor t_d = gguf_get(gf, n_d)
+            unsafe { *((base + 10 * 8) as u64) = t_d.ptr }
+            if t_d.ptr == 0 { missing_count = missing_count + 1 }
+            dealloc(n_d)
+        }
+
+        dealloc(prefix)
+        li = li + 1
+    }
+    u64 load_elapsed_ns = time_elapsed(load_start_ns)
+    eout("[qwen35_0_8b] 24 layers indexed; missing_tensors="); eu64(missing_count)
+    eout("; load_ms="); eu64(load_elapsed_ns / 1000000); eout("\n")
+
+    if missing_count != 0 {
+        eout("[qwen35_0_8b] ABORT: tensor pointer table has missing entries\n")
+        gguf_free(gf); thread_pool_shutdown(); file_close(g_fd); exit(1)
+    }
+
+    // ── KV cache (only used by full-attn layers — 6 of 24) ──
+    // Allocated for every layer for simplicity; GDN slots are never touched.
+    // head_dim=256, n_kv=2 → kv_dim=512 floats = 2048 B/row.
+    u64 kv_dim       = 512
+    u64 kv_row_bytes = kv_dim * 4
+    u64 layer_stride = max_seq * kv_row_bytes
+    u64 total_cache  = n_layers * layer_stride
+    u64 k_cache = alloc(total_cache)
+    u64 v_cache = alloc(total_cache)
+    eout("[qwen35_0_8b] KV cache "); eu64(total_cache * 2); eout(" B (full-attn only)\n")
+
+    // ── Recurrent state per GDN layer ──
+    u64 gdn_bytes_per = qwen35_gdn_state_bytes()
+    u64 gdn_total     = n_layers * gdn_bytes_per
+    u64 gdn_state_base = alloc(gdn_total)
+    // Zero-init the recurrent state
+    u64 gz = 0
+    while gz < gdn_total / 8 {
+        unsafe { *((gdn_state_base + gz * 8) as u64) = 0 }
+        gz = gz + 1
+    }
+    eout("[qwen35_0_8b] GDN state "); eu64(gdn_total); eout(" B (")
+    eu64(gdn_bytes_per); eout(" B/layer × 24 layers — 18 used by GDN; full-attn slots wasted)\n")
+
+    u64 x_cur     = alloc(hidden * 4)
+    u64 x_nxt     = alloc(hidden * 4)
+    u64 final_out = alloc(hidden * 4)
+    u64 logits    = alloc(vocab * 4)
+
+    u64 embed_base = embed_t.ptr
+    u64 row_blocks = hidden / 32
+    u64 row_bytes  = row_blocks * 34
+    eout("[qwen35_0_8b] embed row "); eu64(row_bytes); eout(" B/row\n")
+
+    // ── Hardcoded prompt: "hello" → token 14556 (no BOS in this model) ──
+    u64 prompt_count = 1
+    u64 seq_cap = prompt_count + max_new
+    u64 seq_ids32 = alloc(seq_cap * 4)
+    u32 t0 = 14556
+    unsafe { *((seq_ids32 + 0 * 4) as uint32) = t0 }
+    u64 seq_len = prompt_count
+
+    eout("[qwen35_0_8b] prompt_tokens=1 ids=[14556] (\"hello\")\n")
+
+    // ── Prefill (no-op for 1-token prompt) ──
+    u64 pos = 0
+    u64 prefill_start_ns = time_now()
+    while pos + 1 < prompt_count {
+        u32 pt32 = 0
+        unsafe { *((seq_ids32 + pos * 4) as uint32) -> pt32 }
+        u64 pt = pt32
+        gguf_deq_q8_0(x_cur, embed_base + pt * row_bytes, hidden)
+        u64 layer = 0
+        while layer < n_layers {
+            Qwen35LayerWeights w = layers_arr + layer * slot_stride
+            u64 kc = k_cache + layer * layer_stride
+            u64 vc = v_cache + layer * layer_stride
+            u64 gs = gdn_state_base + layer * gdn_bytes_per
+            qwen35_forward_layer(x_nxt, x_cur, w, layer, pos, kc, vc, gs)
+            u64 tmp = x_cur
+            x_cur = x_nxt
+            x_nxt = tmp
+            layer = layer + 1
+        }
+        pos = pos + 1
+    }
+    u64 prefill_ns = time_elapsed(prefill_start_ns)
+    eout("[qwen35_0_8b] prefill_ms="); eu64(prefill_ns / 1000000); eout("\n")
+
+    // Decode setup
+    u32 last_pt32 = 0
+    unsafe { *((seq_ids32 + (prompt_count - 1) * 4) as uint32) -> last_pt32 }
+    u64 last_pt = last_pt32
+    gguf_deq_q8_0(x_cur, embed_base + last_pt * row_bytes, hidden)
+
+    u64 step = 0
+    u64 decode_start_ns = time_now()
+    while step < max_new {
+        u64 step_start_ns = time_now()
+        eout("step "); eu64(step); eout(" pos="); eu64(pos); eout("\n")
+
+        u64 layer = 0
+        while layer < n_layers {
+            Qwen35LayerWeights w = layers_arr + layer * slot_stride
+            u64 kc = k_cache + layer * layer_stride
+            u64 vc = v_cache + layer * layer_stride
+            u64 gs = gdn_state_base + layer * gdn_bytes_per
+            qwen35_forward_layer(x_nxt, x_cur, w, layer, pos, kc, vc, gs)
+            u64 tmp = x_cur
+            x_cur = x_nxt
+            x_nxt = tmp
+            layer = layer + 1
+        }
+
+        // Final RMSNorm + tied lm_head. (With all 24 layers stubbed, x_cur is
+        // exactly the input embedding, so we'll produce whatever the lm_head
+        // says is the closest token to "hello"'s embedding — guaranteed garbage
+        // until the layers are real.)
+        qwen3_rmsnorm_f32_weights(final_out, x_cur, output_norm_w, hidden)
+        matmul_q8_0_q8_0_f32(logits, final_out, lmhead_ptr, 1, vocab, hidden, num_workers)
+
+        u64 best_id = 0
+        f32 best_val = 0.0f
+        u64 first = 1
+        u64 j = 0
+        while j < vocab {
+            f32 v = 0.0f
+            unsafe { *((logits + j * 4) as f32) -> v }
+            if first == 1 {
+                best_val = v; best_id = j; first = 0
+            } else {
+                if v > best_val { best_val = v; best_id = j }
+            }
+            j = j + 1
+        }
+        u64 step_elapsed_ns = time_elapsed(step_start_ns)
+        eout("  -> next_id = "); eu64(best_id); eout(" logit=")
+        ef32(best_val)
+        eout(" step_ms="); eu64(step_elapsed_ns / 1000000); eout("\n")
+
+        u32 best_id32 = best_id
+        unsafe { *((seq_ids32 + seq_len * 4) as uint32) = best_id32 }
+        seq_len = seq_len + 1
+
+        gguf_deq_q8_0(x_cur, embed_base + best_id * row_bytes, hidden)
+        pos = pos + 1
+        step = step + 1
+    }
+    u64 total_decode_ns = time_elapsed(decode_start_ns)
+    u64 total_ms = total_decode_ns / 1000000
+
+    eout("\n=== GENERATED IDs (STUB — should NOT match llama.cpp ref yet) ===\n")
+    u64 gi = 0
+    while gi < seq_len {
+        if gi != 0 { eout(", ") }
+        u32 gid32 = 0
+        unsafe { *((seq_ids32 + gi * 4) as uint32) -> gid32 }
+        u64 gid = gid32
+        eu64(gid)
+        gi = gi + 1
+    }
+    eout("\n")
+
+    eout("\n=== TIMING ===\n")
+    eout("prompt_tokens="); eu64(prompt_count); eout("\n")
+    eout("prefill_ms="); eu64(prefill_ns / 1000000); eout("\n")
+    eout("total_decode_ms="); eu64(total_ms); eout("\n")
+    eout("tokens_generated="); eu64(max_new); eout("\n")
+
+    dealloc(x_cur); dealloc(x_nxt); dealloc(final_out); dealloc(logits)
+    dealloc(seq_ids32); dealloc(layers_arr)
+    dealloc(k_cache); dealloc(v_cache)
+    dealloc(gdn_state_base)
+    gguf_free(gf)
+    thread_pool_shutdown()
+    file_close(g_fd)
+    exit(0)
+}

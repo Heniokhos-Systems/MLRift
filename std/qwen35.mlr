@@ -1,0 +1,361 @@
+// Qwen3.5 / Qwen3.6 ("qwen35" arch tag — NOT the same as qwen3vl which we
+// call "qwen36" internally for historical reasons). Hybrid Gated-DeltaNet
+// + full-attention. Shipped variants per llama.cpp HEAD's `qwen35.cpp`:
+//
+//   block_count = 24,  n_embd = 1024  → Qwen3.5-0.8B   (this slice's target)
+//   block_count = 24,  n_embd ≠ 1024  → Qwen3.5-2B
+//   block_count = 32,  n_embd = 2560  → Qwen3.5-4B
+//   block_count = 32,  other          → Qwen3.5-9B
+//   block_count = 64,                 → Qwen3.5-27B
+//
+// Probe of `/home/pantelis/qwen35-0.8b/Qwen3.5-0.8B-Q8_0.gguf`:
+//   embedding_length          = 1024
+//   block_count               = 24
+//   feed_forward_length       = 3584
+//   attention.head_count      = 8        head_count_kv = 2  (GQA 4:1)
+//   attention.{key,value}_length = 256   (head_dim — 2× the embed/head ratio
+//                                         because Qwen3.5 uses a DOUBLE-WIDTH
+//                                         Q+gate fused projection on full-attn
+//                                         layers; see "Full-attn layer" below)
+//   rope.dimension_count      = 64       (partial RoPE: only first 64 channels
+//                                         of head_dim=256 rotate)
+//   rope.dimension_sections   = [11, 11, 10, 0]   (text-only IMROPE — 3-axis
+//                                                  with sect_extra=0, total =
+//                                                  rope_dim/2 = 32)
+//   rope.freq_base (f32 bits) = 0x4B189680  (= 1e7)
+//   rms_eps        (f32 bits) = 0x358637BD  (= 1e-6)
+//   ssm.conv_kernel           = 4
+//   ssm.state_size            = 128       (= head_v_dim = head_k_dim)
+//   ssm.group_count           = 16        (= n_k_heads)
+//   ssm.time_step_rank        = 16        (= n_v_heads)
+//   ssm.inner_size            = 2048      (= value_dim = n_v_heads * head_v_dim)
+//   full_attention_interval   = 4         (recurrent_layer[i] = ((i+1)%4 != 0))
+//   tokenizer.bos             = absent    (no BOS prepended)
+//   tokenizer.eos             = 248046
+//   vocab                     = 248320
+//
+// Layer schedule for 24 layers under interval=4:
+//   recurrent (GDN): layers  0,1,2,  4,5,6,  8,9,10, 12,13,14, 16,17,18, 20,21,22  (18)
+//   full-attn:       layers          3,        7,       11,       15,       19,       23  (6)
+//
+// ────────────────────────────────────────────────────────────────────
+// Full-attn layer (e.g. blk.3) — Qwen3.5 specific Q+gate fused projection
+// ────────────────────────────────────────────────────────────────────
+// The Q projection is DOUBLE-WIDTH:
+//   wq:        [n_embd, n_embd_head_k * n_head * 2]  =  [1024, 4096]
+//   wk:        [n_embd, n_embd_k_gqa]                =  [1024, 512]   (= 2 * 256)
+//   wv:        [n_embd, n_embd_v_gqa]                =  [1024, 512]
+//   wo:        [n_embd_head_k * n_head, n_embd]      =  [2048, 1024]
+//   q_norm:    [n_embd_head_k] = [256]
+//   k_norm:    [n_embd_head_k] = [256]
+//   attn_norm:               [n_embd]   (pre-attention)
+//   post_attention_norm:     [n_embd]   (between attn-residual and FFN)
+//   ffn_gate / ffn_up:       [n_embd, n_ff]  = [1024, 3584]
+//   ffn_down:                [n_ff, n_embd]
+//
+// Forward (from llama.cpp qwen35.cpp::build_layer_attn):
+//   1. cur = build_norm(inpL, attn_norm)                   // RMSNorm pre
+//   2. Qcur_full = wq @ cur                                // [4096, 1]
+//      Qcur = view(Qcur_full)[:256, :8]   per head        // Q  [256, 8]
+//      gate = view(Qcur_full)[256:, :8]   per head        // [256, 8] → flatten
+//   3. Qcur = build_norm(Qcur, attn_q_norm)               // per-head Q-norm
+//   4. Kcur = wk @ cur  reshape [256, 2]   K-norm per head
+//   5. Vcur = wv @ cur  reshape [256, 2]
+//   6. Apply MRoPE (rope_multi) with rope_dim=64 partial, sections=[11,11,10,0]
+//      to BOTH Q and K.
+//   7. attn = softmax(QK^T / sqrt(256)) @ V       shape [2048, 1]
+//   8. attn *= sigmoid(gate)                       // OUTPUT GATING (Qwen3-Next)
+//   9. cur = wo @ attn                             [1024, 1]
+//   Then the standard residual + post_attention_norm + FFN → residual → next layer.
+//
+// Note: this is NOT the same as plain Qwen3 — the Q+gate fusion plus output
+// gating is unique to Qwen3.5/3.6/Next. `qwen3_forward_layer` from the
+// existing dense Qwen3 path will not work as-is for these layers. (Slice B
+// will implement `qwen35_forward_full_attn_layer`.)
+//
+// ────────────────────────────────────────────────────────────────────
+// GDN layer (e.g. blk.0) — Gated DeltaNet (linear attention + recurrent state)
+// ────────────────────────────────────────────────────────────────────
+// Tensor inventory:
+//   attn_norm:             [n_embd]
+//   attn_qkv:              [n_embd, key_dim*2 + value_dim] = [1024, 6144]
+//                          where key_dim   = n_k_heads * head_k_dim = 16 * 128 = 2048
+//                                value_dim = n_v_heads * head_v_dim = 16 * 128 = 2048
+//                                so QKV split = 2048 + 2048 + 2048 = 6144
+//   attn_gate:             [n_embd, value_dim] = [1024, 2048]   // post-DN gate (z)
+//   ssm_conv1d:            [conv_kernel, conv_dim] = [4, 6144]
+//                          conv_dim = key_dim*2 + value_dim = 6144
+//   ssm_dt.bias:           [n_v_heads] = [16]
+//   ssm_a:                 [n_v_heads] = [16]   (no "weight" suffix — special)
+//   ssm_alpha.weight:      [n_embd, n_v_heads] = [1024, 16]
+//   ssm_beta.weight:       [n_embd, n_v_heads] = [1024, 16]
+//   ssm_norm.weight:       [head_v_dim] = [128]
+//   ssm_out.weight:        [value_dim, n_embd] = [2048, 1024]
+//   post_attention_norm:   [n_embd]   (shared FFN-pre slot — same as full-attn)
+//   ffn_gate / ffn_up / ffn_down — same shapes as full-attn layers
+//
+// Forward (from llama.cpp qwen35.cpp::build_layer_attn_linear, sources at the
+// graph level + the autoregressive 1-token build_delta_net_autoregressive):
+//
+//   cur = RMSNorm(x, attn_norm)
+//
+//   // Input projections — produce Q+K+V mixed for conv, plus z for output gate
+//   qkv_mixed = wqkv @ cur                       [6144]  // = [Q | K | V] flat
+//   z         = wqkv_gate @ cur                  [2048]
+//
+//   // Beta (recurrence write gate, per v-head)
+//   beta = sigmoid(ssm_beta @ cur)               [16]
+//
+//   // Alpha (recurrence forget gate magnitude)
+//   alpha       = ssm_alpha @ cur                [16]
+//   alpha_bias  = alpha + ssm_dt                 [16]
+//   alpha_sp    = softplus(alpha_bias)           [16]
+//   gate_g      = alpha_sp * ssm_a               [16]   // negative because ssm_a < 0
+//
+//   // 1D causal convolution over the QKV mixed channels with stored conv state.
+//   // For autoregressive (1 new token), maintain a sliding window of the last
+//   // (conv_kernel - 1) = 3 raw qkv_mixed vectors per channel:
+//   //   conv_input[ch, t] = [conv_state[ch, 0..2], qkv_mixed[ch]]   shape [4]
+//   //   conv_out[ch]      = sum(conv_input[ch, :] * ssm_conv1d[:, ch])
+//   //   conv_state shifts: state[ch, t] = state[ch, t+1] for t in 0..2
+//   //   state[ch, 2]      = qkv_mixed[ch]
+//   conv_qkv = silu(conv_out)                     [6144]
+//
+//   // Split conv_qkv into Q, K, V for the linear attention
+//   q = conv_qkv[0       : key_dim]                .view([head_k_dim, n_k_heads])
+//   k = conv_qkv[key_dim : 2*key_dim]              .view([head_k_dim, n_k_heads])
+//   v = conv_qkv[2*key_dim : 2*key_dim+value_dim]  .view([head_v_dim, n_v_heads])
+//
+//   // L2 normalize Q and K along their head_dim axis.
+//   q = q / sqrt(sum(q^2) + eps)         per (k_head)
+//   k = k / sqrt(sum(k^2) + eps)         per (k_head)
+//
+//   // Repeat-broadcast Q,K from n_k_heads=16 to n_v_heads=16 (here 1:1 already,
+//   // so this is a no-op for 0.8B; on larger variants where n_v_heads !=
+//   // n_k_heads it would replicate).
+//
+//   // Gated Delta Rule (autoregressive 1-token form, n_tokens == 1):
+//   //   scale  = 1 / sqrt(head_k_dim)
+//   //   q     *= scale
+//   //   g     = exp(gate_g)              [n_v_heads, 1, 1]    // diagonal forget
+//   //   s     = s * g                    [head_v_dim, head_v_dim, n_v_heads]
+//   //   sk    = sum_rows(s * k)          [head_v_dim, 1, n_v_heads]    // s @ k
+//   //   d     = (v - sk^T) * beta        [head_v_dim, 1, n_v_heads]    // delta
+//   //   s    += k @ d^T                  [head_v_dim, head_v_dim, n_v_heads]
+//   //   o     = sum_rows(s * q)          [head_v_dim, 1, n_v_heads]    // s @ q
+//   //
+//   // o has shape [head_v_dim, n_v_heads] = [128, 16] = 2048 flat.
+//
+//   // Apply gated norm: o = RMSNorm(o, ssm_norm) * silu(z_reshaped)
+//   //   ssm_norm weight is [head_v_dim] = [128], normalized per (n_v_head).
+//   o_normed = rmsnorm_per_vhead(o, ssm_norm)             [2048]
+//   o_gated  = o_normed * silu(z)                         [2048]
+//
+//   // Output projection back to embed dim
+//   out = ssm_out @ o_gated                               [1024]
+//
+//   return out
+//
+// Recurrent state shapes per GDN layer (allocated once at startup):
+//   conv_state:  [conv_kernel - 1, conv_dim]              = [3,   6144]   = 73728 B  (f32)
+//   ssm_state:   [head_v_dim, head_v_dim, n_v_heads]      = [128,128,16]  = 1048576 B (f32)
+//   total per GDN layer: 1 122 304 B ≈ 1.07 MiB
+//   18 GDN layers × 1.07 MiB                               ≈ 19.27 MiB total
+//   (matches llama.cpp's "CPU RS buffer size = 19.27 MiB" log line)
+//
+// ────────────────────────────────────────────────────────────────────
+// Status (this slice — Slice A)
+// ────────────────────────────────────────────────────────────────────
+//   - Header doc captured here (full math sequence above).
+//   - Two layer-weight structs scaffolded.
+//   - `qwen35_set_arch()` configurator wires the 3-section text-only IMROPE
+//     and the GDN sub-arch knobs (conv_kernel, state_size, n_k/v_heads).
+//   - GDN forward: STUB (memcpy x_in -> x_out — identity pass-through).
+//   - Full-attn forward: STUB (identity pass-through too — Qwen3.5's Q+gate
+//     fused projection + output gating doesn't fit the qwen3_forward_layer
+//     contract; will be implemented in Slice B).
+//   - Driver: examples/qwen35_0_8b_generate.mlr — loads weights, indexes the
+//     two layer types, runs a 20-step decode loop. Expected output: garbage
+//     (all layers stubbed). Validation goal: NO crashes, decode finishes.
+//
+// Reference llama.cpp greedy output for prompt "hello" at n=20 is captured in
+// memory/project_qwen35_slice_a.md (see "20-token reference" section).
+
+import "qwen3.mlr"
+
+// ─── Arch knobs (separate from QWEN3_*) ───────────────────────────────
+// Most knobs are inherited from std/qwen3.mlr's static state (HIDDEN, HEAD_DIM,
+// FF, ROPE_DIM, IMROPE sections, etc.). Qwen3.5 adds GDN-specific dims that
+// don't exist in the dense path:
+static u64 QWEN35_SSM_CONV_K       = 4
+static u64 QWEN35_SSM_STATE_SIZE   = 128    // = head_v_dim = head_k_dim
+static u64 QWEN35_SSM_N_K_HEADS    = 16     // ssm.group_count
+static u64 QWEN35_SSM_N_V_HEADS    = 16     // ssm.time_step_rank (yes, "rank"
+                                            // is misnamed — it's the head count)
+static u64 QWEN35_SSM_INNER_SIZE   = 2048   // = n_v_heads * head_v_dim
+static u64 QWEN35_FULL_ATTN_INTV   = 4      // (i+1)%intv != 0  → GDN; else full-attn
+
+// Setter callable by the driver.
+fn qwen35_set_ssm(u64 conv_k, u64 state_sz, u64 n_k_h, u64 n_v_h, u64 inner_sz, u64 full_attn_intv) {
+    QWEN35_SSM_CONV_K     = conv_k
+    QWEN35_SSM_STATE_SIZE = state_sz
+    QWEN35_SSM_N_K_HEADS  = n_k_h
+    QWEN35_SSM_N_V_HEADS  = n_v_h
+    QWEN35_SSM_INNER_SIZE = inner_sz
+    QWEN35_FULL_ATTN_INTV = full_attn_intv
+}
+
+// One-shot configurator. Wires the dense qwen3 dispatcher AND the qwen3-VL
+// IMROPE plumbing AND the GDN-specific dims, all in one call.
+//
+// `rope_dim`     = partial-RoPE channel count (e.g. 64 for the 0.8B). This is
+//                  passed straight to qwen3_set_imrope_rope_dim and matches
+//                  the gguf `qwen35.rope.dimension_count` key.
+// `sect_t/h/w/extra` come from `qwen35.rope.dimension_sections`. For
+//                  text-only inference, sect_extra is generally 0.
+fn qwen35_set_arch(u64 hidden, u64 head_dim, u64 n_heads, u64 n_kv_heads,
+                   u64 ff, u64 rope_dim, u64 rope_base,
+                   u64 sect_t, u64 sect_h, u64 sect_w, u64 sect_extra,
+                   u64 ssm_conv_k, u64 ssm_state_sz, u64 ssm_n_k_h, u64 ssm_n_v_h,
+                   u64 ssm_inner, u64 full_attn_intv) {
+    qwen3_set_arch(hidden, head_dim, n_heads, n_kv_heads, ff)
+    qwen3_set_qknorm(1)
+    qwen3_set_rope_base(rope_base)
+    qwen3_set_use_imrope(1)
+    qwen3_set_imrope_rope_dim(rope_dim)
+    qwen3_set_imrope_sections(sect_t, sect_h, sect_w, sect_extra)
+    qwen35_set_ssm(ssm_conv_k, ssm_state_sz, ssm_n_k_h, ssm_n_v_h, ssm_inner, full_attn_intv)
+}
+
+// `is_recurrent` predicate matching llama.cpp:
+//   recurrent_layer_arr[i] = ((i + 1) % full_attn_interval != 0)
+// i.e. the LAST layer of every interval window is full-attn.
+fn qwen35_is_gdn_layer(u64 layer_idx) -> u64 {
+    u64 m = (layer_idx + 1) % QWEN35_FULL_ATTN_INTV
+    if m != 0 { return 1 }
+    return 0
+}
+
+// ─── Layer weight structs (two variants) ─────────────────────────────
+//
+// Padded to 16 u64 slots = 128 B each so we can use the same stride for both
+// kinds; we pick which fields to populate based on `is_gdn`. Zero-init unused
+// slots so accidental reads on the wrong-kind layer trap as nullptr derefs.
+//
+// Index conventions (must stay in sync with the driver's pointer table loader):
+//
+//   FULL-ATTN layer:
+//     [0]  attn_norm.weight                  (= input_norm)
+//     [1]  attn_q.weight        (Q+gate fused, [n_embd, head_dim*n_head*2])
+//     [2]  attn_k.weight
+//     [3]  attn_v.weight
+//     [4]  attn_q_norm.weight
+//     [5]  attn_k_norm.weight
+//     [6]  attn_output.weight
+//     [7]  post_attention_norm.weight        (= post_norm)
+//     [8]  ffn_gate.weight
+//     [9]  ffn_up.weight
+//    [10]  ffn_down.weight
+//    [11..15] unused (zero)
+//
+//   GDN layer:
+//     [0]  attn_norm.weight                  (= input_norm)
+//     [1]  attn_qkv.weight    (fused Q|K|V, [n_embd, key_dim*2 + value_dim])
+//     [2]  attn_gate.weight                  (z)
+//     [3]  ssm_conv1d.weight
+//     [4]  ssm_dt.bias                       (alpha bias before softplus)
+//     [5]  ssm_a                             (per-v-head log-decay scale)
+//     [6]  ssm_alpha.weight
+//     [7]  ssm_beta.weight
+//     [8]  ssm_norm.weight                   (per-v-head RMSNorm before output)
+//     [9]  ssm_out.weight
+//    [10]  post_attention_norm.weight        (= post_norm)
+//    [11]  ffn_gate.weight
+//    [12]  ffn_up.weight
+//    [13]  ffn_down.weight
+//    [14..15] unused (zero)
+//
+// We could split this into two structs and a tagged union; for the scaffold
+// stage one fat struct is simpler. Stretch goal in a future slice: lift the
+// shared norms (attn_norm, post_attention_norm, ffn_*) into a base struct.
+
+struct Qwen35LayerWeights {
+    u64 slot00     // attn_norm                    (BOTH)
+    u64 slot01     // FULL: attn_q     | GDN: attn_qkv
+    u64 slot02     // FULL: attn_k     | GDN: attn_gate
+    u64 slot03     // FULL: attn_v     | GDN: ssm_conv1d
+    u64 slot04     // FULL: attn_q_norm| GDN: ssm_dt.bias
+    u64 slot05     // FULL: attn_k_norm| GDN: ssm_a
+    u64 slot06     // FULL: attn_output| GDN: ssm_alpha
+    u64 slot07     // FULL: post_attn_norm | GDN: ssm_beta
+    u64 slot08     // FULL: ffn_gate   | GDN: ssm_norm
+    u64 slot09     // FULL: ffn_up     | GDN: ssm_out
+    u64 slot10     // FULL: ffn_down   | GDN: post_attn_norm
+    u64 slot11     // FULL: --         | GDN: ffn_gate
+    u64 slot12     // FULL: --         | GDN: ffn_up
+    u64 slot13     // FULL: --         | GDN: ffn_down
+    u64 slot14     // unused
+    u64 slot15     // unused
+}
+
+// ─── Recurrent state (per GDN layer) ─────────────────────────────────
+//
+// Layout in a single contiguous block per layer for cache friendliness:
+//   conv_state:  3 * conv_dim  f32  = 3 * 6144 * 4 = 73 728 B
+//   ssm_state:   head_v * head_v * n_v_heads f32 = 128*128*16*4 = 1 048 576 B
+// Total per GDN layer: 1 122 304 B  (matches llama.cpp's "RS buffer = 19.27 MiB"
+// across 18 GDN layers).
+//
+// Driver allocates the full block; this helper computes the size.
+fn qwen35_gdn_state_bytes() -> u64 {
+    u64 conv_dim = QWEN35_SSM_N_K_HEADS * QWEN35_SSM_STATE_SIZE * 2 + QWEN35_SSM_INNER_SIZE
+    u64 conv_bytes = (QWEN35_SSM_CONV_K - 1) * conv_dim * 4
+    u64 ssm_bytes = QWEN35_SSM_STATE_SIZE * QWEN35_SSM_STATE_SIZE * QWEN35_SSM_N_V_HEADS * 4
+    return conv_bytes + ssm_bytes
+}
+
+// ─── GDN forward (STUB — Slice A) ────────────────────────────────────
+//
+// TODO Slice B+: implement the full gated delta rule (math captured in the
+// header comment above). For now we identity-pass: x_out := x_in.
+//
+// `state` is a pointer to this layer's recurrent-state block (size given by
+// `qwen35_gdn_state_bytes`). It MAY be 0 in the stub path since we don't
+// touch it; downstream slices will read/write it.
+fn qwen35_gdn_forward_layer_stub(u64 x_out, u64 x_in, Qwen35LayerWeights w, u64 pos, u64 state) {
+    // Suppress "unused" warnings on the in-progress fields.
+    u64 _w00 = w.slot00
+    u64 _w01 = w.slot01
+    u64 _p   = pos
+    u64 _s   = state
+    u64 hidden = QWEN3_HIDDEN
+    memcpy(x_out, x_in, hidden * 4)
+}
+
+// ─── Full-attn forward (STUB — Slice A) ──────────────────────────────
+//
+// TODO Slice B+: implement Q+gate fused projection, per-head QK-norm, MRoPE,
+// scaled-dot-product attention with KV cache, output gating via sigmoid(gate),
+// then o_proj. For now identity-pass.
+fn qwen35_fullattn_forward_layer_stub(u64 x_out, u64 x_in, Qwen35LayerWeights w,
+                                      u64 pos, u64 k_cache_layer, u64 v_cache_layer) {
+    u64 _w00 = w.slot00
+    u64 _w01 = w.slot01
+    u64 _p   = pos
+    u64 _kc  = k_cache_layer
+    u64 _vc  = v_cache_layer
+    u64 hidden = QWEN3_HIDDEN
+    memcpy(x_out, x_in, hidden * 4)
+}
+
+// Single dispatch entry — driver calls this for every layer regardless of
+// kind; it consults `qwen35_is_gdn_layer` and routes.
+fn qwen35_forward_layer(u64 x_out, u64 x_in, Qwen35LayerWeights w, u64 layer_idx,
+                        u64 pos, u64 k_cache_layer, u64 v_cache_layer, u64 gdn_state) {
+    u64 is_gdn = qwen35_is_gdn_layer(layer_idx)
+    if is_gdn != 0 {
+        qwen35_gdn_forward_layer_stub(x_out, x_in, w, pos, gdn_state)
+    } else {
+        qwen35_fullattn_forward_layer_stub(x_out, x_in, w, pos, k_cache_layer, v_cache_layer)
+    }
+}
