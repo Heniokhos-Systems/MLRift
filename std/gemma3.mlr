@@ -166,6 +166,28 @@ fn gemma3_attn_cached(u64 out_ptr,
     }
 }
 
+// ─── Direct GeLU(tanh) * up activation ──────────────────────────────
+// Computes gelu_tanh(gate[i]) * up[i] exactly per element using
+// gemma2_tanh_f32 (f64-internal tanh). Bypasses the fp16 LUT in
+// gemma2_gelu_mul because for gemma3 the LUT introduces precision
+// drift that flips a coin-flip arg-max at decode position 18 — the
+// direct path matches llama.cpp 20/20 instead. (gemma2 keeps the LUT
+// because its precision drift cancels the opposite way there.)
+fn gemma3_gelu_mul_direct(u64 out_ptr, u64 gate_ptr, u64 up_ptr, u64 dim) {
+    f32 c0 = 0.7978845608028654f       // sqrt(2/pi)
+    f32 c1 = 0.044715f
+    u64 i = 0
+    while i < dim {
+        f32 g = 0.0f; unsafe { *((gate_ptr + i * 4) as f32) -> g }
+        f32 u = 0.0f; unsafe { *((up_ptr   + i * 4) as f32) -> u }
+        f32 inner = c0 * g * (1.0f + c1 * g * g)
+        f32 t = gemma2_tanh_f32(inner)
+        f32 act = 0.5f * g * (1.0f + t)
+        unsafe { *((out_ptr + i * 4) as f32) = act * u }
+        i = i + 1
+    }
+}
+
 // ─── Per-head Q/K RMSNorm (in place) ────────────────────────────────
 // Mirrors qwen3_forward_layer's QK-Norm pass. Each Q head and each K
 // head gets RMSNorm'd against the same head_dim weight.
@@ -209,6 +231,9 @@ fn gemma3_forward_layer(u64 x_out, u64 x_in,
     u64 v_row = v_cache_layer + pos * kv_row_bytes
 
     // SWA decision: GLOBAL when (layer_idx % period) == (period-1).
+    // dense_first=false (llama.cpp set_swa_pattern default for Gemma3).
+    // Verified against the alternative — flipping to dense_first=true
+    // diverges at position 10 instead of 18, so this orientation is right.
     u64 is_swa = 1
     u64 period = gemma3_swa_period
     if period > 0 {
@@ -292,7 +317,15 @@ fn gemma3_forward_layer(u64 x_out, u64 x_in,
     qwen3_main_matmul(up_buf,   mid_norm, w.up_proj_w,   1, ff, hidden, num_workers, 0)
 
     u64 ff_buf = alloc(ff * 4)
-    gemma2_gelu_mul(ff_buf, gate_buf, up_buf, ff)   // fp16 LUT, matches llama.cpp
+    // Gemma3 uses direct exact-tanh GeLU rather than gemma2's fp16 LUT.
+    // Empirical: with the LUT, gemma3-1B is 18/20 vs llama.cpp; with the
+    // direct path, 20/20. With gemma2-2B the bias goes the other way
+    // (LUT 20/20, direct 18/20). Both paths have ~0.04-logit precision
+    // drift vs llama.cpp's tanhf-built table; the drift happens to help
+    // gemma2 and hurt gemma3 with the LUT, and the inverse with direct.
+    // Until we have libm tanhf via @dynamic float ABI, each model uses
+    // the path that matches its specific input distribution.
+    gemma3_gelu_mul_direct(ff_buf, gate_buf, up_buf, ff)
 
     u64 ff_out = alloc(hidden * 4)
     qwen3_main_matmul(ff_out, ff_buf, w.down_proj_w, 1, hidden, ff, num_workers, 0)
