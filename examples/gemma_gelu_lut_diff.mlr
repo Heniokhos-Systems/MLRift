@@ -1,0 +1,138 @@
+// Diagnostic for the gemma3 LUT-vs-direct mystery.
+//
+// Both the LUT path (gemma2_gelu_mul, fp16-quantize input → table
+// lookup → dequant) and the direct path (gemma3_gelu_mul_direct,
+// exact-tanh per element) should produce SAME f32 outputs when the
+// LUT entries are bit-identical to "fp16 of gelu(fp16_to_f32(i))".
+// If they don't, we know our LUT diverges from the reference
+// (llama.cpp's `ggml_table_gelu_f16`).
+//
+// We test by:
+//  1. Forcing the LUT to use libm tanhf (matches llama.cpp's seed).
+//  2. Triggering LUT init via a one-element gemma2_gelu_mul call.
+//  3. Walking ALL 65536 fp16 inputs (including subnormal/inf
+//     boundaries). For each:
+//       g     = fp16_to_f32(i)            // input
+//       direct_y  = libm-based exact-tanh GeLU   (with no fp16 quant)
+//       lut_y     = gguf_f16_to_f32(LUT[i])      (= what llama.cpp gives)
+//       quant_dir = gguf_f16_to_f32(fp16_rne(direct_y))
+//                                           (= what llama.cpp also computes)
+//     Record any (i) where lut_y != quant_dir — that means our LUT
+//     entry diverges from the canonical "round-trip-of-direct" entry.
+//  4. Print up to 8 mismatches + a summary count.
+//
+// Expected: 0 mismatches if the LUT path is bit-correct. Any nonzero
+// count points at our LUT seed differing from what llama.cpp would
+// build — which would explain gemma3's 18/20 LUT-path drift.
+
+import "../std/io.mlr"
+import "../std/fmt.mlr"
+import "../std/math_float.mlr"
+import "../std/qwen3.mlr"
+import "../std/gemma2.mlr"
+import "../std/gguf.mlr"
+
+@dynamic extern fn tanhf(f32 x) -> f32
+
+fn print_u64(u64 label, u64 v) {
+    print_str(label)
+    u64 s = fmt_dec(v)
+    print_str(s)
+    dealloc(s)
+    print_str("\n")
+}
+
+fn print_f32(u64 label, f32 v) {
+    print_str(label)
+    u64 s = fmt_f32(v, 9)
+    print_str(s)
+    dealloc(s)
+    print_str("\n")
+}
+
+fn print_hex_u16(u64 label, u64 v) {
+    print_str(label)
+    u64 s = fmt_dec(v)
+    print_str(s)
+    dealloc(s)
+    print_str("\n")
+}
+
+// Compute the exact-libm GeLU for a given fp16 input bit pattern.
+// Mirrors gemma2_gelu_table_init's libm path: x = fp16→f32, then
+// gelu(x) = 0.5*x*(1+tanh(c0*x*(1+c1*x*x))).
+fn libm_gelu_for_index(u64 i) -> f32 {
+    f32 x = gguf_f16_to_f32_exact(i)
+    f32 c0 = 0.7978845608028654f
+    f32 c1 = 0.044715f
+    f32 inner = c0 * x * (1.0f + c1 * x * x)
+    f32 t = tanhf(inner)
+    return 0.5f * x * (1.0f + t)
+}
+
+fn main() {
+    print_str("=== gemma GeLU LUT diff (vs libm-direct) ===\n")
+
+    // Force LUT seed = libm tanhf (matches llama.cpp's reference).
+    gemma2_set_gelu_table_use_libm(1)
+
+    // Trigger LUT init via a benign one-element call. Allocate small
+    // gate/up/out buffers to satisfy the call signature.
+    u64 g_buf = alloc(4)
+    u64 u_buf = alloc(4)
+    u64 o_buf = alloc(4)
+    f32 zero_f = 0.0f
+    unsafe { *(g_buf as f32) = zero_f }
+    unsafe { *(u_buf as f32) = zero_f }
+    gemma2_gelu_mul(o_buf, g_buf, u_buf, 1)
+    print_str("[LUT initialized via gemma2_gelu_mul]\n")
+
+    // Walk all 65536 entries.
+    u64 mismatches = 0
+    u64 max_print  = 8
+    u64 printed    = 0
+    u64 i = 0
+    while i < 65536 {
+        // Skip exp==31 (Inf/NaN) — neither side defines those.
+        u64 exp = (i >> 10) & 0x1F
+        if exp == 31 { i = i + 1; continue }
+
+        f32 direct_y = libm_gelu_for_index(i)
+        // Quantize direct result to fp16 (RNE, same as LUT init).
+        u64 quant_dir_f16 = _q8q8_fp32_to_fp16_rne(direct_y)
+
+        // Read our LUT entry.
+        u8 lo = load8(gemma2_gelu_table + i * 2 + 0)
+        u8 hi = load8(gemma2_gelu_table + i * 2 + 1)
+        u64 lut_f16 = lo | (hi << 8)
+
+        if lut_f16 != quant_dir_f16 {
+            mismatches = mismatches + 1
+            if printed < max_print {
+                print_str("  mismatch i=")
+                u64 si = fmt_dec(i); print_str(si); dealloc(si)
+                print_str("  lut=")
+                u64 sl = fmt_dec(lut_f16); print_str(sl); dealloc(sl)
+                print_str("  expected=")
+                u64 se = fmt_dec(quant_dir_f16); print_str(se); dealloc(se)
+                f32 x = gguf_f16_to_f32_exact(i)
+                print_str("  x=")
+                u64 sx = fmt_f32(x, 6); print_str(sx); dealloc(sx)
+                print_str("  direct_y=")
+                u64 sy = fmt_f32(direct_y, 6); print_str(sy); dealloc(sy)
+                print_str("\n")
+                printed = printed + 1
+            }
+        }
+        i = i + 1
+    }
+
+    print_u64("total mismatches = ", mismatches)
+    if mismatches == 0 {
+        print_str("=== LUT IS BIT-EXACT vs libm-direct ===\n")
+        print_str("  (gemma3's 18/20 drift is NOT in the LUT seed.)\n")
+    } else {
+        print_str("=== LUT DIFFERS — gemma3 drift may be here ===\n")
+    }
+    exit(0)
+}
