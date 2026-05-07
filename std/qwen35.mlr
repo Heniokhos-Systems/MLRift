@@ -350,6 +350,120 @@ fn qwen35_sigmoid_inplace_f32(u64 x_ptr, u64 n) {
     }
 }
 
+// ─── Slice C: GDN sub-ops ────────────────────────────────────────────
+//
+// Building blocks for the gated-delta-net forward pass. Each one is its
+// own small kernel so the Slice-D forward function reads as math rather
+// than open-coded scalar loops.
+
+// libm dynamic externs — needed for softplus's stable log(1+exp) path.
+// `exp_f32_fast` saturates at x>88 / x<-87 which is fine here, but
+// `log1p` (= log(1 + exp(x))) doesn't have a bit-stable hand-rolled
+// equivalent in the codebase so we lean on libm. Driver builds a
+// dynamic ELF (see project_libm_float_abi.md).
+@dynamic extern fn expf(f32 x) -> f32
+@dynamic extern fn logf(f32 x) -> f32
+
+// Per-group L2 normalization, in-place.
+//   for g in 0..n_groups:
+//       slice = ptr[g*group_dim .. (g+1)*group_dim]
+//       slice = slice / sqrt(sum(slice^2) + eps)
+// `eps` is `f_norm_rms_eps` (1e-6f for Qwen3.5).
+fn qwen35_l2_norm_inplace_f32(u64 ptr, u64 n_groups, u64 group_dim, f32 eps) {
+    u64 g = 0
+    while g < n_groups {
+        u64 base = ptr + g * group_dim * 4
+        f32 ss = qwen3_dot_avx2(base, base, group_dim)
+        f32 inv = 1.0f / sqrt_f32(ss + eps)
+        u64 i = 0
+        while i < group_dim {
+            f32 v = 0.0f
+            unsafe { *((base + i * 4) as f32) -> v }
+            unsafe { *((base + i * 4) as f32) = v * inv }
+            i = i + 1
+        }
+        g = g + 1
+    }
+}
+
+// In-place softplus. Numerically-stable form:
+//   x >= 0:  softplus(x) = x + log1p(exp(-x))
+//   x <  0:  softplus(x) =     log1p(exp( x))
+// We approximate `log1p(y)` as `logf(1 + y)` (libm); for the magnitudes
+// we hit (alpha after a 1024-row dot, plus dt bias), the 1+y term is
+// well above 1 so the simple form is fine.
+fn qwen35_softplus_inplace_f32(u64 ptr, u64 n) {
+    u64 i = 0
+    f32 one = 1.0f
+    f32 zero = 0.0f
+    while i < n {
+        f32 x = 0.0f
+        unsafe { *((ptr + i * 4) as f32) -> x }
+        f32 y = 0.0f
+        if x >= zero {
+            f32 e = expf(zero - x)
+            y = x + logf(one + e)
+        } else {
+            f32 e = expf(x)
+            y = logf(one + e)
+        }
+        unsafe { *((ptr + i * 4) as f32) = y }
+        i = i + 1
+    }
+}
+
+// Non-inplace sigmoid: out[i] = 1/(1+exp(-in[i])).
+fn qwen35_sigmoid_f32(u64 out_ptr, u64 in_ptr, u64 n) {
+    u64 i = 0
+    f32 one = 1.0f
+    while i < n {
+        f32 v = 0.0f
+        unsafe { *((in_ptr + i * 4) as f32) -> v }
+        f32 e = exp_f32_fast(0.0f - v)
+        f32 y = one / (one + e)
+        unsafe { *((out_ptr + i * 4) as f32) = y }
+        i = i + 1
+    }
+}
+
+// SiLU(z) for one f32 scalar. Used by gated-norm below.
+fn qwen35_silu_one_f32(f32 x) -> f32 {
+    f32 e = exp_f32_fast(0.0f - x)
+    f32 sig = 1.0f / (1.0f + e)
+    return x * sig
+}
+
+// Gated norm: out = RMSNorm(in, ssm_norm_w) elementwise * SiLU(z).
+// `in` and `z` are both `n_v_heads * head_v_dim` (= value_dim) floats,
+// with `ssm_norm_w` of length `head_v_dim` reused per v-head.
+//   for h in 0..n_v_heads:
+//       in_h = in[h*head_v_dim..(h+1)*head_v_dim]
+//       z_h  =  z[h*head_v_dim..(h+1)*head_v_dim]
+//       out_h = rmsnorm(in_h, ssm_norm_w) * silu(z_h)
+fn qwen35_gated_norm(u64 out_ptr, u64 in_ptr, u64 ssm_norm_w, u64 z_ptr,
+                     u64 n_v_heads, u64 head_v_dim) {
+    u64 h = 0
+    while h < n_v_heads {
+        u64 in_h  = in_ptr  + h * head_v_dim * 4
+        u64 out_h = out_ptr + h * head_v_dim * 4
+        u64 z_h   = z_ptr   + h * head_v_dim * 4
+        // RMSNorm into out_h.
+        qwen3_rmsnorm_f32_weights(out_h, in_h, ssm_norm_w, head_v_dim)
+        // Multiply by SiLU(z_h).
+        u64 i = 0
+        while i < head_v_dim {
+            f32 a = 0.0f
+            f32 b = 0.0f
+            unsafe { *((out_h + i * 4) as f32) -> a }
+            unsafe { *((z_h   + i * 4) as f32) -> b }
+            f32 sig = qwen35_silu_one_f32(b)
+            unsafe { *((out_h + i * 4) as f32) = a * sig }
+            i = i + 1
+        }
+        h = h + 1
+    }
+}
+
 // ─── Full-attn forward (Slice B) ─────────────────────────────────────
 //
 // Qwen3.5/Next full-attention layer with fused Q+gate projection +
