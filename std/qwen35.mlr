@@ -650,17 +650,372 @@ fn qwen35_fullattn_forward_layer(u64 x_out, u64 x_in, Qwen35LayerWeights w,
     dealloc(gate_ffn); dealloc(up_ffn); dealloc(ff_buf); dealloc(ff_out)
 }
 
+// ─── GDN forward (Slice D) ───────────────────────────────────────────
+//
+// Autoregressive Gated DeltaNet layer (n_tokens == 1).
+// Math sequence (matches llama.cpp qwen35.cpp::build_layer_attn_linear +
+// delta-net-base.cpp::build_delta_net_autoregressive):
+//
+//   cur     = RMSNorm(x_in, attn_norm)
+//   qkv_mix = wqkv      @ cur                       [conv_dim = 6144]
+//   z       = wqkv_gate @ cur                       [value_dim = 2048]
+//   beta    = sigmoid(wbeta @ cur)                  [n_v_heads = 16]
+//   alpha   = walpha @ cur + ssm_dt                 [16]
+//   alpha_s = softplus(alpha)                       [16]
+//   gate_g  = alpha_s * ssm_a                       [16]   (negative)
+//
+//   // Causal depthwise conv1d over a 4-step rolling window per channel.
+//   for ch in 0..conv_dim:
+//       conv_buf[ch] = conv_state[0,ch]*W[0,ch] + conv_state[1,ch]*W[1,ch]
+//                    + conv_state[2,ch]*W[2,ch] + qkv_mix[ch]    *W[3,ch]
+//   // Roll the state: drop the oldest, append the new qkv_mix row.
+//   for ch in 0..conv_dim:
+//       conv_state[0,ch] = conv_state[1,ch]
+//       conv_state[1,ch] = conv_state[2,ch]
+//       conv_state[2,ch] = qkv_mix[ch]
+//   conv_qkv = silu(conv_buf)                       [6144]
+//
+//   q_conv = conv_qkv[          0 ..  key_dim]      [2048] (16 heads × 128)
+//   k_conv = conv_qkv[    key_dim .. 2*key_dim]     [2048] (16 heads × 128)
+//   v_conv = conv_qkv[2*key_dim   .. 2*key_dim+value_dim]  [2048] (16 heads × 128)
+//
+//   // L2-normalize per (k_head, head_k_dim).
+//   q_conv = L2(q_conv)
+//   k_conv = L2(k_conv)
+//
+//   scale = 1 / sqrt(head_k_dim) = 1 / sqrt(128) ≈ 0.088388
+//   q_conv *= scale
+//
+//   // Per v-head autoregressive gated delta rule.
+//   for h in 0..n_v_heads:
+//       q  = q_conv[h*S..(h+1)*S]      // S = head_v_dim = 128
+//       k  = k_conv[h*S..(h+1)*S]
+//       v  = v_conv[h*S..(h+1)*S]
+//       g  = exp(gate_g[h])            // diagonal forget scalar
+//       b_ = beta[h]
+//       state_h = ssm_state[h]         // shape [S, S], row-major [i, j]
+//
+//       // 1) Decay
+//       state_h *= g
+//
+//       // 2) sk[j] = sum_i state_h[i, j] * k[i]
+//       // 3) d[i]  = (v[i] - sk[i]) * b_
+//       // 4) state_h[i, j] += k[i] * d[j]
+//       // 5) o[j]  = sum_i state_h[i, j] * q[i]
+//
+//   // o is [value_dim=2048] flat; gated norm + output projection.
+//   o_normed = RMSNorm(o, ssm_norm) * silu(z)       (per v-head)
+//   cur_out  = ssm_out @ o_normed                   [hidden = 1024]
+//
+// Then the standard residual + post_attention_norm + SwiGLU FFN + residual
+// (shared with the full-attn layer).
+//
+// Recurrent state pointer points at this layer's per-layer block:
+//   conv_state:  3 * conv_dim       f32 = 3 * 6144 = 73 728 B
+//   ssm_state:   n_v_heads * S * S  f32 = 16 * 128 * 128 = 1 048 576 B
+//   total per layer: 1 122 304 B (matches qwen35_gdn_state_bytes()).
+fn qwen35_gdn_forward_layer(u64 x_out, u64 x_in, Qwen35LayerWeights w,
+                            u64 pos, u64 rs_layer, u64 num_workers) {
+    u64 hidden    = QWEN3_HIDDEN
+    u64 ff        = QWEN3_INTERMEDIATE
+    u64 n_k_h     = QWEN35_SSM_N_K_HEADS
+    u64 n_v_h     = QWEN35_SSM_N_V_HEADS
+    u64 head_dim  = QWEN35_SSM_STATE_SIZE          // 128
+    u64 key_dim   = n_k_h * head_dim                // 2048
+    u64 value_dim = QWEN35_SSM_INNER_SIZE           // 2048
+    u64 conv_dim  = key_dim * 2 + value_dim         // 6144
+    u64 conv_k    = QWEN35_SSM_CONV_K               // 4
+
+    // Suppress unused-warning for `pos` (state is per-layer; pos isn't used
+    // explicitly because the state itself encodes history).
+    u64 _p = pos
+
+    u64 attn_norm_w = w.slot00
+    u64 wqkv        = w.slot01
+    u64 wqkv_gate   = w.slot02
+    u64 ssm_conv1d  = w.slot03
+    u64 ssm_dt_bias = w.slot04
+    u64 ssm_a       = w.slot05
+    u64 walpha      = w.slot06
+    u64 wbeta       = w.slot07
+    u64 ssm_norm_w  = w.slot08
+    u64 ssm_out_w   = w.slot09
+    u64 post_norm_w = w.slot10
+    u64 wg_ffn      = w.slot11
+    u64 wu_ffn      = w.slot12
+    u64 wd_ffn      = w.slot13
+
+    // Recurrent-state pointers within the per-layer block:
+    //   [0 .. (conv_k-1)*conv_dim*4)  conv_state, layout [t, ch] = state[t + ch*(conv_k-1)]
+    //   [.. + n_v_h*head_dim*head_dim*4) ssm_state, layout [h, i, j] flat row-major
+    u64 conv_state_bytes = (conv_k - 1) * conv_dim * 4
+    u64 conv_state = rs_layer
+    u64 ssm_state  = rs_layer + conv_state_bytes
+
+    // ── Save residual + RMSNorm input ──
+    u64 resid = alloc(hidden * 4)
+    memcpy(resid, x_in, hidden * 4)
+    u64 cur_norm = alloc(hidden * 4)
+    qwen3_main_rmsnorm(cur_norm, x_in, attn_norm_w, hidden)
+
+    // ── 1. Input projections ──
+    u64 qkv_mix = alloc(conv_dim * 4)
+    u64 z_buf   = alloc(value_dim * 4)
+    qwen3_main_matmul(qkv_mix, cur_norm, wqkv,      1, conv_dim,  hidden, num_workers, 0)
+    qwen3_main_matmul(z_buf,   cur_norm, wqkv_gate, 1, value_dim, hidden, num_workers, 0)
+
+    // ── 2. beta = sigmoid(wbeta @ cur) ──
+    u64 beta_buf = alloc(n_v_h * 4)
+    qwen3_main_matmul(beta_buf, cur_norm, wbeta, 1, n_v_h, hidden, num_workers, 0)
+    qwen35_sigmoid_inplace_f32(beta_buf, n_v_h)
+
+    // ── 3. alpha = softplus(walpha @ cur + ssm_dt); gate_g = alpha * ssm_a ──
+    u64 alpha_buf = alloc(n_v_h * 4)
+    qwen3_main_matmul(alpha_buf, cur_norm, walpha, 1, n_v_h, hidden, num_workers, 0)
+    u64 ai = 0
+    while ai < n_v_h {
+        f32 a = 0.0f
+        f32 dtb = 0.0f
+        unsafe { *((alpha_buf  + ai * 4) as f32) -> a   }
+        unsafe { *((ssm_dt_bias + ai * 4) as f32) -> dtb }
+        unsafe { *((alpha_buf  + ai * 4) as f32) = a + dtb }
+        ai = ai + 1
+    }
+    qwen35_softplus_inplace_f32(alpha_buf, n_v_h)
+    u64 gate_g = alloc(n_v_h * 4)
+    u64 gi = 0
+    while gi < n_v_h {
+        f32 a = 0.0f
+        f32 ag = 0.0f
+        unsafe { *((alpha_buf + gi * 4) as f32) -> a   }
+        unsafe { *((ssm_a    + gi * 4) as f32) -> ag  }
+        unsafe { *((gate_g   + gi * 4) as f32) = a * ag }
+        gi = gi + 1
+    }
+    dealloc(alpha_buf)
+
+    // ── 4. Causal depthwise conv1d w/ rolling state ──
+    // conv_state layout: [3, conv_dim] row-major, i.e. state[t, ch] at
+    // offset (t + ch*3) * 4. (Matches llama.cpp's [conv_kernel-1, conv_channels].)
+    // ssm_conv1d weight: [conv_k=4, conv_dim] row-major, weight[k, ch] at
+    // offset (k + ch*4) * 4.
+    u64 conv_buf = alloc(conv_dim * 4)
+    u64 ks = conv_k - 1                                       // 3
+    u64 ch = 0
+    while ch < conv_dim {
+        u64 sbase = conv_state + ch * ks * 4                  // state[*, ch]
+        u64 wbase = ssm_conv1d + ch * conv_k * 4              // weight[*, ch]
+        f32 s0 = 0.0f; f32 s1 = 0.0f; f32 s2 = 0.0f
+        unsafe { *((sbase + 0 * 4) as f32) -> s0 }
+        unsafe { *((sbase + 1 * 4) as f32) -> s1 }
+        unsafe { *((sbase + 2 * 4) as f32) -> s2 }
+        f32 x_new = 0.0f
+        unsafe { *((qkv_mix + ch * 4) as f32) -> x_new }
+        f32 w0 = 0.0f; f32 w1 = 0.0f; f32 w2 = 0.0f; f32 w3 = 0.0f
+        unsafe { *((wbase + 0 * 4) as f32) -> w0 }
+        unsafe { *((wbase + 1 * 4) as f32) -> w1 }
+        unsafe { *((wbase + 2 * 4) as f32) -> w2 }
+        unsafe { *((wbase + 3 * 4) as f32) -> w3 }
+        f32 sum = s0 * w0 + s1 * w1 + s2 * w2 + x_new * w3
+        unsafe { *((conv_buf + ch * 4) as f32) = sum }
+        // Roll state: [s1, s2, x_new].
+        unsafe { *((sbase + 0 * 4) as f32) = s1 }
+        unsafe { *((sbase + 1 * 4) as f32) = s2 }
+        unsafe { *((sbase + 2 * 4) as f32) = x_new }
+        ch = ch + 1
+    }
+    dealloc(qkv_mix)
+
+    // ── 5. SiLU(conv_buf) → split into Q, K, V ──
+    u64 si = 0
+    while si < conv_dim {
+        f32 v = 0.0f
+        unsafe { *((conv_buf + si * 4) as f32) -> v }
+        f32 e = exp_f32_fast(0.0f - v)
+        f32 sig = 1.0f / (1.0f + e)
+        unsafe { *((conv_buf + si * 4) as f32) = v * sig }
+        si = si + 1
+    }
+    u64 q_buf = conv_buf                                       // [0 .. key_dim)
+    u64 k_buf = conv_buf + key_dim * 4                         // [key_dim .. 2*key_dim)
+    u64 v_buf = conv_buf + 2 * key_dim * 4                     // [2*key_dim .. 2*key_dim + value_dim)
+
+    // ── 6. L2-norm Q (per k-head) and K (per k-head). eps = rmsnorm_eps. ──
+    qwen3_rmsnorm_eps_init()
+    f32 eps_norm = qwen3_rmsnorm_eps
+    qwen35_l2_norm_inplace_f32(q_buf, n_k_h, head_dim, eps_norm)
+    qwen35_l2_norm_inplace_f32(k_buf, n_k_h, head_dim, eps_norm)
+
+    // ── 7. Scale Q by 1/sqrt(head_dim) ──
+    f32 q_scale = 1.0f / sqrt_f32(int_to_f32(head_dim))
+    u64 qi = 0
+    while qi < key_dim {
+        f32 v = 0.0f
+        unsafe { *((q_buf + qi * 4) as f32) -> v }
+        unsafe { *((q_buf + qi * 4) as f32) = v * q_scale }
+        qi = qi + 1
+    }
+
+    // ── 8. Per-v-head gated delta rule (autoregressive, n_tokens=1) ──
+    // n_k_h = n_v_h here (Qwen3.5-0.8B), so q/k/v share the per-head index.
+    u64 o_buf = alloc(value_dim * 4)
+    u64 sk_scratch = alloc(head_dim * 4)
+    u64 d_scratch  = alloc(head_dim * 4)
+    u64 head_state_bytes = head_dim * head_dim * 4
+    u64 hi = 0
+    while hi < n_v_h {
+        u64 q_h = q_buf + hi * head_dim * 4
+        u64 k_h = k_buf + hi * head_dim * 4
+        u64 v_h = v_buf + hi * head_dim * 4
+        u64 o_h = o_buf + hi * head_dim * 4
+        u64 s_h = ssm_state + hi * head_state_bytes
+
+        f32 gg = 0.0f
+        unsafe { *((gate_g + hi * 4) as f32) -> gg }
+        f32 g_exp = exp_f32_fast(gg)
+
+        f32 bb = 0.0f
+        unsafe { *((beta_buf + hi * 4) as f32) -> bb }
+
+        // 1) state[i, j] *= g_exp
+        u64 si2 = 0
+        u64 nij = head_dim * head_dim
+        while si2 < nij {
+            f32 sv = 0.0f
+            unsafe { *((s_h + si2 * 4) as f32) -> sv }
+            unsafe { *((s_h + si2 * 4) as f32) = sv * g_exp }
+            si2 = si2 + 1
+        }
+
+        // 2) sk[j] = sum_i state[i, j] * k[i]
+        //    state row-major [i, j] → element at offset i*head_dim + j.
+        u64 jj = 0
+        while jj < head_dim {
+            f32 acc = 0.0f
+            u64 ii = 0
+            while ii < head_dim {
+                f32 sv = 0.0f
+                f32 kv = 0.0f
+                unsafe { *((s_h + (ii * head_dim + jj) * 4) as f32) -> sv }
+                unsafe { *((k_h + ii * 4) as f32) -> kv }
+                acc = acc + sv * kv
+                ii = ii + 1
+            }
+            unsafe { *((sk_scratch + jj * 4) as f32) = acc }
+            jj = jj + 1
+        }
+
+        // 3) d[i] = (v[i] - sk[i]) * beta_h
+        u64 ii2 = 0
+        while ii2 < head_dim {
+            f32 vv = 0.0f
+            f32 sk_ = 0.0f
+            unsafe { *((v_h + ii2 * 4) as f32) -> vv }
+            unsafe { *((sk_scratch + ii2 * 4) as f32) -> sk_ }
+            unsafe { *((d_scratch  + ii2 * 4) as f32) = (vv - sk_) * bb }
+            ii2 = ii2 + 1
+        }
+
+        // 4) state[i, j] += k[i] * d[j]   (outer product)
+        u64 i3 = 0
+        while i3 < head_dim {
+            f32 ki = 0.0f
+            unsafe { *((k_h + i3 * 4) as f32) -> ki }
+            u64 j3 = 0
+            while j3 < head_dim {
+                f32 dj = 0.0f
+                unsafe { *((d_scratch + j3 * 4) as f32) -> dj }
+                f32 sv = 0.0f
+                unsafe { *((s_h + (i3 * head_dim + j3) * 4) as f32) -> sv }
+                unsafe { *((s_h + (i3 * head_dim + j3) * 4) as f32) = sv + ki * dj }
+                j3 = j3 + 1
+            }
+            i3 = i3 + 1
+        }
+
+        // 5) o[j] = sum_i state[i, j] * q[i]
+        u64 j5 = 0
+        while j5 < head_dim {
+            f32 acc = 0.0f
+            u64 i5 = 0
+            while i5 < head_dim {
+                f32 sv = 0.0f
+                f32 qv = 0.0f
+                unsafe { *((s_h + (i5 * head_dim + j5) * 4) as f32) -> sv }
+                unsafe { *((q_h + i5 * 4) as f32) -> qv }
+                acc = acc + sv * qv
+                i5 = i5 + 1
+            }
+            unsafe { *((o_h + j5 * 4) as f32) = acc }
+            j5 = j5 + 1
+        }
+
+        hi = hi + 1
+    }
+    dealloc(sk_scratch); dealloc(d_scratch)
+    dealloc(conv_buf)
+    dealloc(beta_buf); dealloc(gate_g)
+
+    // ── 9. Gated norm: o_norm = RMSNorm(o, ssm_norm) * silu(z) ──
+    u64 o_normed = alloc(value_dim * 4)
+    qwen35_gated_norm(o_normed, o_buf, ssm_norm_w, z_buf, n_v_h, head_dim)
+    dealloc(o_buf); dealloc(z_buf)
+
+    // ── 10. Output projection: cur_out = ssm_out @ o_normed ──
+    u64 cur_out = alloc(hidden * 4)
+    qwen3_main_matmul(cur_out, o_normed, ssm_out_w, 1, hidden, value_dim, num_workers, 0)
+    dealloc(o_normed)
+
+    // ── 11. First residual: mid = resid + cur_out ──
+    u64 mid = alloc(hidden * 4)
+    u64 ri = 0
+    while ri < hidden {
+        f32 a = 0.0f
+        f32 b = 0.0f
+        unsafe { *((resid   + ri * 4) as f32) -> a }
+        unsafe { *((cur_out + ri * 4) as f32) -> b }
+        unsafe { *((mid + ri * 4) as f32) = a + b }
+        ri = ri + 1
+    }
+    dealloc(cur_out); dealloc(resid); dealloc(cur_norm)
+
+    // ── 12. Post-attn RMSNorm + SwiGLU FFN + second residual ──
+    u64 mid_norm = alloc(hidden * 4)
+    qwen3_main_rmsnorm(mid_norm, mid, post_norm_w, hidden)
+
+    u64 gate_ffn = alloc(ff * 4)
+    u64 up_ffn   = alloc(ff * 4)
+    qwen3_main_matmul(gate_ffn, mid_norm, wg_ffn, 1, ff, hidden, num_workers, 0)
+    qwen3_main_matmul(up_ffn,   mid_norm, wu_ffn, 1, ff, hidden, num_workers, 0)
+
+    u64 ff_buf = alloc(ff * 4)
+    qwen3_silu_mul(ff_buf, gate_ffn, up_ffn, ff)
+
+    u64 ff_out = alloc(hidden * 4)
+    qwen3_main_matmul(ff_out, ff_buf, wd_ffn, 1, hidden, ff, num_workers, 0)
+
+    u64 fi = 0
+    while fi < hidden {
+        f32 a = 0.0f
+        f32 b = 0.0f
+        unsafe { *((mid + fi * 4) as f32) -> a }
+        unsafe { *((ff_out + fi * 4) as f32) -> b }
+        unsafe { *((x_out + fi * 4) as f32) = a + b }
+        fi = fi + 1
+    }
+
+    dealloc(mid); dealloc(mid_norm)
+    dealloc(gate_ffn); dealloc(up_ffn); dealloc(ff_buf); dealloc(ff_out)
+}
+
 // Single dispatch entry — driver calls this for every layer regardless of
 // kind; it consults `qwen35_is_gdn_layer` and routes.
-//
-// `num_workers` is needed by the full-attn matmuls; the GDN path ignores it
-// for now (still stubbed; will be wired up in Slice C+D).
 fn qwen35_forward_layer(u64 x_out, u64 x_in, Qwen35LayerWeights w, u64 layer_idx,
                         u64 pos, u64 k_cache_layer, u64 v_cache_layer,
                         u64 gdn_state, u64 num_workers) {
     u64 is_gdn = qwen35_is_gdn_layer(layer_idx)
     if is_gdn != 0 {
-        qwen35_gdn_forward_layer_stub(x_out, x_in, w, pos, gdn_state)
+        qwen35_gdn_forward_layer(x_out, x_in, w, pos, gdn_state, num_workers)
     } else {
         qwen35_fullattn_forward_layer(x_out, x_in, w, pos,
                                       k_cache_layer, v_cache_layer, num_workers)
