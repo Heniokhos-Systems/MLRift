@@ -81,6 +81,8 @@ fn main() {
     qwen3_set_qknorm(0)                       // Mistral: no per-head Q/K RMSNorm
     qwen3_set_rope_base(10000)                // Mistral 7B-Instruct (v0.1/v0.2) theta = 1e4
     qwen3_set_rmsnorm_eps_bits(0x3727C5AC)    // rms_norm_eps = 1e-5
+    qwen3_set_rope_pair_layout(1)             // Mistral: NORM consecutive pairs (Llama family)
+    qwen3_set_q8_bitexact(1)                  // bit-exact Q8_0×Q8_0 matches llama.cpp
 
     u64 path = "/usr/share/ollama/.ollama/models/blobs/sha256-0624ba75c3cebd8c75b53cc7bcc3f344ad5a410ef74bfc68d757a9ac6764495a"
     eout("[mistral7b] loading weights from ollama blob\n")
@@ -203,19 +205,24 @@ fn main() {
     eout("[mistral7b] embed row decoded on demand ("); eu64(row_bytes); eout(" B/row)\n")
 
     // ---- Hardcoded prompt ([BOS, "▁hello"]) ----
-    // Mistral SentencePiece: BOS=1. Token id for "▁hello" (with leading
-    // SP space) needs to be looked up from the tokenizer. Placeholder
-    // ID 26277 = "hello" in the Mistral v0.3 vocab — verify after pull.
-    u64 prompt_count = 2
+    // Mistral SentencePiece tokenisation of "hello" (lowercase, no leading
+    // space).  Verified via llama.cpp's dump-tokens against this Q8_0 blob:
+    //   prompt_tokens = 1 6312 28709
+    //                   <s> ▁hell o
+    // The vocab does NOT have a single token for "▁hello" — only the
+    // capitalised "▁Hello" (22557).  Three tokens, not two.
+    u64 prompt_count = 3
     u64 seq_cap = prompt_count + max_new
     u64 seq_ids32 = alloc(seq_cap * 4)
-    u32 t0 = 1        // BOS
-    u32 t1 = 22557    // "▁Hello" in Mistral SentencePiece (with leading space)
+    u32 t0 = 1        // BOS = <s>
+    u32 t1 = 6312     // "▁hell"
+    u32 t2 = 28709    // "o"
     unsafe { *((seq_ids32 + 0 * 4) as uint32) = t0 }
     unsafe { *((seq_ids32 + 1 * 4) as uint32) = t1 }
+    unsafe { *((seq_ids32 + 2 * 4) as uint32) = t2 }
     u64 seq_len = prompt_count
 
-    eout("[mistral7b] prompt_tokens="); eu64(prompt_count); eout(" ids=[1, 22557] (\"<s> Hello\")\n")
+    eout("[mistral7b] prompt_tokens="); eu64(prompt_count); eout(" ids=[1, 6312, 28709] (\"<s>▁hell o\")\n")
 
     // ---- Prefill: forward over prompt[0..N-2] to populate K/V cache. ----
     u64 pos = 0
@@ -267,7 +274,7 @@ fn main() {
 
         // Final F32 RMSNorm + lm_head against the SEPARATE output.weight.
         qwen3_rmsnorm_f32_weights(final_out, x_cur, norm_t.ptr, hidden)
-        matmul_q8_0_weights_f32(logits, final_out, lmhead_ptr, 1, vocab, hidden, num_workers)
+        matmul_q8_0_q8_0_f32(logits, final_out, lmhead_ptr, 1, vocab, hidden, num_workers)
 
         u64 best_id = 0
         f32 best_val = 0.0f
