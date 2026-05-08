@@ -2185,7 +2185,11 @@ fn _emit_phase7_attn_decode_coop_inline() {
 //   slice 4.19.5 — phase 9 (o_proj matmul + residual-add, WG<256).
 //   slice 4.19.6 — phase 11 (post-attn rmsnorm, WG-0; reuses the phase-1
 //                  WG-0-gated rmsnorm body with parameterized kernarg offsets).
-// Phases 13..17 remain stubs (s_nop 0) until later slices.
+//   slice 4.19.7 — phase 13 (gate_up matmul, WG<256; reuses the phase-3
+//                  gemv-coop-bf16-padded-strided body with new kernarg triple).
+//   slice 4.19.8 — phase 15 (silu_mul elem-strided, WG<256; NEW shape — SiLU(g)*u
+//                  in-place over gu_scratch[0..FF]).
+// Phases 17 remain stubs (s_nop 0) until later slices.
 //
 // max_phase early-exit simm16 values: every phase boundary 0..7 is patched
 // dynamically (body sizes vary across recognizer outcomes).
@@ -2193,6 +2197,7 @@ fn _emit_phase7_attn_decode_coop_inline() {
 // KD parameters match the v1 reference: MEGA_KERNARG_COUNT args, 192-byte
 // kernarg segment, rsrc2=0x9E (wg_id_x in s15), MEGA_WG_PERSIST=512.
 // LDS=516 (wave_tmp[1]=4B + attn_w_lds[128]=512B = 516B).
+
 fn mega_emit_stub_kernel(uint64 kname_ptr, uint64 nl, uint64 body_node) -> uint64 {
     asm_init()
 
@@ -2332,8 +2337,121 @@ fn mega_emit_stub_kernel(uint64 kname_ptr, uint64 nl, uint64 body_node) -> uint6
     uint64 mp7_cbranch_pos = asm_text_len / 4
     asm_s_cbranch_scc1(0)
 
-    // Phase 15 stub
-    asm_u32(0xBF800000)
+    // ── Phase 15: SiLU(gate) * up, in-place over gu_scratch[0..FF] ────────
+    // FF=3072, wg_active=256, WAVE=32 → 8192 lane-slots, ELEMS_PER_WG=1.
+    // wg_id_x lives in s28 (phase 5 already clobbered s15; prologue stashed
+    // the original wg_id_x to s28 for downstream phases — same constraint
+    // that forced phases 9 / 11 / 13 to read s28).
+    // Math (per element idx):
+    //   g = gu_scratch[idx]; u = gu_scratch[FF+idx]
+    //   gu_scratch[idx] = (g/(1+exp(-g))) * u  =  silu(g) * u
+    // SGPRs: s[2:3] = gu_scratch ptr (loaded from kernarg byte 0x80),
+    //        s14 = log2(e) literal scratch / shift result,
+    //        s17 = saved exec_lo for the per-lane idx<FF gate.
+    // VGPRs: v0 = lane id (r/o); v2 = idx; v3 = byte_off_g = idx*4;
+    //        v4 = byte_off_u = byte_off_g + FF*4; v8 = g; v9 = u;
+    //        v10 = silu/exp scratch.
+    // gfx11 hazards: every VALU result feeding VMEM gets s_delay_alu instid0(VALU_DEP_1).
+    // SiLU compose mirrors standalone silu_mul_3a (format_amdgpu.mlr ~13839):
+    //   log2(e) → v_mul_f32_e64 NEG-src0 → v_exp_f32 → v_add_f32 1.0 →
+    //   v_rcp_f32 → v_mul_f32 g (silu) → v_mul_f32 u.
+    // Marker recognized inline; body inlined here (no wrapper fn) per fn-
+    // table-cap discipline (slice 4.19.5/6/7 convention; adding a wrapper
+    // here would push the bootstrap over the 1024-fn cap).
+    if _body_has_marker(body_node, "silu_mul_elem_strided_marker", 28) != 0 {
+        // ── WG gate: skip if wg_id (s28) >= 256 ───────────────────────────
+        // s_cmp_ge_u32 s28, 256 (literal): SOPC op 0x09, ssrc1=0xFF (lit follows)
+        uint64 p15_wg_gate_pos = asm_text_len / 4
+        asm_u32(0xBF09FF1C)         // s_cmp_ge_u32 s28, lit
+        asm_u32(256)
+        asm_s_cbranch_scc1(0)       // patched at .phase15_done
+
+        // ── Load gu_scratch base ptr → s[2:3] ─────────────────────────────
+        asm_s_load_b64_off(1, 0, 0x80)
+        asm_s_waitcnt_lgkmcnt_zero()
+
+        // ── Compute idx = wg_id*32 + lane = (s28<<5) + v0 → v2 ────────────
+        // s_lshl_b32 s14, s28, 5: SOP2 op 0x08
+        //   word = (2<<30)|(8<<23)|(0x0E<<16)|(0x85<<8)|0x1C = 0x840E851C
+        asm_u32(0x840E851C)
+        // v_add_nc_u32_e32 v2, s14, v0: VOP2 op 0x25
+        //   word = (0x25<<25)|(2<<17)|(0<<9)|0x0E = 0x4A04000E
+        asm_u32(0x4A04000E)
+        // v_lshlrev_b32_e32 v3, 2, v2: byte_off_g = idx*4
+        asm_v_lshlrev_b32_imm(3, 2, 2)
+
+        // ── Per-lane gate: skip if idx >= 3072 ───────────────────────────
+        // v_cmp_gt_u32_e32 vcc_lo, 3072, v2 → vcc_lo = (3072 > idx) = (idx < 3072)
+        //   word1 = (0x3E<<25)|(0x4C<<17)|(2<<9)|0xFF = 0x7C9804FF
+        asm_u32(0x7C9804FF)
+        asm_u32(3072)
+        // s_and_saveexec_b32 s17, vcc_lo  (s17 = old exec; exec &= vcc_lo)
+        asm_s_and_saveexec_b32_vcc_lo(17)
+        // s_cbranch_execz .phase15_lane_done (patched after body)
+        uint64 p15_lane_execz_pos = asm_text_len / 4
+        asm_s_cbranch_execz(0)
+
+        // ── byte_off_u = byte_off_g + FF*4 = byte_off_g + 12288 → v4 ─────
+        // v_add_nc_u32_e32 v4, lit, v3: VOP2 op 0x25, src0=0xFF (lit follows)
+        //   word1 = (0x25<<25)|(4<<17)|(3<<9)|0xFF = 0x4A0806FF
+        asm_u32(0x4A0806FF)
+        asm_u32(3072 * 4)
+        asm_s_delay_alu(0x01)       // VALU→VMEM hazard
+
+        // ── Load g (= gu_scratch[byte_off_g]) and u (= gu_scratch[byte_off_u]) ─
+        // global_load_b32 v8, v3, s[2:3]: word2 = (8<<24)|(2<<16)|3 = 0x08020003
+        asm_u32(0xDC520000)
+        asm_u32(0x08020003)
+        // global_load_b32 v9, v4, s[2:3]: word2 = (9<<24)|(2<<16)|4 = 0x09020004
+        asm_u32(0xDC520000)
+        asm_u32(0x09020004)
+        asm_s_waitcnt_vmcnt_zero()
+
+        // ── SiLU compose: silu(g) = g / (1 + exp(-g)) ────────────────────
+        // s_mov_b32 s14, log2(e) = 0x3FB8AA3B (literal-32 form)
+        asm_s_mov_b32_lit32(14, 0x3FB8AA3B)
+        // v_mul_f32_e64 v10, -v8, s14 → v10 = -g * log2(e)
+        //   word1 = 0xD508_000A
+        //   word2 = NEG_src0 (bit 29) | (s14<<9) | (0x100|8) = 0x2000_1D08
+        asm_u32(0xD508000A)
+        asm_u32(0x20001D08)
+        // v_exp_f32_e32 v10, v10 → v10 = exp2(-g*log2e) = exp(-g)
+        //   VOP1 op 0x4B: word = 0x7E14_4B0A
+        asm_u32(0x7E144B0A)
+        // v_add_f32_e32 v10, 1.0, v10 → v10 = 1 + exp(-g)
+        //   VOP2 op 0x03, src0 = 0xF2 (inline +1.0 f32): word = 0x06141 4F2
+        asm_u32(0x061414F2)
+        // v_rcp_f32_e32 v10, v10 → v10 = 1/(1+exp(-g)) = sigmoid(g)
+        //   VOP1 op 0x55: word = 0x7E14_550A
+        asm_u32(0x7E14550A)
+        // v_mul_f32_e32 v8, v8, v10 → v8 = g * sigmoid(g) = silu(g)
+        //   VOP2 op 0x08, src0 = (0x100|v8) = 0x108: word = 0x1010_1508
+        asm_u32(0x10101508)
+        // v_mul_f32_e32 v8, v8, v9 → v8 = silu(g) * u
+        //   word = 0x1010_1308
+        asm_u32(0x10101308)
+
+        // ── Store back to gu_scratch[byte_off_g] ─────────────────────────
+        asm_s_delay_alu(0x01)       // VALU→VMEM hazard
+        // global_store_b32 v3, v8, s[2:3]: word2 = (2<<16)|(8<<8)|3 = 0x00020803
+        asm_u32(0xDC6A0000)
+        asm_u32(0x00020803)
+        asm_s_waitcnt_vscnt_zero()  // drain store before exec restore
+
+        // ── .phase15_lane_done: patch the per-lane skip target + restore exec ─
+        uint64 p15_lane_done = asm_text_len / 4
+        uint64 p15_lane_off = p15_lane_done - p15_lane_execz_pos - 1
+        asm_patch_u32(p15_lane_execz_pos, 0xBFA50000 | (p15_lane_off & 0xFFFF))
+        // s_or_b32 exec_lo, exec_lo, s17 (restore full exec for the WG)
+        asm_u32(0x8C7E117E)
+
+        // ── Patch WG gate skip-branch to here (.phase15_done) ────────────
+        // p15_wg_gate_pos points at s_cmp (2 dwords); s_cbranch_scc1 is at +2.
+        uint64 p15_wg_body_dwords = (asm_text_len / 4) - (p15_wg_gate_pos + 3)
+        asm_patch_u32(p15_wg_gate_pos + 2, 0xBFA20000 | (p15_wg_body_dwords & 0xFFFF))
+    } else {
+        asm_u32(0xBF800000)   // s_nop 0 (phase 15 stub)
+    }
     mega_emit_barrier_isa(7, MEGA_WG_PERSIST)
 
     // Phase 17 stub (no trailing barrier)
