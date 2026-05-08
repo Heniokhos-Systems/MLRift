@@ -1,0 +1,173 @@
+// Pure-MLRift attempted reproducer for ALLOC_LARGE_BLOCK_BUG_2026-05-08.
+//
+// STATUS: NOT REPRODUCIBLE in pure MLRift on either --target=linux or
+// --target=amdgpu-native. All writes round-trip correctly; the subsequent
+// alloc() does not segfault. The bug surfaces ONLY in the Noesis
+// phase_y_nback.mlr launcher path that imports MLRift/std/hip.mlr (KFD
+// shim) and runs against real /dev/kfd.
+//
+// Why MLRift's alloc CANNOT cause this on its own: alloc(N) lowers to
+// inline mmap(0, N+8, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0)
+// (see src/ir.mlr:6500). The kernel page-rounds the length, so even
+// alloc(408) gets a 4096-byte mapping. A write at user-offset 328 lands
+// at base+8+328 = base+336, well inside the first page.
+//
+// Build:  ./build/mlrc examples/alloc_large_block_repro.mlr -o /tmp/x \
+//                       --arch=x86_64 --target=linux --emit=elfexe
+// Expect: "ALL OK alloc-large-block-repro" on every supported arch/target.
+
+import "../std/io.mlr"
+import "../std/fmt.mlr"
+
+fn pat_a_size408_write328() -> u64 {
+    // Direct repro from bug doc.
+    u64 a = alloc(51 * 8)        // 408 bytes
+    unsafe { *((a + 400) as u64) = 42 }   // write at offset 400
+    u64 b = alloc(80)
+    unsafe { *(b as u64) = 1 }
+    u64 c = 0; unsafe { *((a + 400) as u64) -> c }
+    if c != 42 { return 1 }
+    return 0
+}
+
+fn pat_b_grow_pattern() -> u64 {
+    // Loop allocations that grow slowly past the 41-slot threshold.
+    u64 i = 0
+    while i < 64 {
+        u64 sz = 408 + i * 8
+        u64 p = alloc(sz)
+        u64 j = 0
+        while j < sz {
+            u64 off = p + j
+            u8 vb = 0xAB
+            unsafe { *(off as u8) = vb }
+            j = j + 1
+        }
+        u8 last = 0
+        unsafe { *((p + (sz - 1)) as u8) -> last }
+        if last != 0xAB { return i + 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+fn pat_c_many_small_then_big() -> u64 {
+    // Many small allocs, then big one with writes past 327.
+    u64 i = 0
+    while i < 100 {
+        u64 p = alloc(80)
+        unsafe { *(p as u64) = i }
+        i = i + 1
+    }
+    u64 big = alloc(408)
+    u64 j = 0
+    while j < 51 {
+        unsafe { *((big + j * 8) as u64) = j + 1000 }
+        j = j + 1
+    }
+    u64 r = 0
+    unsafe { *((big + 400) as u64) -> r }
+    if r != 1050 { return 1 }
+    u64 next = alloc(96)
+    unsafe { *(next as u64) = 0xDEAD }
+    return 0
+}
+
+fn pat_d_full_phasey_pattern() -> u64 {
+    // Full faithful copy of phase_y_nback area_new_basic slot_block writes,
+    // including all 30+ unsafe stores at offsets 0..400.
+    u64 slot_block = alloc(408)
+
+    u64 a_V    = slot_block +   0; unsafe { *(a_V    as u64) = 0xAA01 }
+    u64 a_ref  = slot_block +   8; unsafe { *(a_ref  as u64) = 0xAA02 }
+    u64 a_Iex  = slot_block +  16; unsafe { *(a_Iex  as u64) = 0xAA03 }
+    u64 a_gc   = slot_block +  24; unsafe { *(a_gc   as u64) = 0xAA04 }
+    u64 a_gn   = slot_block +  32; unsafe { *(a_gn   as u64) = 0xAA05 }
+    u64 a_vth  = slot_block +  40; unsafe { *(a_vth  as u64) = 0xAA06 }
+    u64 a_fh   = slot_block +  48; unsafe { *(a_fh   as u64) = 0xAA07 }
+    u64 a_pf   = slot_block +  56; unsafe { *(a_pf   as u64) = 0xAA08 }
+    u64 a_pm   = slot_block +  64; unsafe { *(a_pm   as u64) = 0xAA09 }
+    u64 a_ps   = slot_block +  72; unsafe { *(a_ps   as u64) = 0xAA0A }
+    u64 a_n    = slot_block +  80; unsafe { *(a_n    as u64) = 800 }
+    u64 a_step = slot_block +  88
+    u64 a_vth_base = slot_block + 176; unsafe { *(a_vth_base as u64) = 0xAA0B }
+    u64 a_ta_ss    = slot_block + 184
+    u64 a_ta_se    = slot_block + 192
+    f64 ta_tgt_v = 8.0;   unsafe { *((slot_block + 200) as f64) = ta_tgt_v }
+    f64 ta_lr_v  = 0.005; unsafe { *((slot_block + 208) as f64) = ta_lr_v }
+    f64 ta_dec_v = 0.95;  unsafe { *((slot_block + 216) as f64) = ta_dec_v }
+    f64 ta_amn   = -2.0;  unsafe { *((slot_block + 224) as f64) = ta_amn }
+    f64 ta_amx   = 5.0;   unsafe { *((slot_block + 232) as f64) = ta_amx }
+
+    u64 ta_kp = slot_block + 240
+    unsafe { *((ta_kp +  0) as u64) = a_vth }
+    unsafe { *((ta_kp +  8) as u64) = a_vth_base }
+    unsafe { *((ta_kp + 16) as u64) = a_fh }
+    unsafe { *((ta_kp + 24) as u64) = a_n }
+    unsafe { *((ta_kp + 32) as u64) = a_ta_ss }
+    unsafe { *((ta_kp + 40) as u64) = a_ta_se }
+    unsafe { *((ta_kp + 48) as u64) = slot_block + 200 }
+    unsafe { *((ta_kp + 56) as u64) = slot_block + 208 }
+    unsafe { *((ta_kp + 64) as u64) = slot_block + 216 }
+    unsafe { *((ta_kp + 72) as u64) = slot_block + 224 }
+    unsafe { *((ta_kp + 80) as u64) = slot_block + 232 }
+
+    // ----- THE REPORTED BUG: writes past offset 327 -----
+    unsafe { *((slot_block + 328) as u64) = 100 }
+    f64 li_g_v = 0.5;   unsafe { *((slot_block + 336) as f64) = li_g_v }
+    f64 li_fv  = -85.0; unsafe { *((slot_block + 344) as f64) = li_fv }
+    u64 li_kp = slot_block + 352
+    unsafe { *((li_kp +  0) as u64) = a_V }
+    unsafe { *((li_kp +  8) as u64) = a_fh }
+    unsafe { *((li_kp + 16) as u64) = a_n }
+    unsafe { *((li_kp + 24) as u64) = a_step }
+    unsafe { *((li_kp + 32) as u64) = slot_block + 328 }
+    unsafe { *((li_kp + 40) as u64) = slot_block + 336 }
+    unsafe { *((li_kp + 48) as u64) = slot_block + 344 }
+
+    // Subsequent alloc — bug doc says THIS is where the segfault appears.
+    u64 next = alloc(96)
+    unsafe { *(next as u64) = 0xCAFE }
+
+    // Verify writes round-tripped.
+    u64 r_qs = 0; unsafe { *((slot_block + 328) as u64) -> r_qs }
+    if r_qs != 100 { return 1 }
+    u64 r_kpfront = 0; unsafe { *((li_kp + 0) as u64) -> r_kpfront }
+    if r_kpfront != a_V { return 2 }
+    u64 r_next = 0; unsafe { *(next as u64) -> r_next }
+    if r_next != 0xCAFE { return 3 }
+    return 0
+}
+
+fn run() -> u64 {
+    u64 r = pat_a_size408_write328()
+    if r != 0 { print_str("FAIL pat_a\n"); return 1 }
+    print_str("OK pat_a\n")
+
+    r = pat_b_grow_pattern()
+    if r != 0 {
+        print_str("FAIL pat_b iter ")
+        u64 s = fmt_dec(r); print_str(s); dealloc(s); print_str("\n")
+        return 2
+    }
+    print_str("OK pat_b\n")
+
+    r = pat_c_many_small_then_big()
+    if r != 0 { print_str("FAIL pat_c\n"); return 3 }
+    print_str("OK pat_c\n")
+
+    r = pat_d_full_phasey_pattern()
+    if r != 0 {
+        print_str("FAIL pat_d code=")
+        u64 s = fmt_dec(r); print_str(s); dealloc(s); print_str("\n")
+        return 4
+    }
+    print_str("OK pat_d\n")
+
+    print_str("ALL OK alloc-large-block-repro\n")
+    return 0
+}
+
+fn main() -> u64 {
+    return run()
+}
