@@ -576,32 +576,47 @@ fn _body_has_attn_decode_coop_marker(uint64 body_node) -> uint64 {
 }
 
 
-// Phase 3 inline ISA emitter — gemv_coop_bf16_f32 with padded-row stride.
+// Phase 3 / phase 13 inline ISA emitter — gemv_coop_bf16_f32 padded-row stride.
 //
 // Emits INLINE (no asm_init, no s_endpgm) into the ongoing asm buffer.
+// Slice 4.19.7 renamed _emit_phase3_qkv_matmul_inline →
+// _emit_gemv_coop_bf16_padded_strided_inline and parameterized the 3
+// kernarg byte offsets + wg_id_sgpr so phase 13 (gate_up matmul) can reuse it.
 //
 // sdata_pair semantics: each pair index N maps to SGPR pair s[2N:2N+1].
 //   asm_s_load_b64_off(N, 0, offset) → s[2N:2N+1] = kernarg[offset:offset+7]
-// Example: sdata_pair=1 → s[2:3].  Phase 3 caller passes:
-//   w_sdata_pair=1   → s[2:3] = qkv_w     (kernarg offset 0x10, arg 2)
-//   x_sdata_pair=2   → s[4:5] = b_x_norm_g (kernarg offset 0x88, arg 17)
-//   out_sdata_pair=3 → s[6:7] = b_qkv_g   (kernarg offset 0x90, arg 18)
+// Example: sdata_pair=1 → s[2:3].  Both phase 3 and phase 13 pass (1, 2, 3),
+// landing the weight/input/output ptrs in s[2:3]/s[4:5]/s[6:7].
+//
+// Phase 3 caller passes byte offsets:
+//   w_kofs=0x10   → s[2:3] = qkv_w      (arg 2)
+//   x_kofs=0x88   → s[4:5] = b_x_norm_g (arg 17)
+//   out_kofs=0x90 → s[6:7] = b_qkv_g    (arg 18)
+//   wg_id_sgpr=15 (s15 still holds the hardware wg_id_x at phase 3 entry).
+//
+// Phase 13 caller passes byte offsets:
+//   w_kofs=0x20   → s[2:3] = gate_up_w   (arg 4)
+//   x_kofs=0xA8   → s[4:5] = b_mid_norm_g (arg 21)
+//   out_kofs=0x80 → s[6:7] = gu_scratch  (arg 16)
+//   wg_id_sgpr=28 (s15 was clobbered by phase 5's rope_sin load; the prologue
+//   stashed the original wg_id_x to s28, same as phase 9 / phase 11 use).
 //
 // SGPR context on entry (from prologue):
 //   s[0:1]  = kernarg ptr pair
 //   s[8:9]  = barrier_counter ptr (not used here)
 //   s[10:11]= max_phase value (not used here)
-//   s15     = wg_id_x
+//   s15     = wg_id_x ON KERNEL ENTRY (clobbered after phase 5)
+//   s28     = saved wg_id_x (set by prologue before phase 5)
 //
-// Phase 3 allocates:
-//   s[2:3]  = qkv_w ptr         (kernarg offset 0x10)
-//   s[4:5]  = b_x_norm_g ptr    (kernarg offset 0x88)
-//   s[6:7]  = b_qkv_g ptr       (kernarg offset 0x90)
+// Body allocates:
+//   s[2:3]  = weight ptr        (kernarg offset = w_kofs)
+//   s[4:5]  = input  ptr        (kernarg offset = x_kofs)
+//   s[6:7]  = output ptr        (kernarg offset = out_kofs)
 //   s12     = r_off loop counter (0..ROWS_PER_WG-1)
-//   s13     = row index (wg_id + r_off * WG_PERSIST)
-//   s14     = k loop bound (k/2 = 512) in units of lane-stride iterations
+//   s13     = row index (wg_id + r_off * wg_active)
+//   s14     = k loop bound / row*4 byte offset / scratch
 //
-// VGPR context (local to phase 3, not preserved after):
+// VGPR context (local to the phase, not preserved after):
 //   v0  = lane id (hardware — must be preserved across phase; xor only uses it r/o)
 //   v1  = vaddr = 0 (for global_store with saddr)
 //   v2  = acc (f32 accumulator per lane)
@@ -614,14 +629,16 @@ fn _body_has_attn_decode_coop_marker(uint64 body_node) -> uint64 {
 //   v11 = x[kp*2]   (loaded f32)
 //   v12 = x[kp*2+1] (loaded f32 from +4 byte offset)
 //
-// Algorithm:
-//   ROWS_PER_WG = ceil(n_out / WG_PERSIST) = ceil(4096/256) = 16
+// Algorithm (parameterized by n_out / k / k_pad / wg_active):
+//   ROWS_PER_WG = ceil(n_out / wg_active)
+//                 phase 3:  ceil(4096/256) = 16
+//                 phase 13: ceil(6144/256) = 24
 //   for r_off = 0..ROWS_PER_WG-1:
-//       row = wg_id + r_off * WG_PERSIST
+//       row = wg_id + r_off * wg_active
 //       if row >= n_out: continue (skip via gate branch)
 //       acc = 0.0
-//       w_row_u32 = qkv_w + row * k_pad * 2    (bytes; k_pad in u16 = 2B each)
-//       x_base = b_x_norm_g + 0                 (f32 array, kp indexes directly)
+//       w_row_u32 = w_ptr + row * k_pad * 2     (bytes; k_pad in u16 = 2B each)
+//       x_base = x_ptr + 0                      (f32 array, kp indexes directly)
 //       for kp = lane; kp < k/2; kp += 32:
 //           packed = w_row_u32[kp]               (global_load_b32)
 //           x0 = x_base[kp*2]                   (global_load_b32)
@@ -632,22 +649,35 @@ fn _body_has_attn_decode_coop_marker(uint64 body_node) -> uint64 {
 //       acc = wave_reduce_add_5_levels(acc)      (_emit_wave_xor_reduce_add_f32_5_levels)
 //       if lane == 0:
 //           out[row] = acc                       (global_store_b32 via s[6:7]+row*4)
-// _emit_phase3_qkv_matmul_inline — gemv_coop_bf16_f32, padded-row stride,
-// emitted INLINE (no asm_init, no s_endpgm).
+// _emit_gemv_coop_bf16_padded_strided_inline — gemv_coop_bf16_f32,
+// padded-row stride, emitted INLINE (no asm_init, no s_endpgm).
 //
-// For the QKV matmul (N_OUT=4096, K=1024, K_PAD=1152, WG_PERSIST=256):
+// Shared by phase 3 (QKV matmul) and phase 13 (gate_up matmul).  The math
+// core is identical: bf16 weight unpack → fmac into f32 acc → wave-XOR
+// reduce → lane-0 store.  The only differences across phases are:
+//   1. Output shape (n_out): QKV_DIM=4096 vs 2*FF=6144.
+//   2. Kernarg byte offsets for the 3 pointers.
+//   3. Which SGPR holds wg_id_x (s15 on kernel entry, but phase 5 clobbers
+//      s15 mid-kernel via `s_load_b64 s[14:15], 0x58` for rope_sin; the
+//      prologue saves it to s28 for downstream phases).
+//
+// For phase 3 (N_OUT=4096, K=1024, K_PAD=1152, WG_ACTIVE=256):
 //   ROWS_PER_WG = 16.  wg_id range = 0..255.  Max row = 255+15*256 = 4095 < 4096.
 //   All 16 rows per WG are in-bounds — no per-row bounds check needed.
 //   k/2 / 32 = 512/32 = 16 inner loop iterations.
 //
-// SGPR layout (in addition to prologue s[0:1], s[8:9], s[10:11], s15):
-//   s[2:3]  = qkv_w ptr (loaded; advances by w_row_step each outer iter)
-//   s[4:5]  = b_x_norm_g ptr (loaded once; never modified)
-//   s[6:7]  = b_qkv_g ptr (loaded once; never modified; output ptr computed per row)
-//   s3      = saved exec_lo for lane-0 gate (clobbered by next barrier, safe)
-//   s12     = inner loop counter / exec save (inner counter = k_iters, exec save in lane-0 gate)
-//   s13     = row index (init: s15; +256 each outer iter)
+// For phase 13 (N_OUT=6144, K=1024, K_PAD=1152, WG_ACTIVE=256):
+//   ROWS_PER_WG = 24.  wg_id range = 0..255.  Max row = 255+23*256 = 6143 < 6144.
+//   All 24 rows per WG are in-bounds — no per-row bounds check needed.
+//
+// SGPR layout (in addition to prologue s[0:1], s[8:9], s[10:11], wg_id_sgpr):
+//   s[2:3]  = weight ptr (loaded; advances by w_row_step each outer iter)
+//   s[4:5]  = input  ptr (loaded once; never modified)
+//   s[6:7]  = output ptr (loaded once; never modified; output ptr computed per row)
+//   s12     = outer loop counter (r_off)
+//   s13     = row index (init: wg_id_sgpr; +wg_active each outer iter)
 //   s14     = output byte offset per row / scratch
+//   s17     = saved exec_lo for lane-0 gate (clobbered & restored inside)
 //
 // VGPR layout:
 //   v0  = lane id (hardware, r/o)
@@ -661,38 +691,50 @@ fn _body_has_attn_decode_coop_marker(uint64 body_node) -> uint64 {
 //   v10 = bf16-lo f32 / reduce tmp
 //   v11 = x[kp*2]
 //   v12 = x[kp*2+1]
-// _emit_phase3_qkv_matmul_inline — gemv_coop_bf16_f32, padded-row stride,
-// emitted INLINE (no asm_init, no s_endpgm).
 //
 // Parameters:
-//   n_out         = number of output rows (e.g. QKV_DIM = 4096)
+//   n_out         = number of output rows (phase 3: 4096; phase 13: 6144)
 //   k             = inner K dimension (e.g. HIDDEN = 1024)
 //   k_pad         = padded row stride in u16 elements (e.g. HIDDEN_PAD = 1152)
 //   wg_active     = number of WGs active in this phase (row-stride divisor).
 //                   MEGA_WG_PERSIST=512 is the launch grid; wg_active is the
 //                   active-WG count for this phase's per-WG row assignment.
-//                   Phase 3 uses wg_active=256; other phases differ.
+//                   Both phase 3 and phase 13 use wg_active=256.
 //   w_sdata_pair  = sdata_pair for weight ptr (loaded via s_load_b64)
 //   x_sdata_pair  = sdata_pair for input ptr
 //   out_sdata_pair= sdata_pair for output ptr
-fn _emit_phase3_qkv_matmul_inline(uint64 n_out, uint64 k, uint64 k_pad,
+//   w_kofs        = kernarg byte offset for weight ptr (phase 3: 0x10 = qkv_w;
+//                                                       phase 13: 0x20 = gate_up_w)
+//   x_kofs        = kernarg byte offset for input ptr  (phase 3: 0x88 = b_x_norm_g;
+//                                                       phase 13: 0xA8 = b_mid_norm_g)
+//   out_kofs      = kernarg byte offset for output ptr (phase 3: 0x90 = b_qkv_g;
+//                                                       phase 13: 0x80 = gu_scratch)
+//   wg_id_sgpr    = SGPR # holding wg_id_x.  Phase 3 uses 15 (still untouched
+//                   when phase 3 runs).  Phase 13 must use 28 (the saved copy
+//                   stashed in the prologue) because phase 5's rope_sin load
+//                   has clobbered s15 by then — same constraint that forced
+//                   phase 9 / phase 11 to read s28.
+fn _emit_gemv_coop_bf16_padded_strided_inline(uint64 n_out, uint64 k, uint64 k_pad,
                                     uint64 wg_active,
                                     uint64 w_sdata_pair, uint64 x_sdata_pair,
-                                    uint64 out_sdata_pair) {
+                                    uint64 out_sdata_pair,
+                                    uint64 w_kofs, uint64 x_kofs, uint64 out_kofs,
+                                    uint64 wg_id_sgpr) {
     // ── WG gate (skip if wg_id >= wg_active) ─────────────────────────────
-    // s_cmp_ge_u32 s15, wg_active: SOPC op=0x09, ssrc0=s15=0x0F, ssrc1=lit(0xFF), lit=wg_active
+    // s_cmp_ge_u32 s<wg_id_sgpr>, wg_active: SOPC op=0x09, ssrc0=wg_id_sgpr,
+    //   ssrc1=lit(0xFF), lit=wg_active
     //   SOPC ops: eq_i32=0, ne_i32=1, gt_i32=2, ge_i32=3, lt_i32=4, le_i32=5,
     //             eq_u32=6, ne_u32=7, gt_u32=8, ge_u32=9, lt_u32=10, le_u32=11
-    //   word = 0xBF000000|(9<<16)|(0xFF<<8)|0x0F = 0xBF09FF0F
+    //   word = 0xBF000000|(9<<16)|(0xFF<<8)|wg_id_sgpr
     uint64 gate_cmp_pos = asm_text_len / 4
-    asm_u32(0xBF09FF0F)
+    asm_u32(0xBF09FF00 | (wg_id_sgpr & 0xFF))
     asm_u32(wg_active)
     asm_s_cbranch_scc1(0)   // patched at end
 
     // ── Load base pointers ────────────────────────────────────────────────
-    asm_s_load_b64_off(w_sdata_pair,   0, 0x10)   // qkv_w      → s[2:3]
-    asm_s_load_b64_off(x_sdata_pair,   0, 0x88)   // b_x_norm_g → s[4:5]
-    asm_s_load_b64_off(out_sdata_pair, 0, 0x90)   // b_qkv_g    → s[6:7]
+    asm_s_load_b64_off(w_sdata_pair,   0, w_kofs)     // weight → s[w_lo:w_hi]
+    asm_s_load_b64_off(x_sdata_pair,   0, x_kofs)     // input  → s[x_lo:x_hi]
+    asm_s_load_b64_off(out_sdata_pair, 0, out_kofs)   // output → s[out_lo:out_hi]
     asm_s_waitcnt_lgkmcnt_zero()
 
     // ── Constant lane offsets ─────────────────────────────────────────────
@@ -701,13 +743,11 @@ fn _emit_phase3_qkv_matmul_inline(uint64 n_out, uint64 k, uint64 k_pad,
     asm_v_mov_b32_inline_u(1, 0)     // v1 = 0 (vaddr for store)
 
     // ── Outer loop init ───────────────────────────────────────────────────
-    // s13 = row = wg_id
-    // s_mov_b32 s13, s15: SOP1 format (0x17D<<23)|(sdst<<16)|(0<<8)|ssrc0
-    //   sdst=s13=0x0D, ssrc0=s15=0x0F, op=0 (s_mov_b32 op field = 0 in SOP1)
-    //   word = 0xBE800000|(0x0D<<16)|0x0F = 0xBE8D000F
-    //   Verified: asm_s_mov_b32(s13, s15) = (0x17D<<23)|(0x0D<<16)|(0x00<<8)|0x0F
-    //   (Previous 0xBE0D030F was wrong: op/sdst fields swapped and prefix had bit-23 clear)
-    asm_s_mov_b32(13, 15)
+    // s13 = row = wg_id (read from wg_id_sgpr param: s15 phase 3, s28 phase 13)
+    // s_mov_b32 s13, s<wg_id_sgpr>: SOP1 (0x17D<<23)|(0x0D<<16)|wg_id_sgpr
+    //   word = 0xBE8D0000 | wg_id_sgpr
+    //   Verified: asm_s_mov_b32(13, 15) = 0xBE8D000F (phase 3 original).
+    asm_s_mov_b32(13, wg_id_sgpr)
     // s12 = r_off = 0 (outer loop counter)
     asm_s_mov_b32_inline_imm(12, 0)
 
@@ -861,7 +901,7 @@ fn _emit_phase3_qkv_matmul_inline(uint64 n_out, uint64 k, uint64 k_pad,
 //
 // _emit_phase9_gemv_residual_inline — gemv_coop_bf16_f32, padded-row stride,
 // with residual-add at the lane-0 row-store.  Body identical to phase 3
-// (_emit_phase3_qkv_matmul_inline) except the lane-0 store does
+// (_emit_gemv_coop_bf16_padded_strided_inline) except the lane-0 store does
 //   out[row] = in_residual[row] + acc
 // instead of
 //   out[row] = acc.
@@ -918,7 +958,7 @@ fn _emit_phase3_qkv_matmul_inline(uint64 n_out, uint64 k, uint64 k_pad,
 // (VMEM consumer of v2).  Per the gfx11 VALU→VMEM/LDS rule we must insert
 // `s_delay_alu instid0(VALU_DEP_1)` between them.
 //
-// Verified: this function differs from _emit_phase3_qkv_matmul_inline only
+// Verified: this function differs from _emit_gemv_coop_bf16_padded_strided_inline only
 // in (1) the gate uses s28 not s15, (2) the row-init mov is from s28 not
 // s15, (3) the lane-0 store block adds the residual-load + v_add_f32
 // + delay_alu before the global_store.  All other inner-loop math
@@ -2187,9 +2227,14 @@ fn mega_emit_stub_kernel(uint64 kname_ptr, uint64 nl, uint64 body_node) -> uint6
 
     // ── Phase 3: QKV matmul (WG < 256) ────────────────────────────────────
     if _body_has_qkv_matmul_marker(body_node) != 0 {
-        // w=qkv_w(pair 1=s[2:3]), x=b_x_norm_g(pair 2=s[4:5]), out=b_qkv_g(pair 3=s[6:7])
-        // wg_active=256: 256 of the 512 MEGA_WG_PERSIST WGs participate in phase 3
-        _emit_phase3_qkv_matmul_inline(4096, 1024, 1152, 256, 1, 2, 3)
+        // w=qkv_w(0x10, pair 1=s[2:3]), x=b_x_norm_g(0x88, pair 2=s[4:5]),
+        // out=b_qkv_g(0x90, pair 3=s[6:7]).  wg_id_x=s15 (phase 5 hasn't run yet).
+        // wg_active=256: 256 of the 512 MEGA_WG_PERSIST WGs participate.
+        // Slice 4.19.7 generalized this emitter (was _emit_phase3_qkv_matmul_inline)
+        // so phase 13 can reuse it with a different kernarg byte-offset triple.
+        _emit_gemv_coop_bf16_padded_strided_inline(4096, 1024, 1152, 256,
+                                                    1, 2, 3,
+                                                    0x10, 0x88, 0x90, 15)
     } else {
         asm_u32(0xBF800000)   // s_nop 0 (phase 3 stub)
     }
@@ -2263,8 +2308,25 @@ fn mega_emit_stub_kernel(uint64 kname_ptr, uint64 nl, uint64 body_node) -> uint6
     uint64 mp6_cbranch_pos = asm_text_len / 4
     asm_s_cbranch_scc1(0)
 
-    // Phase 13 stub
-    asm_u32(0xBF800000)
+    // ── Phase 13: gate_up matmul (WG < 256) ───────────────────────────────
+    // Kernarg layout: w=gate_up_w(arg 4, 0x20), x=b_mid_norm_g(arg 21, 0xA8),
+    //                 out=gu_scratch(arg 16, 0x80).  Reuses the
+    //                 gemv-coop-bf16-padded-strided body shared with phase 3
+    //                 (slice 4.19.7 generalized the emitter).
+    // Shapes: n_out=6144 (= 2*FF), k=1024 (HIDDEN), k_pad=1152 (HIDDEN_PAD),
+    //         wg_active=256.  ROWS_PER_WG = ceil(6144/256) = 24.
+    // wg_id_x lives in s28 here — phase 5's rope_sin load clobbered s15
+    // mid-kernel; the prologue saves the original s15→s28 for downstream
+    // phases (same constraint that forced phases 9 / 11 to read s28).
+    // Marker recognized inline (no `_body_has_gate_up_matmul_marker` wrapper)
+    // — same fn-table-cap discipline as oproj_residual_marker / post_norm_marker.
+    if _body_has_marker(body_node, "gate_up_matmul_marker", 21) != 0 {
+        _emit_gemv_coop_bf16_padded_strided_inline(6144, 1024, 1152, 256,
+                                                    1, 2, 3,
+                                                    0x20, 0xA8, 0x80, 28)
+    } else {
+        asm_u32(0xBF800000)   // s_nop 0 (phase 13 stub)
+    }
     mega_emit_barrier_isa(6, MEGA_WG_PERSIST)
     asm_s_cmp_lt_u32(10, 0x87)
     uint64 mp7_cbranch_pos = asm_text_len / 4
