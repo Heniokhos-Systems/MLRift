@@ -5,9 +5,11 @@
 // + max_phase early-exit checks).
 //
 // Slice 4.19.1: phase 1 (input rmsnorm, WG-0 gated).  Adds
-// recognize_phase_rmsnorm_wg_gated and _emit_phase1_rmsnorm_inline;
-// replaces the phase-1 s_nop stub with the real inline rmsnorm ISA when
-// the source has the rmsnorm_wg0_marker call in its phase-1 block.
+// recognize_phase_rmsnorm_wg_gated and _emit_rmsnorm_wg_gated_inline
+// (slice 4.19.6 renamed from _emit_phase1_rmsnorm_inline and parameterized
+// by kernarg byte offsets so phase 11 can reuse it); replaces the phase-1
+// s_nop stub with the real inline rmsnorm ISA when the source has the
+// rmsnorm_wg0_marker call in its phase-1 block.
 //
 // Top-level: recognize_megakernel_swiglu_dense_gqa(fn_node, source, kname_ptr, nl)
 // walks the function body parameter list and body shape, then delegates to
@@ -229,20 +231,38 @@ fn _emit_wave_xor_reduce_max_f32_5_levels(uint64 acc, uint64 addr, uint64 tmp) {
     }
 }
 
-// ── Phase 1 inline ISA emitter ────────────────────────────────────────────
+// ── rmsnorm WG-0-gated inline ISA emitter ─────────────────────────────────
 //
-// _emit_phase1_rmsnorm_inline — emits the WG-0-gated input rmsnorm ISA
+// _emit_rmsnorm_wg_gated_inline — emits a WG-0-gated rmsnorm ISA body
 // INLINE into the ongoing asm buffer (no asm_init, no s_endpgm).
+//
+// Shared by phase 1 (input rmsnorm) and phase 11 (post-attn rmsnorm) — the
+// math is identical (`out[i] = (in[i] / sqrt(mean(in*in)+eps)) * norm[i]`,
+// N=HIDDEN=1024, eps=1e-5f) but the three kernarg byte offsets differ.
+// Slice 4.19.6 parameterized the loads (was hardcoded to phase-1 offsets).
 //
 // DEVIATION NOTE (plan Task 1 vs implementation): The original plan called
 // for reusing `_emit_rmsnorm_f32_body_N_eps` from format_amdgpu.mlr, but
 // that helper is structurally incompatible with inline emission: it calls
 // asm_init() (resets the buffer), emits s_endpgm (terminates the kernel),
 // uses an LDS-tree reduce instead of the wave-XOR pattern required here,
-// and is a multi-arch pair emitter.  This function therefore duplicates the
-// math core in single-arch gfx1100 form.  At slice 4.19.6 the plan is to
-// extract `_emit_rmsnorm_math_core` (no asm_init, no endpgm, wave-XOR
-// reduce, single-arch) so that phase 11 can reuse it without forking again.
+// and is a multi-arch pair emitter.  This function duplicates the math
+// core in single-arch gfx1100 form.
+//
+// Parameters (kernarg byte offsets within the 192-byte kernarg segment):
+//   in_kofs    = byte offset of the input ptr   (phase 1: 0x00 = in_residual,
+//                                                 phase 11: 0xA0 = b_mid_g)
+//   norm_kofs  = byte offset of the norm-weight ptr
+//                                                (phase 1: 0x30 = in_norm_g,
+//                                                 phase 11: 0x38 = post_norm_g)
+//   out_kofs   = byte offset of the output ptr  (phase 1: 0x88 = b_x_norm_g,
+//                                                 phase 11: 0xA8 = b_mid_norm_g)
+//   wg_id_sgpr = SGPR # holding wg_id_x for the WG-0 gate.  Phase 1 uses 15
+//                (hardware register, untouched at that point).  Phase 11 must
+//                use 28 (the saved copy stashed in the prologue) because
+//                phase 5's `s_load_b64 s[14:15], ..., 0x58` (rope_sin)
+//                clobbers s15 mid-kernel.  Same constraint that forced
+//                phase 9 to read s28 instead of s15.
 //
 // Mega-kernel SGPR context on entry:
 //   s[0:1]  = kernarg ptr
@@ -250,19 +270,19 @@ fn _emit_wave_xor_reduce_max_f32_5_levels(uint64 acc, uint64 addr, uint64 tmp) {
 //   s[10:11]= max_phase value (already loaded by prologue)
 //   s15     = wg_id_x
 //
-// Phase 1 adds to context:
-//   s[2:3]  = in_residual ptr (kernarg offset 0x00)
-//   s[4:5]  = in_norm_g ptr   (kernarg offset 0x30)
-//   s[6:7]  = b_x_norm_g ptr  (kernarg offset 0x88)
+// SGPRs touched by this body (regardless of phase):
+//   s[2:3]  = input ptr        (loaded from kernarg byte off in_kofs)
+//   s[4:5]  = norm-weight ptr  (loaded from kernarg byte off norm_kofs)
+//   s[6:7]  = output ptr       (loaded from kernarg byte off out_kofs)
 //   s12     = loop counter / saved exec_lo (reused each section)
 //   s14     = float literal scratch (1/1024, eps)
 //
-// VGPR context (all locals, not preserved past phase 1):
+// VGPR context (all locals, not preserved past the phase):
 //   v0  = lane id (hardware, must be preserved)
 //   v2  = ssq accumulator → scale broadcast
 //   v3:v4 = pointer pair (advances during loops)
-//   v5:v6 = second pointer pair (in_norm_g / scratch)
-//   v7:v8 = third pointer pair (b_x_norm_g out)
+//   v5:v6 = second pointer pair (norm-weight / scratch)
+//   v7:v8 = third pointer pair (output)
 //   v9  = lane * 4 (constant byte offset, computed once)
 //   v10, v11 = load temporaries for output loop
 //
@@ -279,26 +299,28 @@ fn _emit_wave_xor_reduce_max_f32_5_levels(uint64 acc, uint64 addr, uint64 tmp) {
 //   the per-phase barrier hands off to phase 7.
 //
 // Hardware: gfx1100 (RDNA3) wave32.  N=HIDDEN=1024, WAVE=32 → 32 iters.
-fn _emit_phase1_rmsnorm_inline() {
+fn _emit_rmsnorm_wg_gated_inline(uint64 in_kofs, uint64 norm_kofs,
+                                  uint64 out_kofs, uint64 wg_id_sgpr) {
     // Record the dword index of the s_cmp before the skip branch so
     // we can patch the simm16 after measuring the body size.
     uint64 gate_cmp_pos = asm_text_len / 4   // position of s_cmp_lg_u32
 
     // ── WG-0 gate ─────────────────────────────────────────────────────
-    // s_cmp_lg_u32 s15, 0   (SCC=1 if wg_id != 0)
+    // s_cmp_lg_u32 s<wg_id_sgpr>, 0   (SCC=1 if wg_id != 0)
     // SOPC op 0x07: word = 0xBF | (0x07<<16) | (ssrc1<<8) | ssrc0
-    //   ssrc0=s15=0x0F, ssrc1=inline-0=0x80
-    asm_u32(0xBF07800F)
+    //   ssrc0 = wg_id_sgpr & 0xFF, ssrc1 = inline-0 = 0x80
+    uint64 cmp_word = 0xBF078000 | (wg_id_sgpr & 0xFF)
+    asm_u32(cmp_word)
     // s_cbranch_scc1 .skip_phase1  — placeholder simm16=0 (patched below)
     asm_s_cbranch_scc1(0)
 
     // ── Load 3 pointer args ────────────────────────────────────────────
-    // s_load_b64 s[2:3], s[0:1], 0x00   (in_residual, arg 0)
-    asm_s_load_b64_off(1, 0, 0x00)
-    // s_load_b64 s[4:5], s[0:1], 0x30   (in_norm_g, arg 6)
-    asm_s_load_b64_off(2, 0, 0x30)
-    // s_load_b64 s[6:7], s[0:1], 0x88   (b_x_norm_g, arg 17)
-    asm_s_load_b64_off(3, 0, 0x88)
+    // s_load_b64 s[2:3], s[0:1], in_kofs    (input ptr — phase-specific)
+    asm_s_load_b64_off(1, 0, in_kofs)
+    // s_load_b64 s[4:5], s[0:1], norm_kofs  (norm-weight ptr — phase-specific)
+    asm_s_load_b64_off(2, 0, norm_kofs)
+    // s_load_b64 s[6:7], s[0:1], out_kofs   (output ptr — phase-specific)
+    asm_s_load_b64_off(3, 0, out_kofs)
     asm_s_waitcnt_lgkmcnt_zero()
 
     // ── Init ──────────────────────────────────────────────────────────
@@ -308,14 +330,14 @@ fn _emit_phase1_rmsnorm_inline() {
     asm_v_lshlrev_b32_imm(9, 2, 0)
     // v4 = 0  (hi-word zero for initial ptr setup)
     asm_v_mov_b32_inline_u(4, 0)
-    // v3 = in_residual_lo + v9  (in_residual ptr lo)
+    // v3 = input_lo + v9  (input ptr lo)
     asm_v_add_co_u32_vcc_sv(3, 2, 9)
-    // v4 = in_residual_hi + carry  (v4 was 0; reuse as carry target)
+    // v4 = input_hi + carry  (v4 was 0; reuse as carry target)
     asm_v_add_co_ci_u32_null_sv_vcc(4, 3, 4)
     // s12 = 32   (SSQ loop counter)
     asm_s_mov_b32_inline_imm(12, 32)
 
-    // ── SSQ loop (32 iters: ssq += in_residual[lane + i*32]^2) ─────────
+    // ── SSQ loop (32 iters: ssq += input[lane + i*32]^2) ───────────────
     // Loop runs while s12 > 0.  Per iteration: load, fmac, advance ptr,
     // decrement counter, compare-zero, branch-if-not-zero.
     uint64 loop_ssq_top = asm_text_len / 4   // dword index of loop top
@@ -393,17 +415,17 @@ fn _emit_phase1_rmsnorm_inline() {
     asm_u32(0x02000008)
     asm_s_waitcnt_lgkmcnt_zero()
 
-    // ── Output loop (32 iters: b_x_norm_g[i]=in_r[i]*scale*in_norm[i]) ─
+    // ── Output loop (32 iters: out[i] = in[i] * scale * norm[i]) ───────
     // Re-setup pointers from saved lane*4 (v9) and loaded SGPRs.
-    // in_residual ptr: v3:v4
+    // input ptr: v3:v4
     asm_v_mov_b32_inline_u(4, 0)
     asm_v_add_co_u32_vcc_sv(3, 2, 9)
     asm_v_add_co_ci_u32_null_sv_vcc(4, 3, 4)
-    // in_norm_g ptr: v5:v6
+    // norm-weight ptr: v5:v6
     asm_v_mov_b32_inline_u(6, 0)
     asm_v_add_co_u32_vcc_sv(5, 4, 9)
     asm_v_add_co_ci_u32_null_sv_vcc(6, 5, 6)
-    // b_x_norm_g ptr: v7:v8
+    // output ptr: v7:v8
     asm_v_mov_b32_inline_u(8, 0)
     asm_v_add_co_u32_vcc_sv(7, 6, 9)
     asm_v_add_co_ci_u32_null_sv_vcc(8, 7, 8)
@@ -412,19 +434,19 @@ fn _emit_phase1_rmsnorm_inline() {
 
     uint64 loop_out_top = asm_text_len / 4
 
-    // global_load_b32 v10, v[3:4], off  (in_residual[i])
+    // global_load_b32 v10, v[3:4], off  (input[i])
     asm_u32(0xDC520000)
     asm_u32(0x0A7C0003)    // vdst=10=0x0A, saddr=0x7C, vaddr=3
-    // global_load_b32 v11, v[5:6], off  (in_norm_g[i])
+    // global_load_b32 v11, v[5:6], off  (norm-weight[i])
     asm_u32(0xDC520000)
     asm_u32(0x0B7C0005)    // vdst=11=0x0B, saddr=0x7C, vaddr=5
     asm_s_waitcnt_vmcnt_zero()
-    // v_mul_f32 v10, v2, v10  (scale * in_resid[i])
+    // v_mul_f32 v10, v2, v10  (scale * input[i])
     // VOP2: (8<<25)|(10<<17)|(10<<9)|(0x100|2)
     //   src1=v10=10 (8-bit VGPR field), src0=v2=0x102 (VGPR bit)
     //   = 0x10000000|0x00140000|0x00001400|0x102 = 0x10141502
     asm_u32(0x10141502)
-    // v_mul_f32 v10, v10, v11  (result * in_norm_g[i])
+    // v_mul_f32 v10, v10, v11  (result * norm-weight[i])
     // VOP2: (8<<25)|(10<<17)|(11<<9)|(0x100|10)
     //   src1=v11=11, src0=v10=0x10A
     //   = 0x10000000|0x00140000|0x00001600|0x10A = 0x1014170A
@@ -433,13 +455,13 @@ fn _emit_phase1_rmsnorm_inline() {
     // word1=0xDC6A0000, word2=(0x7C<<16)|(vdata<<8)|vaddr=(0x7C<<16)|(10<<8)|7=0x007C0A07
     asm_u32(0xDC6A0000)
     asm_u32(0x007C0A07)
-    // Advance in_residual ptr by 128 bytes
+    // Advance input ptr by 128 bytes (v3:v4)
     asm_u32(0xD7006A03)
     asm_u32(0x000206FF)
     asm_u32(128)
     asm_u32(0xD5207C04)
     asm_u32(0x01AA0880)
-    // Advance in_norm_g ptr by 128 bytes (v5:v6)
+    // Advance norm-weight ptr by 128 bytes (v5:v6)
     asm_u32(0xD7006A05)
     asm_u32(0x00020AFF)
     asm_u32(128)
@@ -451,7 +473,7 @@ fn _emit_phase1_rmsnorm_inline() {
     // word2 = 0x01A80000 | 0x00020C00 | 0x80 = 0x01AA0C80
     asm_u32(0xD5207C06)
     asm_u32(0x01AA0C80)
-    // Advance b_x_norm_g ptr by 128 bytes (v7:v8)
+    // Advance output ptr by 128 bytes (v7:v8)
     asm_u32(0xD7006A07)
     asm_u32(0x00020EFF)
     asm_u32(128)
@@ -469,7 +491,7 @@ fn _emit_phase1_rmsnorm_inline() {
     asm_s_cbranch_scc0(back_out_simm16)
 
     // ── Patch the WG-0 skip-branch simm16 ─────────────────────────────
-    // Target of the gate branch = current position (after all phase-1 body).
+    // Target of the gate branch = current position (after all rmsnorm body).
     uint64 body_dwords = (asm_text_len / 4) - (gate_cmp_pos + 2)
     asm_patch_u32(gate_cmp_pos + 1, 0xBFA20000 | (body_dwords & 0xFFFF))
 }
@@ -2112,14 +2134,18 @@ fn _emit_phase7_attn_decode_coop_inline() {
 
 // Emit the mega-kernel body into the kernel table.
 //
-// Slice 4.19.3: phase 1 (rmsnorm, WG-0), phase 3 (QKV matmul, WG<256), and
-// phase 5 (QKV split + qknorm + RoPE, WG<32, 3-way head dispatch) are emitted
-// as real inline ISA when their markers are found in body_node.
-// Phases 7..17 remain stubs (s_nop 0) in this slice.
+// Real inline ISA emitters are gated by per-phase markers in body_node:
+//   slice 4.19.1 — phase 1 (rmsnorm, WG-0).
+//   slice 4.19.2 — phase 3 (QKV matmul, WG<256).
+//   slice 4.19.3 — phase 5 (QKV split + qknorm + RoPE, WG<32, 3-way dispatch).
+//   slice 4.19.4 — phase 7 (attn_decode-coop, WG<64).
+//   slice 4.19.5 — phase 9 (o_proj matmul + residual-add, WG<256).
+//   slice 4.19.6 — phase 11 (post-attn rmsnorm, WG-0; reuses the phase-1
+//                  WG-0-gated rmsnorm body with parameterized kernarg offsets).
+// Phases 13..17 remain stubs (s_nop 0) until later slices.
 //
-// max_phase early-exit simm16 values: phases 0 (after phase 1) and 1 (after
-// phase 3) are patched dynamically.  Phases 2..7 (after phase 5..17) use
-// patched offsets too, since phase 5 body size is now variable.
+// max_phase early-exit simm16 values: every phase boundary 0..7 is patched
+// dynamically (body sizes vary across recognizer outcomes).
 //
 // KD parameters match the v1 reference: MEGA_KERNARG_COUNT args, 192-byte
 // kernarg segment, rsrc2=0x9E (wg_id_x in s15), MEGA_WG_PERSIST=512.
@@ -2140,8 +2166,11 @@ fn mega_emit_stub_kernel(uint64 kname_ptr, uint64 nl, uint64 body_node) -> uint6
     asm_s_mov_b32(28, 15)            // s28 = wg_id_x (preserved across phases)
 
     // ── Phase 1: input rmsnorm (WG-0 gated) ──────────────────────────────
+    // Kernarg layout: in=in_residual(arg 0, 0x00), norm=in_norm_g(arg 6, 0x30),
+    //                 out=b_x_norm_g(arg 17, 0x88).  wg_id_x is still in s15
+    //                 (no prior phase has clobbered it yet).
     if _body_has_rmsnorm_wg0_marker(body_node) != 0 {
-        _emit_phase1_rmsnorm_inline()
+        _emit_rmsnorm_wg_gated_inline(0x00, 0x30, 0x88, 15)
     } else {
         asm_u32(0xBF800000)   // s_nop 0 (phase 1 stub)
     }
@@ -2211,8 +2240,21 @@ fn mega_emit_stub_kernel(uint64 kname_ptr, uint64 nl, uint64 body_node) -> uint6
     uint64 mp5_cbranch_pos = asm_text_len / 4
     asm_s_cbranch_scc1(0)
 
-    // Phase 11 stub
-    asm_u32(0xBF800000)
+    // ── Phase 11: post_norm rmsnorm (WG-0 gated, N=1024) ──────────────────
+    // Kernarg layout: in=b_mid_g(arg 20, 0xA0), norm=post_norm_g(arg 7, 0x38),
+    //                 out=b_mid_norm_g(arg 21, 0xA8).  Reuses the WG-0-gated
+    //                 rmsnorm body shared with phase 1 (slice 4.19.6
+    //                 parameterized the kernarg byte offsets + wg_id_x SGPR).
+    // wg_id_x lives in s28 here — phase 5's rope_sin load clobbered s15
+    // mid-kernel; the prologue saves the original s15→s28 for downstream
+    // phases (same constraint that forced phase 9 to read s28).
+    // Marker recognized inline (no `_body_has_post_norm_marker` wrapper) —
+    // same fn-table-cap discipline as oproj_residual_marker at slice 4.19.5.
+    if _body_has_marker(body_node, "post_norm_marker", 16) != 0 {
+        _emit_rmsnorm_wg_gated_inline(0xA0, 0x38, 0xA8, 28)
+    } else {
+        asm_u32(0xBF800000)   // s_nop 0 (phase 11 stub)
+    }
     mega_emit_barrier_isa(5, MEGA_WG_PERSIST)
     asm_s_cmp_lt_u32(10, 0x86)
     uint64 mp6_cbranch_pos = asm_text_len / 4
