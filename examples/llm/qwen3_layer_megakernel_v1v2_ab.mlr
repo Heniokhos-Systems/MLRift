@@ -18,14 +18,14 @@
 //   ./build/mlrc examples/llm/qwen3_layer_megakernel_v1v2_ab_src.mlr \
 //       -o /tmp/v1v2_ab --arch=x86_64 --target=linux --emit=elfexe
 // Run:
-//   MAX_PHASE=0 /tmp/v1v2_ab   → PASS -- slice 4.19.4 gate (MAX_PHASE=0)
-//   MAX_PHASE=1 /tmp/v1v2_ab   → PASS -- slice 4.19.4 gate (MAX_PHASE=1)
-//   MAX_PHASE=2 /tmp/v1v2_ab   → PASS -- slice 4.19.4 gate (MAX_PHASE=2)
+//   MAX_PHASE=0 /tmp/v1v2_ab   → PASS -- slice 4.19.5 gate (MAX_PHASE=0)
+//   MAX_PHASE=1 /tmp/v1v2_ab   → PASS -- slice 4.19.5 gate (MAX_PHASE=1)
+//   MAX_PHASE=2 /tmp/v1v2_ab   → PASS -- slice 4.19.5 gate (MAX_PHASE=2)
 // Expected output (MAX_PHASE=2):
 //   v1 .bin fletcher-32 pin: PASS
 //   v1 load: PASS  /  v2 load: PASS
 //   OK out_residual  OK kc_layer  ... (all 10 slabs OK)
-//   PASS -- slice 4.19.4 gate (MAX_PHASE=2)
+//   PASS -- slice 4.19.5 gate (MAX_PHASE=2)
 // Exit: 0
 //
 // Implementation note on D2H buffer pre-allocation:
@@ -68,7 +68,9 @@ static uint64 Q_DIM       = 2048      // N_HEADS * HEAD_DIM
 static uint64 KV_DIM      = 1024      // N_KV_HEADS * HEAD_DIM
 static uint64 QKV_DIM     = 4096      // (N_HEADS + 2*N_KV_HEADS) * HEAD_DIM
 static uint64 FF          = 3072
-static uint64 HIDDEN_PAD  = 1152     // padded row stride for qkv_w (from .hip.cpp #define HIDDEN_PAD 1152)
+static uint64 HIDDEN_PAD  = 1152     // padded row stride for qkv_w / gate_up_w (from .hip.cpp #define HIDDEN_PAD 1152)
+static uint64 Q_DIM_PAD   = 2176     // padded row stride for o_w     (from .hip.cpp #define Q_DIM_PAD 2176)
+static uint64 FF_PAD      = 3200     // padded row stride for down_w  (from .hip.cpp #define FF_PAD 3200)
 static uint64 WG_PERSIST_V1 = 512    // v1 native HIP kernel (#define WG_PERSIST 512 in .hip.cpp)
 static uint64 WG_PERSIST_V2 = 512    // v2 AST-walker (matches v1 and HIP source)
 static uint64 MAX_SEQ     = 64
@@ -368,9 +370,9 @@ fn main() {
     // ── Size constants (bytes) ────────────────────────────────────────────
     uint64 in_resid_b   = HIDDEN * 4
     uint64 qkv_w_b      = QKV_DIM * HIDDEN_PAD * 2   // padded row stride: HIDDEN_PAD=1152 u16 per row
-    uint64 o_w_b        = HIDDEN * Q_DIM * 2
-    uint64 gateup_b     = 2 * FF * HIDDEN * 2
-    uint64 down_b       = HIDDEN * FF * 2
+    uint64 o_w_b        = HIDDEN * Q_DIM_PAD * 2     // padded row stride: Q_DIM_PAD=2176 u16 per row
+    uint64 gateup_b     = 2 * FF * HIDDEN_PAD * 2    // padded row stride: HIDDEN_PAD=1152 u16 per row
+    uint64 down_b       = HIDDEN * FF_PAD * 2        // padded row stride: FF_PAD=3200 u16 per row
     uint64 in_norm_b    = HIDDEN * 4
     uint64 post_norm_b  = HIDDEN * 4
     uint64 q_norm_b     = HEAD_DIM * 4
@@ -546,34 +548,40 @@ fn main() {
     uint64 r8 = diff_slab("b_mid_norm_g", 12, dp_slot(dp_v1,32), dp_slot(dp_v2,32), norm_b)
     uint64 r9 = diff_slab("b_attn_out_g", 12, dp_slot(dp_v1,33), dp_slot(dp_v2,33), b_q_b)
 
-    // Slice-4.19.4 gate: at MAX_PHASE=0..3 ALL slabs must match.
+    // Slice-4.19.5 gate: at MAX_PHASE=0..4 ALL slabs must match.
     //   MAX_PHASE=0: v2 phase 1 (rmsnorm) produces b_x_norm_g; all others zero = match.
     //   MAX_PHASE=1: v2 phase 3 (QKV matmul) produces b_qkv_g; must match v1.
     //   MAX_PHASE=2: v2 phase 5 (QKV split + qknorm + RoPE) produces kc_layer, vc_layer,
     //                b_attn_q_g; all 10 slabs must match v1.
     //   MAX_PHASE=3: v2 phase 7 (attn_decode-coop) produces b_attn_out_g; all slabs match.
-    // At MAX_PHASE>=4, phases 9+ are still stubs so downstream slabs will mismatch v1
+    //   MAX_PHASE=4: v2 phase 9 (o_proj + residual-add) produces b_mid_g; all slabs match.
+    // At MAX_PHASE>=5, phases 11+ are still stubs so downstream slabs will mismatch v1
     // (expected; those mismatches are informational, not failures).
     uint64 n_mismatch = r0 + r1 + r2 + r3 + r4 + r5 + r6 + r7 + r8 + r9
 
     if max_phase == 0 {
-        if n_mismatch != 0 { puts("FAIL -- slice 4.19.4 gate (MAX_PHASE=0): expected all slabs to match"); exit(1) }
-        puts("PASS -- slice 4.19.4 gate (MAX_PHASE=0)")
+        if n_mismatch != 0 { puts("FAIL -- slice 4.19.5 gate (MAX_PHASE=0): expected all slabs to match"); exit(1) }
+        puts("PASS -- slice 4.19.5 gate (MAX_PHASE=0)")
         exit(0)
     }
     if max_phase == 1 {
-        if n_mismatch != 0 { puts("FAIL -- slice 4.19.4 gate (MAX_PHASE=1): expected all slabs to match"); exit(1) }
-        puts("PASS -- slice 4.19.4 gate (MAX_PHASE=1)")
+        if n_mismatch != 0 { puts("FAIL -- slice 4.19.5 gate (MAX_PHASE=1): expected all slabs to match"); exit(1) }
+        puts("PASS -- slice 4.19.5 gate (MAX_PHASE=1)")
         exit(0)
     }
     if max_phase == 2 {
-        if n_mismatch != 0 { puts("FAIL -- slice 4.19.4 gate (MAX_PHASE=2): expected all slabs to match"); exit(1) }
-        puts("PASS -- slice 4.19.4 gate (MAX_PHASE=2)")
+        if n_mismatch != 0 { puts("FAIL -- slice 4.19.5 gate (MAX_PHASE=2): expected all slabs to match"); exit(1) }
+        puts("PASS -- slice 4.19.5 gate (MAX_PHASE=2)")
         exit(0)
     }
     if max_phase == 3 {
-        if n_mismatch != 0 { puts("FAIL -- slice 4.19.4 gate (MAX_PHASE=3): expected all slabs to match"); exit(1) }
-        puts("PASS -- slice 4.19.4 gate (MAX_PHASE=3)")
+        if n_mismatch != 0 { puts("FAIL -- slice 4.19.5 gate (MAX_PHASE=3): expected all slabs to match"); exit(1) }
+        puts("PASS -- slice 4.19.5 gate (MAX_PHASE=3)")
+        exit(0)
+    }
+    if max_phase == 4 {
+        if n_mismatch != 0 { puts("FAIL -- slice 4.19.5 gate (MAX_PHASE=4): expected all slabs to match"); exit(1) }
+        puts("PASS -- slice 4.19.5 gate (MAX_PHASE=4)")
         exit(0)
     }
     put_kv("mismatch_slabs", 14, n_mismatch)

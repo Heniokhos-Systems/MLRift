@@ -550,6 +550,7 @@ fn _body_has_attn_decode_coop_marker(uint64 body_node) -> uint64 {
     return _body_has_marker(body_node, "attn_decode_coop_marker", 23)
 }
 
+
 // Phase 3 inline ISA emitter — gemv_coop_bf16_f32 with padded-row stride.
 //
 // Emits INLINE (no asm_init, no s_endpgm) into the ongoing asm buffer.
@@ -823,6 +824,251 @@ fn _emit_phase3_qkv_matmul_inline(uint64 n_out, uint64 k, uint64 k_pad,
     asm_u32(0xBF0AFF0C)
     asm_u32(rows_per_wg & 0xFFFFFFFF)
     // s_cbranch_scc1 outer_top
+    uint64 outer_back = (outer_top - (asm_text_len / 4) - 1) & 0xFFFF
+    asm_s_cbranch_scc1(outer_back)
+
+    // ── Patch the WG gate skip-branch ─────────────────────────────────────
+    uint64 body_dwords = (asm_text_len / 4) - (gate_cmp_pos + 3)
+    asm_patch_u32(gate_cmp_pos + 2, 0xBFA20000 | (body_dwords & 0xFFFF))
+}
+
+// ── Phase 9 inline ISA emitter — gemv-residual-fused ──────────────────────
+//
+// _emit_phase9_gemv_residual_inline — gemv_coop_bf16_f32, padded-row stride,
+// with residual-add at the lane-0 row-store.  Body identical to phase 3
+// (_emit_phase3_qkv_matmul_inline) except the lane-0 store does
+//   out[row] = in_residual[row] + acc
+// instead of
+//   out[row] = acc.
+//
+// Caller supplies kernarg byte offsets directly (since phase 9's inputs
+// are not the canonical 0x10/0x88/0x90 phase-3 set):
+//   w_kofs   = byte offset for the bf16 weight ptr      (e.g. o_w        = 0x18)
+//   x_kofs   = byte offset for the f32 input  ptr       (e.g. b_attn_out_g = 0xB0)
+//   res_kofs = byte offset for the f32 residual ptr     (e.g. in_residual  = 0x00)
+//   out_kofs = byte offset for the f32 output   ptr     (e.g. b_mid_g      = 0xA0)
+//
+// SGPR context on entry (from prologue):
+//   s[0:1]   = kernarg ptr pair
+//   s[8:9]   = barrier_counter ptr        (must NOT be clobbered)
+//   s[10:11] = max_phase value            (must NOT be clobbered)
+//   s15      = wg_id_x ONLY VALID IF NO PRIOR PHASE CLOBBERED IT — phase 5
+//              clobbers s15 with the high half of rope_sin (s_load_b64
+//              s[14:15], 0x58), so by the time phase 9 runs s15 is garbage.
+//              Phase 9 reads the SAVED wg_id_x from s28 (stashed in the
+//              kernel prologue: `asm_s_mov_b32(28, 15)`), exactly like
+//              phase 7 does.
+//   s28      = saved wg_id_x (use this for the row index, NOT s15)
+//
+// Phase 9 SGPR allocation:
+//   s[2:3]   = o_w ptr           (kernarg 0x18; advances by w_row_step per r_off)
+//   s[4:5]   = b_attn_out_g ptr  (kernarg 0xB0; never modified)
+//   s[6:7]   = b_mid_g ptr       (kernarg 0xA0; offset+restored per row)
+//   s[18:19] = in_residual ptr   (kernarg 0x00; offset+restored per row)
+//              s[18:19] is sdata_pair=9, free across phases.  Avoids s17
+//              (used as exec-save in lane-0 gate).
+//   s12      = r_off outer counter (0..ROWS_PER_WG-1)
+//   s13      = row index (init: s28; +256 each outer iter)
+//   s14      = inner k_iters / row*4 byte offset / w_row_step scratch
+//   s17      = saved exec_lo for lane-0 gate (clobbered & restored inside)
+//
+// VGPR usage (mirrors phase 3 exactly except v9 is reused at lane-0 store
+// time as the residual-load destination — safe because v9 is dead after
+// the wave-XOR reduce):
+//   v0   = lane id (hardware, r/o)
+//   v1   = vaddr=0   (for global_load_b32 saddr-form and global_store_b32)
+//   v2   = acc       (f32 accumulator; final wave-reduced sum)
+//   v3:v4 = weight ptr per lane (init: s[w_lo:w_hi]+lane*4; +128 each inner)
+//   v5:v6 = x ptr per lane     (init: s[x_lo:x_hi]+lane*8; +256 each inner)
+//   v7   = lane*4 (constant)
+//   v8   = lane*8 (constant)
+//   v9   = packed u32 (2 bf16 weights) → reused as bpermute addr → reused as
+//          v_res in the residual-add-then-store block
+//   v10  = bf16-lo f32 / reduce tmp
+//   v11  = x[kp*2]
+//   v12  = x[kp*2+1]
+//
+// gfx11 hazard note: the residual load lands in v9, then we do
+// `v_add_f32 v2, v2, v9` (VALU) followed by `global_store_b32 ..., v2, ...`
+// (VMEM consumer of v2).  Per the gfx11 VALU→VMEM/LDS rule we must insert
+// `s_delay_alu instid0(VALU_DEP_1)` between them.
+//
+// Verified: this function differs from _emit_phase3_qkv_matmul_inline only
+// in (1) the gate uses s28 not s15, (2) the row-init mov is from s28 not
+// s15, (3) the lane-0 store block adds the residual-load + v_add_f32
+// + delay_alu before the global_store.  All other inner-loop math
+// (bf16-unpack, fmac, ptr-advance, wave-XOR reduce) is identical.
+fn _emit_phase9_gemv_residual_inline(uint64 n_out, uint64 k, uint64 k_pad,
+                                      uint64 wg_active,
+                                      uint64 w_kofs, uint64 x_kofs,
+                                      uint64 res_kofs, uint64 out_kofs) {
+    // ── WG gate (skip if wg_id >= wg_active) ─────────────────────────────
+    // s_cmp_ge_u32 s28, wg_active: SOPC op=0x09, ssrc0=s28=0x1C, ssrc1=lit(0xFF)
+    //   word = 0xBF000000|(9<<16)|(0xFF<<8)|0x1C = 0xBF09FF1C  (s28 not s15)
+    uint64 gate_cmp_pos = asm_text_len / 4
+    asm_u32(0xBF09FF1C)
+    asm_u32(wg_active)
+    asm_s_cbranch_scc1(0)   // patched at end
+
+    // ── Load base pointers ────────────────────────────────────────────────
+    // sdata pairs: 1=s[2:3] (w), 2=s[4:5] (x), 3=s[6:7] (out), 9=s[18:19] (res).
+    // Pair 9 chosen to avoid s17 collision (used as exec save in lane-0 gate).
+    asm_s_load_b64_off(1, 0, w_kofs)     // o_w           → s[2:3]
+    asm_s_load_b64_off(2, 0, x_kofs)     // b_attn_out_g  → s[4:5]
+    asm_s_load_b64_off(3, 0, out_kofs)   // b_mid_g       → s[6:7]
+    asm_s_load_b64_off(9, 0, res_kofs)   // in_residual   → s[18:19]
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // ── Constant lane offsets ─────────────────────────────────────────────
+    asm_v_lshlrev_b32_imm(7, 2, 0)   // v7 = lane*4
+    asm_v_lshlrev_b32_imm(8, 3, 0)   // v8 = lane*8
+    asm_v_mov_b32_inline_u(1, 0)     // v1 = 0 (vaddr for load/store)
+
+    // ── Outer loop init ───────────────────────────────────────────────────
+    // s13 = row = wg_id (read from saved s28, NOT s15)
+    // s_mov_b32 s13, s28: SOP1 (0x17D<<23)|(0x0D<<16)|0x1C = 0xBE8D001C
+    asm_s_mov_b32(13, 28)
+    // s12 = r_off = 0
+    asm_s_mov_b32_inline_imm(12, 0)
+
+    uint64 w_lo = 2
+    uint64 w_hi = 3
+    uint64 x_lo = 4
+    uint64 x_hi = 5
+    uint64 out_lo = 6
+    uint64 out_hi = 7
+    uint64 res_lo = 18
+    uint64 res_hi = 19
+    uint64 res_pair = 9          // s[18:19] for global_load_b32 saddr field
+
+    // w_row_step = wg_active * k_pad * 2 bytes
+    uint64 w_row_step = wg_active * k_pad * 2
+    // k_iters = k / 2 / 32 (for k=2048: 1024/32 = 32)
+    uint64 k_iters = k / 2 / 32
+    // rows_per_wg = ceil(n_out / wg_active) (for 1024/256 = 4)
+    uint64 rows_per_wg = (n_out + wg_active - 1) / wg_active
+
+    uint64 outer_top = asm_text_len / 4
+
+    // ── Per-row body ──────────────────────────────────────────────────────
+    asm_v_mov_b32_inline_u(2, 0)   // acc = 0.0
+
+    // init weight ptr: v3:v4 = s[w_lo:w_hi] + lane*4
+    asm_v_mov_b32_inline_u(4, 0)
+    asm_v_add_co_u32_vcc_sv(3, w_lo, 7)
+    asm_v_add_co_ci_u32_null_sv_vcc(4, w_hi, 4)
+
+    // init x ptr: v5:v6 = s[x_lo:x_hi] + lane*8
+    asm_v_mov_b32_inline_u(6, 0)
+    asm_v_add_co_u32_vcc_sv(5, x_lo, 8)
+    asm_v_add_co_ci_u32_null_sv_vcc(6, x_hi, 6)
+
+    // ── Inner K loop ──────────────────────────────────────────────────────
+    asm_s_mov_b32_inline_imm(14, k_iters)
+    uint64 inner_top = asm_text_len / 4
+
+    asm_u32(0xDC520000); asm_u32(0x097C0003)    // global_load_b32 v9, v[3:4], off
+    asm_u32(0xDC520000); asm_u32(0x0B7C0005)    // global_load_b32 v11, v[5:6], off
+    asm_u32(0xDC520004); asm_u32(0x0C7C0005)    // global_load_b32 v12, v[5:6], off offset:4
+    asm_s_waitcnt_vmcnt_zero()
+
+    asm_v_lshlrev_b32_imm(10, 16, 9)           // v10 = bf16-lo as f32
+    asm_u32(0x361212FF); asm_u32(0xFFFF0000)   // v9  = bf16-hi as f32
+
+    asm_v_fmac_f32_e32_vv(2, 10, 11)           // acc += w0 * x0
+    asm_v_fmac_f32_e32_vv(2, 9, 12)            // acc += w1 * x1
+
+    // advance weight ptr +128 bytes
+    asm_u32(0xD7006A03); asm_u32(0x000206FF); asm_u32(128)
+    asm_u32(0xD5207C04); asm_u32(0x01AA0880)
+    // advance x ptr +256 bytes
+    asm_u32(0xD7006A05); asm_u32(0x00020AFF); asm_u32(256)
+    asm_u32(0xD5207C06); asm_u32(0x01AA0C80)
+
+    asm_s_sub_u32_imm(14, 14, 1)
+    asm_s_cmp_eq_u32(14, 0x80)
+    uint64 inner_back = (0 - ((asm_text_len / 4) - inner_top) - 1) & 0xFFFF
+    asm_s_cbranch_scc0(inner_back)
+
+    // ── Wave XOR reduce ───────────────────────────────────────────────────
+    // acc=v2, addr=v9 (free after inner loop), tmp=v10
+    _emit_wave_xor_reduce_add_f32_5_levels(2, 9, 10)
+
+    // ── Lane-0 residual-add + store ──────────────────────────────────────
+    // Same exec-save pattern as phase 3 (s17 = exec save; v_cmp_eq writes
+    // ONLY vcc_lo; s_and_saveexec_b32 s17, vcc_lo gates exec to lane 0).
+    asm_v_cmp_eq_u32_imm_vgpr(0, 0)         // vcc_lo = (v0 == 0)
+    asm_s_and_saveexec_b32_vcc_lo(17)       // s17 = old exec; exec &= vcc_lo
+
+    // s14 = row * 4  (s_lshl_b32 s14, s13, 2)
+    //   word = 0x840E820D (verified, from phase 3)
+    asm_u32(0x840E820D)
+
+    // out_ptr += s14   (b_mid_g += row*4)
+    //   s_add_u32 s6,s6,s14 = 0x80061406  (out_lo=6, ssrc1=s14=0x0E)
+    asm_u32(0x80000000 | (out_lo << 16) | (14 << 8) | out_lo)
+    //   s_addc_u32 s7,s7,0
+    asm_u32(0x82000000 | (out_hi << 16) | 0x8000 | out_hi)
+
+    // res_ptr += s14   (in_residual += row*4)
+    //   s_add_u32 s18,s18,s14
+    asm_u32(0x80000000 | (res_lo << 16) | (14 << 8) | res_lo)
+    //   s_addc_u32 s19,s19,0
+    asm_u32(0x82000000 | (res_hi << 16) | 0x8000 | res_hi)
+
+    // global_load_b32 v9, v1, s[res_lo:res_hi]
+    //   word1 = 0xDC520000
+    //   word2 = (vdst<<24) | (saddr<<16) | vaddr
+    //   saddr is the SGPR INDEX of the low reg (= res_lo = 18 for s[18:19]),
+    //   NOT the sdata pair index — encoding bug fixed post-bring-up.
+    asm_u32(0xDC520000)
+    asm_u32((9 << 24) | ((res_lo & 0x7F) << 16) | 1)
+
+    // wait for residual load to retire
+    asm_s_waitcnt_vmcnt_zero()
+
+    // v_add_f32_e32 v2, v2, v9  (acc = res + acc; commutative for f32)
+    //   VOP2 op 0x03: (3<<25)|(v2<<17)|(v9<<9)|(0x100|v2)
+    //                = 0x06000000|0x00040000|0x00001200|0x102 = 0x06041302
+    asm_u32(0x06041302)
+
+    // gfx11 VALU→VMEM hazard: let v_add_f32 settle before global_store
+    asm_s_delay_alu(0x01)
+
+    // global_store_b32 v1, v2, s[out_lo:out_hi]
+    asm_u32(0xDC6A0000)
+    asm_u32(((out_lo & 0x7F) << 16) | (2 << 8) | 1)
+
+    // Restore exec: s_or_b32 exec_lo, exec_lo, s17
+    asm_u32(0x8C7E117E)
+
+    // ── Restore in_residual + b_mid_g ptrs (undo row*4 added above) ──────
+    // s14 still holds row*4 (only the lane-0 gate modified state, but s14
+    // was set BEFORE the saveexec — it's a scalar value shared by all lanes,
+    // so it survives the exec-mask change unmodified).
+    // s_sub_u32 out_lo, out_lo, s14
+    asm_u32(0x80800000 | (out_lo << 16) | (0x0E << 8) | out_lo)
+    // s_subb_u32 out_hi, out_hi, 0
+    asm_u32(0x82800000 | (out_hi << 16) | 0x8000 | out_hi)
+    // s_sub_u32 res_lo, res_lo, s14
+    asm_u32(0x80800000 | (res_lo << 16) | (0x0E << 8) | res_lo)
+    // s_subb_u32 res_hi, res_hi, 0
+    asm_u32(0x82800000 | (res_hi << 16) | 0x8000 | res_hi)
+
+    // ── Outer loop advance ────────────────────────────────────────────────
+    // Advance weight ptr by w_row_step bytes
+    asm_s_mov_b32_lit32(14, w_row_step & 0xFFFFFFFF)
+    asm_u32(0x80000000 | (w_lo << 16) | (0x0E << 8) | w_lo)
+    asm_u32(0x82000000 | (w_hi << 16) | 0x8000 | w_hi)
+
+    // Advance row: s13 += wg_active
+    asm_u32(0x800DFF0D)
+    asm_u32(wg_active)
+
+    // r_off++; check r_off < rows_per_wg
+    asm_u32(0x800C810C)               // s_add_u32 s12, s12, 1
+    asm_u32(0xBF0AFF0C)               // s_cmp_lt_u32 s12, lit
+    asm_u32(rows_per_wg & 0xFFFFFFFF)
     uint64 outer_back = (outer_top - (asm_text_len / 4) - 1) & 0xFFFF
     asm_s_cbranch_scc1(outer_back)
 
@@ -1944,8 +2190,22 @@ fn mega_emit_stub_kernel(uint64 kname_ptr, uint64 nl, uint64 body_node) -> uint6
     uint64 mp4_cbranch_pos = asm_text_len / 4
     asm_s_cbranch_scc1(0)   // patched below
 
-    // Phase 9 stub
-    asm_u32(0xBF800000)
+    // ── Phase 9: o_proj matmul + residual-add (WG < 256) ──────────────────
+    // Kernarg layout: w=o_w(arg 3, 0x18), x=b_attn_out_g(arg 22, 0xB0),
+    //                 res=in_residual(arg 0, 0x00), out=b_mid_g(arg 20, 0xA0).
+    // Shapes: n_out=1024 (HIDDEN), k=2048 (Q_DIM), k_pad=2176 (Q_DIM_PAD),
+    //         wg_active=256.
+    // Marker recognized inline (no `_body_has_oproj_residual_marker` wrapper)
+    // because adding one would overflow the bootstrap's 1024-fn cap. Phases
+    // 11-17 will each have a similar marker; once the cap is bumped (or the
+    // bootstrap rebuilt), a future polish pass can restore the wrapper for
+    // symmetry with phases 1/3/5/7.
+    if _body_has_marker(body_node, "oproj_residual_marker", 21) != 0 {
+        _emit_phase9_gemv_residual_inline(1024, 2048, 2176, 256,
+                                            0x18, 0xB0, 0x00, 0xA0)
+    } else {
+        asm_u32(0xBF800000)   // s_nop 0 (phase 9 stub)
+    }
     mega_emit_barrier_isa(4, MEGA_WG_PERSIST)
     asm_s_cmp_lt_u32(10, 0x85)
     uint64 mp5_cbranch_pos = asm_text_len / 4
