@@ -12290,61 +12290,12 @@ fn amdgpu_lower_kfd_copy_u64(uint64 kname_ptr, uint64 nl) -> uint64 {
     return 0
 }
 
-// Slice 4.18 — qwen3_layer_megakernel module-emit lowerer.
-//
-// Same pre-extracted gfx1100 .text bytes as
-// emit_amdgpu_qwen3_megakernel_blob, but pushed into the kernel
-// table for module-level emit (so e.g. examples/llm/qwen3_layer_megakernel.mlr
-// can be compiled with `--target=amdgpu-native -o /tmp/foo` and
-// produce a working .co alongside any other @kernel fns in the
-// same module).
-fn amdgpu_lower_qwen3_megakernel(uint64 kname_ptr, uint64 nl) -> uint64 {
-    uint64 bin_path = "build/native_megakernel/qwen3_layer_megakernel.gfx1100.bin"
-    uint64 bfd = file_open(bin_path, 0)
-    if bfd > 0xFFFFFFFFFFFFF000 {
-        write(2, "amdgpu_lower_qwen3_megakernel: cannot open .bin (run scripts/build_native_megakernel.sh first)\n", 95)
-        return 1
-    }
-    uint64 text_size = file_size(bfd)
-    if text_size == 0 {
-        write(2, "amdgpu_lower_qwen3_megakernel: empty .bin\n", 42)
-        file_close(bfd)
-        return 1
-    }
-    uint64 text_buf = alloc(text_size)
-    file_read(bfd, text_buf, text_size)
-    file_close(bfd)
-
-    // 24-arg descriptor: 22 global_buffer + 2 by_value (slots 14, 23).
-    uint64 args_desc = alloc(24 * 16)
-    uint64 ai = 0
-    while ai < 24 {
-        uint64 sz_p   = args_desc + ai * 16
-        uint64 kind_p = args_desc + ai * 16 + 8
-        unsafe { *(sz_p as uint64) = 8 }
-        if ai == 14 {
-            unsafe { *(kind_p as uint64) = AMD_ARG_KIND_BY_VALUE }
-        } else if ai == 23 {
-            unsafe { *(kind_p as uint64) = AMD_ARG_KIND_BY_VALUE }
-        } else {
-            unsafe { *(kind_p as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
-        }
-        ai = ai + 1
-    }
-
-    uint64 rsrc1 = 0xE0AF0006
-    uint64 rsrc2 = 0x0000009E
-    uint64 rsrc3 = 0x000003F0
-    uint64 props = 0x0408
-    uint64 lds   = 516
-
-    kt_push_lds(kname_ptr, nl, text_buf, text_size,
-                args_desc, 24, 192,
-                70, 55,
-                rsrc1, rsrc2, rsrc3, props,
-                lds)
-    return 0
-}
+// Slice 4.19.11 — amdgpu_lower_qwen3_megakernel (slice 4.18 byte-wrapper)
+// removed.  Was: pushed pre-extracted gfx1100 .text bytes from
+// build/native_megakernel/qwen3_layer_megakernel.gfx1100.bin into the
+// kernel table for module-level emit.  The v2 AST-walker
+// (--emit-amdgpu-qwen3-megakernel-v2=PATH) replaces this entirely;
+// see emit_amdgpu_qwen3_megakernel_blob_v2 below.
 
 // noesis csr_build lowering.
 //
@@ -17927,16 +17878,13 @@ fn amdgpu_lower_kernel_to_table(uint64 fn_node, uint64 source) -> uint64 {
         return amdgpu_lower_kfd_copy_u64(kname_ptr, nl)
     }
 
-    // ── Slice 4.18: qwen3-0.6B layer mega-kernel ───────────────────────
-    // Recognised by name: pushes the pre-extracted gfx1100 .text bytes
-    // (bitwise identical to hipcc -O3) into the kernel table so the
-    // module-level `--target=amdgpu-native` path bundles it alongside
-    // any other @kernel fns in the same .mlr source.  Same metadata
-    // (24 args, 192 B kernarg seg, 70 SGPR / 55 VGPR / 516 B LDS) as
-    // emit_amdgpu_qwen3_megakernel_blob.
-    if tok_matches(name_tok, "qwen3_layer_megakernel", 22) != 0 {
-        return amdgpu_lower_qwen3_megakernel(kname_ptr, nl)
-    }
+    // ── Slice 4.19.11: qwen3 mega-kernel byte-wrapper removed ─────────
+    // The byte-wrapper recognizer (slice 4.18 amdgpu_lower_qwen3_megakernel)
+    // was deleted along with build/native_megakernel/*.bin; the v2 AST-walker
+    // (recognize_megakernel_swiglu_dense_gqa in format_amdgpu_megakernel.mlr)
+    // is now the sole emit path, invoked via the dedicated CLI flag
+    // `--emit-amdgpu-qwen3-megakernel-v2=PATH` rather than module-level
+    // `--target=amdgpu-native` dispatch.
 
     // ── Phase 3a-2: AST-walking 2-input pointwise recogniser ──────────
     // Catches the (a_ptr, b_ptr, out_ptr, n) shape with `r = a OP b`
@@ -18901,101 +18849,12 @@ fn emit_amdgpu_qwen3_megakernel_skeleton_blob(uint64 out_path) -> uint64 {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// Slice 4.18 — qwen3-0.6B layer mega-kernel native emit (HIP→native).
-//
-// Ports examples/llm/qwen3_layer_megakernel.hip.cpp to MLRift's own
-// .co packager.  The .text bytes are bit-identical to the hipcc -O3
-// gfx1100 reference (extracted once via clang-offload-bundler +
-// llvm-objcopy, shipped under build/native_megakernel/), so this
-// kernel runs at the same per-WG ISA cost as the HIP path while
-// removing the runtime hipcc dependency from the .co build.
-//
-// Caveats (all match the HIP reference):
-//   * gfx1100 only — gfx1030/1200 ports are separate slices
-//   * 24 kernargs, 192-byte segment, 70 SGPRs, 55 VGPRs, 516 B LDS
-//   * grid = (WG_PERSIST=512, 1, 1), block = (32, 1, 1) (caller's job)
-//   * inter-phase carries flow through global scratch slabs (see HIP
-//     source for the slice-4.6 LDS-vs-global rationale)
-//
-// Returns 0 on success, 1 on I/O failure (bin file missing or output
-// path unwritable).  The bin file is shipped under
-// build/native_megakernel/ relative to the repo root; mlrc is invoked
-// from there for now (matches the rest of the slice-4 launchers).
-@export
-fn emit_amdgpu_qwen3_megakernel_blob(uint64 out_path) -> uint64 {
-    uint64 kname = "qwen3_layer_megakernel"
-    uint64 klen  = 22
-
-    // Read the pre-extracted gfx1100 .text bytes.  Bytewise identical
-    // to the hipcc -O3 reference; extraction is a one-shot offline
-    // step (see scripts/build_native_megakernel.sh).
-    uint64 bin_path = "build/native_megakernel/qwen3_layer_megakernel.gfx1100.bin"
-    uint64 bfd = file_open(bin_path, 0)
-    if bfd > 0xFFFFFFFFFFFFF000 {
-        write(2, "emit_amdgpu_qwen3_megakernel_blob: cannot open .bin (run scripts/build_native_megakernel.sh first)\n", 99)
-        return 1
-    }
-    uint64 text_size = file_size(bfd)
-    if text_size == 0 {
-        write(2, "emit_amdgpu_qwen3_megakernel_blob: empty .bin\n", 46)
-        file_close(bfd)
-        return 1
-    }
-    uint64 text_buf = alloc(text_size)
-    file_read(bfd, text_buf, text_size)
-    file_close(bfd)
-
-    // KD layout (decoded from the hipcc reference's .rodata):
-    //   group_segment_fixed_size   = 516   (LDS — wave_tmp + attn_w_lds)
-    //   kernarg_size               = 192   (24 x 8B)
-    //   compute_pgm_rsrc1          = 0xE0AF0006  (vgpr field=6 -> 56 vgprs)
-    //   compute_pgm_rsrc2          = 0x0000009E  (wg_id_x in s15)
-    //   compute_pgm_rsrc3          = 0x000003F0  (inst_pref_size = max)
-    //   properties                 = 0x0408     (kernarg_ptr, wave32)
-    uint64 rsrc1 = 0xE0AF0006
-    uint64 rsrc2 = 0x0000009E
-    uint64 rsrc3 = 0x000003F0
-    uint64 props = 0x0408
-    uint64 lds   = 516
-
-    // 24-arg descriptor: 22 global_buffer + 2 by_value (pos at slot 14,
-    // max_phase at slot 23).  Each entry is (size:u64, kind:u64).
-    uint64 args_desc = alloc(24 * 16)
-    uint64 ai = 0
-    while ai < 24 {
-        uint64 sz_p   = args_desc + ai * 16
-        uint64 kind_p = args_desc + ai * 16 + 8
-        unsafe { *(sz_p as uint64) = 8 }
-        // pos = arg 14, max_phase = arg 23 -> by_value
-        if ai == 14 {
-            unsafe { *(kind_p as uint64) = AMD_ARG_KIND_BY_VALUE }
-        } else if ai == 23 {
-            unsafe { *(kind_p as uint64) = AMD_ARG_KIND_BY_VALUE }
-        } else {
-            unsafe { *(kind_p as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
-        }
-        ai = ai + 1
-    }
-
-    uint64 size = emit_amdgpu_code_object_lds(kname, klen,
-                                               text_buf, text_size,
-                                               192,    // kernarg_size
-                                               8,      // kernarg_align
-                                               70,     // sgpr_count (matches hipcc metadata)
-                                               55,     // vgpr_count
-                                               rsrc1, rsrc2, rsrc3, props,
-                                               args_desc, 24,
-                                               lds)
-
-    uint64 fd = file_open(out_path, 1)
-    if fd > 0xFFFFFFFFFFFFF000 {
-        write(2, "emit_amdgpu_qwen3_megakernel_blob: cannot open output\n", 54)
-        return 1
-    }
-    file_write(fd, amd_buf, size)
-    file_close(fd)
-    return 0
-}
+// Slice 4.19.11 — emit_amdgpu_qwen3_megakernel_blob (slice 4.18 v1
+// byte-wrapper) deleted.  Was: read pre-extracted gfx1100 .text bytes
+// from build/native_megakernel/qwen3_layer_megakernel.gfx1100.bin and
+// wrap into a .co.  The v2 AST-walker below (slice 4.19.0+) is now the
+// sole mega-kernel emit path, validated bit-exact against the v1
+// reference at decode lengths 20/50/80/120 in slice 4.19.10.
 
 // ─────────────────────────────────────────────────────────────────────
 // Slice 4.19.0 — qwen3-0.6B layer mega-kernel v2 (AST-walker stub).
