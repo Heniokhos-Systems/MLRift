@@ -266,9 +266,17 @@ fn _emit_wave_xor_reduce_max_f32_5_levels(uint64 acc, uint64 addr, uint64 tmp) {
 //   v9  = lane * 4 (constant byte offset, computed once)
 //   v10, v11 = load temporaries for output loop
 //
-// LDS layout (must match HIP source attn_w_lds[128]+wave_tmp[1]):
-//   offset 0..511   = attn_w_lds[128] (512 bytes)
-//   offset 512..515 = wave_tmp[0] (4 bytes) — used for scale broadcast
+// LDS layout — 516 bytes total, regions overlap by lifetime:
+//   phase 1 / phase 5 / phase 11 use offset 512..515 as `wave_tmp[0]`
+//     (rsqrt scale broadcast, live only within the phase, written before
+//     the per-phase s_barrier and dead after the phase exits).
+//   phase 7 uses offset 4..515 as `attn_w_lds[t]` at byte off `4 + t*4`
+//     (softmax weights for t in [0..127], cached between Pass 2 and
+//     Pass 3, live only within phase 7).
+//   offset 0..3 is unused on this kernel layout.
+//   The two regions overlap at byte 512 (wave_tmp[0] vs attn_w_lds[127])
+//   but lifetimes are disjoint: phase 1's wave_tmp is dead by the time
+//   the per-phase barrier hands off to phase 7.
 //
 // Hardware: gfx1100 (RDNA3) wave32.  N=HIDDEN=1024, WAVE=32 → 32 iters.
 fn _emit_phase1_rmsnorm_inline() {
@@ -1392,9 +1400,12 @@ fn _emit_phase5_qkv_split_qknorm_rope_inline() {
 //   v24      = acc (Pass 3 output accumulator)
 //   v25      = LDS broadcast addr (Pass 3 per-iter)
 //
-// LDS layout: attn_w_lds[t] at byte offset 4 + t*4 (skipping wave_tmp[0] at
-// offset 0 used by rmsnorm in other phases).  Total LDS usage = 4 + 128*4 =
-// 516 bytes, matches mega_emit_stub_kernel.
+// LDS layout: attn_w_lds[t] at byte offset 4 + t*4, for t in [0..127].
+// Total LDS usage = 516 bytes (matches mega_emit_stub_kernel KD).
+// Phases 1/5 use offset 512..515 as wave_tmp[0] for their rsqrt scale
+// broadcast; lifetime is disjoint from phase 7's attn_w_lds reads/writes
+// (a per-phase s_barrier separates them), so the byte-512 overlap with
+// attn_w_lds[127] is harmless. See top-of-file LDS-layout block.
 //
 // Constants:
 //   scale_attn = 1/sqrt(128) = 0x3DB504F3
@@ -1776,6 +1787,9 @@ fn _emit_phase7_attn_decode_coop_inline() {
     asm_s_cbranch_scc1(0)
 
     // ── Load LDS[t]*4 + 4 broadcast, ds_load with offset:4 ──────────────
+    // s26/s27 are free to reuse here — at lines above they held the
+    // out-ptr (b_attn_out_g + dim_byte_off), already transferred into
+    // v[21:?] + v26 for the pass-3 inner loop.
     // s26 = s25 << 2  (LDS byte offset relative to base, before +4)
     // s_lshl_b32 s26, s25, 2: word = (2<<30)|(8<<23)|(0x1A<<16)|(0x82<<8)|0x19 = 0x841A8219
     asm_u32(0x841A8219)
@@ -1803,15 +1817,10 @@ fn _emit_phase7_attn_decode_coop_inline() {
     asm_v_fmac_f32_e32_vv(24, 22, 20)
 
     // ── Advance v[7:8] by KV_DIM*4 = 4096 bytes ──────────────────────────
-    // v_add_co_u32 v7, vcc_lo, lit, v7: VOP3B op 0x100
-    //   word1 = 0xD7006A07, word2 = ((0x100|7)<<9)|0xFF = (0x107<<9)|0xFF = 0x20E00|0xFF = 0x000020EFF — wait
-    //   (0x107<<9) = 0x20E00, |0xFF = 0x20EFF. word2 = 0x000020EFF doesn't look right.
-    // Compare phase 5 line ~688: asm_u32(0xD7006A05); asm_u32(0x00020AFF); asm_u32(256)
-    //   src1 = v5 → (0x100|5)<<9 = 0x105<<9 = 0x20A00; src0 = 0xFF (lit). word2 = 0x000A00 | 0xFF — no wait
-    //   (0x105<<9) = 0x20A00, |0xFF = 0x20AFF, but they wrote 0x00020AFF → so word2 has 0x00020A00 + 0xFF = 0x00020AFF.
-    //   Hmm, (0x105<<9) = 0x20A00 which doesn't equal 0x00020A00 = 0x20A00. OK same thing, format display.
-    //   word2 = (src1_enc<<9)|src0 = (0x107<<9)|0xFF = 0x20E00|0xFF = 0x20EFF
-    //   But proper format is 0x00020EFF. Let me write that:
+    // v_add_co_u32 v7, vcc_lo, lit, v7  (VOP3B op 0x100, src0=lit32, src1=v7)
+    //   word1 = 0xD7006A07
+    //   word2 = ((0x100|7) << 9) | 0xFF = 0x00020EFF
+    //   lit   = 4096 (KV_DIM * 4)
     asm_u32(0xD7006A07)
     asm_u32(0x00020EFF)
     asm_u32(4096)
