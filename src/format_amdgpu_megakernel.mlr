@@ -433,42 +433,42 @@ fn _emit_phase1_rmsnorm_inline() {
     asm_patch_u32(gate_cmp_pos + 1, 0xBFA20000 | (body_dwords & 0xFFFF))
 }
 
-// Sub-recognizer: phase 1 / phase 11 — rmsnorm gated to WG 0 only.
+// ── Marker recognition helpers ────────────────────────────────────────────
 //
-// Walks the mega-kernel function body block looking for a Call to
-// `rmsnorm_wg0_marker` anywhere in the phase-1 `if wg_id == 0 { ... }`
-// block.  If found, the phase is emitted via _emit_phase1_rmsnorm_inline;
-// otherwise the caller should fall through to the stub emitter.
+// _body_has_marker(body_node, name_ptr, name_len) — generic sub-recognizer.
 //
-// Returns 1 if the marker is found, 0 if not found.
-fn _body_has_rmsnorm_wg0_marker(uint64 body_node) -> uint64 {
+// Walks all if-block bodies in body_node looking for a Call to the function
+// named by name_ptr/name_len.  Handles both:
+//   ExprStmt → Call(name)   (bare call statement)
+//   VarDecl  → Call(name)   (e.g. `uint64 _ = marker()`)
+//
+// Returns 1 if found, 0 if not found.
+//
+// All phase recognizers (_body_has_*_marker) are one-line wrappers below.
+fn _body_has_marker(uint64 body_node, uint64 name_ptr, uint64 name_len) -> uint64 {
     uint32 stmt = ast_child(body_node)
     while stmt != 0 {
-        // Look for `if wg_id == 0 { ... }` (AST_KIND_IF = 13)
         if ast_kind(stmt) == 13 {
             uint32 then_blk = ast_data1(stmt)
             if then_blk != 0 {
                 uint32 inner = ast_child(then_blk)
                 while inner != 0 {
-                    // Check for ExprStmt(Call(rmsnorm_wg0_marker)) — bare call statement.
-                    // A bare fn call in statement position is wrapped in ExprStmt (kind 16),
-                    // with the child being the Call expression (kind 35).
+                    // ExprStmt(kind 16) → Call(kind 35) → callee token
                     if ast_kind(inner) == 16 {
                         uint32 expr = ast_child(inner)
                         if expr != 0 && ast_kind(expr) == 35 {
                             uint32 callee = ast_data1(expr)
-                            if tok_matches(callee, "rmsnorm_wg0_marker", 18) != 0 {
+                            if tok_matches(callee, name_ptr, name_len) != 0 {
                                 return 1
                             }
                         }
                     }
-                    // Also check for VarDecl whose init is a Call to rmsnorm_wg0_marker
-                    // (in case someone writes `uint64 _ = rmsnorm_wg0_marker()`)
+                    // VarDecl(kind 10) → init Call(kind 35) → callee token
                     if ast_kind(inner) == 10 {
                         uint32 init = ast_child(inner)
                         if init != 0 && ast_kind(init) == 35 {
                             uint32 callee = ast_data1(init)
-                            if tok_matches(callee, "rmsnorm_wg0_marker", 18) != 0 {
+                            if tok_matches(callee, name_ptr, name_len) != 0 {
                                 return 1
                             }
                         }
@@ -482,73 +482,36 @@ fn _body_has_rmsnorm_wg0_marker(uint64 body_node) -> uint64 {
     return 0
 }
 
-// Sub-recognizer: phase 3 / phase 13 — gemv_coop_bf16_f32 with padded-row
-// stride and per-WG row offset.
-//
-// Shape of the phase-3 block in the MLRift source:
-//   if wg_id < 256 {
-//       qkv_matmul_marker()       // recognition marker (bare call)
-//   }
-//
-// Phase 3: N_OUT=QKV_DIM=4096, K=HIDDEN=1024, K_PAD=HIDDEN_PAD=1152,
-//          x=b_x_norm_g (arg 17), w=qkv_w (arg 2), out=b_qkv_g (arg 18).
-// Phase 13 (slice 4.19.7): same structure, different params.
-//
-// Returns 1 if the marker call is found in any if-block in body_node, 0 otherwise.
+// Sub-recognizer: phase 1 / phase 11 — rmsnorm gated to WG 0 only.
+// Returns 1 if rmsnorm_wg0_marker() call found in any if-block, 0 otherwise.
+fn _body_has_rmsnorm_wg0_marker(uint64 body_node) -> uint64 {
+    return _body_has_marker(body_node, "rmsnorm_wg0_marker", 18)
+}
+
+// Sub-recognizer: phase 3 / phase 13 — gemv_coop_bf16_f32, padded-row stride.
+// Shape: if wg_id < 256 { qkv_matmul_marker() }
+// Returns 1 if qkv_matmul_marker() call found in any if-block, 0 otherwise.
 fn _body_has_qkv_matmul_marker(uint64 body_node) -> uint64 {
-    uint32 stmt = ast_child(body_node)
-    while stmt != 0 {
-        if ast_kind(stmt) == 13 {
-            uint32 then_blk = ast_data1(stmt)
-            if then_blk != 0 {
-                uint32 inner = ast_child(then_blk)
-                while inner != 0 {
-                    // ExprStmt → Call(qkv_matmul_marker)
-                    if ast_kind(inner) == 16 {
-                        uint32 expr = ast_child(inner)
-                        if expr != 0 && ast_kind(expr) == 35 {
-                            uint32 callee = ast_data1(expr)
-                            if tok_matches(callee, "qkv_matmul_marker", 17) != 0 {
-                                return 1
-                            }
-                        }
-                    }
-                    // VarDecl → Call(qkv_matmul_marker)
-                    if ast_kind(inner) == 10 {
-                        uint32 init = ast_child(inner)
-                        if init != 0 && ast_kind(init) == 35 {
-                            uint32 callee = ast_data1(init)
-                            if tok_matches(callee, "qkv_matmul_marker", 17) != 0 {
-                                return 1
-                            }
-                        }
-                    }
-                    inner = ast_next(inner)
-                }
-            }
-        }
-        stmt = ast_next(stmt)
-    }
-    return 0
+    return _body_has_marker(body_node, "qkv_matmul_marker", 17)
+}
+
+// Sub-recognizer: phase 5 — QKV split + qknorm + RoPE (3-way head dispatch).
+// Shape: if wg_id < 32 { qkv_split_qknorm_rope_marker() }
+// Returns 1 if qkv_split_qknorm_rope_marker() call found in any if-block, 0 otherwise.
+fn _body_has_qkv_split_qknorm_rope_marker(uint64 body_node) -> uint64 {
+    return _body_has_marker(body_node, "qkv_split_qknorm_rope_marker", 28)
 }
 
 // Phase 3 inline ISA emitter — gemv_coop_bf16_f32 with padded-row stride.
 //
 // Emits INLINE (no asm_init, no s_endpgm) into the ongoing asm buffer.
 //
-// Parameters:
-//   n_out         = number of output rows (QKV_DIM = 4096)
-//   k             = inner K dimension (HIDDEN = 1024)
-//   k_pad         = padded row stride in u16 elements (HIDDEN_PAD = 1152)
-//   x_kernarg_idx = kernarg pair index for b_x_norm_g (pair 22 = arg 17, offset 0x88)
-//   w_kernarg_idx = kernarg pair index for qkv_w     (pair 1 = arg 2, offset 0x10)
-//   out_kernarg_idx = kernarg pair index for b_qkv_g (pair 23 = arg 18, offset 0x90)
-//
-// Wait - kernarg pair indices are just the sdata_pair for asm_s_load_b64_off.
-// For consistency with phase 1 usage (sdata_pair → s[2*pair : 2*pair+1]):
-//   x_kernarg_idx = sdata_pair for b_x_norm_g
-//   w_kernarg_idx = sdata_pair for qkv_w
-//   out_kernarg_idx = sdata_pair for b_qkv_g
+// sdata_pair semantics: each pair index N maps to SGPR pair s[2N:2N+1].
+//   asm_s_load_b64_off(N, 0, offset) → s[2N:2N+1] = kernarg[offset:offset+7]
+// Example: sdata_pair=1 → s[2:3].  Phase 3 caller passes:
+//   w_sdata_pair=1   → s[2:3] = qkv_w     (kernarg offset 0x10, arg 2)
+//   x_sdata_pair=2   → s[4:5] = b_x_norm_g (kernarg offset 0x88, arg 17)
+//   out_sdata_pair=3 → s[6:7] = b_qkv_g   (kernarg offset 0x90, arg 18)
 //
 // SGPR context on entry (from prologue):
 //   s[0:1]  = kernarg ptr pair
@@ -624,17 +587,32 @@ fn _body_has_qkv_matmul_marker(uint64 body_node) -> uint64 {
 //   v10 = bf16-lo f32 / reduce tmp
 //   v11 = x[kp*2]
 //   v12 = x[kp*2+1]
+// _emit_phase3_qkv_matmul_inline — gemv_coop_bf16_f32, padded-row stride,
+// emitted INLINE (no asm_init, no s_endpgm).
+//
+// Parameters:
+//   n_out         = number of output rows (e.g. QKV_DIM = 4096)
+//   k             = inner K dimension (e.g. HIDDEN = 1024)
+//   k_pad         = padded row stride in u16 elements (e.g. HIDDEN_PAD = 1152)
+//   wg_active     = number of WGs active in this phase (row-stride divisor).
+//                   MEGA_WG_PERSIST=512 is the launch grid; wg_active is the
+//                   active-WG count for this phase's per-WG row assignment.
+//                   Phase 3 uses wg_active=256; other phases differ.
+//   w_sdata_pair  = sdata_pair for weight ptr (loaded via s_load_b64)
+//   x_sdata_pair  = sdata_pair for input ptr
+//   out_sdata_pair= sdata_pair for output ptr
 fn _emit_phase3_qkv_matmul_inline(uint64 n_out, uint64 k, uint64 k_pad,
+                                    uint64 wg_active,
                                     uint64 w_sdata_pair, uint64 x_sdata_pair,
                                     uint64 out_sdata_pair) {
-    // ── WG gate (skip if wg_id >= 256) ───────────────────────────────────
-    // s_cmp_ge_u32 s15, 256: SOPC op=0x09, ssrc0=s15=0x0F, ssrc1=lit(0xFF), lit=256
+    // ── WG gate (skip if wg_id >= wg_active) ─────────────────────────────
+    // s_cmp_ge_u32 s15, wg_active: SOPC op=0x09, ssrc0=s15=0x0F, ssrc1=lit(0xFF), lit=wg_active
     //   SOPC ops: eq_i32=0, ne_i32=1, gt_i32=2, ge_i32=3, lt_i32=4, le_i32=5,
     //             eq_u32=6, ne_u32=7, gt_u32=8, ge_u32=9, lt_u32=10, le_u32=11
     //   word = 0xBF000000|(9<<16)|(0xFF<<8)|0x0F = 0xBF09FF0F
     uint64 gate_cmp_pos = asm_text_len / 4
     asm_u32(0xBF09FF0F)
-    asm_u32(256)
+    asm_u32(wg_active)
     asm_s_cbranch_scc1(0)   // patched at end
 
     // ── Load base pointers ────────────────────────────────────────────────
@@ -666,12 +644,12 @@ fn _emit_phase3_qkv_matmul_inline(uint64 n_out, uint64 k, uint64 k_pad,
     uint64 out_lo = out_sdata_pair * 2
     uint64 out_hi = out_lo + 1
 
-    // w_row_step = WG_PERSIST * k_pad * 2 bytes (advance qkv_w ptr per r_off iter)
-    uint64 w_row_step = 256 * k_pad * 2
+    // w_row_step = wg_active * k_pad * 2 bytes (advance qkv_w ptr per r_off iter)
+    uint64 w_row_step = wg_active * k_pad * 2
     // k_iters = k / 2 / 32 (inner loop count; for k=1024: 512/32=16)
     uint64 k_iters = k / 2 / 32
-    // rows_per_wg = ceil(n_out / 256); for n_out=4096, wg<256: all 16 rows in-bounds
-    uint64 rows_per_wg = (n_out + 255) / 256
+    // rows_per_wg = ceil(n_out / wg_active)
+    uint64 rows_per_wg = (n_out + wg_active - 1) / wg_active
 
     uint64 outer_top = asm_text_len / 4
 
@@ -720,13 +698,18 @@ fn _emit_phase3_qkv_matmul_inline(uint64 n_out, uint64 k, uint64 k_pad,
     _emit_wave_xor_reduce_add_f32_5_levels(2, 9, 10)
 
     // ── Lane-0 store ──────────────────────────────────────────────────────
-    // Save exec in s15 via s_and_saveexec_b32 (s15 is free: wg_id already saved to s13).
+    // Save exec to s17 (free high SGPR; s15 = wg_id_x MUST NOT be overwritten here —
+    // clobbering s15 was the root cause of the phase-5 zero-output bug: all WGs saw
+    // s15 = 0xFFFFFFFF = exec_lo instead of the real wg_id, so all 512 WGs took the
+    // outer gate skip-branch wg_id >= 32, leaving kc/vc/b_attn_q_g buffers all zeros).
+    // GFX11 (RDNA3) does not enforce an SGPR upper limit via RSRC1 bits[9:6] (the HIP
+    // compiler emits bits[9:6]=0 for a kernel that uses s0..s67), so s17 is safe.
     // v_cmpx_eq_u32_e32 clobbers BOTH exec AND vcc_lo, so we cannot use vcc_lo as save.
-    // Correct pattern: v_cmp_eq_u32_e32 (writes ONLY vcc_lo), then s_and_saveexec_b32 s15.
+    // Correct pattern: v_cmp_eq_u32_e32 (writes ONLY vcc_lo), then s_and_saveexec_b32 s17.
     // v_cmp_eq_u32_e32 vcc_lo, 0, v0  → vcc_lo = mask of lane 0 (does NOT modify exec)
     asm_v_cmp_eq_u32_imm_vgpr(0, 0)  // vcc_lo = (v0 == 0), exec unchanged
-    // s_and_saveexec_b32 s15, vcc_lo  → s15 = old exec; exec = exec & vcc_lo (lane 0 only)
-    asm_s_and_saveexec_b32_vcc_lo(15)
+    // s_and_saveexec_b32 s17, vcc_lo  → s17 = old exec; exec = exec & vcc_lo (lane 0 only)
+    asm_s_and_saveexec_b32_vcc_lo(17)
 
     // output byte offset = row * 4
     // s_lshl_b32 s14, s13, 2: SOP2 op=0x08, sdst=s14=0x0E, ssrc1=inline 2=0x82, ssrc0=s13=0x0D
@@ -746,11 +729,11 @@ fn _emit_phase3_qkv_matmul_inline(uint64 n_out, uint64 k, uint64 k_pad,
     asm_u32(0xDC6A0000)
     asm_u32((out_lo << 16) | (2 << 8) | 1)
 
-    // Restore exec: s_or_b32 exec_lo, exec_lo, s15  (restores from s15 save above)
-    // SOP2 op=11 (s_or_b32): sdst=exec_lo=0x7E, ssrc0=exec_lo=0x7E, ssrc1=s15=0x0F
-    // Verified encoding: s_or_b32 exec_lo, exec_lo, s3 = 0x8C7E037E (from barrier code)
-    //   ssrc1 field is bits[15:8]; s15=0x0F → 0x8C7E0F7E
-    asm_u32(0x8C7E0F7E)               // s_or_b32 exec_lo, exec_lo, s15
+    // Restore exec: s_or_b32 exec_lo, exec_lo, s17  (restores from s17 save above)
+    // SOP2 op=11 (s_or_b32): sdst=exec_lo=0x7E, ssrc0=exec_lo=0x7E, ssrc1=s17=0x11
+    // Verified base encoding: s_or_b32 exec_lo, exec_lo, s3 = 0x8C7E037E (from barrier code)
+    //   ssrc1 field is bits[15:8]; s17=0x11 → 0x8C7E117E
+    asm_u32(0x8C7E117E)               // s_or_b32 exec_lo, exec_lo, s17
 
     // ── Restore b_qkv_g ptr (undo the offset added above) ─────────────────
     // We added row*4 to s[out_lo:out_hi]. Remove it: s_sub_u32 / s_subb_u32.
@@ -776,11 +759,11 @@ fn _emit_phase3_qkv_matmul_inline(uint64 n_out, uint64 k, uint64 k_pad,
     // s_addc_u32 w_hi, w_hi, 0 (op 4): 0x82000000|(w_hi<<16)|(0x80<<8)|w_hi
     asm_u32(0x82000000 | (w_hi << 16) | 0x8000 | w_hi)
 
-    // Advance row: s13 += 256 (WG_PERSIST)
-    // s_add_u32 s13, s13, 256: ssrc1=0xFF(lit), lit=256
-    // word = (0x80000000)|(0x0D<<16)|(0xFF<<8)|0x0D = 0x800DFF0D, lit=256
+    // Advance row: s13 += wg_active (active WG count for this phase's row stride)
+    // s_add_u32 s13, s13, wg_active: ssrc1=0xFF(lit), lit=wg_active
+    // word = (0x80000000)|(0x0D<<16)|(0xFF<<8)|0x0D = 0x800DFF0D, lit=wg_active
     asm_u32(0x800DFF0D)
-    asm_u32(256)
+    asm_u32(wg_active)
 
     // Increment r_off: s_add_u32 s12, s12, 1; check s12 < rows_per_wg
     // s_add_u32 s12, s12, 1: ssrc1=0x81(inline imm 1)
@@ -800,19 +783,514 @@ fn _emit_phase3_qkv_matmul_inline(uint64 n_out, uint64 k, uint64 k_pad,
     asm_patch_u32(gate_cmp_pos + 2, 0xBFA20000 | (body_dwords & 0xFFFF))
 }
 
+// ── Phase 5 inline ISA emitter ────────────────────────────────────────────
+//
+// _emit_phase5_qkv_split_qknorm_rope_inline — emits the 3-way head-per-WG
+// QKV-split + qknorm + RoPE ISA INLINE (no asm_init, no s_endpgm).
+//
+// Shape: 32 WGs active (wg_id 0..31).
+//   wg_id <  16           → Q head: rmsnorm-128 + NEOX RoPE → b_attn_q_g
+//   16 ≤ wg_id < 24       → K head: rmsnorm-128 + NEOX RoPE → kc_layer[pos*KV_DIM]
+//   24 ≤ wg_id < 32       → V head: passthrough copy         → vc_layer[pos*KV_DIM]
+//
+// Constants: N_HEADS=16, N_KV_HEADS=8, HEAD_DIM=128, half=64, WAVE=32.
+//   eps=1e-6 = 0x358637BD,  1/128 = 0x3C000000.
+//   Q_DIM=2048 (bytes: 8192),  KV_DIM=1024 (bytes: 4096).
+//
+// SGPR context on entry (from prologue):
+//   s[0:1]  = kernarg ptr pair
+//   s[8:9]  = barrier_counter ptr  (must NOT be clobbered — barrier follows)
+//   s[10:11]= max_phase value
+//   s15     = wg_id_x
+//
+// Phase 5 SGPR usage (reused across branches; branches are mutually exclusive):
+//   s[2:3]  = src base ptr  (b_qkv_g ± head offset, or slice for K/V)
+//   s[4:5]  = norm base ptr (q_norm_g / k_norm_g; unused for V)
+//   s[6:7]  = dst base ptr  (b_attn_q_g, kc_layer+pos_off, vc_layer+pos_off)
+//   s12     = pos (low 32 bits) then reused as SSQ loop counter
+//   s13     = head local index (wg_id, kv_head, v_head)
+//   s14     = pointer arithmetic scratch
+//   s[12:13]= rope_cos base (after pos committed to dst ptr setup)
+//   s[14:15]= rope_sin base (s15 is free inside a branch after 3-way dispatch)
+//
+// VGPR usage (19 VGPRs, v0..v18; well within rsrc1=6 = 56 VGPR budget):
+//   v0  = lane id (hardware, r/o)
+//   v1  = vaddr=0  (for global_store/ds_store)
+//   v2  = ssq accumulator → rsqrt scale (broadcast via LDS[512])
+//   v3:v4  = src ptr     (base + lane*4; advances +128/iter in SSQ; reset for RoPE)
+//   v5:v6  = norm ptr    (base + lane*4; reset per RoPE iter)
+//   v7:v8  = dst lo ptr  (base + lane*4; reset per RoPE iter)
+//   v9:v10 = rope_cos ptr (base + lane*4; advances +128/iter)
+//   v11:v12= rope_sin ptr (base + lane*4; advances +128/iter)
+//   v13    = x1 (load → x1*scale*norm1)
+//   v14    = x2 (load → x2*scale*norm2)
+//   v15    = wave-XOR addr tmp; reused as cos value
+//   v16    = wave-XOR reduce tmp; reused as sin value
+//   v17    = rotation scratch (x1*cos or x1*sin intermediate)
+//   v18    = rotation scratch (x2*sin or x2*cos intermediate)
+//
+// LDS layout (shared with phases 1..3, per-WG — no contention):
+//   offset 512 = wave_tmp[0]: scale broadcast slot.
+//
+// Slice 4.19.3 note: eps=1e-6 (NOT 1e-5 used in phase 1/11 for HIDDEN=1024).
+//   Different N means different 1/N literal (0x3C000000 vs 0x3A800000).
+fn _emit_phase5_qkv_split_qknorm_rope_inline() {
+    // ── Outer skip-branch: skip if wg_id >= 32 ───────────────────────────
+    // s_cmp_ge_u32 s15, 32: SOPC op=0x09, ssrc0=s15=0x0F, ssrc1=inline 32=0xA0
+    //   word = 0xBF000000|(9<<16)|(0xA0<<8)|0x0F = 0xBF09A00F
+    uint64 outer_gate_pos = asm_text_len / 4
+    asm_u32(0xBF09A00F)
+    asm_s_cbranch_scc1(0)   // forward to .phase5_done (patched at end)
+
+    // ── Load pos (low 32 bits) from kernarg offset 0x70 (arg 14, u64 by-value) ──
+    // s_load_b32 s12, s[0:1], 0x70  (sdata_pair=6 → s12)
+    asm_s_load_b32(6, 0, 0x70)
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // ── v1 = 0 (vaddr placeholder for stores and ds ops) ─────────────────
+    asm_v_mov_b32_inline_u(1, 0)
+
+    // ── 3-way head dispatch ───────────────────────────────────────────────
+    // Q check: s_cmp_lt_u32 s15, 16 (SCC=1 if wg_id < 16)
+    // SOPC op=0x0A: ssrc1=inline 16=0x90; word=0xBF000000|(0x0A<<16)|(0x90<<8)|0x0F=0xBF0A900F
+    asm_u32(0xBF0A900F)
+    uint64 q_gate_pos = asm_text_len / 4
+    asm_s_cbranch_scc0(0)   // to .not_q if wg_id >= 16 (patched)
+
+    // ════════════════════════════════════════════════════════════════════
+    // Q BODY (wg_id < 16)
+    //   head = wg_id  (= s15)
+    //   src = b_qkv_g + head*128*4  = b_qkv_g + head*512 bytes
+    //   dst = b_attn_q_g + head*128*4
+    // ════════════════════════════════════════════════════════════════════
+
+    // Load b_qkv_g → s[2:3]   (kernarg 0x90 = arg 18)
+    asm_s_load_b64_off(1, 0, 0x90)
+    // Load q_norm_g → s[4:5]  (kernarg 0x40 = arg 8)
+    asm_s_load_b64_off(2, 0, 0x40)
+    // Load b_attn_q_g → s[6:7] (kernarg 0x98 = arg 19)
+    asm_s_load_b64_off(3, 0, 0x98)
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // head_byte_offset = head * 512 = s15 << 9
+    // s_lshl_b32 s13, s15, 9: SOP2 op 0x08, sdst=s13=0x0D, ssrc0=s15=0x0F, ssrc1=inline 9=0x89
+    //   word = (2<<30)|(8<<23)|(0x0D<<16)|(0x89<<8)|0x0F = 0x840D890F
+    asm_u32(0x840D890F)
+    // s_add_u32 s2, s2, s13  (src_lo += head*512)
+    //   SOP2 op 0: word = 0x80000000|(0x02<<16)|(0x0D<<8)|0x02 = 0x80020D02
+    asm_u32(0x80020D02)
+    // s_addc_u32 s3, s3, 0   (src_hi += carry)
+    //   SOP2 op 4: word = 0x82000000|(0x03<<16)|(0x80<<8)|0x03 = 0x82038003
+    asm_u32(0x82038003)
+    // s_add_u32 s6, s6, s13  (dst_lo += head*512)
+    asm_u32(0x80060D06)
+    // s_addc_u32 s7, s7, 0   (dst_hi += carry)
+    asm_u32(0x82078007)
+
+    // ── Q: inline rmsnorm-128 ────────────────────────────────────────────
+    // v2 = 0.0 (ssq accumulator)
+    asm_v_mov_b32_inline_u(2, 0)
+    // v9 = lane*4 (byte offset per lane)
+    asm_v_lshlrev_b32_imm(9, 2, 0)
+    // v3:v4 = s[2:3] + lane*4  (src ptr, lo+hi)
+    asm_v_mov_b32_inline_u(4, 0)
+    asm_v_add_co_u32_vcc_sv(3, 2, 9)
+    asm_v_add_co_ci_u32_null_sv_vcc(4, 3, 4)
+    // SSQ loop: 4 iterations (lane..128 step 32)
+    asm_s_mov_b32_inline_imm(12, 4)
+    uint64 q_ssq_top = asm_text_len / 4
+    // global_load_b32 v13, v[3:4], off
+    asm_u32(0xDC520000); asm_u32(0x0D7C0003)
+    asm_s_waitcnt_vmcnt_zero()
+    // v_fmac_f32_e32 v2, v13, v13  (ssq += v13*v13)
+    asm_v_fmac_f32_e32_vv(2, 13, 13)
+    // advance src ptr +128 bytes
+    asm_u32(0xD7006A03); asm_u32(0x000206FF); asm_u32(128)
+    asm_u32(0xD5207C04); asm_u32(0x01AA0880)
+    asm_s_sub_u32_imm(12, 12, 1)
+    asm_s_cmp_eq_u32(12, 0x80)
+    uint64 q_ssq_back = (0 - ((asm_text_len / 4) - q_ssq_top) - 1) & 0xFFFF
+    asm_s_cbranch_scc0(q_ssq_back)
+    // Wave XOR reduce: acc=v2, addr=v15, tmp=v16
+    _emit_wave_xor_reduce_add_f32_5_levels(2, 15, 16)
+    // Lane-0: scale = rsqrt(ssq/128 + 1e-6), store to LDS[512]
+    asm_s_mov_b32(12, 0x7E)                          // save exec in s12
+    asm_u32(0x7D940080)                               // v_cmpx_eq_u32_e32 0, v0 (exec=lane-0)
+    asm_s_mov_b32_lit32(14, 0x3C000000)               // s14 = 1/128.0f
+    // v_mul_f32 v2, s14, v2: word=(8<<25)|(2<<17)|(2<<9)|14 = 0x1004040E
+    asm_u32(0x1004040E)
+    asm_s_mov_b32_lit32(14, 0x358637BD)               // s14 = 1e-6f (eps)
+    // v_add_f32 v2, s14, v2: word=(3<<25)|(2<<17)|(2<<9)|14 = 0x0604040E
+    asm_u32(0x0604040E)
+    // v_rsq_f32 v2, v2: word=0x7E045D02
+    asm_u32(0x7E045D02)
+    // ds_store_b32 v1, v2 offset:512  (v1=addr=0, v2=scale)
+    asm_u32(0xD8340200); asm_u32(0x00000201)
+    asm_s_mov_b32(0x7E, 12)                           // restore exec
+    asm_s_waitcnt_lgkmcnt_zero()
+    asm_s_barrier()
+    // ds_load_b32 v2, v1 offset:512
+    asm_u32(0xD8D80200); asm_u32(0x02000001)
+    asm_s_waitcnt_lgkmcnt_zero()
+    // v2 = scale (broadcast to all lanes)
+
+    // ── Q: load rope_cos→s[12:13], rope_sin→s[14:15] ─────────────────────
+    // s_load_b64 s[12:13], s[0:1], 0x50  (rope_cos, arg 10; sdata_pair=6)
+    asm_s_load_b64_off(6, 0, 0x50)
+    // s_load_b64 s[14:15], s[0:1], 0x58  (rope_sin, arg 11; sdata_pair=7)
+    asm_s_load_b64_off(7, 0, 0x58)
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // ── Q: RoPE pair-rotation loop (2 iters: lane..64 step 32) ──────────
+    // Reset src ptr: v3:v4 = s[2:3] + lane*4  (v9 = lane*4 still valid)
+    asm_v_mov_b32_inline_u(4, 0)
+    asm_v_add_co_u32_vcc_sv(3, 2, 9)
+    asm_v_add_co_ci_u32_null_sv_vcc(4, 3, 4)
+    // Setup norm ptr: v5:v6 = s[4:5] + lane*4
+    asm_v_mov_b32_inline_u(6, 0)
+    asm_v_add_co_u32_vcc_sv(5, 4, 9)
+    asm_v_add_co_ci_u32_null_sv_vcc(6, 5, 6)
+    // Setup dst ptr: v7:v8 = s[6:7] + lane*4
+    asm_v_mov_b32_inline_u(8, 0)
+    asm_v_add_co_u32_vcc_sv(7, 6, 9)
+    asm_v_add_co_ci_u32_null_sv_vcc(8, 7, 8)
+    // Setup rope_cos ptr: v9:v10 = s[12:13] + lane*4  (v9 becomes ptr lo)
+    // Re-compute lane*4 into v17 first (v9 will be overwritten)
+    asm_v_lshlrev_b32_imm(17, 2, 0)                  // v17 = lane*4
+    asm_v_mov_b32_inline_u(10, 0)
+    asm_v_add_co_u32_vcc_sv(9, 12, 17)               // v9 = s12 + lane*4
+    asm_v_add_co_ci_u32_null_sv_vcc(10, 13, 10)      // v10 = s13 + carry
+    // Setup rope_sin ptr: v11:v12 = s[14:15] + lane*4
+    asm_v_mov_b32_inline_u(12, 0)
+    asm_v_add_co_u32_vcc_sv(11, 14, 17)              // v11 = s14 + lane*4
+    asm_v_add_co_ci_u32_null_sv_vcc(12, 15, 12)      // v12 = s15 + carry
+    // s12 = 2 (RoPE loop counter)
+    asm_s_mov_b32_inline_imm(12, 2)
+    uint64 q_rope_top = asm_text_len / 4
+    // Load x1 = src[i], x2 = src[i+64] (+256 bytes)
+    asm_u32(0xDC520000); asm_u32(0x0D7C0003)          // v13 = src[i]
+    asm_u32(0xDC520100); asm_u32(0x0E7C0003)          // v14 = src[i+64]
+    // Load norm1 = q_norm[i], norm2 = q_norm[i+64]
+    asm_u32(0xDC520000); asm_u32(0x0F7C0005)          // v15 = norm[i]
+    asm_u32(0xDC520100); asm_u32(0x107C0005)          // v16 = norm[i+64]
+    asm_s_waitcnt_vmcnt_zero()
+    // x1' = x1 * scale * norm1
+    // v_mul_f32 v13, v2, v13  (v13 = scale*x1):  word=(8<<25)|(13<<17)|(13<<9)|(0x100|2)=0x101A1B02
+    asm_u32(0x101A1B02)
+    // v_mul_f32 v13, v15, v13  (v13 = norm1*v13): src0=v13=0x10D, vsrc1=v15=15
+    // word=(8<<25)|(13<<17)|(15<<9)|(0x10D)=0x10000000|0x001A0000|0x00001E00|0x10D=0x101A1F0D
+    asm_u32(0x101A1F0D)
+    // x2' = x2 * scale * norm2
+    // v_mul_f32 v14, v2, v14  (v14 = scale*x2): word=(8<<25)|(14<<17)|(14<<9)|(0x102)=0x101C1D02
+    asm_u32(0x101C1D02)
+    // v_mul_f32 v14, v16, v14  (v14 = norm2*v14): src0=v14=0x10E, vsrc1=v16=16
+    // word=(8<<25)|(14<<17)|(16<<9)|(0x10E)=0x10000000|0x001C0000|0x00002000|0x10E=0x101C210E
+    asm_u32(0x101C210E)
+    // Load cos = rope_cos[i] into v15; sin = rope_sin[i] into v16
+    asm_u32(0xDC520000); asm_u32(0x0F7C0009)          // v15 = cos[i]
+    asm_u32(0xDC520000); asm_u32(0x107C000B)          // v16 = sin[i]
+    asm_s_waitcnt_vmcnt_zero()
+    // Rotation: out_lo = x1*cos - x2*sin; out_hi = x1*sin + x2*cos
+    // v17 = x1 * cos: v_mul_f32 v17, v13, v15; src0=v13=0x10D, vsrc1=v15=15
+    // word=(8<<25)|(17<<17)|(15<<9)|(0x10D)=0x10000000|0x00220000|0x00001E00|0x10D=0x10221F0D
+    asm_u32(0x10221F0D)
+    // v18 = x2 * sin: v_mul_f32 v18, v14, v16; src0=v14=0x10E, vsrc1=v16=16
+    // word=(8<<25)|(18<<17)|(16<<9)|(0x10E)=0x10000000|0x00240000|0x00002000|0x10E=0x1024210E
+    asm_u32(0x1024210E)
+    // out_lo = v17 - v18: v_sub_f32 v17, v17, v18; VOP2 op 4; src0=v17=0x111, vsrc1=v18=18
+    // word=(4<<25)|(17<<17)|(18<<9)|(0x111)=0x08000000|0x00220000|0x00002400|0x111=0x08222511
+    asm_u32(0x08222511)
+    // global_store_b32 v[7:8], v17, off  (store out_lo at dst[i]; per-lane v7:v8 ptr)
+    // word1=0xDC6A0000, word2=(0x7C<<16)|(17<<8)|7=0x007C1107
+    asm_u32(0xDC6A0000); asm_u32(0x007C1107)
+    // out_hi = x1*sin + x2*cos: v17 = x1*sin; v_fmac(v17, x2, cos)
+    // v17 = x1 * sin: v_mul_f32 v17, v13, v16; src0=v13=0x10D, vsrc1=v16=16
+    // word=(8<<25)|(17<<17)|(16<<9)|(0x10D)=0x10000000|0x00220000|0x00002000|0x10D=0x1022210D
+    asm_u32(0x1022210D)
+    // v_fmac_f32_e32 v17, v14, v15  (v17 += x2*cos): vdst=17, src0=v14=0x10E, vsrc1=v15=15
+    // VOP2 op 0x2B: word=(0x2B<<25)|(17<<17)|(15<<9)|(0x10E)=0x56000000|0x00220000|0x00001E00|0x10E=0x56221F0E
+    asm_u32(0x56221F0E)
+    // global_store_b32 v[7:8], v17, off offset:256  (store out_hi at dst[i+64])
+    // word1=0xDC6A0100, word2=(0x7C<<16)|(17<<8)|7=0x007C1107
+    asm_u32(0xDC6A0100); asm_u32(0x007C1107)
+    // Advance src, norm, dst, cos, sin ptrs by 128 bytes each
+    asm_u32(0xD7006A03); asm_u32(0x000206FF); asm_u32(128)    // src ptr lo
+    asm_u32(0xD5207C04); asm_u32(0x01AA0880)                   // src ptr hi
+    asm_u32(0xD7006A05); asm_u32(0x00020AFF); asm_u32(128)    // norm ptr lo
+    asm_u32(0xD5207C06); asm_u32(0x01AA0C80)                   // norm ptr hi
+    asm_u32(0xD7006A07); asm_u32(0x00020EFF); asm_u32(128)    // dst ptr lo
+    asm_u32(0xD5207C08); asm_u32(0x01AA1080)                   // dst ptr hi
+    asm_u32(0xD7006A09); asm_u32(0x000212FF); asm_u32(128)    // cos ptr lo: v9
+    asm_u32(0xD5207C0A); asm_u32(0x01AA1480)                   // cos ptr hi: v10
+    asm_u32(0xD7006A0B); asm_u32(0x000216FF); asm_u32(128)    // sin ptr lo: v11
+    asm_u32(0xD5207C0C); asm_u32(0x01AA1880)                   // sin ptr hi: v12
+    asm_s_sub_u32_imm(12, 12, 1)
+    asm_s_cmp_eq_u32(12, 0x80)
+    uint64 q_rope_back = (0 - ((asm_text_len / 4) - q_rope_top) - 1) & 0xFFFF
+    asm_s_cbranch_scc0(q_rope_back)
+
+    // Q done: s_branch to .phase5_done (SOPP op 0x20; prefix 0x17F → 0xBFA00000 | simm16)
+    // Emit placeholder (simm16=0), patch at end.
+    uint64 q_done_pos = asm_text_len / 4
+    asm_u32(0xBFA00000)   // s_branch simm16=0 placeholder (patched at phase5_done)
+
+    // ── .not_q target: K/V check ─────────────────────────────────────────
+    uint64 not_q_target = asm_text_len / 4
+    // Patch q_gate branch to here: scc0 (branch when SCC=0 = wg_id >= 16 = NOT Q head)
+    asm_patch_u32(q_gate_pos, 0xBFA10000 | ((not_q_target - q_gate_pos - 1) & 0xFFFF))
+
+    // K check: s_cmp_lt_u32 s15, 24  (SCC=1 if wg_id < 24 → K head)
+    // SOPC op=0x0A: ssrc1 = inline 24 = 0x98 (inline imm 24 = 0x80+24)
+    // word = 0xBF000000|(0x0A<<16)|(0x98<<8)|0x0F = 0xBF0A980F
+    asm_u32(0xBF0A980F)
+    uint64 k_gate_pos = asm_text_len / 4
+    asm_s_cbranch_scc0(0)   // to .not_k if wg_id >= 24 (patched)
+
+    // ════════════════════════════════════════════════════════════════════
+    // K BODY (16 ≤ wg_id < 24)
+    //   kv_head = wg_id - 16  (= s15 - 16)
+    //   src  = b_qkv_g + Q_DIM*4 + kv_head*512  = b_qkv_g + 8192 + kv_head*512
+    //   norm = k_norm_g
+    //   dst  = kc_layer + pos*KV_DIM*4 + kv_head*512
+    //        = kc_layer + pos*4096 + kv_head*512
+    // ════════════════════════════════════════════════════════════════════
+
+    // Load b_qkv_g → s[2:3]    (kernarg 0x90)
+    asm_s_load_b64_off(1, 0, 0x90)
+    // Load k_norm_g → s[4:5]   (kernarg 0x48 = arg 9)
+    asm_s_load_b64_off(2, 0, 0x48)
+    // Load kc_layer → s[6:7]   (kernarg 0x60 = arg 12)
+    asm_s_load_b64_off(3, 0, 0x60)
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // kv_head = s15 - 16; s_sub_u32 s13, s15, 16
+    // SOP2 op 1 (s_sub): word = (2<<30)|(1<<23)|(0x0D<<16)|(0xFF<<8)|0x0F = 0x808DFF0F, lit=16
+    asm_u32(0x808DFF0F); asm_u32(16)
+
+    // src offset = Q_DIM*4 + kv_head*512 = 8192 + kv_head*512
+    // s14 = kv_head * 512 = s13 << 9
+    // s_lshl_b32 s14, s13, 9: word=(2<<30)|(8<<23)|(0x0E<<16)|(0x89<<8)|0x0D=0x840E890D
+    asm_u32(0x840E890D)
+    // s14 += 8192: s_add_u32 s14, s14, 8192
+    // s_add_u32 s14, s14, lit: word = 0x80000000|(0x0E<<16)|(0xFF<<8)|0x0E=0x800EFF0E, lit=8192
+    asm_u32(0x800EFF0E); asm_u32(8192)
+    // s_add_u32 s2, s2, s14 (src_lo += offset)
+    asm_u32(0x80020E02)
+    // s_addc_u32 s3, s3, 0
+    asm_u32(0x82038003)
+
+    // dst offset = pos*4096 + kv_head*512
+    // pos*4096 = s12 << 12 (pos is low 32 bits in s12)
+    // s_lshl_b32 s14, s12, 12: word=(2<<30)|(8<<23)|(0x0E<<16)|(0x8C<<8)|0x0C=0x840E8C0C
+    asm_u32(0x840E8C0C)
+    // dst_lo = kc_layer_lo + pos*4096 + kv_head*512
+    // s_add_u32 s6, s6, s14
+    asm_u32(0x80060E06)
+    // s_addc_u32 s7, s7, 0
+    asm_u32(0x82078007)
+    // add kv_head*512: s_lshl_b32 s13, s13, 9 (kv_head*512)
+    asm_u32(0x840D890D)
+    // s_add_u32 s6, s6, s13
+    asm_u32(0x80060D06)
+    // s_addc_u32 s7, s7, 0
+    asm_u32(0x82078007)
+
+    // ── K: inline rmsnorm-128 (identical to Q body) ───────────────────────
+    asm_v_mov_b32_inline_u(2, 0)
+    asm_v_lshlrev_b32_imm(9, 2, 0)
+    asm_v_mov_b32_inline_u(4, 0)
+    asm_v_add_co_u32_vcc_sv(3, 2, 9)
+    asm_v_add_co_ci_u32_null_sv_vcc(4, 3, 4)
+    asm_s_mov_b32_inline_imm(12, 4)
+    uint64 k_ssq_top = asm_text_len / 4
+    asm_u32(0xDC520000); asm_u32(0x0D7C0003)
+    asm_s_waitcnt_vmcnt_zero()
+    asm_v_fmac_f32_e32_vv(2, 13, 13)
+    asm_u32(0xD7006A03); asm_u32(0x000206FF); asm_u32(128)
+    asm_u32(0xD5207C04); asm_u32(0x01AA0880)
+    asm_s_sub_u32_imm(12, 12, 1)
+    asm_s_cmp_eq_u32(12, 0x80)
+    uint64 k_ssq_back = (0 - ((asm_text_len / 4) - k_ssq_top) - 1) & 0xFFFF
+    asm_s_cbranch_scc0(k_ssq_back)
+    _emit_wave_xor_reduce_add_f32_5_levels(2, 15, 16)
+    asm_s_mov_b32(12, 0x7E)
+    asm_u32(0x7D940080)
+    asm_s_mov_b32_lit32(14, 0x3C000000)
+    asm_u32(0x1004040E)
+    asm_s_mov_b32_lit32(14, 0x358637BD)
+    asm_u32(0x0604040E)
+    asm_u32(0x7E045D02)
+    asm_u32(0xD8340200); asm_u32(0x00000201)
+    asm_s_mov_b32(0x7E, 12)
+    asm_s_waitcnt_lgkmcnt_zero()
+    asm_s_barrier()
+    asm_u32(0xD8D80200); asm_u32(0x02000001)
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // ── K: load rope_cos→s[12:13], rope_sin→s[14:15] ─────────────────────
+    asm_s_load_b64_off(6, 0, 0x50)
+    asm_s_load_b64_off(7, 0, 0x58)
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // ── K: RoPE pair-rotation loop (identical structure to Q) ────────────
+    asm_v_mov_b32_inline_u(4, 0)
+    asm_v_add_co_u32_vcc_sv(3, 2, 9)
+    asm_v_add_co_ci_u32_null_sv_vcc(4, 3, 4)
+    asm_v_mov_b32_inline_u(6, 0)
+    asm_v_add_co_u32_vcc_sv(5, 4, 9)
+    asm_v_add_co_ci_u32_null_sv_vcc(6, 5, 6)
+    asm_v_mov_b32_inline_u(8, 0)
+    asm_v_add_co_u32_vcc_sv(7, 6, 9)
+    asm_v_add_co_ci_u32_null_sv_vcc(8, 7, 8)
+    asm_v_lshlrev_b32_imm(17, 2, 0)
+    asm_v_mov_b32_inline_u(10, 0)
+    asm_v_add_co_u32_vcc_sv(9, 12, 17)
+    asm_v_add_co_ci_u32_null_sv_vcc(10, 13, 10)
+    asm_v_mov_b32_inline_u(12, 0)
+    asm_v_add_co_u32_vcc_sv(11, 14, 17)
+    asm_v_add_co_ci_u32_null_sv_vcc(12, 15, 12)
+    asm_s_mov_b32_inline_imm(12, 2)
+    uint64 k_rope_top = asm_text_len / 4
+    asm_u32(0xDC520000); asm_u32(0x0D7C0003)
+    asm_u32(0xDC520100); asm_u32(0x0E7C0003)
+    asm_u32(0xDC520000); asm_u32(0x0F7C0005)
+    asm_u32(0xDC520100); asm_u32(0x107C0005)
+    asm_s_waitcnt_vmcnt_zero()
+    asm_u32(0x101A1B02)
+    asm_u32(0x101A1F0D)
+    asm_u32(0x101C1D02)
+    asm_u32(0x101C210E)
+    asm_u32(0xDC520000); asm_u32(0x0F7C0009)
+    asm_u32(0xDC520000); asm_u32(0x107C000B)
+    asm_s_waitcnt_vmcnt_zero()
+    asm_u32(0x10221F0D)
+    asm_u32(0x1024210E)
+    asm_u32(0x08222511)
+    // global_store_b32 v[7:8], v17, off  (K out_lo; per-lane v7:v8 ptr)
+    asm_u32(0xDC6A0000); asm_u32(0x007C1107)
+    asm_u32(0x1022210D)
+    asm_u32(0x56221F0E)
+    // global_store_b32 v[7:8], v17, off offset:256  (K out_hi)
+    asm_u32(0xDC6A0100); asm_u32(0x007C1107)
+    asm_u32(0xD7006A03); asm_u32(0x000206FF); asm_u32(128)
+    asm_u32(0xD5207C04); asm_u32(0x01AA0880)
+    asm_u32(0xD7006A05); asm_u32(0x00020AFF); asm_u32(128)
+    asm_u32(0xD5207C06); asm_u32(0x01AA0C80)
+    asm_u32(0xD7006A07); asm_u32(0x00020EFF); asm_u32(128)
+    asm_u32(0xD5207C08); asm_u32(0x01AA1080)
+    asm_u32(0xD7006A09); asm_u32(0x000212FF); asm_u32(128)
+    asm_u32(0xD5207C0A); asm_u32(0x01AA1480)
+    asm_u32(0xD7006A0B); asm_u32(0x000216FF); asm_u32(128)
+    asm_u32(0xD5207C0C); asm_u32(0x01AA1880)
+    asm_s_sub_u32_imm(12, 12, 1)
+    asm_s_cmp_eq_u32(12, 0x80)
+    uint64 k_rope_back = (0 - ((asm_text_len / 4) - k_rope_top) - 1) & 0xFFFF
+    asm_s_cbranch_scc0(k_rope_back)
+
+    // K done: s_branch to .phase5_done (placeholder, patched at end)
+    uint64 k_done_pos = asm_text_len / 4
+    asm_u32(0xBFA00000)   // s_branch simm16=0 placeholder (patched at end)
+
+    // ── .not_k target: V body ─────────────────────────────────────────────
+    uint64 not_k_target = asm_text_len / 4
+    // Patch K gate branch to here: scc0 (branch when SCC=0 = wg_id >= 24 = NOT K head)
+    asm_patch_u32(k_gate_pos, 0xBFA10000 | ((not_k_target - k_gate_pos - 1) & 0xFFFF))
+
+    // ════════════════════════════════════════════════════════════════════
+    // V BODY (24 ≤ wg_id < 32)
+    //   v_head = wg_id - 24  (= s15 - 24)
+    //   src = b_qkv_g + (Q_DIM+KV_DIM)*4 + v_head*512
+    //       = b_qkv_g + 12288 + v_head*512
+    //   dst = vc_layer + pos*4096 + v_head*512
+    // ════════════════════════════════════════════════════════════════════
+
+    // Load b_qkv_g → s[2:3]    (kernarg 0x90)
+    asm_s_load_b64_off(1, 0, 0x90)
+    // Load vc_layer → s[6:7]   (kernarg 0x68 = arg 13)
+    asm_s_load_b64_off(3, 0, 0x68)
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // v_head = s15 - 24; s_sub_u32 s13, s15, 24
+    asm_u32(0x808DFF0F); asm_u32(24)
+
+    // src offset = 12288 + v_head*512
+    // s14 = v_head * 512 = s13 << 9
+    asm_u32(0x840E890D)
+    // s14 += 12288
+    asm_u32(0x800EFF0E); asm_u32(12288)
+    // s_add_u32 s2, s2, s14
+    asm_u32(0x80020E02)
+    // s_addc_u32 s3, s3, 0
+    asm_u32(0x82038003)
+
+    // dst offset = pos*4096 + v_head*512
+    // s14 = pos*4096 = s12 << 12
+    asm_u32(0x840E8C0C)
+    // s_add_u32 s6, s6, s14
+    asm_u32(0x80060E06)
+    // s_addc_u32 s7, s7, 0
+    asm_u32(0x82078007)
+    // add v_head*512: s_lshl_b32 s13, s13, 9
+    asm_u32(0x840D890D)
+    // s_add_u32 s6, s6, s13
+    asm_u32(0x80060D06)
+    // s_addc_u32 s7, s7, 0
+    asm_u32(0x82078007)
+
+    // ── V: passthrough copy (lane..128 step 32, 4 iters) ─────────────────
+    asm_v_lshlrev_b32_imm(9, 2, 0)               // v9 = lane*4
+    asm_v_mov_b32_inline_u(4, 0)
+    asm_v_add_co_u32_vcc_sv(3, 2, 9)             // v3:v4 = src ptr
+    asm_v_add_co_ci_u32_null_sv_vcc(4, 3, 4)
+    asm_v_mov_b32_inline_u(8, 0)
+    asm_v_add_co_u32_vcc_sv(7, 6, 9)             // v7:v8 = dst ptr
+    asm_v_add_co_ci_u32_null_sv_vcc(8, 7, 8)
+    asm_s_mov_b32_inline_imm(12, 4)              // loop count = 4
+    uint64 v_copy_top = asm_text_len / 4
+    // global_load_b32 v13, v[3:4], off
+    asm_u32(0xDC520000); asm_u32(0x0D7C0003)
+    asm_s_waitcnt_vmcnt_zero()
+    // global_store_b32 v[7:8], v13, off  (V copy; per-lane v7:v8 ptr)
+    // word2=(0x7C<<16)|(13<<8)|7=0x007C0D07
+    asm_u32(0xDC6A0000); asm_u32(0x007C0D07)
+    // advance src ptr +128 bytes
+    asm_u32(0xD7006A03); asm_u32(0x000206FF); asm_u32(128)
+    asm_u32(0xD5207C04); asm_u32(0x01AA0880)
+    // advance dst ptr +128 bytes
+    asm_u32(0xD7006A07); asm_u32(0x00020EFF); asm_u32(128)
+    asm_u32(0xD5207C08); asm_u32(0x01AA1080)
+    asm_s_sub_u32_imm(12, 12, 1)
+    asm_s_cmp_eq_u32(12, 0x80)
+    uint64 v_copy_back = (0 - ((asm_text_len / 4) - v_copy_top) - 1) & 0xFFFF
+    asm_s_cbranch_scc0(v_copy_back)
+    // V fall-through to .phase5_done
+
+    // ── .phase5_done: patch all forward branches ──────────────────────────
+    uint64 phase5_done = asm_text_len / 4
+
+    // Patch outer skip-branch (wg_id >= 32 → here)
+    asm_patch_u32(outer_gate_pos + 1,
+        0xBFA20000 | ((phase5_done - outer_gate_pos - 2) & 0xFFFF))
+
+    // Patch Q done s_branch → .phase5_done
+    asm_patch_u32(q_done_pos,
+        0xBFA00000 | ((phase5_done - q_done_pos - 1) & 0xFFFF))
+
+    // Patch K done s_branch → .phase5_done
+    asm_patch_u32(k_done_pos,
+        0xBFA00000 | ((phase5_done - k_done_pos - 1) & 0xFFFF))
+}
+
 // Emit the mega-kernel body into the kernel table.
 //
-// Slice 4.19.2: phase 1 (rmsnorm, WG-0) and phase 3 (QKV matmul, WG<256)
-// are emitted as real inline ISA when their markers are found in body_node.
-// Phases 5..17 remain stubs (s_nop 0) in this slice.
+// Slice 4.19.3: phase 1 (rmsnorm, WG-0), phase 3 (QKV matmul, WG<256), and
+// phase 5 (QKV split + qknorm + RoPE, WG<32, 3-way head dispatch) are emitted
+// as real inline ISA when their markers are found in body_node.
+// Phases 7..17 remain stubs (s_nop 0) in this slice.
 //
-// The max_phase early-exit simm16 values are computed dynamically with
-// asm_patch_u32 so that real phase bodies (which are larger than 1 dword)
-// do not break the branch offsets to .Lend (s_endpgm).
-//
-// Barriers 1..7 (phases 5..17) remain stub-sized, so their max_phase
-// offsets are fixed at slice 4.19.2.  Barrier 0's check offset is patched
-// after measuring phase-3's actual size.
+// max_phase early-exit simm16 values: phases 0 (after phase 1) and 1 (after
+// phase 3) are patched dynamically.  Phases 2..7 (after phase 5..17) use
+// patched offsets too, since phase 5 body size is now variable.
 //
 // KD parameters match the v1 reference: MEGA_KERNARG_COUNT args, 192-byte
 // kernarg segment, rsrc2=0x9E (wg_id_x in s15), MEGA_WG_PERSIST=512.
@@ -842,47 +1320,56 @@ fn mega_emit_stub_kernel(uint64 kname_ptr, uint64 nl, uint64 body_node) -> uint6
     // ── Phase 3: QKV matmul (WG < 256) ────────────────────────────────────
     if _body_has_qkv_matmul_marker(body_node) != 0 {
         // w=qkv_w(pair 1=s[2:3]), x=b_x_norm_g(pair 2=s[4:5]), out=b_qkv_g(pair 3=s[6:7])
-        _emit_phase3_qkv_matmul_inline(4096, 1024, 1152, 1, 2, 3)
+        // wg_active=256: 256 of the 512 MEGA_WG_PERSIST WGs participate in phase 3
+        _emit_phase3_qkv_matmul_inline(4096, 1024, 1152, 256, 1, 2, 3)
     } else {
         asm_u32(0xBF800000)   // s_nop 0 (phase 3 stub)
     }
     mega_emit_barrier_isa(1, MEGA_WG_PERSIST)
 
-    // max_phase < 2 check — phases 5..17 are all stubs; fixed offset.
-    // Remaining after this branch to .Lend = 6 slots × 34 dwords = 204; simm16=203.
+    // max_phase < 2 check — phase 5 body size varies; patch after emitting phase 5.
     asm_s_cmp_lt_u32(10, 0x82)
-    asm_s_cbranch_scc1(203)
+    uint64 mp2_cbranch_pos = asm_text_len / 4
+    asm_s_cbranch_scc1(0)   // patched below after measuring phase 5 + remaining stubs
 
-    // ── Phases 5..17: stubs ───────────────────────────────────────────────
-    // Phase 5 stub
-    asm_u32(0xBF800000)
+    // ── Phase 5: QKV split + qknorm + RoPE (3-way head dispatch, WG < 32) ──
+    if _body_has_qkv_split_qknorm_rope_marker(body_node) != 0 {
+        _emit_phase5_qkv_split_qknorm_rope_inline()
+    } else {
+        asm_u32(0xBF800000)   // s_nop 0 (phase 5 stub)
+    }
     mega_emit_barrier_isa(2, MEGA_WG_PERSIST)
     asm_s_cmp_lt_u32(10, 0x83)
-    asm_s_cbranch_scc1(169)
+    uint64 mp3_cbranch_pos = asm_text_len / 4
+    asm_s_cbranch_scc1(0)   // patched below
 
     // Phase 7 stub
     asm_u32(0xBF800000)
     mega_emit_barrier_isa(3, MEGA_WG_PERSIST)
     asm_s_cmp_lt_u32(10, 0x84)
-    asm_s_cbranch_scc1(135)
+    uint64 mp4_cbranch_pos = asm_text_len / 4
+    asm_s_cbranch_scc1(0)   // patched below
 
     // Phase 9 stub
     asm_u32(0xBF800000)
     mega_emit_barrier_isa(4, MEGA_WG_PERSIST)
     asm_s_cmp_lt_u32(10, 0x85)
-    asm_s_cbranch_scc1(101)
+    uint64 mp5_cbranch_pos = asm_text_len / 4
+    asm_s_cbranch_scc1(0)
 
     // Phase 11 stub
     asm_u32(0xBF800000)
     mega_emit_barrier_isa(5, MEGA_WG_PERSIST)
     asm_s_cmp_lt_u32(10, 0x86)
-    asm_s_cbranch_scc1(67)
+    uint64 mp6_cbranch_pos = asm_text_len / 4
+    asm_s_cbranch_scc1(0)
 
     // Phase 13 stub
     asm_u32(0xBF800000)
     mega_emit_barrier_isa(6, MEGA_WG_PERSIST)
     asm_s_cmp_lt_u32(10, 0x87)
-    asm_s_cbranch_scc1(33)
+    uint64 mp7_cbranch_pos = asm_text_len / 4
+    asm_s_cbranch_scc1(0)
 
     // Phase 15 stub
     asm_u32(0xBF800000)
@@ -894,13 +1381,36 @@ fn mega_emit_stub_kernel(uint64 kname_ptr, uint64 nl, uint64 body_node) -> uint6
     // .Lend:
     asm_s_endpgm()
 
-    // ── Patch max_phase < 1 branch (after barrier 0) ─────────────────────
-    // Now that s_endpgm is emitted, compute the distance from mp1_cbranch_pos
-    // to s_endpgm (exclusive of the branch itself).
-    // simm16 = (endpgm_dword_pos - mp1_cbranch_pos - 1)
+    // ── Patch all max_phase branches to .Lend ─────────────────────────────
     uint64 endpgm_pos = (asm_text_len / 4) - 1   // s_endpgm is the last dword
+
+    // max_phase < 1 (after barrier 0)
     uint64 mp1_simm16 = (endpgm_pos - mp1_cbranch_pos - 1) & 0xFFFF
     asm_patch_u32(mp1_cbranch_pos, 0xBFA20000 | mp1_simm16)
+
+    // max_phase < 2 (after barrier 1 + phase 5)
+    uint64 mp2_simm16 = (endpgm_pos - mp2_cbranch_pos - 1) & 0xFFFF
+    asm_patch_u32(mp2_cbranch_pos, 0xBFA20000 | mp2_simm16)
+
+    // max_phase < 3 (after barrier 2)
+    uint64 mp3_simm16 = (endpgm_pos - mp3_cbranch_pos - 1) & 0xFFFF
+    asm_patch_u32(mp3_cbranch_pos, 0xBFA20000 | mp3_simm16)
+
+    // max_phase < 4 (after barrier 3)
+    uint64 mp4_simm16 = (endpgm_pos - mp4_cbranch_pos - 1) & 0xFFFF
+    asm_patch_u32(mp4_cbranch_pos, 0xBFA20000 | mp4_simm16)
+
+    // max_phase < 5 (after barrier 4)
+    uint64 mp5_simm16 = (endpgm_pos - mp5_cbranch_pos - 1) & 0xFFFF
+    asm_patch_u32(mp5_cbranch_pos, 0xBFA20000 | mp5_simm16)
+
+    // max_phase < 6 (after barrier 5)
+    uint64 mp6_simm16 = (endpgm_pos - mp6_cbranch_pos - 1) & 0xFFFF
+    asm_patch_u32(mp6_cbranch_pos, 0xBFA20000 | mp6_simm16)
+
+    // max_phase < 7 (after barrier 6)
+    uint64 mp7_simm16 = (endpgm_pos - mp7_cbranch_pos - 1) & 0xFFFF
+    asm_patch_u32(mp7_cbranch_pos, 0xBFA20000 | mp7_simm16)
 
     // ── Snapshot ISA and register in kernel table ──────────────────────────
     uint64 k_text_size = asm_text_len
