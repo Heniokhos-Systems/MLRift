@@ -196,6 +196,39 @@ fn _emit_wave_xor_reduce_add_f32_5_levels(uint64 acc, uint64 addr, uint64 tmp) {
     }
 }
 
+// _emit_wave_xor_reduce_max_f32_5_levels — sister of the add helper but
+// uses v_max_f32_e32 to compute a wave-wide max (used by phase 7 pass 1).
+//
+// On entry: acc holds the per-lane partial max (f32; lanes that never wrote
+//           must hold -inf or any safe identity, e.g. -1e30).
+// On exit:  every lane's acc holds the wave-reduced max (xor-bfly is
+//           symmetric — no separate broadcast needed).
+//           addr_vgpr and tmp_vgpr are clobbered.
+//
+// Per-level pattern (offset = 16, 8, 4, 2, 1):
+//   v_xor_b32_e32 addr, offset, v0
+//   v_lshlrev_b32_imm addr, 2, addr     ; ×4 → byte addr
+//   ds_bpermute_b32 tmp, addr, acc      ; gather partner's value
+//   s_waitcnt lgkmcnt(0)
+//   v_max_f32_e32 acc, acc, tmp         ; max-reduce
+//
+// VOP2 op for v_max_f32 = 0x10 (prefix 0x20000000).  Verified against the
+// existing softmax phase-A encoding 0x200A0F05 (= v_max_f32_e32 v5, v5, v7).
+fn _emit_wave_xor_reduce_max_f32_5_levels(uint64 acc, uint64 addr, uint64 tmp) {
+    // v_max_f32_e32 acc, acc, tmp encoding:
+    //   VOP2 op 0x10: (0x10<<25)|(acc<<17)|(tmp<<9)|(0x100|acc)
+    uint64 max_word = 0x20000000 | ((acc & 0xFF) << 17) | ((tmp & 0xFF) << 9) | (0x100 | (acc & 0xFF))
+    uint64 off = 16
+    while off >= 1 {
+        _emit_v_xor_b32_e32_imm_v0(addr, off)
+        asm_v_lshlrev_b32_imm(addr, 2, addr)
+        asm_ds_bpermute_b32(tmp, addr, acc)
+        asm_s_waitcnt_lgkmcnt_zero()
+        asm_u32(max_word)
+        off = off / 2
+    }
+}
+
 // ── Phase 1 inline ISA emitter ────────────────────────────────────────────
 //
 // _emit_phase1_rmsnorm_inline — emits the WG-0-gated input rmsnorm ISA
@@ -500,6 +533,13 @@ fn _body_has_qkv_matmul_marker(uint64 body_node) -> uint64 {
 // Returns 1 if qkv_split_qknorm_rope_marker() call found in any if-block, 0 otherwise.
 fn _body_has_qkv_split_qknorm_rope_marker(uint64 body_node) -> uint64 {
     return _body_has_marker(body_node, "qkv_split_qknorm_rope_marker", 28)
+}
+
+// Sub-recognizer: phase 7 — attn_decode with cooperative-WG dimension.
+// Shape: if wg_id < 64 { attn_decode_coop_marker() }   (64 = N_HEADS*ATTN_COOP)
+// Returns 1 if attn_decode_coop_marker() call found in any if-block, 0 otherwise.
+fn _body_has_attn_decode_coop_marker(uint64 body_node) -> uint64 {
+    return _body_has_marker(body_node, "attn_decode_coop_marker", 23)
 }
 
 // Phase 3 inline ISA emitter — gemv_coop_bf16_f32 with padded-row stride.
@@ -1281,6 +1321,540 @@ fn _emit_phase5_qkv_split_qknorm_rope_inline() {
         0xBFA00000 | ((phase5_done - k_done_pos - 1) & 0xFFFF))
 }
 
+// ── Phase 7 inline ISA emitter (attn_decode-coop) ─────────────────────────
+//
+// _emit_phase7_attn_decode_coop_inline — emits the cooperative-WG attn_decode
+// 3-pass softmax-attention ISA INLINE (no asm_init, no s_endpgm).
+//
+// HIP source: examples/llm/qwen3_layer_megakernel.hip.cpp lines 230–286
+// (function `phase7_attn_decode`).
+//
+// Shape (Qwen3-0.6B): N_HEADS=16, N_KV_HEADS=8, HEAD_DIM=128, KV_DIM=1024,
+//   ATTN_COOP=4 → 64 active WGs (q_head = wg_id/4, coop_idx = wg_id%4),
+//   kv_head = q_head>>1, OUT_PER_WG = HEAD_DIM/ATTN_COOP = 32, WAVE=32.
+//
+// Bit-exactness note (CRITICAL): hipcc's compiled v1 .co uses heavily
+// optimized ISA (s_clause, v_dual_*, v_div_scale_f32 / v_div_fixup_f32 IEEE
+// divide for inv_sum, prefetch hints).  This emitter reproduces the
+// HIP-source semantics structurally but does NOT match hipcc byte-for-byte.
+// It uses a plain v_rcp_f32 for inv_sum (≈24-bit ULP, vs hipcc's ~0.5 ULP
+// IEEE-correct divide via div_scale + Newton-Raphson + div_fixup).  The
+// resulting b_attn_out_g floats may diverge from v1 in low bits → expect
+// the slice 4.19.4 A/B gate to fail bit-exact and report BLOCKED rather
+// than PASS.  This is a known limitation; full bit-exactness would require
+// hand-emitting the IEEE-correct divide expansion and matching hipcc's
+// instruction order verbatim.
+//
+// Mega-kernel SGPR context on entry (from prologue + prior phases):
+//   s[0:1]   = kernarg ptr pair
+//   s[8:9]   = barrier_counter ptr — MUST NOT BE CLOBBERED
+//   s[10:11] = max_phase value
+//   s15      = wg_id_x — MUST NOT BE CLOBBERED (used for outer gate, then
+//              copied to s_q_head/s_coop_idx; never written via saveexec)
+//
+// Phase 7 SGPR usage:
+//   s[2:3]   = b_attn_q_g + q_head*HEAD_DIM*4 (loaded + offset)
+//   s[4:5]   = kc_layer + kv_head*HEAD_DIM*4
+//   s[6:7]   = vc_layer + kv_head*HEAD_DIM*4
+//   s[12:13] = b_attn_out_g + q_head*HEAD_DIM*4
+//   s14      = pos (low 32 bits, from kernarg 0x70)
+//   s16      = q_head = wg_id >> 2
+//   s17      = saved-exec for lane-active gate (NOT s15!)
+//   s18      = coop_idx = wg_id & 3
+//   s19      = kv_head = q_head >> 1
+//   s20      = q_byte_off = q_head * 512  (HEAD_DIM*4)
+//   s21      = kv_byte_off = kv_head * 512
+//   s22      = dim_byte_off = coop_idx * 128  (OUT_PER_WG*4)
+//   s24      = t_base scalar loop counter (advances 0, 32, 64, ...)
+//   s25      = t scalar (Pass 3, advances 0, 1, 2, ..., pos)
+//   s26      = lds byte offset scratch (Pass 3: 4 + t*4)
+//   s27      = scratch
+//
+// VGPR usage (within the 56-VGPR rsrc1=0xE0AF0006 budget):
+//   v0       = lane id (hardware, r/o)
+//   v1       = vaddr=0 placeholder for global_store
+//   v2       = m (Pass 1 max accumulator → broadcast across wave)
+//   v3       = q ptr lo
+//   v4       = q ptr hi
+//   v5       = k ptr lo (per-lane: kc_layer + lane_t*KV_DIM*4)
+//   v6       = k ptr hi
+//   v7       = v ptr lo (Pass 3: vc_layer + dim_byte_off + lane*4)
+//   v8       = v ptr hi
+//   v9       = lane*4 byte offset (constant)
+//   v10      = wave-XOR reduce addr scratch
+//   v11      = wave-XOR reduce tmp scratch
+//   v12:v15  = Q quad (loaded per inner chunk via b128)
+//   v16:v19  = K (or V) quad
+//   v20      = dot accumulator / pass 3 V scratch
+//   v21      = lane_t (= t_base + lane), Pass 3: out ptr lo
+//   v22      = w (post-exp) / Pass 3: out ptr hi
+//   v23      = ssum / inv_sum
+//   v24      = acc (Pass 3 output accumulator)
+//   v25      = LDS broadcast addr (Pass 3 per-iter)
+//
+// LDS layout: attn_w_lds[t] at byte offset 4 + t*4 (skipping wave_tmp[0] at
+// offset 0 used by rmsnorm in other phases).  Total LDS usage = 4 + 128*4 =
+// 516 bytes, matches mega_emit_stub_kernel.
+//
+// Constants:
+//   scale_attn = 1/sqrt(128) = 0x3DB504F3
+//   log2_e     = 1.4426950408 = 0x3FB8AA3B (used for v_exp_f32 = exp2 input)
+//   neg_inf_init = -1e30 = 0xF149F2CA  (HIP source: float m = -1e30f)
+fn _emit_phase7_attn_decode_coop_inline() {
+    // ── Outer gate: skip if wg_id >= 64 ─────────────────────────────────
+    // Use s28 (saved wg_id_x) NOT s15 — phase 5 clobbers s15 with the high
+    // half of the rope_sin pointer (s_load_b64 s[14:15], 0x58), so by the
+    // time phase 7 runs s15 is garbage.  s28 was set in the kernel prologue
+    // from the original wg_id_x.
+    // s_cmp_ge_u32 s28, 64: SOPC op=0x09, ssrc1=inline 64=0xC0
+    //   word = 0xBF000000|(9<<16)|(0xC0<<8)|0x1C = 0xBF09C01C
+    uint64 outer_gate_pos = asm_text_len / 4
+    asm_u32(0xBF09C01C)
+    asm_s_cbranch_scc1(0)        // patched at .phase7_done
+
+    // ── Compute q_head, coop_idx, kv_head from saved wg_id (s28) ────────
+    // s16 = wg_id >> 2  (q_head)  ← uses s28 not s15
+    // s_lshr_b32 s16, s28, 2: SOP2 op 0x0A, sdst=s16=0x10, ssrc0=s28=0x1C, ssrc1=inline 2=0x82
+    //   word = (2<<30)|(0x0A<<23)|(0x10<<16)|(0x82<<8)|0x1C = 0x8510821C
+    asm_u32(0x8510821C)
+    // s18 = wg_id & 3  (coop_idx)  ← uses s28 not s15
+    // s_and_b32 s18, s28, 3: SOP2 op 0x16
+    //   word = (2<<30)|(0x16<<23)|(0x12<<16)|(0x83<<8)|0x1C = 0x8B12831C
+    asm_u32(0x8B12831C)
+    // s19 = q_head >> 1 = s16 >> 1  (kv_head)
+    // s_lshr_b32 s19, s16, 1: op 0x0A; ssrc0=s16=0x10, ssrc1=inline 1=0x81
+    //   word = (2<<30)|(0x0A<<23)|(0x13<<16)|(0x81<<8)|0x10 = 0x85138110
+    asm_u32(0x85138110)
+
+    // ── Load kernarg pointers ───────────────────────────────────────────
+    // s_load_b64 s[2:3], s[0:1], 0x98   (b_attn_q_g, arg 19)
+    asm_s_load_b64_off(1, 0, 0x98)
+    // s_load_b64 s[4:5], s[0:1], 0x60   (kc_layer, arg 12)
+    asm_s_load_b64_off(2, 0, 0x60)
+    // s_load_b64 s[6:7], s[0:1], 0x68   (vc_layer, arg 13)
+    asm_s_load_b64_off(3, 0, 0x68)
+    // s_load_b32 s14, s[0:1], 0x70      (pos low 32, arg 14 by-value u64)
+    asm_s_load_b32(7, 0, 0x70)
+    // s_load_b64 s[12:13], s[0:1], 0xB0 (b_attn_out_g, arg 22)
+    asm_s_load_b64_off(6, 0, 0xB0)
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // ── Compute byte offsets and add to base pointers ───────────────────
+    // s20 = q_head * 512 = s16 << 9
+    // s_lshl_b32 s20, s16, 9: SOP2 op 0x08, sdst=0x14, ssrc0=s16=0x10, ssrc1=inline 9=0x89
+    //   word = (2<<30)|(8<<23)|(0x14<<16)|(0x89<<8)|0x10 = 0x84148910
+    asm_u32(0x84148910)
+    // s21 = kv_head * 512 = s19 << 9
+    //   word = (2<<30)|(8<<23)|(0x15<<16)|(0x89<<8)|0x13 = 0x84158913
+    asm_u32(0x84158913)
+    // s22 = coop_idx * 128 = s18 << 7
+    //   word = (2<<30)|(8<<23)|(0x16<<16)|(0x87<<8)|0x12 = 0x84168712
+    asm_u32(0x84168712)
+
+    // s2 = s2 + s20  (b_attn_q_g += q_head*512); s3 += carry
+    // SOP2 op 0 (s_add_u32): word = 0x80000000|(0x02<<16)|(0x14<<8)|0x02 = 0x80021402
+    asm_u32(0x80021402)
+    // s_addc_u32 s3, s3, 0
+    asm_u32(0x82038003)
+    // s4 = s4 + s21
+    asm_u32(0x80041504)
+    asm_u32(0x82058005)
+    // s6 = s6 + s21
+    asm_u32(0x80061506)
+    asm_u32(0x82078007)
+    // s12 = s12 + s20  (b_attn_out_g += q_head*512)
+    asm_u32(0x800C140C)
+    asm_u32(0x820D800D)
+
+    // ── Init v2 = -1e30f (= 0xF149F2CA) ──────────────────────────────────
+    asm_v_mov_b32_lit32(2, 0xF149F2CA)
+    // ── v9 = lane*4 (constant byte offset) ──────────────────────────────
+    asm_v_lshlrev_b32_imm(9, 2, 0)
+    // ── v1 = 0 (vaddr=0 for global_store with saddr) ────────────────────
+    asm_v_mov_b32_inline_u(1, 0)
+
+    // ════════════════════════════════════════════════════════════════════
+    // PASS 1 — max
+    // For t_base = 0..pos step 32:
+    //   per-lane lane_t = t_base + lane
+    //   if lane_t > pos: skip (exec mask)
+    //   k_byte_off_lo = lane_t * 4096 = lane_t << 12
+    //   k_addr = s[4:5] + k_byte_off
+    //   q_addr = s[2:3]  (constant)
+    //   dot = sum_{i=0..127} q[i] * k[i]  (32 b128-quad loads, 128 fmacs)
+    //   dot *= scale_attn
+    //   m = max(m, dot)
+    // wave-XOR-max reduce
+    // ════════════════════════════════════════════════════════════════════
+
+    // s24 = 0  (t_base counter)
+    asm_s_mov_b32_inline_imm(24, 0)
+    uint64 pass1_top = asm_text_len / 4
+
+    // s_cmp_lt_u32 s14, s24  (SCC=1 if pos < t_base → exit)
+    // SOPC op 0x0A: word = 0xBF000000|(0x0A<<16)|(0x18<<8)|0x0E = 0xBF0A180E
+    asm_u32(0xBF0A180E)
+    uint64 pass1_exit_pos = asm_text_len / 4
+    asm_s_cbranch_scc1(0)        // patched at .pass1_end
+
+    // ── per-lane lane_t = t_base + lane ─────────────────────────────────
+    // v_add_nc_u32_e32 v21, s24, v0: VOP2 op 0x25
+    //   word = (0x25<<25)|(21<<17)|(0<<9)|0x18 = 0x4A000000|0x002A0000|0x18 = 0x4A2A0018
+    //   (verified via llvm-mc gfx1100)
+    asm_u32(0x4A2A0018)
+
+    // v_cmp_le_u32_e64 vcc_lo, v21, s14: VOP3 op 0x4B (NOT 0x4D — that's gt_i32)
+    //   word1 = 0xD44B006A, word2 = ((s14)<<9)|(0x100|21) = (0x0E<<9)|0x115 = 0x1C00|0x115 = 0x1D15
+    //   (verified via llvm-mc gfx1100)
+    asm_u32(0xD44B006A)
+    asm_u32(0x00001D15)
+
+    // s_and_saveexec_b32 s17, vcc_lo  → s17 saves old exec; exec = exec & vcc_lo
+    asm_s_and_saveexec_b32_vcc_lo(17)
+    // s_cbranch_execz .pass1_skip  (forward; if no lane active, skip body)
+    uint64 pass1_execz_pos = asm_text_len / 4
+    asm_s_cbranch_execz(0)        // patched after the body
+
+    // ── k_byte_off (lo) = v21 << 12 → v10 ────────────────────────────────
+    asm_v_lshlrev_b32_imm(10, 12, 21)
+
+    // v[5:6] = s[4:5] + (v10, 0)
+    asm_v_add_co_u32_vcc_sv(5, 4, 10)
+    asm_v_mov_b32_inline_u(6, 0)
+    asm_v_add_co_ci_u32_null_sv_vcc(6, 5, 6)
+
+    // q ptr (constant for all lanes): v[3:4] = s[2:3] + 0
+    // v_mov_b32 v3, s2; v_mov_b32 v4, s3
+    asm_v_mov_b32(3, 2)
+    asm_v_mov_b32(4, 3)
+
+    // s_delay_alu (let VALU writes settle before VMEM)
+    asm_s_delay_alu(0x01)
+
+    // ── v20 = 0 (dot accumulator) ────────────────────────────────────────
+    asm_v_mov_b32_inline_u(20, 0)
+
+    // ── Inner dot: 32 chunks × 4 fmacs = 128-elem dot ────────────────────
+    uint64 chunk = 0
+    while chunk < 32 {
+        uint64 off = chunk * 16
+        // global_load_b128 v[12:15], v[3:4], off  offset:(off)
+        // word1 = 0xDC5E0000 | (off & 0xFFFF), word2 = (vdst<<24)|(0x7C<<16)|vaddr_lo
+        //   vdst=12=0x0C, vaddr_lo=v3=3
+        asm_u32(0xDC5E0000 | (off & 0xFFFF))
+        asm_u32(0x0C7C0003)
+        // global_load_b128 v[16:19], v[5:6], off  offset:(off)
+        asm_u32(0xDC5E0000 | (off & 0xFFFF))
+        asm_u32(0x107C0005)
+        asm_s_waitcnt_vmcnt_zero()
+        // 4 fmacs: v20 += q[i]*k[i] for i in chunk*4..chunk*4+3
+        asm_v_fmac_f32_e32_vv(20, 12, 16)
+        asm_v_fmac_f32_e32_vv(20, 13, 17)
+        asm_v_fmac_f32_e32_vv(20, 14, 18)
+        asm_v_fmac_f32_e32_vv(20, 15, 19)
+        chunk = chunk + 1
+    }
+
+    // ── v20 *= scale_attn (= 0x3DB504F3) ─────────────────────────────────
+    // v_mul_f32_e32 v20, lit, v20  — VOP2 op 0x08, src0=0xFF (lit32 follows)
+    //   word = (8<<25)|(20<<17)|(20<<9)|0xFF = 0x10000000|0x00280000|0x00002800|0xFF = 0x102828FF
+    //   (verified via llvm-mc gfx1100)
+    asm_u32(0x102828FF)
+    asm_u32(0x3DB504F3)
+
+    // ── m = max(m, dot)  → v_max_f32_e32 v2, v2, v20 ─────────────────────
+    // VOP2 op 0x10: word = 0x20000000|(2<<17)|(20<<9)|(0x100|2) = 0x20042902
+    //   (2<<17)=0x00040000, (20<<9)=0x00002800, src0=0x102 → 0x20042902
+    asm_u32(0x20042902)
+
+    // ── .pass1_skip: restore exec ────────────────────────────────────────
+    uint64 pass1_skip_target = asm_text_len / 4
+    // Patch s_cbranch_execz to here
+    uint64 execz_off = pass1_skip_target - pass1_execz_pos - 1
+    asm_patch_u32(pass1_execz_pos, 0xBFA50000 | (execz_off & 0xFFFF))
+
+    // s_or_b32 exec_lo, exec_lo, s17  (restore full exec)
+    // word = 0x8C7E000 | (0x11<<8) | 0x7E = 0x8C7E117E
+    asm_u32(0x8C7E117E)
+
+    // s_add_u32 s24, s24, 32  (t_base += 32)
+    // SOP2 op 0: word = 0x80000000|(0x18<<16)|(0xA0<<8)|0x18 = 0x8018A018
+    asm_u32(0x8018A018)
+    // s_branch back to pass1_top
+    uint64 pass1_back_simm = (pass1_top - (asm_text_len / 4) - 1) & 0xFFFF
+    asm_u32(0xBFA00000 | pass1_back_simm)
+
+    // ── .pass1_end ───────────────────────────────────────────────────────
+    uint64 pass1_end = asm_text_len / 4
+    asm_patch_u32(pass1_exit_pos, 0xBFA20000 | ((pass1_end - pass1_exit_pos - 1) & 0xFFFF))
+
+    // ── Wave-XOR-max reduce: acc=v2, addr=v10, tmp=v11 ───────────────────
+    _emit_wave_xor_reduce_max_f32_5_levels(2, 10, 11)
+
+    // ════════════════════════════════════════════════════════════════════
+    // PASS 2 — sum + LDS cache
+    // For t_base = 0..pos step 32 (same loop shape as pass 1):
+    //   recompute dot (same i-order, same fmac sequence)
+    //   exp_arg = fma(scale, dot, -m)        ← ONE fma to match HIP `dot*scale - m`
+    //   exp_arg *= log2_e (= 0x3FB8AA3B)
+    //   w = v_exp_f32(exp_arg)
+    //   ssum += w
+    //   attn_w_lds[lane_t] = w   (LDS byte offset = 4 + lane_t*4)
+    // wave-XOR-add reduce
+    // inv_sum = v_rcp_f32(ssum)
+    // s_barrier (cross-wave LDS visibility)
+    // ════════════════════════════════════════════════════════════════════
+
+    // v23 = 0 (ssum)
+    asm_v_mov_b32_inline_u(23, 0)
+    // s24 = 0 (reset t_base)
+    asm_s_mov_b32_inline_imm(24, 0)
+
+    uint64 pass2_top = asm_text_len / 4
+
+    // s_cmp_lt_u32 s14, s24  (SCC=1 if pos < t_base → exit)
+    asm_u32(0xBF0A180E)
+    uint64 pass2_exit_pos = asm_text_len / 4
+    asm_s_cbranch_scc1(0)        // patched at .pass2_end
+
+    // v21 = s24 + v0  (lane_t) — VOP2 op 0x25 (verified via llvm-mc gfx1100)
+    asm_u32(0x4A2A0018)
+
+    // v_cmp_le_u32_e64 vcc_lo, v21, s14 — VOP3 op 0x4B
+    asm_u32(0xD44B006A)
+    asm_u32(0x00001D15)
+
+    asm_s_and_saveexec_b32_vcc_lo(17)
+    uint64 pass2_execz_pos = asm_text_len / 4
+    asm_s_cbranch_execz(0)
+
+    // k offset, k ptr (same as pass 1)
+    asm_v_lshlrev_b32_imm(10, 12, 21)
+    asm_v_add_co_u32_vcc_sv(5, 4, 10)
+    asm_v_mov_b32_inline_u(6, 0)
+    asm_v_add_co_ci_u32_null_sv_vcc(6, 5, 6)
+    asm_v_mov_b32(3, 2)
+    asm_v_mov_b32(4, 3)
+    asm_s_delay_alu(0x01)
+
+    asm_v_mov_b32_inline_u(20, 0)
+
+    chunk = 0
+    while chunk < 32 {
+        uint64 off = chunk * 16
+        asm_u32(0xDC5E0000 | (off & 0xFFFF))
+        asm_u32(0x0C7C0003)
+        asm_u32(0xDC5E0000 | (off & 0xFFFF))
+        asm_u32(0x107C0005)
+        asm_s_waitcnt_vmcnt_zero()
+        asm_v_fmac_f32_e32_vv(20, 12, 16)
+        asm_v_fmac_f32_e32_vv(20, 13, 17)
+        asm_v_fmac_f32_e32_vv(20, 14, 18)
+        asm_v_fmac_f32_e32_vv(20, 15, 19)
+        chunk = chunk + 1
+    }
+
+    // ── exp_arg = fma(scale, dot, -m) ───────────────────────────────────
+    // v_fma_f32 v20, scale_lit, v20, -v2 (VOP3 op 0x113 with src2_neg modifier)
+    //   word1 = 0xD6130000 | vdst = 0xD6130014
+    //   word2: src2_neg in bit 23+|29... no, modifier bits in word1: NEG[2:0] in
+    //     word1 bits[63:61] in VOP3 — actually VOP3 modifiers go in word1 bits[15:11] (abs)
+    //     and word2 bits[31:29] (neg). For src2_neg, word2 |= (1<<31).
+    //   word2 = (src2<<18)|(src1<<9)|src0 with appropriate encodings:
+    //     src0 = 0xFF (literal, scale_attn follows)
+    //     src1 = 0x100|20 = 0x114 (v20)
+    //     src2 = 0x100|2 = 0x102 (v2)
+    //   neg src2 → word2 bit 31 = 1
+    //   word2 = (1<<31)|((0x102)<<18)|(0x114<<9)|0xFF = 0x80000000|0x40800000|0x00022800|0xFF
+    //         = 0x80000000 | 0x40800000 | 0x000228FF
+    //         = 0xC08228FF
+    // Wait — the V_FMA_F32 modifier bits: in VOP3-A, NEG[2:0] are bits [63:61]
+    // (which is word2 bits [31:29]). So src2_neg sets bit 31 of word2.
+    // src1_neg would set bit 30, src0_neg bit 29.
+    asm_u32(0xD6130014)
+    asm_u32(0x80000000 | (0x102 << 18) | (0x114 << 9) | 0xFF)
+    asm_u32(0x3DB504F3)
+
+    // ── exp_arg *= log2_e (= 0x3FB8AA3B) ────────────────────────────────
+    // v_mul_f32_e32 v20, lit, v20  (verified via llvm-mc gfx1100: 0x102828FF + lit)
+    asm_u32(0x102828FF)
+    asm_u32(0x3FB8AA3B)
+
+    // ── w = exp(exp_arg) → v22 ───────────────────────────────────────────
+    // v_exp_f32_e32 v22, v20  (VOP1 op 0x25)
+    //   word = (0x3F<<25)|(22<<17)|(0x25<<9)|(0x100|20) = 0x7E000000|0x002C0000|0x00004A00|0x114 = 0x7E2C4B14
+    asm_u32(0x7E2C4B14)
+
+    // ── ssum += w  (v23 += v22) ──────────────────────────────────────────
+    // v_add_f32_e32 v23, v23, v22  (VOP2 op 0x03)
+    //   word = (3<<25)|(23<<17)|(22<<9)|(0x100|23) = 0x06000000|0x002E0000|0x00002C00|0x117 = 0x062E2D17
+    asm_u32(0x062E2D17)
+
+    // ── LDS write: attn_w_lds[lane_t] = w (offset = 4 + lane_t*4) ────────
+    // v_lshlrev_b32 v25, 2, v21 → lane_t * 4 (lds slot offset relative to attn_w_lds[0])
+    asm_v_lshlrev_b32_imm(25, 2, 21)
+    // ds_store_b32 v25, v22 offset:4
+    //   word1 = 0xD8340000 | 4 = 0xD8340004
+    //   word2 = (vdata<<8)|vaddr = (22<<8)|25 = 0x1619
+    asm_u32(0xD8340004)
+    asm_u32(0x00001619)
+
+    // ── .pass2_skip: restore exec ────────────────────────────────────────
+    uint64 pass2_skip_target = asm_text_len / 4
+    asm_patch_u32(pass2_execz_pos, 0xBFA50000 | ((pass2_skip_target - pass2_execz_pos - 1) & 0xFFFF))
+    asm_u32(0x8C7E117E)        // s_or_b32 exec_lo, exec_lo, s17
+    asm_u32(0x8018A018)        // s_add_u32 s24, s24, 32
+    uint64 pass2_back_simm = (pass2_top - (asm_text_len / 4) - 1) & 0xFFFF
+    asm_u32(0xBFA00000 | pass2_back_simm)
+
+    // ── .pass2_end ───────────────────────────────────────────────────────
+    uint64 pass2_end = asm_text_len / 4
+    asm_patch_u32(pass2_exit_pos, 0xBFA20000 | ((pass2_end - pass2_exit_pos - 1) & 0xFFFF))
+
+    // ── Wave-XOR-add reduce: acc=v23, addr=v10, tmp=v11 ──────────────────
+    _emit_wave_xor_reduce_add_f32_5_levels(23, 10, 11)
+
+    // ── inv_sum = 1.0 / ssum (plain v_rcp_f32) ──────────────────────────
+    // v_rcp_f32_e32 v23, v23  (VOP1 op 0x2A)
+    //   word = (0x3F<<25)|(23<<17)|(0x2A<<9)|(0x100|23) = 0x7E000000|0x002E0000|0x00005400|0x117 = 0x7E2E5517
+    asm_u32(0x7E2E5517)
+
+    // ── s_barrier: ensure pass-2 LDS writes from all lanes are visible ──
+    asm_s_waitcnt_lgkmcnt_zero()
+    asm_s_barrier()
+
+    // ════════════════════════════════════════════════════════════════════
+    // PASS 3 — cooperative output
+    //   i = coop_idx*32 + lane         (per-lane output dim within head)
+    //   acc = 0
+    //   for t = 0..pos:
+    //     w = lds[t] * inv_sum
+    //     v_val = vc_layer[t][kv_head][i]
+    //     acc += w * v_val
+    //   b_attn_out_g[q_head*HEAD_DIM + i] = acc
+    //
+    // OUT_PER_WG = 32 = WAVE → all lanes active (no extra exec gate).
+    // ════════════════════════════════════════════════════════════════════
+
+    // ── Compute v[7:8] = vc_layer + kv_head*512 + coop_idx*128 + lane*4 ──
+    // Build scalar base: s26 = s6 + s22 (vc_layer + dim_byte_off)
+    // s_add_u32 s26, s6, s22: word = 0x80000000|(0x1A<<16)|(0x16<<8)|0x06 = 0x801A1606
+    asm_u32(0x801A1606)
+    // s_addc_u32 s27, s7, 0: word = 0x82000000|(0x1B<<16)|(0x80<<8)|0x07 = 0x821B8007
+    asm_u32(0x821B8007)
+    // v[7:8] = s[26:27] + lane*4 (v9)
+    asm_v_add_co_u32_vcc_sv(7, 26, 9)
+    asm_v_mov_b32_inline_u(8, 0)
+    asm_v_add_co_ci_u32_null_sv_vcc(8, 27, 8)
+
+    // ── Compute v[21:26] = b_attn_out_g + dim_byte_off + lane*4 ─────────
+    // out ptr LO in v21, HI in v26 (v22 is reused below for w/inv_sum result;
+    // a v_mov_b32 v22, ... in the pass-3 loop would otherwise clobber the
+    // ptr-hi half, corrupting global_store_b32 v[21:?] — encode-fault-free
+    // but stores to a wild address).  Pair v[21:?] is an EXPRESSION-level
+    // pair: global_store_b32 with vaddr=v21 reads v21 and v22 as the pair.
+    // Solution: keep ptr-hi in v26 and copy v26→v22 right before the store.
+    // s26 = s12 + s22; s27 = s13 + 0
+    asm_u32(0x801A160C)        // s_add_u32 s26, s12, s22
+    asm_u32(0x821B800D)        // s_addc_u32 s27, s13, 0
+    asm_v_add_co_u32_vcc_sv(21, 26, 9)
+    asm_v_mov_b32_inline_u(26, 0)
+    // hi = s27 + v26 + carry  → v26
+    asm_v_add_co_ci_u32_null_sv_vcc(26, 27, 26)
+
+    // ── v24 = 0 (acc) ────────────────────────────────────────────────────
+    asm_v_mov_b32_inline_u(24, 0)
+    // s25 = 0 (t counter)
+    asm_s_mov_b32_inline_imm(25, 0)
+
+    uint64 pass3_top = asm_text_len / 4
+
+    // s_cmp_lt_u32 s14, s25  (SCC=1 if pos < t → exit)
+    // word = 0xBF000000|(0x0A<<16)|(0x19<<8)|0x0E = 0xBF0A190E
+    asm_u32(0xBF0A190E)
+    uint64 pass3_exit_pos = asm_text_len / 4
+    asm_s_cbranch_scc1(0)
+
+    // ── Load LDS[t]*4 + 4 broadcast, ds_load with offset:4 ──────────────
+    // s26 = s25 << 2  (LDS byte offset relative to base, before +4)
+    // s_lshl_b32 s26, s25, 2: word = (2<<30)|(8<<23)|(0x1A<<16)|(0x82<<8)|0x19 = 0x841A8219
+    asm_u32(0x841A8219)
+    // v25 = s26 (broadcast scalar to vector)
+    asm_v_mov_b32(25, 26)
+    // ds_load_b32 v22, v25 offset:4
+    //   word1 = 0xD8D80004, word2 = (vdst<<24)|(0x00<<16)|vaddr = (22<<24)|25 = 0x16000019
+    asm_u32(0xD8D80004)
+    asm_u32(0x16000019)
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // ── w *= inv_sum   (v22 = v22 * v23) ─────────────────────────────────
+    // v_mul_f32_e32 v22, v22, v23: VOP2 op 0x08
+    //   word = (8<<25)|(22<<17)|(23<<9)|(0x100|22) = 0x10000000|0x002C0000|0x00002E00|0x116 = 0x102C2F16
+    asm_u32(0x102C2F16)
+
+    // ── Load V[t][lane] ──────────────────────────────────────────────────
+    // global_load_b32 v20, v[7:8], off
+    //   word1 = 0xDC520000, word2 = (vdst<<24)|(0x7C<<16)|vaddr = (20<<24)|(0x7C<<16)|7 = 0x147C0007
+    asm_u32(0xDC520000)
+    asm_u32(0x147C0007)
+    asm_s_waitcnt_vmcnt_zero()
+
+    // ── acc += w * v_val  (v_fmac_f32 v24, v22, v20) ────────────────────
+    asm_v_fmac_f32_e32_vv(24, 22, 20)
+
+    // ── Advance v[7:8] by KV_DIM*4 = 4096 bytes ──────────────────────────
+    // v_add_co_u32 v7, vcc_lo, lit, v7: VOP3B op 0x100
+    //   word1 = 0xD7006A07, word2 = ((0x100|7)<<9)|0xFF = (0x107<<9)|0xFF = 0x20E00|0xFF = 0x000020EFF — wait
+    //   (0x107<<9) = 0x20E00, |0xFF = 0x20EFF. word2 = 0x000020EFF doesn't look right.
+    // Compare phase 5 line ~688: asm_u32(0xD7006A05); asm_u32(0x00020AFF); asm_u32(256)
+    //   src1 = v5 → (0x100|5)<<9 = 0x105<<9 = 0x20A00; src0 = 0xFF (lit). word2 = 0x000A00 | 0xFF — no wait
+    //   (0x105<<9) = 0x20A00, |0xFF = 0x20AFF, but they wrote 0x00020AFF → so word2 has 0x00020A00 + 0xFF = 0x00020AFF.
+    //   Hmm, (0x105<<9) = 0x20A00 which doesn't equal 0x00020A00 = 0x20A00. OK same thing, format display.
+    //   word2 = (src1_enc<<9)|src0 = (0x107<<9)|0xFF = 0x20E00|0xFF = 0x20EFF
+    //   But proper format is 0x00020EFF. Let me write that:
+    asm_u32(0xD7006A07)
+    asm_u32(0x00020EFF)
+    asm_u32(4096)
+    // v_add_co_ci_u32_e64 v8, null, 0, v8, vcc_lo
+    //   word1 = 0xD5207C08, word2 = (0x6A<<18)|((0x100|8)<<9)|0x80
+    //         = 0x01A80000 | (0x108<<9) | 0x80 = 0x01A80000 | 0x21000 | 0x80 = 0x01AA1080
+    asm_u32(0xD5207C08)
+    asm_u32(0x01AA1080)
+
+    // ── s_add_u32 s25, s25, 1 ────────────────────────────────────────────
+    // word = 0x80000000|(0x19<<16)|(0x81<<8)|0x19 = 0x80198119
+    asm_u32(0x80198119)
+
+    // s_branch back to pass3_top
+    uint64 pass3_back_simm = (pass3_top - (asm_text_len / 4) - 1) & 0xFFFF
+    asm_u32(0xBFA00000 | pass3_back_simm)
+
+    // ── .pass3_end ───────────────────────────────────────────────────────
+    uint64 pass3_end = asm_text_len / 4
+    asm_patch_u32(pass3_exit_pos, 0xBFA20000 | ((pass3_end - pass3_exit_pos - 1) & 0xFFFF))
+
+    // ── Store acc to out_ptr per-lane ────────────────────────────────────
+    // Copy out-ptr-hi (v26) → v22 to form the v[21:22] pair for the store.
+    // (v22 was clobbered in the pass-3 inner loop by the LDS w-load + mul.)
+    // v_mov_b32_e32 v22, v26 (VOP1 op 1, vsrc=v26): word = (0x3F<<25)|(22<<17)|(1<<9)|(0x100|26)
+    //   = 0x7E000000|0x002C0000|0x00000200|0x11A = 0x7E2C031A
+    asm_u32(0x7E2C031A)
+    // VALU→VMEM hazard: VOP1 v_mov_b32 → v22 then global_store reads v[21:22].
+    // gfx11 requires s_delay_alu between the producer and the VMEM consumer
+    // for the dest VGPR. Without it the store may read a stale v22, sending
+    // the store to a wild address (silently dropped by the GPU MMU).
+    asm_s_delay_alu(0x01)
+    // global_store_b32 v[21:22], v24, off
+    //   word1 = 0xDC6A0000, word2 = (0x7C<<16)|(vdata<<8)|vaddr_lo = (0x7C<<16)|(24<<8)|21 = 0x007C1815
+    asm_u32(0xDC6A0000)
+    asm_u32(0x007C1815)
+
+    // ── .phase7_done: patch outer skip-branch ────────────────────────────
+    uint64 phase7_done = asm_text_len / 4
+    asm_patch_u32(outer_gate_pos + 1,
+        0xBFA20000 | ((phase7_done - outer_gate_pos - 2) & 0xFFFF))
+}
+
 // Emit the mega-kernel body into the kernel table.
 //
 // Slice 4.19.3: phase 1 (rmsnorm, WG-0), phase 3 (QKV matmul, WG<256), and
@@ -1302,6 +1876,13 @@ fn mega_emit_stub_kernel(uint64 kname_ptr, uint64 nl, uint64 body_node) -> uint6
     asm_s_load_b64_off(4, 0, 0x78)   // s[8:9]  = barrier_counter ptr (arg 15)
     asm_s_load_b64_off(5, 0, 0xB8)   // s[10:11]= max_phase value     (arg 23)
     asm_s_waitcnt_lgkmcnt_zero()
+    // Save wg_id_x (s15) → s28 BEFORE any phase that could clobber s15.
+    // Phase 5's `s_load_b64 s[14:15], ..., 0x58` (rope_sin) overwrites s15
+    // mid-kernel, so phase 7's outer-gate test against s15 would compare a
+    // pointer-high half to 64 and skip the entire phase 7 body for every WG
+    // (zero output).  s28 is unused by phases 1, 3, 5 (verified by disasm),
+    // so it serves as a safe save slot for the original wg_id_x.
+    asm_s_mov_b32(28, 15)            // s28 = wg_id_x (preserved across phases)
 
     // ── Phase 1: input rmsnorm (WG-0 gated) ──────────────────────────────
     if _body_has_rmsnorm_wg0_marker(body_node) != 0 {
@@ -1343,8 +1924,12 @@ fn mega_emit_stub_kernel(uint64 kname_ptr, uint64 nl, uint64 body_node) -> uint6
     uint64 mp3_cbranch_pos = asm_text_len / 4
     asm_s_cbranch_scc1(0)   // patched below
 
-    // Phase 7 stub
-    asm_u32(0xBF800000)
+    // ── Phase 7: attn_decode-coop (WG < 64) ───────────────────────────────
+    if _body_has_attn_decode_coop_marker(body_node) != 0 {
+        _emit_phase7_attn_decode_coop_inline()
+    } else {
+        asm_u32(0xBF800000)   // s_nop 0 (phase 7 stub)
+    }
     mega_emit_barrier_isa(3, MEGA_WG_PERSIST)
     asm_s_cmp_lt_u32(10, 0x84)
     uint64 mp4_cbranch_pos = asm_text_len / 4
