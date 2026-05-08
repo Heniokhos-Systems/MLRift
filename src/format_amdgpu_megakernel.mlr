@@ -2189,7 +2189,10 @@ fn _emit_phase7_attn_decode_coop_inline() {
 //                  gemv-coop-bf16-padded-strided body with new kernarg triple).
 //   slice 4.19.8 — phase 15 (silu_mul elem-strided, WG<256; NEW shape — SiLU(g)*u
 //                  in-place over gu_scratch[0..FF]).
-// Phases 17 remain stubs (s_nop 0) until later slices.
+//   slice 4.19.9 — phase 17 (down_w matmul + final residual-add, WG<256; reuses
+//                  the phase-9 gemv-residual-fused body with new kernarg quad).
+//                  LAST phase — no trailing mega_barrier.
+// All real-emit phases now landed; mega-kernel v2 is full forward.
 //
 // max_phase early-exit simm16 values: every phase boundary 0..7 is patched
 // dynamically (body sizes vary across recognizer outcomes).
@@ -2454,8 +2457,29 @@ fn mega_emit_stub_kernel(uint64 kname_ptr, uint64 nl, uint64 body_node) -> uint6
     }
     mega_emit_barrier_isa(7, MEGA_WG_PERSIST)
 
-    // Phase 17 stub (no trailing barrier)
-    asm_u32(0xBF800000)
+    // ── Phase 17: down_w matmul + final residual-add (WG < 256) ───────────
+    // Kernarg layout: w=down_w(arg 5, 0x28), x=gu_scratch(arg 16, 0x80),
+    //                 res=b_mid_g(arg 20, 0xA0), out=out_residual(arg 1, 0x08).
+    // Reuses the gemv-residual-fused body shared with phase 9 (slice 4.19.5
+    // emitter — _emit_phase9_gemv_residual_inline).
+    // Shapes: n_out=1024 (HIDDEN), k=3072 (FF), k_pad=3200 (FF_PAD),
+    //         wg_active=256.  ROWS_PER_WG = ceil(1024/256) = 4.
+    // wg_id_x lives in s28 here — phase 5's rope_sin load clobbered s15
+    // mid-kernel; the prologue saves the original s15→s28 for downstream
+    // phases.  The shared emitter hardcodes s28 internally (phase-17 uses
+    // the same saved register as phase 9 / 11 / 13 / 15).
+    // Marker recognized inline (no `_body_has_down_residual_marker` wrapper)
+    // — same fn-table-cap discipline as oproj_residual_marker /
+    // post_norm_marker / gate_up_matmul_marker / silu_mul_elem_strided_marker.
+    // Phase 17 is the LAST phase: no trailing mega_emit_barrier_isa(8, ...)
+    // because no later phase reads phase 17's output.  Control falls through
+    // to s_endpgm directly.
+    if _body_has_marker(body_node, "down_residual_marker", 20) != 0 {
+        _emit_phase9_gemv_residual_inline(1024, 3072, 3200, 256,
+                                            0x28, 0x80, 0xA0, 0x08)
+    } else {
+        asm_u32(0xBF800000)   // s_nop 0 (phase 17 stub)
+    }
 
     // .Lend:
     asm_s_endpgm()
