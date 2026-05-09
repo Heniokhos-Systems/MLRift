@@ -1,0 +1,172 @@
+// qwen3-0.6B SPECK4 layer mega-kernel as a MLRift @kernel.
+//
+// Speculative-decode variant of qwen3_layer_megakernel: M_EFF=4 multi-query
+// per-layer pass, runs 4 streams (one per speculative token candidate)
+// through every phase in lockstep.  Used by qwen3_generate's spec_K=4 path.
+//
+// Body shape mirrors the base mega-kernel (9 phases + 8 mega_barrier calls,
+// each phase wrapped in `if (wg_id ...)`).  Marker names are SUFFIXED with
+// `_speck4` so the speck4 recognizer doesn't false-fire on the base body
+// and vice-versa.  Outer-WG gates differ from the base for phase 5 only:
+//   phase 5: wg_id < 128 (vs base wg_id < 32)  — flat (m, head) dispatch
+//            over M_EFF=4 streams * 32 heads.
+//   phase 7: wg_id <  64 (unchanged)            — internal m-loop over
+//            M_EFF=4 inside the existing 64-WG cooperative shape.
+//   all other phases: unchanged outer gates.
+//
+// WG_PERSIST = 512 (matches base + HIP source).
+//
+// Build the .co:
+//   ./build/mlrc --emit-amdgpu-qwen3-megakernel-speck4-v2=/tmp/qwen3_layer_megakernel_speck4_v2.co \
+//       examples/llm/qwen3_layer_megakernel_speck4.mlr
+//
+// Use at runtime:
+//   MLRIFT_NATIVE_MEGAKERNEL=2 ./build/qwen3_generate ...    (unified flag)
+//   MLRIFT_NATIVE_MEGAKERNEL_SPECK4=2 ./build/qwen3_generate ... (per-variant override)
+
+// CPU stubs for block_idx_x / tid_local_x — the recognizer pattern-matches
+// the @kernel body via AST walk; these are never called on AMDGPU.
+fn block_idx_x() -> uint64 { return 0 }
+fn tid_local_x()  -> uint64 { return 0 }
+
+// rmsnorm_wg0_speck4_marker — CPU no-op; tells the AMDGPU recognizer that
+// the phase-1 block should emit the speck4 m-loop wrapper around the
+// existing _emit_rmsnorm_wg_gated_inline (M_EFF=4 iterations, per-m base
+// = base_kofs + m*HIDDEN*4).  Pattern-matched by inline _body_has_marker
+// at the slice 4.20.0 dispatch site.
+fn rmsnorm_wg0_speck4_marker() { }
+
+// qkv_matmul_speck4_marker — CPU no-op; phase-3 m4 gemv (4-stream gemv,
+// 4 accumulators / 4 stores per row).  Reuses the base
+// _emit_gemv_coop_bf16_padded_strided_*_m4_inline (slice 4.20.2).
+fn qkv_matmul_speck4_marker() { }
+
+// qkv_split_qknorm_rope_speck4_marker — CPU no-op; phase-5 NEW shape
+// (128 WGs, flat (m, head) dispatch).  Speck4-only emitter
+// _emit_phase5_qkv_split_qknorm_rope_speck4_inline (slice 4.20.3).
+fn qkv_split_qknorm_rope_speck4_marker() { }
+
+// attn_decode_coop_speck4_marker — CPU no-op; phase-7 NEW shape
+// (64 WGs, internal `for m in 0..3` loop, 3 passes per m,
+// attn_w_lds[M_EFF*128=512]).  Speck4-only emitter
+// _emit_phase7_attn_decode_coop_speck4_inline (slice 4.20.4).
+fn attn_decode_coop_speck4_marker() { }
+
+// oproj_residual_speck4_marker — CPU no-op; phase-9 m4 gemv-residual
+// (4 streams, per-stream residual add).  Uses the new
+// _emit_phase9_gemv_residual_m4_inline variant (slice 4.20.5).
+fn oproj_residual_speck4_marker() { }
+
+// post_norm_speck4_marker — CPU no-op; phase-11 m-loop wrapper around
+// _emit_rmsnorm_wg_gated_inline (slice 4.20.1, same body as phase 1).
+fn post_norm_speck4_marker() { }
+
+// gate_up_matmul_speck4_marker — CPU no-op; phase-13 m4 gemv (slice 4.20.5,
+// reuses the phase-3 m4 emitter with shape (6144, 1024, 1152)).
+fn gate_up_matmul_speck4_marker() { }
+
+// silu_mul_elem_strided_speck4_marker — CPU no-op; phase-15 m-loop
+// wrapper around the silu_mul elem-strided body (slice 4.20.6).  Each m
+// iteration writes to gu_scratch[m * 2*FF, m * 2*FF + FF).
+fn silu_mul_elem_strided_speck4_marker() { }
+
+// down_residual_speck4_marker — CPU no-op; phase-17 m4 gemv-residual
+// with shape (1024, 3072, 3200) and per-stream input stride 2*FF*4 bytes
+// (NOT FF*4 — phase 15 wrote silu*up into slot [m, 0..FF] of a
+// [m, 0..2*FF]-block).  Reuses _emit_phase9_gemv_residual_m4_inline
+// (slice 4.20.7).  Phase 17 is the LAST phase — no trailing mega_barrier.
+fn down_residual_speck4_marker() { }
+
+// mega_barrier is a 3-arg void intrinsic (registered in the parser's
+// builtin table — see src/analysis.mlr is_builtin / builtin_arg_count).
+// Lowered by the AMDGPU emitter to the validated cross-WG barrier ISA
+// sequence (global_atomic_add_u32 + spin-loop, ~31 dwords per barrier).
+@kernel
+fn qwen3_layer_megakernel_speck4(
+    uint64 in_residual,        //  0
+    uint64 out_residual,       //  1
+    uint64 qkv_w,              //  2
+    uint64 o_w,                //  3
+    uint64 gate_up_w,          //  4
+    uint64 down_w,             //  5
+    uint64 in_norm_g,          //  6
+    uint64 post_norm_g,        //  7
+    uint64 q_norm_g,           //  8
+    uint64 k_norm_g,           //  9
+    uint64 rope_cos,           // 10  (per-m: rope_cos[m * HEAD_DIM/2])
+    uint64 rope_sin,           // 11  (per-m: rope_sin[m * HEAD_DIM/2])
+    uint64 kc_layer,           // 12
+    uint64 vc_layer,           // 13
+    uint64 pos_base,           // 14  (by_value u64; per-m pos = pos_base + m)
+    uint64 barrier_counter,    // 15
+    uint64 gu_scratch,         // 16  (per-m base: m * 2*FF*4 bytes)
+    uint64 b_x_norm_g,         // 17  (per-m base: m * HIDDEN*4 bytes)
+    uint64 b_qkv_g,            // 18  (per-m base: m * QKV_DIM*4 bytes)
+    uint64 b_attn_q_g,         // 19  (per-m base: m * Q_DIM*4 bytes)
+    uint64 b_mid_g,            // 20  (per-m base: m * HIDDEN*4 bytes)
+    uint64 b_mid_norm_g,       // 21  (per-m base: m * HIDDEN*4 bytes)
+    uint64 b_attn_out_g,       // 22  (per-m base: m * Q_DIM*4 bytes)
+    uint64 max_phase           // 23  (by_value u64)
+) {
+    // Slice 4.20.0: 9 stub phases + 8 cross-WG barriers + max_phase guards.
+    // Body shape mirrors the base mega-kernel; the AST walker dispatches
+    // each phase block to the speck4 sub-recognizer at slice 4.20.1+.
+
+    uint64 wg_id = block_idx_x()
+    uint64 lane  = tid_local_x()
+
+    if wg_id == 0 {
+        rmsnorm_wg0_speck4_marker()        // phase 1: input rmsnorm × M_EFF
+    }
+    mega_barrier(barrier_counter, 0, 512)
+    if max_phase < 1 { return }
+
+    if wg_id < 256 {
+        qkv_matmul_speck4_marker()         // phase 3: QKV matmul × M_EFF (4-stream gemv)
+    }
+    mega_barrier(barrier_counter, 1, 512)
+    if max_phase < 2 { return }
+
+    if wg_id < 128 {
+        qkv_split_qknorm_rope_speck4_marker()   // phase 5: 128 WGs flat (m, head)
+    }
+    mega_barrier(barrier_counter, 2, 512)
+    if max_phase < 3 { return }
+
+    if wg_id < 64 {
+        attn_decode_coop_speck4_marker()   // phase 7: 64 WGs, internal m-loop
+    }
+    mega_barrier(barrier_counter, 3, 512)
+    if max_phase < 4 { return }
+
+    if wg_id < 256 {
+        oproj_residual_speck4_marker()     // phase 9: o_proj + residual × M_EFF
+    }
+    mega_barrier(barrier_counter, 4, 512)
+    if max_phase < 5 { return }
+
+    if wg_id == 0 {
+        post_norm_speck4_marker()          // phase 11: post_norm rmsnorm × M_EFF
+    }
+    mega_barrier(barrier_counter, 5, 512)
+    if max_phase < 6 { return }
+
+    if wg_id < 256 {
+        gate_up_matmul_speck4_marker()     // phase 13: gate_up matmul × M_EFF
+    }
+    mega_barrier(barrier_counter, 6, 512)
+    if max_phase < 7 { return }
+
+    if wg_id < 256 {
+        silu_mul_elem_strided_speck4_marker()  // phase 15: SiLU(gate)*up × M_EFF
+    }
+    mega_barrier(barrier_counter, 7, 512)
+
+    if wg_id < 256 {
+        down_residual_speck4_marker()      // phase 17: down_w + final residual × M_EFF
+    }
+}
+
+fn main() {
+    exit(0)
+}

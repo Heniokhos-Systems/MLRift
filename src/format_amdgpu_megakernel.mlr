@@ -31,6 +31,27 @@ static uint64 MEGA_KERNARG_COUNT = 24
 //   Matches the HIP source #define WG_PERSIST 512.
 static uint64 MEGA_WG_PERSIST = 512
 
+// ── speck4 mega-kernel constants ──────────────────────────────────────────
+// Slice 4.20.0: scaffold for the M_EFF=4 multi-query mega-kernel
+// (qwen3_layer_megakernel_speck4).  Identical 24-arg kernarg layout as the
+// base; per-stream slabs are 4× larger (M_EFF=4 streams).
+//
+// MEGA_KERNARG_COUNT_SPECK4 — same 24 args as base.
+static uint64 MEGA_KERNARG_COUNT_SPECK4 = 24
+
+// MEGA_M_EFF — number of speculative-decode streams per layer pass.
+static uint64 MEGA_M_EFF = 4
+
+// MEGA_LDS_SPECK4 — phase 7 needs attn_w_lds[M_EFF*128]=512 floats=2048B
+// plus wave_tmp[1]=4B at offset 0 (same layout as base for clean reuse with
+// _emit_rmsnorm_wg_gated_inline's broadcast slot).  Round up to 2080
+// (multiple of 32) for safety.
+//   layout: offset 0..3   = wave_tmp[0]            (4 B)
+//           offset 4..31  = padding                (28 B; alignment headroom)
+//           offset 32..2079 = attn_w_lds[512]      (2048 B)
+// The base mega-kernel uses LDS=516; speck4 explicitly overrides to 2080.
+static uint64 MEGA_LDS_SPECK4 = 2080
+
 // AST_KIND_BLOCK: ast_kind() value for a Block node (used in recognizer).
 static uint64 AST_KIND_BLOCK = 15
 
@@ -2592,4 +2613,244 @@ fn recognize_megakernel_swiglu_dense_gqa(uint64 fn_node, uint64 source,
     if ast_kind(body) != AST_KIND_BLOCK { return 1 }
 
     return mega_emit_stub_kernel(kname_ptr, nl, body)
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Slice 4.20.0 — speck4 mega-kernel scaffold
+// ──────────────────────────────────────────────────────────────────────────
+//
+// mega_emit_stub_kernel_speck4 emits a structurally-valid stub .co for the
+// M_EFF=4 multi-query mega-kernel.  All 9 phases are `s_nop 0` placeholders;
+// the 8 cross-WG barriers and max_phase early-exit guards are real (cloned
+// from mega_emit_stub_kernel).  Slice 4.20.1+ replaces the per-phase stubs
+// with real m-loop wrappers / m4 variants / new emitters.
+//
+// Differences vs mega_emit_stub_kernel:
+//   - LDS=2080 (vs base 516) — phase 7 needs attn_w_lds[M_EFF*128]=2048B.
+//   - All 9 marker checks use *_speck4_marker names (inlined via
+//     _body_has_marker; no per-marker wrappers, slice 4.19.5 fn-table-cap
+//     discipline carried forward).
+//   - All 9 phases are s_nop stubs at slice 4.20.0; real emit added in
+//     subsequent slices (4.20.1..4.20.7).
+fn mega_emit_stub_kernel_speck4(uint64 kname_ptr, uint64 nl, uint64 body_node) -> uint64 {
+    asm_init()
+
+    // ── Prologue ──────────────────────────────────────────────────────────
+    asm_s_load_b64_off(4, 0, 0x78)   // s[8:9]  = barrier_counter ptr (arg 15)
+    asm_s_load_b64_off(5, 0, 0xB8)   // s[10:11]= max_phase value     (arg 23)
+    asm_s_waitcnt_lgkmcnt_zero()
+    // Save wg_id_x (s15) → s28 BEFORE any phase that could clobber s15.
+    // Same hazard as base: phase 5's `s_load_b64 s[14:15], ..., 0x58` for
+    // rope_sin will overwrite s15 once the real emitter ships at slice 4.20.3.
+    // s28 is unused by phases 1, 3, 5; safe save slot for the original wg_id_x.
+    asm_s_mov_b32(28, 15)            // s28 = wg_id_x (preserved across phases)
+
+    // ── Phase 1: input rmsnorm × M_EFF (WG-0 gated) ──────────────────────
+    // Slice 4.20.0: stub.  Slice 4.20.1 wraps _emit_rmsnorm_wg_gated_inline
+    // in a 4-iteration m-loop with per-m base = base_kofs + m*HIDDEN*4.
+    if _body_has_marker(body_node, "rmsnorm_wg0_speck4_marker", 25) != 0 {
+        asm_u32(0xBF800000)   // s_nop 0 (phase 1 stub — slice 4.20.0)
+    } else {
+        asm_u32(0xBF800000)   // s_nop 0 (phase 1 stub)
+    }
+    mega_emit_barrier_isa(0, MEGA_WG_PERSIST)
+
+    asm_s_cmp_lt_u32(10, 0x81)
+    uint64 mp1_cbranch_pos = asm_text_len / 4
+    asm_s_cbranch_scc1(0)
+
+    // ── Phase 3: QKV matmul × M_EFF (WG < 256) ────────────────────────────
+    // Slice 4.20.0: stub.  Slice 4.20.2 emits the m4 gemv variant
+    // (4 accumulators / 4 output stores per row).
+    if _body_has_marker(body_node, "qkv_matmul_speck4_marker", 24) != 0 {
+        asm_u32(0xBF800000)   // s_nop 0 (phase 3 stub — slice 4.20.0)
+    } else {
+        asm_u32(0xBF800000)   // s_nop 0 (phase 3 stub)
+    }
+    mega_emit_barrier_isa(1, MEGA_WG_PERSIST)
+
+    asm_s_cmp_lt_u32(10, 0x82)
+    uint64 mp2_cbranch_pos = asm_text_len / 4
+    asm_s_cbranch_scc1(0)
+
+    // ── Phase 5: QKV split + qknorm + RoPE (WG < 128, flat (m, head)) ────
+    // Slice 4.20.0: stub.  Slice 4.20.3 emits the speck4 phase-5 NEW shape
+    // (128 WGs = M_EFF*32, decompose wg_id → (m, head) via div/mod).
+    if _body_has_marker(body_node, "qkv_split_qknorm_rope_speck4_marker", 35) != 0 {
+        asm_u32(0xBF800000)   // s_nop 0 (phase 5 stub — slice 4.20.0)
+    } else {
+        asm_u32(0xBF800000)   // s_nop 0 (phase 5 stub)
+    }
+    mega_emit_barrier_isa(2, MEGA_WG_PERSIST)
+    asm_s_cmp_lt_u32(10, 0x83)
+    uint64 mp3_cbranch_pos = asm_text_len / 4
+    asm_s_cbranch_scc1(0)
+
+    // ── Phase 7: attn_decode-coop with internal m-loop (WG < 64) ─────────
+    // Slice 4.20.0: stub.  Slice 4.20.4 emits the new phase-7 emitter
+    // (3-pass body wrapped in `for m in 0..3`, attn_w_lds offset = m*128*4).
+    if _body_has_marker(body_node, "attn_decode_coop_speck4_marker", 30) != 0 {
+        asm_u32(0xBF800000)   // s_nop 0 (phase 7 stub — slice 4.20.0)
+    } else {
+        asm_u32(0xBF800000)   // s_nop 0 (phase 7 stub)
+    }
+    mega_emit_barrier_isa(3, MEGA_WG_PERSIST)
+    asm_s_cmp_lt_u32(10, 0x84)
+    uint64 mp4_cbranch_pos = asm_text_len / 4
+    asm_s_cbranch_scc1(0)
+
+    // ── Phase 9: o_proj matmul + residual-add × M_EFF (WG < 256) ─────────
+    // Slice 4.20.0: stub.  Slice 4.20.5 emits the m4 gemv-residual variant.
+    if _body_has_marker(body_node, "oproj_residual_speck4_marker", 28) != 0 {
+        asm_u32(0xBF800000)   // s_nop 0 (phase 9 stub — slice 4.20.0)
+    } else {
+        asm_u32(0xBF800000)   // s_nop 0 (phase 9 stub)
+    }
+    mega_emit_barrier_isa(4, MEGA_WG_PERSIST)
+    asm_s_cmp_lt_u32(10, 0x85)
+    uint64 mp5_cbranch_pos = asm_text_len / 4
+    asm_s_cbranch_scc1(0)
+
+    // ── Phase 11: post_norm rmsnorm × M_EFF (WG-0 gated) ─────────────────
+    // Slice 4.20.0: stub.  Slice 4.20.1 reuses the rmsnorm m-loop wrapper
+    // from phase 1 with different kernarg byte offsets.
+    if _body_has_marker(body_node, "post_norm_speck4_marker", 23) != 0 {
+        asm_u32(0xBF800000)   // s_nop 0 (phase 11 stub — slice 4.20.0)
+    } else {
+        asm_u32(0xBF800000)   // s_nop 0 (phase 11 stub)
+    }
+    mega_emit_barrier_isa(5, MEGA_WG_PERSIST)
+    asm_s_cmp_lt_u32(10, 0x86)
+    uint64 mp6_cbranch_pos = asm_text_len / 4
+    asm_s_cbranch_scc1(0)
+
+    // ── Phase 13: gate_up matmul × M_EFF (WG < 256) ──────────────────────
+    // Slice 4.20.0: stub.  Slice 4.20.5 reuses the phase-3 m4 emitter
+    // with shape (6144, 1024, 1152).
+    if _body_has_marker(body_node, "gate_up_matmul_speck4_marker", 28) != 0 {
+        asm_u32(0xBF800000)   // s_nop 0 (phase 13 stub — slice 4.20.0)
+    } else {
+        asm_u32(0xBF800000)   // s_nop 0 (phase 13 stub)
+    }
+    mega_emit_barrier_isa(6, MEGA_WG_PERSIST)
+    asm_s_cmp_lt_u32(10, 0x87)
+    uint64 mp7_cbranch_pos = asm_text_len / 4
+    asm_s_cbranch_scc1(0)
+
+    // ── Phase 15: SiLU(gate)*up × M_EFF in-place over gu_scratch ─────────
+    // Slice 4.20.0: stub.  Slice 4.20.6 wraps the elem-strided silu_mul
+    // body in a 4-iteration m-loop; per-m base = m * 2*FF*4 bytes.
+    if _body_has_marker(body_node, "silu_mul_elem_strided_speck4_marker", 35) != 0 {
+        asm_u32(0xBF800000)   // s_nop 0 (phase 15 stub — slice 4.20.0)
+    } else {
+        asm_u32(0xBF800000)   // s_nop 0 (phase 15 stub)
+    }
+    mega_emit_barrier_isa(7, MEGA_WG_PERSIST)
+
+    // ── Phase 17: down_w matmul + final residual-add × M_EFF (WG < 256) ──
+    // Slice 4.20.0: stub.  Slice 4.20.7 reuses the m4 gemv-residual emitter
+    // with shape (1024, 3072, 3200) and per-stream input stride 2*FF*4
+    // bytes (NOT FF*4 — phase 15 wrote silu*up into slot [m, 0..FF] of a
+    // [m, 0..2*FF]-block).  Phase 17 is the LAST phase — no trailing
+    // mega_emit_barrier_isa(8, ...).
+    if _body_has_marker(body_node, "down_residual_speck4_marker", 27) != 0 {
+        asm_u32(0xBF800000)   // s_nop 0 (phase 17 stub — slice 4.20.0)
+    } else {
+        asm_u32(0xBF800000)   // s_nop 0 (phase 17 stub)
+    }
+
+    // .Lend:
+    asm_s_endpgm()
+
+    // ── Patch all max_phase branches to .Lend ─────────────────────────────
+    uint64 endpgm_pos = (asm_text_len / 4) - 1   // s_endpgm is the last dword
+
+    uint64 mp1_simm16 = (endpgm_pos - mp1_cbranch_pos - 1) & 0xFFFF
+    asm_patch_u32(mp1_cbranch_pos, 0xBFA20000 | mp1_simm16)
+    uint64 mp2_simm16 = (endpgm_pos - mp2_cbranch_pos - 1) & 0xFFFF
+    asm_patch_u32(mp2_cbranch_pos, 0xBFA20000 | mp2_simm16)
+    uint64 mp3_simm16 = (endpgm_pos - mp3_cbranch_pos - 1) & 0xFFFF
+    asm_patch_u32(mp3_cbranch_pos, 0xBFA20000 | mp3_simm16)
+    uint64 mp4_simm16 = (endpgm_pos - mp4_cbranch_pos - 1) & 0xFFFF
+    asm_patch_u32(mp4_cbranch_pos, 0xBFA20000 | mp4_simm16)
+    uint64 mp5_simm16 = (endpgm_pos - mp5_cbranch_pos - 1) & 0xFFFF
+    asm_patch_u32(mp5_cbranch_pos, 0xBFA20000 | mp5_simm16)
+    uint64 mp6_simm16 = (endpgm_pos - mp6_cbranch_pos - 1) & 0xFFFF
+    asm_patch_u32(mp6_cbranch_pos, 0xBFA20000 | mp6_simm16)
+    uint64 mp7_simm16 = (endpgm_pos - mp7_cbranch_pos - 1) & 0xFFFF
+    asm_patch_u32(mp7_cbranch_pos, 0xBFA20000 | mp7_simm16)
+
+    // ── Snapshot ISA and register in kernel table ──────────────────────────
+    uint64 k_text_size = asm_text_len
+    uint64 k_text_buf  = alloc(k_text_size)
+    uint64 ci = 0
+    while ci < k_text_size {
+        uint64 sp = asm_text_buf + ci
+        uint64 b = 0
+        unsafe { *(sp as uint8) -> b }
+        uint64 dp = k_text_buf + ci
+        uint8 b8 = b
+        unsafe { *(dp as uint8) = b8 }
+        ci = ci + 1
+    }
+
+    // MEGA_KERNARG_COUNT_SPECK4-arg descriptor: same kernarg layout as base
+    // (args 14 = pos_base, 23 = max_phase are by-value; rest are global_buffer).
+    uint64 args_desc = alloc(MEGA_KERNARG_COUNT_SPECK4 * 16)
+    uint64 ai = 0
+    while ai < MEGA_KERNARG_COUNT_SPECK4 {
+        uint64 sz_p   = args_desc + ai * 16
+        uint64 kind_p = args_desc + ai * 16 + 8
+        unsafe { *(sz_p as uint64) = 8 }
+        if ai == 14 {
+            unsafe { *(kind_p as uint64) = AMD_ARG_KIND_BY_VALUE }
+        } else if ai == 23 {
+            unsafe { *(kind_p as uint64) = AMD_ARG_KIND_BY_VALUE }
+        } else {
+            unsafe { *(kind_p as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+        }
+        ai = ai + 1
+    }
+
+    // KD: same rsrc1/rsrc2/rsrc3/props as base mega-kernel.
+    //     LDS = MEGA_LDS_SPECK4 = 2080 (override base 516; phase 7 needs
+    //     attn_w_lds[M_EFF*128]=2048B + wave_tmp[1]=4B at offset 0).
+    uint64 rsrc1 = 0xE0AF0006
+    uint64 rsrc2 = 0x0000009E
+    uint64 rsrc3 = 0x00000010
+    uint64 props = 0x0408
+
+    kt_push_lds(kname_ptr, nl, k_text_buf, k_text_size,
+                args_desc, MEGA_KERNARG_COUNT_SPECK4, 192,
+                16, 3,
+                rsrc1, rsrc2, rsrc3, props,
+                MEGA_LDS_SPECK4)
+    return 0
+}
+
+// Top-level AST-walking recognizer for the qwen3_layer_megakernel_speck4 @kernel.
+//
+// Slice 4.20.0: validates the 24-parameter signature and body block shape,
+// then delegates to mega_emit_stub_kernel_speck4 to produce the stub .co.
+// Marker names matched at dispatch time are *_speck4_marker (no false-fire
+// risk on the base body).
+//
+// Returns 0 on match (kernel emitted), 1 on shape mismatch.
+fn recognize_megakernel_swiglu_dense_gqa_speck4(uint64 fn_node, uint64 source,
+                                                 uint64 kname_ptr, uint64 nl) -> uint64 {
+    // ── shape: exactly MEGA_KERNARG_COUNT_SPECK4 params ──────────────────
+    uint64 n_params = 0
+    uint64 wp = ast_child(fn_node)
+    while wp != 0 {
+        n_params = n_params + 1
+        wp = ast_next(wp)
+    }
+    if n_params != MEGA_KERNARG_COUNT_SPECK4 { return 1 }
+
+    // ── shape: body is a non-empty Block ─────────────────────────────────
+    uint32 body = ast_data3(fn_node)
+    if body == 0 { return 1 }
+    if ast_kind(body) != AST_KIND_BLOCK { return 1 }
+
+    return mega_emit_stub_kernel_speck4(kname_ptr, nl, body)
 }
