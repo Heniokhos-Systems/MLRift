@@ -1791,6 +1791,7 @@ fn qwen3_gpu_chain_resid_to_next_norm(u64 d_x_out, u64 next_input_norm_w_bf16,
 // Legacy path uses 0xFF (no skip bits) — every sub-step runs inline.
 // Batched path uses 0x02|0x200, 0x08|0x100 plus the batched matmul +
 // post_norm + Q-rope calls dispatched separately by qwen3_generate.
+@export
 fn qwen3_forward_layer_gpu(u64 d_x_in, u64 d_x_out,
                             Qwen3LayerWeights w, u64 pos,
                             u64 k_cache_layer, u64 v_cache_layer,
@@ -1828,9 +1829,18 @@ fn qwen3_forward_layer_gpu(u64 d_x_in, u64 d_x_out,
             if c0 != 48 { _gpuq_megak_use = 1 }
         }
     }
+    // Slice 5.8: arch-dispatch the mega-kernel handle.
+    //   hidden=1024 → qwen3-0.6B .co (gpu_fh_qwen3_megakernel)
+    //   hidden=2048 → llama-3.2-1B .co (gpu_fh_llama_megakernel)
+    // The kernarg layout, scratch slabs, RoPE/KV plumbing, and per-layer
+    // flush logic are identical between the two .co's; only the launcher
+    // call (and the readiness probe) differs.
+    u64 _mk_arch_ok = 0
+    if hidden == 1024 { if gpu_qwen3_megakernel_ready() != 0 { _mk_arch_ok = 1 } }
+    if hidden == 2048 { if gpu_llama_megakernel_ready() != 0 { _mk_arch_ok = 1 } }
     if _gpuq_megak_use != 0 {
-        if gpu_qwen3_megakernel_ready() != 0 {
-            if _gpuq_batch_size == 1 && batch_idx == 0 && hidden == 1024 && pos < 64 {
+        if _mk_arch_ok != 0 {
+            if _gpuq_batch_size == 1 && batch_idx == 0 && pos < 64 {
                 // Strip the 0x40000 (qknorm-rope-fused opt-out) bit; it
                 // doesn't apply to the mega-kernel path.
                 u64 mp = phase_mask & ~0x40000
@@ -1865,9 +1875,11 @@ fn qwen3_forward_layer_gpu(u64 d_x_in, u64 d_x_out,
                     if d_k_gamma == 0 { return 1 }
 
                     // Refresh cos/sin tables when pos has advanced (same
-                    // logic as the per-op gpu attn path).
+                    // logic as the per-op gpu attn path).  Slice 5.8:
+                    // theta now sourced from qwen3_set_rope_base() — Qwen3
+                    // calls it with 1e6, Llama-3.2 calls it with 5e5.
                     if _gpuq_rope_cache_pos != pos {
-                        f64 theta = 1000000.0
+                        f64 theta = int_to_f64(qwen3_rope_theta_int)
                         qwen3_rope_compute(_gpuq_d_rope_cos_h, _gpuq_d_rope_sin_h, pos, hd, theta)
                         _gpuq_rope_cache_pos = pos
                     }
@@ -1892,7 +1904,12 @@ fn qwen3_forward_layer_gpu(u64 d_x_in, u64 d_x_out,
                         // Fall through to per-op path below.
                     } else {
                         u64 max_phase = 7
-                        if gpu_qwen3_layer_megakernel_to_dev(
+                        // Slice 5.8: arch-dispatch the launcher.  Both .co's
+                        // share the 24-arg kernarg layout (the Llama .co
+                        // ignores q_norm_g/k_norm_g since USE_QKNORM=0).
+                        u64 mk_rc = 1
+                        if hidden == 1024 {
+                            mk_rc = gpu_qwen3_layer_megakernel_to_dev(
                                 d_x_in, d_x_out,
                                 d_qkv_w, d_o_w, d_gate_up_w, d_down_w,
                                 d_in_gamma, d_post_gamma, d_q_gamma, d_k_gamma,
@@ -1904,7 +1921,24 @@ fn qwen3_forward_layer_gpu(u64 d_x_in, u64 d_x_out,
                                 _gpuq_d_megak_b_x_norm_g, _gpuq_d_megak_b_qkv_g,
                                 _gpuq_d_megak_b_attn_q_g, _gpuq_d_megak_b_mid_g,
                                 _gpuq_d_megak_b_mid_norm_g, _gpuq_d_megak_b_attn_out_g,
-                                max_phase) != 0 {
+                                max_phase)
+                        }
+                        if hidden == 2048 {
+                            mk_rc = gpu_llama_layer_megakernel_to_dev(
+                                d_x_in, d_x_out,
+                                d_qkv_w, d_o_w, d_gate_up_w, d_down_w,
+                                d_in_gamma, d_post_gamma, d_q_gamma, d_k_gamma,
+                                _gpuq_d_rope_cos, _gpuq_d_rope_sin,
+                                d_kc_layer, d_vc_layer,
+                                pos,
+                                _gpuq_d_megak_barrier_ctr, _gpuq_d_megak_barrier_h,
+                                _gpuq_d_megak_gu_scratch,
+                                _gpuq_d_megak_b_x_norm_g, _gpuq_d_megak_b_qkv_g,
+                                _gpuq_d_megak_b_attn_q_g, _gpuq_d_megak_b_mid_g,
+                                _gpuq_d_megak_b_mid_norm_g, _gpuq_d_megak_b_attn_out_g,
+                                max_phase)
+                        }
+                        if mk_rc != 0 {
                             return 1
                         }
                         // Honour the same per-layer flush throttle as
