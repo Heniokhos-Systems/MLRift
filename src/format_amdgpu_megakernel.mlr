@@ -2513,9 +2513,12 @@ fn _emit_phase5_qkv_split_qknorm_rope_inline() {
     asm_s_load_b64_off(3, 0, 0x60)
     asm_s_waitcnt_lgkmcnt_zero()
 
-    // kv_head = s15 - 16; s_sub_u32 s13, s15, 16
-    // SOP2 op 1 (s_sub): word = (2<<30)|(1<<23)|(0x0D<<16)|(0xFF<<8)|0x0F = 0x808DFF0F, lit=16
-    asm_u32(0x808DFF0F); asm_u32(16)
+    // kv_head = s15 - N_HEADS; s_sub_u32 s13, s15, MEGA_N_HEADS
+    // SOP2 op 1 (s_sub): word = (2<<30)|(1<<23)|(0x0D<<16)|(0xFF<<8)|0x0F = 0x808DFF0F, lit=N_HEADS
+    // Slice 5.9: literal hard-coded as 16 (Qwen3 N_HEADS) was wrong for
+    // Llama (N_HEADS=32) — kv_head was off by 16, K rotation read+wrote
+    // garbage offsets, mega_barrier never reconciled.
+    asm_u32(0x808DFF0F); asm_u32(MEGA_N_HEADS & 0xFFFFFFFF)
 
     // src offset = Q_DIM*4 + kv_head*HEAD_DIM*4 = q_dim_bytes + kv_head*(1<<head_off_shift)
     // s14 = kv_head * HEAD_DIM*4 = s13 << head_off_shift.
@@ -2674,8 +2677,13 @@ fn _emit_phase5_qkv_split_qknorm_rope_inline() {
     asm_s_load_b64_off(3, 0, 0x68)
     asm_s_waitcnt_lgkmcnt_zero()
 
-    // v_head = s15 - 24; s_sub_u32 s13, s15, 24
-    asm_u32(0x808DFF0F); asm_u32(24)
+    // v_head = s15 - (N_HEADS+N_KV_HEADS) = s15 - k_boundary
+    // s_sub_u32 s13, s15, k_boundary  (lit32)
+    // Slice 5.9: literal hard-coded as 24 (Qwen3 N_HEADS+N_KV_HEADS = 16+8)
+    // was wrong for Llama (32+8 = 40); v_head was off by 16 → V rotation
+    // wrote KV cache at the wrong offsets and the cross-WG barrier
+    // never reconciled.
+    asm_u32(0x808DFF0F); asm_u32(k_boundary & 0xFFFFFFFF)
 
     // src offset = v_src_base_off + v_head*HEAD_DIM*4
     // s14 = v_head * HEAD_DIM*4 = s13 << head_off_shift; sdst=14, ssrc0=13.
@@ -3332,6 +3340,7 @@ fn _emit_phase7_attn_decode_coop_inline() {
     uint64 q_to_kv_shift      = _arch_log2_pow2(MEGA_N_HEADS / MEGA_N_KV_HEADS) // GQA ratio
     uint64 out_per_wg_bytes_shift = _arch_log2_pow2(MEGA_HEAD_DIM)            // = log2(OUT_PER_WG*4) = log2(HEAD_DIM)
     uint64 kv_off_shift       = _arch_log2_pow2(MEGA_N_KV_HEADS * MEGA_HEAD_DIM * 4)  // log2(KV_DIM*4)
+    uint64 kv_dim_bytes_p7    = MEGA_N_KV_HEADS * MEGA_HEAD_DIM * 4                  // bytes per KV slot (slice 5.9)
     uint64 outer_cap          = MEGA_N_HEADS * 4    // ATTN_COOP=4 invariant
     uint64 chunk_count        = MEGA_HEAD_DIM / 4   // inner-dot chunk count
     uint64 inv_sqrt_head_bits = _arch_inv_sqrt_pow2_f32_bits(MEGA_HEAD_DIM)
@@ -3737,22 +3746,18 @@ fn _emit_phase7_attn_decode_coop_inline() {
     // ── acc += w * v_val  (v_fmac_f32 v24, v22, v20) ────────────────────
     asm_v_fmac_f32_e32_vv(24, 22, 20)
 
-    // ── Advance v[7:8] by KV_DIM*4 = 4096 bytes ──────────────────────────
+    // ── Advance v[7:8] by KV_DIM*4 bytes ─────────────────────────────────
+    // Slice 5.9: was hard-coded 4096 (Qwen3 KV_DIM=1024); Llama
+    // KV_DIM=512 → KV_DIM*4=2048.  Use parametric kv_dim_bytes_p7.
     // v_add_co_u32 v7, vcc_lo, lit, v7  (VOP3B op 0x100, src0=lit32, src1=v7)
-    //   word1 = 0xD7006A07
-    //   word2 = ((0x100|7) << 9) | 0xFF = 0x00020EFF
-    //   lit   = 4096 (KV_DIM * 4)
     asm_u32(0xD7006A07)
     asm_u32(0x00020EFF)
-    asm_u32(4096)
+    asm_u32(kv_dim_bytes_p7 & 0xFFFFFFFF)
     // v_add_co_ci_u32_e64 v8, null, 0, v8, vcc_lo
-    //   word1 = 0xD5207C08, word2 = (0x6A<<18)|((0x100|8)<<9)|0x80
-    //         = 0x01A80000 | (0x108<<9) | 0x80 = 0x01A80000 | 0x21000 | 0x80 = 0x01AA1080
     asm_u32(0xD5207C08)
     asm_u32(0x01AA1080)
 
     // ── s_add_u32 s25, s25, 1 ────────────────────────────────────────────
-    // word = 0x80000000|(0x19<<16)|(0x81<<8)|0x19 = 0x80198119
     asm_u32(0x80198119)
 
     // s_branch back to pass3_top
@@ -3764,18 +3769,9 @@ fn _emit_phase7_attn_decode_coop_inline() {
     asm_patch_u32(pass3_exit_pos, 0xBFA20000 | ((pass3_end - pass3_exit_pos - 1) & 0xFFFF))
 
     // ── Store acc to out_ptr per-lane ────────────────────────────────────
-    // Copy out-ptr-hi (v26) → v22 to form the v[21:22] pair for the store.
-    // (v22 was clobbered in the pass-3 inner loop by the LDS w-load + mul.)
-    // v_mov_b32_e32 v22, v26 (VOP1 op 1, vsrc=v26): word = (0x3F<<25)|(22<<17)|(1<<9)|(0x100|26)
-    //   = 0x7E000000|0x002C0000|0x00000200|0x11A = 0x7E2C031A
     asm_u32(0x7E2C031A)
-    // VALU→VMEM hazard: VOP1 v_mov_b32 → v22 then global_store reads v[21:22].
-    // gfx11 requires s_delay_alu between the producer and the VMEM consumer
-    // for the dest VGPR. Without it the store may read a stale v22, sending
-    // the store to a wild address (silently dropped by the GPU MMU).
     asm_s_delay_alu(0x01)
     // global_store_b32 v[21:22], v24, off
-    //   word1 = 0xDC6A0000, word2 = (0x7C<<16)|(vdata<<8)|vaddr_lo = (0x7C<<16)|(24<<8)|21 = 0x007C1815
     asm_u32(0xDC6A0000)
     asm_u32(0x007C1815)
 

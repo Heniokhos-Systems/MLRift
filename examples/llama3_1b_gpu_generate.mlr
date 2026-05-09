@@ -290,12 +290,19 @@ fn main() {
     eout("[llama32_1b_gpu] 16 layers indexed + dequantised; load_ms=")
     eu64(load_elapsed_ns / 1000000); eout("\n")
 
-    // KV cache + scratch buffers (host — CPU attn path consumes this).
+    // KV cache + scratch buffers.  At slice 5.9, when MLRIFT_NATIVE_MEGAKERNEL
+    // is requested, we allocate the KV cache as device-resident GTT so the
+    // mega-kernel can read/write it without H2D/D2H staging.  The host
+    // pointer (dev_host_ptr) is wired into k_cache/v_cache below so the
+    // per-op CPU fallback path keeps reading the right bytes (mega-kernel
+    // writes are GPU-coherent through GTT mapping).
     u64 kv_row_bytes = kv_dim * 4
     u64 layer_stride = max_seq * kv_row_bytes
     u64 total_cache  = n_layers * layer_stride
-    u64 k_cache = alloc(total_cache)
-    u64 v_cache = alloc(total_cache)
+    u64 k_cache_dev  = 0
+    u64 v_cache_dev  = 0
+    u64 k_cache = 0
+    u64 v_cache = 0
 
     u64 x_cur     = alloc(hidden * 4)
     u64 x_nxt     = alloc(hidden * 4)
@@ -318,12 +325,11 @@ fn main() {
 
     eout("[llama32_1b_gpu] prompt=[128000, 15339] (\"<|begin_of_text|>hello\")\n")
 
-    // Slice 5.8 — MLRIFT_NATIVE_MEGAKERNEL=1|2 plumbing.  Detects the env
-    // var, probes the Llama mega-kernel readiness, and toggles
-    // _native_mk_use accordingly.  The per-layer call dispatches on this
-    // flag inside both prefill and decode loops below.  Slice 5.9 will
-    // replace the placeholder mega-kernel branch with a device-resident
-    // KV + qwen3_forward_layer_gpu(...) chain; this slice is plumbing-only.
+    // Slice 5.9 — MLRIFT_NATIVE_MEGAKERNEL=1|2 wiring.  Detects the env var,
+    // probes the Llama mega-kernel readiness, allocates device-resident KV
+    // cache + ping-pong residual buffers, and dispatches the mega-kernel
+    // per layer.  When unset, the path stays bit-identical to the CPU
+    // bf16 reference (k_cache/v_cache via host alloc, qwen3_forward_layer).
     u64 _native_mk_env = getenv("MLRIFT_NATIVE_MEGAKERNEL")
     u64 _native_mk_use = 0
     if _native_mk_env != 0 {
@@ -331,19 +337,122 @@ fn main() {
         if _nmc == 49 { _native_mk_use = 1 }   // '1'
         if _nmc == 50 { _native_mk_use = 1 }   // '2'
     }
+    // Mega-kernel device-resident state (slice 5.9).  All allocations
+    // happen below when _native_mk_use != 0; otherwise stay 0.
+    u64 d_x_A     = 0    // ping-pong residual A (device, host-mapped)
+    u64 d_x_B     = 0    // ping-pong residual B
+    u64 d_x_A_h   = 0    // host-mapped pointer to d_x_A
+    u64 d_x_B_h   = 0    // host-mapped pointer to d_x_B
     if _native_mk_use != 0 {
         if gpu_llama_megakernel_ready() == 0 {
             eout("[llama32_1b_gpu] MLRIFT_NATIVE_MEGAKERNEL set but llama_layer_megakernel_v2.co not loaded; falling back to per-op CPU bf16\n")
             _native_mk_use = 0
         } else {
-            eout("[llama32_1b_gpu] mega-kernel path active (plumbing only at slice 5.8 — per-layer call not yet wired; see slice 5.9)\n")
-            // Slice 5.8: until the device-resident KV cache + GPU input/output
-            // staging is wired (slice 5.9), the per-layer mega-kernel branch
-            // would have nothing to dispatch into.  Force the CPU bf16 path
-            // for this slice so the driver still produces correct tokens.
-            // Slice 5.9 will flip this back on with the real wiring.
-            _native_mk_use = 0
+            // Trigger HIP/KFD shim init (also done above as the dummy
+            // hipMalloc, but redundant calls are cheap).  After this,
+            // gpu_pipeline_ready() returns 1 so dev_try_alloc_host_visible
+            // can succeed.
+            u64 _force_init = gpu_matmul_enabled()
+            if gpu_pipeline_ready() == 0 {
+                eout("[llama32_1b_gpu] gpu_pipeline_ready returned 0; falling back to CPU bf16\n")
+                _native_mk_use = 0
+            } else {
+                k_cache_dev = dev_try_alloc_host_visible(total_cache)
+                v_cache_dev = dev_try_alloc_host_visible(total_cache)
+                if k_cache_dev == 0 || v_cache_dev == 0 {
+                    eout("[llama32_1b_gpu] dev_try_alloc_host_visible(KV cache) FAILED; falling back to CPU bf16\n")
+                    _native_mk_use = 0
+                } else {
+                    k_cache = dev_host_ptr(k_cache_dev)
+                    v_cache = dev_host_ptr(v_cache_dev)
+                    // Tell the qwen3 GPU layer about the device-resident
+                    // KV slabs.  layer_stride = max_seq * kv_row_bytes
+                    // (= per-layer slab size in bytes); batch_size = 1.
+                    qwen3_gpu_set_kv_cache_dev(k_cache_dev, v_cache_dev, layer_stride, 1)
+                    qwen3_gpu_set_batch_size(1)
+
+                    // Ping-pong residual carry buffers (one HIDDEN-element
+                    // f32 each, host-visible GTT so D2H reads after the
+                    // last layer come for free).
+                    d_x_A = dev_try_alloc_host_visible(hidden * 4)
+                    d_x_B = dev_try_alloc_host_visible(hidden * 4)
+                    if d_x_A == 0 || d_x_B == 0 {
+                        eout("[llama32_1b_gpu] dev_try_alloc_host_visible(d_x ping-pong) FAILED; falling back to CPU bf16\n")
+                        _native_mk_use = 0
+                    } else {
+                        d_x_A_h = dev_host_ptr(d_x_A)
+                        d_x_B_h = dev_host_ptr(d_x_B)
+                        // Zero the KV cache slabs (mega-kernel reads K/V
+                        // at every position 0..pos for attention).  GTT
+                        // mapping is CPU-coherent so a host memset is
+                        // visible to the GPU.
+                        u64 zi = 0
+                        while zi < total_cache {
+                            unsafe { *((k_cache + zi) as u8) = 0 }
+                            unsafe { *((v_cache + zi) as u8) = 0 }
+                            zi = zi + 1
+                        }
+                        eout("[llama32_1b_gpu] mega-kernel path ENABLED: KV cache + ping-pong residuals device-resident (")
+                        eu64(total_cache * 2 + hidden * 8); eout(" bytes total)\n")
+
+                        // The Llama mega-kernel reads ONE fused QKV bf16
+                        // matrix [qkv_dim, hidden] and ONE fused gate_up
+                        // bf16 matrix [2*ff, hidden] — same kernarg layout
+                        // as the Qwen3 mega-kernel.  Pre-stack the per-tensor
+                        // GGUF weights here (only when mega-kernel path is
+                        // active; the legacy CPU bf16 path uses unfused
+                        // matmuls and would mis-read the stacked layout).
+                        u64 qkv_dim_elems = q_dim + 2 * kv_dim
+                        u64 qkv_row_bytes = hidden * 2
+                        u64 q_bytes_l     = q_dim  * qkv_row_bytes
+                        u64 kv_bytes_l    = kv_dim * qkv_row_bytes
+                        u64 stacked_bytes = qkv_dim_elems * qkv_row_bytes
+                        u64 gu_dim_elems  = 2 * ff
+                        u64 gate_bytes_l  = ff * qkv_row_bytes
+                        u64 gu_stacked_bytes = gu_dim_elems * qkv_row_bytes
+                        eout("[llama32_1b_gpu] fusing QKV + gate/up bf16 weights (")
+                        eu64((stacked_bytes + gu_stacked_bytes) * n_layers); eout(" bytes total)\n")
+                        u64 lf = 0
+                        while lf < n_layers {
+                            u64 base_lf = layers_arr + lf * 88
+                            u64 qp_lf = 0; unsafe { *((base_lf + 1 * 8) as u64) -> qp_lf }
+                            u64 kp_lf = 0; unsafe { *((base_lf + 2 * 8) as u64) -> kp_lf }
+                            u64 vp_lf = 0; unsafe { *((base_lf + 3 * 8) as u64) -> vp_lf }
+                            u64 qkv_stacked = alloc(stacked_bytes)
+                            memcpy(qkv_stacked,                          qp_lf, q_bytes_l)
+                            memcpy(qkv_stacked + q_bytes_l,              kp_lf, kv_bytes_l)
+                            memcpy(qkv_stacked + q_bytes_l + kv_bytes_l, vp_lf, kv_bytes_l)
+                            unsafe { *((base_lf + 1 * 8) as u64) = qkv_stacked }
+
+                            u64 gpw_lf = 0; unsafe { *((base_lf + 8 * 8) as u64) -> gpw_lf }
+                            u64 upw_lf = 0; unsafe { *((base_lf + 9 * 8) as u64) -> upw_lf }
+                            u64 gu_stacked = alloc(gu_stacked_bytes)
+                            memcpy(gu_stacked,                gpw_lf, gate_bytes_l)
+                            memcpy(gu_stacked + gate_bytes_l, upw_lf, gate_bytes_l)
+                            unsafe { *((base_lf + 8 * 8) as u64) = gu_stacked }
+                            lf = lf + 1
+                        }
+                        // qwen3_forward_layer_gpu's mega-kernel branch
+                        // expects the stacked layout via gpu_get_or_upload_
+                        // bf16_weight_padded(w.q_proj_w, hidden, qkv_dim, ...);
+                        // matches what we just wrote.  Flip qwen3_fuse_qkv
+                        // so the per-op fallback path (would only fire if
+                        // pos >= 64; never in this driver's max_new=20
+                        // run) reads the same stacked layout.
+                        qwen3_set_fuse_qkv(1)
+                    }
+                }
+            }
         }
+    }
+    // If the mega-kernel path is OFF (env unset, or any setup failure
+    // above), fall back to host-only KV cache so the CPU bf16 chain
+    // produces bit-identical tokens to the legacy reference run.
+    if k_cache == 0 {
+        k_cache = alloc(total_cache)
+        v_cache = alloc(total_cache)
+        eout("[llama32_1b_gpu] KV cache on host (")
+        eu64(total_cache * 2); eout(" bytes total)\n")
     }
 
     // Smoke-test the GPU matmul on a single layer-0 q-proj BEFORE the
@@ -366,29 +475,53 @@ fn main() {
     // Prefill: every prompt token but the last needs a forward pass to
     // populate K/V at its position.  Last prompt token's forward becomes
     // step 0 of the decode loop (its logits feed the first argmax).
+    //
+    // Slice 5.9: when _native_mk_use != 0, each layer dispatches the
+    // mega-kernel via qwen3_forward_layer_gpu (arch-dispatched on
+    // hidden=2048 → gpu_llama_layer_megakernel_to_dev).  Per-token H2D
+    // upload of the new embedding into d_x_cur, ping-pong d_x_cur ↔
+    // d_x_nxt across layers, D2H back into host x_cur for the lm_head.
     u64 pos = 0
     u64 prefill_start_ns = time_now()
+    // Per-step ping-pong of the device residual: d_x_cur is the input
+    // to the next layer, d_x_nxt is the output buffer.  Both stay
+    // device-resident across all 16 layers; only the host x_cur copy
+    // happens at the start (embedding upload) and end (D2H for lm_head).
+    u64 d_x_cur = d_x_A
+    u64 d_x_nxt = d_x_B
+    u64 d_x_cur_h = d_x_A_h
+    u64 d_x_nxt_h = d_x_B_h
     while pos + 1 < prompt_count {
         u32 pt32 = 0
         unsafe { *((seq_ids32 + pos * 4) as uint32) -> pt32 }
         u64 pt = pt32
         gguf_deq_q8_0(x_cur, embed_base + pt * row_bytes, hidden)
+        if _native_mk_use != 0 {
+            // H2D upload of the freshly-embedded token.  d_x_cur_h is
+            // GTT-mapped, so a plain memcpy is GPU-coherent on the next
+            // dispatch read.
+            memcpy(d_x_cur_h, x_cur, hidden * 4)
+        }
         u64 layer = 0
         while layer < n_layers {
             Qwen3LayerWeights w = layers_arr + layer * 88
             u64 kc = k_cache + layer * layer_stride
             u64 vc = v_cache + layer * layer_stride
             if _native_mk_use != 0 {
-                // Slice 5.9 will populate this branch with the real
-                // device-resident mega-kernel call.  Currently unreachable
-                // (forced off above at slice 5.8 plumbing).
-                qwen3_forward_layer(x_nxt, x_cur, w, pos, kc, vc, num_workers)
+                if qwen3_forward_layer_gpu(d_x_cur, d_x_nxt, w, pos, kc, vc, num_workers, 0, 0xFF) != 0 {
+                    eout("[llama32_1b_gpu] qwen3_forward_layer_gpu(mega-kernel) FAILED at prefill pos=")
+                    eu64(pos); eout(" layer="); eu64(layer); eout("\n")
+                    exit(1)
+                }
+                // Ping-pong device pointers.
+                u64 dtmp = d_x_cur; d_x_cur = d_x_nxt; d_x_nxt = dtmp
+                u64 dhtmp = d_x_cur_h; d_x_cur_h = d_x_nxt_h; d_x_nxt_h = dhtmp
             } else {
                 qwen3_forward_layer(x_nxt, x_cur, w, pos, kc, vc, num_workers)
+                u64 tmp = x_cur
+                x_cur = x_nxt
+                x_nxt = tmp
             }
-            u64 tmp = x_cur
-            x_cur = x_nxt
-            x_nxt = tmp
             layer = layer + 1
         }
         pos = pos + 1
@@ -409,23 +542,43 @@ fn main() {
         u64 step_start_ns = time_now()
         eout("step "); eu64(step); eout(" pos="); eu64(pos); eout("\n")
 
+        // Slice 5.9: when mega-kernel is active, upload the current host
+        // residual (the just-embedded token) to d_x_cur for the layer
+        // sweep.  After the sweep, D2H back to host x_cur for lm_head.
+        if _native_mk_use != 0 {
+            memcpy(d_x_cur_h, x_cur, hidden * 4)
+        }
+
         u64 layer = 0
         while layer < n_layers {
             Qwen3LayerWeights w = layers_arr + layer * 88
             u64 kc = k_cache + layer * layer_stride
             u64 vc = v_cache + layer * layer_stride
             if _native_mk_use != 0 {
-                // Slice 5.9 will populate this branch with the real
-                // device-resident mega-kernel call.  Currently unreachable
-                // (forced off above at slice 5.8 plumbing).
-                qwen3_forward_layer(x_nxt, x_cur, w, pos, kc, vc, num_workers)
+                if qwen3_forward_layer_gpu(d_x_cur, d_x_nxt, w, pos, kc, vc, num_workers, 0, 0xFF) != 0 {
+                    eout("[llama32_1b_gpu] qwen3_forward_layer_gpu(mega-kernel) FAILED at decode step=")
+                    eu64(step); eout(" pos="); eu64(pos); eout(" layer="); eu64(layer); eout("\n")
+                    exit(1)
+                }
+                u64 dtmp = d_x_cur; d_x_cur = d_x_nxt; d_x_nxt = dtmp
+                u64 dhtmp = d_x_cur_h; d_x_cur_h = d_x_nxt_h; d_x_nxt_h = dhtmp
             } else {
                 qwen3_forward_layer(x_nxt, x_cur, w, pos, kc, vc, num_workers)
+                u64 tmp = x_cur
+                x_cur = x_nxt
+                x_nxt = tmp
             }
-            u64 tmp = x_cur
-            x_cur = x_nxt
-            x_nxt = tmp
             layer = layer + 1
+        }
+
+        // After the layer sweep, the final residual lives in d_x_cur
+        // (mega-kernel path) or x_cur (CPU path).  D2H copy via the
+        // GTT host-mapped pointer so the lm_head reads correct bytes.
+        if _native_mk_use != 0 {
+            // qwen3_forward_layer_gpu's mega-kernel branch already
+            // gpu_pipeline_flush()'d (default flush_every_n=1), so the
+            // GPU writes to d_x_cur are visible at d_x_cur_h.
+            memcpy(x_cur, d_x_cur_h, hidden * 4)
         }
 
         // Final RMSNorm + lm_head against the tied Q8_0 embedding matrix

@@ -1828,6 +1828,16 @@ fn qwen3_forward_layer_gpu(u64 d_x_in, u64 d_x_out,
             u8 c0 = 0; unsafe { *(ev_megak as u8) -> c0 }
             if c0 != 48 { _gpuq_megak_use = 1 }
         }
+        // Slice 5.9: MLRIFT_NATIVE_MEGAKERNEL=1|2 also enables the
+        // mega-kernel dispatch path (in addition to selecting v2 .co
+        // bytes via inference_gpu.mlr).  This lets the Llama-3.2-1B
+        // driver activate the mega-kernel through a single env var,
+        // without requiring users to also set MLRIFT_QWEN3_MEGAKERNEL.
+        u64 ev_native_megak = getenv("MLRIFT_NATIVE_MEGAKERNEL")
+        if ev_native_megak != 0 {
+            u8 c0n = 0; unsafe { *(ev_native_megak as u8) -> c0n }
+            if c0n != 48 { _gpuq_megak_use = 1 }
+        }
     }
     // Slice 5.8: arch-dispatch the mega-kernel handle.
     //   hidden=1024 → qwen3-0.6B .co (gpu_fh_qwen3_megakernel)
@@ -1852,27 +1862,49 @@ fn qwen3_forward_layer_gpu(u64 d_x_in, u64 d_x_out,
                     // bf16 weights directly (no f32 dequant variant),
                     // so we always go through the bf16 cache.
                     // Slice 4.13: padded-row uploads to break GDDR6 channel
-                    // binding.  HIDDEN_PAD=1152, Q_DIM_PAD=2176, FF_PAD=3200
-                    // — each pad chosen so row_bytes mod 4096 != 0 (16ch ×
-                    // 256B channel cycle), distributing rows across all 16
-                    // channels instead of the 1-2 channels naive layout hits.
-                    u64 d_qkv_w     = gpu_get_or_upload_bf16_weight_padded(w.q_proj_w,    hidden, qkv_dim, 1152)
+                    // binding — each pad chosen so row_bytes mod 4096 != 0
+                    // (16ch × 256B channel cycle), distributing rows across
+                    // all 16 channels instead of the 1-2 channels naive
+                    // layout hits.
+                    // Slice 5.9: HIDDEN_PAD = K + 128 derives the per-arch
+                    // padded stride (Qwen3 K∈{1024,3072} → {1152,3200};
+                    // Llama K∈{2048,8192} → {2176,8320}).  Mega-kernel .co
+                    // emits the matching K_pad literal at recognize time
+                    // via the slice 5.0-5.6 arch-globals path.
+                    u64 hidden_pad = hidden + 128
+                    u64 q_dim_pad  = q_dim  + 128
+                    u64 ff_pad     = ff     + 128
+                    u64 d_qkv_w     = gpu_get_or_upload_bf16_weight_padded(w.q_proj_w,    hidden, qkv_dim, hidden_pad)
                     if d_qkv_w == 0 { return 1 }
-                    u64 d_o_w       = gpu_get_or_upload_bf16_weight_padded(w.o_proj_w,    q_dim,  hidden,  2176)
+                    u64 d_o_w       = gpu_get_or_upload_bf16_weight_padded(w.o_proj_w,    q_dim,  hidden,  q_dim_pad)
                     if d_o_w == 0 { return 1 }
-                    u64 d_gate_up_w = gpu_get_or_upload_bf16_weight_padded(w.gate_proj_w, hidden, 2 * ff,  1152)
+                    u64 d_gate_up_w = gpu_get_or_upload_bf16_weight_padded(w.gate_proj_w, hidden, 2 * ff,  hidden_pad)
                     if d_gate_up_w == 0 { return 1 }
-                    u64 d_down_w    = gpu_get_or_upload_bf16_weight_padded(w.down_proj_w, ff,     hidden,  3200)
+                    u64 d_down_w    = gpu_get_or_upload_bf16_weight_padded(w.down_proj_w, ff,     hidden,  ff_pad)
                     if d_down_w == 0 { return 1 }
 
                     u64 d_in_gamma   = gpu_cache_bf16_as_f32(w.input_norm_w, hidden)
                     if d_in_gamma == 0 { return 1 }
                     u64 d_post_gamma = gpu_cache_bf16_as_f32(w.post_norm_w,  hidden)
                     if d_post_gamma == 0 { return 1 }
-                    u64 d_q_gamma    = gpu_cache_bf16_as_f32(w.q_norm_w,     hd)
-                    if d_q_gamma == 0 { return 1 }
-                    u64 d_k_gamma    = gpu_cache_bf16_as_f32(w.k_norm_w,     hd)
-                    if d_k_gamma == 0 { return 1 }
+                    // Slice 5.9: qknorm gammas are arch-optional.  Llama's
+                    // mega-kernel was emitted with MEGA_USE_QKNORM=0, so
+                    // phase 5 ignores these kernarg slots entirely.  Pass
+                    // device-null when the host weight is missing (q_norm_w
+                    // / k_norm_w stored as 0 in Qwen3LayerWeights for arches
+                    // without per-head qknorm) — uploading via
+                    // gpu_cache_bf16_as_f32(0, ...) would segfault inside
+                    // hipMemcpy(... src=0 ...).
+                    u64 d_q_gamma = 0
+                    u64 d_k_gamma = 0
+                    if w.q_norm_w != 0 {
+                        d_q_gamma = gpu_cache_bf16_as_f32(w.q_norm_w, hd)
+                        if d_q_gamma == 0 { return 1 }
+                    }
+                    if w.k_norm_w != 0 {
+                        d_k_gamma = gpu_cache_bf16_as_f32(w.k_norm_w, hd)
+                        if d_k_gamma == 0 { return 1 }
+                    }
 
                     // Refresh cos/sin tables when pos has advanced (same
                     // logic as the per-op gpu attn path).  Slice 5.8:
@@ -1904,6 +1936,17 @@ fn qwen3_forward_layer_gpu(u64 d_x_in, u64 d_x_out,
                         // Fall through to per-op path below.
                     } else {
                         u64 max_phase = 7
+                        // Slice 5.9: MLRIFT_MEGAK_MAX_PHASE=0..7 lowers
+                        // the max_phase the kernel runs (0 = phase 1 only,
+                        // 7 = full layer).  Used for bisecting kernel hangs
+                        // during Llama bringup.  Default 7.
+                        u64 ev_mp = getenv("MLRIFT_MEGAK_MAX_PHASE")
+                        if ev_mp != 0 {
+                            u8 mp_c0 = 0; unsafe { *(ev_mp as u8) -> mp_c0 }
+                            if mp_c0 >= 48 && mp_c0 <= 55 {
+                                max_phase = mp_c0 - 48
+                            }
+                        }
                         // Slice 5.8: arch-dispatch the launcher.  Both .co's
                         // share the 24-arg kernarg layout (the Llama .co
                         // ignores q_norm_g/k_norm_g since USE_QKNORM=0).
