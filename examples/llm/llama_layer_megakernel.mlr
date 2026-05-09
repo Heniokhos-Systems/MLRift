@@ -1,0 +1,213 @@
+// llama-3.2-1B layer mega-kernel as a MLRift @kernel.
+//
+// This file is the MLRift-side declaration of the 24-arg kernel.  Body
+// shape: 9 phases + 8 mega_barrier calls, each phase wrapped in
+// `if (wg_id ...)` so the AST walker can dispatch each block to a
+// phase-shape sub-recognizer.
+//
+// Llama-3.2-1B shapes (vs Qwen3-0.6B):
+//   hidden = 2048, head_dim = 64, n_heads = 32, n_kv_heads = 8 (GQA 4:1),
+//   ff = 8192, rmsnorm eps = 1e-5.
+//   QKNorm DISABLED (no per-head Q/K rmsnorm — phase 5 is split + RoPE only).
+//   RoPE: NORM consecutive-pair layout (not Qwen3's NEOX half-split),
+//         theta = 500000, rope_freqs.weight scaling pre-baked CPU-side
+//         into the cos/sin tables.
+//
+// The AMDGPU recognizer (recognize_megakernel_swiglu_dense_gqa in
+// src/format_amdgpu_megakernel.mlr) walks this structure and emits
+// gfx1100 ISA for all 9 phases.  Slice 5.0 dispatches arch params via
+// the kernel-name prefix:
+//   "qwen3_layer_megakernel..." -> mega_set_arch_qwen3_06b()
+//   "llama_layer_megakernel..." -> mega_set_arch_llama_1b()
+//
+// The body's `if wg_id < N` literals are CPU-side scope-shaping for the
+// recognizer's `_body_has_marker` traversal — the actual emitted ISA's
+// outer wg gate is computed from MEGA_N_HEADS / MEGA_N_KV_HEADS at emit
+// time, not from these literals.  The Llama values below match Llama
+// shapes for documentation (phase 5 < 48 = N_HEADS+2*N_KV_HEADS,
+// phase 7 < 128 = N_HEADS*4).
+//
+// WG_PERSIST = 512.
+//
+// Build the .co (slice 5.8 wires the CLI flag and exporter):
+//   ./build/mlrc --emit-amdgpu-llama-megakernel-v2=/tmp/llama_layer_megakernel_v2.co \
+//       examples/llm/llama_layer_megakernel.mlr
+
+// CPU stubs for block_idx_x / tid_local_x — the recognizer pattern-matches
+// the @kernel body via AST walk; these are never called on AMDGPU.
+fn block_idx_x() -> uint64 { return 0 }
+fn tid_local_x()  -> uint64 { return 0 }
+
+// rmsnorm_wg0_marker — CPU no-op; tells the AMDGPU recognizer that the
+// phase-1 block should emit real inline rmsnorm ISA (WG-0 gated).
+// Pattern-matched by _body_has_rmsnorm_wg0_marker in format_amdgpu_megakernel.mlr.
+fn rmsnorm_wg0_marker() { }
+
+// qkv_matmul_marker — CPU no-op; tells the AMDGPU recognizer that the
+// phase-3 block should emit real inline QKV matmul ISA (gemv_coop_bf16_f32,
+// padded-row stride, WG<256, all 256 WGs participate).
+// Pattern-matched by _body_has_qkv_matmul_marker in format_amdgpu_megakernel.mlr.
+fn qkv_matmul_marker() { }
+
+// qkv_split_qknorm_rope_marker — CPU no-op; tells the AMDGPU recognizer that
+// the phase-5 block should emit real inline QKV-split + (optional qknorm) + RoPE ISA.
+// 3-way dispatch: Q heads (wg_id<N_HEADS), K heads (next N_KV_HEADS), V heads
+// (last N_KV_HEADS).  For Llama-1B: Q wg<32, K wg<40, V wg<48.
+// QKNorm is skipped (arch flag) — for Llama this phase is split + RoPE only.
+// Pattern-matched by _body_has_qkv_split_qknorm_rope_marker in format_amdgpu_megakernel.mlr.
+fn qkv_split_qknorm_rope_marker() { }
+
+// attn_decode_coop_marker — CPU no-op; tells the AMDGPU recognizer that the
+// phase-7 block should emit real inline attn_decode-coop ISA (3-pass softmax,
+// ATTN_COOP=4 cooperative WGs per Q-head, OUT_PER_WG=HEAD_DIM/4).
+// For Llama-1B: N_HEADS*4 = 32*4 = 128, so wg<128.
+// Pattern-matched by _body_has_attn_decode_coop_marker in format_amdgpu_megakernel.mlr.
+fn attn_decode_coop_marker() { }
+
+// oproj_residual_marker — CPU no-op; tells the AMDGPU recognizer that the
+// phase-9 block should emit real inline o_proj matmul + residual-add ISA
+// (gemv_coop_bf16_f32, padded-row stride, WG<256, all 256 WGs participate).
+// Body identical to phase-3 gemv-coop-bf16-padded-strided except the lane-0
+// row-store does `out[row] = in_residual[row] + acc`.
+// Pattern-matched by _body_has_oproj_residual_marker in format_amdgpu_megakernel.mlr.
+fn oproj_residual_marker() { }
+
+// post_norm_marker — CPU no-op; tells the AMDGPU recognizer that the phase-11
+// block should emit real inline rmsnorm-wg-gated ISA (WG-0 gated).
+// Math identical to phase 1 but operates on different kernargs: in=b_mid_g
+// (arg 20), norm=post_norm_g (arg 7), out=b_mid_norm_g (arg 21).
+// Recognized inline at the dispatch site (no wrapper fn — same fn-table-cap
+// discipline as oproj_residual_marker).
+fn post_norm_marker() { }
+
+// gate_up_matmul_marker — CPU no-op; tells the AMDGPU recognizer that the
+// phase-13 block should emit real inline gate_up matmul ISA
+// (gemv_coop_bf16_f32, padded-row stride, WG<256).  Body identical to
+// phase-3 QKV matmul (shared emitter _emit_gemv_coop_bf16_padded_strided_inline)
+// except for kernarg byte offsets and n_out=2*FF.
+// Inputs: w=gate_up_w (arg 4), x=b_mid_norm_g (arg 21), out=gu_scratch (arg 16).
+// Recognized inline at the dispatch site (no wrapper fn — same fn-table-cap
+// discipline as oproj_residual_marker / post_norm_marker).
+fn gate_up_matmul_marker() { }
+
+// silu_mul_elem_strided_marker — CPU no-op; tells the AMDGPU recognizer that
+// the phase-15 block should emit real inline SiLU(gate)*up ISA, in-place over
+// the first FF floats of gu_scratch.  Math:
+//   for idx in [0..FF): g = gu_scratch[idx]; u = gu_scratch[FF+idx];
+//                       gu_scratch[idx] = (g / (1+exp(-g))) * u
+// Distributed across 256*32 = 8192 lane-slots; lanes with idx>=FF gate-skip
+// via v_cmp_lt + s_and_saveexec_b32 s17.  ELEMS_PER_WG = ceil(FF/8192).
+// Recognized inline at the dispatch site (no wrapper fn — same fn-table-cap
+// discipline as oproj_residual_marker / post_norm_marker / gate_up_matmul_marker).
+fn silu_mul_elem_strided_marker() { }
+
+// down_residual_marker — CPU no-op; tells the AMDGPU recognizer that the
+// phase-17 block should emit real inline down_w matmul + final residual-add
+// ISA (gemv_coop_bf16_f32, padded-row, WG<256).  Body identical to phase-9
+// (shared emitter _emit_phase9_gemv_residual_inline) except shape constants
+// + kernarg offsets:
+//   weight = down_w (kernarg 5, byte 0x28),
+//   x      = gu_scratch (kernarg 16, byte 0x80),
+//   res    = b_mid_g (kernarg 20, byte 0xA0),
+//   out    = out_residual (kernarg 1, byte 0x08).
+// Phase 17 is the LAST phase — no trailing mega_barrier in the body walker.
+// Recognized inline at the dispatch site (no wrapper fn — same fn-table-cap
+// discipline as the other phase markers).
+fn down_residual_marker() { }
+
+// mega_barrier is a 3-arg void intrinsic (registered in the parser's
+// builtin table — see src/analysis.mlr is_builtin / builtin_arg_count).
+// Lowered by the AMDGPU emitter to the validated cross-WG barrier ISA
+// sequence (global_atomic_add_u32 + spin-loop, ~31 dwords per barrier).
+// On CPU (non-AMDGPU targets) the call is a no-op — the kernel body is
+// never compiled for CPU execution.
+@kernel
+fn llama_layer_megakernel(
+    uint64 in_residual,        //  0
+    uint64 out_residual,       //  1
+    uint64 qkv_w,              //  2
+    uint64 o_w,                //  3
+    uint64 gate_up_w,          //  4
+    uint64 down_w,             //  5
+    uint64 in_norm_g,          //  6
+    uint64 post_norm_g,        //  7
+    uint64 q_norm_g,           //  8
+    uint64 k_norm_g,           //  9
+    uint64 rope_cos,           // 10
+    uint64 rope_sin,           // 11
+    uint64 kc_layer,           // 12
+    uint64 vc_layer,           // 13
+    uint64 pos,                // 14  (by_value u64)
+    uint64 barrier_counter,    // 15
+    uint64 gu_scratch,         // 16
+    uint64 b_x_norm_g,         // 17
+    uint64 b_qkv_g,            // 18
+    uint64 b_attn_q_g,         // 19
+    uint64 b_mid_g,            // 20
+    uint64 b_mid_norm_g,       // 21
+    uint64 b_attn_out_g,       // 22
+    uint64 max_phase           // 23  (by_value u64)
+) {
+    // Llama-3.2-1B variant: 9 stub phases + 8 cross-WG barriers + max_phase guards.
+    // Body shape matches Qwen3 mega-kernel exactly; only the wg-bounds literals
+    // on phases 5 and 7 change to reflect Llama shapes (32 Q heads + 8 KV heads,
+    // ATTN_COOP=4).  WG_PERSIST=512.
+
+    uint64 wg_id = block_idx_x()
+    uint64 lane  = tid_local_x()
+
+    if wg_id == 0 {
+        rmsnorm_wg0_marker()       // phase 1: input rmsnorm (WG-0 gated)
+    }
+    mega_barrier(barrier_counter, 0, 512)
+    if max_phase < 1 { return }
+
+    if wg_id < 256 {
+        qkv_matmul_marker()        // phase 3: QKV matmul (gemv_coop_bf16_f32, padded-row, WG<256)
+    }
+    mega_barrier(barrier_counter, 1, 512)
+    if max_phase < 2 { return }
+
+    if wg_id < 48 {
+        qkv_split_qknorm_rope_marker()   // phase 5: QKV split + RoPE (3-way head dispatch, wg<N_HEADS+2*N_KV_HEADS=48)
+    }
+    mega_barrier(barrier_counter, 2, 512)
+    if max_phase < 3 { return }
+
+    if wg_id < 128 {
+        attn_decode_coop_marker()  // phase 7: attn_decode-coop (ATTN_COOP=4, wg<N_HEADS*4=128)
+    }
+    mega_barrier(barrier_counter, 3, 512)
+    if max_phase < 4 { return }
+
+    if wg_id < 256 {
+        oproj_residual_marker()    // phase 9: o_proj matmul + residual-add (gemv_coop_bf16_f32, wg<256)
+    }
+    mega_barrier(barrier_counter, 4, 512)
+    if max_phase < 5 { return }
+
+    if wg_id == 0 {
+        post_norm_marker()         // phase 11: post_norm rmsnorm (WG-0 gated)
+    }
+    mega_barrier(barrier_counter, 5, 512)
+    if max_phase < 6 { return }
+
+    if wg_id < 256 {
+        gate_up_matmul_marker()    // phase 13: gate_up matmul (gemv_coop_bf16_f32, wg<256)
+    }
+    mega_barrier(barrier_counter, 6, 512)
+    if max_phase < 7 { return }
+
+    if wg_id < 256 {
+        silu_mul_elem_strided_marker()  // phase 15: SiLU(gate)*up in-place over gu_scratch[0..FF]
+    }
+    mega_barrier(barrier_counter, 7, 512)
+
+    if wg_id < 256 {
+        down_residual_marker()     // phase 17: down_w matmul + final residual-add (gemv_coop_bf16_f32, wg<256)
+    }
+}
+
+fn main() {
+    exit(0)
+}
