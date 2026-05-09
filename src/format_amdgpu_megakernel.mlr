@@ -3335,16 +3335,24 @@ fn _emit_phase5_qkv_split_qknorm_rope_speck4_inline() {
 //   log2_e     = 1.4426950408 = 0x3FB8AA3B (used for v_exp_f32 = exp2 input)
 //   neg_inf_init = -1e30 = 0xF149F2CA  (HIP source: float m = -1e30f)
 fn _emit_phase7_attn_decode_coop_inline() {
-    // ── Arch-derived shape locals (slice 5.4) ───────────────────────────
+    // ── Arch-derived shape locals (slice 5.4 + slice 5.10) ──────────────
+    // Slice 5.10: ATTN_COOP_arch = HEAD_DIM / WAVE invariant, so
+    //   OUT_PER_WG = HEAD_DIM / ATTN_COOP = WAVE = 32 for every model.
+    //   Qwen3 HEAD_DIM=128/WAVE=32 → ATTN_COOP=4 (unchanged; byte-exact)
+    //   Llama HEAD_DIM= 64/WAVE=32 → ATTN_COOP=2 (was 4; lanes 16-31 ran past
+    //                                            their coop's slot → deadlock)
+    uint64 attn_coop          = MEGA_HEAD_DIM / 32   // = WAVE invariant; Qwen3=4, Llama=2
+    uint64 q_to_coop_shift    = _arch_log2_pow2(attn_coop)  // log2(ATTN_COOP)
+    uint64 coop_idx_mask      = attn_coop - 1               // ATTN_COOP - 1
     uint64 head_off_shift     = _arch_log2_pow2(MEGA_HEAD_DIM * 4)            // log2(HEAD_DIM*4)
     uint64 q_to_kv_shift      = _arch_log2_pow2(MEGA_N_HEADS / MEGA_N_KV_HEADS) // GQA ratio
-    uint64 out_per_wg_bytes_shift = _arch_log2_pow2(MEGA_HEAD_DIM)            // = log2(OUT_PER_WG*4) = log2(HEAD_DIM)
+    uint64 out_per_wg         = MEGA_HEAD_DIM / attn_coop   // = WAVE = 32 always (slice 5.10)
+    uint64 out_per_wg_bytes_shift = _arch_log2_pow2(out_per_wg * 4)           // log2(OUT_PER_WG*4) = log2(128) = 7 always
     uint64 kv_off_shift       = _arch_log2_pow2(MEGA_N_KV_HEADS * MEGA_HEAD_DIM * 4)  // log2(KV_DIM*4)
     uint64 kv_dim_bytes_p7    = MEGA_N_KV_HEADS * MEGA_HEAD_DIM * 4                  // bytes per KV slot (slice 5.9)
-    uint64 outer_cap          = MEGA_N_HEADS * 4    // ATTN_COOP=4 invariant
+    uint64 outer_cap          = MEGA_N_HEADS * attn_coop  // (Qwen3 16*4=64; Llama 32*2=64)
     uint64 chunk_count        = MEGA_HEAD_DIM / 4   // inner-dot chunk count
     uint64 inv_sqrt_head_bits = _arch_inv_sqrt_pow2_f32_bits(MEGA_HEAD_DIM)
-    uint64 out_per_wg         = MEGA_HEAD_DIM / 4   // pass-3 lane gate cap
 
     // ── Outer gate: skip if wg_id >= 64 ─────────────────────────────────
     // Use s28 (saved wg_id_x) NOT s15 — phase 5 clobbers s15 with the high
@@ -3357,14 +3365,18 @@ fn _emit_phase7_attn_decode_coop_inline() {
     asm_s_cbranch_scc1(0)        // patched at .phase7_done
 
     // ── Compute q_head, coop_idx, kv_head from saved wg_id (s28) ────────
-    // s16 = wg_id >> 2  (q_head)  ← uses s28 not s15
-    // s_lshr_b32 s16, s28, 2: SOP2 op 0x0A, sdst=s16=0x10, ssrc0=s28=0x1C, ssrc1=inline 2=0x82
-    //   word = (2<<30)|(0x0A<<23)|(0x10<<16)|(0x82<<8)|0x1C = 0x8510821C
-    asm_u32(0x8510821C)
-    // s18 = wg_id & 3  (coop_idx)  ← uses s28 not s15
-    // s_and_b32 s18, s28, 3: SOP2 op 0x16
-    //   word = (2<<30)|(0x16<<23)|(0x12<<16)|(0x83<<8)|0x1C = 0x8B12831C
-    asm_u32(0x8B12831C)
+    // s16 = wg_id >> log2(ATTN_COOP)  (q_head)  ← uses s28 not s15
+    // s_lshr_b32 s16, s28, q_to_coop_shift: SOP2 op 0x0A, sdst=s16=0x10, ssrc0=s28=0x1C
+    //   ssrc1 = inline-imm (0x80 + shift); Qwen3 shift=2 → 0x82 (= 0x8510821C)
+    //                                       Llama shift=1 → 0x81 (= 0x8510811C)
+    uint64 q_to_coop_inline = 0x80 + q_to_coop_shift
+    asm_u32(0x8510001C | (q_to_coop_inline << 8))
+    // s18 = wg_id & (ATTN_COOP-1)  (coop_idx)  ← uses s28 not s15
+    // s_and_b32 s18, s28, coop_idx_mask: SOP2 op 0x16, sdst=s18=0x12, ssrc0=s28=0x1C
+    //   ssrc1 = inline-imm (0x80 + mask); Qwen3 mask=3 → 0x83 (= 0x8B12831C)
+    //                                       Llama mask=1 → 0x81 (= 0x8B12811C)
+    uint64 coop_idx_inline = 0x80 + coop_idx_mask
+    asm_u32(0x8B12001C | (coop_idx_inline << 8))
     // s19 = q_head >> q_to_kv_shift = kv_head  (Qwen3 shift=1 → 0x85138110)
     // s_lshr_b32 s19, s16, q_to_kv_shift: op 0x0A; ssrc0=s16=0x10, ssrc1=inline (0x80+shift)
     uint64 q_to_kv_inline = 0x80 + q_to_kv_shift
@@ -3389,7 +3401,10 @@ fn _emit_phase7_attn_decode_coop_inline() {
     // s21 = kv_head * HEAD_DIM*4 = s19 << head_off_shift (Qwen3 → 0x84158913)
     asm_u32(0x84150013 | ((0x80 + head_off_shift) << 8))
     // s22 = coop_idx * OUT_PER_WG*4 = s18 << out_per_wg_bytes_shift
-    //   OUT_PER_WG*4 = HEAD_DIM, so shift = log2(HEAD_DIM) (Qwen3 shift=7 → 0x84168712)
+    //   slice 5.10: OUT_PER_WG = WAVE = 32 always, so OUT_PER_WG*4 = 128, shift = 7
+    //   Qwen3: coop_idx ∈ [0..3], dim_byte_off ∈ {0,128,256,384} (covers HEAD_DIM*4=512)
+    //   Llama: coop_idx ∈ [0..1], dim_byte_off ∈ {0,128}         (covers HEAD_DIM*4=256)
+    //   Encoding: 0x84160012 | ((0x80 + 7) << 8) = 0x84168712 (unchanged for Qwen3)
     asm_u32(0x84160012 | ((0x80 + out_per_wg_bytes_shift) << 8))
 
     // s2 = s2 + s20  (b_attn_q_g += q_head*512); s3 += carry
