@@ -323,8 +323,17 @@ fn _emit_wave_xor_reduce_max_f32_5_levels(uint64 acc, uint64 addr, uint64 tmp) {
 //   the per-phase barrier hands off to phase 7.
 //
 // Hardware: gfx1100 (RDNA3) wave32.  N=HIDDEN=1024, WAVE=32 → 32 iters.
+//
+// Slice 4.20.1 added `stream_byte_offset`: when non-zero, the helper
+// inserts `s_add_u32 s2, s2, stream_byte_offset` (carry into s3) and the
+// matching add into s[6:7] right after the kernarg loads, before any
+// VGPR pointer setup.  Used by the speck4 m4 wrapper to retarget input
+// + output base pointers to stream m's slab (m*HIDDEN*4 bytes).  The
+// norm-weight ptr (s[4:5]) is stream-independent and is left untouched.
+// Base-mega callsites pass 0 (no offset).
 fn _emit_rmsnorm_wg_gated_inline(uint64 in_kofs, uint64 norm_kofs,
-                                  uint64 out_kofs, uint64 wg_id_sgpr) {
+                                  uint64 out_kofs, uint64 wg_id_sgpr,
+                                  uint64 stream_byte_offset) {
     // Record the dword index of the s_cmp before the skip branch so
     // we can patch the simm16 after measuring the body size.
     uint64 gate_cmp_pos = asm_text_len / 4   // position of s_cmp_lg_u32
@@ -346,6 +355,23 @@ fn _emit_rmsnorm_wg_gated_inline(uint64 in_kofs, uint64 norm_kofs,
     // s_load_b64 s[6:7], s[0:1], out_kofs   (output ptr — phase-specific)
     asm_s_load_b64_off(3, 0, out_kofs)
     asm_s_waitcnt_lgkmcnt_zero()
+
+    // ── Optional per-stream base-pointer adjust (slice 4.20.1) ────────
+    // When stream_byte_offset != 0, retarget s[2:3] (input) and s[6:7]
+    // (output) to stream m's slab.  s[4:5] (norm-weight) is unchanged —
+    // norm weights are shared across all M_EFF streams.
+    //
+    // 32-bit-literal SOP2 encoding (ssrc1=0xFF means "literal follows"):
+    //   s_add_u32  s2, s2, lit  → 0x8002FF02 ; <lit32>
+    //   s_addc_u32 s3, s3, 0    → 0x82038003   (op 4, ssrc1=0x80=inline-0)
+    //   s_add_u32  s6, s6, lit  → 0x8006FF06 ; <lit32>
+    //   s_addc_u32 s7, s7, 0    → 0x82078007
+    if stream_byte_offset != 0 {
+        asm_u32(0x8002FF02); asm_u32(stream_byte_offset)   // s2 += lit
+        asm_u32(0x82038003)                                 // s3 += carry
+        asm_u32(0x8006FF06); asm_u32(stream_byte_offset)   // s6 += lit
+        asm_u32(0x82078007)                                 // s7 += carry
+    }
 
     // ── Init ──────────────────────────────────────────────────────────
     // v2 = 0.0f  (ssq accumulator; inline-0 = f32 0.0)
@@ -518,6 +544,37 @@ fn _emit_rmsnorm_wg_gated_inline(uint64 in_kofs, uint64 norm_kofs,
     // Target of the gate branch = current position (after all rmsnorm body).
     uint64 body_dwords = (asm_text_len / 4) - (gate_cmp_pos + 2)
     asm_patch_u32(gate_cmp_pos + 1, 0xBFA20000 | (body_dwords & 0xFFFF))
+}
+
+// _emit_rmsnorm_wg_gated_m4_inline — speck4 m4 wrapper around the
+// WG-0-gated rmsnorm body.  Emits 4 sequential rmsnorm bodies for streams
+// m=0..3.  For each stream m, the input/output base pointers are offset
+// by m * HIDDEN * 4 = m * 4096 bytes within the M_EFF*HIDDEN slabs at the
+// kernarg-buffer-pointed base addresses.  The norm-weight pointer is
+// stream-independent (one shared norm per phase) and is left untouched.
+//
+// Implementation choice (slice 4.20.1): static unroll, 4× the
+// `_emit_rmsnorm_wg_gated_inline` body inline, threading a per-stream
+// `stream_byte_offset` through the helper's new 5th parameter (default
+// 0 for base-mega callsites).  Each invocation re-emits its own WG-0
+// gate + 3 kernarg loads + base-pointer adjust + body — matches v1
+// hipcc -O3 unrolled ISA structure (the HIP source's `for m in 0..3`
+// loop is constant-trip and fully unrolled), so disasm-diff stays
+// readable if the bit-exact gate fails.
+//
+// Cost: 4× the .text size of one rmsnorm body for this phase.  Each
+// stream's kernarg loads (s_load_b64 ×3) hit the L2 KCACHE on streams
+// 1..3, so the latency overhead vs runtime-loop is small.
+//
+// Phase 1 callsite: in_kofs=0x00, norm_kofs=0x30, out_kofs=0x88, wg=15
+// Phase 11 callsite: in_kofs=0xA0, norm_kofs=0x38, out_kofs=0xA8, wg=28
+fn _emit_rmsnorm_wg_gated_m4_inline(uint64 in_kofs, uint64 norm_kofs,
+                                     uint64 out_kofs, uint64 wg_id_sgpr) {
+    // HIDDEN * 4 = 1024 * 4 = 4096 bytes per stream.
+    _emit_rmsnorm_wg_gated_inline(in_kofs, norm_kofs, out_kofs, wg_id_sgpr, 0)
+    _emit_rmsnorm_wg_gated_inline(in_kofs, norm_kofs, out_kofs, wg_id_sgpr, 4096)
+    _emit_rmsnorm_wg_gated_inline(in_kofs, norm_kofs, out_kofs, wg_id_sgpr, 8192)
+    _emit_rmsnorm_wg_gated_inline(in_kofs, norm_kofs, out_kofs, wg_id_sgpr, 12288)
 }
 
 // ── Marker recognition helpers ────────────────────────────────────────────
@@ -2242,7 +2299,7 @@ fn mega_emit_stub_kernel(uint64 kname_ptr, uint64 nl, uint64 body_node) -> uint6
     //                 out=b_x_norm_g(arg 17, 0x88).  wg_id_x is still in s15
     //                 (no prior phase has clobbered it yet).
     if _body_has_rmsnorm_wg0_marker(body_node) != 0 {
-        _emit_rmsnorm_wg_gated_inline(0x00, 0x30, 0x88, 15)
+        _emit_rmsnorm_wg_gated_inline(0x00, 0x30, 0x88, 15, 0)
     } else {
         asm_u32(0xBF800000)   // s_nop 0 (phase 1 stub)
     }
@@ -2328,7 +2385,7 @@ fn mega_emit_stub_kernel(uint64 kname_ptr, uint64 nl, uint64 body_node) -> uint6
     // Marker recognized inline (no `_body_has_post_norm_marker` wrapper) —
     // same fn-table-cap discipline as oproj_residual_marker at slice 4.19.5.
     if _body_has_marker(body_node, "post_norm_marker", 16) != 0 {
-        _emit_rmsnorm_wg_gated_inline(0xA0, 0x38, 0xA8, 28)
+        _emit_rmsnorm_wg_gated_inline(0xA0, 0x38, 0xA8, 28, 0)
     } else {
         asm_u32(0xBF800000)   // s_nop 0 (phase 11 stub)
     }
@@ -2646,10 +2703,13 @@ fn mega_emit_stub_kernel_speck4(uint64 kname_ptr, uint64 nl, uint64 body_node) -
     asm_s_mov_b32(28, 15)            // s28 = wg_id_x (preserved across phases)
 
     // ── Phase 1: input rmsnorm × M_EFF (WG-0 gated) ──────────────────────
-    // Slice 4.20.0: stub.  Slice 4.20.1 wraps _emit_rmsnorm_wg_gated_inline
-    // in a 4-iteration m-loop with per-m base = base_kofs + m*HIDDEN*4.
+    // Slice 4.20.1: m4 wrapper around _emit_rmsnorm_wg_gated_inline (4
+    // streams, per-m base = base_kofs + m*HIDDEN*4 bytes).  Kernarg layout
+    // identical to base mega: in=in_residual_4(arg 0, 0x00),
+    // norm=in_norm_g(arg 6, 0x30), out=b_x_norm_g_4(arg 17, 0x88).
+    // wg_id_x is in s15 here (no prior phase has clobbered it yet).
     if _body_has_marker(body_node, "rmsnorm_wg0_speck4_marker", 25) != 0 {
-        asm_u32(0xBF800000)   // s_nop 0 (phase 1 stub — slice 4.20.0)
+        _emit_rmsnorm_wg_gated_m4_inline(0x00, 0x30, 0x88, 15)
     } else {
         asm_u32(0xBF800000)   // s_nop 0 (phase 1 stub)
     }
@@ -2712,10 +2772,14 @@ fn mega_emit_stub_kernel_speck4(uint64 kname_ptr, uint64 nl, uint64 body_node) -
     asm_s_cbranch_scc1(0)
 
     // ── Phase 11: post_norm rmsnorm × M_EFF (WG-0 gated) ─────────────────
-    // Slice 4.20.0: stub.  Slice 4.20.1 reuses the rmsnorm m-loop wrapper
-    // from phase 1 with different kernarg byte offsets.
+    // Slice 4.20.1: same m4 wrapper as phase 1, with different kernarg
+    // byte offsets.  in=b_mid_g_4(arg 20, 0xA0), norm=post_norm_g(arg 7,
+    // 0x38), out=b_mid_norm_g_4(arg 21, 0xA8).  wg_id_x is in s28 here
+    // (phase 5's rope_sin load clobbered s15 mid-kernel; the prologue
+    // saved the original s15→s28 — same constraint forced phase 9 in
+    // the base kernel to read s28).
     if _body_has_marker(body_node, "post_norm_speck4_marker", 23) != 0 {
-        asm_u32(0xBF800000)   // s_nop 0 (phase 11 stub — slice 4.20.0)
+        _emit_rmsnorm_wg_gated_m4_inline(0xA0, 0x38, 0xA8, 28)
     } else {
         asm_u32(0xBF800000)   // s_nop 0 (phase 11 stub)
     }
