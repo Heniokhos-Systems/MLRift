@@ -1557,6 +1557,349 @@ fn _emit_phase9_gemv_residual_inline(uint64 n_out, uint64 k, uint64 k_pad,
     asm_patch_u32(gate_cmp_pos + 2, 0xBFA20000 | (body_dwords & 0xFFFF))
 }
 
+// ── Phase 9 m4 inline ISA emitter — gemv-residual-fused, 4 streams ────────
+//
+// _emit_phase9_gemv_residual_m4_inline — speck4 phase-9 variant.  Same single
+// bf16 weight read per row as the base emitter (_emit_phase9_gemv_residual_inline),
+// but accumulates FOUR independent dot products (one per stream m=0..3) and
+// stores 4 output rows, each with its own residual-add.
+//
+// Maps the HIP source body:
+//
+//     for r_off in 0..ROWS_PER_WG:
+//         row = wg_id + r_off * WG_PERSIST
+//         acc0=acc1=acc2=acc3=0
+//         for kp in lane..Q_DIM/2 step WAVE:
+//             packed = o_w[row*Q_DIM_PAD/2 + kp]
+//             w0 = bf16_lo, w1 = bf16_hi
+//             accm += w0 * b_attn_out_g_4[m*Q_DIM + 2*kp]
+//                   + w1 * b_attn_out_g_4[m*Q_DIM + 2*kp + 1]   (m=0..3)
+//         wave-XOR-reduce(acc0/1/2/3)
+//         if lane==0:
+//             b_mid_g_4[m*HIDDEN + row] =
+//                 in_residual_4[m*HIDDEN + row] + accm           (m=0..3)
+//
+// Stream stride layout (NOTE: input and output strides DIFFER, unlike
+// phase-3 m4 where both were derivable from k and n_out separately but
+// the input was unpadded HIDDEN):
+//   x   stream stride = k    *4 = 2048*4 = 8192 bytes  (Q_DIM)
+//   out stream stride = n_out*4 = 1024*4 = 4096 bytes  (HIDDEN)
+//   res stream stride = n_out*4 = 4096 bytes (same as out — both are HIDDEN-shaped)
+//
+// SGPR layout (matches base phase 9 + reuses sdata pair 9 = s[18:19] for res):
+//   s[0:1]   = kernarg ptr (untouched)
+//   s[2:3]   = o_w ptr     (advances by w_row_step per outer iter)
+//   s[4:5]   = b_attn_out_g_4 ptr (loaded once, stream-0 base; never modified)
+//   s[6:7]   = b_mid_g_4 ptr      (offset+restored per row by the 4-store block)
+//   s[18:19] = in_residual_4 ptr  (offset+restored per row; sdata pair 9)
+//   s12      = outer loop counter (r_off)
+//   s13      = row index (init: s28=saved wg_id_x; +wg_active each outer iter)
+//   s14      = row*4 / w_row_step / outer-loop scratch
+//   s17      = saved exec_lo for lane-0 gate
+//   s28      = saved wg_id_x (read here, NOT s15 — phase 5 clobbered s15)
+//
+// VGPR layout (mirrors phase-3 m4 exactly; v9 reused as residual-load dest
+// like base phase 9):
+//   v0       = lane id (hardware, r/o)
+//   v1       = vaddr=0 (for global_store/load saddr-form)
+//   v2       = acc_0 (stream 0 accumulator)
+//   v3:v4    = weight ptr per lane (init: s[2:3]+lane*4; +128 each inner)
+//   v5:v6    = x ptr stream 0 per lane (init: s[4:5]+lane*8;       +256)
+//   v7       = lane*4
+//   v8       = lane*8                      (= stream-0 lane offset)
+//   v9       = packed u32 (2 bf16 weights) → wave-reduce addr → residual load
+//   v10      = bf16-lo as f32 → wave-reduce tmp
+//   v11      = x[kp*2]   stream 0
+//   v12      = x[kp*2+1] stream 0
+//   v13      = acc_1 (stream 1 accumulator)
+//   v14      = acc_2 (stream 2 accumulator)
+//   v15      = acc_3 (stream 3 accumulator)
+//   v16:v17  = x ptr stream 1 per lane (+256)
+//   v18:v19  = x ptr stream 2 per lane (+256)
+//   v20:v21  = x ptr stream 3 per lane (+256)
+//   v22:v23  = x lo/hi stream 1
+//   v24:v25  = x lo/hi stream 2
+//   v26:v27  = x lo/hi stream 3
+//   v28      = lane*8 + 8192   (stream-1 lane offset; constant after init)
+//   v29      = lane*8 + 16384  (stream-2 lane offset)
+//   v30      = lane*8 + 24576  (stream-3 lane offset)
+//
+// gfx11 hazard note: each residual-add is a VALU op feeding a VMEM store;
+// the existing base-phase-9 s_delay_alu pattern is replicated per stream.
+fn _emit_phase9_gemv_residual_m4_inline(uint64 n_out, uint64 k, uint64 k_pad,
+                                         uint64 wg_active,
+                                         uint64 w_kofs, uint64 x_kofs,
+                                         uint64 res_kofs, uint64 out_kofs) {
+    // Per-stream byte strides:
+    //   x stream stride  = k    *4 (Q_DIM-shaped)
+    //   out stream stride= n_out*4 (HIDDEN-shaped — same for residual)
+    uint64 x_stream_stride   = k * 4
+    uint64 out_stream_stride = n_out * 4
+
+    // ── WG gate (skip if wg_id >= wg_active) — read from s28, NOT s15 ────
+    // s_cmp_ge_u32 s28, wg_active: word = 0xBF09FF1C
+    uint64 gate_cmp_pos = asm_text_len / 4
+    asm_u32(0xBF09FF1C)
+    asm_u32(wg_active)
+    asm_s_cbranch_scc1(0)   // patched at end
+
+    // ── Load base pointers ────────────────────────────────────────────────
+    // sdata pairs: 1=s[2:3] (w), 2=s[4:5] (x), 3=s[6:7] (out), 9=s[18:19] (res).
+    asm_s_load_b64_off(1, 0, w_kofs)     // o_w           → s[2:3]
+    asm_s_load_b64_off(2, 0, x_kofs)     // b_attn_out_g_4→ s[4:5] (stream-0)
+    asm_s_load_b64_off(3, 0, out_kofs)   // b_mid_g_4     → s[6:7] (stream-0)
+    asm_s_load_b64_off(9, 0, res_kofs)   // in_residual_4 → s[18:19] (stream-0)
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // ── Constant lane offsets ─────────────────────────────────────────────
+    asm_v_lshlrev_b32_imm(7, 2, 0)   // v7 = lane*4
+    asm_v_lshlrev_b32_imm(8, 3, 0)   // v8 = lane*8 (stream-0 lane offset)
+    asm_v_mov_b32_inline_u(1, 0)     // v1 = 0 (vaddr for store/load)
+
+    // Precompute per-stream lane offsets v28/v29/v30 = lane*8 + m*x_stream_stride
+    // (m = 1, 2, 3).  src1=v8 (lane*8) → (0x108<<9)|0xFF = 0x210FF.
+    asm_u32(0xD7006A1C); asm_u32(0x000210FF); asm_u32(x_stream_stride)         // v28 = v8 + 8192
+    asm_u32(0xD7006A1D); asm_u32(0x000210FF); asm_u32(2 * x_stream_stride)     // v29 = v8 + 16384
+    asm_u32(0xD7006A1E); asm_u32(0x000210FF); asm_u32(3 * x_stream_stride)     // v30 = v8 + 24576
+
+    // ── Outer loop init ───────────────────────────────────────────────────
+    asm_s_mov_b32(13, 28)                      // s13 = row = saved wg_id (s28)
+    asm_s_mov_b32_inline_imm(12, 0)            // s12 = r_off = 0
+
+    uint64 w_lo = 2
+    uint64 w_hi = 3
+    uint64 x_lo = 4
+    uint64 x_hi = 5
+    uint64 out_lo = 6
+    uint64 out_hi = 7
+    uint64 res_lo = 18
+    uint64 res_hi = 19
+
+    uint64 w_row_step = wg_active * k_pad * 2
+    uint64 k_iters = k / 2 / 32
+    uint64 rows_per_wg = (n_out + wg_active - 1) / wg_active
+
+    uint64 outer_top = asm_text_len / 4
+
+    // ── Per-row body ──────────────────────────────────────────────────────
+    // Reset all 4 accumulators.
+    asm_v_mov_b32_inline_u(2,  0)     // acc_0 = 0.0
+    asm_v_mov_b32_inline_u(13, 0)     // acc_1 = 0.0
+    asm_v_mov_b32_inline_u(14, 0)     // acc_2 = 0.0
+    asm_v_mov_b32_inline_u(15, 0)     // acc_3 = 0.0
+
+    // init weight ptr: v3:v4 = s[w_lo:w_hi] + lane*4
+    asm_v_mov_b32_inline_u(4, 0)
+    asm_v_add_co_u32_vcc_sv(3, w_lo, 7)
+    asm_v_add_co_ci_u32_null_sv_vcc(4, w_hi, 4)
+
+    // init x stream-0 ptr: v5:v6 = s[x_lo:x_hi] + v8(lane*8)
+    asm_v_mov_b32_inline_u(6, 0)
+    asm_v_add_co_u32_vcc_sv(5, x_lo, 8)
+    asm_v_add_co_ci_u32_null_sv_vcc(6, x_hi, 6)
+
+    // init x stream-1 ptr: v16:v17 = s[x_lo:x_hi] + v28
+    asm_v_mov_b32_inline_u(17, 0)
+    asm_v_add_co_u32_vcc_sv(16, x_lo, 28)
+    asm_v_add_co_ci_u32_null_sv_vcc(17, x_hi, 17)
+
+    // init x stream-2 ptr: v18:v19 = s[x_lo:x_hi] + v29
+    asm_v_mov_b32_inline_u(19, 0)
+    asm_v_add_co_u32_vcc_sv(18, x_lo, 29)
+    asm_v_add_co_ci_u32_null_sv_vcc(19, x_hi, 19)
+
+    // init x stream-3 ptr: v20:v21 = s[x_lo:x_hi] + v30
+    asm_v_mov_b32_inline_u(21, 0)
+    asm_v_add_co_u32_vcc_sv(20, x_lo, 30)
+    asm_v_add_co_ci_u32_null_sv_vcc(21, x_hi, 21)
+
+    // ── Inner K loop ──────────────────────────────────────────────────────
+    asm_s_mov_b32_inline_imm(14, k_iters)
+    uint64 inner_top = asm_text_len / 4
+
+    // 1 weight load (shared across 4 streams)
+    asm_u32(0xDC520000); asm_u32(0x097C0003)    // global_load_b32 v9, v[3:4], off
+    // 4 stream x loads (lo + hi pair per stream)
+    asm_u32(0xDC520000); asm_u32(0x0B7C0005)    // global_load_b32 v11, v[5:6], off          (stream 0 lo)
+    asm_u32(0xDC520004); asm_u32(0x0C7C0005)    // global_load_b32 v12, v[5:6], off offset:4 (stream 0 hi)
+    asm_u32(0xDC520000); asm_u32(0x167C0010)    // global_load_b32 v22, v[16:17], off          (stream 1 lo)
+    asm_u32(0xDC520004); asm_u32(0x177C0010)    // global_load_b32 v23, v[16:17], off offset:4 (stream 1 hi)
+    asm_u32(0xDC520000); asm_u32(0x187C0012)    // global_load_b32 v24, v[18:19], off          (stream 2 lo)
+    asm_u32(0xDC520004); asm_u32(0x197C0012)    // global_load_b32 v25, v[18:19], off offset:4 (stream 2 hi)
+    asm_u32(0xDC520000); asm_u32(0x1A7C0014)    // global_load_b32 v26, v[20:21], off          (stream 3 lo)
+    asm_u32(0xDC520004); asm_u32(0x1B7C0014)    // global_load_b32 v27, v[20:21], off offset:4 (stream 3 hi)
+    asm_s_waitcnt_vmcnt_zero()
+
+    // Unpack packed bf16 → 2 f32 in v10 (lo) + v9 (hi).
+    asm_v_lshlrev_b32_imm(10, 16, 9)           // v10 = bf16-lo as f32
+    asm_u32(0x361212FF); asm_u32(0xFFFF0000)   // v9  = bf16-hi as f32
+
+    // 4 fmacs per stream (acc_m += w0 * x_lo + w1 * x_hi)
+    asm_v_fmac_f32_e32_vv(2,  10, 11)          // acc_0 += w0 * x0_lo
+    asm_v_fmac_f32_e32_vv(2,  9,  12)          // acc_0 += w1 * x0_hi
+    asm_v_fmac_f32_e32_vv(13, 10, 22)          // acc_1 += w0 * x1_lo
+    asm_v_fmac_f32_e32_vv(13, 9,  23)          // acc_1 += w1 * x1_hi
+    asm_v_fmac_f32_e32_vv(14, 10, 24)          // acc_2 += w0 * x2_lo
+    asm_v_fmac_f32_e32_vv(14, 9,  25)          // acc_2 += w1 * x2_hi
+    asm_v_fmac_f32_e32_vv(15, 10, 26)          // acc_3 += w0 * x3_lo
+    asm_v_fmac_f32_e32_vv(15, 9,  27)          // acc_3 += w1 * x3_hi
+
+    // advance weight ptr +128 bytes (32 lanes × 4 = 128)
+    asm_u32(0xD7006A03); asm_u32(0x000206FF); asm_u32(128)
+    asm_u32(0xD5207C04); asm_u32(0x01AA0880)
+    // advance stream-0 x ptr +256 bytes (v[5:6])
+    asm_u32(0xD7006A05); asm_u32(0x00020AFF); asm_u32(256)
+    asm_u32(0xD5207C06); asm_u32(0x01AA0C80)
+    // advance stream-1 x ptr +256 bytes (v[16:17])
+    asm_u32(0xD7006A10); asm_u32(0x000220FF); asm_u32(256)
+    asm_u32(0xD5207C11); asm_u32(0x01AA2280)
+    // advance stream-2 x ptr +256 bytes (v[18:19])
+    asm_u32(0xD7006A12); asm_u32(0x000224FF); asm_u32(256)
+    asm_u32(0xD5207C13); asm_u32(0x01AA2680)
+    // advance stream-3 x ptr +256 bytes (v[20:21])
+    asm_u32(0xD7006A14); asm_u32(0x000228FF); asm_u32(256)
+    asm_u32(0xD5207C15); asm_u32(0x01AA2A80)
+
+    asm_s_sub_u32_imm(14, 14, 1)
+    asm_s_cmp_eq_u32(14, 0x80)
+    uint64 inner_back = (0 - ((asm_text_len / 4) - inner_top) - 1) & 0xFFFF
+    asm_s_cbranch_scc0(inner_back)
+
+    // ── Wave XOR reduce × 4 (acc_0..acc_3) ────────────────────────────────
+    // acc=v2/v13/v14/v15, addr=v9, tmp=v10 (both free after inner loop).
+    _emit_wave_xor_reduce_add_f32_5_levels(2,  9, 10)
+    _emit_wave_xor_reduce_add_f32_5_levels(13, 9, 10)
+    _emit_wave_xor_reduce_add_f32_5_levels(14, 9, 10)
+    _emit_wave_xor_reduce_add_f32_5_levels(15, 9, 10)
+
+    // ── Lane-0 residual-add + store × 4 ───────────────────────────────────
+    // Save exec → s17, gate to lane 0, then 4 sequential blocks:
+    //   advance out_ptr + res_ptr by row*4 (m=0) or stream_stride (m>0)
+    //   global_load_b32 v9, v1, s[res_lo:res_hi]
+    //   wait, v_add_f32 acc_m, acc_m, v9
+    //   s_delay_alu, global_store_b32 v1, acc_m, s[out_lo:out_hi]
+    asm_v_cmp_eq_u32_imm_vgpr(0, 0)         // vcc_lo = (v0 == 0)
+    asm_s_and_saveexec_b32_vcc_lo(17)       // s17 = old exec; exec &= vcc_lo
+
+    // s14 = row * 4: s_lshl_b32 s14, s13, 2 = 0x840E820D
+    asm_u32(0x840E820D)
+
+    // ── Stream 0: out += row*4, res += row*4 ─────────────────────────────
+    // s_add_u32 out_lo, out_lo, s14
+    asm_u32(0x80000000 | (out_lo << 16) | (14 << 8) | out_lo)
+    // s_addc_u32 out_hi, out_hi, 0
+    asm_u32(0x82000000 | (out_hi << 16) | 0x8000 | out_hi)
+    // s_add_u32 res_lo, res_lo, s14
+    asm_u32(0x80000000 | (res_lo << 16) | (14 << 8) | res_lo)
+    // s_addc_u32 res_hi, res_hi, 0
+    asm_u32(0x82000000 | (res_hi << 16) | 0x8000 | res_hi)
+
+    // global_load_b32 v9, v1, s[res_lo:res_hi]
+    //   word2 = (vdst<<24) | ((res_lo & 0x7F)<<16) | vaddr  (saddr is sgpr index)
+    asm_u32(0xDC520000)
+    asm_u32((9 << 24) | ((res_lo & 0x7F) << 16) | 1)
+    asm_s_waitcnt_vmcnt_zero()
+    // v_add_f32_e32 v2, v2, v9 = 0x06041302
+    asm_u32(0x06041302)
+    asm_s_delay_alu(0x01)
+    // global_store_b32 v1, v2, s[out_lo:out_hi]
+    asm_u32(0xDC6A0000)
+    asm_u32(((out_lo & 0x7F) << 16) | (2 << 8) | 1)
+
+    // ── Stream 1: out += stride, res += stride; store v13 ─────────────────
+    // s_add_u32 out_lo, out_lo, lit (lit = out_stream_stride)
+    asm_u32(0x80000000 | (out_lo << 16) | (0xFF << 8) | out_lo)
+    asm_u32(out_stream_stride)
+    asm_u32(0x82000000 | (out_hi << 16) | 0x8000 | out_hi)
+    // s_add_u32 res_lo, res_lo, lit
+    asm_u32(0x80000000 | (res_lo << 16) | (0xFF << 8) | res_lo)
+    asm_u32(out_stream_stride)
+    asm_u32(0x82000000 | (res_hi << 16) | 0x8000 | res_hi)
+    // global_load_b32 v9, v1, s[res_lo:res_hi]
+    asm_u32(0xDC520000)
+    asm_u32((9 << 24) | ((res_lo & 0x7F) << 16) | 1)
+    asm_s_waitcnt_vmcnt_zero()
+    // v_add_f32_e32 v13, v13, v9 = 0x061A130D
+    asm_u32(0x061A130D)
+    asm_s_delay_alu(0x01)
+    // global_store_b32 v1, v13, s[out_lo:out_hi]
+    asm_u32(0xDC6A0000)
+    asm_u32(((out_lo & 0x7F) << 16) | (13 << 8) | 1)
+
+    // ── Stream 2: out += stride, res += stride; store v14 ─────────────────
+    asm_u32(0x80000000 | (out_lo << 16) | (0xFF << 8) | out_lo)
+    asm_u32(out_stream_stride)
+    asm_u32(0x82000000 | (out_hi << 16) | 0x8000 | out_hi)
+    asm_u32(0x80000000 | (res_lo << 16) | (0xFF << 8) | res_lo)
+    asm_u32(out_stream_stride)
+    asm_u32(0x82000000 | (res_hi << 16) | 0x8000 | res_hi)
+    asm_u32(0xDC520000)
+    asm_u32((9 << 24) | ((res_lo & 0x7F) << 16) | 1)
+    asm_s_waitcnt_vmcnt_zero()
+    // v_add_f32_e32 v14, v14, v9 = 0x061C130E
+    asm_u32(0x061C130E)
+    asm_s_delay_alu(0x01)
+    asm_u32(0xDC6A0000)
+    asm_u32(((out_lo & 0x7F) << 16) | (14 << 8) | 1)
+
+    // ── Stream 3: out += stride, res += stride; store v15 ─────────────────
+    asm_u32(0x80000000 | (out_lo << 16) | (0xFF << 8) | out_lo)
+    asm_u32(out_stream_stride)
+    asm_u32(0x82000000 | (out_hi << 16) | 0x8000 | out_hi)
+    asm_u32(0x80000000 | (res_lo << 16) | (0xFF << 8) | res_lo)
+    asm_u32(out_stream_stride)
+    asm_u32(0x82000000 | (res_hi << 16) | 0x8000 | res_hi)
+    asm_u32(0xDC520000)
+    asm_u32((9 << 24) | ((res_lo & 0x7F) << 16) | 1)
+    asm_s_waitcnt_vmcnt_zero()
+    // v_add_f32_e32 v15, v15, v9 = 0x061E130F
+    asm_u32(0x061E130F)
+    asm_s_delay_alu(0x01)
+    asm_u32(0xDC6A0000)
+    asm_u32(((out_lo & 0x7F) << 16) | (15 << 8) | 1)
+
+    // Restore exec: s_or_b32 exec_lo, exec_lo, s17
+    asm_u32(0x8C7E117E)
+
+    // ── Restore out_ptr + res_ptr ────────────────────────────────────────
+    // Total added: row*4 (s14) + 3 × stream_stride to each of out and res.
+    // s_sub_u32 out_lo, out_lo, s14
+    asm_u32(0x80800000 | (out_lo << 16) | (0x0E << 8) | out_lo)
+    asm_u32(0x82800000 | (out_hi << 16) | 0x8000 | out_hi)
+    // s_sub_u32 out_lo, out_lo, lit (3 * stream_stride)
+    asm_u32(0x80800000 | (out_lo << 16) | (0xFF << 8) | out_lo)
+    asm_u32(3 * out_stream_stride)
+    asm_u32(0x82800000 | (out_hi << 16) | 0x8000 | out_hi)
+    // s_sub_u32 res_lo, res_lo, s14
+    asm_u32(0x80800000 | (res_lo << 16) | (0x0E << 8) | res_lo)
+    asm_u32(0x82800000 | (res_hi << 16) | 0x8000 | res_hi)
+    // s_sub_u32 res_lo, res_lo, lit (3 * stream_stride)
+    asm_u32(0x80800000 | (res_lo << 16) | (0xFF << 8) | res_lo)
+    asm_u32(3 * out_stream_stride)
+    asm_u32(0x82800000 | (res_hi << 16) | 0x8000 | res_hi)
+
+    // ── Outer loop advance ────────────────────────────────────────────────
+    // Advance weight ptr by w_row_step bytes
+    asm_s_mov_b32_lit32(14, w_row_step & 0xFFFFFFFF)
+    asm_u32(0x80000000 | (w_lo << 16) | (0x0E << 8) | w_lo)
+    asm_u32(0x82000000 | (w_hi << 16) | 0x8000 | w_hi)
+
+    // Advance row: s13 += wg_active
+    asm_u32(0x800DFF0D)
+    asm_u32(wg_active)
+
+    // r_off++; check r_off < rows_per_wg
+    asm_u32(0x800C810C)
+    asm_u32(0xBF0AFF0C)
+    asm_u32(rows_per_wg & 0xFFFFFFFF)
+    uint64 outer_back = (outer_top - (asm_text_len / 4) - 1) & 0xFFFF
+    asm_s_cbranch_scc1(outer_back)
+
+    // ── Patch the WG gate skip-branch ─────────────────────────────────────
+    uint64 body_dwords = (asm_text_len / 4) - (gate_cmp_pos + 3)
+    asm_patch_u32(gate_cmp_pos + 2, 0xBFA20000 | (body_dwords & 0xFFFF))
+}
+
 // ── Phase 5 inline ISA emitter ────────────────────────────────────────────
 //
 // _emit_phase5_qkv_split_qknorm_rope_inline — emits the 3-way head-per-WG
@@ -4065,9 +4408,14 @@ fn mega_emit_stub_kernel_speck4(uint64 kname_ptr, uint64 nl, uint64 body_node) -
     asm_s_cbranch_scc1(0)
 
     // ── Phase 9: o_proj matmul + residual-add × M_EFF (WG < 256) ─────────
-    // Slice 4.20.0: stub.  Slice 4.20.5 emits the m4 gemv-residual variant.
+    // Slice 4.20.5: m4 gemv-residual variant.  Shape (n_out=1024 HIDDEN,
+    // k=2048 Q_DIM, k_pad=2176, wg_active=256).  Kernarg layout:
+    // w=o_w(0x18, sgpr pair 1), x=b_attn_out_g_4(0xB0, pair 2),
+    // res=in_residual_4(0x00, pair 9), out=b_mid_g_4(0xA0, pair 3).
+    // wg_id_x is read from s28 (saved in prologue; phase 5 clobbered s15).
     if _body_has_marker(body_node, "oproj_residual_speck4_marker", 28) != 0 {
-        asm_u32(0xBF800000)   // s_nop 0 (phase 9 stub — slice 4.20.0)
+        _emit_phase9_gemv_residual_m4_inline(1024, 2048, 2176, 256,
+                                              0x18, 0xB0, 0x00, 0xA0)
     } else {
         asm_u32(0xBF800000)   // s_nop 0 (phase 9 stub)
     }
@@ -4094,10 +4442,15 @@ fn mega_emit_stub_kernel_speck4(uint64 kname_ptr, uint64 nl, uint64 body_node) -
     asm_s_cbranch_scc1(0)
 
     // ── Phase 13: gate_up matmul × M_EFF (WG < 256) ──────────────────────
-    // Slice 4.20.0: stub.  Slice 4.20.5 reuses the phase-3 m4 emitter
-    // with shape (6144, 1024, 1152).
+    // Slice 4.20.5: reuses the phase-3 m4 gemv-coop-bf16-padded-strided
+    // emitter with shape (n_out=6144 = 2*FF, k=1024 HIDDEN, k_pad=1152,
+    // wg_active=256).  Kernarg layout: w=gate_up_w(0x20, sgpr pair 1),
+    // x=b_mid_norm_g_4(0xA8, pair 2), out=gu_scratch_4(0x80, pair 3).
+    // wg_id_sgpr=28 (saved in prologue; phase 5 clobbered s15).
     if _body_has_marker(body_node, "gate_up_matmul_speck4_marker", 28) != 0 {
-        asm_u32(0xBF800000)   // s_nop 0 (phase 13 stub — slice 4.20.0)
+        _emit_gemv_coop_bf16_padded_strided_m4_inline(6144, 1024, 1152, 256,
+                                                       1, 2, 3,
+                                                       0x20, 0xA8, 0x80, 28)
     } else {
         asm_u32(0xBF800000)   // s_nop 0 (phase 13 stub)
     }
