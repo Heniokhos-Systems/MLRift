@@ -1900,6 +1900,154 @@ fn _emit_phase9_gemv_residual_m4_inline(uint64 n_out, uint64 k, uint64 k_pad,
     asm_patch_u32(gate_cmp_pos + 2, 0xBFA20000 | (body_dwords & 0xFFFF))
 }
 
+// ── Phase 15 m4 inline ISA emitter — silu_mul-elem-strided × 4 streams ────
+//
+// _emit_silu_mul_elem_strided_m4_inline — speck4 phase-15 variant.  The
+// base slice-4.19.8 silu_mul body operates over a single [0..FF] slab
+// (gu_scratch[idx] = silu(gu_scratch[idx]) * gu_scratch[FF+idx], idx<FF=3072).
+// speck4 operates over 4 contiguous [m, 0..2*FF] slabs (gu_scratch_4 layout
+// matches phase-13 m4 output: stream-m starts at byte m*N_OUT*4 = m*24576).
+//
+// Implementation: STATIC UNROLL of the silu-mul body 4 times.  Between
+// iterations, bump the gu_scratch base ptr s[2:3] by 24576 bytes (= N_OUT*4
+// = 2*FF*4) using a 32-bit-literal s_add_u32 + s_addc_u32 carry pair (same
+// pattern as slice 4.20.1 rmsnorm m4 wrapper).  After m=3 finishes, leave
+// s[2:3] at gu_scratch_4 + 73728 (phase 17 reloads its own copy from kernarg
+// 0x80 — no need to restore).
+//
+// The WG gate (s28 < 256) and the per-lane gate (idx < FF=3072) are emitted
+// ONCE outside the m-loop — both predicates are m-independent.  Inside the
+// gate, the 4 silu-mul bodies run back-to-back; each body's loads/silu/store
+// pattern is identical to base, just with s[2:3] retargeted to stream m's
+// slab via the 3 inter-body s_add_u32 instructions.
+//
+// SGPR layout (matches base phase 15):
+//   s[2:3]  = gu_scratch_4 ptr (advances by +24576 between m's)
+//   s14     = log2(e) literal scratch (re-loaded per body — cheap)
+//   s17     = saved exec_lo for the per-lane idx<FF gate
+//   s28     = saved wg_id_x (read here, NOT s15 — phase 5 clobbered s15)
+//
+// VGPR layout (matches base phase 15, all reused across 4 m iterations):
+//   v0      = lane id (hardware, r/o)
+//   v2      = idx = wg_id*32 + lane
+//   v3      = byte_off_g = idx*4
+//   v4      = byte_off_u = byte_off_g + 12288
+//   v8      = g (load) → silu(g)*u (store)
+//   v9      = u (load)
+//   v10     = silu/exp scratch
+//
+// Bytes-per-body comparison (verified against base @ slice 4.19.8):
+//   16 dwords for the silu-mul body itself (loads + waitcnt + silu + store
+//   + waitcnt) + 3 dwords for the inter-body s_add_u32+s_addc_u32 pair
+//   (only between m=0→1, 1→2, 2→3 — three of them).  Total ~67 dwords vs
+//   ~50 for base.
+fn _emit_silu_mul_elem_strided_m4_inline() {
+    // ── WG gate: skip if wg_id (s28) >= 256 ───────────────────────────────
+    // s_cmp_ge_u32 s28, 256 (literal): SOPC op 0x09, ssrc1=0xFF (lit follows)
+    uint64 p15_wg_gate_pos = asm_text_len / 4
+    asm_u32(0xBF09FF1C)         // s_cmp_ge_u32 s28, lit
+    asm_u32(256)
+    asm_s_cbranch_scc1(0)       // patched at .phase15_done
+
+    // ── Load gu_scratch_4 base ptr (stream 0) → s[2:3] ────────────────────
+    asm_s_load_b64_off(1, 0, 0x80)
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // ── Compute idx = wg_id*32 + lane = (s28<<5) + v0 → v2 ────────────────
+    // s_lshl_b32 s14, s28, 5: SOP2 op 0x08
+    //   word = (2<<30)|(8<<23)|(0x0E<<16)|(0x85<<8)|0x1C = 0x840E851C
+    asm_u32(0x840E851C)
+    // v_add_nc_u32_e32 v2, s14, v0: VOP2 op 0x25
+    //   word = (0x25<<25)|(2<<17)|(0<<9)|0x0E = 0x4A04000E
+    asm_u32(0x4A04000E)
+    // v_lshlrev_b32_e32 v3, 2, v2: byte_off_g = idx*4
+    asm_v_lshlrev_b32_imm(3, 2, 2)
+
+    // ── Per-lane gate: skip if idx >= FF=3072 ─────────────────────────────
+    // v_cmp_gt_u32_e32 vcc_lo, 3072, v2 → vcc_lo = (3072 > idx) = (idx < 3072)
+    //   word1 = (0x3E<<25)|(0x4C<<17)|(2<<9)|0xFF = 0x7C9804FF
+    asm_u32(0x7C9804FF)
+    asm_u32(3072)
+    // s_and_saveexec_b32 s17, vcc_lo  (s17 = old exec; exec &= vcc_lo)
+    asm_s_and_saveexec_b32_vcc_lo(17)
+    // s_cbranch_execz .phase15_lane_done (patched after all 4 bodies)
+    uint64 p15_lane_execz_pos = asm_text_len / 4
+    asm_s_cbranch_execz(0)
+
+    // ── byte_off_u = byte_off_g + FF*4 = byte_off_g + 12288 → v4 ──────────
+    // v_add_nc_u32_e32 v4, lit, v3: VOP2 op 0x25, src0=0xFF (lit follows)
+    //   word1 = (0x25<<25)|(4<<17)|(3<<9)|0xFF = 0x4A0806FF
+    asm_u32(0x4A0806FF)
+    asm_u32(3072 * 4)
+    asm_s_delay_alu(0x01)       // VALU→VMEM hazard
+
+    // ── Stream stride between m's: m*N_OUT*4 = m*24576 = m*0x6000 bytes ──
+    // Apply via s_add_u32 s2, s2, 24576 (lit32) + s_addc_u32 s3, s3, 0 between
+    // each consecutive pair of bodies (3 of them total).  Encoding mirrors
+    // slice 4.20.1 rmsnorm m4 wrapper's stream_byte_offset adjust.
+
+    uint64 m = 0
+    while m < 4 {
+        // ── Load g (= s[2:3][byte_off_g]) and u (= s[2:3][byte_off_u]) ────
+        // global_load_b32 v8, v3, s[2:3]: word2 = (8<<24)|(2<<16)|3 = 0x08020003
+        asm_u32(0xDC520000)
+        asm_u32(0x08020003)
+        // global_load_b32 v9, v4, s[2:3]: word2 = (9<<24)|(2<<16)|4 = 0x09020004
+        asm_u32(0xDC520000)
+        asm_u32(0x09020004)
+        asm_s_waitcnt_vmcnt_zero()
+
+        // ── SiLU compose: silu(g) = g / (1 + exp(-g)) ─────────────────────
+        // s_mov_b32 s14, log2(e) = 0x3FB8AA3B (literal-32 form).
+        // (Re-emitted per iter; cost is 2 dwords each.  Could be hoisted out
+        // of the loop, but s14 is also used as a scratch for the s_lshl_b32
+        // earlier — re-loading here is the safest pattern.)
+        asm_s_mov_b32_lit32(14, 0x3FB8AA3B)
+        // v_mul_f32_e64 v10, -v8, s14 → v10 = -g * log2(e)
+        asm_u32(0xD508000A)
+        asm_u32(0x20001D08)
+        // v_exp_f32_e32 v10, v10 → v10 = exp2(-g*log2e) = exp(-g)
+        asm_u32(0x7E144B0A)
+        // v_add_f32_e32 v10, 1.0, v10 → v10 = 1 + exp(-g)
+        asm_u32(0x061414F2)
+        // v_rcp_f32_e32 v10, v10 → v10 = 1/(1+exp(-g)) = sigmoid(g)
+        asm_u32(0x7E14550A)
+        // v_mul_f32_e32 v8, v8, v10 → v8 = g * sigmoid(g) = silu(g)
+        asm_u32(0x10101508)
+        // v_mul_f32_e32 v8, v8, v9 → v8 = silu(g) * u
+        asm_u32(0x10101308)
+
+        // ── Store back to s[2:3][byte_off_g] ──────────────────────────────
+        asm_s_delay_alu(0x01)       // VALU→VMEM hazard
+        // global_store_b32 v3, v8, s[2:3]: word2 = (2<<16)|(8<<8)|3 = 0x00020803
+        asm_u32(0xDC6A0000)
+        asm_u32(0x00020803)
+        asm_s_waitcnt_vscnt_zero()  // drain store before next body's loads
+
+        // ── Bump s[2:3] by 24576 (N_OUT*4) for next iter (m=0,1,2 only) ──
+        // s_add_u32  s2, s2, 24576  → 0x8002FF02 ; <lit32>
+        // s_addc_u32 s3, s3, 0      → 0x82038003 (op 4, ssrc1=0x80=inline-0)
+        if m < 3 {
+            asm_u32(0x8002FF02); asm_u32(24576)
+            asm_u32(0x82038003)
+        }
+
+        m = m + 1
+    }
+
+    // ── .phase15_lane_done: patch the per-lane skip target + restore exec ─
+    uint64 p15_lane_done = asm_text_len / 4
+    uint64 p15_lane_off = p15_lane_done - p15_lane_execz_pos - 1
+    asm_patch_u32(p15_lane_execz_pos, 0xBFA50000 | (p15_lane_off & 0xFFFF))
+    // s_or_b32 exec_lo, exec_lo, s17 (restore full exec for the WG)
+    asm_u32(0x8C7E117E)
+
+    // ── Patch WG gate skip-branch to here (.phase15_done) ────────────────
+    // p15_wg_gate_pos points at s_cmp (2 dwords); s_cbranch_scc1 is at +2.
+    uint64 p15_wg_body_dwords = (asm_text_len / 4) - (p15_wg_gate_pos + 3)
+    asm_patch_u32(p15_wg_gate_pos + 2, 0xBFA20000 | (p15_wg_body_dwords & 0xFFFF))
+}
+
 // ── Phase 5 inline ISA emitter ────────────────────────────────────────────
 //
 // _emit_phase5_qkv_split_qknorm_rope_inline — emits the 3-way head-per-WG
@@ -4459,11 +4607,15 @@ fn mega_emit_stub_kernel_speck4(uint64 kname_ptr, uint64 nl, uint64 body_node) -
     uint64 mp7_cbranch_pos = asm_text_len / 4
     asm_s_cbranch_scc1(0)
 
-    // ── Phase 15: SiLU(gate)*up × M_EFF in-place over gu_scratch ─────────
-    // Slice 4.20.0: stub.  Slice 4.20.6 wraps the elem-strided silu_mul
-    // body in a 4-iteration m-loop; per-m base = m * 2*FF*4 bytes.
+    // ── Phase 15: SiLU(gate)*up × M_EFF in-place over gu_scratch_4 ───────
+    // Slice 4.20.6: wraps the elem-strided silu_mul body in a 4× static
+    // unroll; per-m gu_scratch_4 base advances by m*N_OUT*4 = m*24576 bytes
+    // (N_OUT = 2*FF = 6144, the gate_up output row stride).  WG gate (s28<256)
+    // and per-lane gate (idx<FF=3072) emitted ONCE outside the unroll —
+    // both predicates are m-independent.  See _emit_silu_mul_elem_strided_m4_inline
+    // for the SGPR/VGPR layout.
     if _body_has_marker(body_node, "silu_mul_elem_strided_speck4_marker", 35) != 0 {
-        asm_u32(0xBF800000)   // s_nop 0 (phase 15 stub — slice 4.20.0)
+        _emit_silu_mul_elem_strided_m4_inline()
     } else {
         asm_u32(0xBF800000)   // s_nop 0 (phase 15 stub)
     }
