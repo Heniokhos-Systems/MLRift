@@ -72,10 +72,12 @@ static uint64 MEGA_FF                  = 3072
 static uint64 MEGA_USE_QKNORM          =    1     // Qwen3=1, Llama=0
 static uint64 MEGA_ROPE_PAIR_LAYOUT    =    0     // 0 = NEOX split-half (Qwen3),
                                                   // 1 = NORM consecutive-pair (Llama)
-static uint64 MEGA_RMSNORM_EPS_BITS    = 0x358637BD  // 1e-6 (Qwen3 phase-5 qknorm).
-                                                     // For phase 1/11 the eps bits
-                                                     // also depend on N=hidden;
-                                                     // see _arch_rmsnorm_eps_bits().
+static uint64 MEGA_RMSNORM_EPS_BITS    = 0x3727C5AC  // phase 1/11 RMSNorm eps.
+                                                     // Both Qwen3 and Llama use 1e-5
+                                                     // here. The phase-5 qknorm eps
+                                                     // (1e-6) is hardcoded in slice
+                                                     // 5.3 under the MEGA_USE_QKNORM
+                                                     // branch.
 
 // ── Slice 5.0 — arch setters + name-dispatch + bit-math helpers ───────────
 
@@ -87,7 +89,8 @@ fn mega_set_arch_qwen3_06b() {
     MEGA_FF              = 3072
     MEGA_USE_QKNORM      =    1
     MEGA_ROPE_PAIR_LAYOUT=    0
-    MEGA_RMSNORM_EPS_BITS= 0x358637BD   // 1e-6f
+    MEGA_RMSNORM_EPS_BITS= 0x3727C5AC   // 1e-5f (phase 1/11; phase-5 qknorm
+                                        // hardcodes 0x358637BD = 1e-6 in slice 5.3)
 }
 
 fn mega_set_arch_llama_1b() {
@@ -472,10 +475,10 @@ fn _emit_rmsnorm_wg_gated_inline(uint64 in_kofs, uint64 norm_kofs,
     asm_v_add_co_u32_vcc_sv(3, 2, 9)
     // v4 = input_hi + carry  (v4 was 0; reuse as carry target)
     asm_v_add_co_ci_u32_null_sv_vcc(4, 3, 4)
-    // s12 = 32   (SSQ loop counter)
-    asm_s_mov_b32_inline_imm(12, 32)
+    // s12 = HIDDEN/32   (SSQ loop counter — was hardcoded 32 for Qwen3 N=1024)
+    asm_s_mov_b32_inline_imm(12, MEGA_HIDDEN / 32)
 
-    // ── SSQ loop (32 iters: ssq += input[lane + i*32]^2) ───────────────
+    // ── SSQ loop (HIDDEN/32 iters: ssq += input[lane + i*32]^2) ────────
     // Loop runs while s12 > 0.  Per iteration: load, fmac, advance ptr,
     // decrement counter, compare-zero, branch-if-not-zero.
     uint64 loop_ssq_top = asm_text_len / 4   // dword index of loop top
@@ -519,17 +522,19 @@ fn _emit_rmsnorm_wg_gated_inline(uint64 in_kofs, uint64 norm_kofs,
     asm_s_mov_b32(12, 0x7E)
     // v_cmpx_eq_u32_e32 0, v0  (exec = {lanes where v0==0} = lane 0 only)
     asm_u32(0x7D940080)
-    // s_mov_b32 s14, 0x3A800000  (1/1024.0f = 0x3A800000)
-    asm_s_mov_b32_lit32(14, 0x3A800000)
-    // v_mul_f32 v2, s14, v2  (v2 = ssq / 1024)
+    // s_mov_b32 s14, _arch_inv_n_f32_bits(MEGA_HIDDEN)  (1/N.0f bits;
+    //   Qwen3 N=1024 → 0x3A800000, Llama N=2048 → 0x3A000000)
+    asm_s_mov_b32_lit32(14, _arch_inv_n_f32_bits(MEGA_HIDDEN))
+    // v_mul_f32 v2, s14, v2  (v2 = ssq / N)
     // VOP2: (8<<25)|(2<<17)|(2<<9)|14 = 0x10000000|0x00040000|0x00000400|14 = 0x1004040E
     asm_u32(0x1004040E)
-    // s_mov_b32 s14, 0x3727C5AC  (eps = 1e-5f bits)
-    asm_s_mov_b32_lit32(14, 0x3727C5AC)
-    // v_add_f32 v2, s14, v2  (v2 = ssq/1024 + eps)
+    // s_mov_b32 s14, MEGA_RMSNORM_EPS_BITS  (eps; 1e-5f = 0x3727C5AC for both
+    //   Qwen3 phase 1/11 and Llama)
+    asm_s_mov_b32_lit32(14, MEGA_RMSNORM_EPS_BITS)
+    // v_add_f32 v2, s14, v2  (v2 = ssq/N + eps)
     // VOP2: (3<<25)|(2<<17)|(2<<9)|14 = 0x06000000|0x00040000|0x00000400|14 = 0x0604040E
     asm_u32(0x0604040E)
-    // v_rsq_f32 v2, v2  (v2 = rsqrt(ssq/1024+eps))
+    // v_rsq_f32 v2, v2  (v2 = rsqrt(ssq/N+eps))
     // VOP1: (0x3F<<25)|(2<<17)|(0x2E<<9)|(0x100|2)
     //   = 0x7E000000|0x00040000|0x00005C00|0x102 = 0x7E045D02
     asm_u32(0x7E045D02)
@@ -567,8 +572,8 @@ fn _emit_rmsnorm_wg_gated_inline(uint64 in_kofs, uint64 norm_kofs,
     asm_v_mov_b32_inline_u(8, 0)
     asm_v_add_co_u32_vcc_sv(7, 6, 9)
     asm_v_add_co_ci_u32_null_sv_vcc(8, 7, 8)
-    // s12 = 32  (output loop counter)
-    asm_s_mov_b32_inline_imm(12, 32)
+    // s12 = HIDDEN/32  (output loop counter — was hardcoded 32 for Qwen3 N=1024)
+    asm_s_mov_b32_inline_imm(12, MEGA_HIDDEN / 32)
 
     uint64 loop_out_top = asm_text_len / 4
 
