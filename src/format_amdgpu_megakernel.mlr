@@ -1579,12 +1579,13 @@ fn _emit_phase9_gemv_residual_inline(uint64 n_out, uint64 k, uint64 k_pad,
 //             b_mid_g_4[m*HIDDEN + row] =
 //                 in_residual_4[m*HIDDEN + row] + accm           (m=0..3)
 //
-// Stream stride layout (NOTE: input and output strides DIFFER, unlike
-// phase-3 m4 where both were derivable from k and n_out separately but
-// the input was unpadded HIDDEN):
-//   x   stream stride = k    *4 = 2048*4 = 8192 bytes  (Q_DIM)
-//   out stream stride = n_out*4 = 1024*4 = 4096 bytes  (HIDDEN)
-//   res stream stride = n_out*4 = 4096 bytes (same as out — both are HIDDEN-shaped)
+// Stream stride layout (slice 4.20.7: now caller-supplied via 3 explicit
+// parameters — phase 9 and phase 17 both reuse this emitter but disagree
+// on the x-stream stride):
+//   phase 9 (oproj):  x=k*4=8192,    res=n_out*4=4096, out=n_out*4=4096
+//   phase 17 (down):  x=2*FF*4=24576 (gu_scratch_4 row stride is 2*FF
+//                     even though only first FF elements are read),
+//                     res=n_out*4=4096, out=n_out*4=4096
 //
 // SGPR layout (matches base phase 9 + reuses sdata pair 9 = s[18:19] for res):
 //   s[0:1]   = kernarg ptr (untouched)
@@ -1629,12 +1630,17 @@ fn _emit_phase9_gemv_residual_inline(uint64 n_out, uint64 k, uint64 k_pad,
 fn _emit_phase9_gemv_residual_m4_inline(uint64 n_out, uint64 k, uint64 k_pad,
                                          uint64 wg_active,
                                          uint64 w_kofs, uint64 x_kofs,
-                                         uint64 res_kofs, uint64 out_kofs) {
-    // Per-stream byte strides:
-    //   x stream stride  = k    *4 (Q_DIM-shaped)
-    //   out stream stride= n_out*4 (HIDDEN-shaped — same for residual)
-    uint64 x_stream_stride   = k * 4
-    uint64 out_stream_stride = n_out * 4
+                                         uint64 res_kofs, uint64 out_kofs,
+                                         uint64 x_stream_stride_bytes,
+                                         uint64 res_stream_stride_bytes,
+                                         uint64 out_stream_stride_bytes) {
+    // Per-stream byte strides (slice 4.20.7: caller-supplied — phase 9 uses
+    // k*4 / n_out*4 / n_out*4; phase 17 uses 2*FF*4 (24576) / n_out*4 / n_out*4
+    // because gu_scratch_4 rows are 2*FF wide even though down_w only reads
+    // the first FF elements per row).
+    uint64 x_stream_stride   = x_stream_stride_bytes
+    uint64 res_stream_stride = res_stream_stride_bytes
+    uint64 out_stream_stride = out_stream_stride_bytes
 
     // ── WG gate (skip if wg_id >= wg_active) — read from s28, NOT s15 ────
     // s_cmp_ge_u32 s28, wg_active: word = 0xBF09FF1C
@@ -1806,14 +1812,14 @@ fn _emit_phase9_gemv_residual_m4_inline(uint64 n_out, uint64 k, uint64 k_pad,
     asm_u32(0xDC6A0000)
     asm_u32(((out_lo & 0x7F) << 16) | (2 << 8) | 1)
 
-    // ── Stream 1: out += stride, res += stride; store v13 ─────────────────
+    // ── Stream 1: out += out_stride, res += res_stride; store v13 ────────
     // s_add_u32 out_lo, out_lo, lit (lit = out_stream_stride)
     asm_u32(0x80000000 | (out_lo << 16) | (0xFF << 8) | out_lo)
     asm_u32(out_stream_stride)
     asm_u32(0x82000000 | (out_hi << 16) | 0x8000 | out_hi)
-    // s_add_u32 res_lo, res_lo, lit
+    // s_add_u32 res_lo, res_lo, lit (lit = res_stream_stride)
     asm_u32(0x80000000 | (res_lo << 16) | (0xFF << 8) | res_lo)
-    asm_u32(out_stream_stride)
+    asm_u32(res_stream_stride)
     asm_u32(0x82000000 | (res_hi << 16) | 0x8000 | res_hi)
     // global_load_b32 v9, v1, s[res_lo:res_hi]
     asm_u32(0xDC520000)
@@ -1826,12 +1832,12 @@ fn _emit_phase9_gemv_residual_m4_inline(uint64 n_out, uint64 k, uint64 k_pad,
     asm_u32(0xDC6A0000)
     asm_u32(((out_lo & 0x7F) << 16) | (13 << 8) | 1)
 
-    // ── Stream 2: out += stride, res += stride; store v14 ─────────────────
+    // ── Stream 2: out += out_stride, res += res_stride; store v14 ────────
     asm_u32(0x80000000 | (out_lo << 16) | (0xFF << 8) | out_lo)
     asm_u32(out_stream_stride)
     asm_u32(0x82000000 | (out_hi << 16) | 0x8000 | out_hi)
     asm_u32(0x80000000 | (res_lo << 16) | (0xFF << 8) | res_lo)
-    asm_u32(out_stream_stride)
+    asm_u32(res_stream_stride)
     asm_u32(0x82000000 | (res_hi << 16) | 0x8000 | res_hi)
     asm_u32(0xDC520000)
     asm_u32((9 << 24) | ((res_lo & 0x7F) << 16) | 1)
@@ -1842,12 +1848,12 @@ fn _emit_phase9_gemv_residual_m4_inline(uint64 n_out, uint64 k, uint64 k_pad,
     asm_u32(0xDC6A0000)
     asm_u32(((out_lo & 0x7F) << 16) | (14 << 8) | 1)
 
-    // ── Stream 3: out += stride, res += stride; store v15 ─────────────────
+    // ── Stream 3: out += out_stride, res += res_stride; store v15 ────────
     asm_u32(0x80000000 | (out_lo << 16) | (0xFF << 8) | out_lo)
     asm_u32(out_stream_stride)
     asm_u32(0x82000000 | (out_hi << 16) | 0x8000 | out_hi)
     asm_u32(0x80000000 | (res_lo << 16) | (0xFF << 8) | res_lo)
-    asm_u32(out_stream_stride)
+    asm_u32(res_stream_stride)
     asm_u32(0x82000000 | (res_hi << 16) | 0x8000 | res_hi)
     asm_u32(0xDC520000)
     asm_u32((9 << 24) | ((res_lo & 0x7F) << 16) | 1)
@@ -1862,20 +1868,21 @@ fn _emit_phase9_gemv_residual_m4_inline(uint64 n_out, uint64 k, uint64 k_pad,
     asm_u32(0x8C7E117E)
 
     // ── Restore out_ptr + res_ptr ────────────────────────────────────────
-    // Total added: row*4 (s14) + 3 × stream_stride to each of out and res.
+    // Total added: row*4 (s14) + 3 × out_stream_stride to out;
+    //              row*4 (s14) + 3 × res_stream_stride to res.
     // s_sub_u32 out_lo, out_lo, s14
     asm_u32(0x80800000 | (out_lo << 16) | (0x0E << 8) | out_lo)
     asm_u32(0x82800000 | (out_hi << 16) | 0x8000 | out_hi)
-    // s_sub_u32 out_lo, out_lo, lit (3 * stream_stride)
+    // s_sub_u32 out_lo, out_lo, lit (3 * out_stream_stride)
     asm_u32(0x80800000 | (out_lo << 16) | (0xFF << 8) | out_lo)
     asm_u32(3 * out_stream_stride)
     asm_u32(0x82800000 | (out_hi << 16) | 0x8000 | out_hi)
     // s_sub_u32 res_lo, res_lo, s14
     asm_u32(0x80800000 | (res_lo << 16) | (0x0E << 8) | res_lo)
     asm_u32(0x82800000 | (res_hi << 16) | 0x8000 | res_hi)
-    // s_sub_u32 res_lo, res_lo, lit (3 * stream_stride)
+    // s_sub_u32 res_lo, res_lo, lit (3 * res_stream_stride)
     asm_u32(0x80800000 | (res_lo << 16) | (0xFF << 8) | res_lo)
-    asm_u32(3 * out_stream_stride)
+    asm_u32(3 * res_stream_stride)
     asm_u32(0x82800000 | (res_hi << 16) | 0x8000 | res_hi)
 
     // ── Outer loop advance ────────────────────────────────────────────────
@@ -4563,7 +4570,8 @@ fn mega_emit_stub_kernel_speck4(uint64 kname_ptr, uint64 nl, uint64 body_node) -
     // wg_id_x is read from s28 (saved in prologue; phase 5 clobbered s15).
     if _body_has_marker(body_node, "oproj_residual_speck4_marker", 28) != 0 {
         _emit_phase9_gemv_residual_m4_inline(1024, 2048, 2176, 256,
-                                              0x18, 0xB0, 0x00, 0xA0)
+                                              0x18, 0xB0, 0x00, 0xA0,
+                                              8192, 4096, 4096)
     } else {
         asm_u32(0xBF800000)   // s_nop 0 (phase 9 stub)
     }
@@ -4628,7 +4636,20 @@ fn mega_emit_stub_kernel_speck4(uint64 kname_ptr, uint64 nl, uint64 body_node) -
     // [m, 0..2*FF]-block).  Phase 17 is the LAST phase — no trailing
     // mega_emit_barrier_isa(8, ...).
     if _body_has_marker(body_node, "down_residual_speck4_marker", 27) != 0 {
-        asm_u32(0xBF800000)   // s_nop 0 (phase 17 stub — slice 4.20.0)
+        // Slice 4.20.7: phase-17 reuses the slice-4.20.5 phase-9 m4
+        // gemv-residual emitter with phase-17's strides.  Shape:
+        // (n_out=HIDDEN=1024, k=FF=3072, k_pad=FF_PAD=3200, wg_active=256).
+        // Kernarg layout: w=down_w(arg 5, byte 0x28),
+        // x=gu_scratch_4(arg 16, byte 0x80),
+        // res=b_mid_g_4(arg 20, byte 0xA0),
+        // out=out_residual_4(arg 1, byte 0x08).
+        // Stream strides: x=24576 (=2*FF*4 — gu_scratch_4 rows are 2*FF
+        // wide because phase 13 wrote the gate||up concat there, even
+        // though down_w only reads the first FF elements per row),
+        // res=4096 (=HIDDEN*4), out=4096 (=HIDDEN*4).
+        _emit_phase9_gemv_residual_m4_inline(1024, 3072, 3200, 256,
+                                              0x28, 0x80, 0xA0, 0x08,
+                                              24576, 4096, 4096)
     } else {
         asm_u32(0xBF800000)   // s_nop 0 (phase 17 stub)
     }
