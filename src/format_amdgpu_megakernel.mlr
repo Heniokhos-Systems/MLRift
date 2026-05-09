@@ -157,6 +157,19 @@ fn _emit_s_cmp_lt_u32_lit(uint64 sgpr, uint64 v) {
     }
 }
 
+// 1/sqrt(n) f32 bits for n a power of 2 in {64, 128, 256, ...}.
+//   n= 64: 1/8       = 0x3D000000
+//   n=128: 1/sqrt(128) ≈ 0x3DB504F3
+//   n=256: 1/16      = 0x3C800000
+fn _arch_inv_sqrt_pow2_f32_bits(uint64 n) -> uint64 {
+    if n ==  64 { return 0x3D000000 }
+    if n == 128 { return 0x3DB504F3 }
+    if n == 256 { return 0x3C800000 }
+    write(2, "_arch_inv_sqrt_pow2_f32_bits: unsupported n\n", 44)
+    exit(1)
+    return 0
+}
+
 // Name-dispatcher: examines the kernel name and selects the correct arch
 // preset.  Called at the top of recognize_megakernel_swiglu_dense_gqa{,_speck4}
 // so the recognizer/emitter pipeline always operates on a consistent set of
@@ -3314,15 +3327,24 @@ fn _emit_phase5_qkv_split_qknorm_rope_speck4_inline() {
 //   log2_e     = 1.4426950408 = 0x3FB8AA3B (used for v_exp_f32 = exp2 input)
 //   neg_inf_init = -1e30 = 0xF149F2CA  (HIP source: float m = -1e30f)
 fn _emit_phase7_attn_decode_coop_inline() {
+    // ── Arch-derived shape locals (slice 5.4) ───────────────────────────
+    uint64 head_off_shift     = _arch_log2_pow2(MEGA_HEAD_DIM * 4)            // log2(HEAD_DIM*4)
+    uint64 q_to_kv_shift      = _arch_log2_pow2(MEGA_N_HEADS / MEGA_N_KV_HEADS) // GQA ratio
+    uint64 out_per_wg_bytes_shift = _arch_log2_pow2(MEGA_HEAD_DIM)            // = log2(OUT_PER_WG*4) = log2(HEAD_DIM)
+    uint64 kv_off_shift       = _arch_log2_pow2(MEGA_N_KV_HEADS * MEGA_HEAD_DIM * 4)  // log2(KV_DIM*4)
+    uint64 outer_cap          = MEGA_N_HEADS * 4    // ATTN_COOP=4 invariant
+    uint64 chunk_count        = MEGA_HEAD_DIM / 4   // inner-dot chunk count
+    uint64 inv_sqrt_head_bits = _arch_inv_sqrt_pow2_f32_bits(MEGA_HEAD_DIM)
+    uint64 out_per_wg         = MEGA_HEAD_DIM / 4   // pass-3 lane gate cap
+
     // ── Outer gate: skip if wg_id >= 64 ─────────────────────────────────
     // Use s28 (saved wg_id_x) NOT s15 — phase 5 clobbers s15 with the high
     // half of the rope_sin pointer (s_load_b64 s[14:15], 0x58), so by the
     // time phase 7 runs s15 is garbage.  s28 was set in the kernel prologue
     // from the original wg_id_x.
-    // s_cmp_ge_u32 s28, 64: SOPC op=0x09, ssrc1=inline 64=0xC0
-    //   word = 0xBF000000|(9<<16)|(0xC0<<8)|0x1C = 0xBF09C01C
+    // s_cmp_ge_u32 s28, outer_cap: SOPC op=0x09 (Qwen3 outer_cap=64 → 0xBF09C01C)
     uint64 outer_gate_pos = asm_text_len / 4
-    asm_u32(0xBF09C01C)
+    _emit_s_cmp_ge_u32_lit(28, outer_cap)
     asm_s_cbranch_scc1(0)        // patched at .phase7_done
 
     // ── Compute q_head, coop_idx, kv_head from saved wg_id (s28) ────────
@@ -3334,10 +3356,10 @@ fn _emit_phase7_attn_decode_coop_inline() {
     // s_and_b32 s18, s28, 3: SOP2 op 0x16
     //   word = (2<<30)|(0x16<<23)|(0x12<<16)|(0x83<<8)|0x1C = 0x8B12831C
     asm_u32(0x8B12831C)
-    // s19 = q_head >> 1 = s16 >> 1  (kv_head)
-    // s_lshr_b32 s19, s16, 1: op 0x0A; ssrc0=s16=0x10, ssrc1=inline 1=0x81
-    //   word = (2<<30)|(0x0A<<23)|(0x13<<16)|(0x81<<8)|0x10 = 0x85138110
-    asm_u32(0x85138110)
+    // s19 = q_head >> q_to_kv_shift = kv_head  (Qwen3 shift=1 → 0x85138110)
+    // s_lshr_b32 s19, s16, q_to_kv_shift: op 0x0A; ssrc0=s16=0x10, ssrc1=inline (0x80+shift)
+    uint64 q_to_kv_inline = 0x80 + q_to_kv_shift
+    asm_u32(0x85130010 | (q_to_kv_inline << 8))
 
     // ── Load kernarg pointers ───────────────────────────────────────────
     // s_load_b64 s[2:3], s[0:1], 0x98   (b_attn_q_g, arg 19)
@@ -3353,16 +3375,13 @@ fn _emit_phase7_attn_decode_coop_inline() {
     asm_s_waitcnt_lgkmcnt_zero()
 
     // ── Compute byte offsets and add to base pointers ───────────────────
-    // s20 = q_head * 512 = s16 << 9
-    // s_lshl_b32 s20, s16, 9: SOP2 op 0x08, sdst=0x14, ssrc0=s16=0x10, ssrc1=inline 9=0x89
-    //   word = (2<<30)|(8<<23)|(0x14<<16)|(0x89<<8)|0x10 = 0x84148910
-    asm_u32(0x84148910)
-    // s21 = kv_head * 512 = s19 << 9
-    //   word = (2<<30)|(8<<23)|(0x15<<16)|(0x89<<8)|0x13 = 0x84158913
-    asm_u32(0x84158913)
-    // s22 = coop_idx * 128 = s18 << 7
-    //   word = (2<<30)|(8<<23)|(0x16<<16)|(0x87<<8)|0x12 = 0x84168712
-    asm_u32(0x84168712)
+    // s20 = q_head * HEAD_DIM*4 = s16 << head_off_shift (Qwen3 shift=9 → 0x84148910)
+    asm_u32(0x84140010 | ((0x80 + head_off_shift) << 8))
+    // s21 = kv_head * HEAD_DIM*4 = s19 << head_off_shift (Qwen3 → 0x84158913)
+    asm_u32(0x84150013 | ((0x80 + head_off_shift) << 8))
+    // s22 = coop_idx * OUT_PER_WG*4 = s18 << out_per_wg_bytes_shift
+    //   OUT_PER_WG*4 = HEAD_DIM, so shift = log2(HEAD_DIM) (Qwen3 shift=7 → 0x84168712)
+    asm_u32(0x84160012 | ((0x80 + out_per_wg_bytes_shift) << 8))
 
     // s2 = s2 + s20  (b_attn_q_g += q_head*512); s3 += carry
     // SOP2 op 0 (s_add_u32): word = 0x80000000|(0x02<<16)|(0x14<<8)|0x02 = 0x80021402
@@ -3428,8 +3447,8 @@ fn _emit_phase7_attn_decode_coop_inline() {
     uint64 pass1_execz_pos = asm_text_len / 4
     asm_s_cbranch_execz(0)        // patched after the body
 
-    // ── k_byte_off (lo) = v21 << 12 → v10 ────────────────────────────────
-    asm_v_lshlrev_b32_imm(10, 12, 21)
+    // ── k_byte_off (lo) = v21 << kv_off_shift → v10 (Qwen3 shift=12) ─────
+    asm_v_lshlrev_b32_imm(10, kv_off_shift, 21)
 
     // v[5:6] = s[4:5] + (v10, 0)
     asm_v_add_co_u32_vcc_sv(5, 4, 10)
@@ -3447,9 +3466,9 @@ fn _emit_phase7_attn_decode_coop_inline() {
     // ── v20 = 0 (dot accumulator) ────────────────────────────────────────
     asm_v_mov_b32_inline_u(20, 0)
 
-    // ── Inner dot: 32 chunks × 4 fmacs = 128-elem dot ────────────────────
+    // ── Inner dot: chunk_count chunks × 4 fmacs = HEAD_DIM-elem dot ──────
     uint64 chunk = 0
-    while chunk < 32 {
+    while chunk < chunk_count {
         uint64 off = chunk * 16
         // global_load_b128 v[12:15], v[3:4], off  offset:(off)
         // word1 = 0xDC5E0000 | (off & 0xFFFF), word2 = (vdst<<24)|(0x7C<<16)|vaddr_lo
@@ -3468,12 +3487,12 @@ fn _emit_phase7_attn_decode_coop_inline() {
         chunk = chunk + 1
     }
 
-    // ── v20 *= scale_attn (= 0x3DB504F3) ─────────────────────────────────
+    // ── v20 *= scale_attn (= 1/sqrt(HEAD_DIM); Qwen3 0x3DB504F3) ─────────
     // v_mul_f32_e32 v20, lit, v20  — VOP2 op 0x08, src0=0xFF (lit32 follows)
     //   word = (8<<25)|(20<<17)|(20<<9)|0xFF = 0x10000000|0x00280000|0x00002800|0xFF = 0x102828FF
     //   (verified via llvm-mc gfx1100)
     asm_u32(0x102828FF)
-    asm_u32(0x3DB504F3)
+    asm_u32(inv_sqrt_head_bits)
 
     // ── m = max(m, dot)  → v_max_f32_e32 v2, v2, v20 ─────────────────────
     // VOP2 op 0x10: word = 0x20000000|(2<<17)|(20<<9)|(0x100|2) = 0x20042902
@@ -3541,8 +3560,8 @@ fn _emit_phase7_attn_decode_coop_inline() {
     uint64 pass2_execz_pos = asm_text_len / 4
     asm_s_cbranch_execz(0)
 
-    // k offset, k ptr (same as pass 1)
-    asm_v_lshlrev_b32_imm(10, 12, 21)
+    // k offset, k ptr (same as pass 1; Qwen3 kv_off_shift=12)
+    asm_v_lshlrev_b32_imm(10, kv_off_shift, 21)
     asm_v_add_co_u32_vcc_sv(5, 4, 10)
     asm_v_mov_b32_inline_u(6, 0)
     asm_v_add_co_ci_u32_null_sv_vcc(6, 5, 6)
@@ -3553,7 +3572,7 @@ fn _emit_phase7_attn_decode_coop_inline() {
     asm_v_mov_b32_inline_u(20, 0)
 
     chunk = 0
-    while chunk < 32 {
+    while chunk < chunk_count {
         uint64 off = chunk * 16
         asm_u32(0xDC5E0000 | (off & 0xFFFF))
         asm_u32(0x0C7C0003)
@@ -3586,7 +3605,7 @@ fn _emit_phase7_attn_decode_coop_inline() {
     // src1_neg would set bit 30, src0_neg bit 29.
     asm_u32(0xD6130014)
     asm_u32(0x80000000 | (0x102 << 18) | (0x114 << 9) | 0xFF)
-    asm_u32(0x3DB504F3)
+    asm_u32(inv_sqrt_head_bits)
 
     // ── exp_arg *= log2_e (= 0x3FB8AA3B) ────────────────────────────────
     // v_mul_f32_e32 v20, lit, v20  (verified via llvm-mc gfx1100: 0x102828FF + lit)
