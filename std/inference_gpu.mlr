@@ -1625,6 +1625,68 @@ fn gpu_cache_bf16_as_f32(u64 w_bf16_host, u64 N) -> u64 {
     return d_f32
 }
 
+// Slice 6.7c — parallel cache for 1D F32 norm-weight arrays (Llama
+// stores attn_norm.weight as F32, not bf16).  Maps host f32 ptr →
+// device f32 ptr.  Plain hipMemcpy on first lookup (no dequant), cached
+// thereafter.  Separate table from the bf16 gamma cache so host-ptr key
+// collisions across drivers in the same process can't cross-resolve.
+static u64 _gpu_f32_norm_cache_keys = 0
+static u64 _gpu_f32_norm_cache_vals = 0
+static u64 _gpu_f32_norm_cache_n    = 0
+
+fn _gpu_f32_norm_cache_init() {
+    if _gpu_f32_norm_cache_keys != 0 { return }
+    _gpu_f32_norm_cache_keys = alloc(_gpu_mm_cache_cap * 8)
+    _gpu_f32_norm_cache_vals = alloc(_gpu_mm_cache_cap * 8)
+    _gpu_f32_norm_cache_n = 0
+}
+
+fn _gpu_f32_norm_cache_lookup(u64 w_f32) -> u64 {
+    u64 i = 0
+    while i < _gpu_f32_norm_cache_n {
+        u64 kp = _gpu_f32_norm_cache_keys + i * 8
+        u64 k = 0; unsafe { *(kp as u64) -> k }
+        if k == w_f32 {
+            u64 vp = _gpu_f32_norm_cache_vals + i * 8
+            u64 v = 0; unsafe { *(vp as u64) -> v }
+            return v
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// Cache a 1D F32 array as a device f32 buffer (no dequant, plain copy).
+// For rmsnorm gamma weights stored as F32 in GGUF (Llama, etc).
+// Returns the device VA of the f32 copy, or 0 on failure.  Subsequent
+// calls with the same host ptr hit the cache.
+fn gpu_cache_f32_as_f32(u64 w_f32_host, u64 N) -> u64 {
+    if gpu_matmul_enabled() == 0 { return 0 }
+    _gpu_f32_norm_cache_init()
+
+    u64 cached = _gpu_f32_norm_cache_lookup(w_f32_host)
+    if cached != 0 { return cached }
+
+    // Alloc device f32 dest, then plain hipMemcpy H2D.
+    u64 d_f32 = 0
+    u64 slot = alloc(8)
+    u32 err = hipMalloc(slot, N * 4)
+    if err != 0 { return 0 }
+    unsafe { *(slot as u64) -> d_f32 }
+    err = hipMemcpy(d_f32, w_f32_host, N * 4, 1)
+    if err != 0 { return 0 }
+
+    // Insert into cache.
+    if _gpu_f32_norm_cache_n < _gpu_mm_cache_cap {
+        u64 kp_g = _gpu_f32_norm_cache_keys + _gpu_f32_norm_cache_n * 8
+        u64 vp_g = _gpu_f32_norm_cache_vals + _gpu_f32_norm_cache_n * 8
+        unsafe { *(kp_g as u64) = w_f32_host }
+        unsafe { *(vp_g as u64) = d_f32 }
+        _gpu_f32_norm_cache_n = _gpu_f32_norm_cache_n + 1
+    }
+    return d_f32
+}
+
 // Probe whether the full-GPU pipeline kernels loaded successfully.
 fn gpu_pipeline_ready() -> u64 {
     if _gpu_fh_resid_add == 0 { return 0 }
