@@ -81,6 +81,58 @@ fn eu64(u64 v) {
     dealloc(s)
 }
 
+// Slice 6.4 — Phase B PLD (Prompt Lookup Decoding) draft proposer.
+//
+// Scan the last LOOKBACK=64 tokens of seq_ids32 for an NGRAM=2 match
+// with the last 2 tokens of the sequence.  If found, write the next K
+// tokens AFTER the matched bigram into draft_out and return the count.
+// Else return 0.
+//
+// seq_ids32 : u32 array of token IDs (4 bytes each)
+// seq_len   : number of tokens currently in seq_ids32
+// draft_out : caller-allocated buffer of K * 4 bytes (u32 each)
+// K         : number of draft tokens to propose (<= M_EFF_S4 - 1 = 3)
+fn pld_propose(u64 seq_ids32, u64 seq_len, u64 draft_out, u64 K) -> u64 {
+    u64 NGRAM = 2
+    u64 LOOKBACK = 64
+    if seq_len < NGRAM + 1 { return 0 }
+    u32 last_a32 = 0
+    unsafe { *((seq_ids32 + (seq_len - 2) * 4) as u32) -> last_a32 }
+    u32 last_b32 = 0
+    unsafe { *((seq_ids32 + (seq_len - 1) * 4) as u32) -> last_b32 }
+    u64 last_a = last_a32
+    u64 last_b = last_b32
+    u64 scan_start = 0
+    if seq_len > LOOKBACK { scan_start = seq_len - LOOKBACK }
+    u64 i = scan_start
+    // i + NGRAM < seq_len so that i+1 is in-range and emit_start = i+2
+    // can read at least one token at index i+2 (still < seq_len).
+    while i + NGRAM < seq_len {
+        u32 v_a32 = 0
+        unsafe { *((seq_ids32 + i * 4) as u32) -> v_a32 }
+        u32 v_b32 = 0
+        unsafe { *((seq_ids32 + (i + 1) * 4) as u32) -> v_b32 }
+        u64 v_a = v_a32
+        u64 v_b = v_b32
+        if v_a == last_a {
+            if v_b == last_b {
+                u64 emit_start = i + NGRAM
+                u64 written = 0
+                while written < K {
+                    if emit_start + written >= seq_len { return written }
+                    u32 t = 0
+                    unsafe { *((seq_ids32 + (emit_start + written) * 4) as u32) -> t }
+                    unsafe { *((draft_out + written * 4) as u32) = t }
+                    written = written + 1
+                }
+                return written
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
 // Dequantise a Q8_0 tensor of `n_elements` total values into a freshly
 // allocated bf16 buffer (2 bytes per element).  Q8_0 layout: 32-element
 // blocks of [f16 scale | int8 qs[32]] = 34 bytes each.  Output bf16:
@@ -315,7 +367,10 @@ fn main() {
     u64 row_bytes  = row_blocks * 34
 
     u64 prompt_count = 2
-    u64 seq_cap = prompt_count + max_new
+    // Slice 6.4: speck4 path can append up to M_EFF_S4=4 tokens per outer
+    // iteration in the worst (all-accepted) case.  Pad seq_cap accordingly
+    // so the speculative write never escapes the buffer.
+    u64 seq_cap = prompt_count + max_new * 4 + 8
     u64 seq_ids32 = alloc(seq_cap * 4)
     u32 t0 = 128000   // BOS
     u32 t1 = 15339    // "hello"
@@ -455,6 +510,89 @@ fn main() {
         eu64(total_cache * 2); eout(" bytes total)\n")
     }
 
+    // ─── Slice 6.4 — Phase B speck4 PLD acceleration ────────────────────
+    // After each successful M=1 step (always correct), optionally fire a
+    // speck4 mega-kernel call (M_EFF=4) that processes the just-emitted
+    // token plus up to 3 PLD-proposed drafts in parallel.  Accept drafts
+    // whose predicted-next matches the proposed token.  Acceptance speeds
+    // up generation while preserving exact equality to the M=1 baseline.
+    //
+    // Buffer alloc uses hipMalloc (NOT dev_try_alloc_host_visible) so we
+    // don't trip the KFD ACQUIRE_VM collision that the M=1 path already
+    // consumed with its host-visible KV cache + ping-pong residuals.
+    u64 _native_mks4_env = getenv("MLRIFT_NATIVE_MEGAKERNEL_SPECK4")
+    u64 _native_mks4_use = 0
+    if _native_mks4_env != 0 {
+        u8 _nmc4 = 0; unsafe { *(_native_mks4_env as u8) -> _nmc4 }
+        if _nmc4 == 49 { _native_mks4_use = 1 }   // '1'
+        if _nmc4 == 50 { _native_mks4_use = 1 }   // '2'
+    }
+    // Unified flag: MLRIFT_NATIVE_MEGAKERNEL=2 also enables the speck4 path.
+    if _native_mk_env != 0 {
+        u8 _nmc = 0; unsafe { *(_native_mk_env as u8) -> _nmc }
+        if _nmc == 50 { _native_mks4_use = 1 }   // '2'
+    }
+    u64 M_EFF_S4         = 4
+    u64 d_in_residual_4  = 0
+    u64 d_out_residual_4 = 0
+    u64 d_b_x_norm_g_4   = 0
+    u64 d_b_qkv_g_4      = 0
+    u64 d_b_attn_q_g_4   = 0
+    u64 d_b_mid_g_4      = 0
+    u64 d_b_mid_norm_g_4 = 0
+    u64 d_b_attn_out_g_4 = 0
+    u64 d_gu_scratch_4   = 0
+    u64 d_rope_cos_4     = 0
+    u64 d_rope_sin_4     = 0
+    u64 draft_buf        = 0
+    u64 head_dim         = 64    // Llama-3.2-1B: q_dim=2048 / n_heads=32
+    if _native_mks4_use != 0 {
+        if gpu_llama_megakernel_speck4_ready() == 0 {
+            eout("[llama32_1b_gpu] MLRIFT_NATIVE_MEGAKERNEL_SPECK4 set but speck4 .co not loaded; speck4 path disabled\n")
+            _native_mks4_use = 0
+        } else {
+            if _native_mk_use == 0 {
+                eout("[llama32_1b_gpu] speck4 requires MLRIFT_NATIVE_MEGAKERNEL=1|2 (M=1 always-correct fallback); speck4 path disabled\n")
+                _native_mks4_use = 0
+            } else {
+                u64 qkv_dim_l = q_dim + 2 * kv_dim
+                u64 _slot = alloc(8)
+                u32 _err = 0
+                _err = hipMalloc(_slot, M_EFF_S4 * hidden * 4)
+                if _err == 0 { unsafe { *(_slot as u64) -> d_in_residual_4 } }
+                _err = hipMalloc(_slot, M_EFF_S4 * hidden * 4)
+                if _err == 0 { unsafe { *(_slot as u64) -> d_out_residual_4 } }
+                _err = hipMalloc(_slot, M_EFF_S4 * hidden * 4)
+                if _err == 0 { unsafe { *(_slot as u64) -> d_b_x_norm_g_4 } }
+                _err = hipMalloc(_slot, M_EFF_S4 * qkv_dim_l * 4)
+                if _err == 0 { unsafe { *(_slot as u64) -> d_b_qkv_g_4 } }
+                _err = hipMalloc(_slot, M_EFF_S4 * q_dim * 4)
+                if _err == 0 { unsafe { *(_slot as u64) -> d_b_attn_q_g_4 } }
+                _err = hipMalloc(_slot, M_EFF_S4 * hidden * 4)
+                if _err == 0 { unsafe { *(_slot as u64) -> d_b_mid_g_4 } }
+                _err = hipMalloc(_slot, M_EFF_S4 * hidden * 4)
+                if _err == 0 { unsafe { *(_slot as u64) -> d_b_mid_norm_g_4 } }
+                _err = hipMalloc(_slot, M_EFF_S4 * q_dim * 4)
+                if _err == 0 { unsafe { *(_slot as u64) -> d_b_attn_out_g_4 } }
+                _err = hipMalloc(_slot, M_EFF_S4 * 2 * ff * 4)
+                if _err == 0 { unsafe { *(_slot as u64) -> d_gu_scratch_4 } }
+                _err = hipMalloc(_slot, M_EFF_S4 * (head_dim / 2) * 4)
+                if _err == 0 { unsafe { *(_slot as u64) -> d_rope_cos_4 } }
+                _err = hipMalloc(_slot, M_EFF_S4 * (head_dim / 2) * 4)
+                if _err == 0 { unsafe { *(_slot as u64) -> d_rope_sin_4 } }
+                dealloc(_slot)
+                draft_buf = alloc((M_EFF_S4 - 1) * 4)   // host-side u32 draft IDs
+                if d_in_residual_4 == 0 || d_out_residual_4 == 0 || d_b_qkv_g_4 == 0 ||
+                   d_gu_scratch_4 == 0 || d_rope_cos_4 == 0 || d_rope_sin_4 == 0 || draft_buf == 0 {
+                    eout("[llama32_1b_gpu] speck4 buffer alloc FAILED; speck4 path disabled\n")
+                    _native_mks4_use = 0
+                } else {
+                    eout("[llama32_1b_gpu] speck4 path ENABLED (M=1 always-correct + PLD-K=3 acceleration)\n")
+                }
+            }
+        }
+    }
+
     // Smoke-test the GPU matmul on a single layer-0 q-proj BEFORE the
     // prefill, so any KFD / dispatch failure surfaces with a clear log
     // (instead of mid-prefill where it looks like a forward-layer bug).
@@ -538,6 +676,10 @@ fn main() {
     qwen3_profile_reset()
     u64 step = 0
     u64 decode_start_ns = time_now()
+    // Slice 6.4 — speck4 acceptance metrics.
+    u64 total_steps         = 0
+    u64 total_speck4_calls  = 0
+    u64 total_accepted      = 0
     while step < max_new {
         u64 step_start_ns = time_now()
         eout("step "); eu64(step); eout(" pos="); eu64(pos); eout("\n")
@@ -614,6 +756,205 @@ fn main() {
         gguf_deq_q8_0(x_cur, embed_base + best_id * row_bytes, hidden)
         pos = pos + 1
         step = step + 1
+        total_steps = total_steps + 1
+
+        // ─── Slice 6.4 — speck4 PLD acceleration step ─────────────────
+        // After every M=1 step (which is always correct), opportunistically
+        // run a speck4 mega-kernel call (M_EFF=4) to verify up to 3 PLD-
+        // proposed draft tokens.  Every accepted draft advances pos+step
+        // by 1 without an additional M=1 forward.
+        if step < max_new {
+            if _native_mks4_use != 0 {
+                u64 draft_n = pld_propose(seq_ids32, seq_len, draft_buf, M_EFF_S4 - 1)
+                if draft_n > 0 {
+                    total_speck4_calls = total_speck4_calls + 1
+
+                    // ── Stage per-stream input embeddings into d_in_residual_4 ──
+                    // Stream 0 = best_id (just-emitted); stream m>=1 = draft[m-1].
+                    u64 host_in_4 = alloc(M_EFF_S4 * hidden * 4)
+                    u64 m_in = 0
+                    while m_in < M_EFF_S4 {
+                        u64 tok = best_id
+                        if m_in >= 1 {
+                            if m_in - 1 < draft_n {
+                                u32 dt32 = 0
+                                unsafe { *((draft_buf + (m_in - 1) * 4) as u32) -> dt32 }
+                                tok = dt32
+                            } else {
+                                // Past the drafted prefix — pad with the just-emitted
+                                // token so the kernel still runs M_EFF=4 streams
+                                // without reading from invalid embedding rows.
+                                tok = best_id
+                            }
+                        }
+                        u64 dst_m = host_in_4 + m_in * hidden * 4
+                        gguf_deq_q8_0(dst_m, embed_base + tok * row_bytes, hidden)
+                        m_in = m_in + 1
+                    }
+                    u32 cerr_in = hipMemcpy(d_in_residual_4, host_in_4, M_EFF_S4 * hidden * 4, 1)
+                    dealloc(host_in_4)
+                    if cerr_in != 0 {
+                        eout("[llama32_1b_gpu] speck4 in_resid H2D fail; speck4 path disabled\n")
+                        _native_mks4_use = 0
+                    } else {
+                        // ── Compute per-stream RoPE cos/sin tables ──
+                        // Stream m's K/V write position is pos + m (pos was just
+                        // incremented above to the NEXT position).  Theta = 5e5
+                        // for Llama-3.x (qwen3_set_rope_base(500000) at top).
+                        u64 host_cos_4 = alloc(M_EFF_S4 * (head_dim / 2) * 4)
+                        u64 host_sin_4 = alloc(M_EFF_S4 * (head_dim / 2) * 4)
+                        u64 mr = 0
+                        f64 theta_l = 500000.0
+                        while mr < M_EFF_S4 {
+                            u64 c_m = host_cos_4 + mr * (head_dim / 2) * 4
+                            u64 s_m = host_sin_4 + mr * (head_dim / 2) * 4
+                            qwen3_rope_compute(c_m, s_m, pos + mr, head_dim, theta_l)
+                            mr = mr + 1
+                        }
+                        u32 cerr_c = hipMemcpy(d_rope_cos_4, host_cos_4, M_EFF_S4 * (head_dim / 2) * 4, 1)
+                        u32 cerr_s = 0
+                        if cerr_c == 0 {
+                            cerr_s = hipMemcpy(d_rope_sin_4, host_sin_4, M_EFF_S4 * (head_dim / 2) * 4, 1)
+                        }
+                        dealloc(host_cos_4); dealloc(host_sin_4)
+                        if cerr_c != 0 {
+                            eout("[llama32_1b_gpu] speck4 rope_cos H2D fail; speck4 path disabled\n")
+                            _native_mks4_use = 0
+                        } else if cerr_s != 0 {
+                            eout("[llama32_1b_gpu] speck4 rope_sin H2D fail; speck4 path disabled\n")
+                            _native_mks4_use = 0
+                        } else {
+                            // ── Run all 16 layers via the speck4 mega-kernel ──
+                            u64 hidden_pad_l = hidden + 128
+                            u64 q_dim_pad_l  = q_dim  + 128
+                            u64 ff_pad_l     = ff     + 128
+                            u64 qkv_dim_l    = q_dim + 2 * kv_dim
+                            u64 d_barrier_dev  = qwen3_gpu_get_megak_barrier_dev()
+                            u64 d_barrier_host = qwen3_gpu_get_megak_barrier_host()
+                            u64 d_in_4_cur  = d_in_residual_4
+                            u64 d_out_4_cur = d_out_residual_4
+                            u64 sl_ok = 1
+                            u64 layer_s = 0
+                            while layer_s < n_layers {
+                                Qwen3LayerWeights w_s = layers_arr + layer_s * 88
+                                u64 kc_s = k_cache_dev + layer_s * layer_stride
+                                u64 vc_s = v_cache_dev + layer_s * layer_stride
+                                u64 d_qkv_w_s     = gpu_get_or_upload_bf16_weight_padded(w_s.q_proj_w,    hidden, qkv_dim_l, hidden_pad_l)
+                                u64 d_o_w_s       = gpu_get_or_upload_bf16_weight_padded(w_s.o_proj_w,    q_dim,  hidden,    q_dim_pad_l)
+                                u64 d_gate_up_w_s = gpu_get_or_upload_bf16_weight_padded(w_s.gate_proj_w, hidden, 2 * ff,    hidden_pad_l)
+                                u64 d_down_w_s    = gpu_get_or_upload_bf16_weight_padded(w_s.down_proj_w, ff,     hidden,    ff_pad_l)
+                                u64 d_in_g_s      = gpu_cache_bf16_as_f32(w_s.input_norm_w, hidden)
+                                u64 d_post_g_s    = gpu_cache_bf16_as_f32(w_s.post_norm_w,  hidden)
+                                if d_qkv_w_s == 0 || d_o_w_s == 0 || d_gate_up_w_s == 0 || d_down_w_s == 0 ||
+                                   d_in_g_s == 0 || d_post_g_s == 0 {
+                                    eout("[llama32_1b_gpu] speck4 weight upload FAILED at layer="); eu64(layer_s); eout("\n")
+                                    sl_ok = 0
+                                    layer_s = n_layers
+                                } else {
+                                    if gpu_llama_layer_megakernel_speck4_to_dev(
+                                            d_in_4_cur, d_out_4_cur,
+                                            d_qkv_w_s, d_o_w_s, d_gate_up_w_s, d_down_w_s,
+                                            d_in_g_s, d_post_g_s, 0, 0,
+                                            d_rope_cos_4, d_rope_sin_4,
+                                            kc_s, vc_s,
+                                            pos,
+                                            d_barrier_dev, d_barrier_host,
+                                            d_gu_scratch_4,
+                                            d_b_x_norm_g_4, d_b_qkv_g_4,
+                                            d_b_attn_q_g_4, d_b_mid_g_4,
+                                            d_b_mid_norm_g_4, d_b_attn_out_g_4,
+                                            7) != 0 {
+                                        eout("[llama32_1b_gpu] speck4 launch FAIL at layer="); eu64(layer_s); eout("\n")
+                                        sl_ok = 0
+                                        layer_s = n_layers
+                                    } else {
+                                        u64 tmp4 = d_in_4_cur
+                                        d_in_4_cur  = d_out_4_cur
+                                        d_out_4_cur = tmp4
+                                        layer_s = layer_s + 1
+                                    }
+                                }
+                            }
+                            if sl_ok == 0 {
+                                eout("[llama32_1b_gpu] speck4 path disabled after layer FAIL\n")
+                                _native_mks4_use = 0
+                            } else {
+                                // Sync so the device-side d_in_4_cur is observable
+                                // via hipMemcpy on the host.
+                                gpu_pipeline_flush()
+
+                                // ── D2H per-stream final residual ──
+                                u64 host_resid_4 = alloc(M_EFF_S4 * hidden * 4)
+                                u32 cerr_d = hipMemcpy(host_resid_4, d_in_4_cur, M_EFF_S4 * hidden * 4, 2)
+                                if cerr_d != 0 {
+                                    eout("[llama32_1b_gpu] speck4 D2H fail; speck4 path disabled\n")
+                                    _native_mks4_use = 0
+                                    dealloc(host_resid_4)
+                                } else {
+                                    // ── Per-stream final norm + lm_head + argmax ──
+                                    u64 host_predicted = alloc(M_EFF_S4 * 4)
+                                    u64 mp = 0
+                                    while mp < M_EFF_S4 {
+                                        u64 stream_resid = host_resid_4 + mp * hidden * 4
+                                        qwen3_rmsnorm_f32_weights(final_out, stream_resid, norm_t.ptr, hidden)
+                                        matmul_q8_0_q8_0_f32(logits, final_out, lmhead_ptr, 1, vocab, hidden, num_workers)
+                                        u64 best_s_id = 0
+                                        f32 best_s_val = 0.0f
+                                        u64 first_s = 1
+                                        u64 js = 0
+                                        while js < vocab {
+                                            f32 vs = 0.0f
+                                            unsafe { *((logits + js * 4) as f32) -> vs }
+                                            if first_s == 1 { best_s_val = vs; best_s_id = js; first_s = 0 }
+                                            else            { if vs > best_s_val { best_s_val = vs; best_s_id = js } }
+                                            js = js + 1
+                                        }
+                                        u32 best_s_id32 = best_s_id
+                                        unsafe { *((host_predicted + mp * 4) as u32) = best_s_id32 }
+                                        mp = mp + 1
+                                    }
+                                    dealloc(host_resid_4)
+
+                                    // ── Verify / accept loop ──
+                                    // Rule: accept draft[k] iff predicted[k] == draft[k]
+                                    // for k = 0 .. draft_n - 1.  Stop at first mismatch.
+                                    // (predicted[k] is the model's prediction at position
+                                    // pos+k given context [token_0, draft[0..k-1]].)
+                                    u64 accepted = 0
+                                    u64 k_chk = 0
+                                    while k_chk < draft_n {
+                                        u32 d_k32 = 0
+                                        unsafe { *((draft_buf + k_chk * 4) as u32) -> d_k32 }
+                                        u32 p_k32 = 0
+                                        unsafe { *((host_predicted + k_chk * 4) as u32) -> p_k32 }
+                                        if d_k32 == p_k32 {
+                                            unsafe { *((seq_ids32 + seq_len * 4) as uint32) = d_k32 }
+                                            seq_len  = seq_len + 1
+                                            pos      = pos + 1
+                                            step     = step + 1
+                                            accepted = accepted + 1
+                                            u64 d_k_u = d_k32
+                                            gguf_deq_q8_0(x_cur, embed_base + d_k_u * row_bytes, hidden)
+                                            if step >= max_new {
+                                                k_chk = draft_n
+                                            } else {
+                                                k_chk = k_chk + 1
+                                            }
+                                        } else {
+                                            k_chk = draft_n
+                                        }
+                                    }
+                                    dealloc(host_predicted)
+                                    total_accepted = total_accepted + accepted
+                                    eout("  [speck4] draft_n="); eu64(draft_n)
+                                    eout(" accepted="); eu64(accepted); eout("\n")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
     u64 total_decode_ns = time_elapsed(decode_start_ns)
     u64 total_ms = total_decode_ns / 1000000
@@ -640,6 +981,18 @@ fn main() {
     eout("total_decode_ms="); eu64(total_ms); eout("\n")
     eout("tokens_per_sec_x1000="); eu64(tokps_milli); eout("\n")
     eout("tokens_generated="); eu64(max_new); eout("\n")
+    // Slice 6.4 — speck4 acceptance metrics.
+    if total_speck4_calls > 0 {
+        u64 aa_x100  = (total_accepted * 100)        / total_speck4_calls
+        u64 dhr_x100 = (total_speck4_calls * 100)    / total_steps
+        eout("[llama32_1b_gpu] speck4: avg_accept=")
+        eu64(aa_x100 / 100); eout("."); eu64(aa_x100 % 100)
+        eout(" draft_hit_ratio=")
+        eu64(dhr_x100 / 100); eout("."); eu64(dhr_x100 % 100)
+        eout(" total_calls="); eu64(total_speck4_calls)
+        eout(" total_steps="); eu64(total_steps)
+        eout("\n")
+    }
     qwen3_profile_dump()
 
     dealloc(x_cur); dealloc(x_nxt); dealloc(final_out); dealloc(logits)
