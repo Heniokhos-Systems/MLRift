@@ -2296,10 +2296,17 @@ fn _emit_phase5_qkv_split_qknorm_rope_inline() {
     uint64 pair2_load_off     = 256        // NEOX: x2 lives at +HEAD_DIM/2*4 bytes
     uint64 pair2_store_off    = 256
     uint64 ptr_advance_bytes  = 128        // NEOX: src/norm/dst advance per iter
+    // Per-lane byte stride into src/norm/dst for the rope pair loop.
+    // NEOX (Qwen3, split-half): each thread t handles pair (q[t], q[t+HD/2]),
+    //   so the per-lane offset between adjacent threads is 4 bytes (one f32).
+    // NORM-pair (Llama, consecutive-pair): each thread t handles pair
+    //   (q[2t], q[2t+1]), so the per-lane offset is 8 bytes (one f32 pair).
+    uint64 lane_byte_shift    = 2          // NEOX default: lane_id * 4
     if MEGA_ROPE_PAIR_LAYOUT == 1 {
         pair2_load_off    = 4
         pair2_store_off   = 4
         ptr_advance_bytes = 256
+        lane_byte_shift   = 3              // NORM-pair: lane_id * 8
     }
 
     // ── Outer skip-branch: skip if wg_id >= outer_cap (=N_HEADS+2*N_KV_HEADS) ─
@@ -2418,17 +2425,28 @@ fn _emit_phase5_qkv_split_qknorm_rope_inline() {
     asm_s_waitcnt_lgkmcnt_zero()
 
     // ── Q: RoPE pair-rotation loop (HEAD_DIM/64 iters: lane..HEAD_DIM/2 step 32) ──
-    // Reset src ptr: v3:v4 = s[2:3] + lane*4  (v9 = lane*4 still valid)
+    // Slice 6.7: ensure v9 holds the correct per-lane byte stride for this
+    // arch's rope pair layout BEFORE Q-rope src/dst ptr setup.
+    //   - QKNORM=1 path (Qwen3): the qknorm block above just emitted
+    //     v9 = lane*4 (NEOX, lane_byte_shift=2) — already correct, so we
+    //     do NOT re-emit here (preserves Qwen3 byte-exactness).
+    //   - QKNORM=0 path (Llama): no qknorm block fired, so v9 carries a
+    //     stale value from phase 1.  Emit v9 = lane << lane_byte_shift
+    //     (NORM-pair → lane*8).  This is the slice 6.7 fix.
+    if MEGA_USE_QKNORM == 0 {
+        asm_v_lshlrev_b32_imm(9, lane_byte_shift, 0)
+    }
+    // Reset src ptr: v3:v4 = s[2:3] + v9
     asm_v_mov_b32_inline_u(4, 0)
     asm_v_add_co_u32_vcc_sv(3, 2, 9)
     asm_v_add_co_ci_u32_null_sv_vcc(4, 3, 4)
-    // Setup norm ptr: v5:v6 = s[4:5] + lane*4 — qknorm only.
+    // Setup norm ptr: v5:v6 = s[4:5] + v9 — qknorm only.
     if MEGA_USE_QKNORM != 0 {
         asm_v_mov_b32_inline_u(6, 0)
         asm_v_add_co_u32_vcc_sv(5, 4, 9)
         asm_v_add_co_ci_u32_null_sv_vcc(6, 5, 6)
     }
-    // Setup dst ptr: v7:v8 = s[6:7] + lane*4
+    // Setup dst ptr: v7:v8 = s[6:7] + v9
     asm_v_mov_b32_inline_u(8, 0)
     asm_v_add_co_u32_vcc_sv(7, 6, 9)
     asm_v_add_co_ci_u32_null_sv_vcc(8, 7, 8)
@@ -2626,6 +2644,12 @@ fn _emit_phase5_qkv_split_qknorm_rope_inline() {
     asm_s_waitcnt_lgkmcnt_zero()
 
     // ── K: RoPE pair-rotation loop (identical structure to Q) ────────────
+    // Slice 6.7: same v9 lane-stride fix as Q-rope above.  Qwen3 (QKNORM=1)
+    // gets v9=lane*4 from the K-qknorm block; Llama (QKNORM=0) must set
+    // v9 = lane << lane_byte_shift explicitly (NORM-pair → lane*8).
+    if MEGA_USE_QKNORM == 0 {
+        asm_v_lshlrev_b32_imm(9, lane_byte_shift, 0)
+    }
     asm_v_mov_b32_inline_u(4, 0)
     asm_v_add_co_u32_vcc_sv(3, 2, 9)
     asm_v_add_co_ci_u32_null_sv_vcc(4, 3, 4)
