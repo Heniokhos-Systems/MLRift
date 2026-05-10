@@ -704,11 +704,12 @@ fn _emit_rmsnorm_wg_gated_inline(uint64 in_kofs, uint64 norm_kofs,
 // Phase 11 callsite: in_kofs=0xA0, norm_kofs=0x38, out_kofs=0xA8, wg=28
 fn _emit_rmsnorm_wg_gated_m4_inline(uint64 in_kofs, uint64 norm_kofs,
                                      uint64 out_kofs, uint64 wg_id_sgpr) {
-    // HIDDEN * 4 = 1024 * 4 = 4096 bytes per stream.
+    // Stream byte offset = MEGA_HIDDEN * 4 per stream (4 bytes per f32).
+    uint64 stride = MEGA_HIDDEN * 4
     _emit_rmsnorm_wg_gated_inline(in_kofs, norm_kofs, out_kofs, wg_id_sgpr, 0)
-    _emit_rmsnorm_wg_gated_inline(in_kofs, norm_kofs, out_kofs, wg_id_sgpr, 4096)
-    _emit_rmsnorm_wg_gated_inline(in_kofs, norm_kofs, out_kofs, wg_id_sgpr, 8192)
-    _emit_rmsnorm_wg_gated_inline(in_kofs, norm_kofs, out_kofs, wg_id_sgpr, 12288)
+    _emit_rmsnorm_wg_gated_inline(in_kofs, norm_kofs, out_kofs, wg_id_sgpr, stride)
+    _emit_rmsnorm_wg_gated_inline(in_kofs, norm_kofs, out_kofs, wg_id_sgpr, 2 * stride)
+    _emit_rmsnorm_wg_gated_inline(in_kofs, norm_kofs, out_kofs, wg_id_sgpr, 3 * stride)
 }
 
 // ── Marker recognition helpers ────────────────────────────────────────────
@@ -2104,22 +2105,22 @@ fn _emit_silu_mul_elem_strided_m4_inline() {
     // v_lshlrev_b32_e32 v3, 2, v2: byte_off_g = idx*4
     asm_v_lshlrev_b32_imm(3, 2, 2)
 
-    // ── Per-lane gate: skip if idx >= FF=3072 ─────────────────────────────
-    // v_cmp_gt_u32_e32 vcc_lo, 3072, v2 → vcc_lo = (3072 > idx) = (idx < 3072)
+    // ── Per-lane gate: skip if idx >= FF (MEGA_FF) ────────────────────────
+    // v_cmp_gt_u32_e32 vcc_lo, FF, v2 → vcc_lo = (FF > idx) = (idx < FF)
     //   word1 = (0x3E<<25)|(0x4C<<17)|(2<<9)|0xFF = 0x7C9804FF
     asm_u32(0x7C9804FF)
-    asm_u32(3072)
+    asm_u32(MEGA_FF)
     // s_and_saveexec_b32 s17, vcc_lo  (s17 = old exec; exec &= vcc_lo)
     asm_s_and_saveexec_b32_vcc_lo(17)
     // s_cbranch_execz .phase15_lane_done (patched after all 4 bodies)
     uint64 p15_lane_execz_pos = asm_text_len / 4
     asm_s_cbranch_execz(0)
 
-    // ── byte_off_u = byte_off_g + FF*4 = byte_off_g + 12288 → v4 ──────────
+    // ── byte_off_u = byte_off_g + FF*4 → v4 ───────────────────────────────
     // v_add_nc_u32_e32 v4, lit, v3: VOP2 op 0x25, src0=0xFF (lit follows)
     //   word1 = (0x25<<25)|(4<<17)|(3<<9)|0xFF = 0x4A0806FF
     asm_u32(0x4A0806FF)
-    asm_u32(3072 * 4)
+    asm_u32(MEGA_FF * 4)
     asm_s_delay_alu(0x01)       // VALU→VMEM hazard
 
     // ── Stream stride between m's: m*N_OUT*4 = m*24576 = m*0x6000 bytes ──
@@ -2165,11 +2166,11 @@ fn _emit_silu_mul_elem_strided_m4_inline() {
         asm_u32(0x00020803)
         asm_s_waitcnt_vscnt_zero()  // drain store before next body's loads
 
-        // ── Bump s[2:3] by 24576 (N_OUT*4) for next iter (m=0,1,2 only) ──
-        // s_add_u32  s2, s2, 24576  → 0x8002FF02 ; <lit32>
+        // ── Bump s[2:3] by 2*FF*4 (N_OUT*4) for next iter (m=0,1,2 only) ─
+        // s_add_u32  s2, s2, 2*FF*4 → 0x8002FF02 ; <lit32>
         // s_addc_u32 s3, s3, 0      → 0x82038003 (op 4, ssrc1=0x80=inline-0)
         if m < 3 {
-            asm_u32(0x8002FF02); asm_u32(24576)
+            asm_u32(0x8002FF02); asm_u32(2 * MEGA_FF * 4)
             asm_u32(0x82038003)
         }
 
@@ -4806,9 +4807,14 @@ fn mega_emit_stub_kernel_speck4(uint64 kname_ptr, uint64 nl, uint64 body_node) -
     // res=in_residual_4(0x00, pair 9), out=b_mid_g_4(0xA0, pair 3).
     // wg_id_x is read from s28 (saved in prologue; phase 5 clobbered s15).
     if _body_has_marker(body_node, "oproj_residual_speck4_marker", 28) != 0 {
-        _emit_phase9_gemv_residual_m4_inline(1024, 2048, 2176, 256,
+        // Slice 6.0: phase 9 m4 shape + strides derived from arch globals.
+        uint64 q_dim         = MEGA_N_HEADS * MEGA_HEAD_DIM
+        uint64 q_dim_pad     = q_dim + 128
+        uint64 hidden_stride = MEGA_HIDDEN * 4
+        uint64 q_dim_stride  = q_dim * 4
+        _emit_phase9_gemv_residual_m4_inline(MEGA_HIDDEN, q_dim, q_dim_pad, 256,
                                               0x18, 0xB0, 0x00, 0xA0,
-                                              8192, 4096, 4096)
+                                              q_dim_stride, hidden_stride, hidden_stride)
     } else {
         asm_u32(0xBF800000)   // s_nop 0 (phase 9 stub)
     }
@@ -4875,20 +4881,23 @@ fn mega_emit_stub_kernel_speck4(uint64 kname_ptr, uint64 nl, uint64 body_node) -
     // [m, 0..2*FF]-block).  Phase 17 is the LAST phase — no trailing
     // mega_emit_barrier_isa(8, ...).
     if _body_has_marker(body_node, "down_residual_speck4_marker", 27) != 0 {
-        // Slice 4.20.7: phase-17 reuses the slice-4.20.5 phase-9 m4
-        // gemv-residual emitter with phase-17's strides.  Shape:
-        // (n_out=HIDDEN=1024, k=FF=3072, k_pad=FF_PAD=3200, wg_active=256).
+        // Slice 6.0: phase-17 reuses the phase-9 m4 gemv-residual emitter
+        // with phase-17's strides; shape derived from arch globals.  Shape:
+        // (n_out=HIDDEN, k=FF, k_pad=FF+128, wg_active=256).
         // Kernarg layout: w=down_w(arg 5, byte 0x28),
         // x=gu_scratch_4(arg 16, byte 0x80),
         // res=b_mid_g_4(arg 20, byte 0xA0),
         // out=out_residual_4(arg 1, byte 0x08).
-        // Stream strides: x=24576 (=2*FF*4 — gu_scratch_4 rows are 2*FF
-        // wide because phase 13 wrote the gate||up concat there, even
-        // though down_w only reads the first FF elements per row),
-        // res=4096 (=HIDDEN*4), out=4096 (=HIDDEN*4).
-        _emit_phase9_gemv_residual_m4_inline(1024, 3072, 3200, 256,
+        // Stream strides: x=2*FF*4 (gu_scratch_4 rows are 2*FF wide because
+        // phase 13 wrote the gate||up concat there, even though down_w only
+        // reads the first FF elements per row),
+        // res=HIDDEN*4, out=HIDDEN*4.
+        uint64 ff_pad           = MEGA_FF + 128
+        uint64 hidden_stride_p17 = MEGA_HIDDEN * 4
+        uint64 gu_stride        = 2 * MEGA_FF * 4
+        _emit_phase9_gemv_residual_m4_inline(MEGA_HIDDEN, MEGA_FF, ff_pad, 256,
                                               0x28, 0x80, 0xA0, 0x08,
-                                              24576, 4096, 4096)
+                                              gu_stride, hidden_stride_p17, hidden_stride_p17)
     } else {
         asm_u32(0xBF800000)   // s_nop 0 (phase 17 stub)
     }
