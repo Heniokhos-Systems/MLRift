@@ -1,0 +1,572 @@
+// Slice 6.3 — Llama-3.2-1B SPECK4 smoke harness.
+//
+// Validates the K=4 == 4×M=1 byte-exact invariant on synthetic LFSR-seeded
+// weights.  Loads BOTH /tmp/llama_layer_megakernel_v2.co (slice 5.8 base)
+// and /tmp/llama_layer_megakernel_speck4_v2.co (this slice).  For each of
+// M_EFF=4 streams, runs the M=1 base kernel with that stream's per-m input
+// + pos; then runs the speck4 kernel once with all 4 streams packed.
+// Compares the FINAL out_residual slab byte-exact: speck4[m*HIDDEN..]
+// must == M=1-run-m's out_residual buffer.
+//
+// MAX_PHASE env-var supported (default 7 — run all 9 phases).  Lower
+// values bisect: speck4[m]'s output of the phase-`max_phase` final-write
+// slab must match the corresponding M=1 run's final slab.
+//
+// Build:
+//   ./build/mlrc --emit-amdgpu-llama-megakernel-v2=/tmp/llama_layer_megakernel_v2.co examples/llm/llama_layer_megakernel.mlr
+//   ./build/mlrc --emit-amdgpu-llama-megakernel-speck4-v2=/tmp/llama_layer_megakernel_speck4_v2.co examples/llm/llama_layer_megakernel_speck4.mlr
+//   ./build/mlrc --target=amdgpu-native --emit=elfexe examples/llm/llama_layer_megakernel_speck4_smoke.mlr -o /tmp/llama_s4_smoke
+// Run:
+//   /tmp/llama_s4_smoke                       (max_phase=7, full layer)
+//   MAX_PHASE=0 /tmp/llama_s4_smoke           (phase 1 only — input rmsnorm)
+//   MAX_PHASE=1..7 /tmp/llama_s4_smoke        (bisect through layer)
+
+import "../../std/hip.mlr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn write(int32 fd, uint64 buf, uint64 n) -> int64
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn getenv(uint64 name) -> uint64
+
+// ── Shape constants (Llama-3.2-1B) ───────────────────────────────────────
+static uint64 HIDDEN      = 2048
+static uint64 HEAD_DIM    = 64
+static uint64 N_HEADS     = 32
+static uint64 N_KV_HEADS  = 8
+static uint64 Q_DIM       = 2048      // N_HEADS * HEAD_DIM
+static uint64 KV_DIM      = 512       // N_KV_HEADS * HEAD_DIM
+static uint64 QKV_DIM     = 3072      // (N_HEADS + 2*N_KV_HEADS) * HEAD_DIM
+static uint64 FF          = 8192
+static uint64 HIDDEN_PAD  = 2176      // HIDDEN + 128
+static uint64 Q_DIM_PAD   = 2176      // Q_DIM + 128
+static uint64 FF_PAD      = 8320      // FF + 128
+static uint64 WG_PERSIST  = 512
+static uint64 MAX_SEQ     = 64
+static uint64 M_EFF       = 4
+
+// ── Tiny helpers ─────────────────────────────────────────────────────────
+
+fn u64_dec(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 { uint8 z = 48; unsafe { *(buf as uint8) = z }; return 1 }
+    uint64 n = 0; uint64 t = val
+    while t > 0 { n = n + 1; t = t / 10 }
+    uint64 i = n; t = val
+    while i > 0 {
+        i = i - 1
+        uint64 d = t - (t / 10) * 10
+        uint8 c = d + 48
+        uint64 p = buf + i; unsafe { *(p as uint8) = c }
+        t = t / 10
+    }
+    return n
+}
+
+fn put_kv(uint64 label, uint64 lab_len, uint64 v) {
+    uint64 buf = alloc(128)
+    uint64 i = 0
+    while i < lab_len {
+        uint64 sp = label + i; uint64 c = 0; unsafe { *(sp as uint8) -> c }
+        uint64 dp = buf + i; uint8 cb = c; unsafe { *(dp as uint8) = cb }
+        i = i + 1
+    }
+    uint64 sep_p = buf + lab_len; uint8 eq = 61; unsafe { *(sep_p as uint8) = eq }
+    uint64 num_p = buf + lab_len + 1
+    uint64 nl = u64_dec(v, num_p)
+    uint64 nul_p = buf + lab_len + 1 + nl; uint8 nul = 0; unsafe { *(nul_p as uint8) = nul }
+    puts(buf)
+}
+
+fn die(uint64 msg) { puts(msg); exit(1) }
+
+fn atou64(uint64 s) -> uint64 {
+    uint64 v = 0; uint64 i = 0
+    while 1 {
+        uint8 c = 0; unsafe { *((s + i) as uint8) -> c }
+        uint64 cc = c
+        if cc < 48 { return v }
+        if cc > 57 { return v }
+        v = v * 10 + (cc - 48); i = i + 1
+    }
+    return v
+}
+
+fn hzero(uint64 ptr, uint64 bytes) {
+    uint64 i = 0
+    while i < bytes { uint8 z = 0; unsafe { *((ptr + i) as uint8) = z }; i = i + 1 }
+}
+
+fn build_kp(uint64 k_buf, uint64 n) -> uint64 {
+    uint64 kp = alloc(n * 8); uint64 j = 0
+    while j < n {
+        unsafe { *((kp + j * 8) as uint64) = k_buf + j * 8 }
+        j = j + 1
+    }
+    return kp
+}
+
+fn dmalloc(uint64 bytes) -> uint64 {
+    uint64 slot = alloc(8)
+    uint32 err = hipMalloc(slot, bytes)
+    if err != 0 { die("hipMalloc failed") }
+    uint64 va = 0; unsafe { *(slot as uint64) -> va }
+    return va
+}
+
+fn load_co(uint64 path, uint64 fname) -> uint64 {
+    uint64 fd = file_open(path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 { return 0 }
+    uint64 sz = file_size(fd)
+    uint64 blob = alloc(sz)
+    file_read(fd, blob, sz)
+    file_close(fd)
+    uint64 mod_slot = alloc(8)
+    uint32 err = hipModuleLoadData(mod_slot, blob)
+    if err != 0 { return 0 }
+    uint64 mod = 0; unsafe { *(mod_slot as uint64) -> mod }
+    uint64 fh_slot = alloc(8)
+    err = hipModuleGetFunction(fh_slot, mod, fname)
+    if err != 0 { return 0 }
+    uint64 fh = 0; unsafe { *(fh_slot as uint64) -> fh }
+    return fh
+}
+
+// ── LFSR-seeded synthetic fill (deterministic across runs) ────────────────
+//
+// 32-bit Galois LFSR with poly 0x80200003 (period 2^32-1).  Lane-0 reads
+// the LFSR every iteration to produce u32 → f32 in [-1, +1) range.
+
+fn lfsr_step(uint64 state) -> uint64 {
+    uint64 s = state
+    uint64 bit = s & 1
+    s = s >> 1
+    if bit != 0 { s = s ^ 0x80200003 }
+    return s
+}
+
+// LFSR-seeded f32 fill in [-scale, +scale).  state is by-value; seed
+// the caller separately per buffer to keep streams deterministic.
+fn lfsr_fill_f32(uint64 buf, uint64 n_floats, uint64 seed, f32 scale) {
+    uint64 s = seed
+    if s == 0 { s = 1 }
+    uint64 i = 0
+    while i < n_floats {
+        s = lfsr_step(s)
+        // u32 → f32 normalized to [0,1), then scaled to [-1,+1).
+        uint64 lo = s & 0xFFFF
+        f32 norm = int_to_f32(lo) / 65536.0f
+        f32 v = (norm * 2.0f - 1.0f) * scale
+        unsafe { *((buf + i * 4) as f32) = v }
+        i = i + 1
+    }
+}
+
+// LFSR-seeded u16 (bf16) fill — write u16 directly as a deterministic
+// bit-pattern (we don't need it to be a valid bf16, just byte-equal across
+// stream and run).  Useful for weight buffers.
+fn lfsr_fill_u16(uint64 buf, uint64 n_u16, uint64 seed) {
+    uint64 s = seed
+    if s == 0 { s = 1 }
+    uint64 i = 0
+    while i < n_u16 {
+        s = lfsr_step(s)
+        // Restrict bf16 magnitude to keep gemv outputs from blowing up.
+        // bf16 with exponent biased toward small magnitudes: zero-out the
+        // top 4 bits of the exponent so |v| < ~1.0.
+        uint64 lo = s & 0x83FF      // sign + low 10 mantissa + low 3 of exp
+        uint16 v = lo
+        unsafe { *((buf + i * 2) as uint16) = v }
+        i = i + 1
+    }
+}
+
+// ── DispatchPath struct helpers ──────────────────────────────────────────
+//
+// We allocate two parallel paths.  For the M=1 base (4 runs) we share most
+// device buffers across runs (weights, norm gains, rope) but use per-run
+// in_residual / out_residual / KV cache (since pos differs per run, KV
+// writes land in different slots).  For speck4 we use M_EFF-sized slabs.
+//
+// Slot layout (slots are 8-byte offsets):
+//   0  fh
+//   1  wg_persist
+//   2  d_in_residual
+//   3  d_out_residual
+//   4  d_qkv_w           (shared with speck4)
+//   5  d_o_w             (shared)
+//   6  d_gate_up_w       (shared)
+//   7  d_down_w          (shared)
+//   8  d_in_norm_g       (shared)
+//   9  d_post_norm_g     (shared)
+//   10 d_q_norm_g        (shared, ignored)
+//   11 d_k_norm_g        (shared, ignored)
+//   12 d_rope_cos        (per-m for speck4, M=1 single)
+//   13 d_rope_sin        (per-m for speck4, M=1 single)
+//   14 d_kc_layer        (per-path)
+//   15 d_vc_layer        (per-path)
+//   16 d_barrier_counter
+//   17 d_gu_scratch
+//   18 d_b_x_norm_g
+//   19 d_b_qkv_g
+//   20 d_b_attn_q_g
+//   21 d_b_mid_g
+//   22 d_b_mid_norm_g
+//   23 d_b_attn_out_g
+//   24 h_out_residual    (host buffer for D2H final compare)
+
+fn dp_fh(uint64 p) -> uint64 { uint64 v = 0; unsafe { *(p as uint64) -> v }; return v }
+fn dp_wg(uint64 p) -> uint64 { uint64 v = 0; unsafe { *((p + 8) as uint64) -> v }; return v }
+fn dp_slot(uint64 p, uint64 s) -> uint64 { uint64 v = 0; unsafe { *((p + s * 8) as uint64) -> v }; return v }
+fn dp_set(uint64 p, uint64 s, uint64 v) { unsafe { *((p + s * 8) as uint64) = v } }
+
+// Single-launch dispatcher.  Zeros all output slabs + barrier, builds the
+// 24-arg kernarg blob, launches, syncs.
+fn dispatch(uint64 dp, uint64 max_phase, uint64 pos,
+            uint64 in_resid_b, uint64 kv_b, uint64 gu_b, uint64 norm_b,
+            uint64 b_qkv_b, uint64 b_q_b, uint64 h_zero) {
+    uint64 h_zero4 = alloc(4); hzero(h_zero4, 4)
+    uint32 err = hipMemcpy(dp_slot(dp, 3),  h_zero,  in_resid_b, 1); if err != 0 { die("zero out_r") }
+    err = hipMemcpy(dp_slot(dp, 14), h_zero,  kv_b,      1); if err != 0 { die("zero kc") }
+    err = hipMemcpy(dp_slot(dp, 15), h_zero,  kv_b,      1); if err != 0 { die("zero vc") }
+    err = hipMemcpy(dp_slot(dp, 16), h_zero4, 4,         1); if err != 0 { die("zero bar") }
+    err = hipMemcpy(dp_slot(dp, 17), h_zero,  gu_b,      1); if err != 0 { die("zero gu") }
+    err = hipMemcpy(dp_slot(dp, 18), h_zero,  norm_b,    1); if err != 0 { die("zero bxn") }
+    err = hipMemcpy(dp_slot(dp, 19), h_zero,  b_qkv_b,   1); if err != 0 { die("zero bqkv") }
+    err = hipMemcpy(dp_slot(dp, 20), h_zero,  b_q_b,     1); if err != 0 { die("zero baq") }
+    err = hipMemcpy(dp_slot(dp, 21), h_zero,  norm_b,    1); if err != 0 { die("zero bm") }
+    err = hipMemcpy(dp_slot(dp, 22), h_zero,  norm_b,    1); if err != 0 { die("zero bmn") }
+    err = hipMemcpy(dp_slot(dp, 23), h_zero,  b_q_b,     1); if err != 0 { die("zero bao") }
+    uint64 kb = alloc(24 * 8)
+    dp_set(kb,  0, dp_slot(dp, 2))   // in_residual (kernarg 0)
+    dp_set(kb,  1, dp_slot(dp, 3))   // out_residual
+    dp_set(kb,  2, dp_slot(dp, 4))   // qkv_w
+    dp_set(kb,  3, dp_slot(dp, 5))   // o_w
+    dp_set(kb,  4, dp_slot(dp, 6))   // gate_up_w
+    dp_set(kb,  5, dp_slot(dp, 7))   // down_w
+    dp_set(kb,  6, dp_slot(dp, 8))   // in_norm_g
+    dp_set(kb,  7, dp_slot(dp, 9))   // post_norm_g
+    dp_set(kb,  8, dp_slot(dp, 10))  // q_norm_g (ignored)
+    dp_set(kb,  9, dp_slot(dp, 11))  // k_norm_g (ignored)
+    dp_set(kb, 10, dp_slot(dp, 12))  // rope_cos
+    dp_set(kb, 11, dp_slot(dp, 13))  // rope_sin
+    dp_set(kb, 12, dp_slot(dp, 14))  // kc_layer
+    dp_set(kb, 13, dp_slot(dp, 15))  // vc_layer
+    dp_set(kb, 14, pos)              // pos (by-value u64)
+    dp_set(kb, 15, dp_slot(dp, 16))  // barrier
+    dp_set(kb, 16, dp_slot(dp, 17))  // gu_scratch
+    dp_set(kb, 17, dp_slot(dp, 18))  // b_x_norm_g
+    dp_set(kb, 18, dp_slot(dp, 19))  // b_qkv_g
+    dp_set(kb, 19, dp_slot(dp, 20))  // b_attn_q_g
+    dp_set(kb, 20, dp_slot(dp, 21))  // b_mid_g
+    dp_set(kb, 21, dp_slot(dp, 22))  // b_mid_norm_g
+    dp_set(kb, 22, dp_slot(dp, 23))  // b_attn_out_g
+    dp_set(kb, 23, max_phase)        // max_phase
+    uint64 kp = build_kp(kb, 24)
+    err = hipModuleLaunchKernel(dp_fh(dp), dp_wg(dp), 1, 1, 32, 1, 1, 0, 0, kp, 0)
+    if err != 0 {
+        uint64 errmsg = hipGetErrorString(err)
+        puts(errmsg)
+        die("launch failed")
+    }
+    err = hipDeviceSynchronize()
+    if err != 0 {
+        uint64 errmsg = hipGetErrorString(err)
+        puts(errmsg)
+        die("sync failed -- possible deadlock")
+    }
+}
+
+// Bytewise diff two host slabs of n_bytes each.  Returns 0 on match, 1
+// on mismatch.  Reports the first mismatching byte (offset + values).
+fn diff_slab(uint64 name_ptr, uint64 name_len, uint64 ha, uint64 hb, uint64 n_bytes) -> uint64 {
+    uint64 fm = 0xFFFFFFFFFFFFFFFF; uint64 bk = 0
+    while bk < n_bytes {
+        uint8 xa = 0; unsafe { *((ha + bk) as uint8) -> xa }
+        uint8 xb = 0; unsafe { *((hb + bk) as uint8) -> xb }
+        if xa != xb { if fm == 0xFFFFFFFFFFFFFFFF { fm = bk } }
+        bk = bk + 1
+    }
+    if fm == 0xFFFFFFFFFFFFFFFF {
+        uint64 mb = alloc(32 + name_len)
+        uint64 ok_s = "OK "; memcpy(mb, ok_s, 3); memcpy(mb + 3, name_ptr, name_len)
+        uint8 nul = 0; unsafe { *((mb + 3 + name_len) as uint8) = nul }
+        puts(mb); return 0
+    }
+    uint64 mb = alloc(64 + name_len); uint64 mp = mb
+    uint64 pfx = "MISMATCH "; memcpy(mp, pfx, 9); mp = mp + 9
+    memcpy(mp, name_ptr, name_len); mp = mp + name_len
+    uint64 at_s = " at byte "; memcpy(mp, at_s, 9); mp = mp + 9
+    uint64 nl = u64_dec(fm, mp); mp = mp + nl
+    uint64 colon = ": A="; memcpy(mp, colon, 4); mp = mp + 4
+    uint8 avb = 0; unsafe { *((ha + fm) as uint8) -> avb }
+    uint64 avu = avb; uint64 al = u64_dec(avu, mp); mp = mp + al
+    uint64 bstr = " B="; memcpy(mp, bstr, 3); mp = mp + 3
+    uint8 bvb = 0; unsafe { *((hb + fm) as uint8) -> bvb }
+    uint64 bvu = bvb; uint64 bl = u64_dec(bvu, mp); mp = mp + bl
+    uint8 nul = 0; unsafe { *(mp as uint8) = nul }
+    puts(mb); return 1
+}
+
+fn main() {
+    // ── Per-stream slab byte sizes ─────────────────────────────────────
+    uint64 hidden_b     = HIDDEN * 4                          // 8192
+    uint64 in_resid_4_b = M_EFF * HIDDEN * 4                  // 32768
+    uint64 qkv_w_b      = QKV_DIM * HIDDEN_PAD * 2            // shared weights
+    uint64 o_w_b        = HIDDEN * Q_DIM_PAD * 2
+    uint64 gateup_b     = 2 * FF * HIDDEN_PAD * 2
+    uint64 down_b       = HIDDEN * FF_PAD * 2
+    uint64 in_norm_b    = HIDDEN * 4
+    uint64 post_norm_b  = HIDDEN * 4
+    uint64 q_norm_b     = HEAD_DIM * 4                        // ignored, but kept
+    uint64 k_norm_b     = HEAD_DIM * 4
+    uint64 cos_sin_4_b  = M_EFF * (HEAD_DIM / 2) * 4
+    uint64 cos_sin_1_b  = (HEAD_DIM / 2) * 4
+    uint64 kv_b         = MAX_SEQ * KV_DIM * 4
+    uint64 gu_4_b       = M_EFF * 2 * FF * 4
+    uint64 gu_1_b       = 2 * FF * 4
+    uint64 norm_4_b     = M_EFF * HIDDEN * 4
+    uint64 norm_1_b     = HIDDEN * 4
+    uint64 b_qkv_4_b    = M_EFF * QKV_DIM * 4
+    uint64 b_qkv_1_b    = QKV_DIM * 4
+    uint64 b_q_4_b      = M_EFF * Q_DIM * 4
+    uint64 b_q_1_b      = Q_DIM * 4
+
+    // ── Pre-allocate host buffers BEFORE hipSetDevice ─────────────────
+    // We need 4 host buffers for M=1 out_residual (one per stream) + 1
+    // host buffer for speck4 out_residual (M_EFF-sized).
+    uint64 h_out_m1_0 = alloc(hidden_b); hzero(h_out_m1_0, hidden_b)
+    uint64 h_out_m1_1 = alloc(hidden_b); hzero(h_out_m1_1, hidden_b)
+    uint64 h_out_m1_2 = alloc(hidden_b); hzero(h_out_m1_2, hidden_b)
+    uint64 h_out_m1_3 = alloc(hidden_b); hzero(h_out_m1_3, hidden_b)
+    uint64 h_out_s4   = alloc(in_resid_4_b); hzero(h_out_s4, in_resid_4_b)
+
+    // Synthetic LFSR-seeded host inputs.  Per-stream input differs across
+    // streams via the LFSR seed (stream m uses seed = 0x1000 + m).
+    uint64 h_in_4 = alloc(in_resid_4_b); hzero(h_in_4, in_resid_4_b)
+    uint64 m = 0
+    while m < M_EFF {
+        uint64 base = h_in_4 + m * HIDDEN * 4
+        uint64 seed = 0x1000 + m
+        lfsr_fill_f32(base, HIDDEN, seed, 0.1f)
+        m = m + 1
+    }
+
+    // Shared weights / norms / rope (single LFSR seed each — same content
+    // across both kernels and across all M=1 runs).
+    uint64 h_qkv_w     = alloc(qkv_w_b);    lfsr_fill_u16(h_qkv_w,     qkv_w_b / 2,    0x2001)
+    uint64 h_o_w       = alloc(o_w_b);      lfsr_fill_u16(h_o_w,       o_w_b / 2,      0x2002)
+    uint64 h_gate_up_w = alloc(gateup_b);   lfsr_fill_u16(h_gate_up_w, gateup_b / 2,   0x2003)
+    uint64 h_down_w    = alloc(down_b);     lfsr_fill_u16(h_down_w,    down_b / 2,     0x2004)
+    uint64 h_in_norm   = alloc(in_norm_b);  lfsr_fill_f32(h_in_norm,   HIDDEN,         0x2005, 0.05f)
+    uint64 h_post_norm = alloc(post_norm_b);lfsr_fill_f32(h_post_norm, HIDDEN,         0x2006, 0.05f)
+    uint64 h_q_norm    = alloc(q_norm_b);   lfsr_fill_f32(h_q_norm,    HEAD_DIM,       0x2007, 0.05f)
+    uint64 h_k_norm    = alloc(k_norm_b);   lfsr_fill_f32(h_k_norm,    HEAD_DIM,       0x2008, 0.05f)
+
+    // RoPE tables: 4-stream slab for speck4 (per-m); first HEAD_DIM/2 floats
+    // shared as the M=1 single-stream rope table (= speck4 stream m=0).
+    // Use cos=1, sin=0 identity — keeps numerical sensitivity off the rope
+    // path so this smoke specifically exercises gemv + rmsnorm + softmax.
+    uint64 h_rope_cos_4 = alloc(cos_sin_4_b); hzero(h_rope_cos_4, cos_sin_4_b)
+    uint64 h_rope_sin_4 = alloc(cos_sin_4_b); hzero(h_rope_sin_4, cos_sin_4_b)
+    uint64 mi = 0
+    while mi < M_EFF {
+        uint64 cb = h_rope_cos_4 + mi * (HEAD_DIM / 2) * 4
+        uint64 i = 0
+        while i < (HEAD_DIM / 2) {
+            f32 one_f = 1.0f
+            unsafe { *((cb + i * 4) as f32) = one_f }
+            i = i + 1
+        }
+        mi = mi + 1
+    }
+
+    // ── GPU init + load both .co files ──────────────────────────────────
+    uint32 err = hipSetDevice(0)
+    if err != 0 { die("hipSetDevice failed") }
+
+    uint64 fh_m1 = load_co("/tmp/llama_layer_megakernel_v2.co", "llama_layer_megakernel")
+    if fh_m1 == 0 { die("M=1 load failed -- run: ./build/mlrc --emit-amdgpu-llama-megakernel-v2=/tmp/llama_layer_megakernel_v2.co examples/llm/llama_layer_megakernel.mlr") }
+    puts("M=1 base load: PASS")
+
+    uint64 fh_s4 = load_co("/tmp/llama_layer_megakernel_speck4_v2.co", "llama_layer_megakernel_speck4")
+    if fh_s4 == 0 { die("speck4 load failed -- run: ./build/mlrc --emit-amdgpu-llama-megakernel-speck4-v2=/tmp/llama_layer_megakernel_speck4_v2.co examples/llm/llama_layer_megakernel_speck4.mlr") }
+    puts("speck4 load: PASS")
+
+    // ── Read MAX_PHASE env var (default 7 — full layer) ────────────────
+    uint64 mp_env = getenv("MAX_PHASE")
+    uint64 max_phase = 7
+    if mp_env != 0 { max_phase = atou64(mp_env) }
+    put_kv("MAX_PHASE", 9, max_phase)
+
+    // ── Upload shared device buffers ───────────────────────────────────
+    uint64 d_qkv_w     = dmalloc(qkv_w_b);    err = hipMemcpy(d_qkv_w,     h_qkv_w,     qkv_w_b,    1); if err != 0 { die("H2D qkv_w") }
+    uint64 d_o_w       = dmalloc(o_w_b);      err = hipMemcpy(d_o_w,       h_o_w,       o_w_b,      1); if err != 0 { die("H2D o_w") }
+    uint64 d_gate_up_w = dmalloc(gateup_b);   err = hipMemcpy(d_gate_up_w, h_gate_up_w, gateup_b,   1); if err != 0 { die("H2D gu_w") }
+    uint64 d_down_w    = dmalloc(down_b);     err = hipMemcpy(d_down_w,    h_down_w,    down_b,     1); if err != 0 { die("H2D dn_w") }
+    uint64 d_in_norm   = dmalloc(in_norm_b);  err = hipMemcpy(d_in_norm,   h_in_norm,   in_norm_b,  1); if err != 0 { die("H2D in_g") }
+    uint64 d_post_norm = dmalloc(post_norm_b);err = hipMemcpy(d_post_norm, h_post_norm, post_norm_b,1); if err != 0 { die("H2D pn_g") }
+    uint64 d_q_norm    = dmalloc(q_norm_b);   err = hipMemcpy(d_q_norm,    h_q_norm,    q_norm_b,   1); if err != 0 { die("H2D q_g") }
+    uint64 d_k_norm    = dmalloc(k_norm_b);   err = hipMemcpy(d_k_norm,    h_k_norm,    k_norm_b,   1); if err != 0 { die("H2D k_g") }
+    puts("shared weights uploaded")
+
+    // ── Largest host zero buffer for slab zeroing ──────────────────────
+    uint64 zero_max = gu_4_b  // 4 * 2 * FF * 4 = 262144 — largest output slab
+    if down_b > zero_max { zero_max = down_b }  // bigger if weights need zeroing (not used here)
+    if kv_b > zero_max { zero_max = kv_b }
+    uint64 h_zero = alloc(zero_max); hzero(h_zero, zero_max)
+
+    // ════════════════════════════════════════════════════════════════════
+    // PASS 1: Run M=1 base 4 times sequentially, one per stream.
+    //
+    // Each run uses the per-m slice of h_in_4 as input and writes to a
+    // fresh out_residual buffer.  pos = base_pos + m (= m here, since
+    // pos_base = 0) so KV writes land in distinct slots — but since we
+    // reset KV each run, the runs are independent.
+    // ════════════════════════════════════════════════════════════════════
+    uint64 d_in_m1  = dmalloc(hidden_b)
+    uint64 d_out_m1 = dmalloc(hidden_b)
+    uint64 d_kc_m1  = dmalloc(kv_b)
+    uint64 d_vc_m1  = dmalloc(kv_b)
+    uint64 d_bar_m1 = dmalloc(4)
+    uint64 d_gu_m1  = dmalloc(gu_1_b)
+    uint64 d_bxn_m1 = dmalloc(norm_1_b)
+    uint64 d_bqkv_m1= dmalloc(b_qkv_1_b)
+    uint64 d_baq_m1 = dmalloc(b_q_1_b)
+    uint64 d_bm_m1  = dmalloc(norm_1_b)
+    uint64 d_bmn_m1 = dmalloc(norm_1_b)
+    uint64 d_bao_m1 = dmalloc(b_q_1_b)
+    uint64 d_rcos_m1= dmalloc(cos_sin_1_b)
+    uint64 d_rsin_m1= dmalloc(cos_sin_1_b)
+
+    // Build the per-run dispatch path skeleton (slots 4..23 are shared).
+    uint64 dp_m1 = alloc(34 * 8); hzero(dp_m1, 34 * 8)
+    dp_set(dp_m1,  0, fh_m1)
+    dp_set(dp_m1,  1, WG_PERSIST)
+    dp_set(dp_m1,  2, d_in_m1)
+    dp_set(dp_m1,  3, d_out_m1)
+    dp_set(dp_m1,  4, d_qkv_w)
+    dp_set(dp_m1,  5, d_o_w)
+    dp_set(dp_m1,  6, d_gate_up_w)
+    dp_set(dp_m1,  7, d_down_w)
+    dp_set(dp_m1,  8, d_in_norm)
+    dp_set(dp_m1,  9, d_post_norm)
+    dp_set(dp_m1, 10, d_q_norm)
+    dp_set(dp_m1, 11, d_k_norm)
+    dp_set(dp_m1, 12, d_rcos_m1)
+    dp_set(dp_m1, 13, d_rsin_m1)
+    dp_set(dp_m1, 14, d_kc_m1)
+    dp_set(dp_m1, 15, d_vc_m1)
+    dp_set(dp_m1, 16, d_bar_m1)
+    dp_set(dp_m1, 17, d_gu_m1)
+    dp_set(dp_m1, 18, d_bxn_m1)
+    dp_set(dp_m1, 19, d_bqkv_m1)
+    dp_set(dp_m1, 20, d_baq_m1)
+    dp_set(dp_m1, 21, d_bm_m1)
+    dp_set(dp_m1, 22, d_bmn_m1)
+    dp_set(dp_m1, 23, d_bao_m1)
+
+    // Single identity table for M=1 (cos=1, sin=0)
+    uint64 h_rope_cos_1 = alloc(cos_sin_1_b); hzero(h_rope_cos_1, cos_sin_1_b)
+    uint64 h_rope_sin_1 = alloc(cos_sin_1_b); hzero(h_rope_sin_1, cos_sin_1_b)
+    uint64 ri = 0
+    while ri < (HEAD_DIM / 2) {
+        f32 one_f = 1.0f
+        unsafe { *((h_rope_cos_1 + ri * 4) as f32) = one_f }
+        ri = ri + 1
+    }
+    err = hipMemcpy(d_rcos_m1, h_rope_cos_1, cos_sin_1_b, 1); if err != 0 { die("H2D rcos_m1") }
+    err = hipMemcpy(d_rsin_m1, h_rope_sin_1, cos_sin_1_b, 1); if err != 0 { die("H2D rsin_m1") }
+
+    puts("starting M=1 4-stream sequential pass")
+    uint64 ms = 0
+    while ms < M_EFF {
+        // Upload this stream's input
+        uint64 h_in_m = h_in_4 + ms * HIDDEN * 4
+        err = hipMemcpy(d_in_m1, h_in_m, hidden_b, 1); if err != 0 { die("H2D in_m1") }
+        // Dispatch — pos = ms (matches speck4's pos_base=0, per-m pos = ms)
+        dispatch(dp_m1, max_phase, ms,
+                 hidden_b, kv_b, gu_1_b, norm_1_b, b_qkv_1_b, b_q_1_b, h_zero)
+        // D2H final out_residual into the per-stream host buffer
+        uint64 hb = h_out_m1_0
+        if ms == 1 { hb = h_out_m1_1 }
+        if ms == 2 { hb = h_out_m1_2 }
+        if ms == 3 { hb = h_out_m1_3 }
+        err = hipMemcpy(hb, d_out_m1, hidden_b, 2); if err != 0 { die("D2H out_m1") }
+        ms = ms + 1
+    }
+    puts("M=1 4-stream pass: PASS")
+
+    // ════════════════════════════════════════════════════════════════════
+    // PASS 2: Run speck4 once with all 4 streams packed.
+    // ════════════════════════════════════════════════════════════════════
+    uint64 d_in_s4  = dmalloc(in_resid_4_b)
+    uint64 d_out_s4 = dmalloc(in_resid_4_b)
+    uint64 d_kc_s4  = dmalloc(kv_b)
+    uint64 d_vc_s4  = dmalloc(kv_b)
+    uint64 d_bar_s4 = dmalloc(4)
+    uint64 d_gu_s4  = dmalloc(gu_4_b)
+    uint64 d_bxn_s4 = dmalloc(norm_4_b)
+    uint64 d_bqkv_s4= dmalloc(b_qkv_4_b)
+    uint64 d_baq_s4 = dmalloc(b_q_4_b)
+    uint64 d_bm_s4  = dmalloc(norm_4_b)
+    uint64 d_bmn_s4 = dmalloc(norm_4_b)
+    uint64 d_bao_s4 = dmalloc(b_q_4_b)
+    uint64 d_rcos_s4= dmalloc(cos_sin_4_b)
+    uint64 d_rsin_s4= dmalloc(cos_sin_4_b)
+
+    // Upload the M_EFF-packed input + rope tables
+    err = hipMemcpy(d_in_s4,   h_in_4,        in_resid_4_b, 1); if err != 0 { die("H2D in_s4") }
+    err = hipMemcpy(d_rcos_s4, h_rope_cos_4,  cos_sin_4_b,  1); if err != 0 { die("H2D rcos_s4") }
+    err = hipMemcpy(d_rsin_s4, h_rope_sin_4,  cos_sin_4_b,  1); if err != 0 { die("H2D rsin_s4") }
+
+    uint64 dp_s4 = alloc(34 * 8); hzero(dp_s4, 34 * 8)
+    dp_set(dp_s4,  0, fh_s4)
+    dp_set(dp_s4,  1, WG_PERSIST)
+    dp_set(dp_s4,  2, d_in_s4)
+    dp_set(dp_s4,  3, d_out_s4)
+    dp_set(dp_s4,  4, d_qkv_w)
+    dp_set(dp_s4,  5, d_o_w)
+    dp_set(dp_s4,  6, d_gate_up_w)
+    dp_set(dp_s4,  7, d_down_w)
+    dp_set(dp_s4,  8, d_in_norm)
+    dp_set(dp_s4,  9, d_post_norm)
+    dp_set(dp_s4, 10, d_q_norm)
+    dp_set(dp_s4, 11, d_k_norm)
+    dp_set(dp_s4, 12, d_rcos_s4)
+    dp_set(dp_s4, 13, d_rsin_s4)
+    dp_set(dp_s4, 14, d_kc_s4)
+    dp_set(dp_s4, 15, d_vc_s4)
+    dp_set(dp_s4, 16, d_bar_s4)
+    dp_set(dp_s4, 17, d_gu_s4)
+    dp_set(dp_s4, 18, d_bxn_s4)
+    dp_set(dp_s4, 19, d_bqkv_s4)
+    dp_set(dp_s4, 20, d_baq_s4)
+    dp_set(dp_s4, 21, d_bm_s4)
+    dp_set(dp_s4, 22, d_bmn_s4)
+    dp_set(dp_s4, 23, d_bao_s4)
+
+    puts("starting speck4 single-launch pass")
+    // pos_base = 0 — speck4 internal m-loop computes per-m pos = pos_base + m.
+    dispatch(dp_s4, max_phase, 0,
+             in_resid_4_b, kv_b, gu_4_b, norm_4_b, b_qkv_4_b, b_q_4_b, h_zero)
+    err = hipMemcpy(h_out_s4, d_out_s4, in_resid_4_b, 2); if err != 0 { die("D2H out_s4") }
+    puts("speck4 pass: PASS")
+
+    // ════════════════════════════════════════════════════════════════════
+    // COMPARE: speck4 out_residual[m*HIDDEN..(m+1)*HIDDEN] vs M=1 run m's
+    // out_residual.  Byte-exact per stream.
+    // ════════════════════════════════════════════════════════════════════
+    uint64 n_mismatch = 0
+    uint64 r0 = diff_slab("out_residual_m0", 15, h_out_m1_0, h_out_s4 + 0 * HIDDEN * 4, hidden_b)
+    uint64 r1 = diff_slab("out_residual_m1", 15, h_out_m1_1, h_out_s4 + 1 * HIDDEN * 4, hidden_b)
+    uint64 r2 = diff_slab("out_residual_m2", 15, h_out_m1_2, h_out_s4 + 2 * HIDDEN * 4, hidden_b)
+    uint64 r3 = diff_slab("out_residual_m3", 15, h_out_m1_3, h_out_s4 + 3 * HIDDEN * 4, hidden_b)
+    n_mismatch = r0 + r1 + r2 + r3
+
+    put_kv("mismatch_streams", 16, n_mismatch)
+    if n_mismatch == 0 {
+        puts("PASS -- llama speck4 4-stream out_residual byte-exact vs 4xM=1")
+        exit(0)
+    }
+    puts("FAIL -- speck4 vs 4xM=1 mismatch")
+    exit(1)
+}
