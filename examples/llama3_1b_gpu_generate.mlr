@@ -89,6 +89,48 @@ fn eu64(u64 v) {
     dealloc(s)
 }
 
+// Slice 6.7b — float buffer dump diagnostic (first 8, last 4, sum, max, min)
+// for bisecting mega-kernel vs CPU bf16 divergence.
+fn _dump_buf(u64 label, u64 ptr, u64 n) {
+    eout("  ["); eout(label); eout("] n="); eu64(n); eout("\n    head:")
+    u64 i = 0
+    u64 head_cnt = 8
+    if n < head_cnt { head_cnt = n }
+    while i < head_cnt {
+        f32 v = 0.0f; unsafe { *((ptr + i * 4) as f32) -> v }
+        eout(" "); u64 s = fmt_f32(v, 6); eout(s); dealloc(s)
+        i = i + 1
+    }
+    eout("\n    tail:")
+    u64 tail_start = n
+    if n > 4 { tail_start = n - 4 }
+    i = tail_start
+    while i < n {
+        f32 v = 0.0f; unsafe { *((ptr + i * 4) as f32) -> v }
+        eout(" "); u64 s = fmt_f32(v, 6); eout(s); dealloc(s)
+        i = i + 1
+    }
+    f64 sum = 0.0
+    f32 vmax = 0.0f
+    f32 vmin = 0.0f
+    u64 first = 1
+    i = 0
+    while i < n {
+        f32 v = 0.0f; unsafe { *((ptr + i * 4) as f32) -> v }
+        sum = sum + f32_to_f64(v)
+        if first == 1 { vmax = v; vmin = v; first = 0 }
+        else {
+            if v > vmax { vmax = v }
+            if v < vmin { vmin = v }
+        }
+        i = i + 1
+    }
+    eout("\n    sum="); u64 ss = fmt_f64(sum, 6); eout(ss); dealloc(ss)
+    eout(" max="); u64 sm = fmt_f32(vmax, 6); eout(sm); dealloc(sm)
+    eout(" min="); u64 sn = fmt_f32(vmin, 6); eout(sn); dealloc(sn)
+    eout("\n")
+}
+
 // Slice 6.4 — Phase B PLD (Prompt Lookup Decoding) draft proposer.
 //
 // Scan the last LOOKBACK=64 tokens of seq_ids32 for an NGRAM=2 match
@@ -725,6 +767,88 @@ fn main() {
                 u64 tmp = x_cur
                 x_cur = x_nxt
                 x_nxt = tmp
+            }
+            // Slice 6.7b — per-layer output dump diagnostic.  Enabled when
+            // MLRIFT_MEGAK_DUMP_LAYER=N matches the current layer (and step 0
+            // only).  Prints first 8 + last 4 floats + sum + max + min of
+            // the residual stream AFTER this layer ran.  Allows bisecting
+            // mega-kernel-vs-CPU divergence layer-by-layer.
+            if step == 0 {
+                u64 ev_dl = getenv("MLRIFT_MEGAK_DUMP_LAYER")
+                if ev_dl != 0 {
+                    u64 dl_n = 999
+                    u64 dli = 0
+                    u8 dl_c0 = 0; unsafe { *((ev_dl + 0) as u8) -> dl_c0 }
+                    if dl_c0 >= 48 && dl_c0 <= 57 {
+                        dl_n = 0
+                        while dli < 4 {
+                            u8 dl_c = 0; unsafe { *((ev_dl + dli) as u8) -> dl_c }
+                            if dl_c < 48 { dli = 4 }
+                            else if dl_c > 57 { dli = 4 }
+                            else { dl_n = dl_n * 10 + (dl_c - 48); dli = dli + 1 }
+                        }
+                    }
+                    if layer == dl_n {
+                        u64 dump_src = 0
+                        if _native_mk_use != 0 { dump_src = d_x_cur_h }
+                        else                   { dump_src = x_cur }
+                        _dump_buf("out_resid", dump_src, hidden)
+                        // For MEGAK, also dump all the device intermediates
+                        // (D2H copy via hipMemcpy + scratch host buffer).
+                        // Buffer sizes: b_x_norm_g, b_mid_g, b_mid_norm_g =
+                        // HIDDEN; b_qkv_g = qkv_dim; b_attn_q_g, b_attn_out_g
+                        // = q_dim; gu_scratch = 2*FF.  Last layer's contents
+                        // (since mega-kernel persists buffers across layers).
+                        if _native_mk_use != 0 {
+                            u64 qkv_dim_lg = q_dim + 2 * kv_dim
+                            u64 dump_scratch_max = 2 * ff   // FF f32s = max needed
+                            u64 dump_scratch = alloc(dump_scratch_max * 4)
+                            // b_x_norm_g (HIDDEN floats)
+                            u64 d_bxn = qwen3_gpu_get_megak_b_x_norm_g()
+                            if d_bxn != 0 {
+                                hipMemcpy(dump_scratch, d_bxn, hidden * 4, 2)
+                                _dump_buf("b_x_norm_g", dump_scratch, hidden)
+                            }
+                            // b_qkv_g (QKV_DIM floats)
+                            u64 d_bqk = qwen3_gpu_get_megak_b_qkv_g()
+                            if d_bqk != 0 {
+                                hipMemcpy(dump_scratch, d_bqk, qkv_dim_lg * 4, 2)
+                                _dump_buf("b_qkv_g", dump_scratch, qkv_dim_lg)
+                            }
+                            // b_attn_q_g (Q_DIM floats)
+                            u64 d_baq = qwen3_gpu_get_megak_b_attn_q_g()
+                            if d_baq != 0 {
+                                hipMemcpy(dump_scratch, d_baq, q_dim * 4, 2)
+                                _dump_buf("b_attn_q_g", dump_scratch, q_dim)
+                            }
+                            // b_attn_out_g (Q_DIM floats)
+                            u64 d_bao = qwen3_gpu_get_megak_b_attn_out_g()
+                            if d_bao != 0 {
+                                hipMemcpy(dump_scratch, d_bao, q_dim * 4, 2)
+                                _dump_buf("b_attn_out_g", dump_scratch, q_dim)
+                            }
+                            // b_mid_g (HIDDEN floats)
+                            u64 d_bm = qwen3_gpu_get_megak_b_mid_g()
+                            if d_bm != 0 {
+                                hipMemcpy(dump_scratch, d_bm, hidden * 4, 2)
+                                _dump_buf("b_mid_g", dump_scratch, hidden)
+                            }
+                            // b_mid_norm_g (HIDDEN floats)
+                            u64 d_bmn = qwen3_gpu_get_megak_b_mid_norm_g()
+                            if d_bmn != 0 {
+                                hipMemcpy(dump_scratch, d_bmn, hidden * 4, 2)
+                                _dump_buf("b_mid_norm_g", dump_scratch, hidden)
+                            }
+                            // gu_scratch (first FF floats = silu_mul output)
+                            u64 d_gu = qwen3_gpu_get_megak_gu_scratch()
+                            if d_gu != 0 {
+                                hipMemcpy(dump_scratch, d_gu, ff * 4, 2)
+                                _dump_buf("gu_scratch[0..FF]", dump_scratch, ff)
+                            }
+                            dealloc(dump_scratch)
+                        }
+                    }
+                }
             }
             layer = layer + 1
         }
