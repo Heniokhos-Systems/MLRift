@@ -157,6 +157,39 @@ fn _emit_s_cmp_lt_u32_lit(uint64 sgpr, uint64 v) {
     }
 }
 
+// SOP2 sdst = ssrc * factor.  Emits inline s_lshl_b32 if factor is a
+// non-zero power of 2 with shift in [0, 31]; otherwise emits the lit32
+// s_mul_i32 form.  Used by phase 5 speck4 per-m row-stride math, where
+// QKV row stride differs across archs (Qwen3 16384=pow2, Llama 12288=
+// 3*4096 not pow2).
+//
+// Power-of-2 path: s_lshl_b32 sdst, ssrc, shift  (SOP2 op 8).
+//   word = (2<<30)|(8<<23)|(sdst<<16)|((0x80+shift)<<8)|ssrc
+// Lit32 path:      s_mul_i32 sdst, ssrc, lit32   (SOP2 op 0x2C in gfx11).
+//   Verified via llvm-mc: `s_mul_i32 s19, s16, 12288` → `9613FF10 00003000`.
+//   word = (2<<30)|(0x2C<<23)|(sdst<<16)|(0xFF<<8)|ssrc
+//        = 0x96000000 | (sdst<<16) | (0xFF<<8) | ssrc
+fn _emit_s_mul_u32_pow2_or_lit(uint64 sdst, uint64 ssrc, uint64 factor) {
+    uint64 f = factor
+    uint64 shift = 0
+    uint64 is_pow2 = 1
+    if factor == 0 { is_pow2 = 0 }
+    while f > 1 {
+        if (f & 1) != 0 { is_pow2 = 0 }
+        f = f >> 1
+        shift = shift + 1
+    }
+    if is_pow2 != 0 && shift <= 31 {
+        // s_lshl_b32 sdst, ssrc, inline shift  (SOP2 op 8)
+        uint64 inline_imm = 0x80 + shift
+        asm_u32(0x84000000 | ((sdst & 0xFF) << 16) | (inline_imm << 8) | (ssrc & 0xFF))
+    } else {
+        // s_mul_i32 sdst, ssrc, lit32  (SOP2 op 0x2C in gfx11; ssrc1=0xFF)
+        asm_u32(0x96000000 | ((sdst & 0xFF) << 16) | (0xFF << 8) | (ssrc & 0xFF))
+        asm_u32(factor)
+    }
+}
+
 // 1/sqrt(n) f32 bits for n a power of 2 in {64, 128, 256, ...}.
 //   n= 64: 1/8       = 0x3D000000
 //   n=128: 1/sqrt(128) ≈ 0x3DB504F3
@@ -2805,11 +2838,48 @@ fn _emit_phase5_qkv_split_qknorm_rope_inline() {
 //   s[12:13]= rope_cos base (after pos committed to dst ptr setup)
 //   s[14:15]= rope_sin base (s15 is free inside a branch after 3-way dispatch)
 fn _emit_phase5_qkv_split_qknorm_rope_speck4_inline() {
-    // ── Outer gate: skip if wg_id >= 128 ─────────────────────────────────
-    // s_cmp_ge_u32 s15, 128: SOPC op=0x09; ssrc1 = lit32 = 0xFF; lit=128
-    //   word = 0xBF000000|(9<<16)|(0xFF<<8)|0x0F = 0xBF09FF0F, lit=128
+    // ── Slice 6.1 — shape locals derived from MEGA_* arch globals ────────
+    // Mirrors slice 5.3's lift on the M=1 base emitter.  All previously
+    // hard-coded Qwen3 literals (head dim, N_HEADS, N_KV_HEADS, qknorm
+    // bits, RoPE pair layout) are now expressed as functions of these
+    // locals.  At Qwen3 settings every value below resolves to its old
+    // hard-coded constant — byte-exact regression.
+    uint64 q_dim_bytes        = MEGA_N_HEADS    * MEGA_HEAD_DIM * 4
+    uint64 kv_dim_bytes       = MEGA_N_KV_HEADS * MEGA_HEAD_DIM * 4
+    uint64 qkv_dim_bytes      = q_dim_bytes + 2 * kv_dim_bytes
+    uint64 head_off_shift     = _arch_log2_pow2(MEGA_HEAD_DIM * 4)
+    uint64 kv_off_shift       = _arch_log2_pow2(kv_dim_bytes)
+    uint64 ssq_iter_count     = MEGA_HEAD_DIM / 32
+    uint64 rope_iter_count    = MEGA_HEAD_DIM / 64
+    uint64 vcopy_iter_count   = MEGA_HEAD_DIM / 32
+    uint64 inv_head_dim_bits  = _arch_inv_n_f32_bits(MEGA_HEAD_DIM)
+    uint64 outer_cap_speck4   = MEGA_M_EFF * (MEGA_N_HEADS + 2 * MEGA_N_KV_HEADS)
+    uint64 q_cap_speck4       = MEGA_M_EFF * MEGA_N_HEADS
+    uint64 k_cap_speck4       = MEGA_M_EFF * (MEGA_N_HEADS + MEGA_N_KV_HEADS)
+    uint64 v_src_base_off     = q_dim_bytes + kv_dim_bytes
+    uint64 n_heads_log2       = _arch_log2_pow2(MEGA_N_HEADS)
+    uint64 n_kv_heads_log2    = _arch_log2_pow2(MEGA_N_KV_HEADS)
+    uint64 head_mask_q        = MEGA_N_HEADS    - 1
+    uint64 head_mask_kv       = MEGA_N_KV_HEADS - 1
+    // RoPE pair-layout dependent fields (NEOX split-half by default; flipped
+    // to NORM consecutive-pair under MEGA_ROPE_PAIR_LAYOUT == 1 — Llama).
+    uint64 pair2_load_off     = 256        // NEOX: x2 lives at +HEAD_DIM/2*4 bytes
+    uint64 pair2_store_off    = 256
+    uint64 ptr_advance_bytes  = 128        // NEOX: src/norm/dst advance per iter
+    if MEGA_ROPE_PAIR_LAYOUT == 1 {
+        pair2_load_off    = 4
+        pair2_store_off   = 4
+        ptr_advance_bytes = 256
+    }
+
+    // ── Outer gate: skip if wg_id >= outer_cap_speck4 ────────────────────
+    // SOPC s_cmp_ge_u32 s15, outer_cap_speck4.  Helper picks lit32 form
+    // when v > 64 (Qwen3=128, Llama=192 both lit32).
     uint64 outer_gate_pos = asm_text_len / 4
-    asm_u32(0xBF09FF0F); asm_u32(128)
+    _emit_s_cmp_ge_u32_lit(15, outer_cap_speck4)
+    // Capture position of s_cbranch_scc1 so the patch math doesn't depend
+    // on whether the cmp emitted 1 or 2 dwords.
+    uint64 outer_branch_pos = asm_text_len / 4
     asm_s_cbranch_scc1(0)   // forward to .phase5_done (patched at end)
 
     // ── Load pos_base (full 64 bits) → s[20:21] ──────────────────────────
@@ -2821,11 +2891,11 @@ fn _emit_phase5_qkv_split_qknorm_rope_speck4_inline() {
     asm_v_mov_b32_inline_u(1, 0)
 
     // ── 3-way (Q | K | V) dispatch ───────────────────────────────────────
-    // Q check: s_cmp_lt_u32 s15, 64 (SCC=1 if wg_id < 64)
-    // SOPC op=0x0A: ssrc1=inline 64=0xC0; word=0xBF000000|(0x0A<<16)|(0xC0<<8)|0x0F=0xBF0AC00F
-    asm_u32(0xBF0AC00F)
+    // Q check: s_cmp_lt_u32 s15, q_cap_speck4 (= M_EFF * N_HEADS).
+    // At Qwen3 q_cap_speck4=64 → 0xBF0AC00F (inline 64).
+    _emit_s_cmp_lt_u32_lit(15, q_cap_speck4)
     uint64 q_gate_pos = asm_text_len / 4
-    asm_s_cbranch_scc0(0)   // to .not_q if wg_id >= 64 (patched)
+    asm_s_cbranch_scc0(0)   // to .not_q if wg_id >= q_cap_speck4 (patched)
 
     // ════════════════════════════════════════════════════════════════════
     // Q BODY (wg_id < 64)
@@ -2837,43 +2907,44 @@ fn _emit_phase5_qkv_split_qknorm_rope_speck4_inline() {
     //   rope = rope_cos_4 + (m << 8), rope_sin_4 + (m << 8)
     // ════════════════════════════════════════════════════════════════════
 
-    // m    = s15 >> 4: s_lshr_b32 s16, s15, 4
-    //   SOP2 op 0x0A (gfx11): word = (2<<30)|(0x0A<<23)|(0x10<<16)|(0x84<<8)|0x0F = 0x8510840F
-    asm_u32(0x8510840F)
-    // head = s15 & 15: s_and_b32 s17, s15, 15
-    //   SOP2 op 0x16 (gfx11): word = (2<<30)|(0x16<<23)|(0x11<<16)|(0x8F<<8)|0x0F = 0x8B118F0F
-    asm_u32(0x8B118F0F)
+    // m    = s15 >> n_heads_log2: s_lshr_b32 s16, s15, n_heads_log2
+    //   SOP2 op 0x0A (gfx11), sdst=16, ssrc0=15.
+    //   At Qwen3 n_heads_log2=4 → 0x8510840F.
+    asm_u32(0x85100000 | ((0x80 + n_heads_log2) << 8) | 0x0F)
+    // head = s15 & head_mask_q: s_and_b32 s17, s15, head_mask_q
+    //   SOP2 op 0x16 (gfx11), sdst=17, ssrc0=15.
+    //   At Qwen3 head_mask_q=15 → 0x8B118F0F.
+    asm_u32(0x8B110000 | ((0x80 + head_mask_q) << 8) | 0x0F)
 
     // Load b_qkv_g_4 → s[2:3]   (kernarg 0x90)
     asm_s_load_b64_off(1, 0, 0x90)
-    // Load q_norm_g → s[4:5]    (kernarg 0x40)
-    asm_s_load_b64_off(2, 0, 0x40)
+    // Load q_norm_g → s[4:5]    (kernarg 0x40) — qknorm only.
+    if MEGA_USE_QKNORM != 0 {
+        asm_s_load_b64_off(2, 0, 0x40)
+    }
     // Load b_attn_q_g_4 → s[6:7] (kernarg 0x98)
     asm_s_load_b64_off(3, 0, 0x98)
     asm_s_waitcnt_lgkmcnt_zero()
 
-    // src offset: (m << 14) + (head << 9)
-    // s14 = head << 9: s_lshl_b32 s14, s17, 9
-    //   SOP2 op 8: word=(2<<30)|(8<<23)|(0x0E<<16)|(0x89<<8)|0x11 = 0x840E8911
-    asm_u32(0x840E8911)
-    // s19 = m << 14: s_lshl_b32 s19, s16, 14
-    //   word=(2<<30)|(8<<23)|(0x13<<16)|(0x8E<<8)|0x10 = 0x84138E10
-    asm_u32(0x84138E10)
+    // src offset: m*qkv_dim_bytes + head*HEAD_DIM*4
+    // s14 = head << head_off_shift: s_lshl_b32 s14, s17, head_off_shift
+    // At Qwen3 head_off_shift=9 → 0x840E8911.
+    asm_u32(0x840E0011 | ((0x80 + head_off_shift) << 8))
+    // s19 = m * qkv_dim_bytes (Qwen3 16384 pow2 → s_lshl 14 = 0x84138E10;
+    // Llama 12288 not pow2 → s_mul_i32 s19, s16, 12288 = 9613FF10 lit=12288).
+    _emit_s_mul_u32_pow2_or_lit(19, 16, qkv_dim_bytes)
     // s14 = s14 + s19: s_add_u32 s14, s14, s19
-    //   SOP2 op 0: word = 0x80000000|(0x0E<<16)|(0x13<<8)|0x0E = 0x800E130E
     asm_u32(0x800E130E)
     // s_add_u32  s2, s2, s14
     asm_u32(0x80020E02)
     // s_addc_u32 s3, s3, 0
     asm_u32(0x82038003)
 
-    // dst offset: (m << 13) + (head << 9)
-    // s14 = head << 9 (already), s19 = m << 13 (re-shift m)
-    // s_lshl_b32 s19, s16, 13:
-    //   word=(2<<30)|(8<<23)|(0x13<<16)|(0x8D<<8)|0x10 = 0x84138D10
-    asm_u32(0x84138D10)
-    // s14 = (head << 9) freshly recomputed (was overwritten by add above)
-    asm_u32(0x840E8911)
+    // dst offset: m*q_dim_bytes + head*HEAD_DIM*4
+    // s19 = m * q_dim_bytes (Qwen3 8192 pow2 → s_lshl 13 = 0x84138D10).
+    _emit_s_mul_u32_pow2_or_lit(19, 16, q_dim_bytes)
+    // s14 = (head << head_off_shift) freshly recomputed (was overwritten above)
+    asm_u32(0x840E0011 | ((0x80 + head_off_shift) << 8))
     // s14 = s14 + s19
     asm_u32(0x800E130E)
     // s_add_u32  s6, s6, s14
@@ -2881,37 +2952,39 @@ fn _emit_phase5_qkv_split_qknorm_rope_speck4_inline() {
     // s_addc_u32 s7, s7, 0
     asm_u32(0x82078007)
 
-    // ── Q: inline rmsnorm-128 (identical to base Q body) ─────────────────
-    asm_v_mov_b32_inline_u(2, 0)
-    asm_v_lshlrev_b32_imm(9, 2, 0)
-    asm_v_mov_b32_inline_u(4, 0)
-    asm_v_add_co_u32_vcc_sv(3, 2, 9)
-    asm_v_add_co_ci_u32_null_sv_vcc(4, 3, 4)
-    asm_s_mov_b32_inline_imm(12, 4)
-    uint64 q_ssq_top = asm_text_len / 4
-    asm_u32(0xDC520000); asm_u32(0x0D7C0003)
-    asm_s_waitcnt_vmcnt_zero()
-    asm_v_fmac_f32_e32_vv(2, 13, 13)
-    asm_u32(0xD7006A03); asm_u32(0x000206FF); asm_u32(128)
-    asm_u32(0xD5207C04); asm_u32(0x01AA0880)
-    asm_s_sub_u32_imm(12, 12, 1)
-    asm_s_cmp_eq_u32(12, 0x80)
-    uint64 q_ssq_back = (0 - ((asm_text_len / 4) - q_ssq_top) - 1) & 0xFFFF
-    asm_s_cbranch_scc0(q_ssq_back)
-    _emit_wave_xor_reduce_add_f32_5_levels(2, 15, 16)
-    asm_s_mov_b32(12, 0x7E)
-    asm_u32(0x7D940080)
-    asm_s_mov_b32_lit32(14, 0x3C000000)
-    asm_u32(0x1004040E)
-    asm_s_mov_b32_lit32(14, 0x358637BD)
-    asm_u32(0x0604040E)
-    asm_u32(0x7E045D02)
-    asm_u32(0xD8340200); asm_u32(0x00000201)
-    asm_s_mov_b32(0x7E, 12)
-    asm_s_waitcnt_lgkmcnt_zero()
-    asm_s_barrier()
-    asm_u32(0xD8D80200); asm_u32(0x02000001)
-    asm_s_waitcnt_lgkmcnt_zero()
+    // ── Q: inline rmsnorm-HEAD_DIM (qknorm only; identical to base Q body) ─
+    if MEGA_USE_QKNORM != 0 {
+        asm_v_mov_b32_inline_u(2, 0)
+        asm_v_lshlrev_b32_imm(9, 2, 0)
+        asm_v_mov_b32_inline_u(4, 0)
+        asm_v_add_co_u32_vcc_sv(3, 2, 9)
+        asm_v_add_co_ci_u32_null_sv_vcc(4, 3, 4)
+        asm_s_mov_b32_inline_imm(12, ssq_iter_count)
+        uint64 q_ssq_top = asm_text_len / 4
+        asm_u32(0xDC520000); asm_u32(0x0D7C0003)
+        asm_s_waitcnt_vmcnt_zero()
+        asm_v_fmac_f32_e32_vv(2, 13, 13)
+        asm_u32(0xD7006A03); asm_u32(0x000206FF); asm_u32(128)
+        asm_u32(0xD5207C04); asm_u32(0x01AA0880)
+        asm_s_sub_u32_imm(12, 12, 1)
+        asm_s_cmp_eq_u32(12, 0x80)
+        uint64 q_ssq_back = (0 - ((asm_text_len / 4) - q_ssq_top) - 1) & 0xFFFF
+        asm_s_cbranch_scc0(q_ssq_back)
+        _emit_wave_xor_reduce_add_f32_5_levels(2, 15, 16)
+        asm_s_mov_b32(12, 0x7E)
+        asm_u32(0x7D940080)
+        asm_s_mov_b32_lit32(14, inv_head_dim_bits)        // s14 = 1/HEAD_DIM
+        asm_u32(0x1004040E)
+        asm_s_mov_b32_lit32(14, 0x358637BD)
+        asm_u32(0x0604040E)
+        asm_u32(0x7E045D02)
+        asm_u32(0xD8340200); asm_u32(0x00000201)
+        asm_s_mov_b32(0x7E, 12)
+        asm_s_waitcnt_lgkmcnt_zero()
+        asm_s_barrier()
+        asm_u32(0xD8D80200); asm_u32(0x02000001)
+        asm_s_waitcnt_lgkmcnt_zero()
+    }
 
     // ── Q: load rope_cos→s[12:13], rope_sin→s[14:15], add m*256 ─────────
     // (Note: _emit_wave_xor_reduce_add_f32_5_levels uses s15 internally?
@@ -2934,13 +3007,15 @@ fn _emit_phase5_qkv_split_qknorm_rope_speck4_inline() {
     // s_addc_u32 s15, s15, 0
     asm_u32(0x820F800F)
 
-    // ── Q: RoPE pair-rotation loop (2 iters: lane..64 step 32) ──────────
+    // ── Q: RoPE pair-rotation loop (HEAD_DIM/64 iters: lane..HEAD_DIM/2 step 32) ─
     asm_v_mov_b32_inline_u(4, 0)
     asm_v_add_co_u32_vcc_sv(3, 2, 9)
     asm_v_add_co_ci_u32_null_sv_vcc(4, 3, 4)
-    asm_v_mov_b32_inline_u(6, 0)
-    asm_v_add_co_u32_vcc_sv(5, 4, 9)
-    asm_v_add_co_ci_u32_null_sv_vcc(6, 5, 6)
+    if MEGA_USE_QKNORM != 0 {
+        asm_v_mov_b32_inline_u(6, 0)
+        asm_v_add_co_u32_vcc_sv(5, 4, 9)
+        asm_v_add_co_ci_u32_null_sv_vcc(6, 5, 6)
+    }
     asm_v_mov_b32_inline_u(8, 0)
     asm_v_add_co_u32_vcc_sv(7, 6, 9)
     asm_v_add_co_ci_u32_null_sv_vcc(8, 7, 8)
@@ -2951,17 +3026,21 @@ fn _emit_phase5_qkv_split_qknorm_rope_speck4_inline() {
     asm_v_mov_b32_inline_u(12, 0)
     asm_v_add_co_u32_vcc_sv(11, 14, 17)
     asm_v_add_co_ci_u32_null_sv_vcc(12, 15, 12)
-    asm_s_mov_b32_inline_imm(12, 2)
+    asm_s_mov_b32_inline_imm(12, rope_iter_count)
     uint64 q_rope_top = asm_text_len / 4
-    asm_u32(0xDC520000); asm_u32(0x0D7C0003)
-    asm_u32(0xDC520100); asm_u32(0x0E7C0003)
-    asm_u32(0xDC520000); asm_u32(0x0F7C0005)
-    asm_u32(0xDC520100); asm_u32(0x107C0005)
+    asm_u32(0xDC520000); asm_u32(0x0D7C0003)                                     // v13 = src[i]
+    asm_u32(0xDC520000 | (pair2_load_off & 0xFFFF)); asm_u32(0x0E7C0003)        // v14 = src[i+pair2]
+    if MEGA_USE_QKNORM != 0 {
+        asm_u32(0xDC520000); asm_u32(0x0F7C0005)                                     // v15 = norm[i]
+        asm_u32(0xDC520000 | (pair2_load_off & 0xFFFF)); asm_u32(0x107C0005)        // v16 = norm[i+pair2]
+    }
     asm_s_waitcnt_vmcnt_zero()
-    asm_u32(0x101A1B02)
-    asm_u32(0x101A1F0D)
-    asm_u32(0x101C1D02)
-    asm_u32(0x101C210E)
+    if MEGA_USE_QKNORM != 0 {
+        asm_u32(0x101A1B02)
+        asm_u32(0x101A1F0D)
+        asm_u32(0x101C1D02)
+        asm_u32(0x101C210E)
+    }
     asm_u32(0xDC520000); asm_u32(0x0F7C0009)
     asm_u32(0xDC520000); asm_u32(0x107C000B)
     asm_s_waitcnt_vmcnt_zero()
@@ -2971,16 +3050,18 @@ fn _emit_phase5_qkv_split_qknorm_rope_speck4_inline() {
     asm_u32(0xDC6A0000); asm_u32(0x007C1107)
     asm_u32(0x1022210D)
     asm_u32(0x56221F0E)
-    asm_u32(0xDC6A0100); asm_u32(0x007C1107)
-    asm_u32(0xD7006A03); asm_u32(0x000206FF); asm_u32(128)
+    asm_u32(0xDC6A0000 | (pair2_store_off & 0xFFFF)); asm_u32(0x007C1107)
+    asm_u32(0xD7006A03); asm_u32(0x000206FF); asm_u32(ptr_advance_bytes)         // src ptr lo
     asm_u32(0xD5207C04); asm_u32(0x01AA0880)
-    asm_u32(0xD7006A05); asm_u32(0x00020AFF); asm_u32(128)
-    asm_u32(0xD5207C06); asm_u32(0x01AA0C80)
-    asm_u32(0xD7006A07); asm_u32(0x00020EFF); asm_u32(128)
+    if MEGA_USE_QKNORM != 0 {
+        asm_u32(0xD7006A05); asm_u32(0x00020AFF); asm_u32(ptr_advance_bytes)         // norm ptr lo
+        asm_u32(0xD5207C06); asm_u32(0x01AA0C80)
+    }
+    asm_u32(0xD7006A07); asm_u32(0x00020EFF); asm_u32(ptr_advance_bytes)         // dst ptr lo
     asm_u32(0xD5207C08); asm_u32(0x01AA1080)
-    asm_u32(0xD7006A09); asm_u32(0x000212FF); asm_u32(128)
+    asm_u32(0xD7006A09); asm_u32(0x000212FF); asm_u32(128)                       // cos ptr lo (always 128)
     asm_u32(0xD5207C0A); asm_u32(0x01AA1480)
-    asm_u32(0xD7006A0B); asm_u32(0x000216FF); asm_u32(128)
+    asm_u32(0xD7006A0B); asm_u32(0x000216FF); asm_u32(128)                       // sin ptr lo (always 128)
     asm_u32(0xD5207C0C); asm_u32(0x01AA1880)
     asm_s_sub_u32_imm(12, 12, 1)
     asm_s_cmp_eq_u32(12, 0x80)
@@ -2995,11 +3076,11 @@ fn _emit_phase5_qkv_split_qknorm_rope_speck4_inline() {
     uint64 not_q_target = asm_text_len / 4
     asm_patch_u32(q_gate_pos, 0xBFA10000 | ((not_q_target - q_gate_pos - 1) & 0xFFFF))
 
-    // K check: s_cmp_lt_u32 s15, 96 (SCC=1 if wg_id < 96 → K head)
-    // SOPC op=0x0A: ssrc1=lit32(0xFF); lit=96; word=0xBF000000|(0x0A<<16)|(0xFF<<8)|0x0F=0xBF0AFF0F
-    asm_u32(0xBF0AFF0F); asm_u32(96)
+    // K check: s_cmp_lt_u32 s15, k_cap_speck4 (= M_EFF * (N_HEADS+N_KV_HEADS)).
+    // At Qwen3 k_cap_speck4=96 → 0xBF0AFF0F lit=96.
+    _emit_s_cmp_lt_u32_lit(15, k_cap_speck4)
     uint64 k_gate_pos = asm_text_len / 4
-    asm_s_cbranch_scc0(0)   // to .v_path if wg_id >= 96 (patched)
+    asm_s_cbranch_scc0(0)   // to .v_path if wg_id >= k_cap_speck4 (patched)
 
     // ════════════════════════════════════════════════════════════════════
     // K BODY (64 ≤ wg_id < 96)
@@ -3012,91 +3093,94 @@ fn _emit_phase5_qkv_split_qknorm_rope_speck4_inline() {
     //   norm = k_norm_g
     // ════════════════════════════════════════════════════════════════════
 
-    // t = s15 - 64 → s19; s_sub_u32 s19, s15, lit; lit=64
-    //   word = 0x80000000|(1<<23)|(0x13<<16)|(0xFF<<8)|0x0F = 0x8093FF0F, lit=64
-    asm_u32(0x8093FF0F); asm_u32(64)
-    // m = s19 >> 3: s_lshr_b32 s16, s19, 3
-    //   word=(2<<30)|(0x0A<<23)|(0x10<<16)|(0x83<<8)|0x13 = 0x85108313
-    asm_u32(0x85108313)
-    // head = s19 & 7: s_and_b32 s17, s19, 7
-    //   word=(2<<30)|(0x16<<23)|(0x11<<16)|(0x87<<8)|0x13 = 0x8B118713
-    asm_u32(0x8B118713)
+    // t = s15 - q_cap_speck4 → s19; s_sub_u32 s19, s15, lit32
+    //   word = 0x80000000|(1<<23)|(0x13<<16)|(0xFF<<8)|0x0F = 0x8093FF0F
+    //   At Qwen3 q_cap_speck4=64.
+    asm_u32(0x8093FF0F); asm_u32(q_cap_speck4)
+    // m = s19 >> n_kv_heads_log2: s_lshr_b32 s16, s19, n_kv_heads_log2
+    //   At Qwen3 n_kv_heads_log2=3 → 0x85108313.
+    asm_u32(0x85100013 | ((0x80 + n_kv_heads_log2) << 8))
+    // head = s19 & head_mask_kv: s_and_b32 s17, s19, head_mask_kv
+    //   At Qwen3 head_mask_kv=7 → 0x8B118713.
+    asm_u32(0x8B110013 | ((0x80 + head_mask_kv) << 8))
 
     // Load b_qkv_g_4 → s[2:3]    (kernarg 0x90)
     asm_s_load_b64_off(1, 0, 0x90)
-    // Load k_norm_g → s[4:5]     (kernarg 0x48)
-    asm_s_load_b64_off(2, 0, 0x48)
+    // Load k_norm_g → s[4:5]     (kernarg 0x48) — qknorm only.
+    if MEGA_USE_QKNORM != 0 {
+        asm_s_load_b64_off(2, 0, 0x48)
+    }
     // Load kc_layer → s[6:7]     (kernarg 0x60)
     asm_s_load_b64_off(3, 0, 0x60)
     asm_s_waitcnt_lgkmcnt_zero()
 
-    // src offset = (m << 14) + 8192 + (head << 9)
-    // s14 = head << 9
-    asm_u32(0x840E8911)
-    // s19 = m << 14
-    asm_u32(0x84138E10)
+    // src offset = m*qkv_dim_bytes + q_dim_bytes + head*HEAD_DIM*4
+    // s14 = head << head_off_shift
+    asm_u32(0x840E0011 | ((0x80 + head_off_shift) << 8))
+    // s19 = m * qkv_dim_bytes
+    _emit_s_mul_u32_pow2_or_lit(19, 16, qkv_dim_bytes)
     // s14 = s14 + s19
     asm_u32(0x800E130E)
-    // s14 += 8192 (Q_DIM*4): s_add_u32 s14, s14, lit32
-    //   word = 0x80000000|(0x0E<<16)|(0xFF<<8)|0x0E = 0x800EFF0E, lit=8192
-    asm_u32(0x800EFF0E); asm_u32(8192)
+    // s14 += q_dim_bytes (Qwen3 8192)
+    asm_u32(0x800EFF0E); asm_u32(q_dim_bytes)
     // s_add_u32  s2, s2, s14
     asm_u32(0x80020E02)
     // s_addc_u32 s3, s3, 0
     asm_u32(0x82038003)
 
-    // dst offset = ((pos_base + m) << 12) + (head << 9)
+    // dst offset = (pos_base + m)*KV_DIM*4 + head*HEAD_DIM*4
     // s12 = pos_lo + m: s_add_u32 s12, s20, s16
-    //   word = 0x80000000|(0x0C<<16)|(0x10<<8)|0x14 = 0x800C1014
     asm_u32(0x800C1014)
     // s13 = pos_hi + 0 + carry: s_addc_u32 s13, s21, 0
-    //   SOP2 op 4: word = 0x80000000|(4<<23)|(0x0D<<16)|(0x80<<8)|0x15 = 0x820D8015
     asm_u32(0x820D8015)
-    // s[12:13] <<= 12: s_lshl_b64 s[12:13], s[12:13], 12
-    //   SOP2 op 0x09 (gfx11 s_lshl_b64): word=(2<<30)|(9<<23)|(0x0C<<16)|(0x8C<<8)|0x0C = 0x848C8C0C
-    asm_u32(0x848C8C0C)
+    // s[12:13] <<= kv_off_shift: s_lshl_b64 s[12:13], s[12:13], kv_off_shift
+    //   SOP2 op 0x09 (gfx11 s_lshl_b64).
+    //   At Qwen3 kv_off_shift=12 → 0x848C8C0C.
+    asm_u32(0x84000000 | (9 << 23) | (12 << 16) | ((0x80 + kv_off_shift) << 8) | 12)
     // s_add_u32  s6, s6, s12
     asm_u32(0x80060C06)
     // s_addc_u32 s7, s7, s13
     asm_u32(0x82070D07)
-    // add (head << 9): s14 = head << 9
-    asm_u32(0x840E8911)
+    // add (head << head_off_shift): s14 = head << head_off_shift
+    asm_u32(0x840E0011 | ((0x80 + head_off_shift) << 8))
     // s_add_u32  s6, s6, s14
     asm_u32(0x80060E06)
     // s_addc_u32 s7, s7, 0
     asm_u32(0x82078007)
 
-    // ── K: inline rmsnorm-128 (identical to Q body) ───────────────────────
-    asm_v_mov_b32_inline_u(2, 0)
-    asm_v_lshlrev_b32_imm(9, 2, 0)
-    asm_v_mov_b32_inline_u(4, 0)
-    asm_v_add_co_u32_vcc_sv(3, 2, 9)
-    asm_v_add_co_ci_u32_null_sv_vcc(4, 3, 4)
-    asm_s_mov_b32_inline_imm(12, 4)
-    uint64 k_ssq_top = asm_text_len / 4
-    asm_u32(0xDC520000); asm_u32(0x0D7C0003)
-    asm_s_waitcnt_vmcnt_zero()
-    asm_v_fmac_f32_e32_vv(2, 13, 13)
-    asm_u32(0xD7006A03); asm_u32(0x000206FF); asm_u32(128)
-    asm_u32(0xD5207C04); asm_u32(0x01AA0880)
-    asm_s_sub_u32_imm(12, 12, 1)
-    asm_s_cmp_eq_u32(12, 0x80)
-    uint64 k_ssq_back = (0 - ((asm_text_len / 4) - k_ssq_top) - 1) & 0xFFFF
-    asm_s_cbranch_scc0(k_ssq_back)
-    _emit_wave_xor_reduce_add_f32_5_levels(2, 15, 16)
-    asm_s_mov_b32(12, 0x7E)
-    asm_u32(0x7D940080)
-    asm_s_mov_b32_lit32(14, 0x3C000000)
-    asm_u32(0x1004040E)
-    asm_s_mov_b32_lit32(14, 0x358637BD)
-    asm_u32(0x0604040E)
-    asm_u32(0x7E045D02)
-    asm_u32(0xD8340200); asm_u32(0x00000201)
-    asm_s_mov_b32(0x7E, 12)
-    asm_s_waitcnt_lgkmcnt_zero()
-    asm_s_barrier()
-    asm_u32(0xD8D80200); asm_u32(0x02000001)
-    asm_s_waitcnt_lgkmcnt_zero()
+    // ── K: inline rmsnorm-HEAD_DIM (qknorm only; identical to Q body) ─────
+    if MEGA_USE_QKNORM != 0 {
+        asm_v_mov_b32_inline_u(2, 0)
+        asm_v_lshlrev_b32_imm(9, 2, 0)
+        asm_v_mov_b32_inline_u(4, 0)
+        asm_v_add_co_u32_vcc_sv(3, 2, 9)
+        asm_v_add_co_ci_u32_null_sv_vcc(4, 3, 4)
+        asm_s_mov_b32_inline_imm(12, ssq_iter_count)
+        uint64 k_ssq_top = asm_text_len / 4
+        asm_u32(0xDC520000); asm_u32(0x0D7C0003)
+        asm_s_waitcnt_vmcnt_zero()
+        asm_v_fmac_f32_e32_vv(2, 13, 13)
+        asm_u32(0xD7006A03); asm_u32(0x000206FF); asm_u32(128)
+        asm_u32(0xD5207C04); asm_u32(0x01AA0880)
+        asm_s_sub_u32_imm(12, 12, 1)
+        asm_s_cmp_eq_u32(12, 0x80)
+        uint64 k_ssq_back = (0 - ((asm_text_len / 4) - k_ssq_top) - 1) & 0xFFFF
+        asm_s_cbranch_scc0(k_ssq_back)
+        _emit_wave_xor_reduce_add_f32_5_levels(2, 15, 16)
+        asm_s_mov_b32(12, 0x7E)
+        asm_u32(0x7D940080)
+        asm_s_mov_b32_lit32(14, inv_head_dim_bits)        // s14 = 1/HEAD_DIM
+        asm_u32(0x1004040E)
+        asm_s_mov_b32_lit32(14, 0x358637BD)
+        asm_u32(0x0604040E)
+        asm_u32(0x7E045D02)
+        asm_u32(0xD8340200); asm_u32(0x00000201)
+        asm_s_mov_b32(0x7E, 12)
+        asm_s_waitcnt_lgkmcnt_zero()
+        asm_s_barrier()
+        asm_u32(0xD8D80200); asm_u32(0x02000001)
+        asm_s_waitcnt_lgkmcnt_zero()
+    }
 
     // ── K: load rope_cos→s[12:13], rope_sin→s[14:15], add m*256 ─────────
     asm_s_load_b64_off(6, 0, 0x50)
@@ -3113,9 +3197,11 @@ fn _emit_phase5_qkv_split_qknorm_rope_speck4_inline() {
     asm_v_mov_b32_inline_u(4, 0)
     asm_v_add_co_u32_vcc_sv(3, 2, 9)
     asm_v_add_co_ci_u32_null_sv_vcc(4, 3, 4)
-    asm_v_mov_b32_inline_u(6, 0)
-    asm_v_add_co_u32_vcc_sv(5, 4, 9)
-    asm_v_add_co_ci_u32_null_sv_vcc(6, 5, 6)
+    if MEGA_USE_QKNORM != 0 {
+        asm_v_mov_b32_inline_u(6, 0)
+        asm_v_add_co_u32_vcc_sv(5, 4, 9)
+        asm_v_add_co_ci_u32_null_sv_vcc(6, 5, 6)
+    }
     asm_v_mov_b32_inline_u(8, 0)
     asm_v_add_co_u32_vcc_sv(7, 6, 9)
     asm_v_add_co_ci_u32_null_sv_vcc(8, 7, 8)
@@ -3126,17 +3212,21 @@ fn _emit_phase5_qkv_split_qknorm_rope_speck4_inline() {
     asm_v_mov_b32_inline_u(12, 0)
     asm_v_add_co_u32_vcc_sv(11, 14, 17)
     asm_v_add_co_ci_u32_null_sv_vcc(12, 15, 12)
-    asm_s_mov_b32_inline_imm(12, 2)
+    asm_s_mov_b32_inline_imm(12, rope_iter_count)
     uint64 k_rope_top = asm_text_len / 4
-    asm_u32(0xDC520000); asm_u32(0x0D7C0003)
-    asm_u32(0xDC520100); asm_u32(0x0E7C0003)
-    asm_u32(0xDC520000); asm_u32(0x0F7C0005)
-    asm_u32(0xDC520100); asm_u32(0x107C0005)
+    asm_u32(0xDC520000); asm_u32(0x0D7C0003)                                     // v13 = src[i]
+    asm_u32(0xDC520000 | (pair2_load_off & 0xFFFF)); asm_u32(0x0E7C0003)        // v14 = src[i+pair2]
+    if MEGA_USE_QKNORM != 0 {
+        asm_u32(0xDC520000); asm_u32(0x0F7C0005)                                     // v15 = norm[i]
+        asm_u32(0xDC520000 | (pair2_load_off & 0xFFFF)); asm_u32(0x107C0005)        // v16 = norm[i+pair2]
+    }
     asm_s_waitcnt_vmcnt_zero()
-    asm_u32(0x101A1B02)
-    asm_u32(0x101A1F0D)
-    asm_u32(0x101C1D02)
-    asm_u32(0x101C210E)
+    if MEGA_USE_QKNORM != 0 {
+        asm_u32(0x101A1B02)
+        asm_u32(0x101A1F0D)
+        asm_u32(0x101C1D02)
+        asm_u32(0x101C210E)
+    }
     asm_u32(0xDC520000); asm_u32(0x0F7C0009)
     asm_u32(0xDC520000); asm_u32(0x107C000B)
     asm_s_waitcnt_vmcnt_zero()
@@ -3146,16 +3236,18 @@ fn _emit_phase5_qkv_split_qknorm_rope_speck4_inline() {
     asm_u32(0xDC6A0000); asm_u32(0x007C1107)
     asm_u32(0x1022210D)
     asm_u32(0x56221F0E)
-    asm_u32(0xDC6A0100); asm_u32(0x007C1107)
-    asm_u32(0xD7006A03); asm_u32(0x000206FF); asm_u32(128)
+    asm_u32(0xDC6A0000 | (pair2_store_off & 0xFFFF)); asm_u32(0x007C1107)
+    asm_u32(0xD7006A03); asm_u32(0x000206FF); asm_u32(ptr_advance_bytes)         // src ptr lo
     asm_u32(0xD5207C04); asm_u32(0x01AA0880)
-    asm_u32(0xD7006A05); asm_u32(0x00020AFF); asm_u32(128)
-    asm_u32(0xD5207C06); asm_u32(0x01AA0C80)
-    asm_u32(0xD7006A07); asm_u32(0x00020EFF); asm_u32(128)
+    if MEGA_USE_QKNORM != 0 {
+        asm_u32(0xD7006A05); asm_u32(0x00020AFF); asm_u32(ptr_advance_bytes)         // norm ptr lo
+        asm_u32(0xD5207C06); asm_u32(0x01AA0C80)
+    }
+    asm_u32(0xD7006A07); asm_u32(0x00020EFF); asm_u32(ptr_advance_bytes)         // dst ptr lo
     asm_u32(0xD5207C08); asm_u32(0x01AA1080)
-    asm_u32(0xD7006A09); asm_u32(0x000212FF); asm_u32(128)
+    asm_u32(0xD7006A09); asm_u32(0x000212FF); asm_u32(128)                       // cos ptr lo (always 128)
     asm_u32(0xD5207C0A); asm_u32(0x01AA1480)
-    asm_u32(0xD7006A0B); asm_u32(0x000216FF); asm_u32(128)
+    asm_u32(0xD7006A0B); asm_u32(0x000216FF); asm_u32(128)                       // sin ptr lo (always 128)
     asm_u32(0xD5207C0C); asm_u32(0x01AA1880)
     asm_s_sub_u32_imm(12, 12, 1)
     asm_s_cmp_eq_u32(12, 0x80)
@@ -3180,13 +3272,13 @@ fn _emit_phase5_qkv_split_qknorm_rope_speck4_inline() {
     //   passthrough copy: 128 elements / WAVE=32 → 4 iters @ +128B/iter
     // ════════════════════════════════════════════════════════════════════
 
-    // t = s15 - 96 → s19
-    //   word=0x8093FF0F, lit=96
-    asm_u32(0x8093FF0F); asm_u32(96)
-    // m = s19 >> 3 → s16
-    asm_u32(0x85108313)
-    // head = s19 & 7 → s17
-    asm_u32(0x8B118713)
+    // t = s15 - k_cap_speck4 → s19; s_sub_u32 s19, s15, lit32
+    //   At Qwen3 k_cap_speck4=96.
+    asm_u32(0x8093FF0F); asm_u32(k_cap_speck4)
+    // m = s19 >> n_kv_heads_log2 → s16
+    asm_u32(0x85100013 | ((0x80 + n_kv_heads_log2) << 8))
+    // head = s19 & head_mask_kv → s17
+    asm_u32(0x8B110013 | ((0x80 + head_mask_kv) << 8))
 
     // Load b_qkv_g_4 → s[2:3] (kernarg 0x90)
     asm_s_load_b64_off(1, 0, 0x90)
@@ -3194,25 +3286,28 @@ fn _emit_phase5_qkv_split_qknorm_rope_speck4_inline() {
     asm_s_load_b64_off(3, 0, 0x68)
     asm_s_waitcnt_lgkmcnt_zero()
 
-    // src offset = (m << 14) + 12288 + (head << 9)
-    asm_u32(0x840E8911)         // s14 = head << 9
-    asm_u32(0x84138E10)         // s19 = m << 14
-    asm_u32(0x800E130E)         // s14 = s14 + s19
-    asm_u32(0x800EFF0E); asm_u32(12288)   // s14 += 12288
-    asm_u32(0x80020E02)         // s2 += s14
-    asm_u32(0x82038003)         // s3 += carry
+    // src offset = m*qkv_dim_bytes + v_src_base_off + head*HEAD_DIM*4
+    // s14 = head << head_off_shift
+    asm_u32(0x840E0011 | ((0x80 + head_off_shift) << 8))
+    // s19 = m * qkv_dim_bytes
+    _emit_s_mul_u32_pow2_or_lit(19, 16, qkv_dim_bytes)
+    asm_u32(0x800E130E)                          // s14 = s14 + s19
+    asm_u32(0x800EFF0E); asm_u32(v_src_base_off) // s14 += v_src_base_off (Qwen3 12288)
+    asm_u32(0x80020E02)                          // s2 += s14
+    asm_u32(0x82038003)                          // s3 += carry
 
-    // dst offset = ((pos_base + m) << 12) + (head << 9)
-    asm_u32(0x800C1014)         // s12 = s20 + s16 (pos_lo + m)
-    asm_u32(0x820D8015)         // s13 = s21 + 0  + carry  (s_addc_u32)
-    asm_u32(0x848C8C0C)         // s[12:13] <<= 12 (s_lshl_b64)
-    asm_u32(0x80060C06)         // s6 += s12
-    asm_u32(0x82070D07)         // s7 += s13
-    asm_u32(0x840E8911)         // s14 = head << 9
-    asm_u32(0x80060E06)         // s6 += s14
-    asm_u32(0x82078007)         // s7 += carry
+    // dst offset = ((pos_base + m) << kv_off_shift) + (head << head_off_shift)
+    asm_u32(0x800C1014)                          // s12 = s20 + s16 (pos_lo + m)
+    asm_u32(0x820D8015)                          // s13 = s21 + 0  + carry
+    // s[12:13] <<= kv_off_shift: s_lshl_b64 s[12:13], s[12:13], kv_off_shift
+    asm_u32(0x84000000 | (9 << 23) | (12 << 16) | ((0x80 + kv_off_shift) << 8) | 12)
+    asm_u32(0x80060C06)                          // s6 += s12
+    asm_u32(0x82070D07)                          // s7 += s13
+    asm_u32(0x840E0011 | ((0x80 + head_off_shift) << 8))   // s14 = head << head_off_shift
+    asm_u32(0x80060E06)                          // s6 += s14
+    asm_u32(0x82078007)                          // s7 += carry
 
-    // ── V: passthrough copy (4 iters) ────────────────────────────────────
+    // ── V: passthrough copy (HEAD_DIM/32 iters) ───────────────────────────
     asm_v_lshlrev_b32_imm(9, 2, 0)               // v9 = lane*4
     asm_v_mov_b32_inline_u(4, 0)
     asm_v_add_co_u32_vcc_sv(3, 2, 9)             // v3:v4 = src ptr
@@ -3220,7 +3315,7 @@ fn _emit_phase5_qkv_split_qknorm_rope_speck4_inline() {
     asm_v_mov_b32_inline_u(8, 0)
     asm_v_add_co_u32_vcc_sv(7, 6, 9)             // v7:v8 = dst ptr
     asm_v_add_co_ci_u32_null_sv_vcc(8, 7, 8)
-    asm_s_mov_b32_inline_imm(12, 4)              // loop count = 4
+    asm_s_mov_b32_inline_imm(12, vcopy_iter_count)   // = HEAD_DIM/32 (Qwen3=4)
     uint64 v_copy_top = asm_text_len / 4
     asm_u32(0xDC520000); asm_u32(0x0D7C0003)     // global_load v13
     asm_s_waitcnt_vmcnt_zero()
@@ -3238,11 +3333,12 @@ fn _emit_phase5_qkv_split_qknorm_rope_speck4_inline() {
     // ── .phase5_done: patch all forward branches ──────────────────────────
     uint64 phase5_done = asm_text_len / 4
 
-    // Patch outer skip-branch (wg_id >= 128 → here).
-    // outer_gate is `s_cmp_ge_u32 s15, 128` (1 dword + lit32 1 dword) followed
-    // by s_cbranch_scc1 at outer_gate_pos+2. Branch targets phase5_done.
-    asm_patch_u32(outer_gate_pos + 2,
-        0xBFA20000 | ((phase5_done - outer_gate_pos - 3) & 0xFFFF))
+    // Patch outer skip-branch (wg_id >= outer_cap_speck4 → here).
+    // outer_branch_pos points at the s_cbranch_scc1 placeholder (captured
+    // immediately after the cmp, regardless of whether the cmp emitted
+    // 1 or 2 dwords).  Branch targets phase5_done.
+    asm_patch_u32(outer_branch_pos,
+        0xBFA20000 | ((phase5_done - outer_branch_pos - 1) & 0xFFFF))
 
     // Patch Q done s_branch → .phase5_done
     asm_patch_u32(q_done_pos,
