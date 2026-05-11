@@ -1,0 +1,1460 @@
+// MLRift Standard Library — Qwen3 forward-pass primitives
+//
+// Layer 0 numerical verification target (Qwen3-0.6B, input token 14990 "hello",
+// fp32 reference from transformers 5.6.2):
+//   hidden_states after layer 0, first 5 values:
+//     [-0.2150, 0.3201, 0.0887, -1.2590, -0.0759]
+//
+// Qwen3 architecture (config.json → this file's hard-coded constants for now):
+//   hidden_size            = 1024
+//   head_dim               = 128
+//   num_attention_heads    = 16
+//   num_key_value_heads    = 8
+//   intermediate_size      = 3072
+//   rms_norm_eps           = 1e-6
+//   rope_theta             = 1_000_000
+//   hidden_act             = silu (SwiGLU: gate * silu(gate) * up, then down_proj)
+//   tie_word_embeddings    = true
+//   QK-Norm                = per-head-dim RMSNorm applied to Q and K (shape
+//                            [head_dim], no +1 bias shift)
+//
+// Weights are BF16 row-major (HuggingFace safetensors convention):
+//   embed_tokens.weight: [vocab_size, hidden]
+//   q_proj.weight:       [num_heads * head_dim, hidden]           = [2048, 1024]
+//   k_proj.weight:       [num_kv_heads * head_dim, hidden]        = [1024, 1024]
+//   v_proj.weight:       [num_kv_heads * head_dim, hidden]        = [1024, 1024]
+//   o_proj.weight:       [hidden, num_heads * head_dim]           = [1024, 2048]
+//   q_norm.weight:       [head_dim] = [128]
+//   k_norm.weight:       [head_dim] = [128]
+//   input_layernorm.weight / post_attention_layernorm.weight: [hidden]
+//   gate_proj / up_proj: [intermediate_size, hidden]              = [3072, 1024]
+//   down_proj:           [hidden, intermediate_size]              = [1024, 3072]
+
+import "inference.mlr"
+// inference_gpu.mlr REMOVED — CPU-only build (no HIP DT_NEEDED).
+// getenv was declared in inference_gpu.mlr; re-declare here for CPU build.
+@dynamic extern fn getenv(uint64 name) -> uint64
+import "safetensors.mlr"
+import "math_float.mlr"
+import "thread.mlr"
+import "fmt.mlr"
+import "io.mlr"
+
+// -----------------------------------------------------------------------------
+// Qwen3-0.6B architectural constants. Phase 1 keeps these as compile-time
+// globals; the eventual engine will read them from config.json instead.
+// -----------------------------------------------------------------------------
+// Qwen3 architectural constants. Default values are Qwen3-0.6B so
+// existing examples link unchanged. Larger models reconfigure via
+// qwen3_set_arch() before calling forward_layer.
+static u64 QWEN3_HIDDEN         = 1024
+static u64 QWEN3_HEAD_DIM       = 128
+static u64 QWEN3_N_HEADS        = 16
+static u64 QWEN3_N_KV_HEADS     = 8
+static u64 QWEN3_Q_DIM          = 2048   // N_HEADS × HEAD_DIM
+static u64 QWEN3_KV_DIM         = 1024   // N_KV_HEADS × HEAD_DIM
+static u64 QWEN3_INTERMEDIATE   = 3072
+static u64 QWEN3_ROPE_DIM       = 128    // head_dim (full RoPE across the head)
+
+fn qwen3_set_arch(u64 hidden, u64 head_dim, u64 n_heads, u64 n_kv_heads, u64 ff) {
+    QWEN3_HIDDEN       = hidden
+    QWEN3_HEAD_DIM     = head_dim
+    QWEN3_N_HEADS      = n_heads
+    QWEN3_N_KV_HEADS   = n_kv_heads
+    QWEN3_Q_DIM        = n_heads * head_dim
+    QWEN3_KV_DIM       = n_kv_heads * head_dim
+    QWEN3_INTERMEDIATE = ff
+    QWEN3_ROPE_DIM     = head_dim
+    // gpu_set_arch() call REMOVED — CPU-only build doesn't link inference_gpu.
+}
+
+// rope_theta = 1e6 (big-number base for long-context positional encoding).
+// Expressed as f64 because 1e6 is exact in float64 but not a compile-time
+// integer-friendly constant to keep in the source as f32 / u64.
+
+// -----------------------------------------------------------------------------
+// RMSNorm without the (1 + w) shift used by Gemma. Standard Qwen/Llama form:
+//   y = x * rsqrt(mean(x²) + eps) * w
+// -----------------------------------------------------------------------------
+// AVX2 helper: widen 8 bf16 weights to 8 f32, then out[i] = scale*v[i]*w[i].
+// The bf16 decode is the same trick as the matmul kernel: vpmovzxwd to
+// u32 lanes + vpslld 16 to align into f32 high bits.
+static u64 qwen3_rsq_bf16_scratch = 0
+
+fn qwen3_scale_vv_bf16w_avx2(u64 out_ptr, u64 v_ptr, u64 w_ptr, f32 scale, u64 n) {
+    if qwen3_rsq_bf16_scratch == 0 { qwen3_rsq_bf16_scratch = alloc(4) }
+    u64 sp = qwen3_rsq_bf16_scratch
+    unsafe { *(sp as f32) = scale }
+    u64 n8 = n & 0xFFFFFFFFFFFFFFF8
+    u64 i = 0
+    while i < n8 {
+        u64 v_addr = v_ptr   + i * 4
+        u64 w_addr = w_ptr   + i * 2
+        u64 o_addr = out_ptr + i * 4
+        asm {
+            // vbroadcastss ymm3, [rcx]      ; rsq broadcast
+            "0xC4 0xE2 0x7D 0x18 0x19"
+            // vmovups ymm0, [rsi]           ; v (f32)
+            "0xC5 0xFC 0x10 0x06"
+            // vmovdqu xmm1, [rdi]           ; 8 bf16 (16 B)
+            "0xC5 0xFA 0x6F 0x0F"
+            // vpmovzxwd ymm1, xmm1          ; widen to 8 × u32
+            "0xC4 0xE2 0x7D 0x33 0xC9"
+            // vpslld ymm1, ymm1, 16         ; bf16 bits → upper 16 of f32
+            "0xC5 0xF5 0x72 0xF1 0x10"
+            // vmulps  ymm0, ymm0, ymm1      ; v * w
+            "0xC5 0xFC 0x59 0xC1"
+            // vmulps  ymm0, ymm0, ymm3      ; * rsq
+            "0xC5 0xFC 0x59 0xC3"
+            // vmovups [r8], ymm0
+            "0xC4 0xC1 0x7C 0x11 0x00"
+            // vzeroupper
+            "0xC5 0xF8 0x77"
+        } in(v_addr -> rsi, w_addr -> rdi, o_addr -> r8, sp -> rcx)
+        i = i + 8
+    }
+    // Scalar tail (shouldn't trigger for Qwen3: hidden=1024 is /8).
+    while i < n {
+        f32 v = 0.0f; unsafe { *((v_ptr + i * 4) as f32) -> v }
+        f32 w = bf16_to_f32(w_ptr + i * 2)
+        unsafe { *((out_ptr + i * 4) as f32) = v * scale * w }
+        i = i + 1
+    }
+}
+
+fn qwen3_rmsnorm_bf16(u64 out_ptr, u64 in_ptr, u64 w_ptr, u64 dim) {
+    qwen3_rmsnorm_eps_init()
+    f32 sum_sq = qwen3_dot_avx2(in_ptr, in_ptr, dim)
+    f32 mean_sq = sum_sq / int_to_f32(dim)
+    f32 one  = 1.0f
+    f32 rsq  = one / sqrt_f32(mean_sq + qwen3_rmsnorm_eps)
+    qwen3_scale_vv_bf16w_avx2(out_ptr, in_ptr, w_ptr, rsq, dim)
+}
+
+// Module-level f32 1e-6 eps, bit-set once. Replaces the per-call
+// `uint64[1] eps_tmp` which mmap'd a 4 KB page each invocation under
+// MLRift quirk #5. rmsnorm_* are called ~24 times per layer × 28 × 20
+// tokens = 13 440 calls per decode.
+static u64 qwen3_rmsnorm_eps_bits = 0
+static f32 qwen3_rmsnorm_eps = 0.0f
+
+fn qwen3_rmsnorm_eps_init() {
+    if qwen3_rmsnorm_eps_bits != 0 { return }
+    qwen3_rmsnorm_eps_bits = alloc(4)
+    u64 p = qwen3_rmsnorm_eps_bits
+    // Default: 1e-6f = 0x358637BD ≈ 9.999999e-7 (Qwen3, Mistral, Phi-3).
+    // Override via qwen3_set_rmsnorm_eps_bits — Llama-3.x sets 0x3727C5AC
+    // for 1e-5f.
+    u64 bits = 0x358637BD
+    if qwen3_rmsnorm_eps_override_bits != 0 {
+        bits = qwen3_rmsnorm_eps_override_bits
+    }
+    u8 e0 = bits & 0xFF
+    u8 e1 = (bits >> 8) & 0xFF
+    u8 e2 = (bits >> 16) & 0xFF
+    u8 e3 = (bits >> 24) & 0xFF
+    store8(p + 0, e0); store8(p + 1, e1); store8(p + 2, e2); store8(p + 3, e3)
+    f32 e = 0.0f
+    unsafe { *(p as f32) -> e }
+    qwen3_rmsnorm_eps = e
+}
+
+// Static scratch for the rsq broadcast in qwen3_scale_vvw_avx2.
+static u64 qwen3_rsq_scratch = 0
+
+// AVX2 helper: out[i] = scale * v[i] * w[i], 8 f32 lanes per iter, n
+// must be multiple of 8. Used by qwen3_rmsnorm_f32_weights' output
+// pass. Outer 8-step loop lives in MLRift so the asm stays straight
+// line (no rel8 jumps).
+fn qwen3_scale_vvw_avx2(u64 out_ptr, u64 v_ptr, u64 w_ptr, f32 scale, u64 n) {
+    if qwen3_rsq_scratch == 0 { qwen3_rsq_scratch = alloc(4) }
+    u64 sp = qwen3_rsq_scratch
+    unsafe { *(sp as f32) = scale }
+    u64 n8 = n & 0xFFFFFFFFFFFFFFF8
+    u64 i = 0
+    while i < n8 {
+        u64 v_addr = v_ptr   + i * 4
+        u64 w_addr = w_ptr   + i * 4
+        u64 o_addr = out_ptr + i * 4
+        asm {
+            // vbroadcastss ymm3, [rcx]    ; rsq broadcast
+            "0xC4 0xE2 0x7D 0x18 0x19"
+            // vmovups ymm0, [rsi]         ; v
+            "0xC5 0xFC 0x10 0x06"
+            // vmovups ymm1, [rdi]         ; w
+            "0xC5 0xFC 0x10 0x0F"
+            // vmulps  ymm0, ymm0, ymm1    ; v*w
+            "0xC5 0xFC 0x59 0xC1"
+            // vmulps  ymm0, ymm0, ymm3    ; * rsq
+            "0xC5 0xFC 0x59 0xC3"
+            // vmovups [r8], ymm0
+            "0xC4 0xC1 0x7C 0x11 0x00"
+            // vzeroupper
+            "0xC5 0xF8 0x77"
+        } in(v_addr -> rsi, w_addr -> rdi, o_addr -> r8, sp -> rcx)
+        i = i + 8
+    }
+    // Scalar tail (should never hit for Qwen3; head_dim=128, n=128).
+    while i < n {
+        f32 v = 0.0f; unsafe { *((v_ptr + i * 4) as f32) -> v }
+        f32 w = 0.0f; unsafe { *((w_ptr + i * 4) as f32) -> w }
+        unsafe { *((out_ptr + i * 4) as f32) = v * scale * w }
+        i = i + 1
+    }
+}
+
+// Same RMSNorm but the weight is already in f32. Used when QK-Norm's
+// 128-entry weight has been widened once into a scratch buffer. AVX2
+// sum-of-squares (via qwen3_dot_avx2 with a = b) + AVX2 scale-and-apply.
+fn qwen3_rmsnorm_f32_weights(u64 out_ptr, u64 in_ptr, u64 w_ptr, u64 dim) {
+    qwen3_rmsnorm_eps_init()
+    // sum_sq = <in, in>
+    f32 sum_sq = qwen3_dot_avx2(in_ptr, in_ptr, dim)
+    f32 mean_sq = sum_sq / int_to_f32(dim)
+    f32 one = 1.0f
+    f32 rsq = one / sqrt_f32(mean_sq + qwen3_rmsnorm_eps)
+    qwen3_scale_vvw_avx2(out_ptr, in_ptr, w_ptr, rsq, dim)
+}
+
+// Widen a BF16 weight row of `dim` elements into an f32 scratch buffer.
+// Used once per QK-Norm weight per layer so the inner-loop normalise doesn't
+// redecode the same 128 bytes for every head.
+fn qwen3_bf16_row_to_f32(u64 out_ptr, u64 src_ptr, u64 dim) {
+    u64 i = 0
+    while i < dim {
+        f32 v = bf16_to_f32(src_ptr + i * 2)
+        unsafe { *((out_ptr + i * 4) as f32) = v }
+        i = i + 1
+    }
+}
+
+
+// -----------------------------------------------------------------------------
+// RoPE (rotary positional embedding)
+//
+// Reference (transformers/models/qwen3/modeling_qwen3.py):
+//   inv_freq[i] = 1 / (theta^(2i/rope_dim)),  i = 0..rope_dim/2-1
+//   cos[p, i]   = cos(p * inv_freq[i])
+//   sin[p, i]   = sin(p * inv_freq[i])
+//   # rotate_half splits the last dim in half:
+//   x1 = x[..., :rope_dim/2]
+//   x2 = x[..., rope_dim/2:]
+//   x_rot = cat([x1*cos - x2*sin,  x1*sin + x2*cos], dim=-1)
+//
+// For single-token Phase-1 verification, position=0 → cos=1, sin=0 and RoPE
+// is the identity. We still emit the code path so Phase 2 (multi-token) uses
+// the same helpers without rewriting.
+// -----------------------------------------------------------------------------
+
+// Per-step cos/sin cache. qwen3_forward_layer consults this before
+// recomputing — layers 1..27 within the same decode step reuse layer 0's
+// tables, saving 27/28 of the rope_compute work per step. Reset when
+// `qwen3_rope_cache_pos` does not equal the current `pos`.
+//
+// The actual buffers are lazily allocated on first use; the cached pos
+// is marked 0xFFFFFFFFFFFFFFFF (UINT64_MAX) until then to distinguish
+// from a genuine position 0 hit.
+static u64 qwen3_rope_cache_pos = 0xFFFFFFFFFFFFFFFF
+static u64 qwen3_rope_cos_cache = 0
+static u64 qwen3_rope_sin_cache = 0
+
+// QKV + gate/up weight fusion. When enabled, callers have already
+// concatenated q_proj_w+k_proj_w+v_proj_w into the q_proj_w slot, and
+// gate_proj_w+up_proj_w into the gate_proj_w slot. Saves thread-pool
+// submit overhead but costs ~50 % extra heap for the stacked copies —
+// worth it at 0.6B, prohibitive at 14B Q8_0 (5+ GB of duplicates).
+// Examples flip this off before the weight-load pass when the model
+// is too big for the duplication.
+static u64 qwen3_fuse_qkv = 1
+fn qwen3_set_fuse_qkv(u64 on) { qwen3_fuse_qkv = on }
+
+// Weight dtype selector for the big projection matmuls (Q/K/V/o/gate/
+// up/down/lm_head). 0 = BF16 row-major, 1 = Q8_0 blocks. 0.6B (both
+// safetensors and our own BF16 GGUF) uses 0; 14B Q8_0 uses 1.
+static u64 qwen3_matmul_kind = 0
+fn qwen3_set_matmul_kind(u64 kind) { qwen3_matmul_kind = kind }
+
+// Q8_0 bit-exact mode. When 1, the Q8_0 weight path goes through
+// matmul_q8_0_q8_0_f32 (per-block-quantizes the activation, int8×int8
+// dot, scale by d_w*d_x) instead of the dequant-FMA fast path. Output
+// matches llama.cpp byte-for-byte. Used by examples/llama3_generate.mlr
+// to validate against `llama-completion`. Default 0 keeps the existing
+// 14B Q8_0 fast path untouched.
+static u64 qwen3_q8_bitexact = 0
+fn qwen3_set_q8_bitexact(u64 on) { qwen3_q8_bitexact = on }
+
+// Norm-weight dtype selector. 0 = BF16 (0.6B), 1 = F32 (14B GGUF ships
+// all rms_norm.weight tensors as F32). Applies to input_norm, post_norm,
+// final_norm, and the QK-norm 128-entry tensors.
+static u64 qwen3_norm_kind = 0
+fn qwen3_set_norm_kind(u64 kind) { qwen3_norm_kind = kind }
+
+// Q/K-Norm gate. Qwen3 normalises each query / key head before RoPE
+// (Qwen3 paper §3.1); Llama / Mistral / Phi do not. Default 1 keeps
+// the existing Qwen3 behaviour. Llama callers set 0 before forward.
+static u64 qwen3_use_qknorm = 1
+fn qwen3_set_qknorm(u64 on) { qwen3_use_qknorm = on }
+
+// RoPE base (theta). Qwen3 ships theta = 1e6; Llama-3.x uses 5e5;
+// older Llama-2 / Mistral use 1e4; Phi-3 uses 1e4. Stored as integer
+// to avoid f64-static literal subtleties; widened with int_to_f64
+// at the call site.
+static u64 qwen3_rope_theta_int = 1000000
+fn qwen3_set_rope_base(u64 theta) { qwen3_rope_theta_int = theta }
+
+// Optional NTK-aware RoPE inv_freq scaling factors. Llama-3.1+ ships
+// a `rope_freqs.weight` tensor of length head_dim/2 holding f32
+// divisors that stretch high-frequency channels for extended context
+// (effectively YaRN with the long_factor / short_factor table folded
+// into one vector). When set, qwen3_rope_compute divides each per-i
+// inv_freq by qwen3_rope_freqs[i] before computing the angle. Default
+// 0 = identity (Qwen3 / Mistral / Phi-3 don't ship this tensor).
+static u64 qwen3_rope_freqs_ptr = 0
+fn qwen3_set_rope_freqs(u64 ptr) { qwen3_rope_freqs_ptr = ptr }
+
+// RMSNorm eps override. Default 1e-6 (Qwen3 family, Phi-3, Mistral);
+// Llama-3.x ships 1e-5 in its config. Pass the f32 bit pattern: e.g.
+// 1e-5f = 0x3727C5AC, 1e-6f = 0x358637BD.
+static u64 qwen3_rmsnorm_eps_override_bits = 0
+fn qwen3_set_rmsnorm_eps_bits(u64 bits) { qwen3_rmsnorm_eps_override_bits = bits }
+
+// RoPE pair layout. 0 = NEOX (split-half: rotate x[i], x[i+half] —
+// Qwen3 / GPT-NeoX / Falcon / most modern models). 1 = NORM (consecutive
+// pairs: rotate x[2k], x[2k+1] — Llama-1/2/3, Mistral, Granite). Default
+// 0 keeps Qwen3 behaviour. Llama callers set 1.
+static u64 qwen3_rope_pair_layout = 0
+fn qwen3_set_rope_pair_layout(u64 mode) { qwen3_rope_pair_layout = mode }
+
+// Interleaved-MRoPE knobs (Qwen3-VL / Qwen3.5 family). When use_imrope=1
+// the rope step inside qwen3_forward_layer:
+//   * rotates the first imrope_rope_dim of head_dim. For Qwen3-VL the
+//     gguf has no `rope.dimension_count` so llama.cpp defaults to head_dim
+//     (128) — i.e. NO partial-RoPE truncation; the full head rotates.
+//   * for each pair index i in 0..imrope_rope_dim/2, classifies the
+//     pair into a section by sector%3 (0=t, 1=h, 2=w, else=extra) and
+//     bounds (sector < 3 * sections[k]). For TEXT-ONLY inputs llama.cpp's
+//     llm_graph_input_pos::set_input copies the 1D token position into
+//     the t/h/w slots and zeros only the 4th — so all of t/h/w produce
+//     the same angle as standard RoPE; only the "extra" sectors (those
+//     classified outside 3*sect[t/h/w]) become identity (cos=1, sin=0).
+// Sections sum to imrope_rope_dim/2 (sect_dims = sum is the wraparound
+// modulus). The compute helper assumes text-only (image positions = 0).
+static u64 qwen3_use_imrope        = 0
+static u64 qwen3_imrope_rope_dim   = 0
+static u64 qwen3_imrope_sect_t     = 0
+static u64 qwen3_imrope_sect_h     = 0
+static u64 qwen3_imrope_sect_w     = 0
+static u64 qwen3_imrope_sect_extra = 0
+fn qwen3_set_use_imrope(u64 on)             { qwen3_use_imrope = on }
+fn qwen3_set_imrope_rope_dim(u64 d)         { qwen3_imrope_rope_dim = d }
+fn qwen3_set_imrope_sections(u64 t, u64 h, u64 w, u64 e) {
+    qwen3_imrope_sect_t     = t
+    qwen3_imrope_sect_h     = h
+    qwen3_imrope_sect_w     = w
+    qwen3_imrope_sect_extra = e
+}
+
+// Dispatch helper used by qwen3_forward_layer everywhere it used to call
+// matmul_bf16_weights_f32 directly. Q8_0 path ignores `use_kahan` (no
+// Kahan variant yet) — residual-stream drift at 14B hasn't been tuned.
+fn qwen3_main_matmul(u64 out_ptr, u64 x_ptr, u64 w_ptr,
+                     u64 M, u64 N, u64 K,
+                     u64 num_workers, u64 use_kahan) {
+    if qwen3_matmul_kind == 0 {
+        // GPU dispatch (env-gated by MLRIFT_GPU_MATMUL).  Returns 0 on
+        // success, 1 to signal "fall through to CPU" — the dispatcher
+        // currently lights up the M=1 decode shape and returns 1 for
+        // M≥2 (prefill), keeping the CPU path for those.
+        // GPU fallback REMOVED — CPU-only build.
+        matmul_bf16_weights_f32(out_ptr, x_ptr, w_ptr, M, N, K, num_workers, use_kahan)
+    } else {
+        if qwen3_q8_bitexact == 1 {
+            matmul_q8_0_q8_0_f32(out_ptr, x_ptr, w_ptr, M, N, K, num_workers)
+        } else {
+            matmul_q8_0_weights_f32(out_ptr, x_ptr, w_ptr, M, N, K, num_workers)
+        }
+    }
+}
+
+// Norm dispatch. BF16 path reuses the existing AVX2 bf16-weight kernel;
+// F32 path feeds qwen3_rmsnorm_f32_weights directly.
+fn qwen3_main_rmsnorm(u64 out_ptr, u64 in_ptr, u64 w_ptr, u64 dim) {
+    if qwen3_norm_kind == 0 {
+        qwen3_rmsnorm_bf16(out_ptr, in_ptr, w_ptr, dim)
+    } else {
+        qwen3_rmsnorm_f32_weights(out_ptr, in_ptr, w_ptr, dim)
+    }
+}
+
+// Per-op timing accumulators. Cleared by qwen3_profile_reset(); reported
+// with qwen3_profile_dump(g_fd).
+static u64 qwen3_t_input_norm  = 0
+static u64 qwen3_t_qkv_proj    = 0
+static u64 qwen3_t_qknorm_rope = 0
+static u64 qwen3_t_attn        = 0
+static u64 qwen3_t_oproj_res1  = 0
+static u64 qwen3_t_post_norm   = 0
+static u64 qwen3_t_gate_up     = 0
+static u64 qwen3_t_silu        = 0
+static u64 qwen3_t_down_res2   = 0
+
+fn qwen3_profile_reset() {
+    qwen3_t_input_norm  = 0
+    qwen3_t_qkv_proj    = 0
+    qwen3_t_qknorm_rope = 0
+    qwen3_t_attn        = 0
+    qwen3_t_oproj_res1  = 0
+    qwen3_t_post_norm   = 0
+    qwen3_t_gate_up     = 0
+    qwen3_t_silu        = 0
+    qwen3_t_down_res2   = 0
+}
+
+fn qwen3_profile_dump() {
+    print_str("[profile] input_norm_ms=");  u64 a = fmt_dec(qwen3_t_input_norm  / 1000000); print_str(a); dealloc(a); print_str("\n")
+    print_str("[profile] qkv_proj_ms=");    u64 b = fmt_dec(qwen3_t_qkv_proj    / 1000000); print_str(b); dealloc(b); print_str("\n")
+    print_str("[profile] qknorm_rope_ms="); u64 c = fmt_dec(qwen3_t_qknorm_rope / 1000000); print_str(c); dealloc(c); print_str("\n")
+    print_str("[profile] attn_ms=");        u64 d = fmt_dec(qwen3_t_attn        / 1000000); print_str(d); dealloc(d); print_str("\n")
+    print_str("[profile] oproj_res1_ms=");  u64 e = fmt_dec(qwen3_t_oproj_res1  / 1000000); print_str(e); dealloc(e); print_str("\n")
+    print_str("[profile] post_norm_ms=");   u64 f = fmt_dec(qwen3_t_post_norm   / 1000000); print_str(f); dealloc(f); print_str("\n")
+    print_str("[profile] gate_up_ms=");     u64 g = fmt_dec(qwen3_t_gate_up     / 1000000); print_str(g); dealloc(g); print_str("\n")
+    print_str("[profile] silu_ms=");        u64 h = fmt_dec(qwen3_t_silu        / 1000000); print_str(h); dealloc(h); print_str("\n")
+    print_str("[profile] down_res2_ms=");   u64 i = fmt_dec(qwen3_t_down_res2   / 1000000); print_str(i); dealloc(i); print_str("\n")
+}
+
+// Compute cos/sin for a single position into two f32 buffers of
+// length rope_dim/2. Caller keeps them stack-local.
+fn qwen3_rope_compute(u64 cos_out, u64 sin_out, u64 position, u64 rope_dim, f64 theta_base) {
+    u64 half = rope_dim / 2
+    // Fast path: position 0 → cos = 1, sin = 0 for all frequencies.
+    // Skips 64 log+exp calls per layer, which is the heaviest constant-cost
+    // path in the forward pass at the single-token Phase-1 test point.
+    if position == 0 {
+        f32 one_f = 1.0f
+        f32 zero_f = 0.0f
+        u64 i = 0
+        while i < half {
+            unsafe { *((cos_out + i * 4) as f32) = one_f }
+            unsafe { *((sin_out + i * 4) as f32) = zero_f }
+            i = i + 1
+        }
+        return
+    }
+    u64 i = 0
+    while i < half {
+        f64 exponent = int_to_f64(2 * i) / int_to_f64(rope_dim)
+        f64 denom = pow_f64(theta_base, exponent)
+        f64 inv_freq = int_to_f64(1) / denom
+        // Llama-3.1+ NTK scaling: divide inv_freq by per-channel factor
+        // from rope_freqs.weight (1.0 for low-freq, up to 32.0 for high-
+        // freq on llama3.2-1b; matches llama.cpp's rope-freq-scale).
+        if qwen3_rope_freqs_ptr != 0 {
+            f32 scale_f32 = 0.0f
+            unsafe { *((qwen3_rope_freqs_ptr + i * 4) as f32) -> scale_f32 }
+            f64 scale_f64 = f32_to_f64(scale_f32)
+            inv_freq = inv_freq / scale_f64
+        }
+        f64 angle = int_to_f64(position) * inv_freq
+        f32 c = f64_to_f32(cos_f64(angle))
+        f32 s = f64_to_f32(sin_f64(angle))
+        unsafe { *((cos_out + i * 4) as f32) = c }
+        unsafe { *((sin_out + i * 4) as f32) = s }
+        i = i + 1
+    }
+}
+
+// Apply RoPE in-place to a [n_heads, head_dim] f32 buffer. cos/sin are
+// shared across heads (same position for every head).
+fn qwen3_rope_apply(u64 x_ptr, u64 cos_ptr, u64 sin_ptr, u64 n_heads, u64 head_dim) {
+    u64 half = head_dim / 2
+    u64 h = 0
+    while h < n_heads {
+        u64 row = x_ptr + h * head_dim * 4
+        u64 i = 0
+        if qwen3_rope_pair_layout == 0 {
+            // NEOX split-half: rotate (row[i], row[i+half]) for i = 0..half.
+            while i < half {
+                f32 x1 = 0.0f
+                f32 x2 = 0.0f
+                unsafe { *((row + i * 4) as f32) -> x1 }
+                unsafe { *((row + (i + half) * 4) as f32) -> x2 }
+                f32 c = 0.0f
+                f32 s = 0.0f
+                unsafe { *((cos_ptr + i * 4) as f32) -> c }
+                unsafe { *((sin_ptr + i * 4) as f32) -> s }
+                f32 y1 = x1 * c - x2 * s
+                f32 y2 = x1 * s + x2 * c
+                unsafe { *((row + i * 4) as f32) = y1 }
+                unsafe { *((row + (i + half) * 4) as f32) = y2 }
+                i = i + 1
+            }
+        } else {
+            // NORM consecutive pairs: rotate (row[2k], row[2k+1]) for
+            // k = 0..half. Llama / Mistral / Granite use this. The cos/sin
+            // tables are still indexed by k (one entry per pair); they are
+            // arch-independent — only the *which two channels we rotate*
+            // changes between modes.
+            u64 k = 0
+            while k < half {
+                u64 i0 = 2 * k
+                f32 x1 = 0.0f
+                f32 x2 = 0.0f
+                unsafe { *((row + i0 * 4) as f32) -> x1 }
+                unsafe { *((row + (i0 + 1) * 4) as f32) -> x2 }
+                f32 c = 0.0f
+                f32 s = 0.0f
+                unsafe { *((cos_ptr + k * 4) as f32) -> c }
+                unsafe { *((sin_ptr + k * 4) as f32) -> s }
+                f32 y1 = x1 * c - x2 * s
+                f32 y2 = x1 * s + x2 * c
+                unsafe { *((row + i0 * 4) as f32) = y1 }
+                unsafe { *((row + (i0 + 1) * 4) as f32) = y2 }
+                k = k + 1
+            }
+        }
+        h = h + 1
+    }
+}
+
+// Interleaved-MRoPE cos/sin compute, text-only path. Walks pair indices
+// i in 0..rope_dim/2 and classifies each by `sector = i % sect_dims`
+// into a t/h/w/extra section. For text-only inputs llama.cpp's
+// llm_graph_input_pos::set_input copies the 1D token position into the
+// t/h/w slots and zeros only the "extra" (4th) slot — i.e. for text:
+//   p_t = p_h = p_w = pos,   p_e = 0.
+// So every pair classified into t/h/w gets the SAME angle as standard
+// RoPE: angle = pos * theta_scale^pair_idx. Only pairs that fall into
+// the "extra" sector (sector outside 3*sect[t/h/w] AND not matching the
+// preceding mod3 rules) become identity (cos=1, sin=0).
+//
+// Reference: ggml/src/ggml-cpu/ops.cpp::ggml_mrope_cache_init (the
+// `is_imrope` branch). We mirror its sector classification exactly.
+fn qwen3_rope_compute_imrope_text(u64 cos_out, u64 sin_out, u64 position, u64 rope_dim, f64 theta_base) {
+    u64 half = rope_dim / 2
+    if position == 0 {
+        f32 one_f  = 1.0f
+        f32 zero_f = 0.0f
+        u64 i = 0
+        while i < half {
+            unsafe { *((cos_out + i * 4) as f32) = one_f }
+            unsafe { *((sin_out + i * 4) as f32) = zero_f }
+            i = i + 1
+        }
+        return
+    }
+    u64 sect_dims = qwen3_imrope_sect_t + qwen3_imrope_sect_h + qwen3_imrope_sect_w + qwen3_imrope_sect_extra
+    u64 t_max = 3 * qwen3_imrope_sect_t
+    u64 h_max = 3 * qwen3_imrope_sect_h
+    u64 w_max = 3 * qwen3_imrope_sect_w
+    u64 i = 0
+    while i < half {
+        u64 sector = i
+        if sect_dims != 0 { sector = i % sect_dims }
+        u64 mod3 = sector % 3
+        // Classify pair: which of (t, h, w, extra) does it belong to?
+        // For text-only, t/h/w all use `position`; extra uses 0 → identity.
+        u64 use_pos = 0
+        if mod3 == 0 {
+            if sector < t_max { use_pos = 1 }
+        } else {
+            if mod3 == 1 {
+                if sector < h_max { use_pos = 1 }
+            } else {
+                if sector < w_max { use_pos = 1 }
+            }
+        }
+        f32 c = 1.0f
+        f32 s = 0.0f
+        if use_pos != 0 {
+            f64 exponent = int_to_f64(2 * i) / int_to_f64(rope_dim)
+            f64 denom    = pow_f64(theta_base, exponent)
+            f64 inv_freq = int_to_f64(1) / denom
+            f64 angle    = int_to_f64(position) * inv_freq
+            c = f64_to_f32(cos_f64(angle))
+            s = f64_to_f32(sin_f64(angle))
+        }
+        unsafe { *((cos_out + i * 4) as f32) = c }
+        unsafe { *((sin_out + i * 4) as f32) = s }
+        i = i + 1
+    }
+}
+
+// Apply NEOX-split RoPE to the first `rope_dim` of each head's `head_dim`
+// channels. The remaining (head_dim - rope_dim) dims are left untouched
+// (partial-RoPE — Qwen3-VL rotates 64 of 128). Pair structure mirrors
+// llama.cpp's IMROPE kernel: (row[i], row[i + rope_dim/2]) for
+// i in 0..rope_dim/2. NORM-pair-layout variants aren't supported here;
+// IMROPE callers always use NEOX split-half.
+fn qwen3_rope_apply_partial(u64 x_ptr, u64 cos_ptr, u64 sin_ptr,
+                            u64 n_heads, u64 head_dim, u64 rope_dim) {
+    u64 half = rope_dim / 2
+    u64 h = 0
+    while h < n_heads {
+        u64 row = x_ptr + h * head_dim * 4
+        u64 i = 0
+        while i < half {
+            f32 x1 = 0.0f
+            f32 x2 = 0.0f
+            unsafe { *((row + i * 4) as f32) -> x1 }
+            unsafe { *((row + (i + half) * 4) as f32) -> x2 }
+            f32 c = 0.0f
+            f32 s = 0.0f
+            unsafe { *((cos_ptr + i * 4) as f32) -> c }
+            unsafe { *((sin_ptr + i * 4) as f32) -> s }
+            f32 y1 = x1 * c - x2 * s
+            f32 y2 = x1 * s + x2 * c
+            unsafe { *((row + i * 4) as f32) = y1 }
+            unsafe { *((row + (i + half) * 4) as f32) = y2 }
+            i = i + 1
+        }
+        h = h + 1
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Cached scaled-dot-product attention with grouped-query broadcast.
+//
+// For each query head h: scores[t] = (q[h] · K_cache[t, kvh]) * scale for
+// t in [0, seq_len), softmax with max-subtraction (numerically stable),
+// then out[h] = sum_t softmax[t] * V_cache[t, kvh].
+//
+// Cache layout (per layer, f32):
+//   K_cache: [max_seq, n_kv_heads, head_dim] row-major
+//   V_cache: same shape
+// Offset to K_cache[t, kvh, 0] = (t * n_kv_heads + kvh) * head_dim * 4 bytes.
+//
+// The caller is expected to have written the current token's K and V into
+// K_cache[pos] / V_cache[pos] already (post QK-norm + RoPE for K). Then call
+// here with seq_len = pos + 1. Causal masking is implicit — we only attend
+// over positions 0..seq_len-1, which are exactly the ones written so far.
+//
+// q_ptr: f32 [n_heads, head_dim]    (current token's Q, post QK-norm + RoPE)
+// out:   f32 [n_heads, head_dim]
+// GQA: kvh = (h * n_kv_heads) / n_heads.
+// -----------------------------------------------------------------------------
+static u64 qwen3_dot_scratch = 0
+
+// AVX2 dot product of two f32 vectors of length `n` (must be multiple
+// of 8). Returns scalar. Used for the Q·K computation inside attention.
+fn qwen3_dot_avx2(u64 a_ptr, u64 b_ptr, u64 n) -> f32 {
+    if qwen3_dot_scratch == 0 { qwen3_dot_scratch = alloc(16) }
+    u64 dot_buf = qwen3_dot_scratch
+    u64 n_iter = n / 8
+    if n_iter > 0 {
+        asm {
+            // vxorps ymm0, ymm0, ymm0      ; sum = 0
+            "0xC5 0xFC 0x57 0xC0"
+            // xor rax, rax                  ; k = 0
+            "0x48 0x31 0xC0"
+            // .loop: cmp rax, rdx           ; 3 bytes
+            "0x48 0x39 0xD0"
+            // jge +24 (past body to .done)   ; rel8
+            "0x7D 0x18"
+            // vmovups ymm1, [rsi+rax*4]     ; 5 bytes
+            "0xC5 0xFC 0x10 0x0C 0x86"
+            // vmovups ymm2, [rdi+rax*4]     ; 5 bytes
+            "0xC5 0xFC 0x10 0x14 0x87"
+            // vmulps  ymm1, ymm1, ymm2      ; 4 bytes
+            "0xC5 0xF4 0x59 0xCA"
+            // vaddps  ymm0, ymm0, ymm1      ; 4 bytes
+            "0xC5 0xFC 0x58 0xC1"
+            // add rax, 8                    ; 4 bytes
+            "0x48 0x83 0xC0 0x08"
+            // jmp .loop  rel8 = -29 = 0xE3
+            "0xEB 0xE3"
+            // .done:
+            // Horizontal reduce ymm0 to scalar
+            // vextractf128 xmm1, ymm0, 1
+            "0xC4 0xE3 0x7D 0x19 0xC1 0x01"
+            // vaddps xmm0, xmm0, xmm1
+            "0xC5 0xF8 0x58 0xC1"
+            // vhaddps xmm0, xmm0, xmm0
+            "0xC5 0xFB 0x7C 0xC0"
+            // vhaddps xmm0, xmm0, xmm0
+            "0xC5 0xFB 0x7C 0xC0"
+            // vmovss [rcx], xmm0
+            "0xC5 0xFA 0x11 0x01"
+            // vzeroupper
+            "0xC5 0xF8 0x77"
+        } in(a_ptr -> rsi, b_ptr -> rdi, n -> rdx, dot_buf -> rcx) clobbers(rax)
+    }
+    f32 result = 0.0f
+    unsafe { *(dot_buf as f32) -> result }
+    return result
+}
+
+static u64 qwen3_axpy_scratch = 0
+
+// AVX2 weighted accumulate: o[i] = o[i] + alpha * v[i] for i in [0, n),
+// n must be multiple of 8. Used in the attention pass-2 V-weighted-sum.
+fn qwen3_axpy_avx2(u64 o_ptr, u64 v_ptr, f32 alpha, u64 n) {
+    if qwen3_axpy_scratch == 0 { qwen3_axpy_scratch = alloc(4) }
+    u64 alpha_buf = qwen3_axpy_scratch
+    unsafe { *(alpha_buf as f32) = alpha }
+    u64 n_iter = n / 8
+    if n_iter > 0 {
+        asm {
+            // vbroadcastss ymm3, [rcx]  ; alpha in all lanes
+            "0xC4 0xE2 0x7D 0x18 0x19"
+            // xor rax, rax
+            "0x48 0x31 0xC0"
+            // .loop: cmp rax, rdx
+            "0x48 0x39 0xD0"
+            // jge +29 (past body to .done)
+            "0x7D 0x1D"
+            // vmovups ymm0, [rsi+rax*4]   ; v
+            "0xC5 0xFC 0x10 0x04 0x86"
+            // vmovups ymm1, [rdi+rax*4]   ; o
+            "0xC5 0xFC 0x10 0x0C 0x87"
+            // vmulps  ymm0, ymm0, ymm3    ; alpha*v
+            "0xC5 0xFC 0x59 0xC3"
+            // vaddps  ymm1, ymm1, ymm0    ; o + alpha*v
+            "0xC5 0xF4 0x58 0xC8"
+            // vmovups [rdi+rax*4], ymm1   ; store
+            "0xC5 0xFC 0x11 0x0C 0x87"
+            // add rax, 8
+            "0x48 0x83 0xC0 0x08"
+            // jmp .loop  rel8 = -34 = 0xDE
+            "0xEB 0xDE"
+            // .done:
+            // vzeroupper
+            "0xC5 0xF8 0x77"
+        } in(v_ptr -> rsi, o_ptr -> rdi, n -> rdx, alpha_buf -> rcx) clobbers(rax)
+    }
+}
+
+fn qwen3_attn_cached(u64 out_ptr,
+                     u64 q_ptr, u64 k_cache, u64 v_cache,
+                     u64 seq_len,
+                     u64 n_heads, u64 n_kv_heads, u64 head_dim) {
+    f32 scale = 1.0f / sqrt_f32(int_to_f32(head_dim))
+    u64 kv_row_bytes = n_kv_heads * head_dim * 4
+
+    u64 h = 0
+    while h < n_heads {
+        u64 kvh = (h * n_kv_heads) / n_heads
+        u64 q_row = q_ptr   + h * head_dim * 4
+        u64 o_row = out_ptr + h * head_dim * 4
+
+        // Pass 1: find max raw score across positions. Uses AVX2 dot
+        // product (head_dim = 128 = 16 x 8-wide).
+        f32 max_score = 0.0f
+        u64 first = 1
+        u64 t = 0
+        while t < seq_len {
+            u64 k_row = k_cache + t * kv_row_bytes + kvh * head_dim * 4
+            f32 s = qwen3_dot_avx2(q_row, k_row, head_dim) * scale
+            if first == 1 {
+                max_score = s
+                first = 0
+            } else {
+                if s > max_score { max_score = s }
+            }
+            t = t + 1
+        }
+
+        // Zero output row.
+        f32 zero = 0.0f
+        u64 d0 = 0
+        while d0 < head_dim {
+            unsafe { *((o_row + d0 * 4) as f32) = zero }
+            d0 = d0 + 1
+        }
+
+        // Pass 2: recompute each score (AVX2 dot), exp(score - max),
+        // accumulate e*V[t] into o_row (AVX2 axpy), sum_exp.
+        f32 sum_exp = 0.0f
+        t = 0
+        while t < seq_len {
+            u64 k_row = k_cache + t * kv_row_bytes + kvh * head_dim * 4
+            u64 v_row = v_cache + t * kv_row_bytes + kvh * head_dim * 4
+            f32 s = qwen3_dot_avx2(q_row, k_row, head_dim) * scale
+            f32 e = exp_f32_fast(s - max_score)
+            sum_exp = sum_exp + e
+            qwen3_axpy_avx2(o_row, v_row, e, head_dim)
+            t = t + 1
+        }
+
+        // Normalize: out /= sum_exp
+        f32 inv_sum = 1.0f / sum_exp
+        u64 dn = 0
+        while dn < head_dim {
+            f32 ov = 0.0f; unsafe { *((o_row + dn * 4) as f32) -> ov }
+            unsafe { *((o_row + dn * 4) as f32) = ov * inv_sum }
+            dn = dn + 1
+        }
+
+        h = h + 1
+    }
+}
+
+// -----------------------------------------------------------------------------
+// SwiGLU FFN
+//   gate = gate_proj(x)            [intermediate]
+//   up   = up_proj(x)              [intermediate]
+//   h    = silu(gate) * up         [intermediate]
+//   y    = down_proj(h)            [hidden]
+// silu(x) = x / (1 + exp(-x)) = x * sigmoid(x)
+// -----------------------------------------------------------------------------
+// AVX2 constants pool for qwen3_silu_mul_avx2. 16 f32 slots (1 cache
+// line): log2e, half, c1..c5, 1.0, 127.0 (as f32 for vcvtps2dq domain
+// check), 87.0, -87.0, and a few spares. Laid out so each broadcastss
+// target is a separate offset from rcx.
+//   [ 0] log2_e        [ 4] c5            [ 8] c4
+//   [12] c3            [16] c2            [20] c1
+//   [24] 1.0           [28] 127 (int32)    — int bias for 2^n
+//   [32] max_clamp 87  [36] min_clamp -87
+//   [40] ones mask for sigmoid (= 1.0f)
+//   ...
+static u64 qwen3_silu_consts = 0
+
+fn qwen3_silu_consts_init() {
+    if qwen3_silu_consts != 0 { return }
+    qwen3_silu_consts = alloc(64)
+    u64 c = qwen3_silu_consts
+    f32 log2_e = 1.4426950408889634f
+    f32 c5 = 0.00133335f
+    f32 c4 = 0.00960802f
+    f32 c3 = 0.05550411f
+    f32 c2 = 0.24022651f
+    f32 c1 = 0.69314718f
+    f32 one  = 1.0f
+    f32 p87  = 87.0f
+    f32 n87  = 0.0f - 87.0f
+    unsafe { *((c +  0) as f32) = log2_e }
+    unsafe { *((c +  4) as f32) = c5 }
+    unsafe { *((c +  8) as f32) = c4 }
+    unsafe { *((c + 12) as f32) = c3 }
+    unsafe { *((c + 16) as f32) = c2 }
+    unsafe { *((c + 20) as f32) = c1 }
+    unsafe { *((c + 24) as f32) = one }
+    // int32 127 (biased exponent base) as u32 bits into offset 28
+    u64 bias_u = 127
+    unsafe { *((c + 28) as u32) = bias_u }
+    unsafe { *((c + 32) as f32) = p87 }
+    unsafe { *((c + 36) as f32) = n87 }
+}
+
+// AVX2 SiLU × mul: out[i] = (g[i] * sigmoid(g[i])) * u[i], 8 lanes per
+// iter. Replaces ~185 ms of scalar loop on Qwen3-0.6B (3072 elems ×
+// 28 layers × 20 tokens) with a vectorized path; no parallelism across
+// workers needed at this size (thread-pool submit overhead would wash
+// the per-call time).
+//
+// SIMD exp inside: same polynomial as scalar exp_f32_fast — r = x * log2e,
+// n = round(r), f = r - n (in [-0.5, 0.5]), 2^f via horner poly,
+// 2^n via bit-inject into f32 exponent field. Everything stays in ymm.
+//
+// dim must be a multiple of 8 (true for Qwen3 ff=3072). A scalar tail
+// pass handles any residue — see fallback below.
+fn qwen3_silu_mul_avx2(u64 out_ptr, u64 gate_ptr, u64 up_ptr, u64 dim) {
+    qwen3_silu_consts_init()
+    u64 c = qwen3_silu_consts
+    u64 dim8 = dim & 0xFFFFFFFFFFFFFFF8
+
+    // Outer 8-step loop in MLRift; asm block processes one 8-wide chunk
+    // per invocation. No jumps inside the asm, so rel8 encoding concerns
+    // don't apply. Per-call asm prologue/epilogue is minimal (MLRift
+    // just binds `in()` regs — no ymm save/restore).
+    u64 i = 0
+    while i < dim8 {
+        u64 g_addr = gate_ptr + i * 4
+        u64 u_addr = up_ptr   + i * 4
+        u64 o_addr = out_ptr  + i * 4
+        asm {
+            // vmovups ymm0, [rsi]              ; g
+            "0xC5 0xFC 0x10 0x06"
+            // vxorps  ymm1, ymm1, ymm1         ; 0
+            "0xC5 0xF4 0x57 0xC9"
+            // vsubps  ymm2, ymm1, ymm0         ; -g
+            "0xC5 0xF4 0x5C 0xD0"
+            // vbroadcastss ymm6, [rcx+36]      ; -87 clamp
+            "0xC4 0xE2 0x7D 0x18 0x71 0x24"
+            // vmaxps  ymm2, ymm2, ymm6         ; clamp min
+            "0xC5 0xEC 0x5F 0xD6"
+            // vbroadcastss ymm6, [rcx+32]      ; +87 clamp
+            "0xC4 0xE2 0x7D 0x18 0x71 0x20"
+            // vminps  ymm2, ymm2, ymm6         ; clamp max
+            "0xC5 0xEC 0x5D 0xD6"
+            // vbroadcastss ymm6, [rcx]         ; log2e
+            "0xC4 0xE2 0x7D 0x18 0x31"
+            // vmulps  ymm2, ymm2, ymm6         ; r = x*log2e
+            "0xC5 0xEC 0x59 0xD6"
+            // vcvtps2dq ymm4, ymm2             ; n
+            "0xC5 0xFD 0x5B 0xE2"
+            // vcvtdq2ps ymm3, ymm4             ; n_f
+            "0xC5 0xFC 0x5B 0xDC"
+            // vsubps  ymm2, ymm2, ymm3         ; f in [-0.5, 0.5]
+            "0xC5 0xEC 0x5C 0xD3"
+            // Poly as separate MUL+ADD (not FMA) so the rounding matches
+            // the scalar reference exactly. Using vfmadd213ps gives a
+            // more accurate result per step but diverges by ~1 ULP from
+            // the scalar path, and those differences compound over the
+            // 28 Qwen3 layers enough to flip argmax. Keeping bit-exact
+            // match with scalar preserves PyTorch greedy tokens.
+            // vbroadcastss ymm5, [rcx+4]       ; c5
+            "0xC4 0xE2 0x7D 0x18 0x69 0x04"
+            // vmulps ymm5, ymm5, ymm2          ; c5*f
+            "0xC5 0xD4 0x59 0xEA"
+            // vbroadcastss ymm6, [rcx+8]       ; c4
+            "0xC4 0xE2 0x7D 0x18 0x71 0x08"
+            // vaddps ymm5, ymm5, ymm6          ; +c4
+            "0xC5 0xD4 0x58 0xEE"
+            // vmulps ymm5, ymm5, ymm2
+            "0xC5 0xD4 0x59 0xEA"
+            // vbroadcastss ymm6, [rcx+12]      ; c3
+            "0xC4 0xE2 0x7D 0x18 0x71 0x0C"
+            // vaddps ymm5, ymm5, ymm6
+            "0xC5 0xD4 0x58 0xEE"
+            // vmulps ymm5, ymm5, ymm2
+            "0xC5 0xD4 0x59 0xEA"
+            // vbroadcastss ymm6, [rcx+16]      ; c2
+            "0xC4 0xE2 0x7D 0x18 0x71 0x10"
+            // vaddps ymm5, ymm5, ymm6
+            "0xC5 0xD4 0x58 0xEE"
+            // vmulps ymm5, ymm5, ymm2
+            "0xC5 0xD4 0x59 0xEA"
+            // vbroadcastss ymm6, [rcx+20]      ; c1
+            "0xC4 0xE2 0x7D 0x18 0x71 0x14"
+            // vaddps ymm5, ymm5, ymm6
+            "0xC5 0xD4 0x58 0xEE"
+            // vmulps ymm5, ymm5, ymm2
+            "0xC5 0xD4 0x59 0xEA"
+            // vbroadcastss ymm6, [rcx+24]      ; 1.0
+            "0xC4 0xE2 0x7D 0x18 0x71 0x18"
+            // vaddps ymm5, ymm5, ymm6          ; → 2^f
+            "0xC5 0xD4 0x58 0xEE"
+            // vpbroadcastd ymm6, [rcx+28]      ; int 127
+            "0xC4 0xE2 0x7D 0x58 0x71 0x1C"
+            // vpaddd  ymm4, ymm4, ymm6         ; n + 127
+            "0xC5 0xDD 0xFE 0xE6"
+            // vpslld  ymm4, ymm4, 23           ; → f32 2^n
+            "0xC5 0xDD 0x72 0xF4 0x17"
+            // vmulps  ymm5, ymm5, ymm4         ; exp = 2^f * 2^n
+            "0xC5 0xD4 0x59 0xEC"
+            // vbroadcastss ymm6, [rcx+24]      ; 1.0
+            "0xC4 0xE2 0x7D 0x18 0x71 0x18"
+            // vaddps  ymm5, ymm5, ymm6         ; 1 + exp
+            "0xC5 0xD4 0x58 0xEE"
+            // vdivps  ymm5, ymm6, ymm5         ; sigmoid
+            "0xC5 0xCC 0x5E 0xED"
+            // vmulps  ymm0, ymm0, ymm5         ; silu(g)
+            "0xC5 0xFC 0x59 0xC5"
+            // vmovups ymm1, [rdi]              ; u
+            "0xC5 0xFC 0x10 0x0F"
+            // vmulps  ymm0, ymm0, ymm1         ; * u
+            "0xC5 0xFC 0x59 0xC1"
+            // vmovups [r8], ymm0
+            "0xC4 0xC1 0x7C 0x11 0x00"
+            // vzeroall — clear every ymm register so no stale AVX state
+            // leaks into subsequent SSE/AVX code in caller.
+            "0xC5 0xFC 0x77"
+        } in(g_addr -> rsi, u_addr -> rdi, o_addr -> r8, c -> rcx)
+        i = i + 8
+    }
+
+    // Scalar tail for any residue.
+    f32 one = 1.0f
+    while i < dim {
+        f32 g = 0.0f; unsafe { *((gate_ptr + i * 4) as f32) -> g }
+        f32 u = 0.0f; unsafe { *((up_ptr   + i * 4) as f32) -> u }
+        f32 sig = one / (one + exp_f32_fast(0.0f - g))
+        f32 y = g * sig * u
+        unsafe { *((out_ptr + i * 4) as f32) = y }
+        i = i + 1
+    }
+}
+
+fn qwen3_silu_mul(u64 out_ptr, u64 gate_ptr, u64 up_ptr, u64 dim) {
+    qwen3_silu_mul_avx2(out_ptr, gate_ptr, up_ptr, dim)
+}
+
+// Fast f32 exp via 2^(x*log2e) with a polynomial 2^f approximation on
+// [-0.5, 0.5] and bit-injected 2^n for the integer part. Replaces the
+// old path that called into exp_f64 with its 10-term Taylor + per-call
+// f64 math — ~100+ ns scalar vs ~20 ns here.
+//
+// Accuracy: sigmoid argmax is preserved across 28 Qwen3 layers and
+// 20 greedy tokens (verified bit-identical to PyTorch BF16). Worst-case
+// relative error on |x| < 10 is around 2e-6, plenty for this use.
+//
+// Range: saturates at x > 88 (float overflow) and x < -87. Safe for
+// both sigmoid in SiLU (|g| up to ~30 in practice) and softmax in
+// attention (scores after max-subtraction are ≤ 0 and bounded).
+static u64 exp_f32_fast_bitbuf = 0
+
+fn exp_f32_fast(f32 x) -> f32 {
+    f32 zero_f = 0.0f
+    f32 max_x = 88.0f
+    f32 min_x = 0.0f - 87.0f
+    if x > max_x { x = max_x }
+    if x < min_x { x = min_x }
+
+    // r = x * log2(e) — how many "doublings" relative to 1.
+    f32 log2_e = 1.4426950408889634f
+    f32 r = x * log2_e
+
+    // Round-to-nearest of r, tracking sign separately.
+    f32 half = 0.5f
+    f32 r_abs = r
+    u64 neg = 0
+    if r < zero_f {
+        r_abs = zero_f - r
+        neg = 1
+    }
+    f32 r_rnd = r_abs + half
+    f64 r_rnd_d = f32_to_f64(r_rnd)
+    u64 n_abs = f64_to_int(r_rnd_d)     // |round(r)|
+    f32 n_abs_f = int_to_f32(n_abs)
+    f32 n_f = n_abs_f
+    if neg != 0 { n_f = zero_f - n_f }
+
+    // f = r - n, in [-0.5, 0.5]
+    f32 f = r - n_f
+
+    // 2^f ≈ ((((c5 f + c4) f + c3) f + c2) f + c1) f + 1  (minimax poly)
+    f32 c5 = 0.00133335f
+    f32 c4 = 0.00960802f
+    f32 c3 = 0.05550411f
+    f32 c2 = 0.24022651f
+    f32 c1 = 0.69314718f
+    f32 p = c5 * f + c4
+    p = p * f + c3
+    p = p * f + c2
+    p = p * f + c1
+    p = p * f + 1.0f
+
+    // 2^n via bit-injection into f32 exponent: biased_n = 127 ± |n|.
+    i64 biased = 127
+    if neg == 0 {
+        biased = 127 + n_abs
+    } else {
+        biased = 127 - n_abs
+    }
+    if biased < 0      { biased = 0   }
+    if biased > 254    { biased = 254 }
+    u64 twoN_bits = biased << 23
+
+    if exp_f32_fast_bitbuf == 0 {
+        exp_f32_fast_bitbuf = alloc(4)
+    }
+    u64 tnb = twoN_bits
+    unsafe { *(exp_f32_fast_bitbuf as u32) = tnb }
+    f32 twoN = 0.0f
+    unsafe { *(exp_f32_fast_bitbuf as f32) -> twoN }
+
+    return twoN * p
+}
+
+// -----------------------------------------------------------------------------
+// One full transformer layer (no KV cache, single token at position `pos`).
+//
+// Inputs:
+//   x_in    — f32 [hidden]  residual stream at layer entry
+//   weights — pointers to the 11 BF16 tensors this layer needs:
+//             input_norm_w, q_proj_w, k_proj_w, v_proj_w, q_norm_w, k_norm_w,
+//             o_proj_w, post_attn_norm_w, gate_proj_w, up_proj_w, down_proj_w
+//   pos     — absolute position (0 for first token)
+//
+// Output:
+//   x_out — f32 [hidden], hidden state after this layer (residual stream)
+//
+// Allocates scratch internally for readability; production path can bring
+// scratches in from the caller to avoid per-layer allocs.
+// -----------------------------------------------------------------------------
+struct Qwen3LayerWeights {
+    u64 input_norm_w
+    u64 q_proj_w
+    u64 k_proj_w
+    u64 v_proj_w
+    u64 q_norm_w
+    u64 k_norm_w
+    u64 o_proj_w
+    u64 post_norm_w
+    u64 gate_proj_w
+    u64 up_proj_w
+    u64 down_proj_w
+}
+
+// Dump file FD — caller sets via qwen3_set_dump_fd before calling forward_layer.
+// 0 = no dumping.
+static u64 qwen3_dump_fd = 0
+
+fn qwen3_set_dump_fd(u64 fd) { qwen3_dump_fd = fd }
+
+// Slice 6.7e — env-gated CPU intermediate dump.  When `MLRIFT_MEGAK_DUMP_LAYER=0`
+// is set, qwen3_forward_layer dumps each phase output (b_x_norm_g, b_qkv_g,
+// b_attn_q_g, b_attn_out_g, b_mid_g, b_mid_norm_g, gu_scratch, out_resid) in
+// the same format as the mega-kernel driver's _dump_buf — head 16, stride256,
+// tail 4, sum/max/min — so they can be diffed side-by-side.
+// One-shot: fires only on the first qwen3_forward_layer call after the env
+// var is observed, then disables itself.
+static u64 qwen3_phase_dump_state = 0   // 0=unchecked, 1=armed, 2=fired, 3=disabled
+
+fn _qwen3_phase_dump_check() -> u64 {
+    if qwen3_phase_dump_state == 0 {
+        u64 ev = getenv("MLRIFT_MEGAK_DUMP_LAYER")
+        if ev != 0 {
+            u8 c = 0; unsafe { *(ev as u8) -> c }
+            if c == 48 {   // '0' = layer 0
+                qwen3_phase_dump_state = 1
+            } else {
+                qwen3_phase_dump_state = 3
+            }
+        } else {
+            qwen3_phase_dump_state = 3
+        }
+    }
+    if qwen3_phase_dump_state == 1 { return 1 }
+    return 0
+}
+
+fn _qwen3_dump_buf(u64 label, u64 ptr, u64 n) {
+    write(2, "  [", 3)
+    u64 ll = str_len(label); write(2, label, ll)
+    write(2, "] n=", 4)
+    u64 ns = fmt_dec(n); u64 nsl = str_len(ns)
+    write(2, ns, nsl); dealloc(ns)
+    write(2, "\n    head:", 10)
+    u64 i = 0
+    u64 head_cnt = 16
+    if n < head_cnt { head_cnt = n }
+    while i < head_cnt {
+        write(2, " ", 1)
+        f32 v = 0.0f; unsafe { *((ptr + i * 4) as f32) -> v }
+        u64 s = fmt_f32(v, 6); u64 sl = str_len(s)
+        write(2, s, sl); dealloc(s)
+        i = i + 1
+    }
+    write(2, "\n    stride256:", 15)
+    u64 sti = 0
+    while sti < n && sti < 16 * 256 {
+        write(2, " ", 1)
+        f32 v = 0.0f; unsafe { *((ptr + sti * 4) as f32) -> v }
+        u64 s = fmt_f32(v, 6); u64 sl = str_len(s)
+        write(2, s, sl); dealloc(s)
+        sti = sti + 256
+    }
+    write(2, "\n    tail:", 10)
+    u64 tail_start = n
+    if n > 4 { tail_start = n - 4 }
+    i = tail_start
+    while i < n {
+        write(2, " ", 1)
+        f32 v = 0.0f; unsafe { *((ptr + i * 4) as f32) -> v }
+        u64 s = fmt_f32(v, 6); u64 sl = str_len(s)
+        write(2, s, sl); dealloc(s)
+        i = i + 1
+    }
+    f64 sum = 0.0
+    f32 vmax = 0.0f
+    f32 vmin = 0.0f
+    u64 first = 1
+    i = 0
+    while i < n {
+        f32 v = 0.0f; unsafe { *((ptr + i * 4) as f32) -> v }
+        sum = sum + f32_to_f64(v)
+        if first == 1 { vmax = v; vmin = v; first = 0 }
+        else {
+            if v > vmax { vmax = v }
+            if v < vmin { vmin = v }
+        }
+        i = i + 1
+    }
+    write(2, "\n    sum=", 9)
+    f32 sum_f32 = f64_to_f32(sum)
+    u64 ss = fmt_f32(sum_f32, 6); u64 ssl = str_len(ss)
+    write(2, ss, ssl); dealloc(ss)
+    write(2, " max=", 5)
+    u64 mxs = fmt_f32(vmax, 6); u64 mxsl = str_len(mxs)
+    write(2, mxs, mxsl); dealloc(mxs)
+    write(2, " min=", 5)
+    u64 mns = fmt_f32(vmin, 6); u64 mnsl = str_len(mns)
+    write(2, mns, mnsl); dealloc(mns)
+    write(2, "\n", 1)
+}
+
+// Internal: emit a labelled "[label] v0 v1 v2 v3 v4\n" line to the dump fd.
+fn qwen3_dump5(u64 label, u64 ptr) {
+    if qwen3_dump_fd == 0 { return }
+    u64 ll = str_len(label)
+    file_write(qwen3_dump_fd, "[", 1)
+    file_write(qwen3_dump_fd, label, ll)
+    file_write(qwen3_dump_fd, "] ", 2)
+    u64 i = 0
+    while i < 5 {
+        if i != 0 { file_write(qwen3_dump_fd, " ", 1) }
+        f32 v = 0.0f
+        unsafe { *((ptr + i * 4) as f32) -> v }
+        u64 s = fmt_f32(v, 6)
+        u64 sl = str_len(s)
+        file_write(qwen3_dump_fd, s, sl)
+        dealloc(s)
+        i = i + 1
+    }
+    file_write(qwen3_dump_fd, "\n", 1)
+}
+
+fn qwen3_forward_layer(u64 x_out, u64 x_in,
+                       Qwen3LayerWeights w,
+                       u64 pos,
+                       u64 k_cache_layer, u64 v_cache_layer,
+                       u64 num_workers) {
+    u64 hidden = QWEN3_HIDDEN
+    u64 hd     = QWEN3_HEAD_DIM
+    u64 nh     = QWEN3_N_HEADS
+    u64 nkv    = QWEN3_N_KV_HEADS
+    u64 q_dim  = QWEN3_Q_DIM
+    u64 kv_dim = QWEN3_KV_DIM
+    u64 ff     = QWEN3_INTERMEDIATE
+    // Gate the phase dump on pos != 0 (skip prefill of BOS token; fire on
+    // the first decode-step layer-0 call, matching the GPU driver's
+    // "step 0" dump in examples/llama3_1b_gpu_generate.mlr).
+    u64 _dbg_phase = 0
+    if pos != 0 { _dbg_phase = _qwen3_phase_dump_check() }
+
+    u64 kv_row_bytes = nkv * hd * 4
+    u64 k_row = k_cache_layer + pos * kv_row_bytes
+    u64 v_row = v_cache_layer + pos * kv_row_bytes
+
+    // qwen3_dump5("x_in",   x_in)
+    u64 resid = alloc(hidden * 4)
+    memcpy(resid, x_in, hidden * 4)
+
+    u64 x_norm = alloc(hidden * 4)
+    u64 p_t0 = time_now()
+    qwen3_main_rmsnorm(x_norm, x_in, w.input_norm_w, hidden)
+    qwen3_t_input_norm = qwen3_t_input_norm + time_elapsed(p_t0)
+    if _dbg_phase != 0 { _qwen3_dump_buf("b_x_norm_g", x_norm, hidden) }
+
+    // Q / K / V projections. K and V target the cache slot at `pos` directly;
+    // downstream QK-norm and RoPE mutate the cache in place. V is stored raw
+    // (no norm, no RoPE — Qwen3 only rotates Q and K).
+    // Q/K/V projections. Two code paths:
+    //   * qwen3_fuse_qkv != 0 (small models): caller pre-stacked the
+    //     weights into w.q_proj_w; one matmul + memcpy-split.
+    //   * qwen3_fuse_qkv == 0 (large models like 14B Q8_0): 3 separate
+    //     matmuls hitting the original weight pointers. Avoids ~50 %
+    //     heap duplication cost at the price of a few extra thread-pool
+    //     round trips.
+    u64 q_buf = alloc(q_dim * 4)
+    u64 p_t1 = time_now()
+    if qwen3_fuse_qkv != 0 {
+        u64 qkv_dim_local = q_dim + 2 * kv_dim
+        u64 qkv_buf = alloc(qkv_dim_local * 4)
+        qwen3_main_matmul(qkv_buf, x_norm, w.q_proj_w, 1, qkv_dim_local, hidden, num_workers, 0)
+        if _dbg_phase != 0 { _qwen3_dump_buf("b_qkv_g", qkv_buf, qkv_dim_local) }
+        memcpy(q_buf,  qkv_buf,                        q_dim  * 4)
+        memcpy(k_row,  qkv_buf + q_dim * 4,            kv_dim * 4)
+        memcpy(v_row,  qkv_buf + (q_dim + kv_dim) * 4, kv_dim * 4)
+        dealloc(qkv_buf)
+    } else {
+        qwen3_main_matmul(q_buf, x_norm, w.q_proj_w, 1, q_dim,  hidden, num_workers, 0)
+        qwen3_main_matmul(k_row, x_norm, w.k_proj_w, 1, kv_dim, hidden, num_workers, 0)
+        qwen3_main_matmul(v_row, x_norm, w.v_proj_w, 1, kv_dim, hidden, num_workers, 0)
+    }
+    qwen3_t_qkv_proj = qwen3_t_qkv_proj + time_elapsed(p_t1)
+    // qwen3_dump5("q_raw", q_buf)
+    // qwen3_dump5("q_raw_h1", q_buf + 128 * 4)
+    // qwen3_dump5("k_raw", k_row)
+    // qwen3_dump5("k_raw_64", k_row + 64 * 4)
+    // qwen3_dump5("v_raw", v_row)
+
+    u64 p_t2 = time_now()
+    // QK-Norm. BF16-norm models need a one-off widen of w.q_norm_w /
+    // w.k_norm_w into an f32 scratch before the per-head RMSNorm. F32-
+    // norm models (14B Q8_0) can point the RMSNorm at the weight
+    // directly — no widen, no scratch. Llama/Mistral/Phi skip the
+    // entire block via qwen3_set_qknorm(0).
+    u64 h = 0
+    if qwen3_use_qknorm != 0 {
+        u64 qk_w_q = 0
+        u64 qk_w_k = 0
+        u64 qk_w_f32 = 0
+        if qwen3_norm_kind == 0 {
+            qk_w_f32 = alloc(hd * 4)
+            qwen3_bf16_row_to_f32(qk_w_f32, w.q_norm_w, hd)
+            qk_w_q = qk_w_f32
+        } else {
+            qk_w_q = w.q_norm_w
+        }
+        h = 0
+        while h < nh {
+            u64 q_slice = q_buf + h * hd * 4
+            qwen3_rmsnorm_f32_weights(q_slice, q_slice, qk_w_q, hd)
+            h = h + 1
+        }
+        if qwen3_norm_kind == 0 {
+            qwen3_bf16_row_to_f32(qk_w_f32, w.k_norm_w, hd)
+            qk_w_k = qk_w_f32
+        } else {
+            qk_w_k = w.k_norm_w
+        }
+        h = 0
+        while h < nkv {
+            u64 k_slice = k_row + h * hd * 4
+            qwen3_rmsnorm_f32_weights(k_slice, k_slice, qk_w_k, hd)
+            h = h + 1
+        }
+        if qwen3_norm_kind == 0 { dealloc(qk_w_f32) }
+    }
+    // qwen3_dump5("q_norm", q_buf)
+    // qwen3_dump5("q_norm_h0_64", q_buf + 64 * 4)
+    // qwen3_dump5("q_norm_h1", q_buf + 128 * 4)
+    // qwen3_dump5("k_norm", k_row)
+    // qwen3_dump5("k_norm_h0_64", k_row + 64 * 4)
+
+    // cos/sin only depend on `pos`, not on layer — cache across the
+    // 28-layer sweep. First layer in a step pays the rope_compute cost;
+    // the rest (layers 1..27) just reuse the cache. Buffers outlive
+    // each forward-layer call (module-level statics), so no alloc here.
+    if qwen3_rope_cos_cache == 0 {
+        qwen3_rope_cos_cache = alloc((hd / 2) * 4)
+        qwen3_rope_sin_cache = alloc((hd / 2) * 4)
+    }
+    if qwen3_rope_cache_pos != pos {
+        f64 theta = int_to_f64(qwen3_rope_theta_int)
+        if qwen3_use_imrope != 0 {
+            qwen3_rope_compute_imrope_text(qwen3_rope_cos_cache, qwen3_rope_sin_cache, pos, qwen3_imrope_rope_dim, theta)
+        } else {
+            qwen3_rope_compute(qwen3_rope_cos_cache, qwen3_rope_sin_cache, pos, hd, theta)
+        }
+        qwen3_rope_cache_pos = pos
+    }
+    if qwen3_use_imrope != 0 {
+        qwen3_rope_apply_partial(q_buf, qwen3_rope_cos_cache, qwen3_rope_sin_cache, nh,  hd, qwen3_imrope_rope_dim)
+        qwen3_rope_apply_partial(k_row, qwen3_rope_cos_cache, qwen3_rope_sin_cache, nkv, hd, qwen3_imrope_rope_dim)
+    } else {
+        qwen3_rope_apply(q_buf, qwen3_rope_cos_cache, qwen3_rope_sin_cache, nh,  hd)
+        qwen3_rope_apply(k_row, qwen3_rope_cos_cache, qwen3_rope_sin_cache, nkv, hd)
+    }
+    qwen3_t_qknorm_rope = qwen3_t_qknorm_rope + time_elapsed(p_t2)
+    if _dbg_phase != 0 { _qwen3_dump_buf("b_attn_q_g", q_buf, q_dim) }
+
+    // Cache-aware attention over positions 0..pos (inclusive). V_cache is
+    // already populated at index `pos` by the matmul above.
+    u64 attn_out = alloc(q_dim * 4)
+    u64 p_t3 = time_now()
+    qwen3_attn_cached(attn_out, q_buf,
+                      k_cache_layer, v_cache_layer,
+                      pos + 1, nh, nkv, hd)
+    qwen3_t_attn = qwen3_t_attn + time_elapsed(p_t3)
+    // Mega-kernel's b_attn_out_g is the INPUT to o_proj (phase 7 attn_decode
+    // output, BEFORE o_proj), not the output of o_proj.
+    if _dbg_phase != 0 { _qwen3_dump_buf("b_attn_out_g", attn_out, q_dim) }
+
+    u64 o_buf = alloc(hidden * 4)
+    u64 p_t4 = time_now()
+    qwen3_main_matmul(o_buf, attn_out, w.o_proj_w, 1, hidden, q_dim, num_workers, 0)
+
+    // Residual add: x = resid + o_buf
+    u64 mid = alloc(hidden * 4)
+    u64 i = 0
+    while i < hidden {
+        f32 a = 0.0f; unsafe { *((resid + i * 4) as f32) -> a }
+        f32 b = 0.0f; unsafe { *((o_buf + i * 4) as f32) -> b }
+        f32 y = a + b
+        unsafe { *((mid + i * 4) as f32) = y }
+        i = i + 1
+    }
+    qwen3_t_oproj_res1 = qwen3_t_oproj_res1 + time_elapsed(p_t4)
+    if _dbg_phase != 0 { _qwen3_dump_buf("b_mid_g", mid, hidden) }
+
+    u64 p_t5 = time_now()
+    u64 mid_norm = alloc(hidden * 4)
+    qwen3_main_rmsnorm(mid_norm, mid, w.post_norm_w, hidden)
+    qwen3_t_post_norm = qwen3_t_post_norm + time_elapsed(p_t5)
+    if _dbg_phase != 0 { _qwen3_dump_buf("b_mid_norm_g", mid_norm, hidden) }
+
+    // gate/up: same dual-path story as QKV above.
+    u64 gate_buf = alloc(ff * 4)
+    u64 up_buf   = alloc(ff * 4)
+    u64 p_t6 = time_now()
+    if qwen3_fuse_qkv != 0 {
+        u64 gu_dim_local = 2 * ff
+        u64 gu_buf = alloc(gu_dim_local * 4)
+        qwen3_main_matmul(gu_buf, mid_norm, w.gate_proj_w, 1, gu_dim_local, hidden, num_workers, 0)
+        memcpy(gate_buf, gu_buf,               ff * 4)
+        memcpy(up_buf,   gu_buf + ff * 4,      ff * 4)
+        dealloc(gu_buf)
+    } else {
+        qwen3_main_matmul(gate_buf, mid_norm, w.gate_proj_w, 1, ff, hidden, num_workers, 0)
+        qwen3_main_matmul(up_buf,   mid_norm, w.up_proj_w,   1, ff, hidden, num_workers, 0)
+    }
+    qwen3_t_gate_up = qwen3_t_gate_up + time_elapsed(p_t6)
+    u64 ff_buf = alloc(ff * 4)
+    u64 p_t7 = time_now()
+    qwen3_silu_mul(ff_buf, gate_buf, up_buf, ff)
+    qwen3_t_silu = qwen3_t_silu + time_elapsed(p_t7)
+    if _dbg_phase != 0 { _qwen3_dump_buf("gu_scratch[0..FF]", ff_buf, ff) }
+    // down_proj via the shared MT matmul. The old hand-inlined single-thread
+    // loop was kept while the IR-store-8-byte bug was still in the compiler;
+    // that's fixed now, so the MT path works and parallelises the 3M-element
+    // hotspot.
+    u64 ff_out = alloc(hidden * 4)
+    u64 p_t8 = time_now()
+    qwen3_main_matmul(ff_out, ff_buf, w.down_proj_w, 1, hidden, ff, num_workers, 0)
+    // qwen3_dump5("ff_out", ff_out)
+
+    // Second residual add: x_out = mid + ff_out
+    i = 0
+    while i < hidden {
+        f32 a = 0.0f; unsafe { *((mid + i * 4) as f32) -> a }
+        f32 b = 0.0f; unsafe { *((ff_out + i * 4) as f32) -> b }
+        f32 y = a + b
+        unsafe { *((x_out + i * 4) as f32) = y }
+        i = i + 1
+    }
+    qwen3_t_down_res2 = qwen3_t_down_res2 + time_elapsed(p_t8)
+    if _dbg_phase != 0 {
+        _qwen3_dump_buf("out_resid", x_out, hidden)
+        qwen3_phase_dump_state = 3   // disarm — fire only on first layer
+    }
+
+    dealloc(resid); dealloc(x_norm)
+    dealloc(q_buf)
+    dealloc(attn_out); dealloc(o_buf)
+    dealloc(mid); dealloc(mid_norm)
+    dealloc(gate_buf); dealloc(up_buf); dealloc(ff_buf); dealloc(ff_out)
+}
+
+// ─── Full-GPU forward layer ──────────────────────────────────────────
+// Parallel implementation of qwen3_forward_layer that keeps every
+// intermediate device-resident and chains the GPU ops with a single
+// flush per layer-half (one before CPU attention, one at the layer
+// boundary).  Two syncs per layer instead of four.
+//
+// Inputs:
+//   d_x_in          device VA of the residual carry (input).
+//   d_x_out         device VA where the new residual is written.
+//   w               layer weights (host bf16).
+//   pos             current decode position.
+//   k_cache_layer,
+//   v_cache_layer   host buffers for the KV cache (CPU attention path
+//                   stays the same — this slice keeps qknorm/rope/
+//                   attention on CPU).
+//   num_workers     unused on the GPU path (no thread-pool dispatch).
+//
+// REQUIRES: gpu_pipeline_ready() == 1 and gpu_matmul_enabled() == 1.
+// Caller must allocate d_x_in and d_x_out (hidden f32 each) and
+// initialise d_x_in with the input residual via memcpy through the
+// device's host-mapped pointer.
+
+// Phase 1 batched-decode: each chained intermediate is sized for
+// batch_size streams.  Stream b's sub-slice for buffer X of dim D is
+// at byte offset b * D * 4 from base.  At batch_size = 1 the layout
+// is byte-identical to the prior single-stream form.
+static u64 _gpuq_init           = 0
+static u64 _gpuq_batch_size     = 1
+static u64 _gpuq_d_x_norm    = 0
+static u64 _gpuq_d_qkv       = 0
+static u64 _gpuq_d_qkv_h     = 0
+static u64 _gpuq_d_attn      = 0
+static u64 _gpuq_d_attn_h    = 0
+static u64 _gpuq_d_o         = 0
+static u64 _gpuq_d_mid       = 0
+static u64 _gpuq_d_mid_norm  = 0
+static u64 _gpuq_d_gu        = 0
+static u64 _gpuq_d_ff        = 0
+static u64 _gpuq_d_ff_out    = 0
+

@@ -1,0 +1,328 @@
+// Qwen3-0.6B CPU-only driver — string prompt in, decoded text out.
+//
+// Wires std/tokenizer.mlr (GPT-2 byte-level BPE) to std/qwen3_cpu.mlr's
+// forward layer. No HIP / no ROCm / no libamdhip64 — the binary has no
+// libamdhip64.so.7 DT_NEEDED, so it runs on machines without ROCm
+// installed.
+//
+// To change the prompt: edit `prompt_text` below and recompile.
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --target=linux --emit=elfexe \
+//       examples/qwen3_generate_cpu.mlr -o /tmp/qwen3_cpu
+// Run:
+//   /tmp/qwen3_cpu
+
+import "../std/qwen3_cpu.mlr"
+import "../std/safetensors.mlr"
+import "../std/inference.mlr"
+import "../std/tokenizer.mlr"
+import "../std/io.mlr"
+import "../std/fmt.mlr"
+import "../std/string.mlr"
+import "../std/thread.mlr"
+import "../std/time.mlr"
+
+fn main() {
+    // ===================== USER CONFIG =====================
+    u64 prompt_text  = "Hello, who are you?"
+    u64 max_new      = 20
+    u64 model_dir    = "/home/pantelis/Desktop/Projects/Work/MLRift-experimental/Qwen3-0.6B"
+    u64 num_workers  = 16
+    // ========================================================
+
+    thread_pool_init(num_workers)
+
+    // --- Load tokenizer ---
+    u64 tok_path = str_cat(model_dir, "/tokenizer.json")
+    Tokenizer tk = tokenizer_load(tok_path)
+    tokenizer_set_kind_gpt2(tk)        // Qwen3 uses GPT-2 byte-level BPE.
+    dealloc(tok_path)
+
+    // --- Encode prompt ---
+    // tokenizer_encode allocates the IDs array internally and writes the
+    // heap pointer to *out_ids_box; we just pass two u64 sentinel boxes.
+    u64 prompt_len_bytes = str_len(prompt_text)
+    u64 prompt_ids_box   = alloc(8)
+    u64 prompt_count_box = alloc(8)
+    unsafe { *(prompt_ids_box as u64) = 0 }
+    unsafe { *(prompt_count_box as u64) = 0 }
+    tokenizer_encode(tk, prompt_text, prompt_len_bytes, prompt_ids_box, prompt_count_box)
+    u64 prompt_ids = 0
+    unsafe { *(prompt_ids_box as u64) -> prompt_ids }
+    u64 prompt_count = 0
+    unsafe { *(prompt_count_box as u64) -> prompt_count }
+    dealloc(prompt_ids_box); dealloc(prompt_count_box)
+    print_str("[qwen3_cpu] prompt=\""); print_str(prompt_text); print_str("\" → ")
+    u64 ps = fmt_dec(prompt_count); print_str(ps); dealloc(ps)
+    print_str(" tokens [")
+    u64 pi = 0
+    while pi < prompt_count {
+        if pi != 0 { print_str(", ") }
+        u32 pid32 = 0
+        unsafe { *((prompt_ids + pi * 4) as uint32) -> pid32 }
+        u64 pid = pid32
+        u64 pids = fmt_dec(pid); print_str(pids); dealloc(pids)
+        pi = pi + 1
+    }
+    print_str("]\n")
+
+    // --- Load model weights ---
+    u64 sf_path = str_cat(model_dir, "/model.safetensors")
+    SafetensorFile st = safetensors_open(sf_path)
+    if st.file_size == 0 {
+        print_str("[qwen3_cpu] open safetensors failed\n"); exit(1)
+    }
+    dealloc(sf_path)
+
+    u64 n_layers = 28
+    u64 vocab    = 151936
+    u64 max_seq  = 128
+    // Qwen3-0.6B arch: hidden=1024, head_dim=128, n_heads=16, n_kv_heads=8,
+    // ff=3072 — defaults already set in qwen3_cpu.mlr.
+    u64 hidden = QWEN3_HIDDEN
+    u64 kv_dim = QWEN3_KV_DIM
+    u64 q_dim  = QWEN3_Q_DIM
+    u64 ff     = QWEN3_INTERMEDIATE
+
+    SafetensorView embed_v = safetensors_get(st, "model.embed_tokens.weight")
+    SafetensorView norm_v  = safetensors_get(st, "model.norm.weight")
+    u64 embed_ptr = embed_v.ptr
+    u64 norm_ptr  = norm_v.ptr
+    if embed_ptr == 0 || norm_ptr == 0 {
+        print_str("[qwen3_cpu] missing embed or final norm\n"); exit(1)
+    }
+
+    // Per-layer weight pointer table (11 ptrs × 8 bytes = 88 bytes/layer).
+    u64 layers_arr = alloc(n_layers * 88)
+    u64 li = 0
+    while li < n_layers {
+        u64 base = layers_arr + li * 88
+        u64 li_s = fmt_dec(li)
+        u64 pre0 = str_cat("model.layers.", li_s)
+        u64 prefix = str_cat(pre0, ".")
+        dealloc(li_s); dealloc(pre0)
+
+        u64 n01 = str_cat(prefix, "input_layernorm.weight")
+        SafetensorView v01 = safetensors_get(st, n01)
+        unsafe { *((base + 0 * 8) as u64) = v01.ptr }
+        dealloc(n01)
+
+        u64 n02 = str_cat(prefix, "self_attn.q_proj.weight")
+        SafetensorView v02 = safetensors_get(st, n02)
+        unsafe { *((base + 1 * 8) as u64) = v02.ptr }
+        dealloc(n02)
+
+        u64 n03 = str_cat(prefix, "self_attn.k_proj.weight")
+        SafetensorView v03 = safetensors_get(st, n03)
+        unsafe { *((base + 2 * 8) as u64) = v03.ptr }
+        dealloc(n03)
+
+        u64 n04 = str_cat(prefix, "self_attn.v_proj.weight")
+        SafetensorView v04 = safetensors_get(st, n04)
+        unsafe { *((base + 3 * 8) as u64) = v04.ptr }
+        dealloc(n04)
+
+        u64 n05 = str_cat(prefix, "self_attn.q_norm.weight")
+        SafetensorView v05 = safetensors_get(st, n05)
+        unsafe { *((base + 4 * 8) as u64) = v05.ptr }
+        dealloc(n05)
+
+        u64 n06 = str_cat(prefix, "self_attn.k_norm.weight")
+        SafetensorView v06 = safetensors_get(st, n06)
+        unsafe { *((base + 5 * 8) as u64) = v06.ptr }
+        dealloc(n06)
+
+        u64 n07 = str_cat(prefix, "self_attn.o_proj.weight")
+        SafetensorView v07 = safetensors_get(st, n07)
+        unsafe { *((base + 6 * 8) as u64) = v07.ptr }
+        dealloc(n07)
+
+        u64 n08 = str_cat(prefix, "post_attention_layernorm.weight")
+        SafetensorView v08 = safetensors_get(st, n08)
+        unsafe { *((base + 7 * 8) as u64) = v08.ptr }
+        dealloc(n08)
+
+        u64 n09 = str_cat(prefix, "mlp.gate_proj.weight")
+        SafetensorView v09 = safetensors_get(st, n09)
+        unsafe { *((base + 8 * 8) as u64) = v09.ptr }
+        dealloc(n09)
+
+        u64 n10 = str_cat(prefix, "mlp.up_proj.weight")
+        SafetensorView v10 = safetensors_get(st, n10)
+        unsafe { *((base + 9 * 8) as u64) = v10.ptr }
+        dealloc(n10)
+
+        u64 n11 = str_cat(prefix, "mlp.down_proj.weight")
+        SafetensorView v11 = safetensors_get(st, n11)
+        unsafe { *((base + 10 * 8) as u64) = v11.ptr }
+        dealloc(n11)
+
+        dealloc(prefix)
+        li = li + 1
+    }
+
+    // Fuse Q/K/V → single [q_dim+2*kv_dim, hidden] per layer (1 matmul not 3).
+    // Same for gate/up.
+    u64 qkv_dim_elems    = q_dim + 2 * kv_dim
+    u64 qkv_row_bytes    = hidden * 2
+    u64 q_bytes          = q_dim  * qkv_row_bytes
+    u64 kv_bytes         = kv_dim * qkv_row_bytes
+    u64 stacked_bytes    = qkv_dim_elems * qkv_row_bytes
+    u64 gu_dim_elems     = 2 * ff
+    u64 gate_bytes       = ff * qkv_row_bytes
+    u64 gu_stacked_bytes = gu_dim_elems * qkv_row_bytes
+    print_str("[qwen3_cpu] fusing QKV + gate/up weights\n")
+    li = 0
+    while li < n_layers {
+        u64 base = layers_arr + li * 88
+        u64 qp = 0; unsafe { *((base + 1 * 8) as u64) -> qp }
+        u64 kp = 0; unsafe { *((base + 2 * 8) as u64) -> kp }
+        u64 vp = 0; unsafe { *((base + 3 * 8) as u64) -> vp }
+        u64 stacked = alloc(stacked_bytes)
+        memcpy(stacked,                       qp, q_bytes)
+        memcpy(stacked + q_bytes,             kp, kv_bytes)
+        memcpy(stacked + q_bytes + kv_bytes,  vp, kv_bytes)
+        unsafe { *((base + 1 * 8) as u64) = stacked }
+
+        u64 gpw = 0; unsafe { *((base + 8 * 8) as u64) -> gpw }
+        u64 upw = 0; unsafe { *((base + 9 * 8) as u64) -> upw }
+        u64 gu_stacked = alloc(gu_stacked_bytes)
+        memcpy(gu_stacked,              gpw, gate_bytes)
+        memcpy(gu_stacked + gate_bytes, upw, gate_bytes)
+        unsafe { *((base + 8 * 8) as u64) = gu_stacked }
+        li = li + 1
+    }
+
+    // KV cache: per-layer slab of max_seq * kv_dim f32 = max_seq * 4096 bytes.
+    u64 kv_row_bytes = kv_dim * 4
+    u64 layer_stride = max_seq * kv_row_bytes
+    u64 k_cache = alloc(n_layers * layer_stride)
+    u64 v_cache = alloc(n_layers * layer_stride)
+
+    // Working residual buffers (ping-pong).
+    u64 x_cur     = alloc(hidden * 4)
+    u64 x_nxt     = alloc(hidden * 4)
+    u64 final_out = alloc(hidden * 4)
+    u64 logits    = alloc(vocab * 4)
+
+    // Sequence ID buffer (prompt + generated).
+    u64 seq_cap = prompt_count + max_new + 16
+    u64 seq_ids = alloc(seq_cap * 4)
+    u64 si = 0
+    while si < prompt_count {
+        u32 pid32 = 0
+        unsafe { *((prompt_ids + si * 4) as uint32) -> pid32 }
+        unsafe { *((seq_ids + si * 4) as uint32) = pid32 }
+        si = si + 1
+    }
+    u64 seq_len = prompt_count
+
+    // --- Prefill: run forward on prompt tokens 0..N-2 to populate K/V cache ---
+    u64 prefill_start_ns = time_now()
+    u64 pos = 0
+    while pos + 1 < prompt_count {
+        u32 pt32 = 0
+        unsafe { *((seq_ids + pos * 4) as uint32) -> pt32 }
+        u64 pt = pt32
+        // Embed token pt → x_cur (bf16 row → f32).
+        u64 row_p = embed_ptr + pt * hidden * 2
+        u64 ii = 0
+        while ii < hidden {
+            f32 v = bf16_to_f32(row_p + ii * 2)
+            unsafe { *((x_cur + ii * 4) as f32) = v }
+            ii = ii + 1
+        }
+        u64 layer = 0
+        while layer < n_layers {
+            Qwen3LayerWeights w = layers_arr + layer * 88
+            u64 kc = k_cache + layer * layer_stride
+            u64 vc = v_cache + layer * layer_stride
+            qwen3_forward_layer(x_nxt, x_cur, w, pos, kc, vc, num_workers)
+            u64 tmp = x_cur; x_cur = x_nxt; x_nxt = tmp
+            layer = layer + 1
+        }
+        pos = pos + 1
+    }
+    u64 prefill_ns = time_elapsed(prefill_start_ns)
+    print_str("[qwen3_cpu] prefill_ms="); u64 pms = fmt_dec(prefill_ns / 1000000); print_str(pms); dealloc(pms); print_str("\n")
+
+    // Embed the last prompt token into x_cur for the first decode step.
+    u32 last_pt32 = 0
+    unsafe { *((seq_ids + (prompt_count - 1) * 4) as uint32) -> last_pt32 }
+    u64 last_pt = last_pt32
+    u64 row_l = embed_ptr + last_pt * hidden * 2
+    u64 jj = 0
+    while jj < hidden {
+        f32 v = bf16_to_f32(row_l + jj * 2)
+        unsafe { *((x_cur + jj * 4) as f32) = v }
+        jj = jj + 1
+    }
+
+    // --- Decode loop ---
+    u64 decode_start_ns = time_now()
+    u64 step = 0
+    while step < max_new {
+        // Run all 28 layers.
+        u64 layer = 0
+        while layer < n_layers {
+            Qwen3LayerWeights w = layers_arr + layer * 88
+            u64 kc = k_cache + layer * layer_stride
+            u64 vc = v_cache + layer * layer_stride
+            qwen3_forward_layer(x_nxt, x_cur, w, pos, kc, vc, num_workers)
+            u64 tmp = x_cur; x_cur = x_nxt; x_nxt = tmp
+            layer = layer + 1
+        }
+
+        // Final rmsnorm + lm_head.
+        qwen3_rmsnorm_bf16(final_out, x_cur, norm_ptr, hidden)
+        qwen3_main_matmul(logits, final_out, embed_ptr, 1, vocab, hidden, num_workers, 0)
+
+        // Greedy argmax over vocab.
+        u64 best_id = 0
+        f32 best_val = 0.0f
+        u64 first = 1
+        u64 j = 0
+        while j < vocab {
+            f32 lv = 0.0f
+            unsafe { *((logits + j * 4) as f32) -> lv }
+            if first == 1 { best_val = lv; best_id = j; first = 0 }
+            else { if lv > best_val { best_val = lv; best_id = j } }
+            j = j + 1
+        }
+
+        u32 best_id32 = best_id
+        unsafe { *((seq_ids + seq_len * 4) as uint32) = best_id32 }
+        seq_len = seq_len + 1
+
+        // Embed best_id into x_cur for next step.
+        u64 row_n = embed_ptr + best_id * hidden * 2
+        u64 kk = 0
+        while kk < hidden {
+            f32 v = bf16_to_f32(row_n + kk * 2)
+            unsafe { *((x_cur + kk * 4) as f32) = v }
+            kk = kk + 1
+        }
+        pos = pos + 1
+        step = step + 1
+    }
+    u64 decode_ns = time_elapsed(decode_start_ns)
+
+    // --- Decode the generated portion back to text ---
+    print_str("\n=== OUTPUT ===\n")
+    u64 out_text = tokenizer_decode(tk, seq_ids, seq_len)
+    print_str(out_text)
+    dealloc(out_text)
+    print_str("\n\n")
+
+    // Stats.
+    u64 dms = fmt_dec(decode_ns / 1000000)
+    print_str("[qwen3_cpu] decoded "); u64 mns = fmt_dec(max_new); print_str(mns); dealloc(mns)
+    print_str(" tokens in "); print_str(dms); dealloc(dms); print_str(" ms\n")
+
+    // Cleanup (best-effort; the kernel will reclaim on exit anyway).
+    dealloc(prompt_ids)
+    tokenizer_free(tk)
+    thread_pool_shutdown()
+    exit(0)
+}
