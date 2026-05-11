@@ -144,7 +144,7 @@ mlrc: GPU runtime not available
 ```
 
 Host-side coordination code emitted by `format_hip.mlr` calls into
-these bindings through normal KernRift extern-call machinery.
+these bindings through normal MLRift extern-call machinery.
 
 ## Build pipeline
 

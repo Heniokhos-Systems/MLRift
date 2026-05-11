@@ -1,22 +1,26 @@
-# MLRift
+# MLRift — v1.0.0
 
-A systems language for machine-learning workloads — built on
-[KernRift](https://github.com/Pantelis23/KernRift) at commit `6cf758b`
-(v2.8.15). The compiler's own source is KernRift; MLRift extends the
-KRIR backend with ML-specific primitives (tensors, event streams,
-continuous-time dynamics, sparse CSR ops, plasticity rules) and will
-introduce a `.mlr` frontend for user programs as the roadmap lands.
+A self-hosted systems language and compiler for machine-learning
+workloads. Forked from [KernRift](https://github.com/Pantelis23/KernRift)
+at commit `6cf758b` (v2.8.15); MLRift extends the IR backend with
+ML-specific primitives (tensors, event streams, continuous-time
+dynamics, sparse CSR ops, plasticity rules) and ships a native
+AMDGCN GPU emitter that talks to `/dev/kfd` directly with zero ROCm
+DSO dependencies on Linux.
 
-**Status:** day zero. The rename pass is done (product identity is
-MLRift, binary is `mlrc`, bootstrap binary is `build/mlrc`), 436/436
-tests pass, self-host fixed point holds. The MLRift-specific syntax
-and IR extensions are not started yet — those follow the roadmap in
-`~/Desktop/Projects/Work/ideas/MLRift.md`.
+**v1.0.0 highlights**
+
+- Self-hosted (`build/mlrc` is built from `src/*.mlr` by `build/mlrc`).
+- 439/439 tests pass, self-host fixed point holds.
+- 8-target fat binary (`.mlrbo`) — Linux/macOS/Windows/Android × x86_64/arm64.
+- Native AMDGCN backend for gfx1100 + gfx1030; 31 LLM kernels reachable.
+- Four-platform benchmark report — see `benchmarks/BENCHMARKS.md`
+  for x86_64 Linux, aarch64 Pi 400, Windows 11 x86_64, and Android arm64.
 
 ## What works today
 
 Real LLM inference is already running end-to-end through the existing
-KernRift compiler + a small ML stdlib (`std/qwen3.mlr`,
+MLRift compiler + a small ML stdlib (`std/qwen3.mlr`,
 `std/matmul.mlr`, `std/tokenizer.mlr`, `std/gguf.mlr`) — no external
 runtime, no Python.
 
@@ -56,7 +60,7 @@ the next target.
 ### OS portability
 
 The compiler and the emitted GPU bytes are OS-agnostic: `mlrc` builds
-on Linux/macOS/Windows/Android (KernRift's portable host backends),
+on Linux/macOS/Windows/Android (MLRift's portable host backends),
 and the AMDGCN code object the emitter writes doesn't care about the
 host kernel.  The **runtime** that loads and dispatches those bytes
 is what's OS-bound:
@@ -225,21 +229,21 @@ all on the same RX 7800 XT.
 
 ```
 make build    # self-compiles build/mlrc (bootstrap committed)
-make test     # 436/436
+make test     # 439/439
 make bootstrap   # verify stage3 == stage4
 mlrc --version
 ```
 
-## Why "built on KernRift"
+## Lineage — forked from KernRift
 
-MLRift is explicitly a **layer on top of KernRift**, not a hard fork.
-It shares the type system, the optimization pipeline, the codegen
-backends (x86_64 + ARM64, Linux/macOS/Windows/Android), and all the
-infrastructure KernRift spent the last year hardening. MLRift-specific
-work lives in added passes, added IR ops, and a new frontend — not in
-re-implementing the basics. When KernRift fixes a backend bug,
-MLRift inherits it with a cherry-pick.
+MLRift began as a soft fork of [KernRift](https://github.com/Pantelis23/KernRift)
+at v2.8.15 and shares its type system, IR-level optimization pipeline, and the
+host code generators for x86_64 + ARM64 across Linux / macOS / Windows /
+Android. MLRift-specific work lives in added passes, added IR ops, the AMDGCN
+emitter, and ML-oriented stdlib modules — not in re-implementing the basics.
+Generic compiler-level findings that apply upstream are tracked in
+`docs/kernrift_upstream.md`.
 
 ## License
 
-Same as KernRift — see `LICENSE`.
+See `LICENSE`.

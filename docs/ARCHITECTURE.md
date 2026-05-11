@@ -1,6 +1,6 @@
 # Architecture
 
-The KernRift compiler (`krc`) is a self-hosting compiler written entirely in KernRift. It compiles itself to a bit-identical fixed point. No external assembler, linker, or C toolchain is involved — `krc` writes ELF, Mach-O, and PE headers plus native machine code directly to disk.
+The MLRift compiler (`mlrc`) is a self-hosting compiler written entirely in MLRift. It compiles itself to a bit-identical fixed point. No external assembler, linker, or C toolchain is involved — `mlrc` writes ELF, Mach-O, and PE headers plus native machine code directly to disk.
 
 ## Source Structure
 
@@ -46,19 +46,19 @@ Not every target defaults to IR. The release recipe is:
 
 | Binary | Flags | Why |
 |--------|-------|-----|
-| `krc-linux-x86_64`        | default (IR)     | IR + optimizer handles real-world code well |
-| `krc-windows-x86_64.exe`  | default (IR)     | same |
-| `krc-macos-x86_64`        | default (IR)     | same |
-| `krc-android-x86_64`      | default (IR)     | same |
-| `krc-linux-arm64`         | **`--legacy`**   | IR ARM64 miscompiles `compile_fat`; legacy is 13 % larger but correct |
-| `krc-windows-arm64.exe`   | **`--legacy`**   | same |
-| `krc-macos-arm64`         | **`--legacy`**   | same |
-| `krc-android-arm64`       | **`--legacy`**   | same |
+| `mlrc-linux-x86_64`        | default (IR)     | IR + optimizer handles real-world code well |
+| `mlrc-windows-x86_64.exe`  | default (IR)     | same |
+| `mlrc-macos-x86_64`        | default (IR)     | same |
+| `mlrc-android-x86_64`      | default (IR)     | same |
+| `mlrc-linux-arm64`         | **`--legacy`**   | IR ARM64 miscompiles `compile_fat`; legacy is 13 % larger but correct |
+| `mlrc-windows-arm64.exe`   | **`--legacy`**   | same |
+| `mlrc-macos-arm64`         | **`--legacy`**   | same |
+| `mlrc-android-arm64`       | **`--legacy`**   | same |
 | `mlr-*` (runner, all 8)   | default (IR)     | simple program, no compile_fat — IR is fine |
 
 Inside `compile_fat` itself (building the 8-slice `.mlrbo`), every ARM64 slice dispatches to `gen_function_a64` (legacy) regardless of `emit_ir_mode`, so the arm64 slice users pull out of `mlrc.mlrbo` is also legacy-built. `--ir` (emit_ir_mode ≥ 2) forces the IR path through those slices for backend testing.
 
-User-invoked `krc --arch=arm64 myprog.mlr -o myprog` still defaults to IR — the miscompile is specific to the `compile_fat` function's shape.
+User-invoked `mlrc --arch=arm64 myprog.mlr -o myprog` still defaults to IR — the miscompile is specific to the `compile_fat` function's shape.
 
 ## Android fat-binary runner
 
@@ -83,11 +83,11 @@ This bypasses the SELinux file-label transition Termux uses to block execve of u
 ## Bootstrap
 
 ```
-released krc binary → krc (stage 1, from source)
-krc → krc2 (stage 2, self-compiled)
+released mlrc binary → mlrc (stage 1, from source)
+mlrc → krc2 (stage 2, self-compiled)
 krc2 → krc3 (stage 3)
 krc3 → krc4 (stage 4)
 krc3 == krc4 (bit-identical fixed point)
 ```
 
-There is no Rust, no C, and no LLVM in the build. A released `krc` binary compiles the current source tree into the next `krc`. CI verifies the fixed point on every push across all eight platform targets.
+There is no Rust, no C, and no LLVM in the build. A released `mlrc` binary compiles the current source tree into the next `mlrc`. CI verifies the fixed point on every push across all eight platform targets.

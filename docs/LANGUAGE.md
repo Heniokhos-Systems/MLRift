@@ -1,6 +1,6 @@
-# KernRift Language Reference
+# MLRift Language Reference
 
-**KernRift** is a bare-metal systems programming language and compiler created
+**MLRift** is a bare-metal systems programming language and compiler created
 by Pantelis Christou. It compiles itself. It runs on Linux, Windows, macOS,
 and Android across x86_64 and ARM64 without any C toolchain, runtime, or libc.
 
@@ -42,7 +42,7 @@ something that doesn't work, it's a bug, not a typo in the docs.
 
 ## 1. File structure and comments
 
-KernRift source files use the `.mlr` extension. One file is one module. A
+MLRift source files use the `.mlr` extension. One file is one module. A
 program starts execution at `fn main()` (unless you pass `--freestanding`).
 
 ```kr
@@ -52,7 +52,7 @@ program starts execution at `fn main()` (unless you pass `--freestanding`).
    Can span multiple lines. */
 
 fn main() {
-    println("Hello, KernRift!")
+    println("Hello, MLRift!")
     exit(0)
 }
 ```
@@ -620,7 +620,7 @@ inlined — there is no runtime storage.
 
 ## 11. Pointer operations
 
-KernRift has no dedicated pointer type. Addresses are just `u64` values. To
+MLRift has no dedicated pointer type. Addresses are just `u64` values. To
 read or write memory at an address, use the pointer built-ins:
 
 ### The easy way
@@ -793,7 +793,7 @@ For anything not in the built-in table, use the raw hex form.
 
 Any `asm(...)` or `asm { ... }` may be followed by `in(...)`, `out(...)`,
 and/or `clobbers(...)` clauses that describe how registers flow between
-the block and KernRift's local variables.
+the block and MLRift's local variables.
 
 ```kr
 import "std/fmt.mlr"
@@ -829,10 +829,10 @@ fn cpuid_signature() -> u64 {
 ```
 
 **Clause semantics**:
-- `in(<var> -> <reg>, ...)` — before the block runs, KernRift emits a
+- `in(<var> -> <reg>, ...)` — before the block runs, MLRift emits a
   `mov <reg>, <local_slot>` for each pair. Inputs are load-only; the
   named variable is not updated after the block.
-- `out(<reg> -> <var>, ...)` — after the block runs, KernRift emits a
+- `out(<reg> -> <var>, ...)` — after the block runs, MLRift emits a
   `mov <local_slot>, <reg>` for each pair. Outputs are store-only.
 - `clobbers(<reg>, ...)` — accepted syntactically but currently
   **advisory**. You still must list every register your block writes
@@ -855,7 +855,7 @@ fn cpuid_signature() -> u64 {
 - Only integer GPRs are accepted; no SSE/NEON register constraints.
 - No memory-operand constraints (Rust's `in("rax") [ptr]` — not yet).
 - Pinned-parameter inputs (rbx/r12 on x86_64, picked by the compiler
-  for parameter slots 0 and 1) are handled correctly — KernRift
+  for parameter slots 0 and 1) are handled correctly — MLRift
   emits a reg-reg move instead of a stack reload so pinning stays
   transparent.
 
@@ -863,7 +863,7 @@ fn cpuid_signature() -> u64 {
 
 ## 15. Floating-point types
 
-KernRift supports IEEE 754 floating-point types: `f32` (single, 32-bit),
+MLRift supports IEEE 754 floating-point types: `f32` (single, 32-bit),
 `f64` (double, 64-bit), and `f16` (half, 16-bit, storage-only — no
 arithmetic, use `f16_to_f32` / `f32_to_f16` for conversion).
 
@@ -969,7 +969,7 @@ fn lerp(f64 a, f64 b, f64 t) -> f64 {
 import "std/alloc.mlr"
 ```
 
-KernRift ships three allocators in the standard library. All are backed
+MLRift ships three allocators in the standard library. All are backed
 by `mmap`/`VirtualAlloc` with no libc dependency.
 
 ### Low-level: `alloc` / `dealloc`
@@ -1073,7 +1073,7 @@ Import paths are resolved:
 
 1. Relative to the importing file's directory
 2. Then in the standard library location: `~/.local/share/kernrift/`
-   (or `%LOCALAPPDATA%\KernRift\share\` on Windows)
+   (or `%LOCALAPPDATA%\MLRift\share\` on Windows)
 
 Circular imports are detected and rejected. Each file is compiled at most
 once regardless of how many files import it.
@@ -1268,7 +1268,7 @@ The compiler omits the epilogue.
 
 ### `@packed`
 
-Accepted on struct declarations. KernRift structs are *already* packed
+Accepted on struct declarations. MLRift structs are *already* packed
 (no alignment padding), so this annotation is currently a no-op that
 documents intent.
 
@@ -1293,11 +1293,11 @@ Parses and records a linker section name. Used with `--emit=obj` output.
 ## 20. Compiler CLI
 
 ```sh
-krc <file.mlr>                        # compile to <stem>.mlrbo (fat binary, all 8 slices)
-krc <file.mlr> -o out                 # specify output name
-krc <file.mlr> --arch=x86_64 -o out   # single-arch native ELF
-krc <file.mlr> --arch=arm64 -o out    # single-arch ARM64 ELF
-krc <file.mlr> --targets=linux-x64,macos-arm64 -o out.mlrbo   # custom fat subset (v2.8.x)
+mlrc <file.mlr>                        # compile to <stem>.mlrbo (fat binary, all 8 slices)
+mlrc <file.mlr> -o out                 # specify output name
+mlrc <file.mlr> --arch=x86_64 -o out   # single-arch native ELF
+mlrc <file.mlr> --arch=arm64 -o out    # single-arch ARM64 ELF
+mlrc <file.mlr> --targets=linux-x64,macos-arm64 -o out.mlrbo   # custom fat subset (v2.8.x)
 
 # Emit format (aliased since v2.8.4):
 #   linux / linux-x86_64 / linux-arm64 / elfexe / elf   → Linux ELF
@@ -1306,34 +1306,34 @@ krc <file.mlr> --targets=linux-x64,macos-arm64 -o out.mlrbo   # custom fat subse
 #   android                                             → Android PIE ELF
 #   obj                                                 → ELF relocatable (.o)
 #   asm                                                 → disassembled listing
-krc <file.mlr> --emit=pe -o out.exe
-krc <file.mlr> --emit=macho -o out
-krc <file.mlr> --emit=android -o out
-krc <file.mlr> --arch=x86_64 --emit=android -o out
+mlrc <file.mlr> --emit=pe -o out.exe
+mlrc <file.mlr> --emit=macho -o out
+mlrc <file.mlr> --emit=android -o out
+mlrc <file.mlr> --arch=x86_64 --emit=android -o out
 
 # Codegen backend
-krc <file.mlr> --arch=arm64           # default: IR (SSA + optimizer + regalloc)
-krc --legacy --arch=arm64 <file.mlr>  # legacy direct-walking codegen
-krc --ir <file.mlr>                   # force IR even where the release recipe falls back to legacy (e.g. ARM64 fat slices)
-krc -O0 <file.mlr>                    # disable IR optimizer (useful for debugging miscompiles)
-krc --debug <file.mlr>                # enable runtime div-by-zero + bounds traps
+mlrc <file.mlr> --arch=arm64           # default: IR (SSA + optimizer + regalloc)
+mlrc --legacy --arch=arm64 <file.mlr>  # legacy direct-walking codegen
+mlrc --ir <file.mlr>                   # force IR even where the release recipe falls back to legacy (e.g. ARM64 fat slices)
+mlrc -O0 <file.mlr>                    # disable IR optimizer (useful for debugging miscompiles)
+mlrc --debug <file.mlr>                # enable runtime div-by-zero + bounds traps
 
 # Non-compile modes
-krc --freestanding <file.mlr> -o out  # no main trampoline, no auto-exit
-krc check <file.mlr>                  # run semantic checks only
-krc fmt   <file.mlr>                  # auto-format the file in place
-krc lc <file.mlr>                     # living compiler report (section 21)
-krc lc --fix <file.mlr>               # apply auto-fixes in place
-krc lc --fix --dry-run <file.mlr>     # preview auto-fixes without writing
-krc lc --ci <file.mlr>                # CI gate: exit non-zero if patterns fire
-krc lc --min-fitness=N <file.mlr>     # filter: only patterns with fitness >= N
-krc lc --list-proposals              # print the proposal registry
-krc lc --promote <name>              # promote a proposal to stable
-krc lc --deprecate <name>            # mark a proposal as deprecated
-krc lc --reject <name>               # revert a proposal to experimental
-krc --emit=ir <file.mlr>              # dump the SSA IR for a single function
-krc --version                        # print the compiler version
-krc --help                           # usage info
+mlrc --freestanding <file.mlr> -o out  # no main trampoline, no auto-exit
+mlrc check <file.mlr>                  # run semantic checks only
+mlrc fmt   <file.mlr>                  # auto-format the file in place
+mlrc lc <file.mlr>                     # living compiler report (section 21)
+mlrc lc --fix <file.mlr>               # apply auto-fixes in place
+mlrc lc --fix --dry-run <file.mlr>     # preview auto-fixes without writing
+mlrc lc --ci <file.mlr>                # CI gate: exit non-zero if patterns fire
+mlrc lc --min-fitness=N <file.mlr>     # filter: only patterns with fitness >= N
+mlrc lc --list-proposals              # print the proposal registry
+mlrc lc --promote <name>              # promote a proposal to stable
+mlrc lc --deprecate <name>            # mark a proposal as deprecated
+mlrc lc --reject <name>               # revert a proposal to experimental
+mlrc --emit=ir <file.mlr>              # dump the SSA IR for a single function
+mlrc --version                        # print the compiler version
+mlrc --help                           # usage info
 ```
 
 ### `mlr` runner
@@ -1357,7 +1357,7 @@ fall back to a `/data/local/tmp/mlr-exec` / cwd temp file plus a
 
 ## 21. Living compiler
 
-`krc lc` analyses KernRift source and produces a two-layer report. The
+`mlrc lc` analyses MLRift source and produces a two-layer report. The
 living compiler separates concerns into a **stable semantic core**
 (correctness and structural issues) and an **adaptive surface layer**
 (ergonomic migrations that lower to the same IR). This lets the language
@@ -1366,7 +1366,7 @@ evolve without destroying compatibility.
 ### Basic report
 
 ```sh
-krc lc file.mlr
+mlrc lc file.mlr
 ```
 
 Output has three sections: a telemetry summary, a fitness score
@@ -1376,16 +1376,16 @@ Patterns tagged `(auto-fix available)` can be rewritten mechanically.
 ### CI gating
 
 ```sh
-krc lc --min-fitness=60 file.mlr     # filter: only patterns with fitness >= 60
-krc lc --ci file.mlr                 # exit non-zero if any pattern fires
-krc lc --ci --min-fitness=50 file.mlr  # gate only on patterns >= 50
+mlrc lc --min-fitness=60 file.mlr     # filter: only patterns with fitness >= 60
+mlrc lc --ci file.mlr                 # exit non-zero if any pattern fires
+mlrc lc --ci --min-fitness=50 file.mlr  # gate only on patterns >= 50
 ```
 
 ### Migration engine (auto-fix)
 
 ```sh
-krc lc --fix file.mlr                # rewrite in place
-krc lc --fix --dry-run file.mlr      # preview the rewritten source
+mlrc lc --fix file.mlr                # rewrite in place
+mlrc lc --fix --dry-run file.mlr      # preview the rewritten source
 ```
 
 The migration engine currently handles the `legacy_ptr_ops` pattern:
@@ -1403,7 +1403,7 @@ each tagged with a lifecycle state (`experimental`, `stable`, or
 `deprecated`):
 
 ```sh
-krc lc --list-proposals
+mlrc lc --list-proposals
 ```
 
 Proposals with triggers that match the current file fire inline in the
@@ -1417,13 +1417,13 @@ Each project can override the compiler's baseline proposal states and
 store them in a `.kernrift/proposals` file at the project root:
 
 ```sh
-krc lc --promote <name>     # move a proposal to `stable`
-krc lc --deprecate <name>   # move a proposal to `deprecated`
-krc lc --reject <name>      # revert to `experimental`
+mlrc lc --promote <name>     # move a proposal to `stable`
+mlrc lc --deprecate <name>   # move a proposal to `deprecated`
+mlrc lc --reject <name>      # revert to `experimental`
 ```
 
 The first invocation creates `.kernrift/proposals`. Subsequent runs of
-`krc lc` in that directory automatically load the overrides. The format
+`mlrc lc` in that directory automatically load the overrides. The format
 is one line per proposal:
 
 ```
@@ -1485,7 +1485,7 @@ forever, even as new experimental features enter the language.
 
 ## 23. Freestanding mode
 
-`krc --freestanding` produces a binary suitable for bare-metal:
+`mlrc --freestanding` produces a binary suitable for bare-metal:
 
 - No automatic `exit(0)` at the end of `main`.
 - No OS-specific syscall wrappers injected.
@@ -1495,7 +1495,7 @@ forever, even as new experimental features enter the language.
   entry function.
 
 ```sh
-krc --freestanding --arch=arm64 kernel.mlr -o kernel.elf
+mlrc --freestanding --arch=arm64 kernel.mlr -o kernel.elf
 ```
 
 Use this for kernel entry points, bootloaders, and embedded firmware.
@@ -1544,7 +1544,7 @@ extern fn strlen(u64 s) -> u64
 extern fn write(u64 fd, u64 buf, u64 len) -> u64
 
 fn main() {
-    u64 msg = "hello from KernRift via libc!\n"
+    u64 msg = "hello from MLRift via libc!\n"
     write(1, msg, strlen(msg))
     exit(0)
 }
@@ -1554,15 +1554,15 @@ Compile to a relocatable object and link with the platform toolchain:
 
 ```sh
 # Linux
-krc --emit=obj extern_libc.mlr -o extern_libc.o
+mlrc --emit=obj extern_libc.mlr -o extern_libc.o
 gcc extern_libc.o -o extern_libc -no-pie
 
 # macOS
-krc --target=macos --emit=obj extern_libc.mlr -o extern_libc.o
+mlrc --target=macos --emit=obj extern_libc.mlr -o extern_libc.o
 clang extern_libc.o -o extern_libc
 
 # Windows
-krc --target=windows --emit=obj extern_libc.mlr -o extern_libc.obj
+mlrc --target=windows --emit=obj extern_libc.mlr -o extern_libc.obj
 link extern_libc.obj msvcrt.lib /ENTRY:main /SUBSYSTEM:console
 ```
 
@@ -1620,7 +1620,7 @@ extracts and executes the slice matching the current host at startup.
 
 ## Appendix A. ABI reference
 
-This is a quick reference for anyone reading the code `krc` generates or
+This is a quick reference for anyone reading the code `mlrc` generates or
 linking it against other toolchains. It's the minimum you need to
 reason about register allocation, interoperate with C, or write
 `@naked` functions.
@@ -1633,11 +1633,11 @@ reason about register allocation, interoperate with C, or write
 | macOS   | same (System V)                     | `rax`  | same                            | 16                  |
 | Windows | `rcx rdx r8 r9` (then stack, +32 shadow) | `rax` | `rbx rbp rdi rsi rsp r12..r15 xmm6..xmm15` | 16 |
 
-- KernRift currently allocates only GPRs — no XMM usage in generated
+- MLRift currently allocates only GPRs — no XMM usage in generated
   code, so the caller-saved XMM registers are irrelevant to user code
   but matter when you link against C.
 - On Windows, the first 32 bytes of the stack below `rsp` at call time
-  are a **shadow** area owned by the callee. `krc` allocates it for you.
+  are a **shadow** area owned by the callee. `mlrc` allocates it for you.
 - `@naked` functions get no prologue/epilogue — you're responsible for
   stack alignment if you call into user code.
 
@@ -1652,7 +1652,7 @@ reason about register allocation, interoperate with C, or write
 
 ## Appendix B. Syscall numbers
 
-`krc`'s builtins lower to real kernel syscalls. The table below is the
+`mlrc`'s builtins lower to real kernel syscalls. The table below is the
 number used by each builtin on each supported (OS × arch) target.
 Useful when reading `--emit=asm` output, stepping through with a
 debugger, or writing portable code that uses `syscall_raw`.
@@ -1675,7 +1675,7 @@ debugger, or writing portable code that uses `syscall_raw`.
 
 `syscall_raw(nr, a1, a2, a3, a4, a5, a6)` passes `nr` in `rax` and the
 arguments in `rdi rsi rdx r10 r8 r9` (standard Linux x86_64 ABI). The
-table above covers every `krc` builtin that lowers to a syscall — for
+table above covers every `mlrc` builtin that lowers to a syscall — for
 anything else you're calling directly, get the number from the kernel's
 own table at
 [`arch/x86/entry/syscalls/syscall_64.tbl`](https://github.com/torvalds/linux/blob/master/arch/x86/entry/syscalls/syscall_64.tbl).
@@ -1795,7 +1795,7 @@ x86_64. `extern fn` call sites use relocations
 
 ```sh
 # Linux
-krc --emit=obj prog.mlr -o prog.o
+mlrc --emit=obj prog.mlr -o prog.o
 gcc prog.o -o prog -no-pie
 
 # No more "missing .note.GNU-stack" warning as of v2.6.3 — the compiler

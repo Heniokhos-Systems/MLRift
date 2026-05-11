@@ -1,6 +1,6 @@
-# Getting Started with KernRift
+# Getting Started with MLRift
 
-**KernRift** is a self-hosted systems programming language and compiler
+**MLRift** is a self-hosted systems programming language and compiler
 created by Pantelis Christou. It produces native binaries for Linux,
 Windows, macOS, and Android on x86_64 and ARM64.
 
@@ -12,35 +12,35 @@ first program, and the language features you'll use in day-to-day code.
 ### Linux / macOS
 
 ```bash
-curl -sSf https://raw.githubusercontent.com/Pantelis23/KernRift/main/install.sh | sh
+curl -sSf https://raw.githubusercontent.com/Pantelis23/MLRift/main/install.sh | sh
 ```
 
-Installs `krc` (compiler) and `kr` (runner) to `~/.local/bin/`, and the
+Installs `mlrc` (compiler) and `mlr` (runner) to `~/.local/bin/`, and the
 standard library to `~/.local/share/kernrift/`. Make sure `~/.local/bin`
 is on your `PATH`.
 
 ### Windows
 
 ```powershell
-irm https://raw.githubusercontent.com/Pantelis23/KernRift/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/Pantelis23/MLRift/main/install.ps1 | iex
 ```
 
-Installs to `%LOCALAPPDATA%\KernRift\bin\` and adds it to `PATH`.
+Installs to `%LOCALAPPDATA%\MLRift\bin\` and adds it to `PATH`.
 
 ### Verify
 
 ```sh
-krc --version
-kr --version
+mlrc --version
+mlr --version
 ```
 
 ## Your first program
 
 Save this as `hello.mlr`:
 
-```kr
+```mlr
 fn main() {
-    println("Hello, KernRift!")
+    println("Hello, MLRift!")
     exit(0)
 }
 ```
@@ -48,7 +48,7 @@ fn main() {
 Compile and run:
 
 ```sh
-krc hello.mlr --arch=x86_64 -o hello
+mlrc hello.mlr --arch=x86_64 -o hello
 ./hello
 ```
 
@@ -101,7 +101,7 @@ directly in comparisons: `if c == 'a' { ... }`).
 
 **Printing**:
 
-```kr
+```mlr
 println("hello")           // string literal
 println(42)                // integer (decimal)
 println(x)                 // variable (decimal)
@@ -132,7 +132,7 @@ program with `exit(code)`; every example in this guide ends with `exit(0)`.
 
 ## Language basics
 
-```kr
+```mlr
 // Comments — line and /* block */
 
 // Variables: type precedes the name
@@ -189,7 +189,7 @@ enum Color {
 
 ### Printing output
 
-```kr
+```mlr
 println("a literal string")   // works
 println(42)                   // formats as decimal
 println(variable)             // formats as decimal
@@ -207,10 +207,10 @@ string that lives in a variable (e.g. the result of `int_to_str`), use
 
 ### Pointers made easy
 
-KernRift has no dedicated pointer type — addresses are just `u64` values.
+MLRift has no dedicated pointer type — addresses are just `u64` values.
 Use the built-in load/store functions:
 
-```kr
+```mlr
 u64 buf = alloc(32)
 
 store64(buf + 0, 0x1122334455667788)
@@ -230,7 +230,7 @@ memory barrier (`mfence` on x86_64, `DSB SY` on ARM64).
 
 ### Arrays
 
-```kr
+```mlr
 // Local byte buffer
 u8[256] buf
 buf[0] = 0xAA
@@ -249,7 +249,7 @@ fn main() {
 
 Fixed arrays of structs work the same way:
 
-```kr
+```mlr
 struct Point { u64 x; u64 y }
 
 fn main() {
@@ -266,7 +266,7 @@ fn main() {
 For functions that take a buffer, use the slice syntax. Inside the
 function, `data.len` reads the length and `data` is a plain pointer:
 
-```kr
+```mlr
 fn sum_bytes([u8] data) -> u64 {
     u64 total = 0
     u64 i = 0
@@ -292,7 +292,7 @@ fn main() {
 
 ### Imports
 
-```kr
+```mlr
 import "std/io.mlr"
 import "std/string.mlr"
 import "utils.mlr"
@@ -305,7 +305,7 @@ Paths are resolved relative to the importing file, then under
 
 A file can pin its required language profile on the first line:
 
-```kr
+```mlr
 #lang stable
 
 fn main() { exit(0) }
@@ -321,15 +321,15 @@ won't sneak in behind your back, even as the language evolves. See the
 
 | Tool | What it does |
 |------|--------------|
-| `krc <file.mlr>` | Compile a source file (to a fat binary by default). |
-| `krc --arch=x86_64 <file.mlr>` | Compile for a single architecture — native ELF. |
-| `krc --emit=asm <file.mlr>` | Emit a disassembled listing with function labels. |
-| `krc check <file.mlr>` | Run semantic analysis only. |
-| `krc fmt <file.mlr>` | Auto-format the file in place. |
-| `krc lc <file.mlr>` | Living compiler report: fitness score, pattern detection, proposal triggers. |
-| `krc lc --fix <file.mlr>` | Apply auto-fixes in place (e.g. `unsafe{}` pointer ops → `load/store` builtins). |
-| `krc lc --fix --dry-run <file.mlr>` | Preview auto-fixes without writing. |
-| `krc lc --list-proposals` | Print the proposal registry with lifecycle states. |
+| `mlrc <file.mlr>` | Compile a source file (to a fat binary by default). |
+| `mlrc --arch=x86_64 <file.mlr>` | Compile for a single architecture — native ELF. |
+| `mlrc --emit=asm <file.mlr>` | Emit a disassembled listing with function labels. |
+| `mlrc check <file.mlr>` | Run semantic analysis only. |
+| `mlrc fmt <file.mlr>` | Auto-format the file in place. |
+| `mlrc lc <file.mlr>` | Living compiler report: fitness score, pattern detection, proposal triggers. |
+| `mlrc lc --fix <file.mlr>` | Apply auto-fixes in place (e.g. `unsafe{}` pointer ops → `load/store` builtins). |
+| `mlrc lc --fix --dry-run <file.mlr>` | Preview auto-fixes without writing. |
+| `mlrc lc --list-proposals` | Print the proposal registry with lifecycle states. |
 | `mlr <file.mlrbo>` | Run a fat binary on the current platform. |
 
 ## Platforms
@@ -347,10 +347,10 @@ won't sneak in behind your back, even as the language evolves. See the
 
 ## Standard library
 
-KernRift ships with a standard library in `std/`. Import any module with
+MLRift ships with a standard library in `std/`. Import any module with
 `import "std/module.mlr"`. Highlights:
 
-```kr
+```mlr
 import "std/string.mlr"
 import "std/io.mlr"
 import "std/math.mlr"
@@ -423,11 +423,11 @@ directory. Start with:
 
 ### VS Code
 
-Install the **KernRift** extension from the VS Code Marketplace. It
+Install the **MLRift** extension from the VS Code Marketplace. It
 provides:
 
 - Syntax highlighting
-- LSP diagnostics (via `krc check`)
+- LSP diagnostics (via `mlrc check`)
 - Completions, hover docs, and go-to-definition
 
 The extension activates automatically for `.mlr` files.

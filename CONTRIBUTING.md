@@ -1,8 +1,8 @@
 # Contributing to MLRift
 
 MLRift is a systems language for machine learning and artificial biology, built
-on top of KernRift. The compiler's own source is written in KernRift (`.mlr`
-files in `src/`), reuses KernRift's backend, and extends its IR with
+on top of MLRift. The compiler's own source is written in MLRift (`.mlr`
+files in `src/`), reuses MLRift's backend, and extends its IR with
 ML-specific primitives. MLRift user programs (when the frontend lands) will
 use the `.mlr` extension.
 
@@ -32,7 +32,7 @@ make install     # installs to ~/.local/bin/mlrc
 
 ## Source Structure
 
-All compiler source is in `src/` (written in KernRift):
+All compiler source is in `src/` (written in MLRift):
 
 | File | Purpose |
 |------|---------|
@@ -48,12 +48,12 @@ All compiler source is in `src/` (written in KernRift):
 | `runtime.mlr`, `living.mlr`, `formatter.mlr` | Supporting infrastructure |
 | `main.mlr` | CLI and compilation driver |
 
-Standard library modules in `std/` are inherited from KernRift.
+Standard library modules in `std/` are inherited from MLRift.
 
 ## Guidelines
 
 - The compiler must always self-compile to a fixed point (`make bootstrap`)
 - Run `make test` before submitting changes
 - No external dependencies — the compiler is fully self-contained
-- When porting bug fixes from upstream KernRift, reference the KernRift
+- When porting bug fixes from upstream MLRift, reference the MLRift
   commit hash in the commit message so the lineage stays traceable

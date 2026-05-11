@@ -1,6 +1,6 @@
-# KernRift Formal Grammar
+# MLRift Formal Grammar
 
-EBNF grammar for the KernRift language as implemented by `src/parser.mlr` and
+EBNF grammar for the MLRift language as implemented by `src/parser.mlr` and
 `src/lexer.mlr`. The parser is a hand-written recursive-descent parser with
 Pratt precedence for expressions. Anywhere this document and the parser
 disagree, the parser is authoritative — file an issue.

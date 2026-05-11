@@ -1,6 +1,6 @@
 # IR Opcode Reference
 
-KernRift's intermediate representation is a flat SSA form produced by
+MLRift's intermediate representation is a flat SSA form produced by
 `src/ir.mlr` (AST → IR lowering) and consumed by `src/ir.mlr` (x86_64 emitter)
 and `src/ir_aarch64.mlr` (AArch64 emitter). Each instruction is a 32-byte
 record with fields `{opcode, dest, src1, src2, imm, bb}`. Virtual
@@ -308,7 +308,7 @@ ADD xN, sp, xN ; LDR` when the offset exceeds the imm12-scaled limit
 - **R1**: the IR ARM64 backend mis-compiles `compile_fat` when the
   resulting binary runs natively on ARM64. Happens under `-O0` too, so
   it's in codegen/regalloc, not the optimizer. Workaround in place: all
-  shipped `krc-*-arm64` binaries use `--legacy` codegen.
+  shipped `mlrc-*-arm64` binaries use `--legacy` codegen.
 - **R2**: IR x86_64 output is 10–34 % larger than legacy. Likely cause:
   extra register-move inserts at graph-coloring boundaries and no
   peephole after emission.

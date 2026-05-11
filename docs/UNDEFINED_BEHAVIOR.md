@@ -1,7 +1,7 @@
-# KernRift — Defined vs Undefined Behavior
+# MLRift — Defined vs Undefined Behavior
 
 This table lists every operation whose semantics a systems programmer might
-reasonably want to rely on, and says whether KernRift gives it a defined
+reasonably want to rely on, and says whether MLRift gives it a defined
 meaning, leaves it unspecified, or treats it as undefined.
 
 - **Defined** — the compiler guarantees this behavior across all supported
@@ -84,7 +84,7 @@ reasoning for anything non-obvious.
 | Missing `return` from a non-void function | Unspecified | The caller reads whatever register the ABI uses for the return value (usually garbage). |
 | Calling a `@noreturn` function that returns | **Undefined** | Caller's frame is not restored. |
 | Reaching `exit(code)`                   | Defined  | `code` is masked to 8 bits by the OS. |
-| Infinite loop with no I/O               | Defined  | Not optimized away — KernRift has no "infinite loop without side-effects" UB rule. |
+| Infinite loop with no I/O               | Defined  | Not optimized away — MLRift has no "infinite loop without side-effects" UB rule. |
 
 ## Types
 

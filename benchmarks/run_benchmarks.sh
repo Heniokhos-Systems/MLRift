@@ -1,116 +1,148 @@
 #!/bin/bash
-# KernRift vs C vs Rust Benchmark Suite
-set -e
+# MLRift vs C vs Rust benchmark suite.
+#
+# Auto-detects host arch; runs whichever of {mlrc, gcc, rustc} is on PATH.
+# Missing toolchains are reported as "N/A" rather than failing.
+#
+# Env knobs:
+#   MLRC=<path>       compiler binary (default: ../build/mlrc, then `mlrc`)
+#   MLRC_ARCH=<flag>  override `--arch=...` (default: host arch)
+#   RESULTS=<path>    output md file (default: results.md beside this script)
+#   PLATFORM=<label>  string for the result header (e.g. "Pi 400 / aarch64")
+
+set -u
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
-KRC="${KRC:-$DIR/../build/krc2}"
-RESULTS="$DIR/results.md"
+MLRC="${MLRC:-$DIR/../build/mlrc}"
+[ -x "$MLRC" ] || MLRC="$(command -v mlrc 2>/dev/null || true)"
+RESULTS="${RESULTS:-$DIR/results.md}"
 
-echo "=== KernRift Benchmark Suite ===" | tee "$RESULTS"
-echo "Date: $(date -u)" | tee -a "$RESULTS"
-echo "CPU: $(lscpu | grep 'Model name' | sed 's/.*: *//')" | tee -a "$RESULTS"
-echo "" | tee -a "$RESULTS"
+host_arch="$(uname -m)"
+case "$host_arch" in
+    x86_64|amd64)  default_mlrc_arch="--arch=x86_64" ;;
+    aarch64|arm64) default_mlrc_arch="--arch=arm64" ;;
+    *)             default_mlrc_arch="" ;;
+esac
+MLRC_ARCH="${MLRC_ARCH:-$default_mlrc_arch}"
 
-# Time a command, print result in ms
-bench() {
-    local label="$1"
-    shift
-    # Run 3 times, take median
-    local times=()
-    for run in 1 2 3; do
-        local start=$(date +%s%N)
-        "$@" >/dev/null 2>&1 || true
-        local end=$(date +%s%N)
-        local ms=$(( (end - start) / 1000000 ))
-        times+=($ms)
+HAVE_MLRC=0; [ -x "$MLRC" ] && HAVE_MLRC=1
+HAVE_GCC=0;  command -v gcc   > /dev/null 2>&1 && HAVE_GCC=1
+HAVE_RUSTC=0;command -v rustc > /dev/null 2>&1 && HAVE_RUSTC=1
+
+PLATFORM="${PLATFORM:-$(uname -s) / $host_arch}"
+
+cpu_model=""
+if [ -r /proc/cpuinfo ]; then
+    cpu_model="$(grep -m1 'model name' /proc/cpuinfo | sed 's/.*: //')"
+    [ -z "$cpu_model" ] && cpu_model="$(grep -m1 'Hardware' /proc/cpuinfo | sed 's/.*: //')"
+fi
+[ -z "$cpu_model" ] && cpu_model="$(uname -p 2>/dev/null || echo unknown)"
+
+{
+    echo "# MLRift benchmark — $PLATFORM"
+    echo
+    echo "**Date:** $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+    echo "**Host:** $cpu_model"
+    echo "**Kernel:** $(uname -srm)"
+    echo "**Toolchains:** mlrc=$([ "$HAVE_MLRC" = 1 ] && echo yes || echo no), gcc=$([ "$HAVE_GCC" = 1 ] && echo yes || echo no), rustc=$([ "$HAVE_RUSTC" = 1 ] && echo yes || echo no)"
+    echo "**mlrc flags:** \`$MLRC_ARCH\`"
+    echo
+} > "$RESULTS"
+
+if [ "$HAVE_MLRC" != 1 ]; then
+    echo "ERROR: mlrc not found (MLRC=$MLRC, PATH miss)" >&2
+    exit 2
+fi
+
+# Median of 3 runs in milliseconds. Echoes the median to stdout.
+median3_ms() {
+    local t0 t1 t2 a b c m
+    for i in 0 1 2; do
+        local start end
+        start=$(date +%s%N)
+        "$@" > /dev/null 2>&1 || true
+        end=$(date +%s%N)
+        eval "t$i=$(( (end - start) / 1000000 ))"
     done
-    # Sort and take median
-    IFS=$'\n' sorted=($(sort -n <<<"${times[*]}")); unset IFS
-    echo "$label: ${sorted[1]}ms (runs: ${times[0]}, ${times[1]}, ${times[2]})"
+    a=$t0; b=$t1; c=$t2
+    # Median of 3 without external sort
+    if   [ "$a" -le "$b" ] && [ "$a" -le "$c" ]; then m=$(( b<=c ? b : c ))
+    elif [ "$b" -le "$a" ] && [ "$b" -le "$c" ]; then m=$(( a<=c ? a : c ))
+    else                                              m=$(( a<=b ? a : b ))
+    fi
+    echo "$m"
 }
 
-compile_bench() {
+# Compile-time of one command (single run, ms).
+compile_ms() {
+    local start end
+    start=$(date +%s%N)
+    "$@" > /dev/null 2>&1
+    local rc=$?
+    end=$(date +%s%N)
+    if [ "$rc" -ne 0 ]; then echo "FAIL"; else echo $(( (end - start) / 1000000 )); fi
+}
+
+bench_one() {
     local name="$1"
-    echo "--- $name ---" | tee -a "$RESULTS"
 
-    # Compile KernRift
-    echo "  Compiling KernRift..."
-    local start=$(date +%s%N)
-    $KRC --arch=x86_64 "$DIR/$name.kr" -o "$DIR/$name.krc.bin" 2>/dev/null
-    local end=$(date +%s%N)
-    local kr_compile_ms=$(( (end - start) / 1000000 ))
-    chmod +x "$DIR/$name.krc.bin"
+    local mlrc_compile="N/A" gcc_O0_compile="N/A" gcc_O2_compile="N/A" rs_dbg_compile="N/A" rs_rel_compile="N/A"
+    local mlrc_size="N/A"    gcc_O0_size="N/A"    gcc_O2_size="N/A"    rs_dbg_size="N/A"    rs_rel_size="N/A"
+    local mlrc_run="N/A"     gcc_O0_run="N/A"     gcc_O2_run="N/A"     rs_dbg_run="N/A"     rs_rel_run="N/A"
 
-    # Compile C (-O0 for fair comparison, -O2 for optimized)
-    local start=$(date +%s%N)
-    gcc -O0 -o "$DIR/$name.c.O0.bin" "$DIR/$name.c" 2>/dev/null
-    local end=$(date +%s%N)
-    local c_O0_compile_ms=$(( (end - start) / 1000000 ))
+    local mlr_src="$DIR/$name.mlr"
+    local c_src="$DIR/$name.c"
+    local rs_src="$DIR/$name.rs"
 
-    local start=$(date +%s%N)
-    gcc -O2 -o "$DIR/$name.c.O2.bin" "$DIR/$name.c" 2>/dev/null
-    local end=$(date +%s%N)
-    local c_O2_compile_ms=$(( (end - start) / 1000000 ))
+    local mlr_bin="$DIR/$name.mlrc.bin"
+    local c0_bin="$DIR/$name.c.O0.bin"
+    local c2_bin="$DIR/$name.c.O2.bin"
+    local rd_bin="$DIR/$name.rs.dbg.bin"
+    local rr_bin="$DIR/$name.rs.rel.bin"
 
-    # Compile Rust (debug and release)
-    local start=$(date +%s%N)
-    rustc -o "$DIR/$name.rs.dbg.bin" "$DIR/$name.rs" 2>/dev/null
-    local end=$(date +%s%N)
-    local rs_dbg_compile_ms=$(( (end - start) / 1000000 ))
+    if [ -f "$mlr_src" ]; then
+        mlrc_compile=$(compile_ms $MLRC $MLRC_ARCH "$mlr_src" -o "$mlr_bin")
+        [ -f "$mlr_bin" ] && chmod +x "$mlr_bin" 2>/dev/null
+        [ -f "$mlr_bin" ] && mlrc_size=$(stat -c%s "$mlr_bin" 2>/dev/null || wc -c < "$mlr_bin")
+        [ -x "$mlr_bin" ] && mlrc_run="$(median3_ms "$mlr_bin")"
+    fi
 
-    local start=$(date +%s%N)
-    rustc -C opt-level=2 -o "$DIR/$name.rs.rel.bin" "$DIR/$name.rs" 2>/dev/null
-    local end=$(date +%s%N)
-    local rs_rel_compile_ms=$(( (end - start) / 1000000 ))
+    if [ "$HAVE_GCC" = 1 ] && [ -f "$c_src" ]; then
+        gcc_O0_compile=$(compile_ms gcc -O0 -o "$c0_bin" "$c_src")
+        gcc_O2_compile=$(compile_ms gcc -O2 -o "$c2_bin" "$c_src")
+        [ -f "$c0_bin" ] && gcc_O0_size=$(stat -c%s "$c0_bin")
+        [ -f "$c2_bin" ] && gcc_O2_size=$(stat -c%s "$c2_bin")
+        [ -x "$c0_bin" ] && gcc_O0_run="$(median3_ms "$c0_bin")"
+        [ -x "$c2_bin" ] && gcc_O2_run="$(median3_ms "$c2_bin")"
+    fi
 
-    # Binary sizes
-    local kr_size=$(stat -c%s "$DIR/$name.krc.bin" 2>/dev/null || echo 0)
-    local c_O0_size=$(stat -c%s "$DIR/$name.c.O0.bin" 2>/dev/null || echo 0)
-    local c_O2_size=$(stat -c%s "$DIR/$name.c.O2.bin" 2>/dev/null || echo 0)
-    local rs_dbg_size=$(stat -c%s "$DIR/$name.rs.dbg.bin" 2>/dev/null || echo 0)
-    local rs_rel_size=$(stat -c%s "$DIR/$name.rs.rel.bin" 2>/dev/null || echo 0)
+    if [ "$HAVE_RUSTC" = 1 ] && [ -f "$rs_src" ]; then
+        rs_dbg_compile=$(compile_ms rustc -o "$rd_bin" "$rs_src")
+        rs_rel_compile=$(compile_ms rustc -C opt-level=2 -o "$rr_bin" "$rs_src")
+        [ -f "$rd_bin" ] && rs_dbg_size=$(stat -c%s "$rd_bin")
+        [ -f "$rr_bin" ] && rs_rel_size=$(stat -c%s "$rr_bin")
+        [ -x "$rd_bin" ] && rs_dbg_run="$(median3_ms "$rd_bin")"
+        [ -x "$rr_bin" ] && rs_rel_run="$(median3_ms "$rr_bin")"
+    fi
 
-    echo "" | tee -a "$RESULTS"
-    echo "### $name" | tee -a "$RESULTS"
-    echo "" | tee -a "$RESULTS"
-    echo "**Compile time:**" | tee -a "$RESULTS"
-    echo "| Compiler | Time |" | tee -a "$RESULTS"
-    echo "|----------|------|" | tee -a "$RESULTS"
-    echo "| krc (self-hosted) | ${kr_compile_ms}ms |" | tee -a "$RESULTS"
-    echo "| gcc -O0 | ${c_O0_compile_ms}ms |" | tee -a "$RESULTS"
-    echo "| gcc -O2 | ${c_O2_compile_ms}ms |" | tee -a "$RESULTS"
-    echo "| rustc (debug) | ${rs_dbg_compile_ms}ms |" | tee -a "$RESULTS"
-    echo "| rustc -O2 | ${rs_rel_compile_ms}ms |" | tee -a "$RESULTS"
-    echo "" | tee -a "$RESULTS"
+    {
+        echo "## $name"
+        echo
+        echo "| Compiler | Compile (ms) | Binary (B) | Runtime median-of-3 (ms) |"
+        echo "|---|---|---|---|"
+        echo "| mlrc (self-hosted) | $mlrc_compile | $mlrc_size | $mlrc_run |"
+        echo "| gcc -O0 | $gcc_O0_compile | $gcc_O0_size | $gcc_O0_run |"
+        echo "| gcc -O2 | $gcc_O2_compile | $gcc_O2_size | $gcc_O2_run |"
+        echo "| rustc (debug) | $rs_dbg_compile | $rs_dbg_size | $rs_dbg_run |"
+        echo "| rustc -O opt2 | $rs_rel_compile | $rs_rel_size | $rs_rel_run |"
+        echo
+    } | tee -a "$RESULTS"
 
-    echo "**Binary size:**" | tee -a "$RESULTS"
-    echo "| Binary | Size |" | tee -a "$RESULTS"
-    echo "|--------|------|" | tee -a "$RESULTS"
-    echo "| krc | ${kr_size} B |" | tee -a "$RESULTS"
-    echo "| gcc -O0 | ${c_O0_size} B |" | tee -a "$RESULTS"
-    echo "| gcc -O2 | ${c_O2_size} B |" | tee -a "$RESULTS"
-    echo "| rustc debug | ${rs_dbg_size} B |" | tee -a "$RESULTS"
-    echo "| rustc -O2 | ${rs_rel_size} B |" | tee -a "$RESULTS"
-    echo "" | tee -a "$RESULTS"
-
-    echo "**Runtime (median of 3):**" | tee -a "$RESULTS"
-    echo "| Binary | Time |" | tee -a "$RESULTS"
-    echo "|--------|------|" | tee -a "$RESULTS"
-    bench "| krc" "$DIR/$name.krc.bin" | tee -a "$RESULTS"
-    bench "| gcc -O0" "$DIR/$name.c.O0.bin" | tee -a "$RESULTS"
-    bench "| gcc -O2" "$DIR/$name.c.O2.bin" | tee -a "$RESULTS"
-    bench "| rustc debug" "$DIR/$name.rs.dbg.bin" | tee -a "$RESULTS"
-    bench "| rustc -O2" "$DIR/$name.rs.rel.bin" | tee -a "$RESULTS"
-    echo "" | tee -a "$RESULTS"
+    rm -f "$mlr_bin" "$c0_bin" "$c2_bin" "$rd_bin" "$rr_bin"
 }
 
-compile_bench "fib"
-compile_bench "sort"
-compile_bench "sieve"
-compile_bench "matmul"
+for prog in fib sort sieve matmul; do
+    bench_one "$prog"
+done
 
-# Cleanup binaries
-rm -f "$DIR"/*.bin
-
-echo "=== Done ===" | tee -a "$RESULTS"
-echo "Results saved to $RESULTS"
+echo "Done. Results: $RESULTS"
