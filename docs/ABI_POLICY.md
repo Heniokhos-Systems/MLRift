@@ -125,7 +125,7 @@ for target B are fully ABI-compatible *only* when:
 3. Both were built by the same `kernriftc` version, OR versions that share
    the same MINOR (2.8.x ↔ 2.8.y).
 
-Fat binaries (KrboFat v2) work across targets by shipping one slice per
+Fat binaries (MlrboFat v2) work across targets by shipping one slice per
 target; they do not attempt to unify the ABI.
 
 ## Breaking-change process

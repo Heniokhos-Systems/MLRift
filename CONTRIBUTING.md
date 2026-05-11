@@ -44,7 +44,7 @@ All compiler source is in `src/` (written in KernRift):
 | `ir_aarch64.mlr` | AArch64 IR codegen |
 | `codegen.mlr` | x86_64 legacy code generation |
 | `codegen_aarch64.mlr` | AArch64 legacy code generation |
-| `format_*.mlr` | Output formats (ELF, Mach-O, PE, AR, KRBO) |
+| `format_*.mlr` | Output formats (ELF, Mach-O, PE, AR, MLRBO) |
 | `runtime.mlr`, `living.mlr`, `formatter.mlr` | Supporting infrastructure |
 | `main.mlr` | CLI and compilation driver |
 

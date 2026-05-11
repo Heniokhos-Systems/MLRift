@@ -52,11 +52,11 @@ krc hello.mlr --arch=x86_64 -o hello
 ./hello
 ```
 
-Or build a cross-platform fat binary and run it through `kr`:
+Or build a cross-platform fat binary and run it through `mlr`:
 
 ```sh
-krc hello.mlr -o hello.krbo
-kr hello.krbo
+mlrc hello.mlr -o hello.mlrbo
+mlr hello.mlrbo
 ```
 
 ## Cheatsheet (one page)
@@ -330,7 +330,7 @@ won't sneak in behind your back, even as the language evolves. See the
 | `krc lc --fix <file.mlr>` | Apply auto-fixes in place (e.g. `unsafe{}` pointer ops → `load/store` builtins). |
 | `krc lc --fix --dry-run <file.mlr>` | Preview auto-fixes without writing. |
 | `krc lc --list-proposals` | Print the proposal registry with lifecycle states. |
-| `kr <file.krbo>` | Run a fat binary on the current platform. |
+| `mlr <file.mlrbo>` | Run a fat binary on the current platform. |
 
 ## Platforms
 

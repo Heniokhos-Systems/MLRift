@@ -1293,11 +1293,11 @@ Parses and records a linker section name. Used with `--emit=obj` output.
 ## 20. Compiler CLI
 
 ```sh
-krc <file.mlr>                        # compile to <stem>.krbo (fat binary, all 8 slices)
+krc <file.mlr>                        # compile to <stem>.mlrbo (fat binary, all 8 slices)
 krc <file.mlr> -o out                 # specify output name
 krc <file.mlr> --arch=x86_64 -o out   # single-arch native ELF
 krc <file.mlr> --arch=arm64 -o out    # single-arch ARM64 ELF
-krc <file.mlr> --targets=linux-x64,macos-arm64 -o out.krbo   # custom fat subset (v2.8.x)
+krc <file.mlr> --targets=linux-x64,macos-arm64 -o out.mlrbo   # custom fat subset (v2.8.x)
 
 # Emit format (aliased since v2.8.4):
 #   linux / linux-x86_64 / linux-arm64 / elfexe / elf   → Linux ELF
@@ -1336,21 +1336,21 @@ krc --version                        # print the compiler version
 krc --help                           # usage info
 ```
 
-### `kr` runner
+### `mlr` runner
 
 ```sh
-kr program.krbo                      # run a fat binary on any platform
-kr program.krbo arg1 arg2            # forward args to the child
-kr --version
-kr --help
+mlr program.mlrbo                    # run a fat binary on any platform
+mlr program.mlrbo arg1 arg2          # forward args to the child
+mlr --version
+mlr --help
 ```
 
-The `kr` runner auto-detects the host architecture (x86_64 / arm64 / Linux
-/ Windows / macOS / Android), extracts the matching slice from `.krbo`,
+The `mlr` runner auto-detects the host architecture (x86_64 / arm64 / Linux
+/ Windows / macOS / Android), extracts the matching slice from `.mlrbo`,
 BCJ-unfilters the decompressed code, and execves it. On Android (Linux
 ≥ 3.17) it uses `memfd_create` + `execveat(AT_EMPTY_PATH)` to bypass
 SELinux file-exec restrictions without writing to cwd; older kernels
-fall back to a `/data/local/tmp/kr-exec` / cwd temp file plus a
+fall back to a `/data/local/tmp/mlr-exec` / cwd temp file plus a
 `exit(120)` shell-wrapper trampoline.
 
 ---
@@ -1603,7 +1603,7 @@ fn main() {
 
 | Format | Produced by | Use |
 |---|---|---|
-| `.krbo` fat binary | default (no `--arch`) | Cross-platform distribution — `kr` picks the right slice |
+| `.mlrbo` fat binary | default (no `--arch`) | Cross-platform distribution — `mlr` picks the right slice |
 | ELF executable | `--arch=x86_64` / `--arch=arm64` on Linux | Native Linux binary |
 | ELF relocatable | `--emit=obj` | Link into an external object (`.o`) |
 | Mach-O | `--emit=macho` | macOS executable (x86_64 or arm64) |
@@ -1611,9 +1611,9 @@ fn main() {
 | Android PIE ELF | `--emit=android` | Android ARM64 (default) or x86_64 (`--arch=x86_64`) |
 | Assembly listing | `--emit=asm` | Human-readable disassembly with labels |
 
-A `.krbo` fat binary packs up to 8 platform slices (Linux x86_64, Linux
+A `.mlrbo` fat binary packs up to 8 platform slices (Linux x86_64, Linux
 ARM64, Windows x86_64, Windows ARM64, macOS x86_64, macOS ARM64, Android
-ARM64, Android x86_64), each BCJ+LZ4 compressed. The `kr` runner
+ARM64, Android x86_64), each BCJ+LZ4 compressed. The `mlr` runner
 extracts and executes the slice matching the current host at startup.
 
 ---
@@ -1803,15 +1803,15 @@ gcc prog.o -o prog -no-pie
 # stack.
 ```
 
-## Appendix D. `.krbo` fat-binary format (v2)
+## Appendix D. `.mlrbo` fat-binary format (v2)
 
-The runtime format for `.krbo` files — directly parseable without any
-KernRift toolchain.
+The runtime format for `.mlrbo` files — directly parseable without any
+MLRift toolchain.
 
 **Layout**:
 ```
 offset  size  field
-0x00    8     magic:        "KRBOFAT\0"
+0x00    8     magic:        "MLRBOFAT"
 0x08    4     version:      u32 = 2
 0x0C    4     arch_count:   u32 (currently emitted as 8)
 0x10    (arch_count × 48)   arch descriptor table
@@ -1819,7 +1819,7 @@ offset  size  field
 ```
 
 > **Note**: the descriptor reserves `runtime_offset` / `runtime_len`
-> for per-arch kr-runner blobs, but the current emitter writes them
+> for per-arch mlr-runner blobs, but the current emitter writes them
 > as `0` and the runner ignores them. Decoders should treat those
 > fields as informational only.
 
@@ -1868,9 +1868,9 @@ encode+decode remains a perfect round-trip.
 ```python
 import struct, lz4.frame
 
-def parse_krbo(path):
+def parse_mlrbo(path):
     d = open(path, 'rb').read()
-    assert d[:8] == b'KRBOFAT\0'
+    assert d[:8] == b'MLRBOFAT'
     ver, n = struct.unpack_from('<II', d, 8)
     assert ver == 2
     slices = []

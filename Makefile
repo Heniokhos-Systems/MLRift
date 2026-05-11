@@ -28,27 +28,27 @@ build: build/mlrc
 # silently corrupts every extracted slice (entry-point bytes get
 # clobbered, slice bus-errors at startup on the device).
 #
-# `kr` is a shell wrapper (packaging/kr.sh) that catches exit-120 from
-# kr-bin and re-execs the extracted ./kr-exec — needed on Termux/Android
+# `mlr` is a shell wrapper (packaging/mlr.sh) that catches exit-120 from
+# mlr-bin and re-execs the extracted ./mlr-exec — needed on Termux/Android
 # where raw execve from app data dirs is SELinux-denied. Other hosts hit
 # the wrapper's `exit $status` line as a no-op since the runner exec's
 # the slice directly.
-mlr-runner: build/kr build/kr-bin
+mlr-runner: build/mlr build/mlr-bin
 
-build/kr-runner.mlr: src/runner.mlr src/bcj.mlr
+build/mlr-runner.mlr: src/runner.mlr src/bcj.mlr
 	@mkdir -p build
-	cat src/runner.mlr src/bcj.mlr > build/kr-runner.mlr
+	cat src/runner.mlr src/bcj.mlr > build/mlr-runner.mlr
 
-build/kr-bin: build/kr-runner.mlr build/mlrc
-	./build/mlrc --arch=x86_64 build/kr-runner.mlr -o build/kr-bin
-	chmod +x build/kr-bin
-	@echo "Built build/kr-bin (host-native runner binary)"
+build/mlr-bin: build/mlr-runner.mlr build/mlrc
+	./build/mlrc --arch=x86_64 build/mlr-runner.mlr -o build/mlr-bin
+	chmod +x build/mlr-bin
+	@echo "Built build/mlr-bin (host-native runner binary)"
 
-build/kr: packaging/kr.sh
+build/mlr: packaging/mlr.sh
 	@mkdir -p build
-	cp packaging/kr.sh build/kr
-	chmod +x build/kr
-	@echo "Built build/kr (shell wrapper for kr-bin)"
+	cp packaging/mlr.sh build/mlr
+	chmod +x build/mlr
+	@echo "Built build/mlr (shell wrapper for mlr-bin)"
 
 build/mlrc.mlr: $(SRCS)
 	@mkdir -p build

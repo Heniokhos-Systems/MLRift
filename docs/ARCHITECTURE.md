@@ -17,11 +17,11 @@ src/
 ├── format_macho.mlr    macOS Mach-O header emission
 ├── format_pe.mlr       Windows PE/COFF headers + import table
 ├── format_android.mlr  Android ELF quirks (DT_FLAGS_1, soname)
-├── format_archive.mlr  AR archives, KRBO objects, KrboFat v2 (BCJ + LZ-Rift)
+├── format_archive.mlr  AR archives, MLRBO objects, MlrboFat v2 (BCJ + LZ-Rift)
 ├── bcj.mlr             Branch/call/jump filter for better compression
 ├── living.mlr          Pattern detection + fitness scoring
 ├── formatter.mlr       Source-level auto-formatter
-├── runner.mlr          `kr` — fat-binary slice extractor / launcher
+├── runner.mlr          `mlr` — fat-binary slice extractor / launcher
 ├── runtime.mlr         fmt_uint helper
 └── main.mlr            CLI, compile(), compile_fat()
 ```
@@ -54,17 +54,17 @@ Not every target defaults to IR. The release recipe is:
 | `krc-windows-arm64.exe`   | **`--legacy`**   | same |
 | `krc-macos-arm64`         | **`--legacy`**   | same |
 | `krc-android-arm64`       | **`--legacy`**   | same |
-| `kr-*` (runner, all 8)    | default (IR)     | simple program, no compile_fat — IR is fine |
+| `mlr-*` (runner, all 8)   | default (IR)     | simple program, no compile_fat — IR is fine |
 
-Inside `compile_fat` itself (building the 8-slice `.krbo`), every ARM64 slice dispatches to `gen_function_a64` (legacy) regardless of `emit_ir_mode`, so the arm64 slice users pull out of `krc.krbo` is also legacy-built. `--ir` (emit_ir_mode ≥ 2) forces the IR path through those slices for backend testing.
+Inside `compile_fat` itself (building the 8-slice `.mlrbo`), every ARM64 slice dispatches to `gen_function_a64` (legacy) regardless of `emit_ir_mode`, so the arm64 slice users pull out of `mlrc.mlrbo` is also legacy-built. `--ir` (emit_ir_mode ≥ 2) forces the IR path through those slices for backend testing.
 
 User-invoked `krc --arch=arm64 myprog.mlr -o myprog` still defaults to IR — the miscompile is specific to the `compile_fat` function's shape.
 
 ## Android fat-binary runner
 
-`src/runner.mlr` (the `kr` tool) on Android prefers a filesystem-free exec path:
+`src/runner.mlr` (the `mlr` tool) on Android prefers a filesystem-free exec path:
 
-1. `memfd_create("kr", MFD_CLOEXEC)` — anonymous in-kernel fd
+1. `memfd_create("mlr", MFD_CLOEXEC)` — anonymous in-kernel fd
 2. `write(fd, slice, slice_size)` — copy the BCJ-decoded slice into it
 3. `execveat(fd, "", argv, envp, AT_EMPTY_PATH)` — kernel ignores the pathname and execs the fd directly
 
@@ -78,7 +78,7 @@ This bypasses the SELinux file-label transition Termux uses to block execve of u
 - **No external tools**: the compiler writes binaries directly; there is no assembler, linker, or libc in the build graph.
 - **Variable dedup**: same-named variables in different if-branches share a slot.
 - **Static access**: RIP-relative on x86_64, ADRP+ADD / LDR on AArch64.
-- **Fat binary default**: `compile_fat()` runs the IR backend once per target, BCJ-filters the code, LZ-Rift-compresses each slice, and packs all eight into a KrboFat v2 `.krbo`.
+- **Fat binary default**: `compile_fat()` runs the IR backend once per target, BCJ-filters the code, LZ-Rift-compresses each slice, and packs all eight into a MlrboFat v2 `.mlrbo`.
 
 ## Bootstrap
 
