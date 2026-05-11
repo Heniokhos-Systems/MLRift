@@ -1,0 +1,155 @@
+// SDMA-copy stress test (slice 6.8b).
+//
+// Validates slice 6.8's doorbell-mask fix by performing N_ITERS pairs
+// of host-to-vram + vram-to-host SDMA copies in a tight loop. The
+// pre-fix state would hang inside kfd_sdma_copy: timeout draining
+// after enough copies; post-fix should complete N_ITERS=12M (the
+// Noesis PhaseAJ pre-crash budget).
+//
+// Build:
+//   ./build/mlrc --target=amdgpu-native --emit=elfexe \
+//       examples/kfd_sdma_stress.mlr -o /tmp/kfd_sdma_stress
+//
+// Run (Test C — boost ON):
+//   /tmp/kfd_sdma_stress
+//
+// Run (Test D — boost OFF):
+//   MLRIFT_BOOST=0 /tmp/kfd_sdma_stress
+//
+// Optional knobs:
+//   MLRIFT_SDMA_STRESS_ITERS=N    override iteration count (default 12000000)
+//   MLRIFT_SDMA_STRESS_BYTES=N    override copy size (default 6400, Noesis-shaped)
+//
+// We deliberately call hipMemcpyHostToVram / hipMemcpyVramToHost (not the
+// generic hipMemcpy()) because the generic path bypasses SDMA entirely
+// for transfers smaller than 1 MiB — it does direct CPU writes through
+// host-mapped VRAM.  The whole point of this test is to drive the SDMA
+// ring, so we go through the staging-SDMA helpers directly.
+
+import "../std/hip_kfd.mlr"
+import "../std/io.mlr"
+import "../std/fmt.mlr"
+import "../std/time.mlr"
+
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn getenv(uint64 name) -> uint64
+
+// Parse an ASCII unsigned-decimal env value pointed to by `p`.
+// Returns 0 if the string is empty / non-numeric.
+fn parse_env_u64(uint64 p) -> uint64 {
+    if p == 0 { return 0 }
+    uint64 v = 0
+    uint64 i = 0
+    uint8 c = 0
+    unsafe { *((p + i) as uint8) -> c }
+    while c >= 48 && c <= 57 {
+        v = v * 10 + (c - 48)
+        i = i + 1
+        unsafe { *((p + i) as uint8) -> c }
+    }
+    return v
+}
+
+fn putu(uint64 v) { uint64 s = fmt_dec(v); print_str(s); dealloc(s) }
+fn putx(uint64 v) { uint64 s = fmt_hex(v); print_str(s); dealloc(s) }
+
+fn die_with(uint64 msg, uint64 code) {
+    print_str(msg); print_str(" err="); putu(code); print_str("\n")
+    exit(1)
+}
+
+fn main() {
+    uint32 e = hipSetDevice(0)
+    if e != 0 { die_with("hipSetDevice failed", e) }
+
+    // Iteration count (default 12 M, matches PhaseAJ pre-crash budget).
+    uint64 n_iters = 12000000
+    uint64 ev_it = getenv("MLRIFT_SDMA_STRESS_ITERS")
+    uint64 ov_it = parse_env_u64(ev_it)
+    if ov_it > 0 { n_iters = ov_it }
+
+    // Copy size (default 6400 B, matches Noesis per-step drive).
+    uint64 n_bytes = 6400
+    uint64 ev_by = getenv("MLRIFT_SDMA_STRESS_BYTES")
+    uint64 ov_by = parse_env_u64(ev_by)
+    if ov_by > 0 { n_bytes = ov_by }
+
+    print_str("[kfd_sdma_stress] iters="); putu(n_iters)
+    print_str(" bytes="); putu(n_bytes); print_str("\n")
+
+    // Host buffer + recognisable pattern (byte i = i & 0xFF).
+    uint64 h_buf = alloc(n_bytes)
+    uint64 j = 0
+    while j < n_bytes {
+        uint8 b = j & 0xFF
+        unsafe { *((h_buf + j) as uint8) = b }
+        j = j + 1
+    }
+
+    // Device VRAM buffer via the KFD-shim path.
+    uint64 d_slot = alloc(8)
+    uint32 me = hipMalloc(d_slot, n_bytes)
+    if me != 0 { die_with("hipMalloc failed", me) }
+    uint64 d_buf = 0
+    unsafe { *(d_slot as uint64) -> d_buf }
+    dealloc(d_slot)
+
+    // Warm up the lazy init / boost queues BEFORE timing starts.
+    uint32 we = hipMemcpyHostToVram(d_buf, h_buf, n_bytes)
+    if we != 0 { die_with("initial H2D failed", we) }
+    uint32 re = hipMemcpyVramToHost(h_buf, d_buf, n_bytes)
+    if re != 0 { die_with("initial D2H failed", re) }
+
+    // Confirm round-trip preserved byte 0 ('\0') and byte 1 (0x01).
+    uint8 first = 0; unsafe { *(h_buf as uint8) -> first }
+    uint8 second = 0; unsafe { *((h_buf + 1) as uint8) -> second }
+    print_str("[kfd_sdma_stress] warmup ok  h_buf[0]=0x"); putx(first)
+    print_str(" h_buf[1]=0x"); putx(second); print_str("\n")
+
+    print_str("[kfd_sdma_stress] starting tight loop...\n")
+    uint64 t0 = time_now()
+    uint64 last_report = t0
+    uint64 i = 0
+    while i < n_iters {
+        uint32 e1 = hipMemcpyHostToVram(d_buf, h_buf, n_bytes)
+        if e1 != 0 {
+            print_str("[kfd_sdma_stress] H2D failed at iter="); putu(i)
+            print_str(" err="); putu(e1); print_str("\n")
+            exit(1)
+        }
+        uint32 e2 = hipMemcpyVramToHost(h_buf, d_buf, n_bytes)
+        if e2 != 0 {
+            print_str("[kfd_sdma_stress] D2H failed at iter="); putu(i)
+            print_str(" err="); putu(e2); print_str("\n")
+            exit(1)
+        }
+
+        // Report every 131072 iters (~100 k order).
+        if (i & 0x1FFFF) == 0 && i > 0 {
+            uint64 t_now = time_now()
+            uint64 elapsed_ms = (t_now - t0) / 1000000
+            uint64 since_last_ms = (t_now - last_report) / 1000000
+            uint8 b0 = 0; unsafe { *(h_buf as uint8) -> b0 }
+            print_str("[kfd_sdma_stress] iter="); putu(i)
+            print_str(" elapsed_ms="); putu(elapsed_ms)
+            print_str(" delta_ms="); putu(since_last_ms)
+            print_str(" h_buf[0]=0x"); putx(b0); print_str("\n")
+            last_report = t_now
+        }
+
+        i = i + 1
+    }
+
+    uint64 t1 = time_now()
+    uint64 total_ms = (t1 - t0) / 1000000
+    print_str("[kfd_sdma_stress] PASS: "); putu(n_iters)
+    print_str(" iters completed in "); putu(total_ms); print_str(" ms")
+    if total_ms > 0 {
+        print_str(" ("); putu((n_iters * 1000) / total_ms); print_str(" iter/sec)")
+    }
+    print_str("\n")
+
+    hipFree(d_buf)
+    dealloc(h_buf)
+    exit(0)
+}
