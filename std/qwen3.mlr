@@ -1082,6 +1082,98 @@ static u64 qwen3_dump_fd = 0
 
 fn qwen3_set_dump_fd(u64 fd) { qwen3_dump_fd = fd }
 
+// Slice 6.7e — env-gated CPU intermediate dump.  When `MLRIFT_MEGAK_DUMP_LAYER=0`
+// is set, qwen3_forward_layer dumps each phase output (b_x_norm_g, b_qkv_g,
+// b_attn_q_g, b_attn_out_g, b_mid_g, b_mid_norm_g, gu_scratch, out_resid) in
+// the same format as the mega-kernel driver's _dump_buf — head 16, stride256,
+// tail 4, sum/max/min — so they can be diffed side-by-side.
+// One-shot: fires only on the first qwen3_forward_layer call after the env
+// var is observed, then disables itself.
+static u64 qwen3_phase_dump_state = 0   // 0=unchecked, 1=armed, 2=fired, 3=disabled
+
+fn _qwen3_phase_dump_check() -> u64 {
+    if qwen3_phase_dump_state == 0 {
+        u64 ev = getenv("MLRIFT_MEGAK_DUMP_LAYER")
+        if ev != 0 {
+            u8 c = 0; unsafe { *(ev as u8) -> c }
+            if c == 48 {   // '0' = layer 0
+                qwen3_phase_dump_state = 1
+            } else {
+                qwen3_phase_dump_state = 3
+            }
+        } else {
+            qwen3_phase_dump_state = 3
+        }
+    }
+    if qwen3_phase_dump_state == 1 { return 1 }
+    return 0
+}
+
+fn _qwen3_dump_buf(u64 label, u64 ptr, u64 n) {
+    write(2, "  [", 3)
+    u64 ll = str_len(label); write(2, label, ll)
+    write(2, "] n=", 4)
+    u64 ns = fmt_dec(n); u64 nsl = str_len(ns)
+    write(2, ns, nsl); dealloc(ns)
+    write(2, "\n    head:", 10)
+    u64 i = 0
+    u64 head_cnt = 16
+    if n < head_cnt { head_cnt = n }
+    while i < head_cnt {
+        write(2, " ", 1)
+        f32 v = 0.0f; unsafe { *((ptr + i * 4) as f32) -> v }
+        u64 s = fmt_f32(v, 6); u64 sl = str_len(s)
+        write(2, s, sl); dealloc(s)
+        i = i + 1
+    }
+    write(2, "\n    stride256:", 15)
+    u64 sti = 0
+    while sti < n && sti < 16 * 256 {
+        write(2, " ", 1)
+        f32 v = 0.0f; unsafe { *((ptr + sti * 4) as f32) -> v }
+        u64 s = fmt_f32(v, 6); u64 sl = str_len(s)
+        write(2, s, sl); dealloc(s)
+        sti = sti + 256
+    }
+    write(2, "\n    tail:", 10)
+    u64 tail_start = n
+    if n > 4 { tail_start = n - 4 }
+    i = tail_start
+    while i < n {
+        write(2, " ", 1)
+        f32 v = 0.0f; unsafe { *((ptr + i * 4) as f32) -> v }
+        u64 s = fmt_f32(v, 6); u64 sl = str_len(s)
+        write(2, s, sl); dealloc(s)
+        i = i + 1
+    }
+    f64 sum = 0.0
+    f32 vmax = 0.0f
+    f32 vmin = 0.0f
+    u64 first = 1
+    i = 0
+    while i < n {
+        f32 v = 0.0f; unsafe { *((ptr + i * 4) as f32) -> v }
+        sum = sum + f32_to_f64(v)
+        if first == 1 { vmax = v; vmin = v; first = 0 }
+        else {
+            if v > vmax { vmax = v }
+            if v < vmin { vmin = v }
+        }
+        i = i + 1
+    }
+    write(2, "\n    sum=", 9)
+    f32 sum_f32 = f64_to_f32(sum)
+    u64 ss = fmt_f32(sum_f32, 6); u64 ssl = str_len(ss)
+    write(2, ss, ssl); dealloc(ss)
+    write(2, " max=", 5)
+    u64 mxs = fmt_f32(vmax, 6); u64 mxsl = str_len(mxs)
+    write(2, mxs, mxsl); dealloc(mxs)
+    write(2, " min=", 5)
+    u64 mns = fmt_f32(vmin, 6); u64 mnsl = str_len(mns)
+    write(2, mns, mnsl); dealloc(mns)
+    write(2, "\n", 1)
+}
+
 // Internal: emit a labelled "[label] v0 v1 v2 v3 v4\n" line to the dump fd.
 fn qwen3_dump5(u64 label, u64 ptr) {
     if qwen3_dump_fd == 0 { return }
@@ -1115,6 +1207,11 @@ fn qwen3_forward_layer(u64 x_out, u64 x_in,
     u64 q_dim  = QWEN3_Q_DIM
     u64 kv_dim = QWEN3_KV_DIM
     u64 ff     = QWEN3_INTERMEDIATE
+    // Gate the phase dump on pos != 0 (skip prefill of BOS token; fire on
+    // the first decode-step layer-0 call, matching the GPU driver's
+    // "step 0" dump in examples/llama3_1b_gpu_generate.mlr).
+    u64 _dbg_phase = 0
+    if pos != 0 { _dbg_phase = _qwen3_phase_dump_check() }
 
     u64 kv_row_bytes = nkv * hd * 4
     u64 k_row = k_cache_layer + pos * kv_row_bytes
@@ -1128,7 +1225,7 @@ fn qwen3_forward_layer(u64 x_out, u64 x_in,
     u64 p_t0 = time_now()
     qwen3_main_rmsnorm(x_norm, x_in, w.input_norm_w, hidden)
     qwen3_t_input_norm = qwen3_t_input_norm + time_elapsed(p_t0)
-    // qwen3_dump5("x_norm", x_norm)
+    if _dbg_phase != 0 { _qwen3_dump_buf("b_x_norm_g", x_norm, hidden) }
 
     // Q / K / V projections. K and V target the cache slot at `pos` directly;
     // downstream QK-norm and RoPE mutate the cache in place. V is stored raw
@@ -1146,6 +1243,7 @@ fn qwen3_forward_layer(u64 x_out, u64 x_in,
         u64 qkv_dim_local = q_dim + 2 * kv_dim
         u64 qkv_buf = alloc(qkv_dim_local * 4)
         qwen3_main_matmul(qkv_buf, x_norm, w.q_proj_w, 1, qkv_dim_local, hidden, num_workers, 0)
+        if _dbg_phase != 0 { _qwen3_dump_buf("b_qkv_g", qkv_buf, qkv_dim_local) }
         memcpy(q_buf,  qkv_buf,                        q_dim  * 4)
         memcpy(k_row,  qkv_buf + q_dim * 4,            kv_dim * 4)
         memcpy(v_row,  qkv_buf + (q_dim + kv_dim) * 4, kv_dim * 4)
@@ -1231,9 +1329,7 @@ fn qwen3_forward_layer(u64 x_out, u64 x_in,
         qwen3_rope_apply(k_row, qwen3_rope_cos_cache, qwen3_rope_sin_cache, nkv, hd)
     }
     qwen3_t_qknorm_rope = qwen3_t_qknorm_rope + time_elapsed(p_t2)
-    // qwen3_dump5("q_rope", q_buf)
-    // qwen3_dump5("k_rope_cur", k_row)
-    // qwen3_dump5("k_rope_pos0", k_cache_layer)
+    if _dbg_phase != 0 { _qwen3_dump_buf("b_attn_q_g", q_buf, q_dim) }
 
     // Cache-aware attention over positions 0..pos (inclusive). V_cache is
     // already populated at index `pos` by the matmul above.
@@ -1248,7 +1344,7 @@ fn qwen3_forward_layer(u64 x_out, u64 x_in,
     u64 o_buf = alloc(hidden * 4)
     u64 p_t4 = time_now()
     qwen3_main_matmul(o_buf, attn_out, w.o_proj_w, 1, hidden, q_dim, num_workers, 0)
-    // qwen3_dump5("o_out",  o_buf)
+    if _dbg_phase != 0 { _qwen3_dump_buf("b_attn_out_g", o_buf, hidden) }
 
     // Residual add: x = resid + o_buf
     u64 mid = alloc(hidden * 4)
@@ -1261,13 +1357,13 @@ fn qwen3_forward_layer(u64 x_out, u64 x_in,
         i = i + 1
     }
     qwen3_t_oproj_res1 = qwen3_t_oproj_res1 + time_elapsed(p_t4)
+    if _dbg_phase != 0 { _qwen3_dump_buf("b_mid_g", mid, hidden) }
 
-    // qwen3_dump5("mid",    mid)
     u64 p_t5 = time_now()
     u64 mid_norm = alloc(hidden * 4)
     qwen3_main_rmsnorm(mid_norm, mid, w.post_norm_w, hidden)
     qwen3_t_post_norm = qwen3_t_post_norm + time_elapsed(p_t5)
-    // qwen3_dump5("mid_norm", mid_norm)
+    if _dbg_phase != 0 { _qwen3_dump_buf("b_mid_norm_g", mid_norm, hidden) }
 
     // gate/up: same dual-path story as QKV above.
     u64 gate_buf = alloc(ff * 4)
@@ -1289,7 +1385,7 @@ fn qwen3_forward_layer(u64 x_out, u64 x_in,
     u64 p_t7 = time_now()
     qwen3_silu_mul(ff_buf, gate_buf, up_buf, ff)
     qwen3_t_silu = qwen3_t_silu + time_elapsed(p_t7)
-    // qwen3_dump5("silu",   ff_buf)
+    if _dbg_phase != 0 { _qwen3_dump_buf("gu_scratch[0..FF]", ff_buf, ff) }
     // down_proj via the shared MT matmul. The old hand-inlined single-thread
     // loop was kept while the IR-store-8-byte bug was still in the compiler;
     // that's fixed now, so the MT path works and parallelises the 3M-element
@@ -1309,6 +1405,10 @@ fn qwen3_forward_layer(u64 x_out, u64 x_in,
         i = i + 1
     }
     qwen3_t_down_res2 = qwen3_t_down_res2 + time_elapsed(p_t8)
+    if _dbg_phase != 0 {
+        _qwen3_dump_buf("out_resid", x_out, hidden)
+        qwen3_phase_dump_state = 3   // disarm — fire only on first layer
+    }
 
     dealloc(resid); dealloc(x_norm)
     dealloc(q_buf)
