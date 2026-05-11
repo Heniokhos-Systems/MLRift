@@ -1002,6 +1002,45 @@ fn _sdma_emit_copy_linear(uint64 ring_host, uint64 wp_byte,
     return off + 28
 }
 
+// Slice 6.8: minimal hex/dec writers for SDMA timeout diagnostics.
+// Self-contained — no logging dep. Used only by kfd_sdma_copy timeout dump.
+fn _kfd_dump_u64_hex(uint32 fd, uint64 v) {
+    uint64 buf = alloc(18)
+    unsafe { *(buf as uint8) = 48 }                // '0'
+    unsafe { *((buf + 1) as uint8) = 120 }         // 'x'
+    uint64 i = 0
+    while i < 16 {
+        uint64 shift = (15 - i) * 4
+        uint64 nib = (v >> shift) & 15
+        uint64 ch = 0
+        if nib < 10 { ch = nib + 48 } else { ch = nib + 87 }   // '0'..'9' / 'a'..'f'
+        uint64 p = buf + 2 + i
+        uint8 cc = ch
+        unsafe { *(p as uint8) = cc }
+        i = i + 1
+    }
+    write(fd, buf, 18)
+}
+
+fn _kfd_dump_u64_dec(uint32 fd, uint64 v) {
+    uint64 buf = alloc(32)
+    uint64 n = 0
+    uint64 tmp = v
+    if tmp == 0 { unsafe { *(buf as uint8) = 48 }; n = 1 }
+    while tmp > 0 { n = n + 1; tmp = tmp / 10 }
+    uint64 i = n
+    tmp = v
+    while i > 0 {
+        i = i - 1
+        uint64 d = tmp - (tmp / 10) * 10
+        uint64 p = buf + i
+        uint8 c = d + 48
+        unsafe { *(p as uint8) = c }
+        tmp = tmp / 10
+    }
+    write(fd, buf, n)
+}
+
 // One-shot dispatch + wait. Caller passes pre-mapped GPU VAs. Spins on
 // rp == wp to drain. Suitable for the H2D init phase where we want
 // ordering w.r.t. the subsequent compute queue.
@@ -1016,8 +1055,19 @@ fn kfd_sdma_copy(uint64 q, uint64 src_va, uint64 dst_va, uint64 nbytes) {
     _kfd_fence()
     unsafe { *(wp_host as uint64) = new_wp }
     _kfd_fence()
-    // SDMA doorbell value = new wp byte index (low 32 bits suffice for our 64 KiB ring).
-    uint64 db_value = new_wp
+    // Slice 6.8: mask doorbell to ring size. The wp byte cursor grows
+    // monotonically (never reset) — over millions of SDMA copies it drifts
+    // far past 64 KiB and past 32-bit. Firmware reads the doorbell as a
+    // ring-relative byte offset hint; the unmasked monotonic value
+    // eventually confuses the SDMA scheduler, manifesting as
+    // kfd_sdma_copy: timeout draining on long-running launchers
+    // (Noesis bistable PhaseAT, 2026-05-11).
+    //
+    // The wp page (std/kfd.mlr:1017) is intentionally NOT masked —
+    // firmware uses the monotonic cursor for work detection via wp != rp.
+    // Only the doorbell — which firmware interprets as a ring offset
+    // hint — needs masking.
+    uint64 db_value = new_wp & KFD_SDMA_RING_MASK
     unsafe { *(db_host as uint64) = db_value }
 
     // Spin until rp catches up. SDMA processes packets in order; rp == wp
@@ -1027,7 +1077,20 @@ fn kfd_sdma_copy(uint64 q, uint64 src_va, uint64 dst_va, uint64 nbytes) {
     uint64 spin = 0
     while rp != new_wp {
         spin = spin + 1
-        if spin > 30000000000 { kfd_die("kfd_sdma_copy: timeout draining", spin) }
+        if spin > 30000000000 {
+            // Slice 6.8: dump SDMA queue state before dying so future
+            // timeouts are diagnosable. wp/rp/db_value/ring_host/tracker
+            // depth all relevant.
+            write(2, "kfd_sdma_copy: TIMEOUT DRAINING - state dump:\n", 46)
+            write(2, "  spin                = ", 24); _kfd_dump_u64_dec(2, spin); write(2, "\n", 1)
+            write(2, "  new_wp (unmasked)   = ", 24); _kfd_dump_u64_hex(2, new_wp); write(2, "\n", 1)
+            write(2, "  new_wp (masked)     = ", 24); _kfd_dump_u64_hex(2, new_wp & KFD_SDMA_RING_MASK); write(2, "\n", 1)
+            write(2, "  rp (current)        = ", 24); _kfd_dump_u64_hex(2, rp); write(2, "\n", 1)
+            write(2, "  db_value last write = ", 24); _kfd_dump_u64_hex(2, db_value); write(2, "\n", 1)
+            write(2, "  ring_host           = ", 24); _kfd_dump_u64_hex(2, ring_host); write(2, "\n", 1)
+            write(2, "  _kfd_alloc_tab_n    = ", 24); _kfd_dump_u64_dec(2, _kfd_alloc_tab_n); write(2, "\n", 1)
+            kfd_die("kfd_sdma_copy: timeout draining", spin)
+        }
         unsafe { *(rp_host as uint64) -> rp }
     }
 }
