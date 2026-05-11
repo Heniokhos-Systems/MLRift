@@ -26,7 +26,7 @@ import "../std/time.mlr"
 fn main() {
     // ===================== USER CONFIG =====================
     u64 prompt_text  = "Hello, who are you?"
-    u64 max_new      = 20
+    u64 max_new      = 128
     u64 model_dir    = "/home/pantelis/Desktop/Projects/Work/MLRift-experimental/Qwen3-0.6B"
     u64 num_workers  = 16
     // ========================================================
@@ -46,20 +46,97 @@ fn main() {
     tokenizer_set_kind_gpt2(tk)        // Qwen3 uses GPT-2 byte-level BPE.
     dealloc(tok_path)
 
-    // --- Encode prompt ---
-    // tokenizer_encode allocates the IDs array internally and writes the
-    // heap pointer to *out_ids_box; we just pass two u64 sentinel boxes.
+    // --- Encode prompt + wrap in Qwen3 chat template ---
+    // Qwen3-0.6B is instruct-tuned; feeding raw text → greedy decode loops.
+    // We wrap as:  <|im_start|>user\n<PROMPT><|im_end|>\n<|im_start|>assistant\n
+    // The tokenizer doesn't merge added_tokens, so special-token IDs are
+    // injected directly: <|im_start|>=151644, <|im_end|>=151645, '\n'=198.
+    u64 IM_START = 151644
+    u64 IM_END   = 151645
+    u64 NL_TOK   = 198
+
+    u64 user_box       = alloc(8)
+    u64 user_cnt_box   = alloc(8)
+    u64 assist_box     = alloc(8)
+    u64 assist_cnt_box = alloc(8)
+    u64 prompt_box     = alloc(8)
+    u64 prompt_cnt_box = alloc(8)
+    unsafe { *(user_box       as u64) = 0 }
+    unsafe { *(user_cnt_box   as u64) = 0 }
+    unsafe { *(assist_box     as u64) = 0 }
+    unsafe { *(assist_cnt_box as u64) = 0 }
+    unsafe { *(prompt_box     as u64) = 0 }
+    unsafe { *(prompt_cnt_box as u64) = 0 }
+    tokenizer_encode(tk, "user",      4, user_box,   user_cnt_box)
+    tokenizer_encode(tk, "assistant", 9, assist_box, assist_cnt_box)
     u64 prompt_len_bytes = str_len(prompt_text)
-    u64 prompt_ids_box   = alloc(8)
-    u64 prompt_count_box = alloc(8)
-    unsafe { *(prompt_ids_box as u64) = 0 }
-    unsafe { *(prompt_count_box as u64) = 0 }
-    tokenizer_encode(tk, prompt_text, prompt_len_bytes, prompt_ids_box, prompt_count_box)
-    u64 prompt_ids = 0
-    unsafe { *(prompt_ids_box as u64) -> prompt_ids }
-    u64 prompt_count = 0
-    unsafe { *(prompt_count_box as u64) -> prompt_count }
-    dealloc(prompt_ids_box); dealloc(prompt_count_box)
+    tokenizer_encode(tk, prompt_text, prompt_len_bytes, prompt_box, prompt_cnt_box)
+    u64 user_ids   = 0
+    u64 user_cnt   = 0
+    u64 assist_ids = 0
+    u64 assist_cnt = 0
+    u64 raw_ids    = 0
+    u64 raw_cnt    = 0
+    unsafe { *(user_box       as u64) -> user_ids   }
+    unsafe { *(user_cnt_box   as u64) -> user_cnt   }
+    unsafe { *(assist_box     as u64) -> assist_ids }
+    unsafe { *(assist_cnt_box as u64) -> assist_cnt }
+    unsafe { *(prompt_box     as u64) -> raw_ids    }
+    unsafe { *(prompt_cnt_box as u64) -> raw_cnt    }
+    dealloc(user_box)
+    dealloc(user_cnt_box)
+    dealloc(assist_box)
+    dealloc(assist_cnt_box)
+    dealloc(prompt_box)
+    dealloc(prompt_cnt_box)
+
+    // Splice: [IM_START, "user", NL, raw..., IM_END, NL, IM_START, "assistant", NL]
+    u64 prompt_count = 1 + user_cnt + 1 + raw_cnt + 1 + 1 + 1 + assist_cnt + 1
+    u64 prompt_ids   = alloc(prompt_count * 4)
+    u64 wp = 0
+    u32 ims32 = IM_START
+    u32 ime32 = IM_END
+    u32 nl32  = NL_TOK
+    unsafe { *((prompt_ids + wp * 4) as uint32) = ims32 }
+    wp = wp + 1
+    u64 r = 0
+    while r < user_cnt {
+        u32 t = 0
+        unsafe { *((user_ids + r * 4) as uint32) -> t }
+        unsafe { *((prompt_ids + wp * 4) as uint32) = t }
+        wp = wp + 1
+        r = r + 1
+    }
+    unsafe { *((prompt_ids + wp * 4) as uint32) = nl32 }
+    wp = wp + 1
+    r = 0
+    while r < raw_cnt {
+        u32 t = 0
+        unsafe { *((raw_ids + r * 4) as uint32) -> t }
+        unsafe { *((prompt_ids + wp * 4) as uint32) = t }
+        wp = wp + 1
+        r = r + 1
+    }
+    unsafe { *((prompt_ids + wp * 4) as uint32) = ime32 }
+    wp = wp + 1
+    unsafe { *((prompt_ids + wp * 4) as uint32) = nl32  }
+    wp = wp + 1
+    unsafe { *((prompt_ids + wp * 4) as uint32) = ims32 }
+    wp = wp + 1
+    r = 0
+    while r < assist_cnt {
+        u32 t = 0
+        unsafe { *((assist_ids + r * 4) as uint32) -> t }
+        unsafe { *((prompt_ids + wp * 4) as uint32) = t }
+        wp = wp + 1
+        r = r + 1
+    }
+    unsafe { *((prompt_ids + wp * 4) as uint32) = nl32 }
+    wp = wp + 1
+    prompt_count = wp
+    dealloc(user_ids)
+    dealloc(assist_ids)
+    dealloc(raw_ids)
     print_str("[qwen3_cpu] prompt=\""); print_str(prompt_text); print_str("\" → ")
     u64 ps = fmt_dec(prompt_count); print_str(ps); dealloc(ps)
     print_str(" tokens [")
@@ -84,7 +161,7 @@ fn main() {
 
     u64 n_layers = 28
     u64 vocab    = 151936
-    u64 max_seq  = 128
+    u64 max_seq  = prompt_count + max_new + 16
     // Qwen3-0.6B arch: hidden=1024, head_dim=128, n_heads=16, n_kv_heads=8,
     // ff=3072 — defaults already set in qwen3_cpu.mlr.
     u64 hidden = QWEN3_HIDDEN
@@ -302,6 +379,9 @@ fn main() {
         unsafe { *((seq_ids + seq_len * 4) as uint32) = best_id32 }
         seq_len = seq_len + 1
 
+        // Stop at <|im_end|> = 151645 (the assistant turn's end-of-turn marker).
+        if best_id == 151645 { step = max_new; continue }
+
         // Embed best_id into x_cur for next step.
         u64 row_n = embed_ptr + best_id * hidden * 2
         u64 kk = 0
@@ -315,9 +395,18 @@ fn main() {
     }
     u64 decode_ns = time_elapsed(decode_start_ns)
 
-    // --- Decode the generated portion back to text ---
+    // --- Decode only the assistant's response (skip the templated prompt) ---
     print_str("\n=== OUTPUT ===\n")
-    u64 out_text = tokenizer_decode(tk, seq_ids, seq_len)
+    u64 reply_start = prompt_count
+    u64 reply_len   = seq_len - prompt_count
+    u64 reply_ids   = seq_ids + reply_start * 4
+    // Trim trailing <|im_end|> from the printed reply.
+    if reply_len > 0 {
+        u32 last_t = 0
+        unsafe { *((reply_ids + (reply_len - 1) * 4) as uint32) -> last_t }
+        if last_t == 151645 { reply_len = reply_len - 1 }
+    }
+    u64 out_text = tokenizer_decode(tk, reply_ids, reply_len)
     print_str(out_text)
     dealloc(out_text)
     print_str("\n\n")
