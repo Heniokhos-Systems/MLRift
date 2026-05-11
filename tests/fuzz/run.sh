@@ -1,7 +1,7 @@
 #!/bin/bash
 # Tier 2: differential fuzzer.
 #
-# 1. Generate N pseudo-random valid KernRift programs via generate.py.
+# 1. Generate N pseudo-random valid MLRift programs via generate.py.
 #    Python computes the expected output for each (three-way oracle).
 # 2. For each program, compile with --legacy and the default IR backend.
 # 3. Run both binaries (with 15s timeout each) and compare stdout+exit
@@ -16,26 +16,26 @@
 # away from its specific shape.
 #
 # Env knobs:
-#   KRC=<path>         compiler to test (default: ../build/krc2)
+#   MLRC=<path>         compiler to test (default: ../build/mlrc2)
 #   FUZZ_COUNT=<N>     programs to generate (default: 50)
 #   FUZZ_SEED=<S>      rng seed (default: 0xDEADBEEF, so CI runs are
 #                      reproducible unless explicitly overridden)
-#   KRC_ARCH=...       arch flag (default: --arch=host)
+#   MLRC_ARCH=...       arch flag (default: --arch=host)
 #   FUZZ_RUNNER=<cmd>  wrapper to exec binaries under (e.g. qemu-...)
 
 set -u
 DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$DIR/.." && pwd)"
-KRC="${KRC:-$REPO/../build/krc2}"
-if [ ! -x "$KRC" ]; then KRC="$REPO/build/krc2"; fi
-if [ ! -x "$KRC" ]; then echo "fuzz: krc not found ($KRC)" >&2; exit 2; fi
+MLRC="${MLRC:-$REPO/../build/mlrc2}"
+if [ ! -x "$MLRC" ]; then MLRC="$REPO/build/mlrc2"; fi
+if [ ! -x "$MLRC" ]; then echo "fuzz: mlrc not found ($MLRC)" >&2; exit 2; fi
 
 FUZZ_COUNT="${FUZZ_COUNT:-50}"
 FUZZ_SEED="${FUZZ_SEED:-3735928559}"   # 0xDEADBEEF
-if [ -z "${KRC_ARCH:-}" ]; then
+if [ -z "${MLRC_ARCH:-}" ]; then
     case "$(uname -m)" in
-        x86_64|amd64)  KRC_ARCH="--arch=x86_64" ;;
-        aarch64|arm64) KRC_ARCH="--arch=arm64" ;;
+        x86_64|amd64)  MLRC_ARCH="--arch=x86_64" ;;
+        aarch64|arm64) MLRC_ARCH="--arch=arm64" ;;
         *) echo "fuzz: unknown host arch $(uname -m)" >&2; exit 2 ;;
     esac
 fi
@@ -58,18 +58,18 @@ record_regression() {
     echo "  regression recorded: ${dst}.mlr"
 }
 
-# Run one <name>.kr, compare legacy / IR / oracle three ways.
-#   $1 = path to .kr
+# Run one <name>.mlr, compare legacy / IR / oracle three ways.
+#   $1 = path to .mlr
 #   $2 = path to .expected (Python oracle)
 #   $3 = source category (for reporting only)
 run_one() {
     local src="$1" expected="$2" category="$3"
     local name="$(basename "$src" .mlr)"
-    local leg_bin="$(mktemp /tmp/krc_fuzz_${name}_leg_XXXX)"; rm -f "$leg_bin"
-    local ir_bin="$(mktemp /tmp/krc_fuzz_${name}_ir_XXXX)"; rm -f "$ir_bin"
+    local leg_bin="$(mktemp /tmp/mlrc_fuzz_${name}_leg_XXXX)"; rm -f "$leg_bin"
+    local ir_bin="$(mktemp /tmp/mlrc_fuzz_${name}_ir_XXXX)"; rm -f "$ir_bin"
     local blog="$(mktemp)"
 
-    if ! $KRC --legacy $KRC_ARCH "$src" -o "$leg_bin" > "$blog" 2>&1; then
+    if ! $MLRC --legacy $MLRC_ARCH "$src" -o "$leg_bin" > "$blog" 2>&1; then
         # Legacy compile failure on an IR-only feature is fine for the diff
         # harness (SKIP), but fuzz doesn't emit legacy-incompatible code.
         # So any legacy failure here is a real regression in the legacy
@@ -80,7 +80,7 @@ run_one() {
         record_regression "$src" "$expected"
         rm -f "$leg_bin" "$ir_bin" "$blog"; return
     fi
-    if ! $KRC $KRC_ARCH "$src" -o "$ir_bin" > "$blog" 2>&1; then
+    if ! $MLRC $MLRC_ARCH "$src" -o "$ir_bin" > "$blog" 2>&1; then
         echo "FAIL[$category]: $name (ir compile failed)"
         sed 's/^/  /' "$blog" | tail -3
         FAIL=$((FAIL + 1)); FAIL_LIST="$FAIL_LIST $name(ir-build)"
@@ -134,7 +134,7 @@ if [ "$reg_count" -gt 0 ]; then
 fi
 
 # --- Fresh random programs ---
-FUZZ_TMP="$(mktemp -d /tmp/krc_fuzz_corpus_XXXX)"
+FUZZ_TMP="$(mktemp -d /tmp/mlrc_fuzz_corpus_XXXX)"
 if ! python3 "$DIR/generate.py" --out "$FUZZ_TMP" --count "$FUZZ_COUNT" --seed "$FUZZ_SEED" > /dev/null 2>&1; then
     echo "fuzz: generate.py failed (seed=$FUZZ_SEED is probably non-decimal — use a plain integer)" >&2
     rm -rf "$FUZZ_TMP"

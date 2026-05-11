@@ -12,8 +12,8 @@
 #                         stdout for every corpus program.
 #
 # Env knobs:
-#   KRC=<path>      compiler under test (default: ../build/krc2)
-#   KRC_ARCH=...    host arch flag (backend mode only)
+#   MLRC=<path>      compiler under test (default: ../build/mlrc2)
+#   MLRC_ARCH=...    host arch flag (backend mode only)
 #   DIFF_RUNNER=... binary wrapper for host-arch runs
 #   QEMU_RUNNER=... arm64 runner (crossarch mode; default qemu-aarch64-static)
 #
@@ -22,15 +22,15 @@
 set -u
 DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$DIR/.." && pwd)"
-KRC="${KRC:-$REPO/../build/krc2}"
-if [ ! -x "$KRC" ]; then KRC="$REPO/build/krc2"; fi
-if [ ! -x "$KRC" ]; then echo "diff: krc not found ($KRC)" >&2; exit 2; fi
+MLRC="${MLRC:-$REPO/../build/mlrc2}"
+if [ ! -x "$MLRC" ]; then MLRC="$REPO/build/mlrc2"; fi
+if [ ! -x "$MLRC" ]; then echo "diff: mlrc not found ($MLRC)" >&2; exit 2; fi
 
 MODE="${DIFF_MODE:-backend}"
-if [ -z "${KRC_ARCH:-}" ]; then
+if [ -z "${MLRC_ARCH:-}" ]; then
     case "$(uname -m)" in
-        x86_64|amd64)  KRC_ARCH="--arch=x86_64" ;;
-        aarch64|arm64) KRC_ARCH="--arch=arm64" ;;
+        x86_64|amd64)  MLRC_ARCH="--arch=x86_64" ;;
+        aarch64|arm64) MLRC_ARCH="--arch=arm64" ;;
         *) echo "diff: unknown host arch $(uname -m)" >&2; exit 2 ;;
     esac
 fi
@@ -56,13 +56,13 @@ run_bin() {
 if [ "$MODE" = "backend" ]; then
     for src in "$DIR"/corpus/*.mlr; do
         name="$(basename "$src" .mlr)"
-        leg_bin="$(mktemp /tmp/krc_diff_${name}_leg_XXXX)"; rm -f "$leg_bin"
-        ir_bin="$(mktemp /tmp/krc_diff_${name}_ir_XXXX)"; rm -f "$ir_bin"
+        leg_bin="$(mktemp /tmp/mlrc_diff_${name}_leg_XXXX)"; rm -f "$leg_bin"
+        ir_bin="$(mktemp /tmp/mlrc_diff_${name}_ir_XXXX)"; rm -f "$ir_bin"
         leg_log="$(mktemp)"; ir_log="$(mktemp)"
 
-        $KRC --legacy $KRC_ARCH "$src" -o "$leg_bin" > "$leg_log" 2>&1
+        $MLRC --legacy $MLRC_ARCH "$src" -o "$leg_bin" > "$leg_log" 2>&1
         leg_compile=$?
-        $KRC $KRC_ARCH "$src" -o "$ir_bin" > "$ir_log" 2>&1
+        $MLRC $MLRC_ARCH "$src" -o "$ir_bin" > "$ir_log" 2>&1
         ir_compile=$?
 
         if [ "$ir_compile" != 0 ]; then
@@ -95,7 +95,7 @@ if [ "$MODE" = "backend" ]; then
         rm -f "$leg_bin" "$ir_bin" "$leg_out" "$ir_out" "$leg_log" "$ir_log"
     done
     echo ""
-    echo "=== diff (backend): $PASS passed, $FAIL failed, $SKIP skipped ($KRC_ARCH) ==="
+    echo "=== diff (backend): $PASS passed, $FAIL failed, $SKIP skipped ($MLRC_ARCH) ==="
 elif [ "$MODE" = "crossarch" ]; then
     if ! command -v "$QEMU_RUNNER" > /dev/null 2>&1; then
         echo "diff: $QEMU_RUNNER not found; install qemu-user-static" >&2
@@ -106,16 +106,16 @@ elif [ "$MODE" = "crossarch" ]; then
     # to behave identically across x86_64 and arm64 IR.
     for src in "$DIR"/corpus/*.mlr "$DIR"/ir-only/*.mlr; do
         name="$(basename "$src" .mlr)"
-        x64_bin="$(mktemp /tmp/krc_diff_${name}_x64_XXXX)"; rm -f "$x64_bin"
-        a64_bin="$(mktemp /tmp/krc_diff_${name}_a64_XXXX)"; rm -f "$a64_bin"
+        x64_bin="$(mktemp /tmp/mlrc_diff_${name}_x64_XXXX)"; rm -f "$x64_bin"
+        a64_bin="$(mktemp /tmp/mlrc_diff_${name}_a64_XXXX)"; rm -f "$a64_bin"
         blog="$(mktemp)"
 
-        if ! $KRC --arch=x86_64 "$src" -o "$x64_bin" > "$blog" 2>&1; then
+        if ! $MLRC --arch=x86_64 "$src" -o "$x64_bin" > "$blog" 2>&1; then
             echo "FAIL: $name (x86_64 compile failed)"; sed 's/^/  /' "$blog" | tail -3
             FAIL=$((FAIL + 1)); FAIL_LIST="$FAIL_LIST $name(x64-build)"
             rm -f "$blog"; continue
         fi
-        if ! $KRC --arch=arm64 "$src" -o "$a64_bin" > "$blog" 2>&1; then
+        if ! $MLRC --arch=arm64 "$src" -o "$a64_bin" > "$blog" 2>&1; then
             echo "FAIL: $name (arm64 compile failed)"; sed 's/^/  /' "$blog" | tail -3
             FAIL=$((FAIL + 1)); FAIL_LIST="$FAIL_LIST $name(a64-build)"
             rm -f "$x64_bin" "$blog"; continue
