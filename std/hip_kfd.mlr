@@ -683,13 +683,10 @@ fn _hipkfd_sdma_boost_topup() {
     _kfd_fence()
     unsafe { *(_hipkfd_sdma_boost_wp_h as uint64) = wp }
     _kfd_fence()
-    // Slice 6.8: same doorbell-mask fix as kfd_sdma_copy. The boost
-    // queue shares the gfx11 SDMA microcontroller with the user-data
-    // queue; its growing-unbounded wp byte cursor contributes to the
-    // same scheduler confusion. wp_h page stays unmasked (firmware
-    // detects work via wp != rp on monotonic cursors).
-    uint64 boost_db_value = wp & KFD_SDMA_RING_MASK
-    unsafe { *(_hipkfd_sdma_boost_db_h as uint64) = boost_db_value }
+    // Doorbell receives monotonic wp (matches wp_h page) — gfx11 SDMA
+    // firmware requires symmetric monotonic doorbell+wp; slice 6.8b
+    // stress test confirmed masked-doorbell + monotonic-wp fails packet 1.
+    unsafe { *(_hipkfd_sdma_boost_db_h as uint64) = wp }
 }
 
 // Top up the boost queue from the user thread on every dispatch.
@@ -756,9 +753,33 @@ fn _hipkfd_lazy_init() {
         uint8 bc = 0; unsafe { *(boost_env as uint8) -> bc }
         if bc == 48 { boost_off = 1 }
     }
+    // MLRIFT_BOOST_COMPUTE defaults to OFF (slice 6.8c, 2026-05-11):
+    // bisect proved the boost compute queue causes a cross-process MES
+    // wedge on RX 7800 XT gfx11. Process N runs fine; process N+1's
+    // _hipkfd_lazy_init page-faults from CPF (PERMISSION_FAULTS=0x3),
+    // forces a full GPU reset, and recovery takes 10–15 min. The cost
+    // of "compute-boost off" is ~30% on small Noesis kernels (DPM sclk
+    // stays at base ~500 MHz between launches); opt back in via
+    // MLRIFT_BOOST_COMPUTE=1 if you accept the wedge risk.
+    //
+    // MLRIFT_BOOST_SDMA defaults to ON — SDMA boost is harmless under
+    // bisect (100K + 1M back-to-back stress passes with only it
+    // enabled). MLRIFT_BOOST=0 still kills both as before.
+    uint64 bc_env = getenv("MLRIFT_BOOST_COMPUTE")
+    uint64 bc_on = 0
+    if bc_env != 0 {
+        uint8 bcc = 0; unsafe { *(bc_env as uint8) -> bcc }
+        if bcc == 49 { bc_on = 1 }     // '1' opts in
+    }
+    uint64 bs_env = getenv("MLRIFT_BOOST_SDMA")
+    uint64 bs_off = 0
+    if bs_env != 0 {
+        uint8 bsc = 0; unsafe { *(bs_env as uint8) -> bsc }
+        if bsc == 48 { bs_off = 1 }    // '0' opts out
+    }
     if boost_off == 0 {
-        _hipkfd_boost_queue_init()
-        _hipkfd_sdma_boost_init()
+        if bc_on != 0 { _hipkfd_boost_queue_init() }
+        if bs_off == 0 { _hipkfd_sdma_boost_init() }
     }
 }
 
@@ -1096,6 +1117,64 @@ fn hipkfd_get_sync_total_ns() -> uint64 {
 
 fn hipkfd_get_sync_busy_calls() -> uint64 {
     return _hipkfd_sync_busy_calls
+}
+
+// Graceful KFD-queue teardown. Drains every queue this process created,
+// then issues DESTROY_QUEUE for each so MES can preempt cleanly.
+//
+// Without this, launcher exit relies on kernel fd-close to reclaim
+// queues. On gfx11 (RX 7800 XT, MES firmware 80.74), abrupt fd-close
+// occasionally wedges MES with "failed to respond to msg=REMOVE_QUEUE"
+// — and the NEXT KFD launcher in the system hits a CPF page fault
+// against the wedged MES, forcing a full GPU reset (~10 min recovery).
+// Validated with kfd_sdma_stress 100k/1M iter sequence 2026-05-11:
+// 100k passed, 1M wedged at warmup packet 1 of the NEXT process —
+// confirming the leak is on EXIT, not on the work itself.
+//
+// Drain order matters: USER compute first (real work), then USER
+// SDMA (already synchronous so nothing to drain, but still destroy),
+// then BOOST compute, then BOOST SDMA. Boost queues drain to 4096-iter
+// caps so a wedged boost wave doesn't hang the launcher's exit path.
+fn hipkfd_teardown() {
+    // 1. User compute queue — drain via hipDeviceSynchronize, then destroy.
+    if _hipkfd_q != 0 {
+        hipDeviceSynchronize()
+        kfd_destroy_queue(_hipkfd_q)
+        _hipkfd_q = 0
+    }
+    // 2. User SDMA queue — kfd_sdma_copy is synchronous so rp == wp by
+    //    construction. Just destroy.
+    if _hipkfd_sdma_q != 0 {
+        kfd_destroy_queue(_hipkfd_sdma_q)
+        _hipkfd_sdma_q = 0
+        _hipkfd_sdma_init_done = 0
+    }
+    // 3. Boost compute queue — short 65k-VALU waves complete in ~75 µs,
+    //    so spin briefly for rp to catch wp before destroying.
+    if _hipkfd_boost_q != 0 {
+        uint64 wp_b = 0; unsafe { *(_hipkfd_boost_q_wp_host as uint64) -> wp_b }
+        uint64 rp_b = 0; unsafe { *(_hipkfd_boost_q_rp_host as uint64) -> rp_b }
+        uint64 spin_b = 0
+        while rp_b != wp_b && spin_b < 100000000 {
+            spin_b = spin_b + 1
+            unsafe { *(_hipkfd_boost_q_rp_host as uint64) -> rp_b }
+        }
+        kfd_destroy_queue(_hipkfd_boost_q)
+        _hipkfd_boost_q = 0
+    }
+    // 4. Boost SDMA queue — depth-32 VRAM↔VRAM 64 KiB packets, each
+    //    ~30 µs at PCIe 4.0 x16, so worst-case drain is ~1 ms.
+    if _hipkfd_sdma_boost_q != 0 {
+        uint64 wp_s = 0; unsafe { *(_hipkfd_sdma_boost_wp_h as uint64) -> wp_s }
+        uint64 rp_s = 0; unsafe { *(_hipkfd_sdma_boost_rp_h as uint64) -> rp_s }
+        uint64 spin_s = 0
+        while rp_s != wp_s && spin_s < 100000000 {
+            spin_s = spin_s + 1
+            unsafe { *(_hipkfd_sdma_boost_rp_h as uint64) -> rp_s }
+        }
+        kfd_destroy_queue(_hipkfd_sdma_boost_q)
+        _hipkfd_sdma_boost_q = 0
+    }
 }
 
 // --- Module loading ---
