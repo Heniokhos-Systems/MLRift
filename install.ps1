@@ -60,15 +60,28 @@ if (!(Test-Path $StdDir)) {
     New-Item -ItemType Directory -Path $StdDir -Force | Out-Null
 }
 Write-Host "Installing standard library..."
-foreach ($mod in @("string", "io", "math", "fmt", "mem", "vec", "map", "color", "fb", "fixedpoint", "font", "memfast", "widget", "time", "log", "net")) {
+# Enumerate every std/*.mlr in the repo via the GitHub contents API so
+# newly-added modules ship without an installer change. Falls back to a
+# minimal core set on API errors (rate-limit or offline).
+$Mods = $null
+try {
+    $listing = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/contents/std?ref=main" -UseBasicParsing
+    $Mods = $listing | Where-Object { $_.name -match '\.mlr$' } | ForEach-Object { $_.name -replace '\.mlr$','' }
+} catch {
+    Write-Host "  warning: std/ listing failed, using minimal core fallback" -ForegroundColor Yellow
+    $Mods = @("alloc","color","fb","fixedpoint","fmt","font","io","log","map","math","mem","memfast","net","string","time","vec","widget")
+}
+$modCount = 0
+foreach ($mod in $Mods) {
     $modUrl = "https://raw.githubusercontent.com/$Repo/main/std/$mod.mlr"
     try {
         Invoke-WebRequest -Uri $modUrl -OutFile "$StdDir\$mod.mlr" -UseBasicParsing
+        $modCount++
     } catch {
         Write-Host "  warning: could not download std/$mod.mlr" -ForegroundColor Yellow
     }
 }
-Write-Host "Standard library: $StdDir"
+Write-Host "Standard library: $StdDir ($modCount modules)"
 
 # Add to PATH if not already there
 $UserPath = [Environment]::GetEnvironmentVariable("PATH", "User")

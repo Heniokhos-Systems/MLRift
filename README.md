@@ -17,6 +17,58 @@ DSO dependencies on Linux.
 - Four-platform benchmark report — see `benchmarks/BENCHMARKS.md`
   for x86_64 Linux, aarch64 Pi 400, Windows 11 x86_64, and Android arm64.
 
+## Install
+
+One-line installers pull the right `mlrc` (compiler) + `mlr` (runner) for
+your platform from the latest [GitHub release](https://github.com/Pantelis23/MLRift/releases/latest)
+and copy every `std/*.mlr` module from `main` into your local standard
+library — no Python, no LLVM, no toolchain prerequisites.
+
+**Linux / macOS / Android (adb or Termux)**
+
+```sh
+curl -sSf https://raw.githubusercontent.com/Pantelis23/MLRift/main/install.sh | sh
+```
+
+**Windows (PowerShell)**
+
+```powershell
+irm https://raw.githubusercontent.com/Pantelis23/MLRift/main/install.ps1 | iex
+```
+
+What lands on disk:
+
+| File | Path |
+|---|---|
+| `mlrc` (compiler) | `~/.local/bin/mlrc` (Linux/macOS), `%LOCALAPPDATA%\MLRift\bin\mlrc.exe` (Windows) |
+| `mlr` (fat-binary runner) | same directory as `mlrc` |
+| stdlib (every `std/*.mlr`) | `~/.local/share/mlrift/std/` (Linux/macOS), `%LOCALAPPDATA%\MLRift\std\` (Windows) |
+
+The stdlib list is **enumerated live from the repo via the GitHub
+contents API**, so newly-added modules ship the moment they land on
+`main` without re-cutting the installer. The current set spans
+40 modules across language primitives (`io`, `fmt`, `vec`, `map`,
+`string`, `math`, `mem`, `alloc`, `time`, `log`, `net`, `widget`,
+`font`, `color`, `fb`, `fixedpoint`, `rng`, `thread`, `memfast`),
+ML/numeric infrastructure (`matmul`, `quant`, `gguf`, `safetensors`,
+`tokenizer`, `inference`, `inference_gpu`, `math_float`, `vec_f64*`),
+model implementations (`qwen3`, `qwen35`, `qwen36`, `gemma2`,
+`gemma3`), and GPU runtimes (`hip`, `hip_kfd`, `kfd`, `kfd_raw`).
+
+Verify:
+
+```sh
+mlrc --version
+echo 'fn main() { println("hello mlrift"); exit(0) }' > hello.mlr
+mlrc hello.mlr -o hello.mlrbo   # 8-slice fat binary
+mlr hello.mlrbo                 # runs the host slice
+```
+
+**Other install paths**
+
+- Build from source: `git clone https://github.com/Pantelis23/MLRift && cd MLRift && make` (the in-tree `build/mlrc` self-compiles).
+- Direct download: every per-arch binary lives under [`releases/latest`](https://github.com/Pantelis23/MLRift/releases/latest) (`mlrc-linux-x86_64`, `mlrc-windows-arm64.exe`, `mlrc.mlrbo`, …).
+
 ## What works today
 
 Real LLM inference is already running end-to-end through the existing

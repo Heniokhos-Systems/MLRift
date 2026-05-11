@@ -99,14 +99,25 @@ else
     chmod +x "$INSTALL_DIR/mlr"
 fi
 
-# Download standard library
+# Download standard library — enumerate every std/*.mlr in the repo via
+# the GitHub contents API so newly-added modules ship without an
+# installer change. Falls back to a minimal core set on API errors
+# (rate-limit or offline).
 echo "Installing standard library..."
 mkdir -p "$STD_DIR"
-for mod in string io math fmt mem vec map color fb fixedpoint font memfast widget time log net; do
+MOD_LIST=$(curl -sL "https://api.github.com/repos/$REPO/contents/std?ref=main" \
+    | sed -nE 's/.*"name": *"([a-zA-Z0-9_]+)\.mlr".*/\1/p')
+if [ -z "$MOD_LIST" ]; then
+    echo "  warning: std/ listing failed, using minimal core fallback"
+    MOD_LIST="alloc color fb fixedpoint fmt font io log map math mem memfast net string time vec widget"
+fi
+mod_count=0
+for mod in $MOD_LIST; do
     curl -sL -o "$STD_DIR/$mod.mlr" \
         "https://raw.githubusercontent.com/$REPO/main/std/$mod.mlr"
+    mod_count=$((mod_count + 1))
 done
-echo "Standard library: $STD_DIR"
+echo "Standard library: $STD_DIR ($mod_count modules)"
 
 echo ""
 
