@@ -1,17 +1,20 @@
-// Qwen3-0.6B CPU-only driver — string prompt in, decoded text out.
+// Qwen3-0.6B CPU-only chat — interactive multi-turn REPL.
 //
 // Wires std/tokenizer.mlr (GPT-2 byte-level BPE) to std/qwen3_cpu.mlr's
 // forward layer. No HIP / no ROCm / no libamdhip64 — the binary has no
 // libamdhip64.so.7 DT_NEEDED, so it runs on machines without ROCm
 // installed.
 //
-// To change the prompt: edit `prompt_text` below and recompile.
-//
 // Build:
 //   ./build/mlrc --arch=x86_64 --target=linux --emit=elfexe \
 //       examples/qwen3_generate_cpu.mlr -o /tmp/qwen3_cpu
 // Run:
 //   /tmp/qwen3_cpu
+//
+// At the prompt, type a message and press Enter. Type "/quit" or an empty
+// line to exit. The KV cache + sequence buffer persist across turns, so
+// the model remembers everything earlier in the conversation up to
+// max_seq tokens.
 
 import "../std/qwen3_cpu.mlr"
 import "../std/safetensors.mlr"
@@ -25,9 +28,9 @@ import "../std/time.mlr"
 
 fn main() {
     // ===================== USER CONFIG =====================
-    u64 prompt_text  = "Hello, who are you?"
-    u64 max_new      = 128
     u64 model_dir    = "/home/pantelis/Desktop/Projects/Work/MLRift-experimental/Qwen3-0.6B"
+    u64 max_new      = 256
+    u64 max_seq      = 2048
     u64 num_workers  = 16
     // ========================================================
 
@@ -46,11 +49,9 @@ fn main() {
     tokenizer_set_kind_gpt2(tk)        // Qwen3 uses GPT-2 byte-level BPE.
     dealloc(tok_path)
 
-    // --- Encode prompt + wrap in Qwen3 chat template ---
-    // Qwen3-0.6B is instruct-tuned; feeding raw text → greedy decode loops.
-    // We wrap as:  <|im_start|>user\n<PROMPT><|im_end|>\n<|im_start|>assistant\n
-    // The tokenizer doesn't merge added_tokens, so special-token IDs are
-    // injected directly: <|im_start|>=151644, <|im_end|>=151645, '\n'=198.
+    // --- Pre-tokenize the role strings used in every chat template turn ---
+    // <|im_start|>=151644, <|im_end|>=151645, '\n'=198. Tokenizer doesn't
+    // merge added_tokens, so we splice special IDs in directly.
     u64 IM_START = 151644
     u64 IM_END   = 151645
     u64 NL_TOK   = 198
@@ -59,97 +60,22 @@ fn main() {
     u64 user_cnt_box   = alloc(8)
     u64 assist_box     = alloc(8)
     u64 assist_cnt_box = alloc(8)
-    u64 prompt_box     = alloc(8)
-    u64 prompt_cnt_box = alloc(8)
     unsafe { *(user_box       as u64) = 0 }
     unsafe { *(user_cnt_box   as u64) = 0 }
     unsafe { *(assist_box     as u64) = 0 }
     unsafe { *(assist_cnt_box as u64) = 0 }
-    unsafe { *(prompt_box     as u64) = 0 }
-    unsafe { *(prompt_cnt_box as u64) = 0 }
     tokenizer_encode(tk, "user",      4, user_box,   user_cnt_box)
     tokenizer_encode(tk, "assistant", 9, assist_box, assist_cnt_box)
-    u64 prompt_len_bytes = str_len(prompt_text)
-    tokenizer_encode(tk, prompt_text, prompt_len_bytes, prompt_box, prompt_cnt_box)
     u64 user_ids   = 0
     u64 user_cnt   = 0
     u64 assist_ids = 0
     u64 assist_cnt = 0
-    u64 raw_ids    = 0
-    u64 raw_cnt    = 0
     unsafe { *(user_box       as u64) -> user_ids   }
     unsafe { *(user_cnt_box   as u64) -> user_cnt   }
     unsafe { *(assist_box     as u64) -> assist_ids }
     unsafe { *(assist_cnt_box as u64) -> assist_cnt }
-    unsafe { *(prompt_box     as u64) -> raw_ids    }
-    unsafe { *(prompt_cnt_box as u64) -> raw_cnt    }
-    dealloc(user_box)
-    dealloc(user_cnt_box)
-    dealloc(assist_box)
-    dealloc(assist_cnt_box)
-    dealloc(prompt_box)
-    dealloc(prompt_cnt_box)
-
-    // Splice: [IM_START, "user", NL, raw..., IM_END, NL, IM_START, "assistant", NL]
-    u64 prompt_count = 1 + user_cnt + 1 + raw_cnt + 1 + 1 + 1 + assist_cnt + 1
-    u64 prompt_ids   = alloc(prompt_count * 4)
-    u64 wp = 0
-    u32 ims32 = IM_START
-    u32 ime32 = IM_END
-    u32 nl32  = NL_TOK
-    unsafe { *((prompt_ids + wp * 4) as uint32) = ims32 }
-    wp = wp + 1
-    u64 r = 0
-    while r < user_cnt {
-        u32 t = 0
-        unsafe { *((user_ids + r * 4) as uint32) -> t }
-        unsafe { *((prompt_ids + wp * 4) as uint32) = t }
-        wp = wp + 1
-        r = r + 1
-    }
-    unsafe { *((prompt_ids + wp * 4) as uint32) = nl32 }
-    wp = wp + 1
-    r = 0
-    while r < raw_cnt {
-        u32 t = 0
-        unsafe { *((raw_ids + r * 4) as uint32) -> t }
-        unsafe { *((prompt_ids + wp * 4) as uint32) = t }
-        wp = wp + 1
-        r = r + 1
-    }
-    unsafe { *((prompt_ids + wp * 4) as uint32) = ime32 }
-    wp = wp + 1
-    unsafe { *((prompt_ids + wp * 4) as uint32) = nl32  }
-    wp = wp + 1
-    unsafe { *((prompt_ids + wp * 4) as uint32) = ims32 }
-    wp = wp + 1
-    r = 0
-    while r < assist_cnt {
-        u32 t = 0
-        unsafe { *((assist_ids + r * 4) as uint32) -> t }
-        unsafe { *((prompt_ids + wp * 4) as uint32) = t }
-        wp = wp + 1
-        r = r + 1
-    }
-    unsafe { *((prompt_ids + wp * 4) as uint32) = nl32 }
-    wp = wp + 1
-    prompt_count = wp
-    dealloc(user_ids)
-    dealloc(assist_ids)
-    dealloc(raw_ids)
-    print_str("[qwen3_cpu] prompt=\""); print_str(prompt_text); print_str("\" → ")
-    u64 ps = fmt_dec(prompt_count); print_str(ps); dealloc(ps)
-    print_str(" tokens [")
-    u64 pi = 0
-    while pi < prompt_count {
-        if pi != 0 { print_str(", ") }
-        u32 pid32 = 0
-        unsafe { *((prompt_ids + pi * 4) as uint32) -> pid32 }
-        u64 pid = pid32
-        u64 pids = fmt_dec(pid); print_str(pids); dealloc(pids)
-        pi = pi + 1
-    }
-    print_str("]\n")
+    dealloc(user_box); dealloc(user_cnt_box)
+    dealloc(assist_box); dealloc(assist_cnt_box)
 
     // --- Load model weights ---
     u64 sf_path = str_cat(model_dir, "/model.safetensors")
@@ -161,9 +87,6 @@ fn main() {
 
     u64 n_layers = 28
     u64 vocab    = 151936
-    u64 max_seq  = prompt_count + max_new + 16
-    // Qwen3-0.6B arch: hidden=1024, head_dim=128, n_heads=16, n_kv_heads=8,
-    // ff=3072 — defaults already set in qwen3_cpu.mlr.
     u64 hidden = QWEN3_HIDDEN
     u64 kv_dim = QWEN3_KV_DIM
     u64 q_dim  = QWEN3_Q_DIM
@@ -256,7 +179,7 @@ fn main() {
     u64 gu_dim_elems     = 2 * ff
     u64 gate_bytes       = ff * qkv_row_bytes
     u64 gu_stacked_bytes = gu_dim_elems * qkv_row_bytes
-    print_str("[qwen3_cpu] fusing QKV + gate/up weights\n")
+    print_str("[qwen3_cpu] loading model + fusing QKV/gate-up weights...\n")
     li = 0
     while li < n_layers {
         u64 base = layers_arr + li * 88
@@ -284,140 +207,215 @@ fn main() {
     u64 k_cache = alloc(n_layers * layer_stride)
     u64 v_cache = alloc(n_layers * layer_stride)
 
-    // Working residual buffers (ping-pong).
+    // Working residual + logits buffers.
     u64 x_cur     = alloc(hidden * 4)
     u64 x_nxt     = alloc(hidden * 4)
     u64 final_out = alloc(hidden * 4)
     u64 logits    = alloc(vocab * 4)
 
-    // Sequence ID buffer (prompt + generated).
-    u64 seq_cap = prompt_count + max_new + 16
+    // Sequence ID buffer (whole conversation).
+    u64 seq_cap = max_seq
     u64 seq_ids = alloc(seq_cap * 4)
-    u64 si = 0
-    while si < prompt_count {
-        u32 pid32 = 0
-        unsafe { *((prompt_ids + si * 4) as uint32) -> pid32 }
-        unsafe { *((seq_ids + si * 4) as uint32) = pid32 }
-        si = si + 1
-    }
-    u64 seq_len = prompt_count
+    u64 seq_len = 0      // tokens in seq_ids
+    u64 next_pos = 0     // K/V cache slots populated so far
 
-    // --- Prefill: run forward on prompt tokens 0..N-2 to populate K/V cache ---
-    u64 prefill_start_ns = time_now()
-    u64 pos = 0
-    while pos + 1 < prompt_count {
-        u32 pt32 = 0
-        unsafe { *((seq_ids + pos * 4) as uint32) -> pt32 }
-        u64 pt = pt32
-        // Embed token pt → x_cur (bf16 row → f32).
-        u64 row_p = embed_ptr + pt * hidden * 2
-        u64 ii = 0
-        while ii < hidden {
-            f32 v = bf16_to_f32(row_p + ii * 2)
-            unsafe { *((x_cur + ii * 4) as f32) = v }
-            ii = ii + 1
+    print_str("[qwen3_cpu] ready. type '/quit' or empty line to exit.\n")
+
+    u64 first_turn = 1
+
+    while 1 == 1 {
+        // -------- read user line --------
+        print_str("\n> ")
+        u64 line = read_line(2048)
+        u64 line_len = str_len(line)
+        if line_len == 0 {
+            dealloc(line)
+            print_str("[qwen3_cpu] bye.\n")
+            break
         }
-        u64 layer = 0
-        while layer < n_layers {
-            Qwen3LayerWeights w = layers_arr + layer * 88
-            u64 kc = k_cache + layer * layer_stride
-            u64 vc = v_cache + layer * layer_stride
-            qwen3_forward_layer(x_nxt, x_cur, w, pos, kc, vc, num_workers)
-            u64 tmp = x_cur; x_cur = x_nxt; x_nxt = tmp
-            layer = layer + 1
-        }
-        pos = pos + 1
-    }
-    u64 prefill_ns = time_elapsed(prefill_start_ns)
-    print_str("[qwen3_cpu] prefill_ms="); u64 pms = fmt_dec(prefill_ns / 1000000); print_str(pms); dealloc(pms); print_str("\n")
-
-    // Embed the last prompt token into x_cur for the first decode step.
-    u32 last_pt32 = 0
-    unsafe { *((seq_ids + (prompt_count - 1) * 4) as uint32) -> last_pt32 }
-    u64 last_pt = last_pt32
-    u64 row_l = embed_ptr + last_pt * hidden * 2
-    u64 jj = 0
-    while jj < hidden {
-        f32 v = bf16_to_f32(row_l + jj * 2)
-        unsafe { *((x_cur + jj * 4) as f32) = v }
-        jj = jj + 1
-    }
-
-    // --- Decode loop ---
-    u64 decode_start_ns = time_now()
-    u64 step = 0
-    while step < max_new {
-        // Run all 28 layers.
-        u64 layer = 0
-        while layer < n_layers {
-            Qwen3LayerWeights w = layers_arr + layer * 88
-            u64 kc = k_cache + layer * layer_stride
-            u64 vc = v_cache + layer * layer_stride
-            qwen3_forward_layer(x_nxt, x_cur, w, pos, kc, vc, num_workers)
-            u64 tmp = x_cur; x_cur = x_nxt; x_nxt = tmp
-            layer = layer + 1
+        u64 is_quit = 0
+        if str_compare(line, "/quit") == 0 { is_quit = 1 }
+        if str_compare(line, "/exit") == 0 { is_quit = 1 }
+        if is_quit == 1 {
+            dealloc(line)
+            print_str("[qwen3_cpu] bye.\n")
+            break
         }
 
-        // Final rmsnorm + lm_head.
-        qwen3_rmsnorm_bf16(final_out, x_cur, norm_ptr, hidden)
-        qwen3_main_matmul(logits, final_out, embed_ptr, 1, vocab, hidden, num_workers, 0)
+        // -------- tokenize user message --------
+        u64 msg_box     = alloc(8); unsafe { *(msg_box     as u64) = 0 }
+        u64 msg_cnt_box = alloc(8); unsafe { *(msg_cnt_box as u64) = 0 }
+        tokenizer_encode(tk, line, line_len, msg_box, msg_cnt_box)
+        u64 msg_ids = 0; unsafe { *(msg_box     as u64) -> msg_ids }
+        u64 msg_cnt = 0; unsafe { *(msg_cnt_box as u64) -> msg_cnt }
+        dealloc(msg_box); dealloc(msg_cnt_box)
+        dealloc(line)
 
-        // Greedy argmax over vocab.
-        u64 best_id = 0
-        f32 best_val = 0.0f
-        u64 first = 1
-        u64 j = 0
-        while j < vocab {
-            f32 lv = 0.0f
-            unsafe { *((logits + j * 4) as f32) -> lv }
-            if first == 1 { best_val = lv; best_id = j; first = 0 }
-            else { if lv > best_val { best_val = lv; best_id = j } }
-            j = j + 1
+        // -------- append turn extension to seq_ids --------
+        //   first turn:  [IM_START, "user", NL, msg..., IM_END, NL, IM_START, "assistant", NL]
+        //   subsequent:  [NL, IM_START, "user", NL, msg..., IM_END, NL, IM_START, "assistant", NL]
+        u64 lead = 0
+        if first_turn == 0 { lead = 1 }
+        u64 ext_count = lead + 1 + user_cnt + 1 + msg_cnt + 1 + 1 + 1 + assist_cnt + 1
+        if seq_len + ext_count + max_new > seq_cap {
+            print_str("[qwen3_cpu] conversation exceeds max_seq="); u64 ms = fmt_dec(max_seq); print_str(ms); dealloc(ms)
+            print_str(" — start a new session.\n")
+            dealloc(msg_ids)
+            break
         }
 
-        u32 best_id32 = best_id
-        unsafe { *((seq_ids + seq_len * 4) as uint32) = best_id32 }
+        u32 ims32 = IM_START
+        u32 ime32 = IM_END
+        u32 nl32  = NL_TOK
+        if lead == 1 {
+            unsafe { *((seq_ids + seq_len * 4) as uint32) = nl32 }
+            seq_len = seq_len + 1
+        }
+        unsafe { *((seq_ids + seq_len * 4) as uint32) = ims32 }
         seq_len = seq_len + 1
-
-        // Stop at <|im_end|> = 151645 (the assistant turn's end-of-turn marker).
-        if best_id == 151645 { step = max_new; continue }
-
-        // Embed best_id into x_cur for next step.
-        u64 row_n = embed_ptr + best_id * hidden * 2
-        u64 kk = 0
-        while kk < hidden {
-            f32 v = bf16_to_f32(row_n + kk * 2)
-            unsafe { *((x_cur + kk * 4) as f32) = v }
-            kk = kk + 1
+        u64 r = 0
+        while r < user_cnt {
+            u32 t = 0
+            unsafe { *((user_ids + r * 4) as uint32) -> t }
+            unsafe { *((seq_ids + seq_len * 4) as uint32) = t }
+            seq_len = seq_len + 1
+            r = r + 1
         }
-        pos = pos + 1
-        step = step + 1
+        unsafe { *((seq_ids + seq_len * 4) as uint32) = nl32 }
+        seq_len = seq_len + 1
+        r = 0
+        while r < msg_cnt {
+            u32 t = 0
+            unsafe { *((msg_ids + r * 4) as uint32) -> t }
+            unsafe { *((seq_ids + seq_len * 4) as uint32) = t }
+            seq_len = seq_len + 1
+            r = r + 1
+        }
+        unsafe { *((seq_ids + seq_len * 4) as uint32) = ime32 }
+        seq_len = seq_len + 1
+        unsafe { *((seq_ids + seq_len * 4) as uint32) = nl32  }
+        seq_len = seq_len + 1
+        unsafe { *((seq_ids + seq_len * 4) as uint32) = ims32 }
+        seq_len = seq_len + 1
+        r = 0
+        while r < assist_cnt {
+            u32 t = 0
+            unsafe { *((assist_ids + r * 4) as uint32) -> t }
+            unsafe { *((seq_ids + seq_len * 4) as uint32) = t }
+            seq_len = seq_len + 1
+            r = r + 1
+        }
+        unsafe { *((seq_ids + seq_len * 4) as uint32) = nl32 }
+        seq_len = seq_len + 1
+        dealloc(msg_ids)
+
+        // -------- prefill: forward through all but the last new token --------
+        u64 prefill_start_ns = time_now()
+        while next_pos + 1 < seq_len {
+            u32 pt32 = 0
+            unsafe { *((seq_ids + next_pos * 4) as uint32) -> pt32 }
+            u64 pt = pt32
+            u64 row_p = embed_ptr + pt * hidden * 2
+            u64 ii = 0
+            while ii < hidden {
+                f32 v = bf16_to_f32(row_p + ii * 2)
+                unsafe { *((x_cur + ii * 4) as f32) = v }
+                ii = ii + 1
+            }
+            u64 layer = 0
+            while layer < n_layers {
+                Qwen3LayerWeights w = layers_arr + layer * 88
+                u64 kc = k_cache + layer * layer_stride
+                u64 vc = v_cache + layer * layer_stride
+                qwen3_forward_layer(x_nxt, x_cur, w, next_pos, kc, vc, num_workers)
+                u64 tmp = x_cur; x_cur = x_nxt; x_nxt = tmp
+                layer = layer + 1
+            }
+            next_pos = next_pos + 1
+        }
+        u64 prefill_ns = time_elapsed(prefill_start_ns)
+
+        // Embed the last appended token (the trailing NL before assistant turn).
+        u32 last_pt32 = 0
+        unsafe { *((seq_ids + (seq_len - 1) * 4) as uint32) -> last_pt32 }
+        u64 last_pt = last_pt32
+        u64 row_l = embed_ptr + last_pt * hidden * 2
+        u64 jj = 0
+        while jj < hidden {
+            f32 v = bf16_to_f32(row_l + jj * 2)
+            unsafe { *((x_cur + jj * 4) as f32) = v }
+            jj = jj + 1
+        }
+
+        // -------- decode loop --------
+        u64 reply_start = seq_len
+        u64 decode_start_ns = time_now()
+        u64 step = 0
+        u64 hit_eos = 0
+        while step < max_new {
+            u64 layer = 0
+            while layer < n_layers {
+                Qwen3LayerWeights w = layers_arr + layer * 88
+                u64 kc = k_cache + layer * layer_stride
+                u64 vc = v_cache + layer * layer_stride
+                qwen3_forward_layer(x_nxt, x_cur, w, next_pos, kc, vc, num_workers)
+                u64 tmp = x_cur; x_cur = x_nxt; x_nxt = tmp
+                layer = layer + 1
+            }
+            qwen3_rmsnorm_bf16(final_out, x_cur, norm_ptr, hidden)
+            qwen3_main_matmul(logits, final_out, embed_ptr, 1, vocab, hidden, num_workers, 0)
+
+            u64 best_id = 0
+            f32 best_val = 0.0f
+            u64 first_lv = 1
+            u64 j = 0
+            while j < vocab {
+                f32 lv = 0.0f
+                unsafe { *((logits + j * 4) as f32) -> lv }
+                if first_lv == 1 { best_val = lv; best_id = j; first_lv = 0 }
+                else { if lv > best_val { best_val = lv; best_id = j } }
+                j = j + 1
+            }
+
+            u32 best_id32 = best_id
+            unsafe { *((seq_ids + seq_len * 4) as uint32) = best_id32 }
+            seq_len = seq_len + 1
+            next_pos = next_pos + 1
+
+            if best_id == 151645 { hit_eos = 1; step = max_new; continue }
+            if seq_len >= seq_cap { step = max_new; continue }
+
+            u64 row_n = embed_ptr + best_id * hidden * 2
+            u64 kk = 0
+            while kk < hidden {
+                f32 v = bf16_to_f32(row_n + kk * 2)
+                unsafe { *((x_cur + kk * 4) as f32) = v }
+                kk = kk + 1
+            }
+            step = step + 1
+        }
+        u64 decode_ns = time_elapsed(decode_start_ns)
+
+        // -------- print assistant's reply (strip trailing <|im_end|>) --------
+        u64 reply_len = seq_len - reply_start
+        if hit_eos == 1 && reply_len > 0 { reply_len = reply_len - 1 }
+        u64 reply_ptr = seq_ids + reply_start * 4
+        u64 out_text = tokenizer_decode(tk, reply_ptr, reply_len)
+        print_str(out_text)
+        dealloc(out_text)
+        print_str("\n")
+
+        // Light timing footer (commented out — uncomment for perf measurements):
+        // u64 dms = fmt_dec(decode_ns / 1000000)
+        // u64 rl  = fmt_dec(reply_len)
+        // print_str("[qwen3_cpu] "); print_str(rl); dealloc(rl)
+        // print_str(" tok in "); print_str(dms); dealloc(dms); print_str(" ms\n")
+
+        first_turn = 0
     }
-    u64 decode_ns = time_elapsed(decode_start_ns)
 
-    // --- Decode only the assistant's response (skip the templated prompt) ---
-    print_str("\n=== OUTPUT ===\n")
-    u64 reply_start = prompt_count
-    u64 reply_len   = seq_len - prompt_count
-    u64 reply_ids   = seq_ids + reply_start * 4
-    // Trim trailing <|im_end|> from the printed reply.
-    if reply_len > 0 {
-        u32 last_t = 0
-        unsafe { *((reply_ids + (reply_len - 1) * 4) as uint32) -> last_t }
-        if last_t == 151645 { reply_len = reply_len - 1 }
-    }
-    u64 out_text = tokenizer_decode(tk, reply_ids, reply_len)
-    print_str(out_text)
-    dealloc(out_text)
-    print_str("\n\n")
-
-    // Stats.
-    u64 dms = fmt_dec(decode_ns / 1000000)
-    print_str("[qwen3_cpu] decoded "); u64 mns = fmt_dec(max_new); print_str(mns); dealloc(mns)
-    print_str(" tokens in "); print_str(dms); dealloc(dms); print_str(" ms\n")
-
-    // Cleanup (best-effort; the kernel will reclaim on exit anyway).
-    dealloc(prompt_ids)
+    // Cleanup.
+    dealloc(user_ids); dealloc(assist_ids)
     tokenizer_free(tk)
     thread_pool_shutdown()
     exit(0)
