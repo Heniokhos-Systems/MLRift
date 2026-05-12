@@ -77,6 +77,11 @@ static u64 g_fd = 0
 // never loaded (slice 6.5 fixed the gating in std/inference_gpu.mlr).
 static u64 _mk_fired_once     = 0
 static u64 _speck4_fired_once = 0
+// Slice 6.7e-bis — speck4 per-phase intermediate-buffer dump flag.
+// Gated by MLRIFT_LLAMA_SPECK4_DUMP=1; fires exactly once (first speck4 call,
+// first layer of that call) so we can compare phase-by-phase against the
+// known-correct M=1 mega-kernel reference (MLRIFT_MEGAK_DUMP_LAYER=0).
+static u64 _speck4_dump_done  = 0
 fn eout(u64 s) {
     print_str(s)
     if g_fd != 0 {
@@ -137,6 +142,64 @@ fn _dump_buf(u64 label, u64 ptr, u64 n) {
     eout(" max="); u64 sm = fmt_f32(vmax, 6); eout(sm); dealloc(sm)
     eout(" min="); u64 sn = fmt_f32(vmin, 6); eout(sn); dealloc(sn)
     eout("\n")
+}
+
+// Slice 6.7e-bis — speck4 per-phase dump.  D2H-copies n_elems f32 values
+// from d_ptr + stream_idx * n_elems * 4 into a scratch host buffer and
+// prints head8 / tail4 / sum / min / max.  Same level of detail as
+// _dump_buf so the speck4-vs-M=1 phase comparison reads naturally.
+// d_ptr MUST be a plain hipMalloc'd device pointer (speck4 phase slabs
+// are allocated this way at line ~739); we explicitly hipMemcpy(D2H).
+fn _dump_speck4_buf(u64 label, u64 d_ptr, u64 n_elems, u64 stream_idx) {
+    if d_ptr == 0 { return }
+    u64 bytes = n_elems * 4
+    u64 host = alloc(bytes)
+    u32 cerr = hipMemcpy(host, d_ptr + stream_idx * bytes, bytes, 2)   // D2H
+    if cerr != 0 {
+        eout("  [dump-speck4] "); eout(label); eout(" stream "); eu64(stream_idx)
+        eout(" D2H FAIL rc="); u64 rs = fmt_dec(cerr); eout(rs); dealloc(rs); eout("\n")
+        dealloc(host)
+        return
+    }
+    eout("  [dump-speck4] "); eout(label); eout(" stream "); eu64(stream_idx)
+    eout(" n="); eu64(n_elems); eout("\n    head8:")
+    u64 head_cnt = 8
+    if n_elems < head_cnt { head_cnt = n_elems }
+    u64 i = 0
+    while i < head_cnt {
+        f32 v = 0.0f; unsafe { *((host + i * 4) as f32) -> v }
+        eout(" "); u64 s = fmt_f32(v, 6); eout(s); dealloc(s)
+        i = i + 1
+    }
+    eout("\n    tail4:")
+    u64 tail_start = n_elems
+    if n_elems > 4 { tail_start = n_elems - 4 }
+    i = tail_start
+    while i < n_elems {
+        f32 v = 0.0f; unsafe { *((host + i * 4) as f32) -> v }
+        eout(" "); u64 s = fmt_f32(v, 6); eout(s); dealloc(s)
+        i = i + 1
+    }
+    f64 sum = 0.0
+    f32 vmax = 0.0f
+    f32 vmin = 0.0f
+    u64 first = 1
+    i = 0
+    while i < n_elems {
+        f32 v = 0.0f; unsafe { *((host + i * 4) as f32) -> v }
+        sum = sum + f32_to_f64(v)
+        if first == 1 { vmax = v; vmin = v; first = 0 }
+        else {
+            if v > vmax { vmax = v }
+            if v < vmin { vmin = v }
+        }
+        i = i + 1
+    }
+    eout("\n    sum="); u64 ss = fmt_f64(sum, 6); eout(ss); dealloc(ss)
+    eout(" max="); u64 sm = fmt_f32(vmax, 6); eout(sm); dealloc(sm)
+    eout(" min="); u64 sn = fmt_f32(vmin, 6); eout(sn); dealloc(sn)
+    eout("\n")
+    dealloc(host)
 }
 
 // Slice 6.4 — Phase B PLD (Prompt Lookup Decoding) draft proposer.
@@ -296,6 +359,23 @@ fn main() {
     u64 vocab     = 128256
     u64 max_seq   = 64
     u64 max_new   = 20
+    // MLRIFT_QWEN3_MAX_NEW: shorten the decode loop so dump/bisect runs
+    // finish quickly (max_new=1 is enough to capture per-phase dumps).
+    u64 _ev_mn_l = getenv("MLRIFT_QWEN3_MAX_NEW")
+    if _ev_mn_l != 0 {
+        u64 _mn_val = 0
+        u64 _mn_i = 0
+        u8 _mn_c0 = 0; unsafe { *((_ev_mn_l + 0) as u8) -> _mn_c0 }
+        if _mn_c0 >= 48 && _mn_c0 <= 57 {
+            while _mn_i < 4 {
+                u8 _mn_c = 0; unsafe { *((_ev_mn_l + _mn_i) as u8) -> _mn_c }
+                if _mn_c < 48 { _mn_i = 4 }
+                else if _mn_c > 57 { _mn_i = 4 }
+                else { _mn_val = _mn_val * 10 + (_mn_c - 48); _mn_i = _mn_i + 1 }
+            }
+            if _mn_val > 0 && _mn_val <= 20 { max_new = _mn_val }
+        }
+    }
     // MLRIFT_LLAMA_SPECK4_MAX_PHASE: bisect speck4 kernel by limiting which
     // phases run.  7 = all phases through 17 (default, full layer).  Lower
     // values stop early so we can dump partial intermediates and compare to
@@ -897,11 +977,31 @@ fn main() {
                 x_nxt = tmp
             }
             // Slice 6.7b — per-layer output dump diagnostic.  Enabled when
-            // MLRIFT_MEGAK_DUMP_LAYER=N matches the current layer (and step 0
-            // only).  Prints first 8 + last 4 floats + sum + max + min of
-            // the residual stream AFTER this layer ran.  Allows bisecting
-            // mega-kernel-vs-CPU divergence layer-by-layer.
-            if step == 0 {
+            // MLRIFT_MEGAK_DUMP_LAYER=N matches the current layer (default
+            // at step 0; override with MLRIFT_MEGAK_DUMP_STEP=K to dump at
+            // step K instead — used by the speck4 bisection so the M=1
+            // reference dump and the first-speck4-call dump are taken
+            // from the SAME input token at the SAME pos).  Prints first 8 +
+            // last 4 floats + sum + max + min of the residual stream AFTER
+            // this layer ran.  Allows bisecting mega-kernel-vs-CPU
+            // divergence layer-by-layer.
+            u64 _dump_step_target = 0
+            u64 _ev_ds = getenv("MLRIFT_MEGAK_DUMP_STEP")
+            if _ev_ds != 0 {
+                u64 _ds_val = 0
+                u64 _ds_i = 0
+                u8 _ds_c0 = 0; unsafe { *((_ev_ds + 0) as u8) -> _ds_c0 }
+                if _ds_c0 >= 48 && _ds_c0 <= 57 {
+                    while _ds_i < 4 {
+                        u8 _ds_c = 0; unsafe { *((_ev_ds + _ds_i) as u8) -> _ds_c }
+                        if _ds_c < 48 { _ds_i = 4 }
+                        else if _ds_c > 57 { _ds_i = 4 }
+                        else { _ds_val = _ds_val * 10 + (_ds_c - 48); _ds_i = _ds_i + 1 }
+                    }
+                    _dump_step_target = _ds_val
+                }
+            }
+            if step == _dump_step_target {
                 u64 ev_dl = getenv("MLRIFT_MEGAK_DUMP_LAYER")
                 if ev_dl != 0 {
                     u64 dl_n = 999
@@ -1156,6 +1256,38 @@ fn main() {
                                         sl_ok = 0
                                         layer_s = n_layers
                                     } else {
+                                        // Slice 6.7e-bis — per-phase dump for layer 0
+                                        // of the FIRST speck4 call only. Mirrors the
+                                        // M=1 dump path so we can bisect speck4-vs-M=1
+                                        // divergence phase-by-phase. Each speck4 phase
+                                        // buffer has M_EFF_S4=4 streams stacked
+                                        // contiguously; we dump stream 0 (token =
+                                        // best_id, == M=1's next input) so the M=1
+                                        // reference is directly comparable.
+                                        if layer_s == 0 && _speck4_dump_done == 0 {
+                                            u64 _ev_s4d = getenv("MLRIFT_LLAMA_SPECK4_DUMP")
+                                            if _ev_s4d != 0 {
+                                                u8 _s4d_c = 0; unsafe { *(_ev_s4d as u8) -> _s4d_c }
+                                                if _s4d_c != 48 {
+                                                    gpu_pipeline_flush()
+                                                    u64 qkv_dim_dbg = q_dim + 2 * kv_dim
+                                                    eout("[dump-speck4] layer=0 first-call begin (stream 0 = best_id; matches M=1 input)\n")
+                                                    _dump_speck4_buf("b_x_norm_g_4",   d_b_x_norm_g_4,   hidden,      0)
+                                                    _dump_speck4_buf("b_qkv_g_4",      d_b_qkv_g_4,      qkv_dim_dbg, 0)
+                                                    _dump_speck4_buf("b_attn_q_g_4",   d_b_attn_q_g_4,   q_dim,       0)
+                                                    _dump_speck4_buf("b_attn_out_g_4", d_b_attn_out_g_4, q_dim,       0)
+                                                    _dump_speck4_buf("b_mid_g_4",      d_b_mid_g_4,      hidden,      0)
+                                                    _dump_speck4_buf("b_mid_norm_g_4", d_b_mid_norm_g_4, hidden,      0)
+                                                    // gu_scratch is [4, 2*ff] but the
+                                                    // post-silu_mul payload lives in
+                                                    // the first FF floats per stream
+                                                    // (matches M=1 dump convention).
+                                                    _dump_speck4_buf("gu_scratch_4[0..FF]", d_gu_scratch_4, ff, 0)
+                                                    _speck4_dump_done = 1
+                                                    eout("[dump-speck4] layer=0 first-call end\n")
+                                                }
+                                            }
+                                        }
                                         u64 tmp4 = d_in_4_cur
                                         d_in_4_cur  = d_out_4_cur
                                         d_out_4_cur = tmp4
