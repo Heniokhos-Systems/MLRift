@@ -1,0 +1,130 @@
+// qwen3-0.6B SPECK8 layer mega-kernel as a MLRift @kernel.
+//
+// Slice 4.21.0 — port of the legacy hipcc-compiled mks8 to MLRift's
+// AST-walker emit path.  Identical body shape to qwen3_layer_megakernel_speck4
+// (9 phases + 8 mega_barrier calls) but with M_EFF=8 streams:
+//   - Phase 5 outer-WG cap: 8 * 32 = 256 (vs speck4's 128, vs base's 32)
+//   - All `_speck4` markers reused: dispatch by KERNEL NAME (slice 5.0
+//     name-dispatcher sets MEGA_M_EFF=8 when name starts with
+//     "qwen3_layer_megakernel_speck8").  Per-stream emit loops bump from
+//     unrolled-4 to MEGA_M_EFF-driven (slice 4.21.1).
+//
+// WG_PERSIST = 512 (unchanged from base / speck4).  attn_w_lds at
+// M_EFF=8 × MAX_SEQ_LDS=128 = 4 KB / WG (within the existing
+// MEGA_LDS_SPECK4=2080 byte allocation needs bumping — fixed in slice
+// 4.21.1).
+//
+// Build the .co:
+//   ./build/mlrc --emit-amdgpu-qwen3-megakernel-speck8-v2=/tmp/qwen3_layer_megakernel_speck8_v2.co \
+//       examples/llm/qwen3_layer_megakernel_speck8.mlr
+//
+// Use at runtime:
+//   MLRIFT_NATIVE_MEGAKERNEL=2 ./build/qwen3_generate ...    (unified flag)
+//   MLRIFT_NATIVE_MEGAKERNEL_SPECK8=2 ./build/qwen3_generate ... (per-variant
+//                                                                override)
+
+// CPU stubs for block_idx_x / tid_local_x — the recognizer pattern-matches
+// the @kernel body via AST walk; these are never called on AMDGPU.
+fn block_idx_x() -> uint64 { return 0 }
+fn tid_local_x()  -> uint64 { return 0 }
+
+// All speck4 markers reused.  Kernel-name dispatch in
+// megakernel_dispatch_arch picks the MEGA_M_EFF=8 preset; per-stream
+// emitters (slice 4.21.1+) loop m=0..MEGA_M_EFF-1.
+fn rmsnorm_wg0_speck4_marker() { }
+fn qkv_matmul_speck4_marker() { }
+fn qkv_split_qknorm_rope_speck4_marker() { }
+fn attn_decode_coop_speck4_marker() { }
+fn oproj_residual_speck4_marker() { }
+fn post_norm_speck4_marker() { }
+fn gate_up_matmul_speck4_marker() { }
+fn silu_mul_elem_strided_speck4_marker() { }
+fn down_residual_speck4_marker() { }
+
+@kernel
+fn qwen3_layer_megakernel_speck8(
+    uint64 in_residual,        //  0
+    uint64 out_residual,       //  1
+    uint64 qkv_w,              //  2
+    uint64 o_w,                //  3
+    uint64 gate_up_w,          //  4
+    uint64 down_w,             //  5
+    uint64 in_norm_g,          //  6
+    uint64 post_norm_g,        //  7
+    uint64 q_norm_g,           //  8
+    uint64 k_norm_g,           //  9
+    uint64 rope_cos,           // 10  (per-m: rope_cos[m * HEAD_DIM/2])
+    uint64 rope_sin,           // 11  (per-m: rope_sin[m * HEAD_DIM/2])
+    uint64 kc_layer,           // 12
+    uint64 vc_layer,           // 13
+    uint64 pos_base,           // 14  (by_value u64; per-m pos = pos_base + m)
+    uint64 barrier_counter,    // 15
+    uint64 gu_scratch,         // 16  (per-m base: m * 2*FF*4 bytes)
+    uint64 b_x_norm_g,         // 17  (per-m base: m * HIDDEN*4 bytes)
+    uint64 b_qkv_g,            // 18  (per-m base: m * QKV_DIM*4 bytes)
+    uint64 b_attn_q_g,         // 19  (per-m base: m * Q_DIM*4 bytes)
+    uint64 b_mid_g,            // 20  (per-m base: m * HIDDEN*4 bytes)
+    uint64 b_mid_norm_g,       // 21  (per-m base: m * HIDDEN*4 bytes)
+    uint64 b_attn_out_g,       // 22  (per-m base: m * Q_DIM*4 bytes)
+    uint64 max_phase           // 23  (by_value u64)
+) {
+    uint64 wg_id = block_idx_x()
+    uint64 lane  = tid_local_x()
+
+    if wg_id == 0 {
+        rmsnorm_wg0_speck4_marker()        // phase 1: input rmsnorm × M_EFF=8
+    }
+    mega_barrier(barrier_counter, 0, 512)
+    if max_phase < 1 { return }
+
+    if wg_id < 256 {
+        qkv_matmul_speck4_marker()         // phase 3: QKV matmul × M_EFF=8
+    }
+    mega_barrier(barrier_counter, 1, 512)
+    if max_phase < 2 { return }
+
+    if wg_id < 256 {
+        qkv_split_qknorm_rope_speck4_marker()   // phase 5: 256 WGs flat (m, head)
+                                                // (vs speck4=128, base=32) —
+                                                // 8 * (16 + 2*8) = 256
+    }
+    mega_barrier(barrier_counter, 2, 512)
+    if max_phase < 3 { return }
+
+    if wg_id < 64 {
+        attn_decode_coop_speck4_marker()   // phase 7: 64 WGs, internal m=0..7 loop
+    }
+    mega_barrier(barrier_counter, 3, 512)
+    if max_phase < 4 { return }
+
+    if wg_id < 256 {
+        oproj_residual_speck4_marker()     // phase 9: o_proj + residual × M_EFF=8
+    }
+    mega_barrier(barrier_counter, 4, 512)
+    if max_phase < 5 { return }
+
+    if wg_id == 0 {
+        post_norm_speck4_marker()          // phase 11: post_norm rmsnorm × M_EFF=8
+    }
+    mega_barrier(barrier_counter, 5, 512)
+    if max_phase < 6 { return }
+
+    if wg_id < 256 {
+        gate_up_matmul_speck4_marker()     // phase 13: gate_up matmul × M_EFF=8
+    }
+    mega_barrier(barrier_counter, 6, 512)
+    if max_phase < 7 { return }
+
+    if wg_id < 256 {
+        silu_mul_elem_strided_speck4_marker()  // phase 15: SiLU(gate)*up × M_EFF=8
+    }
+    mega_barrier(barrier_counter, 7, 512)
+
+    if wg_id < 256 {
+        down_residual_speck4_marker()      // phase 17: down_w + final residual × M_EFF=8
+    }
+}
+
+fn main() {
+    exit(0)
+}

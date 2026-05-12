@@ -158,15 +158,30 @@ Token-id output of every MLRift row is bit-identical to HuggingFace
 | **+ post-4.20 lm_head bf16-direct (fb2de6a + 226b2e2, 2026-05-12)** | bf16 / f32 | **229.8** | **2 046** | **3.68× vs ROCm bf16** |
 | MLRift + `GPU_FULL_FORWARD` + `SPEC_K=4` + LONG-prompt (per-op PLD path, pre-mega) | bf16 / f32 | 72.0 | 1 920 | 0.97× vs ROCm bf16 |
 
-> **Reproducing the 229.8 tok/s mks16 number** requires `MLRIFT_PLD_BENCH=1`
-> alongside `MLRIFT_LONG_PROMPT=1` — the latter alone now uses a
-> human-readable "Hello, who are you?" prefill (CPU-driver smoke), which
-> has no repeating 2-grams and starves PLD speculation.  `PLD_BENCH=1`
-> restores the original `[14990,14582]×8` bigram pattern that gives the
-> mks-K paths 99-100 % accept rate at their designed peak.  Also run
-> `scripts/rebuild_helper_cos.sh` first — mks8/mks16 are hipcc-compiled
-> (no v2 AST-walker port yet) and are absent from `/tmp` after machine
-> reset.  See [`docs/SLICE4_MEGAKERNEL_DESIGN.md`](docs/SLICE4_MEGAKERNEL_DESIGN.md#reproducer-2026-05-12) for the full env block.
+> **Caveat (2026-05-12): mks8 / mks16 are still hipcc-compiled.**  The
+> 229.8 / 216.4 / 201.6 numbers above all flow through
+> `qwen3_layer_megakernel_speck{8,16}.co` files that are built by
+> `hipcc --offload-arch=gfx1100 --genco` from the matching
+> `examples/llm/*.hip.cpp` sources.  This contradicts MLRift's "no
+> hipcc, no LLVM, no clang in the build path" headline.  The M=1 mega
+> (88 tok/s, 1.19× vs ROCm bf16) and mks4 (169.3 tok/s, 2.71× vs
+> ROCm bf16) numbers DO run on AST-walker-emitted `.co` files
+> (`--emit-amdgpu-qwen3-megakernel-v2` / `-speck4-v2`) and ship the
+> destroy-PyTorch claim cleanly.  Slices 4.21+ port mks8 and mks16 to
+> the same AST-walker pipeline; until they land, the mks-K rows above
+> have an hipcc footnote.
+>
+> **Reproducing the 229.8 tok/s mks16 number** requires
+> `MLRIFT_PLD_BENCH=1` alongside `MLRIFT_LONG_PROMPT=1` — the latter
+> alone now uses a human-readable "Hello, who are you?" prefill
+> (CPU-driver smoke), which has no repeating 2-grams and starves PLD
+> speculation.  `PLD_BENCH=1` restores the original `[14990,14582]×8`
+> bigram pattern that gives the mks-K paths 99-100 % accept rate at
+> their designed peak.  Also run `scripts/rebuild_helper_cos.sh`
+> first — mks8/mks16 are hipcc-compiled (no v2 AST-walker port yet)
+> and are absent from `/tmp` after machine reset.  See
+> [`docs/SLICE4_MEGAKERNEL_DESIGN.md`](docs/SLICE4_MEGAKERNEL_DESIGN.md#reproducer-2026-05-12)
+> for the full env block.
 
 The matmul-only rows route only the matmul + lm_head through native
 gfx1100 ISA; qknorm, rope, attn, residuals still run CPU.  The
