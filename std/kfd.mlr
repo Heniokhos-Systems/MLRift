@@ -22,6 +22,56 @@ static uint64 _kfd_gpuvm_limit = 0
 static uint64 _kfd_scratch_base = 0
 static uint64 _kfd_scratch_limit = 0
 
+// Resolve a POSIX errno number to its canonical glibc name. Returns a
+// pointer to a static string. Covers the codes KFD ioctls are likely
+// to surface from kernel-side path drivers/gpu/drm/amd/amdkfd. Falls
+// through to "UNKNOWN" for anything else.
+fn kfd_errno_name(uint32 e) -> uint64 {
+    if e ==   1 { return "EPERM"  }      // permission
+    if e ==   2 { return "ENOENT" }      // missing /sys node etc.
+    if e ==   5 { return "EIO"    }      // hardware fault
+    if e ==  11 { return "EAGAIN" }      // transient busy
+    if e ==  12 { return "ENOMEM" }      // VM / VRAM exhausted
+    if e ==  13 { return "EACCES" }      // /dev/kfd permissions
+    if e ==  14 { return "EFAULT" }      // bad args ptr
+    if e ==  16 { return "EBUSY"  }      // GPU resource in use by another client
+    if e ==  22 { return "EINVAL" }      // bad drm_fd / gpu_id combo
+    if e ==  28 { return "ENOSPC" }      // PASID / VMID exhausted
+    if e == 110 { return "ETIMEDOUT" }   // firmware stuck
+    return "UNKNOWN"
+}
+
+// Write a NUL-terminated string to stderr at its natural length. Used
+// by the ACQUIRE_VM diagnostic to print labels + symbolic names without
+// pulling in std/string. Mirrors kfd_die's inline strlen.
+fn _kfd_eprint_str(uint64 s) {
+    uint64 n = 0
+    while 1 == 1 {
+        uint64 ch = 0
+        unsafe { *((s + n) as uint8) -> ch }
+        if ch == 0 { break }
+        n = n + 1
+    }
+    write(2, s, n)
+}
+
+// Write a uint32 in decimal to stderr.
+fn _kfd_eprint_u32(uint32 v) {
+    uint64 buf = alloc(16)
+    uint64 n = 0
+    uint64 tmp = v
+    if tmp == 0 { unsafe { *(buf as uint8) = 48 }; n = 1 }
+    while tmp > 0 { n = n + 1; tmp = tmp / 10 }
+    uint64 i = n; tmp = v
+    while i > 0 {
+        i = i - 1
+        uint64 d = tmp - (tmp / 10) * 10
+        uint64 p = buf + i; uint8 c = d + 48; unsafe { *(p as uint8) = c }
+        tmp = tmp / 10
+    }
+    write(2, buf, n)
+}
+
 fn kfd_die(uint64 msg, uint64 code) {
     // Compute the real null-terminated length so the diagnostic doesn't
     // overflow into adjacent rodata strings (was a fixed 100-byte write).
@@ -91,7 +141,42 @@ fn kfd_init() -> uint32 {
 
     // ACQUIRE_VM
     r = raw_kfd_acquire_vm(fd, drm, gid)
-    if r != 0 { kfd_die("kfd_init: ACQUIRE_VM failed", r) }
+    if r != 0 {
+        // The wrapper relays glibc's ioctl return as uint32 (-1 →
+        // 0xFFFFFFFF). The real kernel-side reason is in `errno`.
+        // Surface enough state to distinguish "another client is
+        // hogging the device" (EBUSY/EAGAIN) from misconfiguration
+        // (EINVAL/EACCES) from hardware exhaustion (ENOMEM/ENOSPC),
+        // and from a wedged firmware (EIO/ETIMEDOUT). Diagnostic
+        // mirrors strace + lsof + dmesg in one place.
+        uint32 errno_val = kfd_errno_get()
+        write(2, "kfd_init: ACQUIRE_VM failed\n", 28)
+        write(2, "  ioctl_ret = ", 14); _kfd_eprint_u32(r);         write(2, "\n", 1)
+        write(2, "  errno     = ", 14); _kfd_eprint_u32(errno_val); write(2, " (", 2)
+        _kfd_eprint_str(kfd_errno_name(errno_val));                 write(2, ")\n", 2)
+        write(2, "  kfd_fd    = ", 14); _kfd_eprint_u32(fd);        write(2, "\n", 1)
+        write(2, "  drm_fd    = ", 14); _kfd_eprint_u32(drm);       write(2, "\n", 1)
+        write(2, "  gpu_id    = ", 14); _kfd_eprint_u32(gid);       write(2, "\n", 1)
+        write(2, "  num_gpus  = ", 14); _kfd_eprint_u32(nn);        write(2, "\n", 1)
+        if errno_val == 16 {       // EBUSY
+            write(2, "  hint: another KFD client already owns this GPU's VM context.\n", 64)
+            write(2, "        check `fuser /dev/kfd` and `lsof /dev/dri/renderD128`.\n", 63)
+        } else if errno_val == 11 { // EAGAIN
+            write(2, "  hint: KFD transiently busy; firmware is mid-handoff. Retry,\n", 63)
+            write(2, "        or wait for the holding process to release its queues.\n", 64)
+        } else if errno_val == 22 { // EINVAL
+            write(2, "  hint: drm_fd does not match the KFD-reported gpu_id, or the\n", 63)
+            write(2, "        KFD process is already bound to a different DRM FD.\n", 61)
+        } else if errno_val == 12 || errno_val == 28 { // ENOMEM / ENOSPC
+            write(2, "  hint: KFD VMID / PASID slots exhausted. Likely fragmented\n", 61)
+            write(2, "        after many resets; a reboot will recover.\n", 51)
+        } else if errno_val == 13 || errno_val == 1 {  // EACCES / EPERM
+            write(2, "  hint: insufficient permission on /dev/kfd or /dev/dri/renderD128.\n", 69)
+        } else if errno_val == 5 || errno_val == 110 { // EIO / ETIMEDOUT
+            write(2, "  hint: firmware fault or hang. Check `dmesg | grep -i amdgpu`.\n", 65)
+        }
+        exit(1)
+    }
 
     // SET_MEMORY_POLICY: HIP runtime calls this twice at startup with
     // the lds and scratch apertures as `alternate_*`. Without it the
