@@ -1,0 +1,179 @@
+// Standalone bench for the gemv_coop_bf16_f32 kernel — the dispatch
+// used by gpu_matmul_to_dev (M=1 lm_head and per-op matmul path).
+// Validates the kernel's standalone time vs the in-driver measurement
+// to identify whether the WG-launch-overhead hypothesis holds for the
+// multi-row variant in task #254.
+//
+// Build:
+//   ./build/mlrc --emit-amdgpu-gemv-coop-bf16-f32=/tmp/gemv_coop_bf16_f32.co
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/gemv_coop_bf16_f32_launch.mlr -o /tmp/gemv_coop_bf16_f32_launch_kfd
+// Run:
+//   GEMV_N=151936 GEMV_K=1024 /tmp/gemv_coop_bf16_f32_launch_kfd       # Qwen3-0.6B lm_head shape
+
+import "../../std/hip.mlr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn write(int32 fd, uint64 buf, uint64 n) -> int64
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn getenv(uint64 name) -> uint64
+
+static uint64 N_DEF = 151936
+static uint64 K_DEF = 1024
+
+fn u64_to_ascii_decimal(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 { uint8 z = 48; unsafe { *(buf as uint8) = z }; return 1 }
+    uint64 n = 0
+    uint64 tmp = val
+    while tmp > 0 { n = n + 1; tmp = tmp / 10 }
+    uint64 i = n
+    tmp = val
+    while i > 0 {
+        i = i - 1
+        uint64 d = tmp - (tmp / 10) * 10
+        uint64 p = buf + i
+        uint8 c = d + 48
+        unsafe { *(p as uint8) = c }
+        tmp = tmp / 10
+    }
+    return n
+}
+
+fn print_label_val(uint64 label, uint64 label_len, uint64 val) {
+    uint64 buf = alloc(128)
+    uint64 i = 0
+    while i < label_len {
+        uint64 sp = label + i
+        uint64 c = 0
+        unsafe { *(sp as uint8) -> c }
+        uint64 dp = buf + i
+        uint8 cb = c
+        unsafe { *(dp as uint8) = cb }
+        i = i + 1
+    }
+    uint64 cp = buf + label_len
+    uint8 col = 58; unsafe { *(cp as uint8) = col }
+    uint64 sp2 = buf + label_len + 1
+    uint8 space = 32; unsafe { *(sp2 as uint8) = space }
+    uint64 num_buf = buf + label_len + 2
+    uint64 dlen = u64_to_ascii_decimal(val, num_buf)
+    uint64 nul_p = buf + label_len + 2 + dlen
+    uint8 nul = 0; unsafe { *(nul_p as uint8) = nul }
+    puts(buf)
+}
+
+fn die(uint64 msg, uint64 code) {
+    puts(msg)
+    print_label_val("hipError", 8, code)
+    exit(1)
+}
+
+fn parse_env_count(uint64 name) -> uint64 {
+    uint64 s = getenv(name)
+    if s == 0 { return 0 }
+    uint64 v = 0
+    uint64 i = 0
+    while 1 == 1 {
+        uint64 cp = s + i
+        uint64 c = 0
+        unsafe { *(cp as uint8) -> c }
+        if c == 0 { break }
+        if c >= 48 && c <= 57 { v = v * 10 + (c - 48); i = i + 1; continue }
+        break
+    }
+    return v
+}
+
+fn main() {
+    uint32 err = hipSetDevice(0)
+    if err != 0 { die("hipSetDevice failed", err) }
+
+    uint64 N = N_DEF
+    uint64 K = K_DEF
+    uint64 ne = parse_env_count("GEMV_N"); if ne != 0 { N = ne }
+    uint64 ke = parse_env_count("GEMV_K"); if ke != 0 { K = ke }
+
+    // Load co
+    uint64 co_path = "/tmp/gemv_coop_bf16_f32.co"
+    uint64 fd = file_open(co_path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        puts("cannot open /tmp/gemv_coop_bf16_f32.co — build first via scripts/rebuild_helper_cos.sh")
+        exit(1)
+    }
+    uint64 co_size = file_size(fd)
+    uint64 co_blob = alloc(co_size)
+    file_read(fd, co_blob, co_size)
+    file_close(fd)
+
+    uint64 mod_slot = alloc(8)
+    err = hipModuleLoadData(mod_slot, co_blob)
+    if err != 0 { die("hipModuleLoadData", err) }
+    uint64 mod = 0; unsafe { *(mod_slot as uint64) -> mod }
+
+    uint64 fh_slot = alloc(8)
+    err = hipModuleGetFunction(fh_slot, mod, "gemv_coop_bf16_f32")
+    if err != 0 { die("getFn gemv_coop_bf16_f32", err) }
+    uint64 fh = 0; unsafe { *(fh_slot as uint64) -> fh }
+
+    uint64 bytes_w = N * K * 2     // bf16 weight
+    uint64 bytes_x = K * 4         // f32 input
+    uint64 bytes_y = N * 4         // f32 output
+
+    uint64 d_W = 0; uint64 d_X = 0; uint64 d_Y = 0
+    uint64 slot = alloc(8); err = hipMalloc(slot, bytes_w); if err != 0 { die("malloc W", err) }; unsafe { *(slot as uint64) -> d_W }
+    slot = alloc(8); err = hipMalloc(slot, bytes_x); if err != 0 { die("malloc X", err) }; unsafe { *(slot as uint64) -> d_X }
+    slot = alloc(8); err = hipMalloc(slot, bytes_y); if err != 0 { die("malloc Y", err) }; unsafe { *(slot as uint64) -> d_Y }
+
+    // Don't bother filling — we just want kernel time.  VRAM contents
+    // are some leftover values; the kernel will read them as bf16/f32
+    // and produce whatever; we don't check correctness in this bench.
+
+    // Kernarg packing: 5 args (W, X, Y, N, K).  Each slot stores the value.
+    uint64 k_w = alloc(8); unsafe { *(k_w as uint64) = d_W }
+    uint64 k_x = alloc(8); unsafe { *(k_x as uint64) = d_X }
+    uint64 k_y = alloc(8); unsafe { *(k_y as uint64) = d_Y }
+    uint64 k_n = alloc(8); uint64 nv = N; unsafe { *(k_n as uint64) = nv }
+    uint64 k_k = alloc(8); uint64 kv = K; unsafe { *(k_k as uint64) = kv }
+    uint64 kp = alloc(5 * 8)
+    unsafe { *(kp        as uint64) = k_w }
+    unsafe { *((kp +  8) as uint64) = k_x }
+    unsafe { *((kp + 16) as uint64) = k_y }
+    unsafe { *((kp + 24) as uint64) = k_n }
+    unsafe { *((kp + 32) as uint64) = k_k }
+
+    // Grid (N, 1, 1), block (32, 1, 1) — one wave per output row.
+    uint32 grid_x  = N
+    uint32 block_x = 32
+
+    // Warm-up dispatch (cache + clock-up).
+    err = hipModuleLaunchKernel(fh, grid_x, 1, 1, block_x, 1, 1, 0, 0, kp, 0)
+    if err != 0 { die("launch (warmup)", err) }
+    err = hipDeviceSynchronize(); if err != 0 { die("sync (warmup)", err) }
+
+    // Bench: N_ITER dispatches back-to-back with one final sync.
+    uint64 n_iter = 10
+    uint64 t_start = time_ns()
+    uint64 it = 0
+    while it < n_iter {
+        err = hipModuleLaunchKernel(fh, grid_x, 1, 1, block_x, 1, 1, 0, 0, kp, 0)
+        if err != 0 { die("launch iter", err) }
+        it = it + 1
+    }
+    err = hipDeviceSynchronize(); if err != 0 { die("sync end", err) }
+    uint64 t_end = time_ns()
+
+    uint64 total_us  = (t_end - t_start) / 1000
+    uint64 per_us    = total_us / n_iter
+    uint64 bytes_read = bytes_w + bytes_x          // weight + input
+    uint64 bw_mbps = (bytes_read * 1000) / per_us / 1024 / 1024    // MiB/s
+
+    print_label_val("N",              1, N)
+    print_label_val("K",              1, K)
+    print_label_val("n_iter",         6, n_iter)
+    print_label_val("total_us",       8, total_us)
+    print_label_val("per_us",         6, per_us)
+    print_label_val("bytes_read",    10, bytes_read)
+    print_label_val("bw_mbps_eff",   11, bw_mbps)
+
+    hipFree(d_W); hipFree(d_X); hipFree(d_Y)
+    exit(0)
+}
