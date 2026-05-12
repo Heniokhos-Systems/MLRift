@@ -60,16 +60,73 @@ fn ef32(f32 v) {
     dealloc(s)
 }
 
+// Q8_0 → bf16 dequantizer (copied from llama3_generate.mlr).
+// Each Q8_0 block: 2-byte f16 scale + 32 int8 quants. Output is bf16
+// (high 16 bits of f32 representation). Used by the destroy-PyTorch CPU
+// slice (MLRIFT_CPU_BF16=1) to feed MLRift's AVX2 bf16-matmul path.
+fn q8_0_to_bf16_alloc(u64 src_q8, u64 n_elements) -> u64 {
+    u64 dst_bf16 = alloc(n_elements * 2)
+    u64 n_blocks = n_elements / 32
+    u64 scratch = alloc(4)
+    u64 bi = 0
+    while bi < n_blocks {
+        u64 block = src_q8 + bi * 34
+        u64 lo = load8(block)
+        u64 hi = load8(block + 1)
+        u64 dbits = lo | (hi << 8)
+        f32 d = gguf_f16_to_f32_exact(dbits)
+        u64 qs_base = block + 2
+        u64 j = 0
+        while j < 32 {
+            u64 bval = load8(qs_base + j)
+            f32 q = 0.0f
+            if bval >= 128 {
+                f32 pos = int_to_f32_gguf(256 - bval)
+                q = 0.0f - pos
+            } else {
+                q = int_to_f32_gguf(bval)
+            }
+            f32 out_val = d * q
+            unsafe { *(scratch as f32) = out_val }
+            u64 b0 = load8(scratch + 2)
+            u64 b1 = load8(scratch + 3)
+            u64 dst_off = (bi * 32 + j) * 2
+            u8 b0_8 = b0
+            u8 b1_8 = b1
+            unsafe { *((dst_bf16 + dst_off + 0) as u8) = b0_8 }
+            unsafe { *((dst_bf16 + dst_off + 1) as u8) = b1_8 }
+            j = j + 1
+        }
+        bi = bi + 1
+    }
+    dealloc(scratch)
+    return dst_bf16
+}
+
 fn main() {
     u64 num_workers = 24
     thread_pool_init(num_workers)
     g_fd = file_open("/tmp/qwen36_4b_gen.out", 1)
 
     // ── Configure shared qwen3 dispatcher for Q8_0 + F32 norms ──
-    qwen3_set_matmul_kind(1)                   // Q8_0 (matches llama.cpp Q8 path)
+    // Destroy-PyTorch CPU slice (2026-05-12): MLRIFT_CPU_BF16=1 dequantises
+    // every Q8_0 layer weight + the lm_head to bf16 at load and routes
+    // matmul through MLRift's AVX2 bf16 path. Cost: ~8 GiB extra RAM.
+    u64 cpu_bf16 = 0
+    u64 ev_cpu_bf16 = getenv("MLRIFT_CPU_BF16")
+    if ev_cpu_bf16 != 0 {
+        u8 c0bf = 0; unsafe { *(ev_cpu_bf16 as u8) -> c0bf }
+        if c0bf != 48 { cpu_bf16 = 1 }
+    }
+
+    if cpu_bf16 == 0 {
+        qwen3_set_matmul_kind(1)               // Q8_0 (matches llama.cpp Q8 path)
+    } else {
+        qwen3_set_matmul_kind(0)               // bf16 (destroy-PyTorch path)
+    }
     qwen3_set_norm_kind(1)                     // F32 norm weights
     qwen3_set_rmsnorm_eps_bits(0x358637BD)     // 1e-6 IEEE bits
-    qwen3_set_q8_bitexact(1)                   // bit-exact Q8_0×Q8_0
+    qwen3_set_q8_bitexact(1)                   // bit-exact Q8_0×Q8_0; ignored when matmul_kind=0
     qwen3_set_fuse_qkv(0)                      // separate Q/K/V (large model)
 
     // ── Configure Qwen3-VL specifics ──
@@ -205,6 +262,42 @@ fn main() {
     eout("[qwen36_4b] 36 layers indexed; load_ms=")
     eu64(load_elapsed_ns / 1000000); eout("\n")
 
+    // ── Destroy-PyTorch CPU slice: Q8_0 → bf16 dequant for layer + lm_head ──
+    u64 lmhead_bf16_ptr = 0
+    if cpu_bf16 != 0 {
+        eout("[qwen36_4b] MLRIFT_CPU_BF16=1: dequantising layer weights Q8_0 → bf16...\n")
+        u64 q_elems    = q_dim   * hidden
+        u64 kv_elems   = kv_dim  * hidden
+        u64 o_elems    = hidden  * q_dim
+        u64 gate_elems = ff      * hidden
+        u64 up_elems   = ff      * hidden
+        u64 down_elems = hidden  * ff
+        u64 lf = 0
+        u64 deq_start = time_now()
+        while lf < n_layers {
+            u64 base = layers_arr + lf * 88
+            u64 qp = 0; unsafe { *((base + 1 * 8) as u64) -> qp }
+            u64 kp = 0; unsafe { *((base + 2 * 8) as u64) -> kp }
+            u64 vp = 0; unsafe { *((base + 3 * 8) as u64) -> vp }
+            u64 op = 0; unsafe { *((base + 6 * 8) as u64) -> op }
+            u64 gp = 0; unsafe { *((base + 8 * 8) as u64) -> gp }
+            u64 up = 0; unsafe { *((base + 9 * 8) as u64) -> up }
+            u64 dp = 0; unsafe { *((base + 10 * 8) as u64) -> dp }
+            unsafe { *((base + 1 * 8) as u64) = q8_0_to_bf16_alloc(qp, q_elems) }
+            unsafe { *((base + 2 * 8) as u64) = q8_0_to_bf16_alloc(kp, kv_elems) }
+            unsafe { *((base + 3 * 8) as u64) = q8_0_to_bf16_alloc(vp, kv_elems) }
+            unsafe { *((base + 6 * 8) as u64) = q8_0_to_bf16_alloc(op, o_elems) }
+            unsafe { *((base + 8 * 8) as u64) = q8_0_to_bf16_alloc(gp, gate_elems) }
+            unsafe { *((base + 9 * 8) as u64) = q8_0_to_bf16_alloc(up, up_elems) }
+            unsafe { *((base + 10 * 8) as u64) = q8_0_to_bf16_alloc(dp, down_elems) }
+            lf = lf + 1
+        }
+        eout("[qwen36_4b] dequantising lm_head Q8_0 → bf16 ("); eu64(vocab * hidden * 2); eout(" bytes)...\n")
+        lmhead_bf16_ptr = q8_0_to_bf16_alloc(lmhead_ptr, vocab * hidden)
+        u64 deq_ms = time_elapsed(deq_start) / 1000000
+        eout("[qwen36_4b] dequant_ms="); eu64(deq_ms); eout("\n")
+    }
+
     // ── KV cache ──
     u64 kv_row_bytes = kv_dim * 4
     u64 layer_stride = max_seq * kv_row_bytes
@@ -285,7 +378,11 @@ fn main() {
 
         // Final RMSNorm + tied/explicit lm_head. Qwen3-VL has no softcap.
         qwen3_rmsnorm_f32_weights(final_out, x_cur, output_norm_w, hidden)
-        matmul_q8_0_q8_0_f32(logits, final_out, lmhead_ptr, 1, vocab, hidden, num_workers)
+        if cpu_bf16 != 0 {
+            matmul_bf16_weights_f32(logits, final_out, lmhead_bf16_ptr, 1, vocab, hidden, num_workers, 0)
+        } else {
+            matmul_q8_0_q8_0_f32(logits, final_out, lmhead_ptr, 1, vocab, hidden, num_workers)
+        }
 
         u64 best_id = 0
         f32 best_val = 0.0f
