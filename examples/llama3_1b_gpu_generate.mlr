@@ -567,6 +567,33 @@ fn main() {
         eu64(total_cache * 2); eout(" bytes total)\n")
     }
 
+    // Pre-decode warmup of the padded-row weight cache (ported from
+    // Qwen3 driver — examples/qwen3_generate.mlr:614-623, slice 4.13).
+    // The mega-kernel's phase-3/13/9/17 emitters fetch each layer's
+    // fused QKV / o / gate-up / down weights via
+    // gpu_get_or_upload_bf16_weight_padded. Without warmup, the FIRST
+    // dispatch of every weight pays an upload + dequant cost; with
+    // warmup, all uploads complete before the timed decode loop, so
+    // per-step latency reflects steady-state. Strides match Llama-1B:
+    // hidden_pad = hidden + 128 = 2176, q_dim_pad = q_dim + 128 = 2176,
+    // ff_pad = ff + 128 = 8320.
+    if _native_mk_use != 0 {
+        u64 hidden_pad_w = hidden + 128
+        u64 q_dim_pad_w  = q_dim  + 128
+        u64 ff_pad_w     = ff     + 128
+        u64 qkv_dim_w    = q_dim + 2 * kv_dim
+        u64 lwarm = 0
+        while lwarm < n_layers {
+            Qwen3LayerWeights w = layers_arr + lwarm * 88
+            u64 _wq = gpu_get_or_upload_bf16_weight_padded(w.q_proj_w,    hidden, qkv_dim_w, hidden_pad_w)
+            u64 _wo = gpu_get_or_upload_bf16_weight_padded(w.o_proj_w,    q_dim,  hidden,    q_dim_pad_w)
+            u64 _wg = gpu_get_or_upload_bf16_weight_padded(w.gate_proj_w, hidden, 2 * ff,    hidden_pad_w)
+            u64 _wd = gpu_get_or_upload_bf16_weight_padded(w.down_proj_w, ff,     hidden,    ff_pad_w)
+            lwarm = lwarm + 1
+        }
+        eout("[llama32_1b_gpu] padded-row weight cache warmed for "); eu64(n_layers); eout(" layers\n")
+    }
+
     // ─── Slice 6.4 — Phase B speck4 PLD acceleration ────────────────────
     // After each successful M=1 step (always correct), optionally fire a
     // speck4 mega-kernel call (M_EFF=4) that processes the just-emitted
