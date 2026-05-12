@@ -89,6 +89,8 @@ fn mega_set_arch_qwen3_06b() {
     MEGA_FF              = 3072
     MEGA_USE_QKNORM      =    1
     MEGA_ROPE_PAIR_LAYOUT=    0
+    MEGA_M_EFF           =    4   // slice 4.21.1: default speck4; dispatch
+                                  // bumps to 8/16 for _speck8 / _speck16
     MEGA_RMSNORM_EPS_BITS= 0x3727C5AC   // 1e-5f (phase 1/11; phase-5 qknorm
                                         // hardcodes 0x358637BD = 1e-6 in slice 5.3)
 }
@@ -101,6 +103,8 @@ fn mega_set_arch_llama_1b() {
     MEGA_FF              = 8192
     MEGA_USE_QKNORM      =    0
     MEGA_ROPE_PAIR_LAYOUT=    1
+    MEGA_M_EFF           =    4   // slice 4.21.1: Llama-speck4 default;
+                                  // mks8/16 for Llama is future work.
     MEGA_RMSNORM_EPS_BITS= 0x3727C5AC   // 1e-5f (Llama)
 }
 
@@ -214,6 +218,20 @@ fn _arch_inv_sqrt_pow2_f32_bits(uint64 n) -> uint64 {
 fn megakernel_dispatch_arch(uint64 kname_ptr, uint64 nl) {
     if str_starts_with(kname_ptr, "qwen3_layer_megakernel", 22) != 0 {
         mega_set_arch_qwen3_06b()
+        // Slice 4.21.1: per-variant M_EFF override.  Default (slice-4.20.x
+        // speck4 path) is MEGA_M_EFF=4 via mega_set_arch_qwen3_06b().
+        // For `_speck8` and `_speck16` kernel names, bump after the base
+        // preset so phase emitters that read MEGA_M_EFF generate the
+        // right per-stream stride / loop count.
+        if str_starts_with(kname_ptr, "qwen3_layer_megakernel_speck8", 29) != 0 {
+            MEGA_M_EFF = 8
+            return
+        }
+        if str_starts_with(kname_ptr, "qwen3_layer_megakernel_speck16", 30) != 0 {
+            MEGA_M_EFF = 16
+            return
+        }
+        // base / speck4 — MEGA_M_EFF stays at 4 from mega_set_arch_qwen3_06b.
         return
     }
     if str_starts_with(kname_ptr, "llama_layer_megakernel", 22) != 0 {
@@ -741,12 +759,18 @@ fn _emit_rmsnorm_wg_gated_inline(uint64 in_kofs, uint64 norm_kofs,
 // Phase 11 callsite: in_kofs=0xA0, norm_kofs=0x38, out_kofs=0xA8, wg=28
 fn _emit_rmsnorm_wg_gated_m4_inline(uint64 in_kofs, uint64 norm_kofs,
                                      uint64 out_kofs, uint64 wg_id_sgpr) {
+    // Slice 4.21.2: was unrolled-4; now MEGA_M_EFF-driven loop.  At
+    // MEGA_M_EFF=4 the emit sequence is byte-identical to the prior
+    // unrolled body (4 sequential _emit_rmsnorm_wg_gated_inline calls
+    // with strides 0, S, 2S, 3S).  For MEGA_M_EFF=8 / 16 the same
+    // emitter produces 8 / 16 sequential calls.
     // Stream byte offset = MEGA_HIDDEN * 4 per stream (4 bytes per f32).
     uint64 stride = MEGA_HIDDEN * 4
-    _emit_rmsnorm_wg_gated_inline(in_kofs, norm_kofs, out_kofs, wg_id_sgpr, 0)
-    _emit_rmsnorm_wg_gated_inline(in_kofs, norm_kofs, out_kofs, wg_id_sgpr, stride)
-    _emit_rmsnorm_wg_gated_inline(in_kofs, norm_kofs, out_kofs, wg_id_sgpr, 2 * stride)
-    _emit_rmsnorm_wg_gated_inline(in_kofs, norm_kofs, out_kofs, wg_id_sgpr, 3 * stride)
+    uint64 m = 0
+    while m < MEGA_M_EFF {
+        _emit_rmsnorm_wg_gated_inline(in_kofs, norm_kofs, out_kofs, wg_id_sgpr, m * stride)
+        m = m + 1
+    }
 }
 
 // ── Marker recognition helpers ────────────────────────────────────────────
