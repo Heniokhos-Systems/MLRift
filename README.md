@@ -155,7 +155,18 @@ Token-id output of every MLRift row is bit-identical to HuggingFace
 | **+ slice 4.16 — phase-13 `v_wmma_f32_16x16x16_bf16` tensor cores** | bf16 / f32 | **190.3** | 2 600 | **2.57× vs ROCm bf16** |
 | **+ `MLRIFT_QWEN3_MEGAKERNEL_SPECK16=1` + `SPEC_K=16` + LONG_PROMPT (slice 4.18 — M=16 mega-kernel; slice 4.17 unblocks max_seq=128)** | bf16 / f32 | **200.9** | 3 400 | **2.71× vs ROCm bf16** |
 | **+ slice 4.20 — VRAM chase, mks-K cap correction, mks16 LDS bump 64→96** | bf16 / f32 | **216.4** | **2 046** | **3.46× vs ROCm bf16** |
+| **+ post-4.20 lm_head bf16-direct (fb2de6a + 226b2e2, 2026-05-12)** | bf16 / f32 | **229.8** | **2 046** | **3.68× vs ROCm bf16** |
 | MLRift + `GPU_FULL_FORWARD` + `SPEC_K=4` + LONG-prompt (per-op PLD path, pre-mega) | bf16 / f32 | 72.0 | 1 920 | 0.97× vs ROCm bf16 |
+
+> **Reproducing the 229.8 tok/s mks16 number** requires `MLRIFT_PLD_BENCH=1`
+> alongside `MLRIFT_LONG_PROMPT=1` — the latter alone now uses a
+> human-readable "Hello, who are you?" prefill (CPU-driver smoke), which
+> has no repeating 2-grams and starves PLD speculation.  `PLD_BENCH=1`
+> restores the original `[14990,14582]×8` bigram pattern that gives the
+> mks-K paths 99-100 % accept rate at their designed peak.  Also run
+> `scripts/rebuild_helper_cos.sh` first — mks8/mks16 are hipcc-compiled
+> (no v2 AST-walker port yet) and are absent from `/tmp` after machine
+> reset.  See [`docs/SLICE4_MEGAKERNEL_DESIGN.md`](docs/SLICE4_MEGAKERNEL_DESIGN.md#reproducer-2026-05-12) for the full env block.
 
 The matmul-only rows route only the matmul + lm_head through native
 gfx1100 ISA; qknorm, rope, attn, residuals still run CPU.  The

@@ -1398,3 +1398,40 @@ Headline:
 - mks8 gen=112 in the 4.20 table reflects the 14-step run inside the
   max_seq budget (14 × 8 = 112).  Fairly comparable since tok/s is
   steady-state.
+
+### Reproducer (2026-05-12)
+
+After commit 4f40b7c swapped the `MLRIFT_LONG_PROMPT=1` prefill from
+the PLD-friendly `[14990,14582] × 8` bigram pattern to the human
+prompt "Hello, who are you?", the latter is unfriendly to PLD (no
+repeating 2-grams) so the mks16 path only accepts 1/16 per step and
+the 216 tok/s number degrades to ~20.  Set `MLRIFT_PLD_BENCH=1` in
+combination with `MLRIFT_LONG_PROMPT=1` to restore the bigram pattern
+specifically for PLD benchmarking.  Also ensure mks8/mks16 .co files
+exist on `/tmp` — `scripts/rebuild_helper_cos.sh` now hipcc-compiles
+them as path 4 (no v2 AST-walker port yet).
+
+```
+# Rebuild .co files (one-time, includes mks8/mks16 hipcc compile)
+scripts/rebuild_helper_cos.sh
+
+# Build the GPU driver
+./build/mlrc --arch=x86_64 --target=amdgpu-native \
+    examples/qwen3_generate.mlr -o /tmp/qwen3_generate
+
+# Reproduce the 216+ tok/s mks16 number
+MLRIFT_QWEN3_0_6B_DIR=/path/to/Qwen3-0.6B/model.safetensors \
+MLRIFT_NATIVE_MEGAKERNEL=2 \
+MLRIFT_QWEN3_MEGAKERNEL=1 \
+MLRIFT_QWEN3_MEGAKERNEL_SPECK16=1 \
+MLRIFT_SPEC_K=16 \
+MLRIFT_LONG_PROMPT=1 MLRIFT_PLD_BENCH=1 \
+MLRIFT_QWEN3_MAX_NEW=3 \
+MLRIFT_GPU_FULL_FORWARD=1 MLRIFT_GPU_MATMUL_BF16=1 \
+    /tmp/qwen3_generate
+```
+
+Verified 2026-05-12 on the same RX 7800 XT: **233.8 tok/s** (up from
+the slice-4.20 216.4 baseline, driven by post-4.20 lm_head fixes —
+fb2de6a stale-N>65536 gate removal + 226b2e2 gpu_matmul_to_dev
+bf16-direct default at N>=16384).

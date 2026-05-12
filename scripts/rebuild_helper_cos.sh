@@ -117,6 +117,22 @@ echo "=== mega-kernel .cos ==="
 "$MLRC" --emit-amdgpu-llama-megakernel-speck4-v2=/tmp/llama_layer_megakernel_speck4_v2.co examples/llm/llama_layer_megakernel_speck4.mlr > /dev/null 2>&1 \
     && echo "  ok  llama_layer_megakernel_speck4_v2.co"
 
+# mks8 / mks16 mega-kernels — hipcc-only (no v2 AST-walker port yet).
+# Required by the qwen3-0.6B PLD speculative-decode path that reaches
+# 200+ tok/s.  Without these the driver falls back to per-op M_eff=16
+# chain at ~20 tok/s.
+echo "=== path 4: hipcc compile of mks8 / mks16 mega-kernels ==="
+if command -v hipcc > /dev/null 2>&1; then
+    hipcc --offload-arch=gfx1100 --genco -O3 examples/llm/qwen3_layer_megakernel_speck8.hip.cpp -o /tmp/qwen3_layer_megakernel_speck8.co > /dev/null 2>&1 \
+        && echo "  ok  qwen3_layer_megakernel_speck8.co" \
+        || echo "  FAIL qwen3_layer_megakernel_speck8.co"
+    hipcc --offload-arch=gfx1100 --genco -O3 examples/llm/qwen3_layer_megakernel_speck16.hip.cpp -o /tmp/qwen3_layer_megakernel_speck16.co > /dev/null 2>&1 \
+        && echo "  ok  qwen3_layer_megakernel_speck16.co" \
+        || echo "  FAIL qwen3_layer_megakernel_speck16.co"
+else
+    echo "  skip mks8/mks16 — hipcc not on PATH; spec_K=8/16 falls back to per-op chain"
+fi
+
 echo
 n=$(ls /tmp/*.co 2>/dev/null | wc -l)
 echo "Done. /tmp/*.co count = $n"
