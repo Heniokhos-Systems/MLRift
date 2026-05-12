@@ -142,14 +142,24 @@ fn kfd_init() -> uint32 {
     // ACQUIRE_VM
     r = raw_kfd_acquire_vm(fd, drm, gid)
     if r != 0 {
-        // The wrapper relays glibc's ioctl return as uint32 (-1 →
-        // 0xFFFFFFFF). The real kernel-side reason is in `errno`.
-        // Surface enough state to distinguish "another client is
-        // hogging the device" (EBUSY/EAGAIN) from misconfiguration
-        // (EINVAL/EACCES) from hardware exhaustion (ENOMEM/ENOSPC),
-        // and from a wedged firmware (EIO/ETIMEDOUT). Diagnostic
-        // mirrors strace + lsof + dmesg in one place.
         uint32 errno_val = kfd_errno_get()
+        // EBUSY here is the AMDKFD kernel returning -EBUSY from
+        // kfd_chardev.c::kfd_ioctl_acquire_vm at the
+        // `pdd->drm_file == drm_file ? 0 : -EBUSY` check — i.e., the
+        // kfd_process for this tgid ALREADY has a drm_file bound, but
+        // it's a different fd than we just opened. This happens when
+        // libamdhip64.so.7 (DT_NEEDED here) ACQUIRE_VM'd at its own
+        // constructor with HIP's renderD128 fd before our shim ran.
+        // The kfd_process is fully initialised; subsequent ioctls on
+        // our /dev/kfd fd find the same kfd_process (lookup is by
+        // tgid) and operate on the existing pdd / VM. So treat EBUSY
+        // as soft-success: log a note and continue.
+        if errno_val == 16 {
+            write(2, "kfd_init: ACQUIRE_VM returned EBUSY — another in-process client (HIP runtime?) already owns the VM; proceeding\n", 112)
+            // Fall through to the rest of init (SET_MEMORY_POLICY etc.)
+            // — those operate on the same kfd_process and are idempotent
+            // on the kernel side.
+        } else {
         write(2, "kfd_init: ACQUIRE_VM failed\n", 28)
         write(2, "  ioctl_ret = ", 14); _kfd_eprint_u32(r);         write(2, "\n", 1)
         write(2, "  errno     = ", 14); _kfd_eprint_u32(errno_val); write(2, " (", 2)
@@ -176,6 +186,7 @@ fn kfd_init() -> uint32 {
             write(2, "  hint: firmware fault or hang. Check `dmesg | grep -i amdgpu`.\n", 65)
         }
         exit(1)
+        }
     }
 
     // SET_MEMORY_POLICY: HIP runtime calls this twice at startup with
@@ -209,9 +220,20 @@ fn kfd_init() -> uint32 {
     // that don't touch scratch — none of ours do).
     raw_kfd_set_scratch_backing_va(fd, gid, _kfd_scratch_base)
 
-    // RUNTIME_ENABLE (mode 1 = enable)
+    // RUNTIME_ENABLE (mode 1 = enable). Same dual-runtime caveat as
+    // ACQUIRE_VM: the kernel's runtime_enable() returns -EBUSY when
+    // `p->runtime_inited` is already set — which happens when
+    // libamdhip64.so.7 enabled it at its own init. The kfd_process is
+    // already in the runtime-enabled state; soft-success and proceed.
     r = raw_kfd_runtime_enable(fd, 1)
-    if r != 0 { kfd_die("kfd_init: RUNTIME_ENABLE failed", r) }
+    if r != 0 {
+        uint32 re_errno = kfd_errno_get()
+        if re_errno == 16 {
+            write(2, "kfd_init: RUNTIME_ENABLE returned EBUSY — runtime already enabled (HIP runtime?); proceeding\n", 95)
+        } else {
+            kfd_die("kfd_init: RUNTIME_ENABLE failed", r)
+        }
+    }
 
     _kfd_initialized = 1
     return 0
