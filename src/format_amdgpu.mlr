@@ -8437,14 +8437,19 @@ fn emit_amdgpu_gemm_f16f32_blob(uint64 out_path) -> uint64 {
 //   v25..v30 = scratch (wave-half, idx, A v_off, B v_off lo/hi, C v_off).
 fn _emit_gemm_f16f32_wmma_body(uint64 args_desc) {
     asm_init()
+    // USER_SGPR=15 (rsrc2=0x19E) → WG_ID_X in s15, WG_ID_Y in s16
+    // (NOT s2/s3 — original emit was a latent multi-WG bug).
+    // s_load_b64 s[14:15] below overwrites s15 with the high half of
+    // K (always 0), so we must stash WG_ID_X first. s16 (WG_ID_Y) is
+    // not in any kernarg-load destination range, so it survives.
+    asm_u32(0xBE82000F)                         // s_mov_b32 s2, s15  (save WG_ID_X)
     // Kernarg load
     asm_u32(0xF40C0100); asm_u32(0xF8000000)   // s_load_b256 s[4:11]
     asm_u32(0xF4040300); asm_u32(0xF8000020)   // s_load_b64 s[12:13]
-    asm_u32(0xF4040380); asm_u32(0xF8000028)   // s_load_b64 s[14:15]
+    asm_u32(0xF4040380); asm_u32(0xF8000028)   // s_load_b64 s[14:15]  (clobbers s15)
     asm_u32(0xBF89FC07)                         // s_waitcnt lgkmcnt(0)
-    // tile_row, tile_col
-    asm_u32(0x84108403)                         // s_lshl_b32 s16, s3, 4
-    asm_u32(0x84118402)                         // s_lshl_b32 s17, s2, 4
+    asm_u32(0x84108410)                         // s_lshl_b32 s16, s16, 4  (WG_ID_Y → tile_row*16)
+    asm_u32(0x84118402)                         // s_lshl_b32 s17, s2,  4  (WG_ID_X → tile_col*16)
     // Whole-tile bounds
     asm_u32(0xBF090A10)                         // s_cmp_ge_u32 s16, s10
     asm_u32(0xBFA2007C)                         // s_cbranch_scc1 +124 → .Lend
@@ -8574,6 +8579,147 @@ fn emit_amdgpu_gemm_f16f32_wmma_blob(uint64 out_path) -> uint64 {
     uint64 fd = file_open(out_path, 1)
     if fd > 0xFFFFFFFFFFFFF000 {
         write(2, "emit_amdgpu_gemm_f16f32_wmma_blob: cannot open output\n", 54)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
+
+// Destroy-PyTorch slice — bf16 input WMMA GEMM. Byte-identical to the
+// f16 emitter above (`_emit_gemm_f16f32_wmma_body`) except for the WMMA
+// instruction itself: gfx1100's `v_wmma_f32_16x16x16_bf16` encodes as
+// 0xCC414011 (vs 0xCC404011 for f16). All other ops (loads, layout,
+// stores, sgpr/vgpr usage, KD) are identical — bf16 and f16 share the
+// same 16-bit storage shape, so the kernel body just re-interprets the
+// loaded bytes as bf16. Used for lm_head GEMV (padded to M=16) and the
+// bf16 matmul phases that benefit from tensor-core throughput.
+fn _emit_gemm_bf16f32_wmma_body(uint64 args_desc) {
+    asm_init()
+    // Save WG_ID_X before kernarg load clobbers s15 (see f16 variant).
+    asm_u32(0xBE82000F)                         // s_mov_b32 s2, s15
+    asm_u32(0xF40C0100); asm_u32(0xF8000000)
+    asm_u32(0xF4040300); asm_u32(0xF8000020)
+    asm_u32(0xF4040380); asm_u32(0xF8000028)
+    asm_u32(0xBF89FC07)
+    asm_u32(0x84108410)                         // s_lshl_b32 s16, s16, 4  (WG_ID_Y)
+    asm_u32(0x84118402)                         // s_lshl_b32 s17, s2,  4  (WG_ID_X from stash)
+    asm_u32(0xBF090A10)
+    asm_u32(0xBFA2007C)
+    asm_u32(0xBF090C11)
+    asm_u32(0xBFA2007A)
+    asm_u32(0x3634008F)
+    asm_u32(0x32320084)
+    asm_u32(0x8413810C)
+    asm_u32(0x8414820C)
+    asm_u32(0x8417830C)
+    asm_u32(0x4A363410)
+    asm_u32(0xD72C001B); asm_u32(0x00001D1B)
+    asm_u32(0x30363681)
+    asm_u32(0x4A383411)
+    asm_u32(0x30383881)
+    asm_u32(0x4A3A3813)
+    asm_u32(0x4A3C3210)
+    asm_u32(0xD72C001E); asm_u32(0x0000191E)
+    asm_u32(0x4A3C3C11)
+    asm_u32(0x4A3C351E)
+    asm_u32(0x303C3C82)
+    asm_u32(0x8515840E)
+    asm_u32(0xBE960080)
+    asm_u32(0x7E220280); asm_u32(0x7E240280)
+    asm_u32(0x7E260280); asm_u32(0x7E280280)
+    asm_u32(0x7E2A0280); asm_u32(0x7E2C0280)
+    asm_u32(0x7E2E0280); asm_u32(0x7E300280)
+    asm_u32(0xBF068015)
+    asm_u32(0xBFA20044)
+    asm_u32(0xBF870001)
+    asm_u32(0xDC5E0000); asm_u32(0x0904001B)
+    asm_u32(0xDC5E0010); asm_u32(0x0D04001B)
+    asm_u32(0xBF870001)
+    asm_u32(0xDC820000); asm_u32(0x0106001C)
+    asm_u32(0xDC8E0000); asm_u32(0x0106001D)
+    asm_u32(0x4A383814); asm_u32(0x4A3A3A14)
+    asm_u32(0xBF870001)
+    asm_u32(0xDC820000); asm_u32(0x0206001C)
+    asm_u32(0xDC8E0000); asm_u32(0x0206001D)
+    asm_u32(0x4A383814); asm_u32(0x4A3A3A14)
+    asm_u32(0xBF870001)
+    asm_u32(0xDC820000); asm_u32(0x0306001C)
+    asm_u32(0xDC8E0000); asm_u32(0x0306001D)
+    asm_u32(0x4A383814); asm_u32(0x4A3A3A14)
+    asm_u32(0xBF870001)
+    asm_u32(0xDC820000); asm_u32(0x0406001C)
+    asm_u32(0xDC8E0000); asm_u32(0x0406001D)
+    asm_u32(0x4A383814); asm_u32(0x4A3A3A14)
+    asm_u32(0xBF870001)
+    asm_u32(0xDC820000); asm_u32(0x0506001C)
+    asm_u32(0xDC8E0000); asm_u32(0x0506001D)
+    asm_u32(0x4A383814); asm_u32(0x4A3A3A14)
+    asm_u32(0xBF870001)
+    asm_u32(0xDC820000); asm_u32(0x0606001C)
+    asm_u32(0xDC8E0000); asm_u32(0x0606001D)
+    asm_u32(0x4A383814); asm_u32(0x4A3A3A14)
+    asm_u32(0xBF870001)
+    asm_u32(0xDC820000); asm_u32(0x0706001C)
+    asm_u32(0xDC8E0000); asm_u32(0x0706001D)
+    asm_u32(0x4A383814); asm_u32(0x4A3A3A14)
+    asm_u32(0xBF870001)
+    asm_u32(0xDC820000); asm_u32(0x0806001C)
+    asm_u32(0xDC8E0000); asm_u32(0x0806001D)
+    asm_u32(0x4A383814); asm_u32(0x4A3A3A14)
+    asm_u32(0x4A3636A0)
+    asm_u32(0xBF8903F7)
+    asm_u32(0xCC414011); asm_u32(0x1C460309)   // v_wmma_f32_16x16x16_bf16 (bf16 input variant)
+    asm_u32(0x80168116)
+    asm_u32(0xBF0A1516)
+    asm_u32(0xBFA2FFBC)
+    asm_u32(0xDC6A0000); asm_u32(0x0008111E)
+    asm_u32(0x4A3C3C17)
+    asm_u32(0xDC6A0000); asm_u32(0x0008121E)
+    asm_u32(0x4A3C3C17)
+    asm_u32(0xDC6A0000); asm_u32(0x0008131E)
+    asm_u32(0x4A3C3C17)
+    asm_u32(0xDC6A0000); asm_u32(0x0008141E)
+    asm_u32(0x4A3C3C17)
+    asm_u32(0xDC6A0000); asm_u32(0x0008151E)
+    asm_u32(0x4A3C3C17)
+    asm_u32(0xDC6A0000); asm_u32(0x0008161E)
+    asm_u32(0x4A3C3C17)
+    asm_u32(0xDC6A0000); asm_u32(0x0008171E)
+    asm_u32(0x4A3C3C17)
+    asm_u32(0xDC6A0000); asm_u32(0x0008181E)
+    asm_u32(0xBC7C0000)
+    asm_u32(0xBFB00000)
+
+    uint64 a0  = args_desc + 0;   unsafe { *(a0  as uint64) = 8 }
+    uint64 a1  = args_desc + 8;   unsafe { *(a1  as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a2  = args_desc + 16;  unsafe { *(a2  as uint64) = 8 }
+    uint64 a3  = args_desc + 24;  unsafe { *(a3  as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a4  = args_desc + 32;  unsafe { *(a4  as uint64) = 8 }
+    uint64 a5  = args_desc + 40;  unsafe { *(a5  as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a6  = args_desc + 48;  unsafe { *(a6  as uint64) = 8 }
+    uint64 a7  = args_desc + 56;  unsafe { *(a7  as uint64) = AMD_ARG_KIND_BY_VALUE }
+    uint64 a8  = args_desc + 64;  unsafe { *(a8  as uint64) = 8 }
+    uint64 a9  = args_desc + 72;  unsafe { *(a9  as uint64) = AMD_ARG_KIND_BY_VALUE }
+    uint64 a10 = args_desc + 80;  unsafe { *(a10 as uint64) = 8 }
+    uint64 a11 = args_desc + 88;  unsafe { *(a11 as uint64) = AMD_ARG_KIND_BY_VALUE }
+}
+
+@export
+fn emit_amdgpu_gemm_bf16f32_wmma_blob(uint64 out_path) -> uint64 {
+    uint64[12] args_desc
+    _emit_gemm_bf16f32_wmma_body(args_desc)
+
+    uint64 size = emit_amdgpu_code_object("gemm_bf16f32_wmma", 17,
+                                           asm_text_buf, asm_text_len,
+                                           48, 8, 24, 31,
+                                           0xE0AF0083, 0x0000019E, 0x00000010, 0x0408,
+                                           args_desc, 6)
+
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_gemm_bf16f32_wmma_blob: cannot open output\n", 55)
         return 1
     }
     file_write(fd, amd_buf, size)

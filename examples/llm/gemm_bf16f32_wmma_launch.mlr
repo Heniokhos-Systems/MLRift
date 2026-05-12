@@ -1,0 +1,331 @@
+// MLRift WMMA bf16-storage / f32-accum GEMM launcher.
+//
+// Mirrors gemm_f16f32_wmma_launch.mlr but exercises the bf16
+// variant emitted via --emit-amdgpu-gemm-bf16f32-wmma. CPU
+// reference truncates the same f32 fills to bf16 (top 16 bits)
+// so both paths see identical inputs.
+//
+// Build:
+//   ./build/mlrc --emit-amdgpu-gemm-bf16f32-wmma=/tmp/gemm_bf16f32_wmma.co
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/gemm_bf16f32_wmma_launch.mlr -o /tmp/gemm_bf16f32_wmma_launch_kfd
+// Run with custom shape:
+//   GEMM_M=512 GEMM_N=512 GEMM_K=512 /tmp/gemm_bf16f32_wmma_launch_kfd
+
+import "../../std/hip.mlr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn write(int32 fd, uint64 buf, uint64 n) -> int64
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn getenv(uint64 name) -> uint64
+
+static uint64 M_DEF = 512
+static uint64 N_DEF = 512
+static uint64 K_DEF = 512
+
+fn u64_to_ascii_decimal(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 { uint8 z = 48; unsafe { *(buf as uint8) = z }; return 1 }
+    uint64 n = 0
+    uint64 tmp = val
+    while tmp > 0 { n = n + 1; tmp = tmp / 10 }
+    uint64 i = n
+    tmp = val
+    while i > 0 {
+        i = i - 1
+        uint64 d = tmp - (tmp / 10) * 10
+        uint64 p = buf + i
+        uint8 c = d + 48
+        unsafe { *(p as uint8) = c }
+        tmp = tmp / 10
+    }
+    return n
+}
+
+fn print_label_val(uint64 label, uint64 label_len, uint64 val) {
+    uint64 buf = alloc(128)
+    uint64 i = 0
+    while i < label_len {
+        uint64 sp = label + i
+        uint64 c = 0
+        unsafe { *(sp as uint8) -> c }
+        uint64 dp = buf + i
+        uint8 cb = c
+        unsafe { *(dp as uint8) = cb }
+        i = i + 1
+    }
+    uint64 cp = buf + label_len
+    uint8 col = 58; unsafe { *(cp as uint8) = col }
+    uint64 sp2 = buf + label_len + 1
+    uint8 space = 32; unsafe { *(sp2 as uint8) = space }
+    uint64 num_buf = buf + label_len + 2
+    uint64 dlen = u64_to_ascii_decimal(val, num_buf)
+    uint64 nul_p = buf + label_len + 2 + dlen
+    uint8 nul = 0; unsafe { *(nul_p as uint8) = nul }
+    puts(buf)
+}
+
+fn die(uint64 msg, uint64 code) {
+    puts(msg)
+    print_label_val("hipError", 8, code)
+    exit(1)
+}
+
+fn parse_env_count(uint64 name) -> uint64 {
+    uint64 s = getenv(name)
+    if s == 0 { return 0 }
+    uint64 v = 0
+    uint64 i = 0
+    uint64 mult = 1
+    while 1 == 1 {
+        uint64 cp = s + i
+        uint64 c = 0
+        unsafe { *(cp as uint8) -> c }
+        if c == 0 { break }
+        if c >= 48 && c <= 57 { v = v * 10 + (c - 48); i = i + 1; continue }
+        if c == 75 || c == 107 { mult = 1024;       break }
+        if c == 77 || c == 109 { mult = 1024 * 1024; break }
+        break
+    }
+    return v * mult
+}
+
+// f32→bf16 truncation: top 16 bits of the f32 IEEE-754 word.
+// Round-to-nearest-even isn't necessary for a synthetic test; we
+// just need both CPU and GPU paths to see the same bf16 values.
+// Use module-static scratch slots to avoid per-call alloc — at
+// 512³ K the CPU reference invokes these 134M times, and each
+// per-call alloc(4) leaks ~1 GB and OOM-kills the process.
+static uint64 _bf16_scratch_f2b = 0
+static uint64 _bf16_scratch_b2f = 0
+
+fn f32_to_bf16_bits(f32 v) -> uint64 {
+    if _bf16_scratch_f2b == 0 { _bf16_scratch_f2b = alloc(4) }
+    uint64 slot = _bf16_scratch_f2b
+    unsafe { *(slot as f32) = v }
+    uint32 w = 0
+    unsafe { *(slot as uint32) -> w }
+    uint64 w64 = w
+    return (w64 >> 16) & 0xFFFF
+}
+
+fn bf16_bits_to_f32(uint64 bits) -> f32 {
+    if _bf16_scratch_b2f == 0 { _bf16_scratch_b2f = alloc(4) }
+    uint64 slot = _bf16_scratch_b2f
+    uint32 w = (bits & 0xFFFF) << 16
+    unsafe { *(slot as uint32) = w }
+    f32 v = 0.0
+    unsafe { *(slot as f32) -> v }
+    return v
+}
+
+fn fill_a(uint64 a_host, uint64 m, uint64 k_dim) {
+    uint64 row = 0
+    while row < m {
+        uint64 col = 0
+        while col < k_dim {
+            uint64 mix = (row * 31 + col * 17 + 7) - ((row * 31 + col * 17 + 7) / 100) * 100
+            f64 vd = int_to_f64(mix) * 0.01
+            f32 v  = f64_to_f32(vd)
+            uint64 bits = f32_to_bf16_bits(v)
+            uint64 p = a_host + (row * k_dim + col) * 2
+            uint16 b16 = bits
+            unsafe { *(p as uint16) = b16 }
+            col = col + 1
+        }
+        row = row + 1
+    }
+}
+
+fn fill_b(uint64 b_host, uint64 k_dim, uint64 n) {
+    uint64 row = 0
+    while row < k_dim {
+        uint64 col = 0
+        while col < n {
+            uint64 mix = (row * 13 + col * 7 + 3) - ((row * 13 + col * 7 + 3) / 50) * 50
+            f64 vd = int_to_f64(mix) * 0.02
+            f32 v  = f64_to_f32(vd)
+            uint64 bits = f32_to_bf16_bits(v)
+            uint64 p = b_host + (row * n + col) * 2
+            uint16 b16 = bits
+            unsafe { *(p as uint16) = b16 }
+            col = col + 1
+        }
+        row = row + 1
+    }
+}
+
+fn cpu_gemm(uint64 a_host, uint64 b_host, uint64 c_host,
+            uint64 m, uint64 n, uint64 k_dim) {
+    uint64 i = 0
+    while i < m {
+        uint64 j = 0
+        while j < n {
+            f32 sum = 0.0
+            uint64 t = 0
+            while t < k_dim {
+                uint64 ap = a_host + (i * k_dim + t) * 2
+                uint64 bp = b_host + (t * n + j) * 2
+                uint16 ab = 0; unsafe { *(ap as uint16) -> ab }
+                uint16 bb = 0; unsafe { *(bp as uint16) -> bb }
+                uint64 ab64 = ab
+                uint64 bb64 = bb
+                f32 a = bf16_bits_to_f32(ab64)
+                f32 b = bf16_bits_to_f32(bb64)
+                sum = sum + a * b
+                t = t + 1
+            }
+            uint64 cp = c_host + (i * n + j) * 4
+            unsafe { *(cp as f32) = sum }
+            j = j + 1
+        }
+        i = i + 1
+    }
+}
+
+fn diff_f32(uint64 ref_buf, uint64 got_buf, uint64 total,
+            uint64 max_abs_slot, uint64 max_rel_slot,
+            uint64 first_bad_slot) {
+    f32 max_abs = 0.0
+    f32 max_rel = 0.0
+    uint64 first_bad = 0xFFFFFFFFFFFFFFFF
+    uint64 i = 0
+    while i < total {
+        uint64 rp = ref_buf + i * 4
+        uint64 gp = got_buf + i * 4
+        f32 r = 0.0; unsafe { *(rp as f32) -> r }
+        f32 g = 0.0; unsafe { *(gp as f32) -> g }
+        f32 d = g - r
+        if d < 0.0 { d = 0.0 - d }
+        f32 ar = r
+        if ar < 0.0 { ar = 0.0 - ar }
+        f32 rel = 0.0
+        if ar > 0.000001 { rel = d / ar }
+        if d > max_abs {
+            max_abs = d
+            if first_bad == 0xFFFFFFFFFFFFFFFF { first_bad = i }
+        }
+        if rel > max_rel { max_rel = rel }
+        i = i + 1
+    }
+    unsafe { *(max_abs_slot   as f32)    = max_abs }
+    unsafe { *(max_rel_slot   as f32)    = max_rel }
+    unsafe { *(first_bad_slot as uint64) = first_bad }
+}
+
+fn main() {
+    uint32 err = hipSetDevice(0)
+    if err != 0 { die("hipSetDevice failed", err) }
+
+    uint64 M = M_DEF
+    uint64 N = N_DEF
+    uint64 K = K_DEF
+    uint64 me = parse_env_count("GEMM_M"); if me != 0 { M = me }
+    uint64 ne = parse_env_count("GEMM_N"); if ne != 0 { N = ne }
+    uint64 ke = parse_env_count("GEMM_K"); if ke != 0 { K = ke }
+
+    uint64 co_path = "/tmp/gemm_bf16f32_wmma.co"
+    uint64 fd = file_open(co_path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        puts("cannot open /tmp/gemm_bf16f32_wmma.co — build first:")
+        puts("  ./build/mlrc --emit-amdgpu-gemm-bf16f32-wmma=/tmp/gemm_bf16f32_wmma.co")
+        exit(1)
+    }
+    uint64 co_size = file_size(fd)
+    uint64 co_blob = alloc(co_size)
+    file_read(fd, co_blob, co_size)
+    file_close(fd)
+
+    uint64 mod_slot = alloc(8)
+    err = hipModuleLoadData(mod_slot, co_blob)
+    if err != 0 { die("hipModuleLoadData", err) }
+    uint64 mod = 0; unsafe { *(mod_slot as uint64) -> mod }
+
+    uint64 fh_slot = alloc(8)
+    err = hipModuleGetFunction(fh_slot, mod, "gemm_bf16f32_wmma")
+    if err != 0 { die("getFn gemm_bf16f32_wmma", err) }
+    uint64 fh = 0; unsafe { *(fh_slot as uint64) -> fh }
+
+    uint64 t_start = time_ns()
+
+    uint64 bytes_a = M * K * 2     // bf16
+    uint64 bytes_b = K * N * 2     // bf16
+    uint64 bytes_c = M * N * 4     // f32
+
+    uint64 d_A = 0; uint64 d_B = 0; uint64 d_C = 0
+    uint64 slot = alloc(8); err = hipMalloc(slot, bytes_a); if err != 0 { die("m A", err) }; unsafe { *(slot as uint64) -> d_A }
+    slot = alloc(8); err = hipMalloc(slot, bytes_b); if err != 0 { die("m B", err) }; unsafe { *(slot as uint64) -> d_B }
+    slot = alloc(8); err = hipMalloc(slot, bytes_c); if err != 0 { die("m C", err) }; unsafe { *(slot as uint64) -> d_C }
+
+    uint64 t_alloc = time_ns()
+
+    uint64 h_A = alloc(bytes_a); fill_a(h_A, M, K)
+    uint64 h_B = alloc(bytes_b); fill_b(h_B, K, N)
+    err = hipMemcpy(d_A, h_A, bytes_a, 1); if err != 0 { die("H2D A", err) }
+    err = hipMemcpy(d_B, h_B, bytes_b, 1); if err != 0 { die("H2D B", err) }
+
+    uint64 t_h2d = time_ns()
+
+    uint64 h_C_ref = alloc(bytes_c)
+    cpu_gemm(h_A, h_B, h_C_ref, M, N, K)
+
+    uint64 t_cpu = time_ns()
+
+    uint64 tiles_m = (M + 15) / 16
+    uint64 tiles_n = (N + 15) / 16
+    uint32 grid_x  = tiles_n
+    uint32 grid_y  = tiles_m
+    uint32 block_x = 32
+    uint32 block_y = 1
+
+    uint64 k_a = alloc(8); unsafe { *(k_a  as uint64) = d_A }
+    uint64 k_b = alloc(8); unsafe { *(k_b  as uint64) = d_B }
+    uint64 k_c = alloc(8); unsafe { *(k_c  as uint64) = d_C }
+    uint64 k_m = alloc(8); uint64 mv = M; unsafe { *(k_m as uint64) = mv }
+    uint64 k_n = alloc(8); uint64 nv = N; unsafe { *(k_n as uint64) = nv }
+    uint64 k_k = alloc(8); uint64 kv = K; unsafe { *(k_k as uint64) = kv }
+    uint64 kp = alloc(6 * 8)
+    unsafe { *(kp        as uint64) = k_a }
+    unsafe { *((kp +  8) as uint64) = k_b }
+    unsafe { *((kp + 16) as uint64) = k_c }
+    unsafe { *((kp + 24) as uint64) = k_m }
+    unsafe { *((kp + 32) as uint64) = k_n }
+    unsafe { *((kp + 40) as uint64) = k_k }
+
+    err = hipModuleLaunchKernel(fh, grid_x, grid_y, 1, block_x, block_y, 1, 0, 0, kp, 0)
+    if err != 0 { die("launch gemm", err) }
+    err = hipDeviceSynchronize(); if err != 0 { die("sync", err) }
+
+    uint64 t_gpu = time_ns()
+
+    uint64 h_C = alloc(bytes_c)
+    err = hipMemcpy(h_C, d_C, bytes_c, 2); if err != 0 { die("D2H C", err) }
+
+    uint64 ma_slot = alloc(4); uint64 mr_slot = alloc(4); uint64 fb_slot = alloc(8)
+    diff_f32(h_C_ref, h_C, M * N, ma_slot, mr_slot, fb_slot)
+
+    uint32 ma_bits = 0; unsafe { *(ma_slot as uint32) -> ma_bits }
+    uint32 mr_bits = 0; unsafe { *(mr_slot as uint32) -> mr_bits }
+    uint64 fb_idx  = 0; unsafe { *(fb_slot as uint64) -> fb_idx }
+
+    uint64 t_end = time_ns()
+
+    print_label_val("M",            1, M)
+    print_label_val("N",            1, N)
+    print_label_val("K",            1, K)
+    print_label_val("alloc_us",     8, (t_alloc - t_start) / 1000)
+    print_label_val("h2d_us",       6, (t_h2d - t_alloc) / 1000)
+    print_label_val("cpu_ref_us",  10, (t_cpu - t_h2d) / 1000)
+    print_label_val("gpu_us",       6, (t_gpu - t_cpu) / 1000)
+    print_label_val("d2h_diff_us", 11, (t_end - t_gpu) / 1000)
+    print_label_val("max_abs_bits", 12, ma_bits)
+    print_label_val("max_rel_bits", 12, mr_bits)
+    print_label_val("first_bad",    9, fb_idx)
+
+    uint64 ops = 2 * M * N * K
+    uint64 us = (t_gpu - t_cpu) / 1000
+    if us == 0 { us = 1 }
+    uint64 gflops_x100 = ops / us / 10
+    print_label_val("gflops_x100", 11, gflops_x100)
+
+    hipFree(d_A); hipFree(d_B); hipFree(d_C)
+    exit(0)
+}
