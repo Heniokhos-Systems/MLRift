@@ -594,6 +594,40 @@ fn main() {
         eout("[llama32_1b_gpu] padded-row weight cache warmed for "); eu64(n_layers); eout(" layers\n")
     }
 
+    // ─── Slice 6.10 — Port lm_head to GPU bf16 gemv (2026-05-12) ────────
+    // Bench showed CPU Q8_0 lm_head matmul = 135 ms/step = 83% of total
+    // decode time. Dequantize the tied Q8_0 embedding to bf16 (one-time
+    // +526 MiB), let the gpu_matmul_to_dev path's _gpu_mm_get_or_upload_bf16
+    // cache upload it to VRAM on first call, and dispatch the gemv_coop_bf16
+    // kernel for the per-step lm_head matmul.
+    //
+    // d_lm_in / d_lm_out are host-visible (GTT) so the host→device input
+    // copy + device→host logits copy are zero-copy memcpy on the same VA.
+    u64 lm_head_bf16_host = 0
+    u64 d_lm_in           = 0
+    u64 d_lm_in_h         = 0
+    u64 d_lm_out          = 0
+    u64 d_lm_out_h        = 0
+    if _native_mk_use != 0 {
+        eout("[llama32_1b_gpu] dequantising tied embedding Q8_0 → bf16 for GPU lm_head ("); eu64(vocab * hidden * 2); eout(" bytes)...\n")
+        lm_head_bf16_host = q8_0_to_bf16_alloc(embed_t.ptr, vocab * hidden)
+        if lm_head_bf16_host != 0 {
+            d_lm_in  = dev_try_alloc_host_visible(hidden * 4)
+            d_lm_out = dev_try_alloc_host_visible(vocab  * 4)
+            if d_lm_in != 0 && d_lm_out != 0 {
+                d_lm_in_h  = dev_host_ptr(d_lm_in)
+                d_lm_out_h = dev_host_ptr(d_lm_out)
+                eout("[llama32_1b_gpu] lm_head GPU path armed (bf16 host="); eu64(lm_head_bf16_host)
+                eout(" d_lm_in="); eu64(d_lm_in); eout(" d_lm_out="); eu64(d_lm_out); eout(")\n")
+            } else {
+                eout("[llama32_1b_gpu] lm_head GPU buffer alloc FAILED; falling back to CPU\n")
+                lm_head_bf16_host = 0
+            }
+        } else {
+            eout("[llama32_1b_gpu] lm_head Q8_0→bf16 dequant FAILED; falling back to CPU\n")
+        }
+    }
+
     // ─── Slice 6.4 — Phase B speck4 PLD acceleration ────────────────────
     // After each successful M=1 step (always correct), optionally fire a
     // speck4 mega-kernel call (M_EFF=4) that processes the just-emitted
@@ -897,11 +931,24 @@ fn main() {
             memcpy(x_cur, d_x_cur_h, hidden * 4)
         }
 
-        // Final RMSNorm + lm_head against the tied Q8_0 embedding matrix
-        // (CPU; lm_head stays Q8_0 to avoid +500 MiB bf16 inflation of
-        // the 128 256-row vocab table).
+        // Final RMSNorm + lm_head. Slice 6.10 (2026-05-12): port lm_head
+        // to GPU bf16 gemv. CPU Q8_0 matmul was 135 ms/step = 83% of total
+        // step time. lm_head_bf16_dev points at the VRAM-resident bf16
+        // dequant of the tied embedding (one-time +526 MiB at startup).
+        // d_lm_in / d_lm_out are GTT-resident host-visible scratch.
         qwen3_rmsnorm_f32_weights(final_out, x_cur, norm_t.ptr, hidden)
-        matmul_q8_0_q8_0_f32(logits, final_out, lmhead_ptr, 1, vocab, hidden, num_workers)
+        if lm_head_bf16_host != 0 {
+            memcpy(d_lm_in_h, final_out, hidden * 4)
+            if gpu_matmul_to_dev(d_lm_out, d_lm_in, lm_head_bf16_host, vocab, hidden) != 0 {
+                // GPU path failed; fall back to CPU.
+                matmul_q8_0_q8_0_f32(logits, final_out, lmhead_ptr, 1, vocab, hidden, num_workers)
+            } else {
+                gpu_pipeline_flush()
+                memcpy(logits, d_lm_out_h, vocab * 4)
+            }
+        } else {
+            matmul_q8_0_q8_0_f32(logits, final_out, lmhead_ptr, 1, vocab, hidden, num_workers)
+        }
 
         // Greedy argmax.
         u64 best_id = 0
