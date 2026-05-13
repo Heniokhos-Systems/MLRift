@@ -3115,14 +3115,20 @@ fn _emit_phase5_qkv_split_qknorm_rope_speck4_inline() {
     asm_s_load_b64_off(7, 0, 0x58)
     asm_s_waitcnt_lgkmcnt_zero()
 
-    // m_off = m << 8: s_lshl_b32 s13_tmp(s19), s16, 8
-    //   word=(2<<30)|(8<<23)|(0x13<<16)|(0x88<<8)|0x10 = 0x84138810
-    asm_u32(0x84138810)
-    // s_add_u32  s12, s12, s19  (rope_cos lo += m*256)
+    // Per-stream cos/sin stride = (HEAD_DIM/2) f32s = HEAD_DIM*2 bytes.
+    //   Qwen3 HEAD_DIM=128 → 256 bytes/stream → shift 8 (matches old hard-coded form).
+    //   Llama HEAD_DIM= 64 → 128 bytes/stream → shift 7. The previous hard-coded
+    //   shift=8 made stream m=2,3 read past the rope_cos_4 buffer end, where the
+    //   GPU returned zeros, so the rotation collapsed to zero and K[pos+2,3] became
+    //   all-zeros — silently dropping spec-decode K writes for those streams.
+    uint64 cos_off_shift = _arch_log2_pow2(MEGA_HEAD_DIM * 2)
+    // m_off = m << cos_off_shift: s_lshl_b32 s19, s16, cos_off_shift
+    asm_u32(0x84130010 | ((0x80 + cos_off_shift) << 8))
+    // s_add_u32  s12, s12, s19  (rope_cos lo += m_off)
     asm_u32(0x800C130C)
     // s_addc_u32 s13, s13, 0
     asm_u32(0x820D800D)
-    // s_add_u32  s14, s14, s19  (rope_sin lo += m*256)
+    // s_add_u32  s14, s14, s19  (rope_sin lo += m_off)
     asm_u32(0x800E130E)
     // s_addc_u32 s15, s15, 0
     asm_u32(0x820F800F)
@@ -3310,12 +3316,17 @@ fn _emit_phase5_qkv_split_qknorm_rope_speck4_inline() {
         asm_s_waitcnt_lgkmcnt_zero()
     }
 
-    // ── K: load rope_cos→s[12:13], rope_sin→s[14:15], add m*256 ─────────
+    // ── K: load rope_cos→s[12:13], rope_sin→s[14:15], add m*cos_stride ───
     asm_s_load_b64_off(6, 0, 0x50)
     asm_s_load_b64_off(7, 0, 0x58)
     asm_s_waitcnt_lgkmcnt_zero()
-    // m_off = m << 8 (s16 still holds m)
-    asm_u32(0x84138810)
+    // Per-stream cos/sin stride = HEAD_DIM*2 bytes (Qwen3=256→shift 8;
+    // Llama=128→shift 7).  Old hard-coded shift=8 was the latent
+    // K[pos+2,3]=zero bug for HEAD_DIM=64 — same root cause as the Q-body
+    // m_off fix above.
+    uint64 cos_off_shift_k = _arch_log2_pow2(MEGA_HEAD_DIM * 2)
+    // m_off = m << cos_off_shift_k (s16 still holds m)
+    asm_u32(0x84130010 | ((0x80 + cos_off_shift_k) << 8))
     asm_u32(0x800C130C)
     asm_u32(0x820D800D)
     asm_u32(0x800E130E)
