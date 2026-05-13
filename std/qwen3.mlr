@@ -1089,15 +1089,37 @@ fn qwen3_set_dump_fd(u64 fd) { qwen3_dump_fd = fd }
 // tail 4, sum/max/min — so they can be diffed side-by-side.
 // One-shot: fires only on the first qwen3_forward_layer call after the env
 // var is observed, then disables itself.
+//
+// Slice 7.2c: added MLRIFT_MEGAK_DUMP_POS=N gate (defaults to "any pos>=1").
+// For Mistral-7B 3-token prompt, prefill pos=1 fires BEFORE decode step 0
+// pos=2, so without the gate the dump fires on the wrong token vs the GPU
+// driver's decode-step-0 dump.  Set MLRIFT_MEGAK_DUMP_POS=2 to align.
 static u64 qwen3_phase_dump_state = 0   // 0=unchecked, 1=armed, 2=fired, 3=disabled
+static u64 qwen3_phase_dump_pos_target = 0xFFFFFFFFFFFFFFFF  // "any pos>=1"
 
-fn _qwen3_phase_dump_check() -> u64 {
+fn _qwen3_phase_dump_check_pos(u64 pos) -> u64 {
     if qwen3_phase_dump_state == 0 {
         u64 ev = getenv("MLRIFT_MEGAK_DUMP_LAYER")
         if ev != 0 {
             u8 c = 0; unsafe { *(ev as u8) -> c }
             if c == 48 {   // '0' = layer 0
                 qwen3_phase_dump_state = 1
+                // Optional pos gate
+                u64 evp = getenv("MLRIFT_MEGAK_DUMP_POS")
+                if evp != 0 {
+                    u64 v = 0
+                    u64 i = 0
+                    u8 c0 = 0; unsafe { *((evp + 0) as u8) -> c0 }
+                    if c0 >= 48 && c0 <= 57 {
+                        while i < 4 {
+                            u8 cc = 0; unsafe { *((evp + i) as u8) -> cc }
+                            if cc < 48 { i = 4 }
+                            else if cc > 57 { i = 4 }
+                            else { v = v * 10 + (cc - 48); i = i + 1 }
+                        }
+                        qwen3_phase_dump_pos_target = v
+                    }
+                }
             } else {
                 qwen3_phase_dump_state = 3
             }
@@ -1105,8 +1127,16 @@ fn _qwen3_phase_dump_check() -> u64 {
             qwen3_phase_dump_state = 3
         }
     }
-    if qwen3_phase_dump_state == 1 { return 1 }
+    if qwen3_phase_dump_state == 1 {
+        if qwen3_phase_dump_pos_target == 0xFFFFFFFFFFFFFFFF { return 1 }
+        if pos == qwen3_phase_dump_pos_target { return 1 }
+    }
     return 0
+}
+
+fn _qwen3_phase_dump_check() -> u64 {
+    // Legacy entry — assume "any pos>=1".  New callers should pass pos.
+    return _qwen3_phase_dump_check_pos(1)
 }
 
 fn _qwen3_dump_buf(u64 label, u64 ptr, u64 n) {
@@ -1211,12 +1241,14 @@ fn qwen3_forward_layer(u64 x_out, u64 x_in,
     // the first decode-step layer-0 call, matching the GPU driver's
     // "step 0" dump in examples/llama3_1b_gpu_generate.mlr).
     u64 _dbg_phase = 0
-    if pos != 0 { _dbg_phase = _qwen3_phase_dump_check() }
+    if pos != 0 { _dbg_phase = _qwen3_phase_dump_check_pos(pos) }
 
     u64 kv_row_bytes = nkv * hd * 4
     u64 k_row = k_cache_layer + pos * kv_row_bytes
     u64 v_row = v_cache_layer + pos * kv_row_bytes
 
+    // Slice 7.2c — pre-rmsnorm dump of x_in for bug-2 bisection.
+    if _dbg_phase != 0 { _qwen3_dump_buf("x_in_PRE", x_in, hidden) }
     // qwen3_dump5("x_in",   x_in)
     u64 resid = alloc(hidden * 4)
     memcpy(resid, x_in, hidden * 4)
