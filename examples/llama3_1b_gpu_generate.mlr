@@ -171,6 +171,19 @@ fn _dump_speck4_buf(u64 label, u64 d_ptr, u64 n_elems, u64 stream_idx) {
         eout(" "); u64 s = fmt_f32(v, 6); eout(s); dealloc(s)
         i = i + 1
     }
+    // Slice 6.7e — also dump raw f32 bits (u32 hex) so we can distinguish
+    // byte-exact equality from close-display equality.  Without this, two f32
+    // values that share their first 6 decimal digits (e.g. -0.390017 and
+    // -0.390018) look identical in the head8 line, masking whether the speck4
+    // stream-collapse bug is a true byte-exact alias or just numerical drift.
+    eout("\n    head8x:")
+    i = 0
+    while i < head_cnt {
+        u32 vbits = 0; unsafe { *((host + i * 4) as u32) -> vbits }
+        u64 vbits64 = vbits
+        eout(" "); u64 sh = fmt_hex(vbits64); eout(sh); dealloc(sh)
+        i = i + 1
+    }
     eout("\n    tail4:")
     u64 tail_start = n_elems
     if n_elems > 4 { tail_start = n_elems - 4 }
@@ -816,10 +829,13 @@ fn main() {
                 u64 qkv_dim_l = q_dim + 2 * kv_dim
                 u64 _slot = alloc(8)
                 u32 _err = 0
-                _err = hipMalloc(_slot, M_EFF_S4 * hidden * 4)
-                if _err == 0 { unsafe { *(_slot as u64) -> d_in_residual_4 } }
-                _err = hipMalloc(_slot, M_EFF_S4 * hidden * 4)
-                if _err == 0 { unsafe { *(_slot as u64) -> d_out_residual_4 } }
+                // Slice 6.7g — d_in_residual_4 / d_out_residual_4 are
+                // host-visible (GTT) so the trailing D2H of the final
+                // residual is a CPU memcpy of host-mapped memory (~µs),
+                // not a 25 ms hipMemcpy through the slow KFD-shim D2H
+                // path.  Mega-kernel still accesses them at full speed.
+                d_in_residual_4  = dev_try_alloc_host_visible(M_EFF_S4 * hidden * 4)
+                d_out_residual_4 = dev_try_alloc_host_visible(M_EFF_S4 * hidden * 4)
                 _err = hipMalloc(_slot, M_EFF_S4 * hidden * 4)
                 if _err == 0 { unsafe { *(_slot as u64) -> d_b_x_norm_g_4 } }
                 _err = hipMalloc(_slot, M_EFF_S4 * qkv_dim_l * 4)
@@ -1257,6 +1273,16 @@ fn main() {
                                         eout("[llama32_1b_gpu] speck4 ACTUALLY FIRING\n")
                                         _speck4_fired_once = 1
                                     }
+                                    // Slice 6.7e — host-side drain between layer launches.
+                                    // Required for memory coherency: WG 0 of layer N writes
+                                    // b_x_norm_g_4 in phase 1; without this flush, those
+                                    // writes haven't propagated to L2 by the time WGs ≥ 1
+                                    // on other CUs read them in phase 3 of the NEXT layer
+                                    // launch, producing byte-exact stream-pair collapse.
+                                    // Tried alternatives that did NOT fix it: L0 16 KB pad,
+                                    // SCOPE_SYS on stores, removing pre-atomic L1 inv,
+                                    // once-per-sequence-only flush.  See task #267.
+                                    gpu_pipeline_flush()
                                     if gpu_llama_layer_megakernel_speck4_to_dev(
                                             d_in_4_cur, d_out_4_cur,
                                             d_qkv_w_s, d_o_w_s, d_gate_up_w_s, d_down_w_s,
@@ -1388,7 +1414,22 @@ fn main() {
                                     while mp < M_EFF_S4 {
                                         u64 stream_resid = host_resid_4 + mp * hidden * 4
                                         qwen3_rmsnorm_f32_weights(final_out, stream_resid, norm_t.ptr, hidden)
-                                        matmul_q8_0_q8_0_f32(logits, final_out, lmhead_ptr, 1, vocab, hidden, num_workers)
+                                        // Slice 6.7f — port speck4 per-stream lm_head to GPU
+                                        // bf16 gemv (mirrors M=1 path at line ~1115).
+                                        // CPU Q8_0 was 572 ms/step (4 streams × 143 ms);
+                                        // GPU bf16 drops it to ~30 ms/step.
+                                        u64 _lmh_ok = 0
+                                        if lm_head_bf16_host != 0 {
+                                            memcpy(d_lm_in_h, final_out, hidden * 4)
+                                            if gpu_matmul_to_dev(d_lm_out, d_lm_in, lm_head_bf16_host, vocab, hidden) == 0 {
+                                                gpu_pipeline_flush()
+                                                memcpy(logits, d_lm_out_h, vocab * 4)
+                                                _lmh_ok = 1
+                                            }
+                                        }
+                                        if _lmh_ok == 0 {
+                                            matmul_q8_0_q8_0_f32(logits, final_out, lmhead_ptr, 1, vocab, hidden, num_workers)
+                                        }
                                         u64 best_s_id = 0
                                         f32 best_s_val = 0.0f
                                         u64 first_s = 1
