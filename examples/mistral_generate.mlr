@@ -69,6 +69,23 @@ fn eu64(u64 v) {
     dealloc(s)
 }
 
+// Slice 7.2a (2026-05-13) — madvise(MADV_DONTNEED) wrapper.  Mirrors
+// the slice 4.27 host-RSS optimization from examples/llama3_generate.mlr.
+// At Mistral-7B scale the Q8_0 source mmap (~7.5 GiB) is paged in for
+// dequant; without madvise it stays resident alongside the bf16 layer
+// buffers (~13.3 GiB), pushing peak host RSS to ~21 GiB.  Dropping the
+// Q8_0 pages after each tensor brings peak down to ~14 GiB.
+// Linux x86_64: syscall 28, MADV_DONTNEED = 4.
+fn madv_dontneed(u64 addr, u64 length) {
+    u64 page  = 4096
+    u64 mask  = 0 - page
+    u64 start = (addr + page - 1) & mask
+    u64 end   = (addr + length)   & mask
+    if end <= start { return }
+    u64 len = end - start
+    syscall_raw(28, start, len, 4, 0, 0, 0)
+}
+
 // Q8_0 → bf16 dequantizer (copied from llama3_generate.mlr).
 // Each Q8_0 block: 2-byte f16 scale + 32 int8 quants. Output is bf16
 // (high 16 bits of f32 representation). Used by the destroy-PyTorch CPU
@@ -262,8 +279,25 @@ fn main() {
         u64 gate_elems = ff_l    * hidden
         u64 up_elems   = ff_l    * hidden
         u64 down_elems = hidden  * ff_l
-        u64 lf = 0
+        // Q8_0 block-byte sizes for the madvise step.  Q8_0: 34 B / 32 elems.
+        u64 q_q8_bytes    = (q_elems    / 32) * 34
+        u64 kv_q8_bytes   = (kv_elems   / 32) * 34
+        u64 o_q8_bytes    = (o_elems    / 32) * 34
+        u64 gate_q8_bytes = (gate_elems / 32) * 34
+        u64 up_q8_bytes   = (up_elems   / 32) * 34
+        u64 down_q8_bytes = (down_elems / 32) * 34
         u64 deq_start = time_now()
+        // Dequant lm_head FIRST so the Q8_0 source can be released before
+        // the 13 GiB of layer bf16 buffers accumulates.  Mistral has an
+        // UNTIED output.weight (separate from token_embd.weight) — so
+        // unlike Llama-1B's slice 4.27, the per-token embedding lookup
+        // here can NOT reuse lmhead_bf16_ptr (it still has to decode from
+        // embed_t.ptr).  We do skip the lmhead Q8_0 mmap residency though.
+        eout("[mistral7b] dequantising untied lm_head Q8_0 → bf16 ("); eu64(vocab * hidden * 2); eout(" bytes)...\n")
+        lmhead_bf16_ptr = q8_0_to_bf16_alloc(lmhead_t.ptr, vocab * hidden)
+        u64 lmhead_q8_bytes = (vocab * hidden / 32) * 34
+        madv_dontneed(lmhead_t.ptr, lmhead_q8_bytes)
+        u64 lf = 0
         while lf < n_layers {
             u64 base = layers_arr + lf * 88
             u64 qp = 0; unsafe { *((base + 1 * 8) as u64) -> qp }
@@ -274,18 +308,23 @@ fn main() {
             u64 up = 0; unsafe { *((base + 9 * 8) as u64) -> up }
             u64 dp = 0; unsafe { *((base + 10 * 8) as u64) -> dp }
             unsafe { *((base + 1 * 8) as u64) = q8_0_to_bf16_alloc(qp, q_elems) }
+            madv_dontneed(qp, q_q8_bytes)
             unsafe { *((base + 2 * 8) as u64) = q8_0_to_bf16_alloc(kp, kv_elems) }
+            madv_dontneed(kp, kv_q8_bytes)
             unsafe { *((base + 3 * 8) as u64) = q8_0_to_bf16_alloc(vp, kv_elems) }
+            madv_dontneed(vp, kv_q8_bytes)
             unsafe { *((base + 6 * 8) as u64) = q8_0_to_bf16_alloc(op, o_elems) }
+            madv_dontneed(op, o_q8_bytes)
             unsafe { *((base + 8 * 8) as u64) = q8_0_to_bf16_alloc(gp, gate_elems) }
+            madv_dontneed(gp, gate_q8_bytes)
             unsafe { *((base + 9 * 8) as u64) = q8_0_to_bf16_alloc(up, up_elems) }
+            madv_dontneed(up, up_q8_bytes)
             unsafe { *((base + 10 * 8) as u64) = q8_0_to_bf16_alloc(dp, down_elems) }
+            madv_dontneed(dp, down_q8_bytes)
             lf = lf + 1
         }
-        eout("[mistral7b] dequantising untied lm_head Q8_0 → bf16 ("); eu64(vocab * hidden * 2); eout(" bytes)...\n")
-        lmhead_bf16_ptr = q8_0_to_bf16_alloc(lmhead_t.ptr, vocab * hidden)
         u64 deq_ms = time_elapsed(deq_start) / 1000000
-        eout("[mistral7b] dequant_ms="); eu64(deq_ms); eout("\n")
+        eout("[mistral7b] dequant_ms="); eu64(deq_ms); eout(" (Q8_0 source pages released via MADV_DONTNEED)\n")
     }
 
     // ---- KV cache + scratch buffers ----
