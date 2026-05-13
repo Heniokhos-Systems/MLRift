@@ -333,7 +333,15 @@ fn mega_emit_barrier_isa(uint64 phase_idx, uint64 wg_persist) {
     //   sdst=exec_lo=0x7E, ssrc0=exec_lo=0x7E, ssrc1=s3=3
     asm_u32(0x8C7E037E)
 
-    // ── spin loop (12 dwords) ─────────────────────────────────────────────
+    // ── spin loop (9 dwords) ──────────────────────────────────────────────
+    // Slice 4.23 (2026-05-13): dropped buffer_gl1_inv from the spin body.
+    // The spin load uses GLC=1 (bypasses L0/L1 caches and reads from L2
+    // directly), so post-load L1 invalidation is redundant.  buffer_gl0_inv
+    // kept for defense-in-depth on the L0 side; producer-side fence at
+    // the top of mega_emit_barrier_isa still does both.  Savings:
+    // ~50-200 ns per spin probe × 8 barriers × 16 layers = ~1-2 ms/step
+    // on Llama-1B M=1 (8 barriers × WG_PERSIST=512 active spin lanes).
+    // See project_megakernel_inner_loop_5x_gap.md.
     // Loop: load counter, check if >= threshold, spin until done.
     // v_mov_b32 v1, 0   ; vaddr = 0 for spin load
     asm_v_mov_b32_inline_u(1, 0)
@@ -344,9 +352,7 @@ fn mega_emit_barrier_isa(uint64 phase_idx, uint64 wg_persist) {
     asm_u32(0x02080001)
     // s_waitcnt vmcnt(0)
     asm_s_waitcnt_vmcnt_zero()
-    // buffer_gl1_inv
-    asm_buffer_gl1_inv()
-    // buffer_gl0_inv
+    // buffer_gl0_inv  (gl1_inv dropped — GLC load already bypasses L1)
     asm_buffer_gl0_inv()
     // v_cmp_gt_u32_e32 vcc_lo, threshold, v2  ; vcc = (threshold > counter)
     // Means: spin while counter < threshold.  VOPC e32 form: src0=literal.
@@ -356,10 +362,10 @@ fn mega_emit_barrier_isa(uint64 phase_idx, uint64 wg_persist) {
     asm_u32(0x7C9804FF)        // v_cmp_gt_u32_e32 vcc_lo, <lit>, v2
     asm_u32(threshold & 0xFFFFFFFF)
     // s_cbranch_vccnz spin_back  ; loop if vcc != 0 (counter still < threshold)
-    // spin_back is 11 dwords BEFORE this instruction:
-    //   v_mov(1) + global_load(2) + waitcnt(1) + gl1inv(2) + gl0inv(2) + vcmpgt(2) + this(1) = 11
-    //   simm16 = -11 (to branch back to v_mov before spin load)
-    asm_s_cbranch_vccnz(0xFFF5)   // simm16 = -11 as u16
+    // spin_back is 9 dwords BEFORE this instruction (was 11 pre-4.23):
+    //   v_mov(1) + global_load(2) + waitcnt(1) + gl0inv(2) + vcmpgt(2) + this(1) = 9
+    //   simm16 = -9 (to branch back to v_mov before spin load)
+    asm_s_cbranch_vccnz(0xFFF7)   // simm16 = -9 as u16
 
     // ── restore full exec after spin ─────────────────────────────────────
     // s_or_b32 exec_lo, exec_lo, s3
