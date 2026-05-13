@@ -1,0 +1,127 @@
+// llama-3.2-3B layer mega-kernel as a MLRift @kernel.
+//
+// Slice 8.0 (2026-05-13).  Mirror of examples/llm/llama_layer_megakernel.mlr
+// (Llama-3.2-1B) with arch-dispatched shapes:
+//   hidden    = 3072  (vs 1B 2048; NOT a power of 2 — needs precomputed
+//                      MEGA_INV_HIDDEN_BITS = 0x39AAAAAB in the arch setter)
+//   head_dim  =  128  (vs 1B 64; matches Mistral/Qwen3 path so phase 7
+//                      ATTN_COOP = HEAD_DIM/WAVE = 4)
+//   n_heads   =   24  (vs 1B 32; phase 5 outer_cap = 24+2*8 = 40,
+//                      phase 7 outer_cap = 24*4 = 96 — both > 64 so
+//                      cmp emits lit32 form; slice 7.2b patch covers this)
+//   n_kv_heads=    8  (GQA 3:1, same as 1B/Mistral)
+//   ff        = 8192  (same as 1B; phase 15 silu-mul WG count
+//                      = (8192+31)/32 = 256, exact match for slice 7.2d
+//                      arch-derived gate)
+//   rmsnorm eps = 1e-5
+//   QKNorm DISABLED (Llama family — phase 5 = split + RoPE only)
+//   RoPE NORM consecutive-pair (theta=500000, cos/sin tables CPU-side)
+//   tied lm_head (uses embed.ptr; driver-side, not here)
+//
+// Build the .co:
+//   ./build/mlrc --emit-amdgpu-llama-3b-megakernel-v2=/tmp/llama_3b_layer_megakernel_v2.co \
+//       examples/llm/llama_3b_layer_megakernel.mlr
+
+fn block_idx_x() -> uint64 { return 0 }
+fn tid_local_x()  -> uint64 { return 0 }
+
+fn rmsnorm_wg0_marker() { }
+fn qkv_matmul_marker() { }
+fn qkv_split_qknorm_rope_marker() { }
+fn attn_decode_coop_marker() { }
+fn oproj_residual_marker() { }
+fn post_norm_marker() { }
+fn gate_up_matmul_marker() { }
+fn silu_mul_elem_strided_marker() { }
+fn down_residual_marker() { }
+
+@kernel
+fn llama_3b_layer_megakernel(
+    uint64 in_residual,        //  0
+    uint64 out_residual,       //  1
+    uint64 qkv_w,              //  2
+    uint64 o_w,                //  3
+    uint64 gate_up_w,          //  4
+    uint64 down_w,             //  5
+    uint64 in_norm_g,          //  6
+    uint64 post_norm_g,        //  7
+    uint64 q_norm_g,           //  8
+    uint64 k_norm_g,           //  9
+    uint64 rope_cos,           // 10
+    uint64 rope_sin,           // 11
+    uint64 kc_layer,           // 12
+    uint64 vc_layer,           // 13
+    uint64 pos,                // 14
+    uint64 barrier_counter,    // 15
+    uint64 gu_scratch,         // 16
+    uint64 b_x_norm_g,         // 17
+    uint64 b_qkv_g,            // 18
+    uint64 b_attn_q_g,         // 19
+    uint64 b_mid_g,            // 20
+    uint64 b_mid_norm_g,       // 21
+    uint64 b_attn_out_g,       // 22
+    uint64 max_phase           // 23
+) {
+    // Llama-3.2-3B variant: 9 stub phases + 8 cross-WG barriers + max_phase guards.
+    // Body shape matches Llama-1B/Mistral exactly; only the wg-bounds literals
+    // on phases 5 and 7 change to reflect Llama-3B shapes (24 Q heads + 8 KV heads,
+    // ATTN_COOP=4).  WG_PERSIST=512.
+
+    uint64 wg_id = block_idx_x()
+    uint64 lane  = tid_local_x()
+
+    if wg_id == 0 {
+        rmsnorm_wg0_marker()       // phase 1: input rmsnorm (WG-0 gated)
+    }
+    mega_barrier(barrier_counter, 0, 512)
+    if max_phase < 1 { return }
+
+    if wg_id < 256 {
+        qkv_matmul_marker()        // phase 3: QKV matmul (WG<256)
+    }
+    mega_barrier(barrier_counter, 1, 512)
+    if max_phase < 2 { return }
+
+    if wg_id < 40 {
+        qkv_split_qknorm_rope_marker()   // phase 5: QKV split + RoPE (3-way head dispatch, wg<N_HEADS+2*N_KV_HEADS=40)
+    }
+    mega_barrier(barrier_counter, 2, 512)
+    if max_phase < 3 { return }
+
+    if wg_id < 96 {
+        attn_decode_coop_marker()  // phase 7: attn_decode-coop (ATTN_COOP=4, wg<N_HEADS*4=96)
+    }
+    mega_barrier(barrier_counter, 3, 512)
+    if max_phase < 4 { return }
+
+    if wg_id < 256 {
+        oproj_residual_marker()    // phase 9: o_proj + residual (WG<256)
+    }
+    mega_barrier(barrier_counter, 4, 512)
+    if max_phase < 5 { return }
+
+    if wg_id == 0 {
+        post_norm_marker()         // phase 11: post_norm rmsnorm (WG-0 gated)
+    }
+    mega_barrier(barrier_counter, 5, 512)
+    if max_phase < 6 { return }
+
+    if wg_id < 256 {
+        gate_up_matmul_marker()    // phase 13: gate_up matmul (WG<256)
+    }
+    mega_barrier(barrier_counter, 6, 512)
+    if max_phase < 7 { return }
+
+    if wg_id < 256 {
+        silu_mul_elem_strided_marker()  // phase 15: SiLU(gate)*up in-place
+    }
+    mega_barrier(barrier_counter, 7, 512)
+
+    if wg_id < 256 {
+        down_residual_marker()     // phase 17: down + final residual
+    }
+}
+
+fn main() {
+    exit(0)
+}

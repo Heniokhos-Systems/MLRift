@@ -114,6 +114,8 @@ echo "=== mega-kernel .cos ==="
     && echo "  ok  qwen3_layer_megakernel_speck4_v2.co"
 "$MLRC" --emit-amdgpu-llama-megakernel-v2=/tmp/llama_layer_megakernel_v2.co examples/llm/llama_layer_megakernel.mlr > /dev/null 2>&1 \
     && echo "  ok  llama_layer_megakernel_v2.co"
+"$MLRC" --emit-amdgpu-llama-3b-megakernel-v2=/tmp/llama_3b_layer_megakernel_v2.co examples/llm/llama_3b_layer_megakernel.mlr > /dev/null 2>&1 \
+    && echo "  ok  llama_3b_layer_megakernel_v2.co"
 "$MLRC" --emit-amdgpu-llama-megakernel-speck4-v2=/tmp/llama_layer_megakernel_speck4_v2.co examples/llm/llama_layer_megakernel_speck4.mlr > /dev/null 2>&1 \
     && echo "  ok  llama_layer_megakernel_speck4_v2.co"
 

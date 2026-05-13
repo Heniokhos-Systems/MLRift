@@ -78,6 +78,15 @@ static uint64 MEGA_RMSNORM_EPS_BITS    = 0x3727C5AC  // phase 1/11 RMSNorm eps.
                                                      // (1e-6) is hardcoded in slice
                                                      // 5.3 under the MEGA_USE_QKNORM
                                                      // branch.
+// Slice 8.0 (2026-05-13) — precomputed f32 bit pattern for 1.0f / MEGA_HIDDEN.
+// _arch_inv_n_f32_bits() below only handles power-of-2 inputs.  Llama-3.2-3B
+// has HIDDEN=3072 (not power of 2 — 3 × 2^10), so the rmsnorm-scale literal
+// must be precomputed per-arch by the setter instead of derived at emit time.
+//   1/1024 = 0x3A800000  (Qwen3-0.6B)
+//   1/2048 = 0x3A000000  (Llama-3.2-1B)
+//   1/3072 = 0x39AAAAAB  (Llama-3.2-3B)
+//   1/4096 = 0x39800000  (Mistral-7B)
+static uint64 MEGA_INV_HIDDEN_BITS      = 0x3A800000  // Qwen3 default (1/1024)
 
 // ── Slice 5.0 — arch setters + name-dispatch + bit-math helpers ───────────
 
@@ -93,6 +102,7 @@ fn mega_set_arch_qwen3_06b() {
                                   // bumps to 8/16 for _speck8 / _speck16
     MEGA_RMSNORM_EPS_BITS= 0x3727C5AC   // 1e-5f (phase 1/11; phase-5 qknorm
                                         // hardcodes 0x358637BD = 1e-6 in slice 5.3)
+    MEGA_INV_HIDDEN_BITS = 0x3A800000   // 1/1024 (slice 8.0)
 }
 
 fn mega_set_arch_llama_1b() {
@@ -106,6 +116,34 @@ fn mega_set_arch_llama_1b() {
     MEGA_M_EFF           =    4   // slice 4.21.1: Llama-speck4 default;
                                   // mks8/16 for Llama is future work.
     MEGA_RMSNORM_EPS_BITS= 0x3727C5AC   // 1e-5f (Llama)
+    MEGA_INV_HIDDEN_BITS = 0x3A000000   // 1/2048 (slice 8.0)
+}
+
+// Slice 8.0 (2026-05-13) — Llama-3.2-3B-Instruct.
+// Same body shape as Llama-1B (GQA, RMSNorm, RoPE consecutive pairs, no
+// qknorm, SwiGLU FFN); arch knobs:
+//   hidden=3072 (NOT power of 2 — first such arch; requires precomputed
+//     MEGA_INV_HIDDEN_BITS since _arch_inv_n_f32_bits only handles pow2),
+//   head_dim=128 (matches Mistral/Qwen3 path),
+//   n_heads=24 (NEW — outer_cap for phase 7 = 24·4 = 96 > 64 → lit32 form,
+//     already patched in slice 7.2b for Mistral N_HEADS=32),
+//   n_kv_heads=8 (GQA 3:1),
+//   ff=8192 (same as Llama-1B; phase 15 silu-mul WG count
+//     = (8192+31)/32 = 256, fits the slice 7.2d arch-derived form exactly),
+//   rope theta=500000 (Llama-3.x; CPU-side tables), 28 layers (driver).
+// Tied lm_head (uses embed.ptr) — same as Llama-1B.
+fn mega_set_arch_llama_3b() {
+    MEGA_HIDDEN          = 3072
+    MEGA_HEAD_DIM        =  128
+    MEGA_N_HEADS         =   24
+    MEGA_N_KV_HEADS      =    8
+    MEGA_FF              = 8192
+    MEGA_USE_QKNORM      =    0
+    MEGA_ROPE_PAIR_LAYOUT=    1
+    MEGA_M_EFF           =    4   // speck4 wired but llama_3b_speck4 .co
+                                  // is future work; M=1 base path first.
+    MEGA_RMSNORM_EPS_BITS= 0x3727C5AC   // 1e-5f (Llama-3.x)
+    MEGA_INV_HIDDEN_BITS = 0x39AAAAAB   // 1/3072 (slice 8.0) — non-pow2 HIDDEN
 }
 
 // Slice 7.0 (2026-05-13) — Mistral-7B-Instruct-v0.3.
@@ -127,6 +165,7 @@ fn mega_set_arch_mistral_7b() {
     MEGA_M_EFF           =    4   // speck4 wired but mistral_speck4 .co
                                   // is future work; M=1 base path first.
     MEGA_RMSNORM_EPS_BITS= 0x3727C5AC   // 1e-5f (Mistral)
+    MEGA_INV_HIDDEN_BITS = 0x39800000   // 1/4096 (slice 8.0)
 }
 
 // Returns the 32-bit f32 bit pattern of 1.0f/n for n a power of 2 in
@@ -253,6 +292,15 @@ fn megakernel_dispatch_arch(uint64 kname_ptr, uint64 nl) {
             return
         }
         // base / speck4 — MEGA_M_EFF stays at 4 from mega_set_arch_qwen3_06b.
+        return
+    }
+    // Slice 8.0: check "llama_3b_layer_megakernel" BEFORE the generic
+    // "llama_layer_megakernel" prefix (which the 3B name would also
+    // match prefix-wise; "llama_3b..." starts with "llama_" but NOT
+    // with "llama_layer_..." so order doesn't actually matter here —
+    // keep the more specific check first for clarity).
+    if str_starts_with(kname_ptr, "llama_3b_layer_megakernel", 25) != 0 {
+        mega_set_arch_llama_3b()
         return
     }
     if str_starts_with(kname_ptr, "llama_layer_megakernel", 22) != 0 {
@@ -649,9 +697,12 @@ fn _emit_rmsnorm_wg_gated_inline(uint64 in_kofs, uint64 norm_kofs,
     asm_s_mov_b32(12, 0x7E)
     // v_cmpx_eq_u32_e32 0, v0  (exec = {lanes where v0==0} = lane 0 only)
     asm_u32(0x7D940080)
-    // s_mov_b32 s14, _arch_inv_n_f32_bits(MEGA_HIDDEN)  (1/N.0f bits;
-    //   Qwen3 N=1024 → 0x3A800000, Llama N=2048 → 0x3A000000)
-    asm_s_mov_b32_lit32(14, _arch_inv_n_f32_bits(MEGA_HIDDEN))
+    // s_mov_b32 s14, MEGA_INV_HIDDEN_BITS  (1/N.0f bits; set per-arch by
+    //   the arch setter — Qwen3 1024→0x3A800000, Llama-1B 2048→0x3A000000,
+    //   Llama-3B 3072→0x39AAAAAB, Mistral 4096→0x39800000.  Slice 8.0
+    //   moved this off _arch_inv_n_f32_bits because that helper only
+    //   handles power-of-2 N; Llama-3B HIDDEN=3072 is the first non-pow2.)
+    asm_s_mov_b32_lit32(14, MEGA_INV_HIDDEN_BITS)
     // v_mul_f32 v2, s14, v2  (v2 = ssq / N)
     // VOP2: (8<<25)|(2<<17)|(2<<9)|14 = 0x10000000|0x00040000|0x00000400|14 = 0x1004040E
     asm_u32(0x1004040E)
