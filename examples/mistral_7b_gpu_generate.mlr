@@ -1,0 +1,1597 @@
+// Llama-3.2-1B Q8_0 — GPU-matmul-offload greedy decode driver.
+//
+// Mirror of examples/llama3_generate.mlr (CPU-only Q8_0 path), but with
+// the heavy matmul ops (qkv, o_proj, gate/up, down_proj) offloaded to
+// the GPU via the existing qwen3_main_matmul → matmul_bf16_weights_f32_gpu
+// dispatch.  Layout-wise the trick is simple:
+//
+//   * The CPU driver feeds Q8_0 weight pointers into Qwen3LayerWeights
+//     and sets qwen3_set_matmul_kind(1) so qwen3_main_matmul calls
+//     matmul_q8_0_q8_0_f32 (CPU).
+//   * This driver dequantises Q8_0 → bf16 in HOST memory once at load
+//     time, hands those bf16 pointers to Qwen3LayerWeights, and sets
+//     qwen3_set_matmul_kind(0).  qwen3_main_matmul then dispatches via
+//     matmul_bf16_weights_f32_gpu (env-gated by MLRIFT_GPU_MATMUL).
+//   * Embedding lookup + lm_head stay on Q8_0 host pointers — they are
+//     not routed through qwen3_main_matmul.  Embedding is a single-row
+//     dequant per step; lm_head is matmul_q8_0_q8_0_f32 against the
+//     tied-embedding tensor.  lm_head is the dominant cost per step
+//     (~190 ms / 225 ms total) and porting it to GPU is the next slice.
+//
+// Arch knobs are identical to the CPU driver:
+//   qwen3_set_arch(2048, 64, 32, 8, 8192)
+//   qwen3_set_qknorm(0)            — Llama: no per-head Q/K RMSNorm
+//   qwen3_set_rope_base(500000)    — Llama-3 theta
+//   qwen3_set_rope_pair_layout(1)  — NORM consecutive-pair RoPE
+//   qwen3_set_rmsnorm_eps_bits(0x3727C5AC)  — 1e-5
+//   qwen3_set_norm_kind(1)         — F32 norm weights (Llama GGUF)
+//   qwen3_set_fuse_qkv(0)          — three matmuls per QKV
+//   qwen3_set_matmul_kind(0)       — *** bf16 (GPU dispatcher) ***
+//
+// CORRECTNESS STATUS (2026-05-07):
+//   * CPU bf16 path (MLRIFT_GPU_MATMUL_MIN_BYTES=999999999 to suppress
+//     GPU dispatch entirely): bit-exact 20/20 match against
+//     llama3_generate (CPU Q8_0 reference).  Determinism perfect.
+//     4.16 tok/s — 4× speedup over CPU Q8_0 baseline (1.0 tok/s).
+//   * GPU bf16 dequant-to-f32 (default with MLRIFT_GPU_MATMUL=1):
+//     non-deterministic across runs.  Tokens drift even at step 0.
+//     4.43 tok/s.  Likely a determinism bug in
+//     std/inference_gpu.mlr:matmul_bf16_weights_f32_gpu — the same
+//     dispatcher works deterministically for Qwen3-0.6B (different
+//     matmul shape mix) but not for Llama-1B's 5-matmul-per-layer mix.
+//     Tracked separately; not blocking this driver landing.
+//   * GPU bf16-direct (MLRIFT_GPU_MATMUL_BF16=1): same non-determinism.
+//     4.37 tok/s.
+//
+// vs PyTorch ROCm bf16 baseline 51.3 tok/s: ~12× behind.  Bottleneck
+// is the CPU lm_head (Q8_0 × hidden=2048 × vocab=128256 ≈ 525 MiB, MT
+// AVX2).  Porting lm_head onto the GPU bf16 gemv_coop_bf16 path would
+// likely close ~50 % of the gap.
+//
+// Build:
+//   ./build/mlrc --target=amdgpu-native --emit=elfexe examples/llama3_1b_gpu_generate.mlr \
+//                -o /tmp/mistral_7b_gpu
+//   # Bit-exact (CPU bf16, GPU init only):
+//   MLRIFT_GPU_MATMUL=1 MLRIFT_GPU_MATMUL_MIN_BYTES=999999999 /tmp/mistral_7b_gpu
+//   # Best perf (GPU dispatch, accept token drift):
+//   MLRIFT_GPU_MATMUL=1 /tmp/mistral_7b_gpu
+
+import "../std/qwen3.mlr"
+import "../std/gguf.mlr"
+import "../std/matmul.mlr"
+import "../std/inference.mlr"
+import "../std/inference_gpu.mlr"
+import "../std/io.mlr"
+import "../std/fmt.mlr"
+import "../std/string.mlr"
+import "../std/thread.mlr"
+import "../std/time.mlr"
+import "../std/model_path.mlr"
+
+static u64 g_fd = 0
+// Slice 6.5 — one-shot proof-of-firing flags.  Tests grep for the log
+// lines emitted from inside the per-layer dispatch (M=1 path) and the
+// speck4 dispatch to assert the mega-kernel actually ran.  Previously,
+// the driver logged "mega-kernel path active" during setup but silently
+// fell back to CPU bf16 inside the layer loop because the .co was
+// never loaded (slice 6.5 fixed the gating in std/inference_gpu.mlr).
+static u64 _mk_fired_once     = 0
+static u64 _speck4_fired_once = 0
+// Slice 6.7e-bis — speck4 per-phase intermediate-buffer dump flag.
+// Gated by MLRIFT_MISTRAL_SPECK4_DUMP=1; fires exactly once (first speck4 call,
+// first layer of that call) so we can compare phase-by-phase against the
+// known-correct M=1 mega-kernel reference (MLRIFT_MEGAK_DUMP_LAYER=0).
+static u64 _speck4_dump_done  = 0
+fn eout(u64 s) {
+    print_str(s)
+    if g_fd != 0 {
+        u64 n = str_len(s)
+        file_write(g_fd, s, n)
+    }
+}
+fn eu64(u64 v) {
+    u64 s = fmt_dec(v)
+    eout(s)
+    dealloc(s)
+}
+
+// Slice 6.7b — float buffer dump diagnostic (first 8, last 4, sum, max, min)
+// for bisecting mega-kernel vs CPU bf16 divergence.
+fn _dump_buf(u64 label, u64 ptr, u64 n) {
+    eout("  ["); eout(label); eout("] n="); eu64(n); eout("\n    head:")
+    u64 i = 0
+    u64 head_cnt = 16
+    if n < head_cnt { head_cnt = n }
+    while i < head_cnt {
+        f32 v = 0.0f; unsafe { *((ptr + i * 4) as f32) -> v }
+        eout(" "); u64 s = fmt_f32(v, 6); eout(s); dealloc(s)
+        i = i + 1
+    }
+    eout("\n    stride256:")
+    u64 sti = 0
+    while sti < n && sti < 16 * 256 {
+        f32 v = 0.0f; unsafe { *((ptr + sti * 4) as f32) -> v }
+        eout(" "); u64 s = fmt_f32(v, 6); eout(s); dealloc(s)
+        sti = sti + 256
+    }
+    eout("\n    tail:")
+    u64 tail_start = n
+    if n > 4 { tail_start = n - 4 }
+    i = tail_start
+    while i < n {
+        f32 v = 0.0f; unsafe { *((ptr + i * 4) as f32) -> v }
+        eout(" "); u64 s = fmt_f32(v, 6); eout(s); dealloc(s)
+        i = i + 1
+    }
+    f64 sum = 0.0
+    f32 vmax = 0.0f
+    f32 vmin = 0.0f
+    u64 first = 1
+    i = 0
+    while i < n {
+        f32 v = 0.0f; unsafe { *((ptr + i * 4) as f32) -> v }
+        sum = sum + f32_to_f64(v)
+        if first == 1 { vmax = v; vmin = v; first = 0 }
+        else {
+            if v > vmax { vmax = v }
+            if v < vmin { vmin = v }
+        }
+        i = i + 1
+    }
+    eout("\n    sum="); u64 ss = fmt_f64(sum, 6); eout(ss); dealloc(ss)
+    eout(" max="); u64 sm = fmt_f32(vmax, 6); eout(sm); dealloc(sm)
+    eout(" min="); u64 sn = fmt_f32(vmin, 6); eout(sn); dealloc(sn)
+    eout("\n")
+}
+
+// Slice 6.7e-bis — speck4 per-phase dump.  D2H-copies n_elems f32 values
+// from d_ptr + stream_idx * n_elems * 4 into a scratch host buffer and
+// prints head8 / tail4 / sum / min / max.  Same level of detail as
+// _dump_buf so the speck4-vs-M=1 phase comparison reads naturally.
+// d_ptr MUST be a plain hipMalloc'd device pointer (speck4 phase slabs
+// are allocated this way at line ~739); we explicitly hipMemcpy(D2H).
+fn _dump_speck4_buf(u64 label, u64 d_ptr, u64 n_elems, u64 stream_idx) {
+    if d_ptr == 0 { return }
+    u64 bytes = n_elems * 4
+    u64 host = alloc(bytes)
+    u32 cerr = hipMemcpy(host, d_ptr + stream_idx * bytes, bytes, 2)   // D2H
+    if cerr != 0 {
+        eout("  [dump-speck4] "); eout(label); eout(" stream "); eu64(stream_idx)
+        eout(" D2H FAIL rc="); u64 rs = fmt_dec(cerr); eout(rs); dealloc(rs); eout("\n")
+        dealloc(host)
+        return
+    }
+    eout("  [dump-speck4] "); eout(label); eout(" stream "); eu64(stream_idx)
+    eout(" n="); eu64(n_elems); eout("\n    head8:")
+    u64 head_cnt = 8
+    if n_elems < head_cnt { head_cnt = n_elems }
+    u64 i = 0
+    while i < head_cnt {
+        f32 v = 0.0f; unsafe { *((host + i * 4) as f32) -> v }
+        eout(" "); u64 s = fmt_f32(v, 6); eout(s); dealloc(s)
+        i = i + 1
+    }
+    // Slice 6.7e — also dump raw f32 bits (u32 hex) so we can distinguish
+    // byte-exact equality from close-display equality.  Without this, two f32
+    // values that share their first 6 decimal digits (e.g. -0.390017 and
+    // -0.390018) look identical in the head8 line, masking whether the speck4
+    // stream-collapse bug is a true byte-exact alias or just numerical drift.
+    eout("\n    head8x:")
+    i = 0
+    while i < head_cnt {
+        u32 vbits = 0; unsafe { *((host + i * 4) as u32) -> vbits }
+        u64 vbits64 = vbits
+        eout(" "); u64 sh = fmt_hex(vbits64); eout(sh); dealloc(sh)
+        i = i + 1
+    }
+    eout("\n    tail4:")
+    u64 tail_start = n_elems
+    if n_elems > 4 { tail_start = n_elems - 4 }
+    i = tail_start
+    while i < n_elems {
+        f32 v = 0.0f; unsafe { *((host + i * 4) as f32) -> v }
+        eout(" "); u64 s = fmt_f32(v, 6); eout(s); dealloc(s)
+        i = i + 1
+    }
+    f64 sum = 0.0
+    f32 vmax = 0.0f
+    f32 vmin = 0.0f
+    u64 first = 1
+    i = 0
+    while i < n_elems {
+        f32 v = 0.0f; unsafe { *((host + i * 4) as f32) -> v }
+        sum = sum + f32_to_f64(v)
+        if first == 1 { vmax = v; vmin = v; first = 0 }
+        else {
+            if v > vmax { vmax = v }
+            if v < vmin { vmin = v }
+        }
+        i = i + 1
+    }
+    eout("\n    sum="); u64 ss = fmt_f64(sum, 6); eout(ss); dealloc(ss)
+    eout(" max="); u64 sm = fmt_f32(vmax, 6); eout(sm); dealloc(sm)
+    eout(" min="); u64 sn = fmt_f32(vmin, 6); eout(sn); dealloc(sn)
+    eout("\n")
+    dealloc(host)
+}
+
+// Slice 6.4 — Phase B PLD (Prompt Lookup Decoding) draft proposer.
+//
+// Scan the last LOOKBACK=64 tokens of seq_ids32 for an NGRAM=2 match
+// with the last 2 tokens of the sequence.  If found, write the next K
+// tokens AFTER the matched bigram into draft_out and return the count.
+// Else return 0.
+//
+// seq_ids32 : u32 array of token IDs (4 bytes each)
+// seq_len   : number of tokens currently in seq_ids32
+// draft_out : caller-allocated buffer of K * 4 bytes (u32 each)
+// K         : number of draft tokens to propose (<= M_EFF_S4 - 1 = 3)
+fn pld_propose(u64 seq_ids32, u64 seq_len, u64 draft_out, u64 K) -> u64 {
+    u64 NGRAM = 2
+    u64 LOOKBACK = 64
+    if seq_len < NGRAM + 1 { return 0 }
+    u32 last_a32 = 0
+    unsafe { *((seq_ids32 + (seq_len - 2) * 4) as u32) -> last_a32 }
+    u32 last_b32 = 0
+    unsafe { *((seq_ids32 + (seq_len - 1) * 4) as u32) -> last_b32 }
+    u64 last_a = last_a32
+    u64 last_b = last_b32
+    u64 scan_start = 0
+    if seq_len > LOOKBACK { scan_start = seq_len - LOOKBACK }
+    u64 i = scan_start
+    // i + NGRAM < seq_len so that i+1 is in-range and emit_start = i+2
+    // can read at least one token at index i+2 (still < seq_len).
+    while i + NGRAM < seq_len {
+        u32 v_a32 = 0
+        unsafe { *((seq_ids32 + i * 4) as u32) -> v_a32 }
+        u32 v_b32 = 0
+        unsafe { *((seq_ids32 + (i + 1) * 4) as u32) -> v_b32 }
+        u64 v_a = v_a32
+        u64 v_b = v_b32
+        if v_a == last_a {
+            if v_b == last_b {
+                u64 emit_start = i + NGRAM
+                u64 written = 0
+                while written < K {
+                    if emit_start + written >= seq_len { return written }
+                    u32 t = 0
+                    unsafe { *((seq_ids32 + (emit_start + written) * 4) as u32) -> t }
+                    unsafe { *((draft_out + written * 4) as u32) = t }
+                    written = written + 1
+                }
+                return written
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// Dequantise a Q8_0 tensor of `n_elements` total values into a freshly
+// allocated bf16 buffer (2 bytes per element).  Q8_0 layout: 32-element
+// blocks of [f16 scale | int8 qs[32]] = 34 bytes each.  Output bf16:
+// upper 16 bits of f32 = scale * qs[i] (truncation; rounding to nearest
+// even is a wash at f32→bf16 for our purposes — argmax is stable).
+fn q8_0_to_bf16_alloc(u64 src_q8, u64 n_elements) -> u64 {
+    u64 dst_bf16 = alloc(n_elements * 2)
+    u64 n_blocks = n_elements / 32
+    // Single-element f32 scratch for bit-cast.
+    u64 scratch = alloc(4)
+    u64 bi = 0
+    while bi < n_blocks {
+        u64 block = src_q8 + bi * 34
+        u64 lo = load8(block)
+        u64 hi = load8(block + 1)
+        u64 dbits = lo | (hi << 8)
+        f32 d = gguf_f16_to_f32_exact(dbits)
+        u64 qs_base = block + 2
+        u64 j = 0
+        while j < 32 {
+            u64 bval = load8(qs_base + j)
+            f32 q = 0.0f
+            if bval >= 128 {
+                f32 pos = int_to_f32_gguf(256 - bval)
+                q = 0.0f - pos
+            } else {
+                q = int_to_f32_gguf(bval)
+            }
+            f32 out_val = d * q
+            // Bit-cast f32 → upper 16 bits = bf16 (truncation).
+            unsafe { *(scratch as f32) = out_val }
+            // Read bytes 2,3 of scratch (the upper-16 of LE f32).
+            u64 b0 = load8(scratch + 2)
+            u64 b1 = load8(scratch + 3)
+            u64 dst_off = (bi * 32 + j) * 2
+            u8 b0_8 = b0
+            u8 b1_8 = b1
+            unsafe { *((dst_bf16 + dst_off + 0) as u8) = b0_8 }
+            unsafe { *((dst_bf16 + dst_off + 1) as u8) = b1_8 }
+            j = j + 1
+        }
+        bi = bi + 1
+    }
+    dealloc(scratch)
+    return dst_bf16
+}
+
+fn main() {
+    u64 num_workers = 24
+    thread_pool_init(num_workers)
+    g_fd = file_open("/tmp/mistral_7b_gpu_gen.out", 1)
+
+    // --- Reconfigure qwen3.mlr for Mistral-7B-Instruct-v0.3 GPU bf16 matmul path ---
+    qwen3_set_arch(4096, 128, 32, 8, 14336)
+    qwen3_set_matmul_kind(0)                // *** bf16 (GPU dispatcher) ***
+    qwen3_set_norm_kind(1)                  // F32 norms (Mistral)
+    qwen3_set_fuse_qkv(0)                   // separate q/k/v + gate/up matmuls
+    qwen3_set_qknorm(0)                     // Mistral: no per-head Q/K RMSNorm
+    qwen3_set_rope_base(10000)              // Mistral v0.3 theta = 1e4
+    qwen3_set_rmsnorm_eps_bits(0x3727C5AC)  // Mistral: rms_norm_eps = 1e-5
+    qwen3_set_rope_pair_layout(1)           // NORM consecutive-pair RoPE
+
+    // Force-init the GPU matmul dispatcher early so gpu_pipeline_ready()
+    // and matmul_bf16_weights_f32_gpu work without first being touched
+    // through the chained path.
+    u64 gpu_ok = gpu_matmul_enabled()
+    eout("[mistral_7b_gpu] gpu_matmul_enabled="); eu64(gpu_ok); eout("\n")
+
+    // Force the HIP/KFD lazy init to fire NOW (before we allocate the
+    // ~1.86 GiB of bf16 host weights).  After heavy alloc()s the heap
+    // is fragmented and ACQUIRE_VM occasionally fails with errno=-1 —
+    // doing a 64 B dummy hipMalloc first makes the GPU claim its VA
+    // range cleanly while the address space is uncluttered.
+    u64 _dummy_slot = alloc(8)
+    u32 _dummy_err = hipMalloc(_dummy_slot, 64)
+    if _dummy_err == 0 {
+        u64 _dummy_va = 0
+        unsafe { *(_dummy_slot as u64) -> _dummy_va }
+        hipFree(_dummy_va)
+        eout("[mistral_7b_gpu] hip/kfd lazy-init OK (dummy hipMalloc)\n")
+    } else {
+        eout("[mistral_7b_gpu] hip/kfd lazy-init FAILED err="); eu64(_dummy_err); eout("\n")
+    }
+
+    u64 path = resolve_model_path("MLRIFT_MISTRAL_7B_GGUF",
+                                   "models/mistral-7b-instruct-v0.3-q8_0.gguf",
+                                   "mistral-7b-gpu")
+    eout("[mistral_7b_gpu] loading weights from ")
+    eout(path)
+    eout("\n")
+    u64 load_start_ns = time_now()
+    GGUFFile gf = gguf_open(path)
+    if gf.file_size == 0 {
+        eout("open fail\n")
+        thread_pool_shutdown(); file_close(g_fd); exit(1)
+    }
+
+    u64 hidden    = QWEN3_HIDDEN
+    u64 q_dim     = QWEN3_Q_DIM
+    u64 kv_dim    = QWEN3_KV_DIM
+    u64 ff        = QWEN3_INTERMEDIATE
+    u64 n_layers  = 32          // Mistral-7B: 32 transformer blocks
+    u64 vocab     = 32768       // Mistral-7B: V=32768 (smaller than Llama)
+    u64 max_seq   = 128         // bumped from 64 for Mistral RoPE table coverage
+    u64 max_new   = 20
+    // MLRIFT_QWEN3_MAX_NEW: shorten the decode loop so dump/bisect runs
+    // finish quickly (max_new=1 is enough to capture per-phase dumps).
+    u64 _ev_mn_l = getenv("MLRIFT_QWEN3_MAX_NEW")
+    if _ev_mn_l != 0 {
+        u64 _mn_val = 0
+        u64 _mn_i = 0
+        u8 _mn_c0 = 0; unsafe { *((_ev_mn_l + 0) as u8) -> _mn_c0 }
+        if _mn_c0 >= 48 && _mn_c0 <= 57 {
+            while _mn_i < 4 {
+                u8 _mn_c = 0; unsafe { *((_ev_mn_l + _mn_i) as u8) -> _mn_c }
+                if _mn_c < 48 { _mn_i = 4 }
+                else if _mn_c > 57 { _mn_i = 4 }
+                else { _mn_val = _mn_val * 10 + (_mn_c - 48); _mn_i = _mn_i + 1 }
+            }
+            if _mn_val > 0 && _mn_val <= 20 { max_new = _mn_val }
+        }
+    }
+    // MLRIFT_MISTRAL_SPECK4_MAX_PHASE: bisect speck4 kernel by limiting which
+    // phases run.  7 = all phases through 17 (default, full layer).  Lower
+    // values stop early so we can dump partial intermediates and compare to
+    // M=1 reference at each level.
+    //   0 → skip everything (returns after barrier 0)
+    //   1 → after phase 1 (input rmsnorm)
+    //   2 → after phase 3 (qkv matmul)
+    //   3 → after phase 5 (qkv-split + rope; for Llama: no qknorm)
+    //   4 → after phase 7 (attn_decode_coop)
+    //   5 → after phase 9 (o_proj + residual)
+    //   6 → after phase 13 (post_norm + gate_up matmul)
+    //   7 → after phase 17 (silu_mul + down_proj + final residual)
+    u64 _speck4_max_phase = 7
+    u64 _ev_mp = getenv("MLRIFT_MISTRAL_SPECK4_MAX_PHASE")
+    if _ev_mp != 0 {
+        u64 _mp_val = 0
+        u64 _mp_i = 0
+        while _mp_i < 2 {
+            u8 _mp_c = 0; unsafe { *((_ev_mp + _mp_i) as u8) -> _mp_c }
+            if _mp_c < 48 { _mp_i = 2 }
+            else if _mp_c > 57 { _mp_i = 2 }
+            else { _mp_val = _mp_val * 10 + (_mp_c - 48); _mp_i = _mp_i + 1 }
+        }
+        if _mp_val <= 7 { _speck4_max_phase = _mp_val }
+    }
+
+    GGUFTensor embed_t = gguf_get(gf, "token_embd.weight")
+    if embed_t.ptr == 0 {
+        eout("missing token_embd.weight\n")
+        gguf_free(gf); thread_pool_shutdown(); file_close(g_fd); exit(1)
+    }
+    GGUFTensor norm_t = gguf_get(gf, "output_norm.weight")
+    if norm_t.ptr == 0 {
+        eout("missing output_norm.weight\n")
+        gguf_free(gf); thread_pool_shutdown(); file_close(g_fd); exit(1)
+    }
+    // Mistral has a SEPARATE output.weight tensor (lm_head is NOT tied to
+    // the input embedding).  Fall back to embed_t.ptr if missing (some
+    // Mistral GGUF builds tie them anyway).
+    GGUFTensor output_t = gguf_get(gf, "output.weight")
+    u64 lmhead_ptr = 0
+    if output_t.ptr != 0 {
+        lmhead_ptr = output_t.ptr
+        eout("[mistral_7b_gpu] using untied output.weight for lm_head\n")
+    } else {
+        lmhead_ptr = embed_t.ptr   // fallback to tied embedding
+        eout("[mistral_7b_gpu] output.weight missing -- falling back to tied token_embd.weight\n")
+    }
+
+    GGUFTensor rope_freqs_t = gguf_get(gf, "rope_freqs.weight")
+    if rope_freqs_t.ptr != 0 {
+        qwen3_set_rope_freqs(rope_freqs_t.ptr)
+        eout("[mistral_7b_gpu] rope_freqs.weight wired\n")
+    }
+
+    // Per-layer weight pointer table — same 11-slot layout.  Slot 4
+    // (q_norm) and 5 (k_norm) stay 0; qwen3_set_qknorm(0) gates them.
+    // Slots 1,2,3 (q/k/v), 6 (o), 8 (gate), 9 (up), 10 (down) hold
+    // bf16 host pointers (dequantised from the GGUF Q8_0 tensors).
+    // Slots 0 (input_norm) and 7 (post_norm) hold the original f32
+    // pointers (Llama GGUF stores those as F32).
+    u64 layers_arr = alloc(n_layers * 88)
+
+    u64 q_elems    = q_dim  * hidden            // 2048×2048
+    u64 kv_elems   = kv_dim * hidden            //  512×2048
+    u64 o_elems    = hidden * q_dim             // 2048×2048
+    u64 gate_elems = ff     * hidden            // 8192×2048
+    u64 up_elems   = ff     * hidden
+    u64 down_elems = hidden * ff
+
+    eout("[mistral_7b_gpu] dequantising 16 layers of Q8_0 → bf16 (host) — this is one-time...\n")
+    u64 li = 0
+    while li < n_layers {
+        u64 base = layers_arr + li * 88
+        u64 li_s = fmt_dec(li)
+        u64 pre0 = str_cat("blk.", li_s)
+        u64 prefix = str_cat(pre0, ".")
+        dealloc(li_s); dealloc(pre0)
+
+        u64 n01 = str_cat(prefix, "attn_norm.weight")
+        GGUFTensor t01 = gguf_get(gf, n01)
+        unsafe { *((base + 0 * 8) as u64) = t01.ptr }
+        dealloc(n01)
+
+        u64 n02 = str_cat(prefix, "attn_q.weight")
+        GGUFTensor t02 = gguf_get(gf, n02)
+        u64 q_bf16 = q8_0_to_bf16_alloc(t02.ptr, q_elems)
+        unsafe { *((base + 1 * 8) as u64) = q_bf16 }
+        dealloc(n02)
+
+        u64 n03 = str_cat(prefix, "attn_k.weight")
+        GGUFTensor t03 = gguf_get(gf, n03)
+        u64 k_bf16 = q8_0_to_bf16_alloc(t03.ptr, kv_elems)
+        unsafe { *((base + 2 * 8) as u64) = k_bf16 }
+        dealloc(n03)
+
+        u64 n04 = str_cat(prefix, "attn_v.weight")
+        GGUFTensor t04 = gguf_get(gf, n04)
+        u64 v_bf16 = q8_0_to_bf16_alloc(t04.ptr, kv_elems)
+        unsafe { *((base + 3 * 8) as u64) = v_bf16 }
+        dealloc(n04)
+
+        unsafe { *((base + 4 * 8) as u64) = 0 }
+        unsafe { *((base + 5 * 8) as u64) = 0 }
+
+        u64 n07 = str_cat(prefix, "attn_output.weight")
+        GGUFTensor t07 = gguf_get(gf, n07)
+        u64 o_bf16 = q8_0_to_bf16_alloc(t07.ptr, o_elems)
+        unsafe { *((base + 6 * 8) as u64) = o_bf16 }
+        dealloc(n07)
+
+        u64 n08 = str_cat(prefix, "ffn_norm.weight")
+        GGUFTensor t08 = gguf_get(gf, n08)
+        unsafe { *((base + 7 * 8) as u64) = t08.ptr }
+        dealloc(n08)
+
+        u64 n09 = str_cat(prefix, "ffn_gate.weight")
+        GGUFTensor t09 = gguf_get(gf, n09)
+        u64 g_bf16 = q8_0_to_bf16_alloc(t09.ptr, gate_elems)
+        unsafe { *((base + 8 * 8) as u64) = g_bf16 }
+        dealloc(n09)
+
+        u64 n10 = str_cat(prefix, "ffn_up.weight")
+        GGUFTensor t10 = gguf_get(gf, n10)
+        u64 u_bf16 = q8_0_to_bf16_alloc(t10.ptr, up_elems)
+        unsafe { *((base + 9 * 8) as u64) = u_bf16 }
+        dealloc(n10)
+
+        u64 n11 = str_cat(prefix, "ffn_down.weight")
+        GGUFTensor t11 = gguf_get(gf, n11)
+        u64 d_bf16 = q8_0_to_bf16_alloc(t11.ptr, down_elems)
+        unsafe { *((base + 10 * 8) as u64) = d_bf16 }
+        dealloc(n11)
+
+        dealloc(prefix)
+        if (li & 3) == 3 {
+            eout("  layer "); eu64(li); eout(" done\n")
+        }
+        li = li + 1
+    }
+    u64 load_elapsed_ns = time_elapsed(load_start_ns)
+    eout("[mistral_7b_gpu] 16 layers indexed + dequantised; load_ms=")
+    eu64(load_elapsed_ns / 1000000); eout("\n")
+
+    // KV cache + scratch buffers.  At slice 5.9, when MLRIFT_NATIVE_MEGAKERNEL
+    // is requested, we allocate the KV cache as device-resident GTT so the
+    // mega-kernel can read/write it without H2D/D2H staging.  The host
+    // pointer (dev_host_ptr) is wired into k_cache/v_cache below so the
+    // per-op CPU fallback path keeps reading the right bytes (mega-kernel
+    // writes are GPU-coherent through GTT mapping).
+    u64 kv_row_bytes = kv_dim * 4
+    u64 layer_stride = max_seq * kv_row_bytes
+    u64 total_cache  = n_layers * layer_stride
+    u64 k_cache_dev  = 0
+    u64 v_cache_dev  = 0
+    u64 k_cache = 0
+    u64 v_cache = 0
+
+    u64 x_cur     = alloc(hidden * 4)
+    u64 x_nxt     = alloc(hidden * 4)
+    u64 final_out = alloc(hidden * 4)
+    u64 logits    = alloc(vocab * 4)
+
+    // Per-row Q8_0 decode geometry for the embedding lookup (CPU path).
+    u64 embed_base = embed_t.ptr
+    u64 row_blocks = hidden / 32
+    u64 row_bytes  = row_blocks * 34
+
+    // MLRIFT_PLD_BENCH=1 swaps the default `[BOS, "hello"]` 2-token
+    // prompt for a 16-token BOS + [15339, 11] × 7 + 15339 bigram-repeating
+    // pattern so the PLD draft proposer (pld_propose) finds matches at
+    // every step.  Without this, the speck4 mega-kernel runs but
+    // acceptance is ~0 and throughput stays at M=1.  With PLD_BENCH=1
+    // and MLRIFT_NATIVE_MEGAKERNEL_SPECK4=2, PLD-K=3 typically accepts
+    // 3/3 and lifts decode by 3-4×.
+    u64 _llama_pld_bench = 0
+    u64 _ev_pld_l = getenv("MLRIFT_PLD_BENCH")
+    if _ev_pld_l != 0 {
+        u8 _pl_c0 = 0; unsafe { *(_ev_pld_l as u8) -> _pl_c0 }
+        if _pl_c0 != 48 { _llama_pld_bench = 1 }
+    }
+    // Mistral SentencePiece tokenisation of "hello" — three tokens not two.
+    // Reference: llama.cpp's dump-tokens against this Q8_0 blob:
+    //   1 6312 28709 = "<s>" "▁hell" "o"
+    u64 prompt_count = 3
+    if _llama_pld_bench != 0 { prompt_count = 16 }
+    // Slice 6.4: speck4 path can append up to M_EFF_S4=4 tokens per outer
+    // iteration in the worst (all-accepted) case.  Pad seq_cap accordingly
+    // so the speculative write never escapes the buffer.
+    u64 seq_cap = prompt_count + max_new * 4 + 8
+    u64 seq_ids32 = alloc(seq_cap * 4)
+    u32 t0 = 1        // <s> BOS
+    u32 t1 = 6312     // "▁hell"
+    u32 t2 = 28709    // "o"
+    unsafe { *((seq_ids32 + 0 * 4) as uint32) = t0 }
+    unsafe { *((seq_ids32 + 1 * 4) as uint32) = t1 }
+    unsafe { *((seq_ids32 + 2 * 4) as uint32) = t2 }
+    if _llama_pld_bench != 0 {
+        // BOS + alternating (6312, 28709) bigram for PLD acceptance.
+        u64 _pp = 3
+        while _pp < prompt_count {
+            u32 _tk = 28709
+            if (_pp & 1) != 0 { _tk = 6312 }
+            unsafe { *((seq_ids32 + _pp * 4) as uint32) = _tk }
+            _pp = _pp + 1
+        }
+    }
+    u64 seq_len = prompt_count
+
+    if _llama_pld_bench != 0 {
+        eout("[mistral_7b_gpu] MLRIFT_PLD_BENCH=1 — 16-token bigram prefill for PLD speculative-decode benchmark\n")
+    } else {
+        eout("[mistral_7b_gpu] prompt=[1, 6312, 28709] (\"<s>▁hello\")\n")
+    }
+
+    // Slice 5.9 — MLRIFT_NATIVE_MEGAKERNEL=1|2 wiring.  Detects the env var,
+    // probes the Llama mega-kernel readiness, allocates device-resident KV
+    // cache + ping-pong residual buffers, and dispatches the mega-kernel
+    // per layer.  When unset, the path stays bit-identical to the CPU
+    // bf16 reference (k_cache/v_cache via host alloc, qwen3_forward_layer).
+    u64 _native_mk_env = getenv("MLRIFT_NATIVE_MEGAKERNEL")
+    u64 _native_mk_use = 0
+    if _native_mk_env != 0 {
+        u8 _nmc = 0; unsafe { *(_native_mk_env as u8) -> _nmc }
+        if _nmc == 49 { _native_mk_use = 1 }   // '1'
+        if _nmc == 50 { _native_mk_use = 1 }   // '2'
+    }
+    // Mega-kernel device-resident state (slice 5.9).  All allocations
+    // happen below when _native_mk_use != 0; otherwise stay 0.
+    u64 d_x_A     = 0    // ping-pong residual A (device, host-mapped)
+    u64 d_x_B     = 0    // ping-pong residual B
+    u64 d_x_A_h   = 0    // host-mapped pointer to d_x_A
+    u64 d_x_B_h   = 0    // host-mapped pointer to d_x_B
+    if _native_mk_use != 0 {
+        // Trigger HIP/KFD shim init + pipeline_ready (which loads the Llama
+        // .co into _gpu_fh_llama_megakernel).  We then SWAP that handle to
+        // the Mistral .co via gpu_pipeline_load_alt_megakernel_co — the
+        // Mistral .co has the same 24-arg kernarg signature, just with
+        // Mistral arch globals (HIDDEN=4096, HEAD_DIM=128, FF=14336) baked
+        // into the emitted ISA.  After the swap, gpu_llama_megakernel_ready
+        // / gpu_llama_layer_megakernel_to_dev dispatch through the Mistral
+        // module handle transparently.
+        u64 _force_init = gpu_matmul_enabled()
+        if gpu_pipeline_ready() == 0 {
+            eout("[mistral_7b_gpu] gpu_pipeline_ready returned 0; falling back to CPU bf16\n")
+            _native_mk_use = 0
+        } else {
+            u64 _mistral_fh = gpu_pipeline_load_alt_megakernel_co(
+                "/tmp/mistral_layer_megakernel_v2.co",
+                "mistral_layer_megakernel")
+            if _mistral_fh == 0 {
+                eout("[mistral_7b_gpu] /tmp/mistral_layer_megakernel_v2.co not loaded; rerun --emit-amdgpu-mistral-megakernel-v2\n")
+                _native_mk_use = 0
+            } else {
+                eout("[mistral_7b_gpu] Mistral mega-kernel .co swapped into Llama megakernel slot (fh=")
+                eu64(_mistral_fh); eout(")\n")
+            }
+        }
+        if _native_mk_use != 0 {
+            if gpu_llama_megakernel_ready() == 0 {
+                eout("[mistral_7b_gpu] MLRIFT_NATIVE_MEGAKERNEL set but mistral_layer_megakernel_v2.co not loaded; falling back to per-op CPU bf16\n")
+                _native_mk_use = 0
+            } else {
+                k_cache_dev = dev_try_alloc_host_visible(total_cache)
+                v_cache_dev = dev_try_alloc_host_visible(total_cache)
+                if k_cache_dev == 0 || v_cache_dev == 0 {
+                    eout("[mistral_7b_gpu] dev_try_alloc_host_visible(KV cache) FAILED; falling back to CPU bf16\n")
+                    _native_mk_use = 0
+                } else {
+                    k_cache = dev_host_ptr(k_cache_dev)
+                    v_cache = dev_host_ptr(v_cache_dev)
+                    // Tell the qwen3 GPU layer about the device-resident
+                    // KV slabs.  layer_stride = max_seq * kv_row_bytes
+                    // (= per-layer slab size in bytes); batch_size = 1.
+                    qwen3_gpu_set_kv_cache_dev(k_cache_dev, v_cache_dev, layer_stride, 1)
+                    qwen3_gpu_set_batch_size(1)
+
+                    // Ping-pong residual carry buffers (one HIDDEN-element
+                    // f32 each, host-visible GTT so D2H reads after the
+                    // last layer come for free).
+                    d_x_A = dev_try_alloc_host_visible(hidden * 4)
+                    d_x_B = dev_try_alloc_host_visible(hidden * 4)
+                    if d_x_A == 0 || d_x_B == 0 {
+                        eout("[mistral_7b_gpu] dev_try_alloc_host_visible(d_x ping-pong) FAILED; falling back to CPU bf16\n")
+                        _native_mk_use = 0
+                    } else {
+                        d_x_A_h = dev_host_ptr(d_x_A)
+                        d_x_B_h = dev_host_ptr(d_x_B)
+                        // Zero the KV cache slabs (mega-kernel reads K/V
+                        // at every position 0..pos for attention).  GTT
+                        // mapping is CPU-coherent so a host memset is
+                        // visible to the GPU.
+                        u64 zi = 0
+                        while zi < total_cache {
+                            unsafe { *((k_cache + zi) as u8) = 0 }
+                            unsafe { *((v_cache + zi) as u8) = 0 }
+                            zi = zi + 1
+                        }
+                        eout("[mistral_7b_gpu] mega-kernel path ENABLED: KV cache + ping-pong residuals device-resident (")
+                        eu64(total_cache * 2 + hidden * 8); eout(" bytes total)\n")
+
+                        // The Llama mega-kernel reads ONE fused QKV bf16
+                        // matrix [qkv_dim, hidden] and ONE fused gate_up
+                        // bf16 matrix [2*ff, hidden] — same kernarg layout
+                        // as the Qwen3 mega-kernel.  Pre-stack the per-tensor
+                        // GGUF weights here (only when mega-kernel path is
+                        // active; the legacy CPU bf16 path uses unfused
+                        // matmuls and would mis-read the stacked layout).
+                        u64 qkv_dim_elems = q_dim + 2 * kv_dim
+                        u64 qkv_row_bytes = hidden * 2
+                        u64 q_bytes_l     = q_dim  * qkv_row_bytes
+                        u64 kv_bytes_l    = kv_dim * qkv_row_bytes
+                        u64 stacked_bytes = qkv_dim_elems * qkv_row_bytes
+                        u64 gu_dim_elems  = 2 * ff
+                        u64 gate_bytes_l  = ff * qkv_row_bytes
+                        u64 gu_stacked_bytes = gu_dim_elems * qkv_row_bytes
+                        eout("[mistral_7b_gpu] fusing QKV + gate/up bf16 weights (")
+                        eu64((stacked_bytes + gu_stacked_bytes) * n_layers); eout(" bytes total)\n")
+                        u64 lf = 0
+                        while lf < n_layers {
+                            u64 base_lf = layers_arr + lf * 88
+                            u64 qp_lf = 0; unsafe { *((base_lf + 1 * 8) as u64) -> qp_lf }
+                            u64 kp_lf = 0; unsafe { *((base_lf + 2 * 8) as u64) -> kp_lf }
+                            u64 vp_lf = 0; unsafe { *((base_lf + 3 * 8) as u64) -> vp_lf }
+                            u64 qkv_stacked = alloc(stacked_bytes)
+                            memcpy(qkv_stacked,                          qp_lf, q_bytes_l)
+                            memcpy(qkv_stacked + q_bytes_l,              kp_lf, kv_bytes_l)
+                            memcpy(qkv_stacked + q_bytes_l + kv_bytes_l, vp_lf, kv_bytes_l)
+                            unsafe { *((base_lf + 1 * 8) as u64) = qkv_stacked }
+
+                            u64 gpw_lf = 0; unsafe { *((base_lf + 8 * 8) as u64) -> gpw_lf }
+                            u64 upw_lf = 0; unsafe { *((base_lf + 9 * 8) as u64) -> upw_lf }
+                            u64 gu_stacked = alloc(gu_stacked_bytes)
+                            memcpy(gu_stacked,                gpw_lf, gate_bytes_l)
+                            memcpy(gu_stacked + gate_bytes_l, upw_lf, gate_bytes_l)
+                            unsafe { *((base_lf + 8 * 8) as u64) = gu_stacked }
+                            lf = lf + 1
+                        }
+                        // qwen3_forward_layer_gpu's mega-kernel branch
+                        // expects the stacked layout via gpu_get_or_upload_
+                        // bf16_weight_padded(w.q_proj_w, hidden, qkv_dim, ...);
+                        // matches what we just wrote.  Flip qwen3_fuse_qkv
+                        // so the per-op fallback path (would only fire if
+                        // pos >= 64; never in this driver's max_new=20
+                        // run) reads the same stacked layout.
+                        qwen3_set_fuse_qkv(1)
+                    }
+                }
+            }
+        }
+    }
+    // If the mega-kernel path is OFF (env unset, or any setup failure
+    // above), fall back to host-only KV cache so the CPU bf16 chain
+    // produces bit-identical tokens to the legacy reference run.
+    if k_cache == 0 {
+        k_cache = alloc(total_cache)
+        v_cache = alloc(total_cache)
+        eout("[mistral_7b_gpu] KV cache on host (")
+        eu64(total_cache * 2); eout(" bytes total)\n")
+    }
+
+    // Pre-decode warmup of the padded-row weight cache (ported from
+    // Qwen3 driver — examples/qwen3_generate.mlr:614-623, slice 4.13).
+    // The mega-kernel's phase-3/13/9/17 emitters fetch each layer's
+    // fused QKV / o / gate-up / down weights via
+    // gpu_get_or_upload_bf16_weight_padded. Without warmup, the FIRST
+    // dispatch of every weight pays an upload + dequant cost; with
+    // warmup, all uploads complete before the timed decode loop, so
+    // per-step latency reflects steady-state. Strides match Llama-1B:
+    // hidden_pad = hidden + 128 = 2176, q_dim_pad = q_dim + 128 = 2176,
+    // ff_pad = ff + 128 = 8320.
+    if _native_mk_use != 0 {
+        u64 hidden_pad_w = hidden + 128
+        u64 q_dim_pad_w  = q_dim  + 128
+        u64 ff_pad_w     = ff     + 128
+        u64 qkv_dim_w    = q_dim + 2 * kv_dim
+        u64 lwarm = 0
+        while lwarm < n_layers {
+            Qwen3LayerWeights w = layers_arr + lwarm * 88
+            u64 _wq = gpu_get_or_upload_bf16_weight_padded(w.q_proj_w,    hidden, qkv_dim_w, hidden_pad_w)
+            u64 _wo = gpu_get_or_upload_bf16_weight_padded(w.o_proj_w,    q_dim,  hidden,    q_dim_pad_w)
+            u64 _wg = gpu_get_or_upload_bf16_weight_padded(w.gate_proj_w, hidden, 2 * ff,    hidden_pad_w)
+            u64 _wd = gpu_get_or_upload_bf16_weight_padded(w.down_proj_w, ff,     hidden,    ff_pad_w)
+            lwarm = lwarm + 1
+        }
+        eout("[mistral_7b_gpu] padded-row weight cache warmed for "); eu64(n_layers); eout(" layers\n")
+    }
+
+    // ─── Slice 6.10 — Port lm_head to GPU bf16 gemv (2026-05-12) ────────
+    // Bench showed CPU Q8_0 lm_head matmul = 135 ms/step = 83% of total
+    // decode time. Dequantize the tied Q8_0 embedding to bf16 (one-time
+    // +526 MiB), let the gpu_matmul_to_dev path's _gpu_mm_get_or_upload_bf16
+    // cache upload it to VRAM on first call, and dispatch the gemv_coop_bf16
+    // kernel for the per-step lm_head matmul.
+    //
+    // d_lm_in / d_lm_out are host-visible (GTT) so the host→device input
+    // copy + device→host logits copy are zero-copy memcpy on the same VA.
+    u64 lm_head_bf16_host = 0
+    u64 d_lm_in           = 0
+    u64 d_lm_in_h         = 0
+    u64 d_lm_out          = 0
+    u64 d_lm_out_h        = 0
+    if _native_mk_use != 0 {
+        eout("[mistral_7b_gpu] dequantising lm_head Q8_0 → bf16 for GPU lm_head ("); eu64(vocab * hidden * 2); eout(" bytes)...\n")
+        lm_head_bf16_host = q8_0_to_bf16_alloc(lmhead_ptr, vocab * hidden)
+        if lm_head_bf16_host != 0 {
+            d_lm_in  = dev_try_alloc_host_visible(hidden * 4)
+            d_lm_out = dev_try_alloc_host_visible(vocab  * 4)
+            if d_lm_in != 0 && d_lm_out != 0 {
+                d_lm_in_h  = dev_host_ptr(d_lm_in)
+                d_lm_out_h = dev_host_ptr(d_lm_out)
+                eout("[mistral_7b_gpu] lm_head GPU path armed (bf16 host="); eu64(lm_head_bf16_host)
+                eout(" d_lm_in="); eu64(d_lm_in); eout(" d_lm_out="); eu64(d_lm_out); eout(")\n")
+            } else {
+                eout("[mistral_7b_gpu] lm_head GPU buffer alloc FAILED; falling back to CPU\n")
+                lm_head_bf16_host = 0
+            }
+        } else {
+            eout("[mistral_7b_gpu] lm_head Q8_0→bf16 dequant FAILED; falling back to CPU\n")
+        }
+    }
+
+    // ─── Slice 6.4 — Phase B speck4 PLD acceleration ────────────────────
+    // After each successful M=1 step (always correct), optionally fire a
+    // speck4 mega-kernel call (M_EFF=4) that processes the just-emitted
+    // token plus up to 3 PLD-proposed drafts in parallel.  Accept drafts
+    // whose predicted-next matches the proposed token.  Acceptance speeds
+    // up generation while preserving exact equality to the M=1 baseline.
+    //
+    // Buffer alloc uses hipMalloc (NOT dev_try_alloc_host_visible) so we
+    // don't trip the KFD ACQUIRE_VM collision that the M=1 path already
+    // consumed with its host-visible KV cache + ping-pong residuals.
+    u64 _native_mks4_env = getenv("MLRIFT_NATIVE_MEGAKERNEL_SPECK4")
+    u64 _native_mks4_use = 0
+    if _native_mks4_env != 0 {
+        u8 _nmc4 = 0; unsafe { *(_native_mks4_env as u8) -> _nmc4 }
+        if _nmc4 == 49 { _native_mks4_use = 1 }   // '1'
+        if _nmc4 == 50 { _native_mks4_use = 1 }   // '2'
+    }
+    // Unified flag: MLRIFT_NATIVE_MEGAKERNEL=2 also enables the speck4 path.
+    if _native_mk_env != 0 {
+        u8 _nmc = 0; unsafe { *(_native_mk_env as u8) -> _nmc }
+        if _nmc == 50 { _native_mks4_use = 1 }   // '2'
+    }
+    u64 M_EFF_S4         = 4
+    u64 d_in_residual_4  = 0
+    u64 d_out_residual_4 = 0
+    u64 d_b_x_norm_g_4   = 0
+    u64 d_b_qkv_g_4      = 0
+    u64 d_b_attn_q_g_4   = 0
+    u64 d_b_mid_g_4      = 0
+    u64 d_b_mid_norm_g_4 = 0
+    u64 d_b_attn_out_g_4 = 0
+    u64 d_gu_scratch_4   = 0
+    u64 d_rope_cos_4     = 0
+    u64 d_rope_sin_4     = 0
+    u64 draft_buf        = 0
+    u64 head_dim         = 128   // Mistral-7B: q_dim=4096 / n_heads=32
+    if _native_mks4_use != 0 {
+        if gpu_llama_megakernel_speck4_ready() == 0 {
+            eout("[mistral_7b_gpu] MLRIFT_NATIVE_MEGAKERNEL_SPECK4 set but speck4 .co not loaded; speck4 path disabled\n")
+            _native_mks4_use = 0
+        } else {
+            if _native_mk_use == 0 {
+                eout("[mistral_7b_gpu] speck4 requires MLRIFT_NATIVE_MEGAKERNEL=1|2 (M=1 always-correct fallback); speck4 path disabled\n")
+                _native_mks4_use = 0
+            } else {
+                u64 qkv_dim_l = q_dim + 2 * kv_dim
+                u64 _slot = alloc(8)
+                u32 _err = 0
+                // Slice 6.7g — d_in_residual_4 / d_out_residual_4 are
+                // host-visible (GTT) so the trailing D2H of the final
+                // residual is a CPU memcpy of host-mapped memory (~µs),
+                // not a 25 ms hipMemcpy through the slow KFD-shim D2H
+                // path.  Mega-kernel still accesses them at full speed.
+                d_in_residual_4  = dev_try_alloc_host_visible(M_EFF_S4 * hidden * 4)
+                d_out_residual_4 = dev_try_alloc_host_visible(M_EFF_S4 * hidden * 4)
+                _err = hipMalloc(_slot, M_EFF_S4 * hidden * 4)
+                if _err == 0 { unsafe { *(_slot as u64) -> d_b_x_norm_g_4 } }
+                _err = hipMalloc(_slot, M_EFF_S4 * qkv_dim_l * 4)
+                if _err == 0 { unsafe { *(_slot as u64) -> d_b_qkv_g_4 } }
+                _err = hipMalloc(_slot, M_EFF_S4 * q_dim * 4)
+                if _err == 0 { unsafe { *(_slot as u64) -> d_b_attn_q_g_4 } }
+                _err = hipMalloc(_slot, M_EFF_S4 * hidden * 4)
+                if _err == 0 { unsafe { *(_slot as u64) -> d_b_mid_g_4 } }
+                _err = hipMalloc(_slot, M_EFF_S4 * hidden * 4)
+                if _err == 0 { unsafe { *(_slot as u64) -> d_b_mid_norm_g_4 } }
+                _err = hipMalloc(_slot, M_EFF_S4 * q_dim * 4)
+                if _err == 0 { unsafe { *(_slot as u64) -> d_b_attn_out_g_4 } }
+                _err = hipMalloc(_slot, M_EFF_S4 * 2 * ff * 4)
+                if _err == 0 { unsafe { *(_slot as u64) -> d_gu_scratch_4 } }
+                _err = hipMalloc(_slot, M_EFF_S4 * (head_dim / 2) * 4)
+                if _err == 0 { unsafe { *(_slot as u64) -> d_rope_cos_4 } }
+                _err = hipMalloc(_slot, M_EFF_S4 * (head_dim / 2) * 4)
+                if _err == 0 { unsafe { *(_slot as u64) -> d_rope_sin_4 } }
+                dealloc(_slot)
+                draft_buf = alloc((M_EFF_S4 - 1) * 4)   // host-side u32 draft IDs
+                if d_in_residual_4 == 0 || d_out_residual_4 == 0 || d_b_qkv_g_4 == 0 ||
+                   d_gu_scratch_4 == 0 || d_rope_cos_4 == 0 || d_rope_sin_4 == 0 || draft_buf == 0 {
+                    eout("[mistral_7b_gpu] speck4 buffer alloc FAILED; speck4 path disabled\n")
+                    _native_mks4_use = 0
+                } else {
+                    eout("[mistral_7b_gpu] speck4 path ENABLED (M=1 always-correct + PLD-K=3 acceleration)\n")
+                }
+            }
+        }
+    }
+
+    // Smoke-test the GPU matmul on a single layer-0 q-proj BEFORE the
+    // prefill, so any KFD / dispatch failure surfaces with a clear log
+    // (instead of mid-prefill where it looks like a forward-layer bug).
+    eout("[mistral_7b_gpu] smoke-test: layer-0 gate-proj GPU matmul (above default threshold)\n")
+    u64 smoke_x  = alloc(hidden * 4)
+    u64 smoke_y  = alloc(ff     * 4)
+    u64 sx_i = 0
+    while sx_i < hidden { unsafe { *((smoke_x + sx_i * 4) as f32) = 0.5f }; sx_i = sx_i + 1 }
+    Qwen3LayerWeights w0 = layers_arr + 0 * 88
+    u64 smoke_rc = matmul_bf16_weights_f32_gpu(smoke_y, smoke_x, w0.gate_proj_w, 1, ff, hidden)
+    if smoke_rc != 0 {
+        eout("[mistral_7b_gpu] smoke matmul rc="); eu64(smoke_rc); eout(" (probably below threshold; ok)\n")
+    } else {
+        eout("[mistral_7b_gpu] smoke matmul OK rc=0\n")
+    }
+    dealloc(smoke_x); dealloc(smoke_y)
+
+    // Prefill: every prompt token but the last needs a forward pass to
+    // populate K/V at its position.  Last prompt token's forward becomes
+    // step 0 of the decode loop (its logits feed the first argmax).
+    //
+    // Slice 5.9: when _native_mk_use != 0, each layer dispatches the
+    // mega-kernel via qwen3_forward_layer_gpu (arch-dispatched on
+    // hidden=2048 → gpu_llama_layer_megakernel_to_dev).  Per-token H2D
+    // upload of the new embedding into d_x_cur, ping-pong d_x_cur ↔
+    // d_x_nxt across layers, D2H back into host x_cur for the lm_head.
+    u64 pos = 0
+    u64 prefill_start_ns = time_now()
+    // Per-step ping-pong of the device residual: d_x_cur is the input
+    // to the next layer, d_x_nxt is the output buffer.  Both stay
+    // device-resident across all 16 layers; only the host x_cur copy
+    // happens at the start (embedding upload) and end (D2H for lm_head).
+    u64 d_x_cur = d_x_A
+    u64 d_x_nxt = d_x_B
+    u64 d_x_cur_h = d_x_A_h
+    u64 d_x_nxt_h = d_x_B_h
+    while pos + 1 < prompt_count {
+        u32 pt32 = 0
+        unsafe { *((seq_ids32 + pos * 4) as uint32) -> pt32 }
+        u64 pt = pt32
+        gguf_deq_q8_0(x_cur, embed_base + pt * row_bytes, hidden)
+        if _native_mk_use != 0 {
+            // H2D upload of the freshly-embedded token.  d_x_cur_h is
+            // GTT-mapped, so a plain memcpy is GPU-coherent on the next
+            // dispatch read.
+            memcpy(d_x_cur_h, x_cur, hidden * 4)
+        }
+        u64 layer = 0
+        while layer < n_layers {
+            Qwen3LayerWeights w = layers_arr + layer * 88
+            u64 kc = k_cache + layer * layer_stride
+            u64 vc = v_cache + layer * layer_stride
+            if _native_mk_use != 0 {
+                if _mk_fired_once == 0 {
+                    eout("[mistral_7b_gpu] mega-kernel ACTUALLY FIRING (layer 0)\n")
+                    _mk_fired_once = 1
+                }
+                if qwen3_forward_layer_gpu(d_x_cur, d_x_nxt, w, pos, kc, vc, num_workers, 0, 0xFF) != 0 {
+                    eout("[mistral_7b_gpu] qwen3_forward_layer_gpu(mega-kernel) FAILED at prefill pos=")
+                    eu64(pos); eout(" layer="); eu64(layer); eout("\n")
+                    exit(1)
+                }
+                // Ping-pong device pointers.
+                u64 dtmp = d_x_cur; d_x_cur = d_x_nxt; d_x_nxt = dtmp
+                u64 dhtmp = d_x_cur_h; d_x_cur_h = d_x_nxt_h; d_x_nxt_h = dhtmp
+            } else {
+                qwen3_forward_layer(x_nxt, x_cur, w, pos, kc, vc, num_workers)
+                u64 tmp = x_cur
+                x_cur = x_nxt
+                x_nxt = tmp
+            }
+            layer = layer + 1
+        }
+        pos = pos + 1
+    }
+    u64 prefill_ns = time_elapsed(prefill_start_ns)
+    eout("[mistral_7b_gpu] prefill_ms="); eu64(prefill_ns / 1000000); eout("\n")
+
+    // Load last prompt token's embedding for step 0.
+    u32 last_pt32 = 0
+    unsafe { *((seq_ids32 + (prompt_count - 1) * 4) as uint32) -> last_pt32 }
+    u64 last_pt = last_pt32
+    gguf_deq_q8_0(x_cur, embed_base + last_pt * row_bytes, hidden)
+
+    qwen3_profile_reset()
+    u64 step = 0
+    u64 decode_start_ns = time_now()
+    // Slice 6.4 — speck4 acceptance metrics.
+    u64 total_steps         = 0
+    u64 total_speck4_calls  = 0
+    u64 total_accepted      = 0
+    while step < max_new {
+        u64 step_start_ns = time_now()
+        eout("step "); eu64(step); eout(" pos="); eu64(pos); eout("\n")
+
+        // Slice 5.9: when mega-kernel is active, upload the current host
+        // residual (the just-embedded token) to d_x_cur for the layer
+        // sweep.  After the sweep, D2H back to host x_cur for lm_head.
+        if _native_mk_use != 0 {
+            memcpy(d_x_cur_h, x_cur, hidden * 4)
+        }
+
+        u64 layer = 0
+        while layer < n_layers {
+            Qwen3LayerWeights w = layers_arr + layer * 88
+            u64 kc = k_cache + layer * layer_stride
+            u64 vc = v_cache + layer * layer_stride
+            if _native_mk_use != 0 {
+                if _mk_fired_once == 0 {
+                    eout("[mistral_7b_gpu] mega-kernel ACTUALLY FIRING (layer 0)\n")
+                    _mk_fired_once = 1
+                }
+                if qwen3_forward_layer_gpu(d_x_cur, d_x_nxt, w, pos, kc, vc, num_workers, 0, 0xFF) != 0 {
+                    eout("[mistral_7b_gpu] qwen3_forward_layer_gpu(mega-kernel) FAILED at decode step=")
+                    eu64(step); eout(" pos="); eu64(pos); eout(" layer="); eu64(layer); eout("\n")
+                    exit(1)
+                }
+                u64 dtmp = d_x_cur; d_x_cur = d_x_nxt; d_x_nxt = dtmp
+                u64 dhtmp = d_x_cur_h; d_x_cur_h = d_x_nxt_h; d_x_nxt_h = dhtmp
+            } else {
+                qwen3_forward_layer(x_nxt, x_cur, w, pos, kc, vc, num_workers)
+                u64 tmp = x_cur
+                x_cur = x_nxt
+                x_nxt = tmp
+            }
+            // Slice 6.7b — per-layer output dump diagnostic.  Enabled when
+            // MLRIFT_MEGAK_DUMP_LAYER=N matches the current layer (default
+            // at step 0; override with MLRIFT_MEGAK_DUMP_STEP=K to dump at
+            // step K instead — used by the speck4 bisection so the M=1
+            // reference dump and the first-speck4-call dump are taken
+            // from the SAME input token at the SAME pos).  Prints first 8 +
+            // last 4 floats + sum + max + min of the residual stream AFTER
+            // this layer ran.  Allows bisecting mega-kernel-vs-CPU
+            // divergence layer-by-layer.
+            u64 _dump_step_target = 0
+            u64 _ev_ds = getenv("MLRIFT_MEGAK_DUMP_STEP")
+            if _ev_ds != 0 {
+                u64 _ds_val = 0
+                u64 _ds_i = 0
+                u8 _ds_c0 = 0; unsafe { *((_ev_ds + 0) as u8) -> _ds_c0 }
+                if _ds_c0 >= 48 && _ds_c0 <= 57 {
+                    while _ds_i < 4 {
+                        u8 _ds_c = 0; unsafe { *((_ev_ds + _ds_i) as u8) -> _ds_c }
+                        if _ds_c < 48 { _ds_i = 4 }
+                        else if _ds_c > 57 { _ds_i = 4 }
+                        else { _ds_val = _ds_val * 10 + (_ds_c - 48); _ds_i = _ds_i + 1 }
+                    }
+                    _dump_step_target = _ds_val
+                }
+            }
+            if step == _dump_step_target {
+                u64 ev_dl = getenv("MLRIFT_MEGAK_DUMP_LAYER")
+                if ev_dl != 0 {
+                    u64 dl_n = 999
+                    u64 dli = 0
+                    u8 dl_c0 = 0; unsafe { *((ev_dl + 0) as u8) -> dl_c0 }
+                    if dl_c0 >= 48 && dl_c0 <= 57 {
+                        dl_n = 0
+                        while dli < 4 {
+                            u8 dl_c = 0; unsafe { *((ev_dl + dli) as u8) -> dl_c }
+                            if dl_c < 48 { dli = 4 }
+                            else if dl_c > 57 { dli = 4 }
+                            else { dl_n = dl_n * 10 + (dl_c - 48); dli = dli + 1 }
+                        }
+                    }
+                    if layer == dl_n {
+                        u64 dump_src = 0
+                        if _native_mk_use != 0 { dump_src = d_x_cur_h }
+                        else                   { dump_src = x_cur }
+                        _dump_buf("out_resid", dump_src, hidden)
+                        // For MEGAK, also dump all the device intermediates
+                        // (D2H copy via hipMemcpy + scratch host buffer).
+                        // Buffer sizes: b_x_norm_g, b_mid_g, b_mid_norm_g =
+                        // HIDDEN; b_qkv_g = qkv_dim; b_attn_q_g, b_attn_out_g
+                        // = q_dim; gu_scratch = 2*FF.  Last layer's contents
+                        // (since mega-kernel persists buffers across layers).
+                        if _native_mk_use != 0 {
+                            u64 qkv_dim_lg = q_dim + 2 * kv_dim
+                            u64 dump_scratch_max = 2 * ff   // FF f32s = max needed
+                            u64 dump_scratch = alloc(dump_scratch_max * 4)
+                            // b_x_norm_g (HIDDEN floats)
+                            u64 d_bxn = qwen3_gpu_get_megak_b_x_norm_g()
+                            if d_bxn != 0 {
+                                hipMemcpy(dump_scratch, d_bxn, hidden * 4, 2)
+                                _dump_buf("b_x_norm_g", dump_scratch, hidden)
+                            }
+                            // b_qkv_g (QKV_DIM floats)
+                            u64 d_bqk = qwen3_gpu_get_megak_b_qkv_g()
+                            if d_bqk != 0 {
+                                hipMemcpy(dump_scratch, d_bqk, qkv_dim_lg * 4, 2)
+                                _dump_buf("b_qkv_g", dump_scratch, qkv_dim_lg)
+                            }
+                            // b_attn_q_g (Q_DIM floats)
+                            u64 d_baq = qwen3_gpu_get_megak_b_attn_q_g()
+                            if d_baq != 0 {
+                                hipMemcpy(dump_scratch, d_baq, q_dim * 4, 2)
+                                _dump_buf("b_attn_q_g", dump_scratch, q_dim)
+                            }
+                            // b_attn_out_g (Q_DIM floats)
+                            u64 d_bao = qwen3_gpu_get_megak_b_attn_out_g()
+                            if d_bao != 0 {
+                                hipMemcpy(dump_scratch, d_bao, q_dim * 4, 2)
+                                _dump_buf("b_attn_out_g", dump_scratch, q_dim)
+                            }
+                            // b_mid_g (HIDDEN floats)
+                            u64 d_bm = qwen3_gpu_get_megak_b_mid_g()
+                            if d_bm != 0 {
+                                hipMemcpy(dump_scratch, d_bm, hidden * 4, 2)
+                                _dump_buf("b_mid_g", dump_scratch, hidden)
+                            }
+                            // b_mid_norm_g (HIDDEN floats)
+                            u64 d_bmn = qwen3_gpu_get_megak_b_mid_norm_g()
+                            if d_bmn != 0 {
+                                hipMemcpy(dump_scratch, d_bmn, hidden * 4, 2)
+                                _dump_buf("b_mid_norm_g", dump_scratch, hidden)
+                            }
+                            // gu_scratch (first FF floats = silu_mul output)
+                            u64 d_gu = qwen3_gpu_get_megak_gu_scratch()
+                            if d_gu != 0 {
+                                hipMemcpy(dump_scratch, d_gu, ff * 4, 2)
+                                _dump_buf("gu_scratch[0..FF]", dump_scratch, ff)
+                            }
+                            dealloc(dump_scratch)
+                        }
+                    }
+                }
+            }
+            layer = layer + 1
+        }
+
+        // After the layer sweep, the final residual lives in d_x_cur
+        // (mega-kernel path) or x_cur (CPU path).  D2H copy via the
+        // GTT host-mapped pointer so the lm_head reads correct bytes.
+        if _native_mk_use != 0 {
+            // qwen3_forward_layer_gpu's mega-kernel branch already
+            // gpu_pipeline_flush()'d (default flush_every_n=1), so the
+            // GPU writes to d_x_cur are visible at d_x_cur_h.
+            memcpy(x_cur, d_x_cur_h, hidden * 4)
+        }
+
+        // Final RMSNorm + lm_head. Slice 6.10 (2026-05-12): port lm_head
+        // to GPU bf16 gemv. CPU Q8_0 matmul was 135 ms/step = 83% of total
+        // step time. lm_head_bf16_dev points at the VRAM-resident bf16
+        // dequant of the tied embedding (one-time +526 MiB at startup).
+        // d_lm_in / d_lm_out are GTT-resident host-visible scratch.
+        qwen3_rmsnorm_f32_weights(final_out, x_cur, norm_t.ptr, hidden)
+        if lm_head_bf16_host != 0 {
+            memcpy(d_lm_in_h, final_out, hidden * 4)
+            if gpu_matmul_to_dev(d_lm_out, d_lm_in, lm_head_bf16_host, vocab, hidden) != 0 {
+                // GPU path failed; fall back to CPU.
+                matmul_q8_0_q8_0_f32(logits, final_out, lmhead_ptr, 1, vocab, hidden, num_workers)
+            } else {
+                gpu_pipeline_flush()
+                memcpy(logits, d_lm_out_h, vocab * 4)
+            }
+        } else {
+            matmul_q8_0_q8_0_f32(logits, final_out, lmhead_ptr, 1, vocab, hidden, num_workers)
+        }
+
+        // Greedy argmax.
+        u64 best_id = 0
+        f32 best_val = 0.0f
+        u64 first = 1
+        u64 j = 0
+        while j < vocab {
+            f32 v = 0.0f
+            unsafe { *((logits + j * 4) as f32) -> v }
+            if first == 1 {
+                best_val = v; best_id = j; first = 0
+            } else {
+                if v > best_val { best_val = v; best_id = j }
+            }
+            j = j + 1
+        }
+        u64 step_elapsed_ns = time_elapsed(step_start_ns)
+        eout("  -> next_id = "); eu64(best_id); eout(" logit=")
+        u64 lvs = fmt_f32(best_val, 4); eout(lvs); dealloc(lvs)
+        eout(" step_ms="); eu64(step_elapsed_ns / 1000000); eout("\n")
+
+        u32 best_id32 = best_id
+        unsafe { *((seq_ids32 + seq_len * 4) as uint32) = best_id32 }
+        seq_len = seq_len + 1
+
+        gguf_deq_q8_0(x_cur, embed_base + best_id * row_bytes, hidden)
+        pos = pos + 1
+        step = step + 1
+        total_steps = total_steps + 1
+
+        // ─── Slice 6.4 — speck4 PLD acceleration step ─────────────────
+        // After every M=1 step (which is always correct), opportunistically
+        // run a speck4 mega-kernel call (M_EFF=4) to verify up to 3 PLD-
+        // proposed draft tokens.  Every accepted draft advances pos+step
+        // by 1 without an additional M=1 forward.
+        if step < max_new {
+            if _native_mks4_use != 0 {
+                u64 draft_n = pld_propose(seq_ids32, seq_len, draft_buf, M_EFF_S4 - 1)
+                if draft_n > 0 {
+                    total_speck4_calls = total_speck4_calls + 1
+
+                    // ── Stage per-stream input embeddings into d_in_residual_4 ──
+                    // Stream 0 = best_id (just-emitted); stream m>=1 = draft[m-1].
+                    u64 host_in_4 = alloc(M_EFF_S4 * hidden * 4)
+                    u64 m_in = 0
+                    while m_in < M_EFF_S4 {
+                        u64 tok = best_id
+                        if m_in >= 1 {
+                            if m_in - 1 < draft_n {
+                                u32 dt32 = 0
+                                unsafe { *((draft_buf + (m_in - 1) * 4) as u32) -> dt32 }
+                                tok = dt32
+                            } else {
+                                // Past the drafted prefix — pad with the just-emitted
+                                // token so the kernel still runs M_EFF=4 streams
+                                // without reading from invalid embedding rows.
+                                tok = best_id
+                            }
+                        }
+                        u64 dst_m = host_in_4 + m_in * hidden * 4
+                        gguf_deq_q8_0(dst_m, embed_base + tok * row_bytes, hidden)
+                        m_in = m_in + 1
+                    }
+                    // Debug: dump first 4 floats of each stream's input embedding
+                    // to verify per-stream seeding before H2D.  Fires once.
+                    if total_speck4_calls == 1 && getenv("MLRIFT_MISTRAL_SPECK4_SEED_DBG") != 0 {
+                        u64 _sd_m = 0
+                        while _sd_m < M_EFF_S4 {
+                            eout("  [seed-dbg] stream "); eu64(_sd_m); eout(":")
+                            u64 _sd_base = host_in_4 + _sd_m * hidden * 4
+                            u64 _sd_i = 0
+                            while _sd_i < 4 {
+                                f32 _sv = 0.0f
+                                unsafe { *((_sd_base + _sd_i * 4) as f32) -> _sv }
+                                u64 _ss = fmt_f32(_sv, 6); eout(" "); eout(_ss); dealloc(_ss)
+                                _sd_i = _sd_i + 1
+                            }
+                            eout("\n")
+                            _sd_m = _sd_m + 1
+                        }
+                    }
+                    u32 cerr_in = hipMemcpy(d_in_residual_4, host_in_4, M_EFF_S4 * hidden * 4, 1)
+                    dealloc(host_in_4)
+                    if cerr_in != 0 {
+                        eout("[mistral_7b_gpu] speck4 in_resid H2D fail; speck4 path disabled\n")
+                        _native_mks4_use = 0
+                    } else {
+                        // ── Compute per-stream RoPE cos/sin tables ──
+                        // Stream m's K/V write position is pos + m (pos was just
+                        // incremented above to the NEXT position).  Theta = 5e5
+                        // for Llama-3.x (qwen3_set_rope_base(500000) at top).
+                        u64 host_cos_4 = alloc(M_EFF_S4 * (head_dim / 2) * 4)
+                        u64 host_sin_4 = alloc(M_EFF_S4 * (head_dim / 2) * 4)
+                        u64 mr = 0
+                        f64 theta_l = 500000.0
+                        while mr < M_EFF_S4 {
+                            u64 c_m = host_cos_4 + mr * (head_dim / 2) * 4
+                            u64 s_m = host_sin_4 + mr * (head_dim / 2) * 4
+                            qwen3_rope_compute(c_m, s_m, pos + mr, head_dim, theta_l)
+                            mr = mr + 1
+                        }
+                        u32 cerr_c = hipMemcpy(d_rope_cos_4, host_cos_4, M_EFF_S4 * (head_dim / 2) * 4, 1)
+                        u32 cerr_s = 0
+                        if cerr_c == 0 {
+                            cerr_s = hipMemcpy(d_rope_sin_4, host_sin_4, M_EFF_S4 * (head_dim / 2) * 4, 1)
+                        }
+                        dealloc(host_cos_4); dealloc(host_sin_4)
+                        if cerr_c != 0 {
+                            eout("[mistral_7b_gpu] speck4 rope_cos H2D fail; speck4 path disabled\n")
+                            _native_mks4_use = 0
+                        } else if cerr_s != 0 {
+                            eout("[mistral_7b_gpu] speck4 rope_sin H2D fail; speck4 path disabled\n")
+                            _native_mks4_use = 0
+                        } else {
+                            // ── Run all 16 layers via the speck4 mega-kernel ──
+                            u64 hidden_pad_l = hidden + 128
+                            u64 q_dim_pad_l  = q_dim  + 128
+                            u64 ff_pad_l     = ff     + 128
+                            u64 qkv_dim_l    = q_dim + 2 * kv_dim
+                            u64 d_barrier_dev  = qwen3_gpu_get_megak_barrier_dev()
+                            u64 d_barrier_host = qwen3_gpu_get_megak_barrier_host()
+                            u64 d_in_4_cur  = d_in_residual_4
+                            u64 d_out_4_cur = d_out_residual_4
+                            u64 sl_ok = 1
+                            u64 layer_s = 0
+                            while layer_s < n_layers {
+                                Qwen3LayerWeights w_s = layers_arr + layer_s * 88
+                                u64 kc_s = k_cache_dev + layer_s * layer_stride
+                                u64 vc_s = v_cache_dev + layer_s * layer_stride
+                                u64 d_qkv_w_s     = gpu_get_or_upload_bf16_weight_padded(w_s.q_proj_w,    hidden, qkv_dim_l, hidden_pad_l)
+                                u64 d_o_w_s       = gpu_get_or_upload_bf16_weight_padded(w_s.o_proj_w,    q_dim,  hidden,    q_dim_pad_l)
+                                u64 d_gate_up_w_s = gpu_get_or_upload_bf16_weight_padded(w_s.gate_proj_w, hidden, 2 * ff,    hidden_pad_l)
+                                u64 d_down_w_s    = gpu_get_or_upload_bf16_weight_padded(w_s.down_proj_w, ff,     hidden,    ff_pad_l)
+                                // Slice 6.7c — Llama stores attn_norm.weight as
+                                // F32, not bf16.  Feeding the bf16 dequant kernel
+                                // an F32 buffer half-zeros the norm weights.
+                                u64 d_in_g_s      = gpu_cache_f32_as_f32(w_s.input_norm_w, hidden)
+                                u64 d_post_g_s    = gpu_cache_f32_as_f32(w_s.post_norm_w,  hidden)
+                                if d_qkv_w_s == 0 || d_o_w_s == 0 || d_gate_up_w_s == 0 || d_down_w_s == 0 ||
+                                   d_in_g_s == 0 || d_post_g_s == 0 {
+                                    eout("[mistral_7b_gpu] speck4 weight upload FAILED at layer="); eu64(layer_s); eout("\n")
+                                    sl_ok = 0
+                                    layer_s = n_layers
+                                } else {
+                                    if _speck4_fired_once == 0 {
+                                        eout("[mistral_7b_gpu] speck4 ACTUALLY FIRING\n")
+                                        _speck4_fired_once = 1
+                                    }
+                                    // Slice 6.7e — host-side drain between layer launches.
+                                    // Required for memory coherency: WG 0 of layer N writes
+                                    // b_x_norm_g_4 in phase 1; without this flush, those
+                                    // writes haven't propagated to L2 by the time WGs ≥ 1
+                                    // on other CUs read them in phase 3 of the NEXT layer
+                                    // launch, producing byte-exact stream-pair collapse.
+                                    // Tried alternatives that did NOT fix it: L0 16 KB pad,
+                                    // SCOPE_SYS on stores, removing pre-atomic L1 inv,
+                                    // once-per-sequence-only flush.  See task #267.
+                                    gpu_pipeline_flush()
+                                    if gpu_llama_layer_megakernel_speck4_to_dev(
+                                            d_in_4_cur, d_out_4_cur,
+                                            d_qkv_w_s, d_o_w_s, d_gate_up_w_s, d_down_w_s,
+                                            d_in_g_s, d_post_g_s, 0, 0,
+                                            d_rope_cos_4, d_rope_sin_4,
+                                            kc_s, vc_s,
+                                            pos,
+                                            d_barrier_dev, d_barrier_host,
+                                            d_gu_scratch_4,
+                                            d_b_x_norm_g_4, d_b_qkv_g_4,
+                                            d_b_attn_q_g_4, d_b_mid_g_4,
+                                            d_b_mid_norm_g_4, d_b_attn_out_g_4,
+                                            _speck4_max_phase) != 0 {
+                                        eout("[mistral_7b_gpu] speck4 launch FAIL at layer="); eu64(layer_s); eout("\n")
+                                        sl_ok = 0
+                                        layer_s = n_layers
+                                    } else {
+                                        // Slice 6.7e-bis — per-phase dump for layer 0
+                                        // of the FIRST speck4 call only. Mirrors the
+                                        // M=1 dump path so we can bisect speck4-vs-M=1
+                                        // divergence phase-by-phase. Each speck4 phase
+                                        // buffer has M_EFF_S4=4 streams stacked
+                                        // contiguously; we dump stream 0 (token =
+                                        // best_id, == M=1's next input) so the M=1
+                                        // reference is directly comparable.
+                                        u64 _dump_target_layer = 0
+                                        u64 _ev_dl = getenv("MLRIFT_MISTRAL_SPECK4_DUMP_LAYER")
+                                        if _ev_dl != 0 {
+                                            u8 _dlc = 0; unsafe { *(_ev_dl as u8) -> _dlc }
+                                            if _dlc >= 48 && _dlc <= 57 {
+                                                u64 _dl_val = 0
+                                                u64 _idl = 0
+                                                while _idl < 4 {
+                                                    u8 _dlc2 = 0; unsafe { *((_ev_dl + _idl) as u8) -> _dlc2 }
+                                                    if _dlc2 < 48 || _dlc2 > 57 { _idl = 4 }
+                                                    else {
+                                                        _dl_val = _dl_val * 10 + (_dlc2 - 48)
+                                                        _idl = _idl + 1
+                                                    }
+                                                }
+                                                _dump_target_layer = _dl_val
+                                            }
+                                        }
+                                        if layer_s == _dump_target_layer && _speck4_dump_done == 0 {
+                                            u64 _ev_s4d = getenv("MLRIFT_MISTRAL_SPECK4_DUMP")
+                                            if _ev_s4d != 0 {
+                                                u8 _s4d_c = 0; unsafe { *(_ev_s4d as u8) -> _s4d_c }
+                                                if _s4d_c != 48 {
+                                                    gpu_pipeline_flush()
+                                                    u64 qkv_dim_dbg = q_dim + 2 * kv_dim
+                                                    eout("[dump-speck4] layer="); eu64(_dump_target_layer); eout(" first-call begin (stream 0 = best_id; matches M=1 input)\n")
+                                                    _dump_speck4_buf("b_x_norm_g_4_s0", d_b_x_norm_g_4,   hidden,      0)
+                                                    _dump_speck4_buf("b_x_norm_g_4_s1", d_b_x_norm_g_4,   hidden,      1)
+                                                    _dump_speck4_buf("b_x_norm_g_4_s2", d_b_x_norm_g_4,   hidden,      2)
+                                                    _dump_speck4_buf("b_x_norm_g_4_s3", d_b_x_norm_g_4,   hidden,      3)
+                                                    _dump_speck4_buf("b_x_norm_g_4",   d_b_x_norm_g_4,   hidden,      0)
+                                                    _dump_speck4_buf("b_qkv_g_4_s0",   d_b_qkv_g_4,      qkv_dim_dbg, 0)
+                                                    _dump_speck4_buf("b_qkv_g_4_s1",   d_b_qkv_g_4,      qkv_dim_dbg, 1)
+                                                    _dump_speck4_buf("b_qkv_g_4_s2",   d_b_qkv_g_4,      qkv_dim_dbg, 2)
+                                                    _dump_speck4_buf("b_qkv_g_4_s3",   d_b_qkv_g_4,      qkv_dim_dbg, 3)
+                                                    _dump_speck4_buf("b_qkv_g_4",      d_b_qkv_g_4,      qkv_dim_dbg, 0)
+                                                    // K-cache dump for cross-stream race bisection.
+                                                    // Phase 5 of layer N writes K[pos_base..pos_base+M_EFF-1]
+                                                    // for layer N.  If THESE bytes are non-deterministic
+                                                    // across runs, the bug is in phase 5 K-writes; if
+                                                    // these are stable but phase 7 output isn't, bug is
+                                                    // in phase 7.  Use MLRIFT_MISTRAL_SPECK4_MAX_PHASE=3 to
+                                                    // stop kernel right after phase 5.
+                                                    u64 _kv_off0 = kc_s + pos * kv_row_bytes
+                                                    _dump_speck4_buf("kc_layer_pos0", _kv_off0, kv_dim, 0)
+                                                    u64 _kv_off1 = _kv_off0 + kv_row_bytes
+                                                    _dump_speck4_buf("kc_layer_pos1", _kv_off1, kv_dim, 0)
+                                                    u64 _kv_off2 = _kv_off1 + kv_row_bytes
+                                                    _dump_speck4_buf("kc_layer_pos2", _kv_off2, kv_dim, 0)
+                                                    u64 _kv_off3 = _kv_off2 + kv_row_bytes
+                                                    _dump_speck4_buf("kc_layer_pos3", _kv_off3, kv_dim, 0)
+                                                    _dump_speck4_buf("b_attn_q_g_4_s0", d_b_attn_q_g_4, q_dim, 0)
+                                                    _dump_speck4_buf("b_attn_q_g_4_s1", d_b_attn_q_g_4, q_dim, 1)
+                                                    _dump_speck4_buf("b_attn_q_g_4_s2", d_b_attn_q_g_4, q_dim, 2)
+                                                    _dump_speck4_buf("b_attn_q_g_4_s3", d_b_attn_q_g_4, q_dim, 3)
+                                                    _dump_speck4_buf("b_attn_out_g_4_s0", d_b_attn_out_g_4, q_dim, 0)
+                                                    _dump_speck4_buf("b_attn_out_g_4_s1", d_b_attn_out_g_4, q_dim, 1)
+                                                    _dump_speck4_buf("b_attn_out_g_4_s2", d_b_attn_out_g_4, q_dim, 2)
+                                                    _dump_speck4_buf("b_attn_out_g_4_s3", d_b_attn_out_g_4, q_dim, 3)
+                                                    _dump_speck4_buf("b_mid_g_4_s0",   d_b_mid_g_4,      hidden,      0)
+                                                    _dump_speck4_buf("b_mid_g_4_s1",   d_b_mid_g_4,      hidden,      1)
+                                                    _dump_speck4_buf("b_mid_norm_g_4_s0", d_b_mid_norm_g_4, hidden,   0)
+                                                    _dump_speck4_buf("b_mid_norm_g_4_s1", d_b_mid_norm_g_4, hidden,   1)
+                                                    // gu_scratch is [4, 2*ff] but the
+                                                    // post-silu_mul payload lives in
+                                                    // the first FF floats per stream
+                                                    // (matches M=1 dump convention).
+                                                    _dump_speck4_buf("gu_scratch_4[0..FF]", d_gu_scratch_4, ff, 0)
+                                                    _dump_speck4_buf("out_residual_4_s0", d_out_4_cur, hidden, 0)
+                                                    _dump_speck4_buf("out_residual_4_s1", d_out_4_cur, hidden, 1)
+                                                    _dump_speck4_buf("out_residual_4_s2", d_out_4_cur, hidden, 2)
+                                                    _dump_speck4_buf("out_residual_4_s3", d_out_4_cur, hidden, 3)
+                                                    _speck4_dump_done = 1
+                                                    eout("[dump-speck4] layer=0 first-call end\n")
+                                                }
+                                            }
+                                        }
+                                        u64 tmp4 = d_in_4_cur
+                                        d_in_4_cur  = d_out_4_cur
+                                        d_out_4_cur = tmp4
+                                        layer_s = layer_s + 1
+                                    }
+                                }
+                            }
+                            if sl_ok == 0 {
+                                eout("[mistral_7b_gpu] speck4 path disabled after layer FAIL\n")
+                                _native_mks4_use = 0
+                            } else {
+                                // Sync so the device-side d_in_4_cur is observable
+                                // via hipMemcpy on the host.
+                                gpu_pipeline_flush()
+
+                                // ── D2H per-stream final residual ──
+                                u64 host_resid_4 = alloc(M_EFF_S4 * hidden * 4)
+                                u32 cerr_d = hipMemcpy(host_resid_4, d_in_4_cur, M_EFF_S4 * hidden * 4, 2)
+                                if cerr_d != 0 {
+                                    eout("[mistral_7b_gpu] speck4 D2H fail; speck4 path disabled\n")
+                                    _native_mks4_use = 0
+                                    dealloc(host_resid_4)
+                                } else {
+                                    // ── Per-stream final norm + lm_head + argmax ──
+                                    u64 host_predicted = alloc(M_EFF_S4 * 4)
+                                    u64 mp = 0
+                                    while mp < M_EFF_S4 {
+                                        u64 stream_resid = host_resid_4 + mp * hidden * 4
+                                        qwen3_rmsnorm_f32_weights(final_out, stream_resid, norm_t.ptr, hidden)
+                                        // Slice 6.7f — port speck4 per-stream lm_head to GPU
+                                        // bf16 gemv (mirrors M=1 path at line ~1115).
+                                        // CPU Q8_0 was 572 ms/step (4 streams × 143 ms);
+                                        // GPU bf16 drops it to ~30 ms/step.
+                                        u64 _lmh_ok = 0
+                                        if lm_head_bf16_host != 0 {
+                                            memcpy(d_lm_in_h, final_out, hidden * 4)
+                                            if gpu_matmul_to_dev(d_lm_out, d_lm_in, lm_head_bf16_host, vocab, hidden) == 0 {
+                                                gpu_pipeline_flush()
+                                                memcpy(logits, d_lm_out_h, vocab * 4)
+                                                _lmh_ok = 1
+                                            }
+                                        }
+                                        if _lmh_ok == 0 {
+                                            matmul_q8_0_q8_0_f32(logits, final_out, lmhead_ptr, 1, vocab, hidden, num_workers)
+                                        }
+                                        u64 best_s_id = 0
+                                        f32 best_s_val = 0.0f
+                                        u64 first_s = 1
+                                        u64 js = 0
+                                        while js < vocab {
+                                            f32 vs = 0.0f
+                                            unsafe { *((logits + js * 4) as f32) -> vs }
+                                            if first_s == 1 { best_s_val = vs; best_s_id = js; first_s = 0 }
+                                            else            { if vs > best_s_val { best_s_val = vs; best_s_id = js } }
+                                            js = js + 1
+                                        }
+                                        u32 best_s_id32 = best_s_id
+                                        unsafe { *((host_predicted + mp * 4) as u32) = best_s_id32 }
+                                        mp = mp + 1
+                                    }
+                                    dealloc(host_resid_4)
+
+                                    // ── Verify / accept loop ──
+                                    // Rule: accept draft[k] iff predicted[k] == draft[k]
+                                    // for k = 0 .. draft_n - 1.  Stop at first mismatch.
+                                    // (predicted[k] is the model's prediction at position
+                                    // pos+k given context [token_0, draft[0..k-1]].)
+                                    u64 accepted = 0
+                                    u64 k_chk = 0
+                                    while k_chk < draft_n {
+                                        u32 d_k32 = 0
+                                        unsafe { *((draft_buf + k_chk * 4) as u32) -> d_k32 }
+                                        u32 p_k32 = 0
+                                        unsafe { *((host_predicted + k_chk * 4) as u32) -> p_k32 }
+                                        if d_k32 == p_k32 {
+                                            unsafe { *((seq_ids32 + seq_len * 4) as uint32) = d_k32 }
+                                            seq_len  = seq_len + 1
+                                            pos      = pos + 1
+                                            step     = step + 1
+                                            accepted = accepted + 1
+                                            u64 d_k_u = d_k32
+                                            gguf_deq_q8_0(x_cur, embed_base + d_k_u * row_bytes, hidden)
+                                            if step >= max_new {
+                                                k_chk = draft_n
+                                            } else {
+                                                k_chk = k_chk + 1
+                                            }
+                                        } else {
+                                            k_chk = draft_n
+                                        }
+                                    }
+                                    // MLRIFT_MISTRAL_SPECK4_PROBE=1: dump per-stream predicted-vs-draft
+                                    // (BEFORE dealloc(host_predicted)) to bisect whether the speck4
+                                    // mega-kernel's per-stream logits are correct.  Stream 0's input
+                                    // is best_id (same as M=1 next step), so predicted[0] should equal
+                                    // what an M=1 step would produce given best_id; if not, the speck4
+                                    // phase emit is broken even at M=0.  Stream m>=1's input is
+                                    // draft[m-1]; predicted[m] should equal what the model predicts
+                                    // given that draft as context.
+                                    u64 _ev_probe_l = getenv("MLRIFT_MISTRAL_SPECK4_PROBE")
+                                    if _ev_probe_l != 0 {
+                                        u8 _pr_c0 = 0; unsafe { *(_ev_probe_l as u8) -> _pr_c0 }
+                                        if _pr_c0 != 48 {
+                                            u64 _mp_dbg = 0
+                                            while _mp_dbg < M_EFF_S4 {
+                                                u32 _p32 = 0
+                                                unsafe { *((host_predicted + _mp_dbg * 4) as u32) -> _p32 }
+                                                u32 _d32 = 0
+                                                if _mp_dbg == 0 {
+                                                    u64 best_id_u = best_id
+                                                    _d32 = best_id_u
+                                                } else if _mp_dbg - 1 < draft_n {
+                                                    unsafe { *((draft_buf + (_mp_dbg - 1) * 4) as u32) -> _d32 }
+                                                }
+                                                eout("    [probe] m="); eu64(_mp_dbg)
+                                                eout(" predicted="); u64 _pp_u = _p32; eu64(_pp_u)
+                                                eout(" draft="); u64 _dd_u = _d32; eu64(_dd_u); eout("\n")
+                                                _mp_dbg = _mp_dbg + 1
+                                            }
+                                        }
+                                    }
+                                    dealloc(host_predicted)
+                                    total_accepted = total_accepted + accepted
+                                    eout("  [speck4] draft_n="); eu64(draft_n)
+                                    eout(" accepted="); eu64(accepted); eout("\n")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    u64 total_decode_ns = time_elapsed(decode_start_ns)
+    u64 total_ms = total_decode_ns / 1000000
+    u64 tokps_milli = 0
+    if total_decode_ns != 0 {
+        tokps_milli = (max_new * 1000 * 1000000000) / total_decode_ns
+    }
+
+    eout("\n=== GENERATED IDs ===\n")
+    u64 gi = 0
+    while gi < seq_len {
+        if gi != 0 { eout(", ") }
+        u32 gid32 = 0
+        unsafe { *((seq_ids32 + gi * 4) as uint32) -> gid32 }
+        u64 gid = gid32
+        eu64(gid)
+        gi = gi + 1
+    }
+    eout("\n")
+
+    eout("\n=== TIMING ===\n")
+    eout("prompt_tokens="); eu64(prompt_count); eout("\n")
+    eout("prefill_ms="); eu64(prefill_ns / 1000000); eout("\n")
+    eout("total_decode_ms="); eu64(total_ms); eout("\n")
+    eout("tokens_per_sec_x1000="); eu64(tokps_milli); eout("\n")
+    eout("tokens_generated="); eu64(max_new); eout("\n")
+    // Slice 6.4 — speck4 acceptance metrics.
+    if total_speck4_calls > 0 {
+        u64 aa_x100  = (total_accepted * 100)        / total_speck4_calls
+        u64 dhr_x100 = (total_speck4_calls * 100)    / total_steps
+        eout("[mistral_7b_gpu] speck4: avg_accept=")
+        eu64(aa_x100 / 100); eout("."); eu64(aa_x100 % 100)
+        eout(" draft_hit_ratio=")
+        eu64(dhr_x100 / 100); eout("."); eu64(dhr_x100 % 100)
+        eout(" total_calls="); eu64(total_speck4_calls)
+        eout(" total_steps="); eu64(total_steps)
+        eout("\n")
+    }
+    qwen3_profile_dump()
+
+    dealloc(x_cur); dealloc(x_nxt); dealloc(final_out); dealloc(logits)
+    dealloc(seq_ids32); dealloc(layers_arr)
+    dealloc(k_cache); dealloc(v_cache)
+    gguf_free(gf)
+    thread_pool_shutdown()
+    file_close(g_fd)
+    exit(0)
+}
