@@ -254,6 +254,43 @@ fn _emit_s_mul_u32_pow2_or_lit(uint64 sdst, uint64 ssrc, uint64 factor) {
     }
 }
 
+// Slice 8.1: emit `sdst = ssrc / gqa_ratio` for the current arch.  Phase 7's
+// `kv_head = q_head / (N_HEADS / N_KV_HEADS)` formerly used s_lshr_b32 with
+// log2(gqa_ratio), which is correct only for pow-2 ratios (Qwen3 2:1, Llama
+// 4:1, Mistral 4:1).  Llama-3.2-3B has ratio=3 (24/8), for which the shift
+// approximation routes Q heads to the wrong KV head (and OOB for q>=16).
+//
+// Non-pow-2 case for ratio=3: classic libdivide magic via 32-bit s_mul_hi_u32
+// with 0xAAAAAAAB, then s_lshr_b32 by 1.  Identity: 3 * 0xAAAAAAAB = 2^33 + 1,
+// so high_u32(q * M) >> 1 == q / 3 for all 32-bit q.
+fn _emit_div_kv_head(uint64 sdst, uint64 ssrc) {
+    uint64 ratio = MEGA_N_HEADS / MEGA_N_KV_HEADS
+    uint64 r = ratio
+    uint64 shift = 0
+    uint64 is_pow2 = 1
+    if ratio == 0 { is_pow2 = 0 }
+    while r > 1 {
+        if (r & 1) != 0 { is_pow2 = 0 }
+        r = r >> 1
+        shift = shift + 1
+    }
+    if is_pow2 != 0 {
+        // s_lshr_b32 sdst, ssrc, shift  (SOP2 op 0x0A, inline imm 0x80+shift)
+        uint64 inline_imm = 0x80 + shift
+        asm_u32(0x85000000 | ((sdst & 0x7F) << 16) | (inline_imm << 8) | (ssrc & 0xFF))
+    } else if ratio == 3 {
+        // s_mul_hi_u32 sdst, ssrc, 0xAAAAAAAB  (SOP2 op 0x2D, lit32 ssrc1=0xFF)
+        // bits 31:24 = 0x96; bits 23:16 = 0x80|sdst (op msb=1); ssrc1=0xFF; ssrc0=ssrc.
+        asm_u32(0x96800000 | ((sdst & 0x7F) << 16) | (0xFF << 8) | (ssrc & 0xFF))
+        asm_u32(0xAAAAAAAB)
+        // s_lshr_b32 sdst, sdst, 1  (inline imm 0x81)
+        asm_u32(0x85000000 | ((sdst & 0x7F) << 16) | (0x81 << 8) | (sdst & 0xFF))
+    } else {
+        write(2, "_emit_div_kv_head: unsupported GQA ratio (only pow2 or 3)\n", 58)
+        exit(1)
+    }
+}
+
 // 1/sqrt(n) f32 bits for n a power of 2 in {64, 128, 256, ...}.
 // Slice 6.7e: previous table had 0x3D000000 for n=64 (= 1/32) and
 // 0x3C800000 for n=256 (= 1/64) — off-by-one in the exponent.  These
@@ -3804,7 +3841,8 @@ fn _emit_phase7_attn_decode_coop_inline() {
     uint64 q_to_coop_shift    = _arch_log2_pow2(attn_coop)  // log2(ATTN_COOP)
     uint64 coop_idx_mask      = attn_coop - 1               // ATTN_COOP - 1
     uint64 head_off_shift     = _arch_log2_pow2(MEGA_HEAD_DIM * 4)            // log2(HEAD_DIM*4)
-    uint64 q_to_kv_shift      = _arch_log2_pow2(MEGA_N_HEADS / MEGA_N_KV_HEADS) // GQA ratio
+    // Slice 8.1: q_to_kv_shift removed; _emit_div_kv_head handles both pow-2
+    // (s_lshr) and non-pow-2 (Llama-3B ratio=3, libdivide) GQA cases.
     uint64 out_per_wg         = MEGA_HEAD_DIM / attn_coop   // = WAVE = 32 always (slice 5.10)
     uint64 out_per_wg_bytes_shift = _arch_log2_pow2(out_per_wg * 4)           // log2(OUT_PER_WG*4) = log2(128) = 7 always
     uint64 kv_off_shift       = _arch_log2_pow2(MEGA_N_KV_HEADS * MEGA_HEAD_DIM * 4)  // log2(KV_DIM*4)
@@ -3840,10 +3878,10 @@ fn _emit_phase7_attn_decode_coop_inline() {
     //                                       Llama mask=1 → 0x81 (= 0x8B12811C)
     uint64 coop_idx_inline = 0x80 + coop_idx_mask
     asm_u32(0x8B12001C | (coop_idx_inline << 8))
-    // s19 = q_head >> q_to_kv_shift = kv_head  (Qwen3 shift=1 → 0x85138110)
-    // s_lshr_b32 s19, s16, q_to_kv_shift: op 0x0A; ssrc0=s16=0x10, ssrc1=inline (0x80+shift)
-    uint64 q_to_kv_inline = 0x80 + q_to_kv_shift
-    asm_u32(0x85130010 | (q_to_kv_inline << 8))
+    // s19 = q_head / gqa_ratio = kv_head.  Slice 8.1: for non-pow-2 GQA
+    // (Llama-3B 24/8=3), _emit_div_kv_head emits libdivide magic; pow-2
+    // archs (Qwen3, Llama-1B, Mistral) still get the same s_lshr_b32 byte.
+    _emit_div_kv_head(19, 16)
 
     // ── Load kernarg pointers ───────────────────────────────────────────
     // s_load_b64 s[2:3], s[0:1], 0x98   (b_attn_q_g, arg 19)
@@ -4335,7 +4373,7 @@ fn _emit_phase7_attn_decode_coop_speck4_inline() {
     uint64 q_to_coop_shift        = _arch_log2_pow2(attn_coop)
     uint64 coop_idx_mask          = attn_coop - 1
     uint64 head_off_shift         = _arch_log2_pow2(MEGA_HEAD_DIM * 4)
-    uint64 q_to_kv_shift          = _arch_log2_pow2(MEGA_N_HEADS / MEGA_N_KV_HEADS)
+    // Slice 8.1: q_to_kv_shift removed (see _emit_div_kv_head).
     uint64 out_per_wg             = MEGA_HEAD_DIM / attn_coop   // = WAVE = 32 always
     uint64 out_per_wg_bytes_shift = _arch_log2_pow2(out_per_wg * 4)
     uint64 kv_off_shift           = _arch_log2_pow2(MEGA_N_KV_HEADS * MEGA_HEAD_DIM * 4)
@@ -4363,10 +4401,9 @@ fn _emit_phase7_attn_decode_coop_speck4_inline() {
     //   Qwen3 mask=3 → 0x8B12831C ; Llama mask=1 → 0x8B12811C
     uint64 coop_idx_inline = 0x80 + coop_idx_mask
     asm_u32(0x8B12001C | (coop_idx_inline << 8))
-    // s19 = q_head >> q_to_kv_shift  (kv_head)
-    //   Qwen3 shift=1 → 0x85138110 ; Llama shift=2 → 0x85138210
-    uint64 q_to_kv_inline = 0x80 + q_to_kv_shift
-    asm_u32(0x85130010 | (q_to_kv_inline << 8))
+    // s19 = q_head / gqa_ratio  (kv_head).  Slice 8.1: pow-2 ratios keep the
+    // s_lshr_b32 byte; ratio=3 (Llama-3B) uses libdivide magic.
+    _emit_div_kv_head(19, 16)
 
     // ── Load kernarg pointers ───────────────────────────────────────────
     // s_load_b64 s[2:3], s[0:1], 0x98   (b_attn_q_g_4, arg 19)
