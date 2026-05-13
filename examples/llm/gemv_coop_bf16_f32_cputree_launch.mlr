@@ -1,0 +1,324 @@
+// Phase 1 validator for the Llama-3.2-3B bit-exactness project (2026-05-14).
+//
+// Standalone launcher that:
+//   1. Generates deterministic bf16 W [N,K] + f32 X [K] via xorshift.
+//   2. Computes a CPU reference via mm_worker_bf16_f32_avx2_naive
+//      (std/matmul.mlr:313) — the AVX2 8-lane vhaddps reduction
+//      tree that Llama-3B's GPU mega-kernel must bit-match.
+//   3. Dispatches the new gemv_coop_bf16_f32_cputree kernel that mimics
+//      that exact tree via XOR-bpermute offsets [4,1,2] on 8 wave32 lanes.
+//   4. Byte-compares CPU vs GPU output dword-for-dword; prints
+//      mismatch_dwords and first_bad index.
+//
+// SUCCESS = mismatch_dwords: 0, first_bad: -1.
+//
+// Build:
+//   ./build/mlrc --emit-amdgpu-gemv-coop-bf16-f32-cputree=/tmp/gemv_cputree.co
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native -o /tmp/gemv_cputree_launch \
+//                examples/llm/gemv_coop_bf16_f32_cputree_launch.mlr
+// Run:
+//   GEMV_K=3072 GEMV_N=5120 /tmp/gemv_cputree_launch     # Llama-3B QKV shape
+
+import "../../std/hip.mlr"
+import "../../std/matmul.mlr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn write(int32 fd, uint64 buf, uint64 n) -> int64
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn getenv(uint64 name) -> uint64
+
+static uint64 N_DEF = 5120
+static uint64 K_DEF = 3072
+
+fn u64_to_ascii_decimal(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 { uint8 z = 48; unsafe { *(buf as uint8) = z }; return 1 }
+    uint64 n = 0
+    uint64 tmp = val
+    while tmp > 0 { n = n + 1; tmp = tmp / 10 }
+    uint64 i = n
+    tmp = val
+    while i > 0 {
+        i = i - 1
+        uint64 d = tmp - (tmp / 10) * 10
+        uint64 p = buf + i
+        uint8 c = d + 48
+        unsafe { *(p as uint8) = c }
+        tmp = tmp / 10
+    }
+    return n
+}
+
+fn print_label_val(uint64 label, uint64 label_len, uint64 val) {
+    uint64 buf = alloc(128)
+    uint64 i = 0
+    while i < label_len {
+        uint64 sp = label + i
+        uint64 c = 0
+        unsafe { *(sp as uint8) -> c }
+        uint64 dp = buf + i
+        uint8 cb = c
+        unsafe { *(dp as uint8) = cb }
+        i = i + 1
+    }
+    uint64 cp = buf + label_len
+    uint8 col = 58; unsafe { *(cp as uint8) = col }
+    uint64 sp2 = buf + label_len + 1
+    uint8 space = 32; unsafe { *(sp2 as uint8) = space }
+    uint64 num_buf = buf + label_len + 2
+    uint64 dlen = u64_to_ascii_decimal(val, num_buf)
+    uint64 nul_p = buf + label_len + 2 + dlen
+    uint8 nul = 0; unsafe { *(nul_p as uint8) = nul }
+    puts(buf)
+}
+
+// Print "label: 0xHHHHHHHH" — useful for first_bad mismatch dump.
+fn print_label_hex32(uint64 label, uint64 label_len, uint64 val) {
+    uint64 buf = alloc(128)
+    uint64 i = 0
+    while i < label_len {
+        uint64 sp = label + i
+        uint64 c = 0
+        unsafe { *(sp as uint8) -> c }
+        uint64 dp = buf + i
+        uint8 cb = c
+        unsafe { *(dp as uint8) = cb }
+        i = i + 1
+    }
+    uint64 cp = buf + label_len
+    uint8 col = 58; unsafe { *(cp as uint8) = col }
+    uint64 sp2 = buf + label_len + 1
+    uint8 space = 32; unsafe { *(sp2 as uint8) = space }
+    uint64 z0 = buf + label_len + 2; uint8 cz = 48; unsafe { *(z0 as uint8) = cz }  // '0'
+    uint64 z1 = buf + label_len + 3; uint8 cx = 120; unsafe { *(z1 as uint8) = cx } // 'x'
+    uint64 h = 0
+    while h < 8 {
+        uint64 shift = (7 - h) * 4
+        uint64 nib = (val >> shift) & 0xF
+        uint8 cnib = 0
+        if nib < 10 { cnib = nib + 48 } else { cnib = nib - 10 + 97 }
+        uint64 hp = buf + label_len + 4 + h
+        unsafe { *(hp as uint8) = cnib }
+        h = h + 1
+    }
+    uint64 nul_p = buf + label_len + 12
+    uint8 nul = 0; unsafe { *(nul_p as uint8) = nul }
+    puts(buf)
+}
+
+fn die(uint64 msg, uint64 code) {
+    puts(msg)
+    print_label_val("hipError", 8, code)
+    exit(1)
+}
+
+fn parse_env_count(uint64 name) -> uint64 {
+    uint64 s = getenv(name)
+    if s == 0 { return 0 }
+    uint64 v = 0
+    uint64 i = 0
+    while 1 == 1 {
+        uint64 cp = s + i
+        uint64 c = 0
+        unsafe { *(cp as uint8) -> c }
+        if c == 0 { break }
+        if c >= 48 && c <= 57 { v = v * 10 + (c - 48); i = i + 1; continue }
+        break
+    }
+    return v
+}
+
+// Single-iteration xorshift32.  Used to generate deterministic test data.
+fn xorshift32(uint64 state) -> uint64 {
+    uint64 s = state & 0xFFFFFFFF
+    s = (s ^ (s << 13)) & 0xFFFFFFFF
+    s = (s ^ (s >> 17)) & 0xFFFFFFFF
+    s = (s ^ (s << 5))  & 0xFFFFFFFF
+    return s
+}
+
+// Convert a 32-bit xorshift word into a sensible f32 bit pattern:
+// keep low 23 bits of mantissa, force exponent into a known range
+// (0x3D = 2^-4 ≈ 0.0625 magnitude), random sign.  Avoids subnormals,
+// inf, NaN.  Output is the f32 bit pattern (caller writes it as u32).
+fn rand_word_to_f32_bits(uint64 r) -> uint64 {
+    uint64 sign = (r >> 31) & 1
+    uint64 mant = r & 0x7FFFFF
+    uint64 exp  = 0x7D                  // f32 exponent for 2^-2..2^-1 range
+    uint64 bits = (sign << 31) | (exp << 23) | mant
+    return bits & 0xFFFFFFFF
+}
+
+// Convert a 32-bit xorshift word into a sensible bf16 bit pattern.
+// bf16 = top 16 bits of f32.  Take rand word, build an f32 bit pattern
+// the same way as above, then keep the top 16 bits.
+fn rand_word_to_bf16_bits(uint64 r) -> uint64 {
+    uint64 f32_bits = rand_word_to_f32_bits(r)
+    return (f32_bits >> 16) & 0xFFFF
+}
+
+fn main() {
+    uint32 err = hipSetDevice(0)
+    if err != 0 { die("hipSetDevice failed", err) }
+
+    uint64 N = N_DEF
+    uint64 K = K_DEF
+    uint64 ne = parse_env_count("GEMV_N"); if ne != 0 { N = ne }
+    uint64 ke = parse_env_count("GEMV_K"); if ke != 0 { K = ke }
+
+    print_label_val("N", 1, N)
+    print_label_val("K", 1, K)
+
+    // ── Load .co ───────────────────────────────────────────────────────
+    uint64 co_path = "/tmp/gemv_cputree.co"
+    uint64 fd = file_open(co_path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        puts("cannot open /tmp/gemv_cputree.co — build first via --emit-amdgpu-gemv-coop-bf16-f32-cputree=/tmp/gemv_cputree.co")
+        exit(1)
+    }
+    uint64 co_size = file_size(fd)
+    uint64 co_blob = alloc(co_size)
+    file_read(fd, co_blob, co_size)
+    file_close(fd)
+
+    uint64 mod_slot = alloc(8)
+    err = hipModuleLoadData(mod_slot, co_blob)
+    if err != 0 { die("hipModuleLoadData", err) }
+    uint64 mod = 0; unsafe { *(mod_slot as uint64) -> mod }
+
+    uint64 fh_slot = alloc(8)
+    err = hipModuleGetFunction(fh_slot, mod, "gemv_coop_bf16_f32_cputree")
+    if err != 0 { die("getFn gemv_coop_bf16_f32_cputree", err) }
+    uint64 fh = 0; unsafe { *(fh_slot as uint64) -> fh }
+
+    // ── Allocate host + device buffers ────────────────────────────────
+    uint64 bytes_w = N * K * 2     // bf16 weight
+    uint64 bytes_x = K * 4         // f32 input
+    uint64 bytes_y = N * 4         // f32 output
+
+    uint64 h_W = alloc(bytes_w)
+    uint64 h_X = alloc(bytes_x)
+    uint64 h_Y_cpu = alloc(bytes_y)
+    uint64 h_Y_gpu = alloc(bytes_y)
+
+    // Zero output buffers so any out-of-range write is detectable.
+    uint64 i = 0
+    while i < bytes_y { uint64 p = h_Y_cpu + i; uint8 z = 0; unsafe { *(p as uint8) = z }; i = i + 1 }
+    i = 0
+    while i < bytes_y { uint64 p = h_Y_gpu + i; uint8 z = 0; unsafe { *(p as uint8) = z }; i = i + 1 }
+
+    // ── Generate deterministic W (bf16) and X (f32) via xorshift32 ────
+    uint64 state = 0xDEADBEEF
+    uint64 j = 0
+    while j < N * K {
+        state = xorshift32(state)
+        uint64 bits16 = rand_word_to_bf16_bits(state)
+        uint64 p = h_W + j * 2
+        uint8 lo = bits16 & 0xFF
+        uint8 hi = (bits16 >> 8) & 0xFF
+        unsafe { *(p as uint8) = lo }
+        uint64 p1 = p + 1
+        unsafe { *(p1 as uint8) = hi }
+        j = j + 1
+    }
+    j = 0
+    while j < K {
+        state = xorshift32(state)
+        uint64 bits32 = rand_word_to_f32_bits(state)
+        uint64 p = h_X + j * 4
+        uint8 b0 = bits32 & 0xFF
+        uint8 b1 = (bits32 >> 8) & 0xFF
+        uint8 b2 = (bits32 >> 16) & 0xFF
+        uint8 b3 = (bits32 >> 24) & 0xFF
+        unsafe { *(p as uint8) = b0 }
+        uint64 p1 = p + 1; unsafe { *(p1 as uint8) = b1 }
+        uint64 p2 = p + 2; unsafe { *(p2 as uint8) = b2 }
+        uint64 p3 = p + 3; unsafe { *(p3 as uint8) = b3 }
+        j = j + 1
+    }
+
+    // ── CPU reference: call mm_worker_bf16_f32_avx2_naive directly ────
+    // Worker ctx layout (48 bytes): out_ptr, x_ptr, w_ptr, M, N, K.
+    uint64 ctx = alloc(48)
+    unsafe { *(ctx as uint64) = h_Y_cpu }
+    uint64 c8  = ctx + 8;   unsafe { *(c8  as uint64) = h_X }
+    uint64 c16 = ctx + 16;  unsafe { *(c16 as uint64) = h_W }
+    uint64 c24 = ctx + 24;  uint64 M_one = 1; unsafe { *(c24 as uint64) = M_one }
+    uint64 c32 = ctx + 32;  unsafe { *(c32 as uint64) = N }
+    uint64 c40 = ctx + 40;  unsafe { *(c40 as uint64) = K }
+
+    mm_worker_bf16_f32_avx2_naive(0, N, ctx)
+    puts("cpu_reference: done")
+
+    // ── Allocate device buffers + upload W, X ─────────────────────────
+    uint64 d_W = 0; uint64 d_X = 0; uint64 d_Y = 0
+    uint64 slot = alloc(8); err = hipMalloc(slot, bytes_w); if err != 0 { die("malloc W", err) }; unsafe { *(slot as uint64) -> d_W }
+    slot = alloc(8); err = hipMalloc(slot, bytes_x); if err != 0 { die("malloc X", err) }; unsafe { *(slot as uint64) -> d_X }
+    slot = alloc(8); err = hipMalloc(slot, bytes_y); if err != 0 { die("malloc Y", err) }; unsafe { *(slot as uint64) -> d_Y }
+
+    // hipMemcpy dir=1 (H2D), dir=2 (D2H)
+    err = hipMemcpy(d_W, h_W, bytes_w, 1); if err != 0 { die("memcpy W H2D", err) }
+    err = hipMemcpy(d_X, h_X, bytes_x, 1); if err != 0 { die("memcpy X H2D", err) }
+    // Initialize d_Y to zero on device by memcpy from h_Y_gpu (already zeroed).
+    err = hipMemcpy(d_Y, h_Y_gpu, bytes_y, 1); if err != 0 { die("memcpy Y H2D", err) }
+
+    // ── Pack kernargs: (W, X, Y, N, K) — same 40-byte layout as gemv_coop_bf16_f32.
+    uint64 k_w = alloc(8); unsafe { *(k_w as uint64) = d_W }
+    uint64 k_x = alloc(8); unsafe { *(k_x as uint64) = d_X }
+    uint64 k_y = alloc(8); unsafe { *(k_y as uint64) = d_Y }
+    uint64 k_n = alloc(8); uint64 nv = N; unsafe { *(k_n as uint64) = nv }
+    uint64 k_k = alloc(8); uint64 kv = K; unsafe { *(k_k as uint64) = kv }
+    uint64 kp = alloc(5 * 8)
+    unsafe { *(kp        as uint64) = k_w }
+    unsafe { *((kp +  8) as uint64) = k_x }
+    unsafe { *((kp + 16) as uint64) = k_y }
+    unsafe { *((kp + 24) as uint64) = k_n }
+    unsafe { *((kp + 32) as uint64) = k_k }
+
+    uint32 grid_x  = N
+    uint32 block_x = 32
+
+    err = hipModuleLaunchKernel(fh, grid_x, 1, 1, block_x, 1, 1, 0, 0, kp, 0)
+    if err != 0 { die("launch", err) }
+    err = hipDeviceSynchronize(); if err != 0 { die("sync", err) }
+
+    err = hipMemcpy(h_Y_gpu, d_Y, bytes_y, 2); if err != 0 { die("memcpy Y D2H", err) }
+
+    // ── Compare ────────────────────────────────────────────────────────
+    uint64 mismatch = 0
+    uint64 first_bad = 0xFFFFFFFFFFFFFFFF
+    uint64 n_i = 0
+    while n_i < N {
+        uint64 cp = h_Y_cpu + n_i * 4
+        uint64 gp = h_Y_gpu + n_i * 4
+        uint64 cv = 0
+        uint64 gv = 0
+        unsafe { *(cp as uint32) -> cv }
+        unsafe { *(gp as uint32) -> gv }
+        if cv != gv {
+            mismatch = mismatch + 1
+            if first_bad == 0xFFFFFFFFFFFFFFFF { first_bad = n_i }
+        }
+        n_i = n_i + 1
+    }
+
+    print_label_val("mismatch_dwords", 15, mismatch)
+    if mismatch == 0 {
+        puts("first_bad: -1")
+        puts("PASS")
+    } else {
+        print_label_val("first_bad", 9, first_bad)
+        // Dump the diverging dwords for the first failure for quick triage.
+        uint64 cp = h_Y_cpu + first_bad * 4
+        uint64 gp = h_Y_gpu + first_bad * 4
+        uint64 cv = 0
+        uint64 gv = 0
+        unsafe { *(cp as uint32) -> cv }
+        unsafe { *(gp as uint32) -> gv }
+        print_label_hex32("cpu_bits", 8, cv)
+        print_label_hex32("gpu_bits", 8, gv)
+        puts("FAIL")
+    }
+
+    hipFree(d_W); hipFree(d_X); hipFree(d_Y)
+    exit(0)
+}
