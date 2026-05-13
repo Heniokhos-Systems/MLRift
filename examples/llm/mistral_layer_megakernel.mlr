@@ -1,0 +1,138 @@
+// mistral-7B-Instruct-v0.3 layer mega-kernel as a MLRift @kernel.
+//
+// Slice 7.0 (2026-05-13).  Body shape: 9 phases + 8 mega_barrier calls,
+// each phase wrapped in `if (wg_id ...)` so the AST walker can dispatch
+// each block to a phase-shape sub-recognizer.  Identical body to
+// llama_layer_megakernel.mlr — only the kernel name differs.  Arch
+// globals are switched at emit time by megakernel_dispatch_arch() in
+// src/format_amdgpu_megakernel.mlr via mega_set_arch_mistral_7b():
+//
+//   Mistral-7B-Instruct-v0.3 shapes:
+//     hidden     = 4096  (vs Llama-1B 2048, Qwen3-0.6B 1024)
+//     head_dim   = 128   (matches Qwen3 path, vs Llama-1B 64)
+//     n_heads    = 32
+//     n_kv_heads = 8     (GQA 4:1 — same as Llama-1B)
+//     ff         = 14336 (vs Llama-1B 8192)
+//     n_layers   = 32    (runtime loop bound in driver)
+//     vocab      = 32768
+//     rope theta = 10000 (CPU-side tables; not in setter)
+//     rmsnorm eps= 1e-5
+//     QKNorm DISABLED (no per-head Q/K rmsnorm — like Llama)
+//     RoPE NORM consecutive-pair layout (like Llama)
+//     Untied lm_head (separate output.weight tensor — driver-side concern).
+//
+// Body-literal cross-arch check:
+//   phase 5 wg<48 = N_HEADS + 2*N_KV_HEADS = 32+16 = 48 (Llama + Mistral same)
+//   phase 7 wg<128 = N_HEADS * ATTN_COOP   = 32*4  = 128 (Mistral matches
+//                    Llama's loose bound; ATTN_COOP = HEAD_DIM/WAVE = 4 for
+//                    HEAD_DIM=128, parametric per slice 5.10).
+//
+// WG_PERSIST = 512.
+//
+// Build the .co:
+//   ./build/mlrc --emit-amdgpu-mistral-megakernel-v2=/tmp/mistral_layer_megakernel_v2.co \
+//       examples/llm/mistral_layer_megakernel.mlr
+
+// CPU stubs for block_idx_x / tid_local_x — the recognizer pattern-matches
+// the @kernel body via AST walk; these are never called on AMDGPU.
+fn block_idx_x() -> uint64 { return 0 }
+fn tid_local_x()  -> uint64 { return 0 }
+
+// All marker fns reused from the Llama path: same body recognizer
+// (recognize_megakernel_swiglu_dense_gqa in src/format_amdgpu_megakernel.mlr),
+// same emit functions, different arch globals.
+fn rmsnorm_wg0_marker() { }
+fn qkv_matmul_marker() { }
+fn qkv_split_qknorm_rope_marker() { }
+fn attn_decode_coop_marker() { }
+fn oproj_residual_marker() { }
+fn post_norm_marker() { }
+fn gate_up_matmul_marker() { }
+fn silu_mul_elem_strided_marker() { }
+fn down_residual_marker() { }
+
+@kernel
+fn mistral_layer_megakernel(
+    uint64 in_residual,        //  0
+    uint64 out_residual,       //  1
+    uint64 qkv_w,              //  2
+    uint64 o_w,                //  3
+    uint64 gate_up_w,          //  4
+    uint64 down_w,             //  5
+    uint64 in_norm_g,          //  6
+    uint64 post_norm_g,        //  7
+    uint64 q_norm_g,           //  8  (unused for Mistral — QKNorm OFF)
+    uint64 k_norm_g,           //  9  (unused for Mistral — QKNorm OFF)
+    uint64 rope_cos,           // 10
+    uint64 rope_sin,           // 11
+    uint64 kc_layer,           // 12
+    uint64 vc_layer,           // 13
+    uint64 pos,                // 14  (by_value u64)
+    uint64 barrier_counter,    // 15
+    uint64 gu_scratch,         // 16
+    uint64 b_x_norm_g,         // 17
+    uint64 b_qkv_g,            // 18
+    uint64 b_attn_q_g,         // 19
+    uint64 b_mid_g,            // 20
+    uint64 b_mid_norm_g,       // 21
+    uint64 b_attn_out_g,       // 22
+    uint64 max_phase           // 23  (by_value u64)
+) {
+    uint64 wg_id = block_idx_x()
+    uint64 lane  = tid_local_x()
+
+    if wg_id == 0 {
+        rmsnorm_wg0_marker()       // phase 1: input rmsnorm
+    }
+    mega_barrier(barrier_counter, 0, 512)
+    if max_phase < 1 { return }
+
+    if wg_id < 256 {
+        qkv_matmul_marker()        // phase 3: QKV matmul (gemv_coop_bf16_f32, wg<256)
+    }
+    mega_barrier(barrier_counter, 1, 512)
+    if max_phase < 2 { return }
+
+    if wg_id < 48 {
+        qkv_split_qknorm_rope_marker()   // phase 5: QKV split + RoPE (3-way head dispatch, wg<48)
+    }
+    mega_barrier(barrier_counter, 2, 512)
+    if max_phase < 3 { return }
+
+    if wg_id < 128 {
+        attn_decode_coop_marker()  // phase 7: attn_decode-coop (ATTN_COOP=4 for HEAD_DIM=128, wg<128)
+    }
+    mega_barrier(barrier_counter, 3, 512)
+    if max_phase < 4 { return }
+
+    if wg_id < 256 {
+        oproj_residual_marker()    // phase 9: o_proj + residual-add (wg<256)
+    }
+    mega_barrier(barrier_counter, 4, 512)
+    if max_phase < 5 { return }
+
+    if wg_id == 0 {
+        post_norm_marker()         // phase 11: post_norm rmsnorm (WG-0 gated)
+    }
+    mega_barrier(barrier_counter, 5, 512)
+    if max_phase < 6 { return }
+
+    if wg_id < 256 {
+        gate_up_matmul_marker()    // phase 13: gate_up matmul (wg<256)
+    }
+    mega_barrier(barrier_counter, 6, 512)
+    if max_phase < 7 { return }
+
+    if wg_id < 256 {
+        silu_mul_elem_strided_marker()  // phase 15: SiLU(gate)*up in-place
+    }
+    mega_barrier(barrier_counter, 7, 512)
+
+    if wg_id < 256 {
+        down_residual_marker()     // phase 17: down_w + final residual-add (wg<256)
+    }
+}
+
+fn main() {
+    exit(0)
+}
