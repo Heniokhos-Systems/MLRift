@@ -267,6 +267,26 @@ fn pld_propose(u64 seq_ids32, u64 seq_len, u64 draft_out, u64 K) -> u64 {
     return 0
 }
 
+// Slice 7.1 (2026-05-13) — madvise(MADV_DONTNEED) wrapper.  Mirrors the
+// slice 4.27 host-RSS optimization from examples/llama3_generate.mlr.
+// Drops the Q8_0 source pages after each layer's bf16 dequant so peak
+// host RSS during the dequant phase is bounded by:
+//   ~7.5 GiB Q8_0 GGUF mmap (paged in only for the layer currently being
+//   processed) + ~13.3 GiB bf16 weights — without madvise these two add
+//   simultaneously (~21 GiB peak, dangerously close to the 30 GiB system
+//   limit on Mistral-7B).  With madvise the Q8_0 contribution drops to
+//   ~416 MB transient per-layer, peak ~14 GiB.
+// Linux x86_64: syscall 28, MADV_DONTNEED = 4.
+fn madv_dontneed(u64 addr, u64 length) {
+    u64 page  = 4096
+    u64 mask  = 0 - page
+    u64 start = (addr + page - 1) & mask
+    u64 end   = (addr + length)   & mask
+    if end <= start { return }
+    u64 len = end - start
+    syscall_raw(28, start, len, 4, 0, 0, 0)
+}
+
 // Dequantise a Q8_0 tensor of `n_elements` total values into a freshly
 // allocated bf16 buffer (2 bytes per element).  Q8_0 layout: 32-element
 // blocks of [f16 scale | int8 qs[32]] = 34 bytes each.  Output bf16:
@@ -459,7 +479,14 @@ fn main() {
     u64 up_elems   = ff     * hidden
     u64 down_elems = hidden * ff
 
-    eout("[mistral_7b_gpu] dequantising 16 layers of Q8_0 → bf16 (host) — this is one-time...\n")
+    // Q8_0 block-byte sizes for the madvise step (slice 4.27 pattern).
+    u64 q_q8_bytes    = (q_elems    / 32) * 34
+    u64 kv_q8_bytes   = (kv_elems   / 32) * 34
+    u64 o_q8_bytes    = (o_elems    / 32) * 34
+    u64 gate_q8_bytes = (gate_elems / 32) * 34
+    u64 up_q8_bytes   = (up_elems   / 32) * 34
+    u64 down_q8_bytes = (down_elems / 32) * 34
+    eout("[mistral_7b_gpu] dequantising "); eu64(n_layers); eout(" layers of Q8_0 → bf16 (host) — this is one-time...\n")
     u64 li = 0
     while li < n_layers {
         u64 base = layers_arr + li * 88
@@ -477,18 +504,21 @@ fn main() {
         GGUFTensor t02 = gguf_get(gf, n02)
         u64 q_bf16 = q8_0_to_bf16_alloc(t02.ptr, q_elems)
         unsafe { *((base + 1 * 8) as u64) = q_bf16 }
+        madv_dontneed(t02.ptr, q_q8_bytes)
         dealloc(n02)
 
         u64 n03 = str_cat(prefix, "attn_k.weight")
         GGUFTensor t03 = gguf_get(gf, n03)
         u64 k_bf16 = q8_0_to_bf16_alloc(t03.ptr, kv_elems)
         unsafe { *((base + 2 * 8) as u64) = k_bf16 }
+        madv_dontneed(t03.ptr, kv_q8_bytes)
         dealloc(n03)
 
         u64 n04 = str_cat(prefix, "attn_v.weight")
         GGUFTensor t04 = gguf_get(gf, n04)
         u64 v_bf16 = q8_0_to_bf16_alloc(t04.ptr, kv_elems)
         unsafe { *((base + 3 * 8) as u64) = v_bf16 }
+        madv_dontneed(t04.ptr, kv_q8_bytes)
         dealloc(n04)
 
         unsafe { *((base + 4 * 8) as u64) = 0 }
@@ -498,6 +528,7 @@ fn main() {
         GGUFTensor t07 = gguf_get(gf, n07)
         u64 o_bf16 = q8_0_to_bf16_alloc(t07.ptr, o_elems)
         unsafe { *((base + 6 * 8) as u64) = o_bf16 }
+        madv_dontneed(t07.ptr, o_q8_bytes)
         dealloc(n07)
 
         u64 n08 = str_cat(prefix, "ffn_norm.weight")
@@ -509,18 +540,21 @@ fn main() {
         GGUFTensor t09 = gguf_get(gf, n09)
         u64 g_bf16 = q8_0_to_bf16_alloc(t09.ptr, gate_elems)
         unsafe { *((base + 8 * 8) as u64) = g_bf16 }
+        madv_dontneed(t09.ptr, gate_q8_bytes)
         dealloc(n09)
 
         u64 n10 = str_cat(prefix, "ffn_up.weight")
         GGUFTensor t10 = gguf_get(gf, n10)
         u64 u_bf16 = q8_0_to_bf16_alloc(t10.ptr, up_elems)
         unsafe { *((base + 9 * 8) as u64) = u_bf16 }
+        madv_dontneed(t10.ptr, up_q8_bytes)
         dealloc(n10)
 
         u64 n11 = str_cat(prefix, "ffn_down.weight")
         GGUFTensor t11 = gguf_get(gf, n11)
         u64 d_bf16 = q8_0_to_bf16_alloc(t11.ptr, down_elems)
         unsafe { *((base + 10 * 8) as u64) = d_bf16 }
+        madv_dontneed(t11.ptr, down_q8_bytes)
         dealloc(n11)
 
         dealloc(prefix)
@@ -530,8 +564,8 @@ fn main() {
         li = li + 1
     }
     u64 load_elapsed_ns = time_elapsed(load_start_ns)
-    eout("[mistral_7b_gpu] 16 layers indexed + dequantised; load_ms=")
-    eu64(load_elapsed_ns / 1000000); eout("\n")
+    eout("[mistral_7b_gpu] "); eu64(n_layers); eout(" layers indexed + dequantised; load_ms=")
+    eu64(load_elapsed_ns / 1000000); eout(" (Q8_0 source pages released via MADV_DONTNEED)\n")
 
     // KV cache + scratch buffers.  At slice 5.9, when MLRIFT_NATIVE_MEGAKERNEL
     // is requested, we allocate the KV cache as device-resident GTT so the
@@ -794,6 +828,12 @@ fn main() {
     if _native_mk_use != 0 {
         eout("[mistral_7b_gpu] dequantising lm_head Q8_0 → bf16 for GPU lm_head ("); eu64(vocab * hidden * 2); eout(" bytes)...\n")
         lm_head_bf16_host = q8_0_to_bf16_alloc(lmhead_ptr, vocab * hidden)
+        // slice 4.27: drop the lm_head Q8_0 source pages.  The GPU lm_head
+        // path uses lm_head_bf16_host (bf16, already on GPU after upload),
+        // and the per-token embedding lookup uses embed_t.ptr (different
+        // tensor for Mistral since lm_head is UNTIED).
+        u64 lmhead_q8_bytes = (vocab * hidden / 32) * 34
+        madv_dontneed(lmhead_ptr, lmhead_q8_bytes)
         if lm_head_bf16_host != 0 {
             d_lm_in  = dev_try_alloc_host_visible(hidden * 4)
             d_lm_out = dev_try_alloc_host_visible(vocab  * 4)
