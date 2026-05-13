@@ -78,7 +78,7 @@ runtime, no Python.
 
 | Model | Quant | tok/s (CPU) | tok/s (GPU mega) | vs PyTorch bf16 (best) | Peak RSS / VRAM |
 |---|---|---:|---:|---:|---|
-| **Llama-3.2-1B-Instruct** | Q8_0→bf16 (CPU) / bf16 (GPU) | **16.9** | **81.8** (M=1) / **84.8** (speck4+PLD) | **+11% CPU, +59% GPU** | 1.27 GB / ~2.1 GB |
+| **Llama-3.2-1B-Instruct** | Q8_0→bf16 (CPU) / bf16 (GPU) | **16.2** | **81.8** (M=1) / **84.8** (speck4+PLD) | **+6.7% CPU, +59% GPU** | 2.39 GB / ~2.1 GB |
 | Qwen3-0.6B | bf16 (HF safetensors) | 32.03 | **229.8** (mks16+PLD) | **+24% CPU, 3.68× GPU** | 1.67 GB / 2.05 GB |
 | Qwen3-0.6B | bf16 (GGUF) | 32.27 | ~33 (matmul-only) | **1.25×** CPU | 1.67 GB |
 | **Qwen3-14B** | **Q8_0 (GGUF)** | **0.479** | — | **3.63×** CPU | **14.81 GB** |
@@ -320,7 +320,7 @@ prompt `"hello"`, N=20, median of 3 runs.
 | Stack | dtype (weights / compute) | tok/s | peak VRAM | Peak RSS | vs PyTorch (matching dtype) |
 |---|---|---:|---:|---:|---:|
 | MLRift CPU Q8_0 | int8 / f32 | 1.34 | — | 1.27 GiB | 0.088× PT CPU bf16 |
-| **MLRift CPU bf16** (`MLRIFT_CPU_BF16=1`) | bf16 / f32 | **16.9** | — | 3.63 GiB | **1.11× PT CPU bf16 (+11%)** |
+| **MLRift CPU bf16** (`MLRIFT_CPU_BF16=1`, slice 4.27) | bf16 / f32 | **16.2** | — | **2.39 GiB** | **1.07× PT CPU bf16, -37% RAM** |
 | PyTorch ROCm fp32 | f32 / f32 | 31.2 | 4 749 MiB | ~4.7 GiB | 1.00× (PT fp32 baseline) |
 | PyTorch CPU bf16 (MKL + oneDNN) | bf16 / f32 | 15.2 | — | ~3.8 GiB | 1.00× (PT CPU bf16 baseline) |
 | PyTorch ROCm bf16 (SDPA) | bf16 / bf16 | 51.3 | 2 392 MiB | ~3.8 GiB | 1.00× (PT GPU bf16 baseline) |
@@ -331,9 +331,15 @@ prompt `"hello"`, N=20, median of 3 runs.
 The GPU mega-kernel uses higher numerical precision than PT bf16 GPU
 (bf16 weights stream, f32 activations + f32 accumulator throughout —
 matches PT fp32 fidelity, runs 2.62× faster than PT fp32 GPU at 31.2
-tok/s).  CPU bf16 path beats PT CPU bf16 (MKL+oneDNN) by +11 % via
+tok/s).  CPU bf16 path beats PT CPU bf16 (MKL+oneDNN) by +6.7 % via
 MLRift's AVX2 2-wide bf16 inner loop (`mm_worker_bf16_f32_avx2_naive_2w`
-in `std/matmul.mlr:424`).  Session evolution on M=1:
+in `std/matmul.mlr:424`).  **Slice 4.27 (2026-05-13 mem opt)** drops
+CPU bf16 peak RSS from 3.63 → 2.39 GiB (-34 %) by `madvise(MADV_DONTNEED)`
+on the Q8_0 GGUF pages immediately after each tensor's bf16 dequant,
+plus reusing the tied lmhead bf16 buffer for embedding lookup so the
+Q8_0 embed region can also be evicted. MLRift's CPU bf16 RSS (2.39 GiB)
+is now **37 % below** PyTorch's CPU bf16 RSS (~3.8 GiB).  Session
+evolution on M=1:
 
 | Slice | Change | M=1 tok/s |
 |---|---|---:|

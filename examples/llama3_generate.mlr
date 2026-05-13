@@ -64,6 +64,39 @@ fn eu64(u64 v) {
     dealloc(s)
 }
 
+// madvise(MADV_DONTNEED) wrapper.  Releases physical pages back to the
+// kernel for the page-aligned subrange of [addr, addr+len).  Bytes at
+// page-aligned edges stay resident (negligible at GGUF tensor sizes).
+// Linux x86_64 syscall: 28; MADV_DONTNEED = 4.  Returns 0 on success.
+// Used by the MLRIFT_CPU_BF16=1 path to drop the Q8_0 source pages
+// after each tensor's bf16 dequant, dropping peak RSS by ~1.2 GiB on
+// Llama-3.2-1B (Q8_0 mmap stays "open" but its pages are evicted).
+fn madv_dontneed(u64 addr, u64 length) {
+    u64 page  = 4096
+    u64 mask  = 0 - page                             // round-down mask
+    u64 start = (addr + page - 1) & mask              // round up to page
+    u64 end   = (addr + length)   & mask              // round down to page
+    if end <= start { return }
+    u64 len = end - start
+    syscall_raw(28, start, len, 4, 0, 0, 0)           // MADV_DONTNEED = 4
+}
+
+// Expand a row of bf16 into f32 (high-16-bits-of-f32 convention).  Used
+// by the MLRIFT_CPU_BF16=1 embedding lookup when the tied lm_head has
+// already been dequant'd to bf16 — saves a per-token Q8_0 decode pass
+// and lets us drop the Q8_0 embed mmap region after the dequant phase.
+fn bf16_row_to_f32(u64 dst_f32, u64 src_bf16, u64 n) {
+    u64 i = 0
+    while i < n {
+        u16 b16 = 0
+        unsafe { *((src_bf16 + i * 2) as u16) -> b16 }
+        u64 b64 = b16
+        u32 expanded = b64 << 16
+        unsafe { *((dst_f32 + i * 4) as u32) = expanded }
+        i = i + 1
+    }
+}
+
 // Q8_0 → bf16 dequantizer (copied from llama3_1b_gpu_generate.mlr).
 // Each Q8_0 block: 2-byte f16 scale + 32 int8 quants. Output is bf16
 // (high 16 bits of f32 representation). Used by the destroy-PyTorch CPU
@@ -275,8 +308,24 @@ fn main() {
         u64 gate_elems = ff_l    * hidden
         u64 up_elems   = ff_l    * hidden
         u64 down_elems = hidden  * ff_l
-        u64 lf = 0
+        // Q8_0 block-byte sizes for the madvise step.  Q8_0: 34 B / 32 elems.
+        u64 q_q8_bytes    = (q_elems    / 32) * 34
+        u64 kv_q8_bytes   = (kv_elems   / 32) * 34
+        u64 o_q8_bytes    = (o_elems    / 32) * 34
+        u64 gate_q8_bytes = (gate_elems / 32) * 34
+        u64 up_q8_bytes   = (up_elems   / 32) * 34
+        u64 down_q8_bytes = (down_elems / 32) * 34
         u64 deq_start = time_now()
+        // Dequant lm_head FIRST so the embed Q8_0 region can be released
+        // before the layer bf16 buffers start filling the heap — keeps peak
+        // RSS bounded by (lmhead_bf16 + sum_of_layer_bf16) instead of also
+        // including the 279 MB embed Q8_0 source.  Saves ~150 MB peak on
+        // Llama-3.2-1B vs the natural layer-then-lmhead order.
+        eout("[llama32_1b] dequantising tied lm_head Q8_0 → bf16 ("); eu64(vocab * hidden * 2); eout(" bytes)...\n")
+        lmhead_bf16_ptr = q8_0_to_bf16_alloc(embed_t.ptr, vocab * hidden)
+        u64 embed_q8_bytes = (vocab * hidden / 32) * 34
+        madv_dontneed(embed_t.ptr, embed_q8_bytes)
+        u64 lf = 0
         while lf < n_layers {
             u64 base = layers_arr + lf * 88
             u64 qp = 0; unsafe { *((base + 1 * 8) as u64) -> qp }
@@ -287,18 +336,23 @@ fn main() {
             u64 up = 0; unsafe { *((base + 9 * 8) as u64) -> up }
             u64 dp = 0; unsafe { *((base + 10 * 8) as u64) -> dp }
             unsafe { *((base + 1 * 8) as u64) = q8_0_to_bf16_alloc(qp, q_elems) }
+            madv_dontneed(qp, q_q8_bytes)
             unsafe { *((base + 2 * 8) as u64) = q8_0_to_bf16_alloc(kp, kv_elems) }
+            madv_dontneed(kp, kv_q8_bytes)
             unsafe { *((base + 3 * 8) as u64) = q8_0_to_bf16_alloc(vp, kv_elems) }
+            madv_dontneed(vp, kv_q8_bytes)
             unsafe { *((base + 6 * 8) as u64) = q8_0_to_bf16_alloc(op, o_elems) }
+            madv_dontneed(op, o_q8_bytes)
             unsafe { *((base + 8 * 8) as u64) = q8_0_to_bf16_alloc(gp, gate_elems) }
+            madv_dontneed(gp, gate_q8_bytes)
             unsafe { *((base + 9 * 8) as u64) = q8_0_to_bf16_alloc(up, up_elems) }
+            madv_dontneed(up, up_q8_bytes)
             unsafe { *((base + 10 * 8) as u64) = q8_0_to_bf16_alloc(dp, down_elems) }
+            madv_dontneed(dp, down_q8_bytes)
             lf = lf + 1
         }
-        eout("[llama32_1b] dequantising tied lm_head Q8_0 → bf16 ("); eu64(vocab * hidden * 2); eout(" bytes)...\n")
-        lmhead_bf16_ptr = q8_0_to_bf16_alloc(embed_t.ptr, vocab * hidden)
         u64 deq_ms = time_elapsed(deq_start) / 1000000
-        eout("[llama32_1b] dequant_ms="); eu64(deq_ms); eout("\n")
+        eout("[llama32_1b] dequant_ms="); eu64(deq_ms); eout(" (Q8_0 source pages released via MADV_DONTNEED)\n")
     }
 
     // ---- KV cache + scratch buffers ----
@@ -347,7 +401,11 @@ fn main() {
         u32 pt32 = 0
         unsafe { *((seq_ids32 + pos * 4) as uint32) -> pt32 }
         u64 pt = pt32
-        gguf_deq_q8_0(x_cur, embed_base + pt * row_bytes, hidden)
+        if cpu_bf16 != 0 {
+            bf16_row_to_f32(x_cur, lmhead_bf16_ptr + pt * hidden * 2, hidden)
+        } else {
+            gguf_deq_q8_0(x_cur, embed_base + pt * row_bytes, hidden)
+        }
         u64 layer = 0
         while layer < n_layers {
             Qwen3LayerWeights w = layers_arr + layer * 88
@@ -369,7 +427,11 @@ fn main() {
     u32 last_pt32 = 0
     unsafe { *((seq_ids32 + (prompt_count - 1) * 4) as uint32) -> last_pt32 }
     u64 last_pt = last_pt32
-    gguf_deq_q8_0(x_cur, embed_base + last_pt * row_bytes, hidden)
+    if cpu_bf16 != 0 {
+        bf16_row_to_f32(x_cur, lmhead_bf16_ptr + last_pt * hidden * 2, hidden)
+    } else {
+        gguf_deq_q8_0(x_cur, embed_base + last_pt * row_bytes, hidden)
+    }
 
     qwen3_profile_reset()
     u64 step = 0
@@ -422,7 +484,11 @@ fn main() {
         unsafe { *((seq_ids32 + seq_len * 4) as uint32) = best_id32 }
         seq_len = seq_len + 1
 
-        gguf_deq_q8_0(x_cur, embed_base + best_id * row_bytes, hidden)
+        if cpu_bf16 != 0 {
+            bf16_row_to_f32(x_cur, lmhead_bf16_ptr + best_id * hidden * 2, hidden)
+        } else {
+            gguf_deq_q8_0(x_cur, embed_base + best_id * row_bytes, hidden)
+        }
         pos = pos + 1
         step = step + 1
     }
