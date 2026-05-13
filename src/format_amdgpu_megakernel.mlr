@@ -1114,24 +1114,37 @@ fn _emit_gemv_coop_bf16_padded_strided_inline(uint64 n_out, uint64 k, uint64 k_p
     asm_v_add_co_u32_vcc_sv(5, x_lo, 8)
     asm_v_add_co_ci_u32_null_sv_vcc(6, x_hi, 6)
 
-    // ── Inner K loop (4× unrolled) ────────────────────────────────────────
-    // Slice 4.25 (2026-05-13): extended from 2× to 4× unroll.  Each iter
-    // issues 12 loads in a clause (4 weight pairs + 8 x elements) with
-    // one waitcnt, 8 FMAs, one ptr-advance per ptr.  Exposes ~12 VMEM ops
+    // ── Inner K loop (8× unrolled) ────────────────────────────────────────
+    // Slice 7.5 (2026-05-13): extended from 4× to 8× unroll.  Each iter
+    // issues 24 loads in a clause (8 weight pairs + 16 x elements) with
+    // one waitcnt, 16 FMAs, one ptr-advance per ptr.  Exposes ~24 VMEM ops
     // in flight to mask the ~300-cycle global_load latency more
-    // aggressively than the 2× version's 6 in flight.
-    // Precondition: k_iters_outer = k / 8 / 32 must be integer.  Llama-1B
-    // (k ∈ {2048, 8192}) → k_iters/4 ∈ {8, 32}.  Qwen3-0.6B (k ∈ {1024,
-    // 3072, 2048}) → k_iters/4 ∈ {4, 12, 8}.  All integer.
-    uint64 k_iters_unrolled = k_iters / 4
+    // aggressively than the 4× version's 12 in flight.  Also widens the
+    // independent-FMA window from 8 → 16 instructions, opening the door
+    // to a future VOPD v_dual_fmac_f32 pairing (task #273).
+    // Precondition: k_iters_outer = k / 16 / 32 must be integer.  Llama-1B
+    // (k ∈ {2048, 8192}) → k_iters/8 ∈ {4, 16}.  Qwen3-0.6B (k ∈ {1024,
+    // 3072, 2048}) → k_iters/8 ∈ {2, 6, 4}.  Mistral-7B (k ∈ {4096, 14336})
+    // → k_iters/8 ∈ {8, 28}.  All integer.
+    //
+    // VGPR pressure: v9, v13, v17, v21, v25, v29, v33, v37 (weights, stride 4)
+    // plus v10/v14/v18/v22/v26/v30/v34/v38 (lo-bf16 unpacks) plus
+    // v11/v12, v15/v16, v19/v20, v23/v24, v27/v28, v31/v32, v35/v36, v39/v40
+    // (x pairs).  Peak v40, well within rsrc1=0xE0AF0006 (56-VGPR) budget.
+    // global_load_b32 offset max u12 = 0xFFF; max used here = 0x704 (x[15]).
+    uint64 k_iters_unrolled = k_iters / 8
     asm_s_mov_b32_inline_imm(14, k_iters_unrolled)
     uint64 inner_top = asm_text_len / 4
 
-    asm_s_clause(11)
+    asm_s_clause(23)
     asm_u32(0xDC520000); asm_u32(0x097C0003)    // global_load_b32 v9,  v[3:4], off              (weight 0)
     asm_u32(0xDC520080); asm_u32(0x0D7C0003)    // global_load_b32 v13, v[3:4], off offset:128   (weight 1)
     asm_u32(0xDC520100); asm_u32(0x117C0003)    // global_load_b32 v17, v[3:4], off offset:256   (weight 2)
     asm_u32(0xDC520180); asm_u32(0x157C0003)    // global_load_b32 v21, v[3:4], off offset:384   (weight 3)
+    asm_u32(0xDC520200); asm_u32(0x197C0003)    // global_load_b32 v25, v[3:4], off offset:512   (weight 4)
+    asm_u32(0xDC520280); asm_u32(0x1D7C0003)    // global_load_b32 v29, v[3:4], off offset:640   (weight 5)
+    asm_u32(0xDC520300); asm_u32(0x217C0003)    // global_load_b32 v33, v[3:4], off offset:768   (weight 6)
+    asm_u32(0xDC520380); asm_u32(0x257C0003)    // global_load_b32 v37, v[3:4], off offset:896   (weight 7)
     asm_u32(0xDC520000); asm_u32(0x0B7C0005)    // global_load_b32 v11, v[5:6], off              (x[0])
     asm_u32(0xDC520004); asm_u32(0x0C7C0005)    // global_load_b32 v12, v[5:6], off offset:4     (x[1])
     asm_u32(0xDC520100); asm_u32(0x0F7C0005)    // global_load_b32 v15, v[5:6], off offset:256   (x[2])
@@ -1140,6 +1153,14 @@ fn _emit_gemv_coop_bf16_padded_strided_inline(uint64 n_out, uint64 k, uint64 k_p
     asm_u32(0xDC520204); asm_u32(0x147C0005)    // global_load_b32 v20, v[5:6], off offset:516   (x[5])
     asm_u32(0xDC520300); asm_u32(0x177C0005)    // global_load_b32 v23, v[5:6], off offset:768   (x[6])
     asm_u32(0xDC520304); asm_u32(0x187C0005)    // global_load_b32 v24, v[5:6], off offset:772   (x[7])
+    asm_u32(0xDC520400); asm_u32(0x1B7C0005)    // global_load_b32 v27, v[5:6], off offset:1024  (x[8])
+    asm_u32(0xDC520404); asm_u32(0x1C7C0005)    // global_load_b32 v28, v[5:6], off offset:1028  (x[9])
+    asm_u32(0xDC520500); asm_u32(0x1F7C0005)    // global_load_b32 v31, v[5:6], off offset:1280  (x[10])
+    asm_u32(0xDC520504); asm_u32(0x207C0005)    // global_load_b32 v32, v[5:6], off offset:1284  (x[11])
+    asm_u32(0xDC520600); asm_u32(0x237C0005)    // global_load_b32 v35, v[5:6], off offset:1536  (x[12])
+    asm_u32(0xDC520604); asm_u32(0x247C0005)    // global_load_b32 v36, v[5:6], off offset:1540  (x[13])
+    asm_u32(0xDC520700); asm_u32(0x277C0005)    // global_load_b32 v39, v[5:6], off offset:1792  (x[14])
+    asm_u32(0xDC520704); asm_u32(0x287C0005)    // global_load_b32 v40, v[5:6], off offset:1796  (x[15])
     asm_s_waitcnt_vmcnt_zero()
 
     asm_v_lshlrev_b32_imm(10, 16, 9)            // v10 = bf16-lo[0] as f32
@@ -1150,6 +1171,14 @@ fn _emit_gemv_coop_bf16_padded_strided_inline(uint64 n_out, uint64 k, uint64 k_p
     asm_u32(0x362222FF); asm_u32(0xFFFF0000)    // v17 = bf16-hi[2] as f32
     asm_v_lshlrev_b32_imm(22, 16, 21)           // v22 = bf16-lo[3] as f32
     asm_u32(0x362A2AFF); asm_u32(0xFFFF0000)    // v21 = bf16-hi[3] as f32
+    asm_v_lshlrev_b32_imm(26, 16, 25)           // v26 = bf16-lo[4] as f32
+    asm_u32(0x363232FF); asm_u32(0xFFFF0000)    // v25 = bf16-hi[4] as f32
+    asm_v_lshlrev_b32_imm(30, 16, 29)           // v30 = bf16-lo[5] as f32
+    asm_u32(0x363A3AFF); asm_u32(0xFFFF0000)    // v29 = bf16-hi[5] as f32
+    asm_v_lshlrev_b32_imm(34, 16, 33)           // v34 = bf16-lo[6] as f32
+    asm_u32(0x364242FF); asm_u32(0xFFFF0000)    // v33 = bf16-hi[6] as f32
+    asm_v_lshlrev_b32_imm(38, 16, 37)           // v38 = bf16-lo[7] as f32
+    asm_u32(0x364A4AFF); asm_u32(0xFFFF0000)    // v37 = bf16-hi[7] as f32
 
     asm_v_fmac_f32_e32_vv(2, 10, 11)            // acc += w0_lo * x[0]
     asm_v_fmac_f32_e32_vv(2, 9, 12)             // acc += w0_hi * x[1]
@@ -1159,12 +1188,20 @@ fn _emit_gemv_coop_bf16_padded_strided_inline(uint64 n_out, uint64 k, uint64 k_p
     asm_v_fmac_f32_e32_vv(2, 17, 20)            // acc += w2_hi * x[5]
     asm_v_fmac_f32_e32_vv(2, 22, 23)            // acc += w3_lo * x[6]
     asm_v_fmac_f32_e32_vv(2, 21, 24)            // acc += w3_hi * x[7]
+    asm_v_fmac_f32_e32_vv(2, 26, 27)            // acc += w4_lo * x[8]
+    asm_v_fmac_f32_e32_vv(2, 25, 28)            // acc += w4_hi * x[9]
+    asm_v_fmac_f32_e32_vv(2, 30, 31)            // acc += w5_lo * x[10]
+    asm_v_fmac_f32_e32_vv(2, 29, 32)            // acc += w5_hi * x[11]
+    asm_v_fmac_f32_e32_vv(2, 34, 35)            // acc += w6_lo * x[12]
+    asm_v_fmac_f32_e32_vv(2, 33, 36)            // acc += w6_hi * x[13]
+    asm_v_fmac_f32_e32_vv(2, 38, 39)            // acc += w7_lo * x[14]
+    asm_v_fmac_f32_e32_vv(2, 37, 40)            // acc += w7_hi * x[15]
 
-    // advance weight ptr +512 bytes
-    asm_u32(0xD7006A03); asm_u32(0x000206FF); asm_u32(512)
+    // advance weight ptr +1024 bytes (8 weights × 128B stride)
+    asm_u32(0xD7006A03); asm_u32(0x000206FF); asm_u32(1024)
     asm_u32(0xD5207C04); asm_u32(0x01AA0880)
-    // advance x ptr +1024 bytes
-    asm_u32(0xD7006A05); asm_u32(0x00020AFF); asm_u32(1024)
+    // advance x ptr +2048 bytes (16 x × 128B stride)
+    asm_u32(0xD7006A05); asm_u32(0x00020AFF); asm_u32(2048)
     asm_u32(0xD5207C06); asm_u32(0x01AA0C80)
 
     asm_s_sub_u32_imm(14, 14, 1)
@@ -1752,24 +1789,37 @@ fn _emit_phase9_gemv_residual_inline(uint64 n_out, uint64 k, uint64 k_pad,
     asm_v_add_co_u32_vcc_sv(5, x_lo, 8)
     asm_v_add_co_ci_u32_null_sv_vcc(6, x_hi, 6)
 
-    // ── Inner K loop (4× unrolled) ────────────────────────────────────────
-    // Slice 4.25 (2026-05-13): extended from 2× to 4× unroll.  Each iter
-    // issues 12 loads in a clause (4 weight pairs + 8 x elements) with
-    // one waitcnt, 8 FMAs, one ptr-advance per ptr.  Exposes ~12 VMEM ops
+    // ── Inner K loop (8× unrolled) ────────────────────────────────────────
+    // Slice 7.5 (2026-05-13): extended from 4× to 8× unroll.  Each iter
+    // issues 24 loads in a clause (8 weight pairs + 16 x elements) with
+    // one waitcnt, 16 FMAs, one ptr-advance per ptr.  Exposes ~24 VMEM ops
     // in flight to mask the ~300-cycle global_load latency more
-    // aggressively than the 2× version's 6 in flight.
-    // Precondition: k_iters_outer = k / 8 / 32 must be integer.  Llama-1B
-    // (k ∈ {2048, 8192}) → k_iters/4 ∈ {8, 32}.  Qwen3-0.6B (k ∈ {1024,
-    // 3072, 2048}) → k_iters/4 ∈ {4, 12, 8}.  All integer.
-    uint64 k_iters_unrolled = k_iters / 4
+    // aggressively than the 4× version's 12 in flight.  Also widens the
+    // independent-FMA window from 8 → 16 instructions, opening the door
+    // to a future VOPD v_dual_fmac_f32 pairing (task #273).
+    // Precondition: k_iters_outer = k / 16 / 32 must be integer.  Llama-1B
+    // (k ∈ {2048, 8192}) → k_iters/8 ∈ {4, 16}.  Qwen3-0.6B (k ∈ {1024,
+    // 3072, 2048}) → k_iters/8 ∈ {2, 6, 4}.  Mistral-7B (k ∈ {4096, 14336})
+    // → k_iters/8 ∈ {8, 28}.  All integer.
+    //
+    // VGPR pressure: v9, v13, v17, v21, v25, v29, v33, v37 (weights, stride 4)
+    // plus v10/v14/v18/v22/v26/v30/v34/v38 (lo-bf16 unpacks) plus
+    // v11/v12, v15/v16, v19/v20, v23/v24, v27/v28, v31/v32, v35/v36, v39/v40
+    // (x pairs).  Peak v40, well within rsrc1=0xE0AF0006 (56-VGPR) budget.
+    // global_load_b32 offset max u12 = 0xFFF; max used here = 0x704 (x[15]).
+    uint64 k_iters_unrolled = k_iters / 8
     asm_s_mov_b32_inline_imm(14, k_iters_unrolled)
     uint64 inner_top = asm_text_len / 4
 
-    asm_s_clause(11)
+    asm_s_clause(23)
     asm_u32(0xDC520000); asm_u32(0x097C0003)    // global_load_b32 v9,  v[3:4], off              (weight 0)
     asm_u32(0xDC520080); asm_u32(0x0D7C0003)    // global_load_b32 v13, v[3:4], off offset:128   (weight 1)
     asm_u32(0xDC520100); asm_u32(0x117C0003)    // global_load_b32 v17, v[3:4], off offset:256   (weight 2)
     asm_u32(0xDC520180); asm_u32(0x157C0003)    // global_load_b32 v21, v[3:4], off offset:384   (weight 3)
+    asm_u32(0xDC520200); asm_u32(0x197C0003)    // global_load_b32 v25, v[3:4], off offset:512   (weight 4)
+    asm_u32(0xDC520280); asm_u32(0x1D7C0003)    // global_load_b32 v29, v[3:4], off offset:640   (weight 5)
+    asm_u32(0xDC520300); asm_u32(0x217C0003)    // global_load_b32 v33, v[3:4], off offset:768   (weight 6)
+    asm_u32(0xDC520380); asm_u32(0x257C0003)    // global_load_b32 v37, v[3:4], off offset:896   (weight 7)
     asm_u32(0xDC520000); asm_u32(0x0B7C0005)    // global_load_b32 v11, v[5:6], off              (x[0])
     asm_u32(0xDC520004); asm_u32(0x0C7C0005)    // global_load_b32 v12, v[5:6], off offset:4     (x[1])
     asm_u32(0xDC520100); asm_u32(0x0F7C0005)    // global_load_b32 v15, v[5:6], off offset:256   (x[2])
@@ -1778,6 +1828,14 @@ fn _emit_phase9_gemv_residual_inline(uint64 n_out, uint64 k, uint64 k_pad,
     asm_u32(0xDC520204); asm_u32(0x147C0005)    // global_load_b32 v20, v[5:6], off offset:516   (x[5])
     asm_u32(0xDC520300); asm_u32(0x177C0005)    // global_load_b32 v23, v[5:6], off offset:768   (x[6])
     asm_u32(0xDC520304); asm_u32(0x187C0005)    // global_load_b32 v24, v[5:6], off offset:772   (x[7])
+    asm_u32(0xDC520400); asm_u32(0x1B7C0005)    // global_load_b32 v27, v[5:6], off offset:1024  (x[8])
+    asm_u32(0xDC520404); asm_u32(0x1C7C0005)    // global_load_b32 v28, v[5:6], off offset:1028  (x[9])
+    asm_u32(0xDC520500); asm_u32(0x1F7C0005)    // global_load_b32 v31, v[5:6], off offset:1280  (x[10])
+    asm_u32(0xDC520504); asm_u32(0x207C0005)    // global_load_b32 v32, v[5:6], off offset:1284  (x[11])
+    asm_u32(0xDC520600); asm_u32(0x237C0005)    // global_load_b32 v35, v[5:6], off offset:1536  (x[12])
+    asm_u32(0xDC520604); asm_u32(0x247C0005)    // global_load_b32 v36, v[5:6], off offset:1540  (x[13])
+    asm_u32(0xDC520700); asm_u32(0x277C0005)    // global_load_b32 v39, v[5:6], off offset:1792  (x[14])
+    asm_u32(0xDC520704); asm_u32(0x287C0005)    // global_load_b32 v40, v[5:6], off offset:1796  (x[15])
     asm_s_waitcnt_vmcnt_zero()
 
     asm_v_lshlrev_b32_imm(10, 16, 9)            // v10 = bf16-lo[0] as f32
@@ -1788,6 +1846,14 @@ fn _emit_phase9_gemv_residual_inline(uint64 n_out, uint64 k, uint64 k_pad,
     asm_u32(0x362222FF); asm_u32(0xFFFF0000)    // v17 = bf16-hi[2] as f32
     asm_v_lshlrev_b32_imm(22, 16, 21)           // v22 = bf16-lo[3] as f32
     asm_u32(0x362A2AFF); asm_u32(0xFFFF0000)    // v21 = bf16-hi[3] as f32
+    asm_v_lshlrev_b32_imm(26, 16, 25)           // v26 = bf16-lo[4] as f32
+    asm_u32(0x363232FF); asm_u32(0xFFFF0000)    // v25 = bf16-hi[4] as f32
+    asm_v_lshlrev_b32_imm(30, 16, 29)           // v30 = bf16-lo[5] as f32
+    asm_u32(0x363A3AFF); asm_u32(0xFFFF0000)    // v29 = bf16-hi[5] as f32
+    asm_v_lshlrev_b32_imm(34, 16, 33)           // v34 = bf16-lo[6] as f32
+    asm_u32(0x364242FF); asm_u32(0xFFFF0000)    // v33 = bf16-hi[6] as f32
+    asm_v_lshlrev_b32_imm(38, 16, 37)           // v38 = bf16-lo[7] as f32
+    asm_u32(0x364A4AFF); asm_u32(0xFFFF0000)    // v37 = bf16-hi[7] as f32
 
     asm_v_fmac_f32_e32_vv(2, 10, 11)            // acc += w0_lo * x[0]
     asm_v_fmac_f32_e32_vv(2, 9, 12)             // acc += w0_hi * x[1]
@@ -1797,12 +1863,20 @@ fn _emit_phase9_gemv_residual_inline(uint64 n_out, uint64 k, uint64 k_pad,
     asm_v_fmac_f32_e32_vv(2, 17, 20)            // acc += w2_hi * x[5]
     asm_v_fmac_f32_e32_vv(2, 22, 23)            // acc += w3_lo * x[6]
     asm_v_fmac_f32_e32_vv(2, 21, 24)            // acc += w3_hi * x[7]
+    asm_v_fmac_f32_e32_vv(2, 26, 27)            // acc += w4_lo * x[8]
+    asm_v_fmac_f32_e32_vv(2, 25, 28)            // acc += w4_hi * x[9]
+    asm_v_fmac_f32_e32_vv(2, 30, 31)            // acc += w5_lo * x[10]
+    asm_v_fmac_f32_e32_vv(2, 29, 32)            // acc += w5_hi * x[11]
+    asm_v_fmac_f32_e32_vv(2, 34, 35)            // acc += w6_lo * x[12]
+    asm_v_fmac_f32_e32_vv(2, 33, 36)            // acc += w6_hi * x[13]
+    asm_v_fmac_f32_e32_vv(2, 38, 39)            // acc += w7_lo * x[14]
+    asm_v_fmac_f32_e32_vv(2, 37, 40)            // acc += w7_hi * x[15]
 
-    // advance weight ptr +512 bytes
-    asm_u32(0xD7006A03); asm_u32(0x000206FF); asm_u32(512)
+    // advance weight ptr +1024 bytes (8 weights × 128B stride)
+    asm_u32(0xD7006A03); asm_u32(0x000206FF); asm_u32(1024)
     asm_u32(0xD5207C04); asm_u32(0x01AA0880)
-    // advance x ptr +1024 bytes
-    asm_u32(0xD7006A05); asm_u32(0x00020AFF); asm_u32(1024)
+    // advance x ptr +2048 bytes (16 x × 128B stride)
+    asm_u32(0xD7006A05); asm_u32(0x00020AFF); asm_u32(2048)
     asm_u32(0xD5207C06); asm_u32(0x01AA0C80)
 
     asm_s_sub_u32_imm(14, 14, 1)
