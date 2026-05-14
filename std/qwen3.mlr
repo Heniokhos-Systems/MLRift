@@ -283,6 +283,17 @@ fn qwen3_set_matmul_kind(u64 kind) { qwen3_matmul_kind = kind }
 static u64 qwen3_q8_bitexact = 0
 fn qwen3_set_q8_bitexact(u64 on) { qwen3_q8_bitexact = on }
 
+// Slice 8.3 F4 (2026-05-14) — mega-kernel weight-dtype gate.
+//   0 = bf16 (default; existing path for Qwen3/Llama-1B/Llama-3B/Mistral)
+//   1 = fp32-mixed (Llama-3B fp32 path: qkv/o/gate_up uploaded as f32,
+//       down_w stays bf16 because phase 17 emit was not migrated in F3b).
+// Only consulted by qwen3_forward_layer_gpu's mega-kernel branch (slice
+// 5.9+ path; hidden∈{1024,2048,3072,4096}).  Per-op fallback ignores this.
+// Driver must call qwen3_set_mk_weight_dtype(1) AFTER loading the
+// /tmp/llama_3b_layer_megakernel_v2_f32.co .co (which expects this layout).
+static u64 qwen3_mk_weight_dtype = 0
+fn qwen3_set_mk_weight_dtype(u64 dtype) { qwen3_mk_weight_dtype = dtype }
+
 // Norm-weight dtype selector. 0 = BF16 (0.6B), 1 = F32 (14B GGUF ships
 // all rms_norm.weight tensors as F32). Applies to input_norm, post_norm,
 // final_norm, and the QK-norm 128-entry tensors.
@@ -2022,12 +2033,31 @@ fn qwen3_forward_layer_gpu(u64 d_x_in, u64 d_x_out,
                     u64 hidden_pad = hidden + 128
                     u64 q_dim_pad  = q_dim  + 128
                     u64 ff_pad     = ff     + 128
-                    u64 d_qkv_w     = gpu_get_or_upload_bf16_weight_padded(w.q_proj_w,    hidden, qkv_dim, hidden_pad)
-                    if d_qkv_w == 0 { return 1 }
-                    u64 d_o_w       = gpu_get_or_upload_bf16_weight_padded(w.o_proj_w,    q_dim,  hidden,  q_dim_pad)
-                    if d_o_w == 0 { return 1 }
-                    u64 d_gate_up_w = gpu_get_or_upload_bf16_weight_padded(w.gate_proj_w, hidden, 2 * ff,  hidden_pad)
-                    if d_gate_up_w == 0 { return 1 }
+                    // Slice 8.3 F4: Llama-3B fp32 mega-kernel path uploads
+                    // qkv/o/gate_up as f32 (stride K_pad*4) and leaves down_w
+                    // on bf16 (phase 17 emit unchanged; mixed-precision).
+                    // qwen3_mk_weight_dtype=0 (default) → bf16 everywhere.
+                    u64 d_qkv_w     = 0
+                    u64 d_o_w       = 0
+                    u64 d_gate_up_w = 0
+                    if qwen3_mk_weight_dtype == 1 {
+                        d_qkv_w     = gpu_get_or_upload_f32_weight_padded(w.q_proj_w,    hidden, qkv_dim, hidden_pad)
+                        if d_qkv_w == 0 { return 1 }
+                        d_o_w       = gpu_get_or_upload_f32_weight_padded(w.o_proj_w,    q_dim,  hidden,  q_dim_pad)
+                        if d_o_w == 0 { return 1 }
+                        d_gate_up_w = gpu_get_or_upload_f32_weight_padded(w.gate_proj_w, hidden, 2 * ff,  hidden_pad)
+                        if d_gate_up_w == 0 { return 1 }
+                    } else {
+                        d_qkv_w     = gpu_get_or_upload_bf16_weight_padded(w.q_proj_w,    hidden, qkv_dim, hidden_pad)
+                        if d_qkv_w == 0 { return 1 }
+                        d_o_w       = gpu_get_or_upload_bf16_weight_padded(w.o_proj_w,    q_dim,  hidden,  q_dim_pad)
+                        if d_o_w == 0 { return 1 }
+                        d_gate_up_w = gpu_get_or_upload_bf16_weight_padded(w.gate_proj_w, hidden, 2 * ff,  hidden_pad)
+                        if d_gate_up_w == 0 { return 1 }
+                    }
+                    // down_w always bf16 — phase 17 emit was not migrated
+                    // to fp32 in slice 8.3 F3b.  In fp32 mode the driver
+                    // keeps a SEPARATE bf16 down_w buffer in w.down_proj_w.
                     u64 d_down_w    = gpu_get_or_upload_bf16_weight_padded(w.down_proj_w, ff,     hidden,  ff_pad)
                     if d_down_w == 0 { return 1 }
 

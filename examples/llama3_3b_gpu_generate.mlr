@@ -1,37 +1,37 @@
 // Llama-3.2-3B Q8_0 — GPU-matmul-offload greedy decode driver.
 //
 // =========================================================================
-// PRECISION NOTE — Llama-3.2-3B bf16 GPU path is 11/20 bit-exact vs CPU.
+// PRECISION NOTE — Llama-3.2-3B has TWO mega-kernel paths (slice 8.3 F4).
 // =========================================================================
 //
-// The bf16 mega-kernel path used by this driver matches the CPU bf16
-// reference for the first 11 of 20 greedy-decode tokens on prompt "hello",
-// then diverges (argmax flip at pos 11: CPU 8712 vs GPU 7434). The drift
-// is a *structural* precision floor inside phase-7 attention softmax:
+// DEFAULT (fp32 mixed-precision, slice 8.3 F4 - 2026-05-14):
+//   - qkv/o/gate_up projections: Q8_0 dequant to fp32, uploaded as fp32
+//     to GPU; the `_v2_f32.co` mega-kernel reads them with global_load_b32
+//     (no widen step).  CPU forward fallback uses matmul_f32_weights_f32.
+//   - down_w: Q8_0 dequant to bf16, uploaded as bf16 (phase 17 emit was
+//     deliberately scoped out of slice 8.3 F3b).  Mixed-precision.
+//   - Activation flow stays fp32 end-to-end (matches CPU bf16 reference's
+//     accumulator precision).
 //
-//   1. `v_exp_f32` (RDNA3 ~1 ULP hardware approximation) vs CPU
-//      `exp_f32_fast` (custom 5-term minimax polynomial with bit-injection
-//      of 2^n). These are DIFFERENT approximations entirely; matching
-//      requires porting CPU's poly to gfx1100 ISA (research-level).
-//   2. Sum-reduce parallelism: CPU sequential left-fold over t-positions
-//      vs GPU XOR-butterfly over wave32 — no CPU-tree shape matches a
-//      sequential fold without destroying wave-parallel reduction.
+// BF16 OPT-IN (MLRIFT_LLAMA3_3B_USE_BF16=1; legacy 11/20 path):
+//   - All weights bf16 (qkv/o/gate_up/down), `_v2.co` mega-kernel.
+//   - Matches CPU bf16 reference for the first 11 of 20 greedy tokens on
+//     "hello", then argmax flips at pos 11 (CPU 8712 vs GPU 7434).  Drift
+//     is a *structural* precision floor inside phase-7 attention softmax:
+//
+//   1. `v_exp_f32` (RDNA3 ~1 ULP HW approx) vs CPU `exp_f32_fast`
+//      (custom 5-term minimax poly).  Different approximations entirely.
+//   2. Sum-reduce parallelism: CPU sequential left-fold over t vs GPU
+//      XOR-butterfly over wave32.
 //   3. FMA-vs-mul+add semantics in Q·K dot, fused scale-adjust, V-axpy.
 //
-// All other drift sources have been eliminated: see commits 9e89233 /
-// 45a8c9c / d18448b / d83bd3a / e388636 / 3630a5a (slice 8.2-B Option A)
-// for the cputree gemv + IEEE-correct rmsnorm scalar pipeline fixes
-// that brought b_x_norm_g, b_attn_q_g, b_mid_g, gu_scratch all bit-exact.
+// All other drift sources eliminated (commits 9e89233 / 45a8c9c / d18448b
+// / d83bd3a / e388636 / 3630a5a, slice 8.2-B Option A).
 //
-// Other 3 archs (Qwen3, Llama-1B, Mistral) GPU paths remain 20/20 — they
-// happen to round-equal CPU vhaddps for their specific weight values
-// and their softmax 1-ULP drift falls below the argmax-flip threshold.
+// Other 3 archs (Qwen3, Llama-1B, Mistral) GPU paths remain 20/20 on bf16
+// — they round-equal CPU vhaddps for their specific weights, and their
+// softmax 1-ULP drift falls below the argmax-flip threshold.
 //
-// **Planned fix:** ship an fp32 weight path as the new default for this
-// driver. fp32 cannot break the structural softmax floor (precision-
-// independent), but eliminates bf16 quantization noise as a *separate*
-// drift source. The bf16 path will remain available via opt-in env var
-// for users who prefer +86% perf over PT bf16 and accept 11/20 precision.
 // See LLAMA_3B_BIT_EXACT_FINDINGS.md for the journey and reproducer cmds.
 // =========================================================================
 //
@@ -302,6 +302,16 @@ fn pld_propose(u64 seq_ids32, u64 seq_len, u64 draft_out, u64 K) -> u64 {
     return 0
 }
 
+// Slice 8.3 F4 — Q8_0 → f32 dequant into a freshly-allocated buffer
+// (4 bytes per element).  Used by the fp32 mega-kernel weight upload
+// path.  Reuses std/gguf.mlr's `gguf_deq_q8_0` (which already produces
+// f32 from Q8_0 blocks); this just owns the alloc.
+fn q8_0_to_f32_alloc(u64 src_q8, u64 n_elements) -> u64 {
+    u64 dst_f32 = alloc(n_elements * 4)
+    gguf_deq_q8_0(dst_f32, src_q8, n_elements)
+    return dst_f32
+}
+
 // Dequantise a Q8_0 tensor of `n_elements` total values into a freshly
 // allocated bf16 buffer (2 bytes per element).  Q8_0 layout: 32-element
 // blocks of [f16 scale | int8 qs[32]] = 34 bytes each.  Output bf16:
@@ -356,13 +366,49 @@ fn main() {
 
     // --- Reconfigure qwen3.mlr for Llama-3.2-1B GPU bf16 matmul path ---
     qwen3_set_arch(3072, 128, 24, 8, 8192)
-    qwen3_set_matmul_kind(0)                // *** bf16 (GPU dispatcher) ***
+    qwen3_set_matmul_kind(0)                // bf16 (GPU dispatcher + CPU fallback);
+                                            // overridden to 2 below when fp32 mega-kernel active.
     qwen3_set_norm_kind(1)                  // F32 norms (Llama)
     qwen3_set_fuse_qkv(0)                   // separate q/k/v + gate/up matmuls
     qwen3_set_qknorm(0)                     // Llama: no per-head Q/K RMSNorm
     qwen3_set_rope_base(500000)             // Llama-3 theta = 5e5
     qwen3_set_rmsnorm_eps_bits(0x3727C5AC)  // Llama: rms_norm_eps = 1e-5
     qwen3_set_rope_pair_layout(1)           // NORM consecutive-pair RoPE
+
+    // ── Slice 8.3 F4 — fp32 weight path (default) vs bf16 opt-in ────────
+    // MLRIFT_LLAMA3_3B_USE_BF16=1 selects the legacy bf16 mega-kernel + bf16
+    // CPU forward.  Default 0 selects the new fp32 mega-kernel path:
+    //   - qkv/o/gate_up dequant Q8_0 → f32 (host); GPU upload as f32 via the
+    //     new gpu_get_or_upload_f32_weight_padded cache + the .co emitted
+    //     with MEGA_WEIGHT_DTYPE=1 (F3b commit 85cdcf5).
+    //   - down_w dequant Q8_0 → bf16 (host); GPU phase 17 reads bf16 (F3b
+    //     scoped phase-17 emit out — mixed-precision intentional).
+    //   - .co path: /tmp/llama_3b_layer_megakernel_v2_f32.co (vs _v2.co).
+    // The CPU baseline run (MLRIFT_NATIVE_MEGAKERNEL unset) ALWAYS stays
+    // on bf16/kind=0 so the legacy 4.16 tok/s reference output is unchanged.
+    // We probe MLRIFT_NATIVE_MEGAKERNEL here too — if the mega-kernel path
+    // is NOT requested, the fp32 dequant is pointless (CPU forward runs and
+    // expects bf16 weights), so we force the bf16 dequant either way.
+    u64 _use_bf16 = 0
+    u64 _ev_use_bf16 = getenv("MLRIFT_LLAMA3_3B_USE_BF16")
+    if _ev_use_bf16 != 0 {
+        u8 _ub_c0 = 0; unsafe { *(_ev_use_bf16 as u8) -> _ub_c0 }
+        if _ub_c0 == 49 { _use_bf16 = 1 }   // '1'
+    }
+    // Early-probe MLRIFT_NATIVE_MEGAKERNEL so we can decide WHICH dequant
+    // target (f32 vs bf16) before the per-layer Q8_0 dequant loop runs.
+    // Re-parsed at the actual usage site further below; this probe is
+    // read-only and side-effect-free.
+    u64 _native_mk_requested = 0
+    u64 _ev_nmk_probe = getenv("MLRIFT_NATIVE_MEGAKERNEL")
+    if _ev_nmk_probe != 0 {
+        u8 _nmk_c0 = 0; unsafe { *(_ev_nmk_probe as u8) -> _nmk_c0 }
+        if _nmk_c0 == 49 { _native_mk_requested = 1 }   // '1'
+        if _nmk_c0 == 50 { _native_mk_requested = 1 }   // '2'
+    }
+    // EFFECTIVE bf16 mode: any of (a) explicit bf16 opt-in, (b) mega-kernel
+    // not requested (CPU baseline path expects bf16 weights for kind=0).
+    if _native_mk_requested == 0 { _use_bf16 = 1 }
 
     // Force-init the GPU matmul dispatcher early so gpu_pipeline_ready()
     // and matmul_bf16_weights_f32_gpu work without first being touched
@@ -483,7 +529,11 @@ fn main() {
     u64 up_elems   = ff     * hidden
     u64 down_elems = hidden * ff
 
-    eout("[llama32_3b_gpu] dequantising 16 layers of Q8_0 → bf16 (host) — this is one-time...\n")
+    if _use_bf16 == 1 {
+        eout("[llama32_3b_gpu] dequantising 28 layers of Q8_0 → bf16 (host) — this is one-time...\n")
+    } else {
+        eout("[llama32_3b_gpu] dequantising 28 layers Q8_0 → fp32 (qkv/o/gate_up) + bf16 (down_w) — this is one-time...\n")
+    }
     u64 li = 0
     while li < n_layers {
         u64 base = layers_arr + li * 88
@@ -497,22 +547,31 @@ fn main() {
         unsafe { *((base + 0 * 8) as u64) = t01.ptr }
         dealloc(n01)
 
+        // qkv/o/gate/up: dequant to f32 in fp32 mode, bf16 in bf16 mode.
+        // down: ALWAYS bf16 (GPU phase 17 emit reads bf16; CPU forward
+        // is bypassed when mega-kernel is active).
         u64 n02 = str_cat(prefix, "attn_q.weight")
         GGUFTensor t02 = gguf_get(gf, n02)
-        u64 q_bf16 = q8_0_to_bf16_alloc(t02.ptr, q_elems)
-        unsafe { *((base + 1 * 8) as u64) = q_bf16 }
+        u64 q_w = 0
+        if _use_bf16 == 1 { q_w = q8_0_to_bf16_alloc(t02.ptr, q_elems) }
+        else              { q_w = q8_0_to_f32_alloc (t02.ptr, q_elems) }
+        unsafe { *((base + 1 * 8) as u64) = q_w }
         dealloc(n02)
 
         u64 n03 = str_cat(prefix, "attn_k.weight")
         GGUFTensor t03 = gguf_get(gf, n03)
-        u64 k_bf16 = q8_0_to_bf16_alloc(t03.ptr, kv_elems)
-        unsafe { *((base + 2 * 8) as u64) = k_bf16 }
+        u64 k_w = 0
+        if _use_bf16 == 1 { k_w = q8_0_to_bf16_alloc(t03.ptr, kv_elems) }
+        else              { k_w = q8_0_to_f32_alloc (t03.ptr, kv_elems) }
+        unsafe { *((base + 2 * 8) as u64) = k_w }
         dealloc(n03)
 
         u64 n04 = str_cat(prefix, "attn_v.weight")
         GGUFTensor t04 = gguf_get(gf, n04)
-        u64 v_bf16 = q8_0_to_bf16_alloc(t04.ptr, kv_elems)
-        unsafe { *((base + 3 * 8) as u64) = v_bf16 }
+        u64 v_w = 0
+        if _use_bf16 == 1 { v_w = q8_0_to_bf16_alloc(t04.ptr, kv_elems) }
+        else              { v_w = q8_0_to_f32_alloc (t04.ptr, kv_elems) }
+        unsafe { *((base + 3 * 8) as u64) = v_w }
         dealloc(n04)
 
         unsafe { *((base + 4 * 8) as u64) = 0 }
@@ -520,8 +579,10 @@ fn main() {
 
         u64 n07 = str_cat(prefix, "attn_output.weight")
         GGUFTensor t07 = gguf_get(gf, n07)
-        u64 o_bf16 = q8_0_to_bf16_alloc(t07.ptr, o_elems)
-        unsafe { *((base + 6 * 8) as u64) = o_bf16 }
+        u64 o_w = 0
+        if _use_bf16 == 1 { o_w = q8_0_to_bf16_alloc(t07.ptr, o_elems) }
+        else              { o_w = q8_0_to_f32_alloc (t07.ptr, o_elems) }
+        unsafe { *((base + 6 * 8) as u64) = o_w }
         dealloc(n07)
 
         u64 n08 = str_cat(prefix, "ffn_norm.weight")
@@ -531,14 +592,18 @@ fn main() {
 
         u64 n09 = str_cat(prefix, "ffn_gate.weight")
         GGUFTensor t09 = gguf_get(gf, n09)
-        u64 g_bf16 = q8_0_to_bf16_alloc(t09.ptr, gate_elems)
-        unsafe { *((base + 8 * 8) as u64) = g_bf16 }
+        u64 g_w = 0
+        if _use_bf16 == 1 { g_w = q8_0_to_bf16_alloc(t09.ptr, gate_elems) }
+        else              { g_w = q8_0_to_f32_alloc (t09.ptr, gate_elems) }
+        unsafe { *((base + 8 * 8) as u64) = g_w }
         dealloc(n09)
 
         u64 n10 = str_cat(prefix, "ffn_up.weight")
         GGUFTensor t10 = gguf_get(gf, n10)
-        u64 u_bf16 = q8_0_to_bf16_alloc(t10.ptr, up_elems)
-        unsafe { *((base + 9 * 8) as u64) = u_bf16 }
+        u64 u_w = 0
+        if _use_bf16 == 1 { u_w = q8_0_to_bf16_alloc(t10.ptr, up_elems) }
+        else              { u_w = q8_0_to_f32_alloc (t10.ptr, up_elems) }
+        unsafe { *((base + 9 * 8) as u64) = u_w }
         dealloc(n10)
 
         u64 n11 = str_cat(prefix, "ffn_down.weight")
@@ -656,15 +721,37 @@ fn main() {
             eout("[llama32_3b_gpu] gpu_pipeline_ready returned 0; falling back to CPU bf16\n")
             _native_mk_use = 0
         } else {
+            // Slice 8.3 F4: pick the bf16 vs fp32 .co based on _use_bf16.
+            u64 _co_path = "/tmp/llama_3b_layer_megakernel_v2.co"
+            if _use_bf16 == 0 { _co_path = "/tmp/llama_3b_layer_megakernel_v2_f32.co" }
             u64 _llama3b_fh = gpu_pipeline_load_alt_megakernel_co(
-                "/tmp/llama_3b_layer_megakernel_v2.co",
+                _co_path,
                 "llama_3b_layer_megakernel")
             if _llama3b_fh == 0 {
-                eout("[llama32_3b_gpu] /tmp/llama_3b_layer_megakernel_v2.co not loaded; rerun --emit-amdgpu-llama-3b-megakernel-v2\n")
+                eout("[llama32_3b_gpu] ")
+                eout(_co_path)
+                if _use_bf16 == 1 {
+                    eout(" not loaded; rerun --emit-amdgpu-llama-3b-megakernel-v2\n")
+                } else {
+                    eout(" not loaded; rerun --emit-amdgpu-llama-3b-megakernel-v2-f32 (or set MLRIFT_LLAMA3_3B_USE_BF16=1)\n")
+                }
                 _native_mk_use = 0
             } else {
-                eout("[llama32_3b_gpu] Llama-3B mega-kernel .co swapped into Llama megakernel slot (fh=")
-                eu64(_llama3b_fh); eout(")\n")
+                eout("[llama32_3b_gpu] Llama-3B mega-kernel .co swapped into Llama megakernel slot (")
+                eout(_co_path)
+                eout(" fh="); eu64(_llama3b_fh); eout(")\n")
+                // Flip the qwen3 mega-kernel weight-dtype gate to match
+                // the .co we just loaded (slice 8.3 F4).  This controls
+                // which uploader (bf16 vs f32) is used for qkv/o/gate_up.
+                if _use_bf16 == 0 {
+                    qwen3_set_mk_weight_dtype(1)
+                    qwen3_set_matmul_kind(2)   // (only consulted by CPU forward
+                                                // when mega-kernel is NOT firing
+                                                // — kept for symmetry/debug)
+                } else {
+                    qwen3_set_mk_weight_dtype(0)
+                    qwen3_set_matmul_kind(0)
+                }
             }
         }
         if _native_mk_use != 0 {
@@ -709,24 +796,33 @@ fn main() {
                         }
                         eout("[llama32_3b_gpu] mega-kernel path ENABLED: KV cache + ping-pong residuals device-resident (")
                         eu64(total_cache * 2 + hidden * 8); eout(" bytes total)\n")
-                        eout("[llama32_3b_gpu] WARNING: bf16 precision path is 11/20 token-match vs CPU (phase-7 softmax structural floor; see source-file header). fp32 default path is in development.\n")
+                        if _use_bf16 == 1 {
+                            eout("[llama32_3b_gpu] WARNING: bf16 path is 11/20 vs CPU (phase-7 softmax structural floor). fp32 default available - unset MLRIFT_LLAMA3_3B_USE_BF16.\n")
+                        } else {
+                            eout("[llama32_3b_gpu] precision: fp32 (default; bf16 path: MLRIFT_LLAMA3_3B_USE_BF16=1). NOTE: down_w stays bf16 (mixed-precision per F3b phase-17 scope).\n")
+                        }
 
-                        // The Llama mega-kernel reads ONE fused QKV bf16
-                        // matrix [qkv_dim, hidden] and ONE fused gate_up
-                        // bf16 matrix [2*ff, hidden] — same kernarg layout
-                        // as the Qwen3 mega-kernel.  Pre-stack the per-tensor
-                        // GGUF weights here (only when mega-kernel path is
-                        // active; the legacy CPU bf16 path uses unfused
-                        // matmuls and would mis-read the stacked layout).
+                        // The Llama mega-kernel reads ONE fused QKV matrix
+                        // [qkv_dim, hidden] and ONE fused gate_up matrix
+                        // [2*ff, hidden] — same kernarg layout as the Qwen3
+                        // mega-kernel.  In fp32 mode (slice 8.3 F4), qkv/o/
+                        // gate_up are f32 (4-byte row stride per element).
+                        // down_w stays bf16 (phase 17 emit unchanged).
+                        u64 _wb = 2
+                        if _use_bf16 == 0 { _wb = 4 }    // f32 mode: 4-byte elem
                         u64 qkv_dim_elems = q_dim + 2 * kv_dim
-                        u64 qkv_row_bytes = hidden * 2
+                        u64 qkv_row_bytes = hidden * _wb
                         u64 q_bytes_l     = q_dim  * qkv_row_bytes
                         u64 kv_bytes_l    = kv_dim * qkv_row_bytes
                         u64 stacked_bytes = qkv_dim_elems * qkv_row_bytes
                         u64 gu_dim_elems  = 2 * ff
                         u64 gate_bytes_l  = ff * qkv_row_bytes
                         u64 gu_stacked_bytes = gu_dim_elems * qkv_row_bytes
-                        eout("[llama32_3b_gpu] fusing QKV + gate/up bf16 weights (")
+                        if _use_bf16 == 1 {
+                            eout("[llama32_3b_gpu] fusing QKV + gate/up bf16 weights (")
+                        } else {
+                            eout("[llama32_3b_gpu] fusing QKV + gate/up f32 weights (")
+                        }
                         eu64((stacked_bytes + gu_stacked_bytes) * n_layers); eout(" bytes total)\n")
                         u64 lf = 0
                         while lf < n_layers {
@@ -789,10 +885,19 @@ fn main() {
         u64 lwarm = 0
         while lwarm < n_layers {
             Qwen3LayerWeights w = layers_arr + lwarm * 88
-            u64 _wq = gpu_get_or_upload_bf16_weight_padded(w.q_proj_w,    hidden, qkv_dim_w, hidden_pad_w)
-            u64 _wo = gpu_get_or_upload_bf16_weight_padded(w.o_proj_w,    q_dim,  hidden,    q_dim_pad_w)
-            u64 _wg = gpu_get_or_upload_bf16_weight_padded(w.gate_proj_w, hidden, 2 * ff,    hidden_pad_w)
-            u64 _wd = gpu_get_or_upload_bf16_weight_padded(w.down_proj_w, ff,     hidden,    ff_pad_w)
+            // Slice 8.3 F4: pick uploader by mode.  In fp32 mode, qkv/o/
+            // gate_up use f32 uploader (stride K_pad*4); down_w always
+            // uses bf16 uploader (phase 17 emit unchanged).
+            if _use_bf16 == 0 {
+                u64 _wq = gpu_get_or_upload_f32_weight_padded(w.q_proj_w,    hidden, qkv_dim_w, hidden_pad_w)
+                u64 _wo = gpu_get_or_upload_f32_weight_padded(w.o_proj_w,    q_dim,  hidden,    q_dim_pad_w)
+                u64 _wg = gpu_get_or_upload_f32_weight_padded(w.gate_proj_w, hidden, 2 * ff,    hidden_pad_w)
+            } else {
+                u64 _wq = gpu_get_or_upload_bf16_weight_padded(w.q_proj_w,    hidden, qkv_dim_w, hidden_pad_w)
+                u64 _wo = gpu_get_or_upload_bf16_weight_padded(w.o_proj_w,    q_dim,  hidden,    q_dim_pad_w)
+                u64 _wg = gpu_get_or_upload_bf16_weight_padded(w.gate_proj_w, hidden, 2 * ff,    hidden_pad_w)
+            }
+            u64 _wd = gpu_get_or_upload_bf16_weight_padded(w.down_proj_w, ff, hidden, ff_pad_w)
             lwarm = lwarm + 1
         }
         eout("[llama32_3b_gpu] padded-row weight cache warmed for "); eu64(n_layers); eout(" layers\n")

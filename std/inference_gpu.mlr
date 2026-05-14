@@ -134,6 +134,13 @@ static u64 _gpu_mm_bf16_n    = 0
 static u64 _gpu_mm_bf16_pad_keys = 0
 static u64 _gpu_mm_bf16_pad_vals = 0
 static u64 _gpu_mm_bf16_pad_n    = 0
+// Slice 8.3 F4: parallel padded-row f32 cache for the Llama-3B fp32 path.
+// Same shape as the bf16 cache (host_ptr ^ k_pad key, lazy upload, single
+// bulk H2D), but stride is K_pad*4 bytes (f32) instead of K_pad*2.
+// Used by the fp32-mode mega-kernel when MLRIFT_LLAMA3_3B_USE_BF16!=1.
+static u64 _gpu_mm_f32_pad_keys = 0
+static u64 _gpu_mm_f32_pad_vals = 0
+static u64 _gpu_mm_f32_pad_n    = 0
 
 // Parallel cache for Q4_0-direct path: maps host w_bf16 ptr → device
 // Q4_0 ptr.  First reference: CPU-side quantize bf16 → Q4_0, alloc
@@ -363,6 +370,10 @@ fn _gpu_mm_init_once() {
     _gpu_mm_bf16_pad_keys = alloc(_gpu_mm_cache_cap * 8)
     _gpu_mm_bf16_pad_vals = alloc(_gpu_mm_cache_cap * 8)
     _gpu_mm_bf16_pad_n    = 0
+    // Slice 8.3 F4: parallel f32 padded cache (sibling to bf16 above).
+    _gpu_mm_f32_pad_keys = alloc(_gpu_mm_cache_cap * 8)
+    _gpu_mm_f32_pad_vals = alloc(_gpu_mm_cache_cap * 8)
+    _gpu_mm_f32_pad_n    = 0
 
     // Optional threshold override (decimal bytes).
     u64 thr_env = getenv("MLRIFT_GPU_MATMUL_MIN_BYTES")
@@ -604,6 +615,74 @@ fn _gpu_mm_get_or_upload_bf16_padded(u64 w_bf16, u64 K, u64 N, u64 K_pad) -> u64
 fn gpu_get_or_upload_bf16_weight_padded(u64 w_bf16_host, u64 K, u64 N, u64 K_pad) -> u64 {
     if gpu_matmul_enabled() == 0 { return 0 }
     return _gpu_mm_get_or_upload_bf16_padded(w_bf16_host, K, N, K_pad)
+}
+
+// ── Slice 8.3 F4 — padded-row f32 weight upload + cache ──────────────
+// Sibling to the bf16 cache above, but stride is K_pad*4 bytes (f32 raw
+// rather than bf16 truncated).  Cache key folds (host_ptr ^ K_pad) just
+// like the bf16 variant; collisions with bf16 entries are impossible
+// since the host pointer is a different allocation (fp32 dequant buffer
+// vs bf16 dequant buffer).
+//
+// Used by the Llama-3.2-3B fp32 mega-kernel path (slice 8.3 F4).  The
+// emitted .co's phase-3/9/13 cputree gemv issues `global_load_b32` over
+// this stride when MEGA_WEIGHT_DTYPE=1 was set at emit time.
+fn _gpu_mm_f32_pad_lookup(u64 w_f32, u64 K_pad) -> u64 {
+    u64 key = w_f32 ^ K_pad
+    u64 i = 0
+    while i < _gpu_mm_f32_pad_n {
+        u64 kp = _gpu_mm_f32_pad_keys + i * 8
+        u64 k = 0; unsafe { *(kp as u64) -> k }
+        if k == key {
+            u64 vp = _gpu_mm_f32_pad_vals + i * 8
+            u64 v = 0; unsafe { *(vp as u64) -> v }
+            return v
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn _gpu_mm_f32_pad_insert(u64 w_f32, u64 K_pad, u64 d_f32) {
+    if _gpu_mm_f32_pad_n >= _gpu_mm_cache_cap { return }
+    u64 key = w_f32 ^ K_pad
+    u64 kp = _gpu_mm_f32_pad_keys + _gpu_mm_f32_pad_n * 8
+    u64 vp = _gpu_mm_f32_pad_vals + _gpu_mm_f32_pad_n * 8
+    unsafe { *(kp as u64) = key }
+    unsafe { *(vp as u64) = d_f32 }
+    _gpu_mm_f32_pad_n = _gpu_mm_f32_pad_n + 1
+}
+
+fn _gpu_mm_get_or_upload_f32_padded(u64 w_f32, u64 K, u64 N, u64 K_pad) -> u64 {
+    u64 cached = _gpu_mm_f32_pad_lookup(w_f32, K_pad)
+    if cached != 0 { return cached }
+
+    u64 d_f32 = 0
+    u64 slot = alloc(8)
+    u32 err = hipMalloc(slot, N * K_pad * 4)
+    if err != 0 { return 0 }
+    unsafe { *(slot as u64) -> d_f32 }
+
+    u64 host_pad = alloc(N * K_pad * 4)
+    u64 row = 0
+    while row < N {
+        u64 src_row = w_f32 + row * K * 4
+        u64 dst_row = host_pad + row * K_pad * 4
+        memcpy(dst_row, src_row, K * 4)
+        row = row + 1
+    }
+    err = hipMemcpy(d_f32, host_pad, N * K_pad * 4, 1)
+    dealloc(host_pad)
+    if err != 0 { return 0 }
+
+    _gpu_mm_f32_pad_insert(w_f32, K_pad, d_f32)
+    return d_f32
+}
+
+@export
+fn gpu_get_or_upload_f32_weight_padded(u64 w_f32_host, u64 K, u64 N, u64 K_pad) -> u64 {
+    if gpu_matmul_enabled() == 0 { return 0 }
+    return _gpu_mm_get_or_upload_f32_padded(w_f32_host, K, N, K_pad)
 }
 
 // Q4_0 cache: lookup, insert, get-or-upload.  Same parallel-array
