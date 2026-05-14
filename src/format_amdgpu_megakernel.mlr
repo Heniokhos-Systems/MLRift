@@ -1387,6 +1387,203 @@ fn _emit_gemv_coop_bf16_padded_strided_inline(uint64 n_out, uint64 k, uint64 k_p
     asm_patch_u32(gate_cmp_pos + 2, 0xBFA20000 | (body_dwords & 0xFFFF))
 }
 
+// ── Phase 2 cputree inline ISA emitter ────────────────────────────────────
+//
+// _emit_gemv_cputree_bf16_padded_strided_inline — CPU-matching reduction-tree
+// variant of _emit_gemv_coop_bf16_padded_strided_inline.
+//
+// Same outer scaffolding (WG gate, kernarg loads, per-WG weight base offset,
+// outer-row loop, lane-0 store, outer advance, gate patch) as the existing
+// helper, but the INNER per-row body matches the CPU's bf16→f32 dot product
+// exactly:
+//   - 8 active lanes per wave (exec_lo = 0xFF), stride-8 K partition
+//   - Single-FMA v_fmac_f32 per K iter (no unroll), bf16-widen via lshl 16
+//   - 3-level XOR-bpermute reduce in offset order [4, 1, 2]
+//
+// This is the inline-mega-kernel port of _emit_gemv_coop_bf16_f32_cputree_body
+// (src/format_amdgpu.mlr line 6414).  Phase 2 of the Llama-3B bit-exact plan.
+//
+// Signature matches _emit_gemv_coop_bf16_padded_strided_inline so the
+// caller (mega-kernel phase 3 emit) can swap helpers based on MEGA_HIDDEN.
+//
+// VGPR usage (kept close to the existing helper for coexistence safety):
+//   v0       = lane id (hardware, r/o)
+//   v1       = vaddr=0 for global_store_b32 saddr-form (set inside per-row body)
+//   v2       = acc (f32 accumulator)
+//   v3:v4    = weight ptr per lane (s[w_lo:w_hi] + lane*2; +16 each inner iter)
+//   v5:v6    = x ptr per lane     (s[x_lo:x_hi] + lane*4; +32 each inner iter)
+//   v7       = lane*4 (constant, x byte offset)
+//   v8       = lane*2 (constant, w byte offset)  [reused from existing helper's v8]
+//   v9       = scratch bf16 weight load → bf16-widen → bpermute addr scratch
+//   v10      = scratch f32 x load → reduce tmp
+//   v11      = scratch bpermute addr (reduce)
+//   v12      = scratch bpermute tmp  (reduce)
+fn _emit_gemv_cputree_bf16_padded_strided_inline(uint64 n_out, uint64 k, uint64 k_pad,
+                                    uint64 wg_active,
+                                    uint64 w_sdata_pair, uint64 x_sdata_pair,
+                                    uint64 out_sdata_pair,
+                                    uint64 w_kofs, uint64 x_kofs, uint64 out_kofs,
+                                    uint64 wg_id_sgpr) {
+    // ── WG gate (skip if wg_id >= wg_active) — identical to base helper ──
+    uint64 gate_cmp_pos = asm_text_len / 4
+    asm_u32(0xBF09FF00 | (wg_id_sgpr & 0xFF))
+    asm_u32(wg_active)
+    asm_s_cbranch_scc1(0)   // patched at end
+
+    // ── Load base pointers ────────────────────────────────────────────────
+    asm_s_load_b64_off(w_sdata_pair,   0, w_kofs)
+    asm_s_load_b64_off(x_sdata_pair,   0, x_kofs)
+    asm_s_load_b64_off(out_sdata_pair, 0, out_kofs)
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    uint64 w_lo = w_sdata_pair * 2
+    uint64 w_hi = w_lo + 1
+    uint64 x_lo = x_sdata_pair * 2
+    uint64 x_hi = x_lo + 1
+    uint64 out_lo = out_sdata_pair * 2
+    uint64 out_hi = out_lo + 1
+
+    // ── Slice 6.7d: per-WG weight base offset ─────────────────────────────
+    // s14 = wg_id * (k_pad * 2);  s[w_lo:w_hi] += s14
+    _emit_s_mul_u32_pow2_or_lit(14, wg_id_sgpr, k_pad * 2)
+    asm_u32(0x80000000 | (w_lo << 16) | (14 << 8) | w_lo)
+    asm_u32(0x82000000 | (w_hi << 16) | 0x8000 | w_hi)
+
+    // ── Constant lane offsets (cputree: lane*2 for bf16, lane*4 for f32) ──
+    asm_v_lshlrev_b32_imm(7, 2, 0)   // v7 = lane*4 (f32 byte offset for x)
+    asm_v_lshlrev_b32_imm(8, 1, 0)   // v8 = lane*2 (bf16 byte offset for w)
+
+    // ── Outer-row loop init ───────────────────────────────────────────────
+    asm_s_mov_b32(13, wg_id_sgpr)            // s13 = row = wg_id
+    asm_s_mov_b32_inline_imm(12, 0)          // s12 = r_off = 0
+
+    uint64 w_row_step = wg_active * k_pad * 2
+    uint64 k_iters = k / 8                   // 8 active lanes per wave
+    uint64 rows_per_wg = (n_out + wg_active - 1) / wg_active
+
+    uint64 outer_top = asm_text_len / 4
+
+    // ── Per-row body ──────────────────────────────────────────────────────
+    // v2 = acc = 0.0 — set with FULL EXEC so lanes 8..31 keep v2=0 and do
+    // not pollute the post-loop XOR-bpermute reduce.
+    asm_v_mov_b32_inline_u(2, 0)
+
+    // init weight ptr: v3:v4 = s[w_lo:w_hi] + lane*2 (= v8)
+    asm_v_mov_b32_inline_u(4, 0)
+    asm_v_add_co_u32_vcc_sv(3, w_lo, 8)
+    asm_v_add_co_ci_u32_null_sv_vcc(4, w_hi, 4)
+
+    // init x ptr: v5:v6 = s[x_lo:x_hi] + lane*4 (= v7)
+    asm_v_mov_b32_inline_u(6, 0)
+    asm_v_add_co_u32_vcc_sv(5, x_lo, 7)
+    asm_v_add_co_ci_u32_null_sv_vcc(6, x_hi, 6)
+
+    // ── Narrow EXEC to lanes 0..7 ─────────────────────────────────────────
+    // s_mov_b32 exec_lo, 0xFF  (lanes 8..31 keep their previous v2=0 and
+    // do not run the K-loop FMAs).
+    asm_s_mov_b32_lit32(0x7E, 0x000000FF)
+
+    // ── K-loop counter: s14 = k_iters ─────────────────────────────────────
+    asm_s_mov_b32_inline_imm(14, k_iters)
+
+    uint64 loop_idx = asm_text_len / 4
+    // global_load_u16 v9, v[3:4], off
+    asm_u32(0xDC4A0000); asm_u32(0x097C0003)
+    // global_load_b32 v10, v[5:6], off
+    asm_u32(0xDC520000); asm_u32(0x0A7C0005)
+    asm_s_waitcnt_vmcnt_zero()
+    // v_lshlrev_b32 v9, 16, v9  — bf16 → f32 widen
+    asm_v_lshlrev_b32_imm(9, 16, 9)
+    // v_fmac_f32_e32 v2, v9, v10
+    asm_v_fmac_f32_e32_vv(2, 9, 10)
+    // v_add_nc_u32 v3, 0x10, v3   (w_ptr += 16 bytes)
+    asm_u32(0x4A0606FF); asm_u32(16)
+    // v_add_nc_u32 v5, 0x20, v5   (x_ptr += 32 bytes)
+    asm_u32(0x4A0A0AFF); asm_u32(32)
+    asm_s_sub_u32_imm(14, 14, 1)
+    // s_cmp_lg_u32 s14, 0
+    asm_u32(0xBF07800E)
+    uint64 loop_branch_idx = asm_text_len / 4
+    uint64 back_simm = (loop_idx - (loop_branch_idx + 1)) & 0xFFFF
+    asm_s_cbranch_scc1(back_simm)
+
+    // ── Restore EXEC to full wave32 for cross-lane reduce ─────────────────
+    asm_s_mov_b32_lit32(0x7E, 0xFFFFFFFF)
+
+    // ── CPU-tree 3-level reduce, XOR offsets [4, 1, 2] in that order ──────
+    // Per level: v_xor_b32 v11, off, v0 ; v_lshlrev_b32 v11, 2, v11 ;
+    //            ds_bpermute_b32 v12, v11, v2 ; waitcnt lgkm(0) ;
+    //            v_add_f32_e32 v2, v2, v12
+    uint64 add_word = 0x06000000 | (2 << 17) | (12 << 9) | (0x100 | 2)
+
+    // Step 1: offset 4
+    _emit_v_xor_b32_e32_imm_v0(11, 4)
+    asm_v_lshlrev_b32_imm(11, 2, 11)
+    asm_ds_bpermute_b32(12, 11, 2)
+    asm_s_waitcnt_lgkmcnt_zero()
+    asm_u32(add_word)
+
+    // Step 2: offset 1
+    _emit_v_xor_b32_e32_imm_v0(11, 1)
+    asm_v_lshlrev_b32_imm(11, 2, 11)
+    asm_ds_bpermute_b32(12, 11, 2)
+    asm_s_waitcnt_lgkmcnt_zero()
+    asm_u32(add_word)
+
+    // Step 3: offset 2
+    _emit_v_xor_b32_e32_imm_v0(11, 2)
+    asm_v_lshlrev_b32_imm(11, 2, 11)
+    asm_ds_bpermute_b32(12, 11, 2)
+    asm_s_waitcnt_lgkmcnt_zero()
+    asm_u32(add_word)
+
+    // ── Lane-0 gated store of v2 to out[row] ──────────────────────────────
+    asm_v_cmp_eq_u32_imm_vgpr(0, 0)            // vcc_lo = (v0 == 0)
+    asm_s_and_saveexec_b32_vcc_lo(17)          // s17 = old exec; exec &= vcc_lo
+    asm_v_mov_b32_inline_u(1, 0)               // v1 = 0 (vaddr for store)
+
+    // output byte offset = row * 4
+    // s_lshl_b32 s14, s13, 2
+    asm_u32(0x840E820D)
+    // s_add_u32 out_lo, out_lo, s14
+    asm_u32(0x80000000 | (out_lo << 16) | (14 << 8) | out_lo)
+    // s_addc_u32 out_hi, out_hi, 0
+    asm_u32(0x82000000 | (out_hi << 16) | 0x8000 | out_hi)
+
+    // global_store_b32 v1, v2, s[out_lo:out_hi]
+    asm_u32(0xDC6A0000)
+    asm_u32((out_lo << 16) | (2 << 8) | 1)
+
+    // Restore exec: s_or_b32 exec_lo, exec_lo, s17
+    asm_u32(0x8C7E117E)
+
+    // ── Restore out ptr (undo the row*4 offset) ───────────────────────────
+    // s14 still holds row*4 here.
+    asm_u32(0x80800000 | (out_lo << 16) | (0x0E << 8) | out_lo)
+    asm_u32(0x82800000 | (out_hi << 16) | 0x8000 | out_hi)
+
+    // ── Outer loop advance ────────────────────────────────────────────────
+    // Advance weight ptr by w_row_step bytes
+    asm_s_mov_b32_lit32(14, w_row_step & 0xFFFFFFFF)
+    asm_u32(0x80000000 | (w_lo << 16) | (0x0E << 8) | w_lo)
+    asm_u32(0x82000000 | (w_hi << 16) | 0x8000 | w_hi)
+
+    // Advance row: s13 += wg_active
+    asm_u32(0x800DFF0D)
+    asm_u32(wg_active)
+
+    // r_off += 1; if r_off < rows_per_wg loop
+    asm_u32(0x800C810C)
+    asm_u32(0xBF0AFF0C)
+    asm_u32(rows_per_wg & 0xFFFFFFFF)
+    uint64 outer_back = (outer_top - (asm_text_len / 4) - 1) & 0xFFFF
+    asm_s_cbranch_scc1(outer_back)
+
+    // ── Patch the WG gate skip-branch ─────────────────────────────────────
+    uint64 body_dwords = (asm_text_len / 4) - (gate_cmp_pos + 3)
+    asm_patch_u32(gate_cmp_pos + 2, 0xBFA20000 | (body_dwords & 0xFFFF))
+}
+
 // ── Phase 3 m4 inline ISA emitter — gemv-coop-bf16-padded-strided × 4 streams
 //
 // _emit_gemv_coop_bf16_padded_strided_m4_inline — speck4 phase-3 variant.
@@ -4865,9 +5062,18 @@ fn mega_emit_stub_kernel(uint64 kname_ptr, uint64 nl, uint64 body_node) -> uint6
         //   hidden_pad = HIDDEN + 128 = 1152 (Qwen3); 2176 (Llama)
         uint64 hidden_pad = MEGA_HIDDEN + 128
         uint64 qkv_dim    = MEGA_N_HEADS*MEGA_HEAD_DIM + 2*MEGA_N_KV_HEADS*MEGA_HEAD_DIM
-        _emit_gemv_coop_bf16_padded_strided_inline(qkv_dim, MEGA_HIDDEN, hidden_pad, 256,
-                                                    1, 2, 3,
-                                                    0x10, 0x88, 0x90, 15)
+        // Phase 2 (2026-05-14): Llama-3B routes to the CPU-matching reduction
+        // tree variant so phase-3 b_attn_q_g is bit-exact vs the CPU bf16
+        // reference.  All other archs keep the proven unrolled emit.
+        if MEGA_HIDDEN == 3072 {
+            _emit_gemv_cputree_bf16_padded_strided_inline(qkv_dim, MEGA_HIDDEN, hidden_pad, 256,
+                                                          1, 2, 3,
+                                                          0x10, 0x88, 0x90, 15)
+        } else {
+            _emit_gemv_coop_bf16_padded_strided_inline(qkv_dim, MEGA_HIDDEN, hidden_pad, 256,
+                                                       1, 2, 3,
+                                                       0x10, 0x88, 0x90, 15)
+        }
     } else {
         asm_u32(0xBF800000)   // s_nop 0 (phase 3 stub)
     }
