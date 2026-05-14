@@ -376,6 +376,134 @@ fn mm_worker_bf16_f32_avx2_naive(u64 start_n, u64 end_n, u64 ctx_ptr) {
 }
 
 // ---------------------------------------------------------------------------
+// F32-weights × F32-activations AVX2 worker (slice 8.3 Phase F1).
+//
+// Mirrors `mm_worker_bf16_f32_avx2_naive` byte-for-byte EXCEPT:
+//   * Weight stride is K*4 (not K*2)
+//   * Inner load is a 32-byte vmovups ymm2 from rdi+rax*4 (not vmovdqu xmm
+//     + vpmovzxwd + vpslld)
+//   * Loop body is 21 bytes vs 31 in the bf16 variant — `jge` rel8 is +21
+//     (0x15) and `jmp` rel8 is -26 (0xE6)
+//
+// The reduction tree (vextractf128 + vaddps + 2× vhaddps) is IDENTICAL to
+// the bf16 variant, so feeding bf16-widened weights into this kernel
+// produces bit-identical output to feeding the raw bf16 weights into
+// `mm_worker_bf16_f32_avx2_naive`. That equivalence is the foundation of
+// the Phase F2 f32 path for Llama-3B (avoids the bf16 reduction-tree
+// drift baked into the existing chain).
+// ---------------------------------------------------------------------------
+fn mm_worker_f32_weights_f32_avx2_naive(u64 start_n, u64 end_n, u64 ctx_ptr) {
+    u64 out_ptr = 0
+    unsafe { *(ctx_ptr as u64) -> out_ptr }
+    u64 x_ptr = 0
+    unsafe { *((ctx_ptr + 8) as u64) -> x_ptr }
+    u64 w_ptr = 0
+    unsafe { *((ctx_ptr + 16) as u64) -> w_ptr }
+    u64 M = 0
+    unsafe { *((ctx_ptr + 24) as u64) -> M }
+    u64 N = 0
+    unsafe { *((ctx_ptr + 32) as u64) -> N }
+    u64 K = 0
+    unsafe { *((ctx_ptr + 40) as u64) -> K }
+
+    u64 m = 0
+    while m < M {
+        u64 x_row = x_ptr + m * K * 4
+        u64 o_row = out_ptr + m * N * 4
+        u64 n = start_n
+        while n < end_n {
+            u64 w_row = w_ptr + n * K * 4
+            u64 out_slot = o_row + n * 4
+            asm {
+                // vxorps ymm0, ymm0, ymm0       ; accumulator = 0
+                "0xC5 0xFC 0x57 0xC0"
+                // xor rax, rax                   ; k = 0
+                "0x48 0x31 0xC0"
+                // .loop: cmp rax, rdx            ; (3)
+                "0x48 0x39 0xD0"
+                // jge +21 (past loop body to reduce block)
+                "0x7D 0x15"
+                // vmovups ymm1, [rsi + rax*4]    ; (5) 8 f32 activations
+                "0xC5 0xFC 0x10 0x0C 0x86"
+                // vmovups ymm2, [rdi + rax*4]    ; (5) 8 f32 weights
+                "0xC5 0xFC 0x10 0x14 0x87"
+                // vfmadd231ps ymm0, ymm1, ymm2   ; (5) acc += x * w
+                "0xC4 0xE2 0x75 0xB8 0xC2"
+                // add rax, 8                     ; (4)
+                "0x48 0x83 0xC0 0x08"
+                // jmp .loop                       ; rel8 = -26 = 0xE6
+                "0xEB 0xE6"
+                // .done: horizontal reduce ymm0 → scalar (identical to bf16)
+                // vextractf128 xmm1, ymm0, 1
+                "0xC4 0xE3 0x7D 0x19 0xC1 0x01"
+                // vaddps xmm0, xmm0, xmm1
+                "0xC5 0xF8 0x58 0xC1"
+                // vhaddps xmm0, xmm0, xmm0
+                "0xC5 0xFB 0x7C 0xC0"
+                // vhaddps xmm0, xmm0, xmm0
+                "0xC5 0xFB 0x7C 0xC0"
+                // vmovss [rcx], xmm0
+                "0xC5 0xFA 0x11 0x01"
+                // vzeroupper
+                "0xC5 0xF8 0x77"
+            } in(x_row -> rsi, w_row -> rdi, K -> rdx, out_slot -> rcx) clobbers(rax)
+            n = n + 1
+        }
+        m = m + 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public entry: matmul with F32 weights, F32 activations (slice 8.3 F1).
+//
+// Mirrors `matmul_bf16_weights_f32` shape but dispatches to the f32-weight
+// AVX2 worker. Kahan is NOT yet implemented for the f32-weight path — if
+// `use_kahan != 0` we fall back to the naive AVX2 worker (per F1 brief).
+// The f32 AVX2 worker requires K % 8 == 0; F2 caller must guarantee this.
+// ---------------------------------------------------------------------------
+fn matmul_f32_weights_f32(u64 out_ptr, u64 x_ptr, u64 w_ptr,
+                          u64 M, u64 N, u64 K,
+                          u64 num_workers, u64 use_kahan) {
+    if mm_ctx_base == 0 || num_workers > mm_max_workers {
+        mm_init(num_workers)
+    }
+
+    u64 w = 0
+    while w < num_workers {
+        u64 ctx_w = mm_ctx_base + w * 64
+        unsafe { *(ctx_w as u64) = out_ptr }
+        u64 p8 = ctx_w + 8
+        unsafe { *(p8 as u64) = x_ptr }
+        u64 p16 = ctx_w + 16
+        unsafe { *(p16 as u64) = w_ptr }
+        u64 p24 = ctx_w + 24
+        unsafe { *(p24 as u64) = M }
+        u64 p32 = ctx_w + 32
+        unsafe { *(p32 as u64) = N }
+        u64 p40 = ctx_w + 40
+        unsafe { *(p40 as u64) = K }
+        w = w + 1
+    }
+
+    u64 fn_ptr = fn_addr("mm_worker_f32_weights_f32_avx2_naive")
+
+    u64 chunk = N / num_workers
+    w = 0
+    while w + 1 < num_workers {
+        u64 start_n = w * chunk
+        u64 end_n   = start_n + chunk
+        u64 ctx_w = mm_ctx_base + w * 64
+        thread_pool_submit(w, fn_ptr, start_n, end_n, ctx_w)
+        w = w + 1
+    }
+    u64 main_start = (num_workers - 1) * chunk
+    u64 main_end   = N
+    u64 main_ctx   = mm_ctx_base + (num_workers - 1) * 64
+    mm_worker_f32_weights_f32_avx2_naive(main_start, main_end, main_ctx)
+    thread_pool_wait()
+}
+
+// ---------------------------------------------------------------------------
 // Public entry: matmul with BF16 weights, F32 activations, Kahan on/off.
 //
 // out[M × N] = x[M × K] · wᵀ, `w` stored row-major [N × K] in BF16.
