@@ -854,6 +854,201 @@ fn _emit_rmsnorm_wg_gated_inline(uint64 in_kofs, uint64 norm_kofs,
     asm_patch_u32(gate_cmp_pos + 1, 0xBFA20000 | (body_dwords & 0xFFFF))
 }
 
+// _emit_rmsnorm_cputree_wg_gated_inline — CPU-matching reduction-tree
+// variant of _emit_rmsnorm_wg_gated_inline.  Phase 2.5 of the Llama-3B
+// bit-exact plan (2026-05-14).
+//
+// Same outer scaffolding (WG-0 gate, kernarg loads, per-stream byte
+// offset, lane-0 LDS scale broadcast, per-element write-back) as
+// _emit_rmsnorm_wg_gated_inline.  ONLY the SSQ math changes to match
+// CPU `qwen3_dot_avx2(in, in, HIDDEN)` (std/qwen3.mlr:639) exactly:
+//   - 8 active lanes (exec_lo = 0xFF), stride-8 K partition
+//   - v_mul_f32 then v_add_f32 (TWO roundings; matches CPU vmulps+vaddps),
+//     NOT v_fmac_f32 (one rounding) as the base helper uses.
+//   - 3-level XOR-bpermute reduce in offset order [4, 1, 2]
+//     (matches CPU's vextractf128 + 2× vhaddps reduction tree)
+//
+// Without these three changes, ssq drifts ~1 ULP vs CPU, which amplifies
+// to ~10 ULP in phase-3 b_attn_q_g (rmsnorm amplifies via 1/sqrt(ssq)).
+//
+// Caller contract: only invoke when MEGA_HIDDEN == 3072 (Llama-3B).  All
+// other archs keep the proven 5-level wave32 reduce.
+//
+// VGPR layout — mirrors base helper EXCEPT adds v8 as v_mul intermediate.
+// The base helper uses v8 only as a transient store-addr in lane-0 LDS
+// broadcast (set to 0 inline) and re-set to 0 in the output loop.  We use
+// the same recycle pattern — v8 carries x*x during the K-loop and is
+// trampled (set to 0) before any LDS store.
+fn _emit_rmsnorm_cputree_wg_gated_inline(uint64 in_kofs, uint64 norm_kofs,
+                                          uint64 out_kofs, uint64 wg_id_sgpr,
+                                          uint64 stream_byte_offset) {
+    uint64 gate_cmp_pos = asm_text_len / 4
+
+    // ── WG-0 gate ─────────────────────────────────────────────────────
+    uint64 cmp_word = 0xBF078000 | (wg_id_sgpr & 0xFF)
+    asm_u32(cmp_word)
+    asm_s_cbranch_scc1(0)   // patched at end
+
+    // ── Load 3 pointer args ────────────────────────────────────────────
+    asm_s_load_b64_off(1, 0, in_kofs)
+    asm_s_load_b64_off(2, 0, norm_kofs)
+    asm_s_load_b64_off(3, 0, out_kofs)
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // ── Optional per-stream base-pointer adjust ───────────────────────
+    if stream_byte_offset != 0 {
+        asm_u32(0x8002FF02); asm_u32(stream_byte_offset)
+        asm_u32(0x82038003)
+        asm_u32(0x8006FF06); asm_u32(stream_byte_offset)
+        asm_u32(0x82078007)
+    }
+
+    // ── Init ──────────────────────────────────────────────────────────
+    // v2 = 0.0f (ssq accumulator) — set with FULL EXEC so lanes 8..31
+    // keep v2=0 and contribute identity to the wave-XOR-bpermute reduce.
+    asm_v_mov_b32_inline_u(2, 0)
+    asm_v_lshlrev_b32_imm(9, 2, 0)        // v9 = lane*4
+    asm_v_mov_b32_inline_u(4, 0)
+    asm_v_add_co_u32_vcc_sv(3, 2, 9)      // v3 = input_lo + lane*4
+    asm_v_add_co_ci_u32_null_sv_vcc(4, 3, 4)
+
+    // ── Narrow EXEC to lanes 0..7 ─────────────────────────────────────
+    // Lanes 8..31 keep their v2=0 and skip the K-loop.  Mirrors the
+    // exec narrow in _emit_gemv_cputree_bf16_padded_strided_inline:1484.
+    asm_s_mov_b32_lit32(0x7E, 0x000000FF)
+
+    // ── SSQ loop (HIDDEN/8 iters: ssq += input[lane + i*8]^2) ─────────
+    asm_s_mov_b32_inline_imm(12, MEGA_HIDDEN / 8)
+
+    uint64 loop_ssq_top = asm_text_len / 4
+
+    // global_load_b32 v5, v[3:4], off
+    asm_u32(0xDC520000)
+    asm_u32(0x057C0003)
+    asm_s_waitcnt_vmcnt_zero()
+    // v_mul_f32_e32 v8, v5, v5  (single rounding 1: v8 = x*x)
+    //   VOP2 op 0x08: (8<<25)|(vdst=8<<17)|(vsrc1=v5=5<<9)|(src0=v5=0x105)
+    //   = 0x10000000 | 0x00100000 | 0x00000A00 | 0x105 = 0x10100B05
+    asm_u32(0x10100B05)
+    // v_add_f32_e32 v2, v2, v8  (single rounding 2: acc += x*x)
+    //   VOP2 op 0x03: (3<<25)|(vdst=2<<17)|(vsrc1=v8=8<<9)|(src0=v2=0x102)
+    //   = 0x06000000 | 0x00040000 | 0x00001000 | 0x102 = 0x06041102
+    asm_u32(0x06041102)
+    // Advance ptr by 32 bytes (8 floats × 4 bytes): v[3:4] += 32
+    asm_u32(0xD7006A03)
+    asm_u32(0x000206FF)
+    asm_u32(32)
+    asm_u32(0xD5207C04)
+    asm_u32(0x01AA0880)
+    asm_s_sub_u32_imm(12, 12, 1)
+    asm_s_cmp_eq_u32(12, 0x80)
+    uint64 loop_ssq_dwords = (asm_text_len / 4) - loop_ssq_top
+    uint64 back_simm16 = (0 - loop_ssq_dwords - 1) & 0xFFFF
+    asm_s_cbranch_scc0(back_simm16)
+
+    // ── Restore EXEC to full wave32 for cross-lane reduce + write-back ─
+    asm_s_mov_b32_lit32(0x7E, 0xFFFFFFFF)
+
+    // ── CPU-tree 3-level reduce, XOR offsets [4, 1, 2] in that order ──
+    // Per level: v_xor_b32 v6, off, v0 ; v_lshlrev_b32 v6, 2, v6 ;
+    //            ds_bpermute_b32 v7, v6, v2 ; waitcnt lgkm(0) ;
+    //            v_add_f32_e32 v2, v2, v7
+    // v_add_f32 v2, v2, v7: (3<<25)|(2<<17)|(7<<9)|(0x100|2) = 0x06040F02
+    uint64 add_word = 0x06000000 | (2 << 17) | (7 << 9) | (0x100 | 2)
+
+    // Step 1: offset 4
+    _emit_v_xor_b32_e32_imm_v0(6, 4)
+    asm_v_lshlrev_b32_imm(6, 2, 6)
+    asm_ds_bpermute_b32(7, 6, 2)
+    asm_s_waitcnt_lgkmcnt_zero()
+    asm_u32(add_word)
+
+    // Step 2: offset 1
+    _emit_v_xor_b32_e32_imm_v0(6, 1)
+    asm_v_lshlrev_b32_imm(6, 2, 6)
+    asm_ds_bpermute_b32(7, 6, 2)
+    asm_s_waitcnt_lgkmcnt_zero()
+    asm_u32(add_word)
+
+    // Step 3: offset 2
+    _emit_v_xor_b32_e32_imm_v0(6, 2)
+    asm_v_lshlrev_b32_imm(6, 2, 6)
+    asm_ds_bpermute_b32(7, 6, 2)
+    asm_s_waitcnt_lgkmcnt_zero()
+    asm_u32(add_word)
+
+    // ── Lane-0: compute scale, store to LDS[512] ─────────────────────
+    asm_s_mov_b32(12, 0x7E)               // s12 = exec_lo
+    asm_u32(0x7D940080)                    // v_cmpx_eq_u32_e32 0, v0
+    asm_s_mov_b32_lit32(14, MEGA_INV_HIDDEN_BITS)
+    asm_u32(0x1004040E)                    // v_mul_f32 v2, s14, v2
+    asm_s_mov_b32_lit32(14, MEGA_RMSNORM_EPS_BITS)
+    asm_u32(0x0604040E)                    // v_add_f32 v2, s14, v2
+    asm_u32(0x7E045D02)                    // v_rsq_f32 v2, v2
+    asm_v_mov_b32_inline_u(8, 0)           // v8 = 0 (LDS store addr)
+    asm_u32(0xD8340200)
+    asm_u32(0x00000208)                    // ds_store_b32 v8, v2 offset:512
+    asm_s_mov_b32(0x7E, 12)                // restore exec_lo
+
+    // ── Barrier + LDS broadcast ───────────────────────────────────────
+    asm_s_waitcnt_lgkmcnt_zero()
+    asm_s_barrier()
+    asm_v_mov_b32_inline_u(8, 0)
+    asm_u32(0xD8D80200)
+    asm_u32(0x02000008)                    // ds_load_b32 v2, v8 offset:512
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // ── Output loop (HIDDEN/32 iters: out[i] = in[i] * scale * norm[i]) ─
+    // Pointwise elementwise scale — unchanged from base helper.  Uses
+    // FULL wave32, processing HIDDEN/32 elements per lane stride-32.
+    asm_v_mov_b32_inline_u(4, 0)
+    asm_v_add_co_u32_vcc_sv(3, 2, 9)
+    asm_v_add_co_ci_u32_null_sv_vcc(4, 3, 4)
+    asm_v_mov_b32_inline_u(6, 0)
+    asm_v_add_co_u32_vcc_sv(5, 4, 9)
+    asm_v_add_co_ci_u32_null_sv_vcc(6, 5, 6)
+    asm_v_mov_b32_inline_u(8, 0)
+    asm_v_add_co_u32_vcc_sv(7, 6, 9)
+    asm_v_add_co_ci_u32_null_sv_vcc(8, 7, 8)
+    asm_s_mov_b32_inline_imm(12, MEGA_HIDDEN / 32)
+
+    uint64 loop_out_top = asm_text_len / 4
+
+    asm_u32(0xDC520000)
+    asm_u32(0x0A7C0003)
+    asm_u32(0xDC520000)
+    asm_u32(0x0B7C0005)
+    asm_s_waitcnt_vmcnt_zero()
+    asm_u32(0x10141502)
+    asm_u32(0x1014170A)
+    asm_u32(0xDC6A0000)
+    asm_u32(0x007C0A07)
+    asm_u32(0xD7006A03)
+    asm_u32(0x000206FF)
+    asm_u32(128)
+    asm_u32(0xD5207C04)
+    asm_u32(0x01AA0880)
+    asm_u32(0xD7006A05)
+    asm_u32(0x00020AFF)
+    asm_u32(128)
+    asm_u32(0xD5207C06)
+    asm_u32(0x01AA0C80)
+    asm_u32(0xD7006A07)
+    asm_u32(0x00020EFF)
+    asm_u32(128)
+    asm_u32(0xD5207C08)
+    asm_u32(0x01AA1080)
+    asm_s_sub_u32_imm(12, 12, 1)
+    asm_s_cmp_eq_u32(12, 0x80)
+    uint64 loop_out_dwords = (asm_text_len / 4) - loop_out_top
+    uint64 back_out_simm16 = (0 - loop_out_dwords - 1) & 0xFFFF
+    asm_s_cbranch_scc0(back_out_simm16)
+
+    // ── Patch the WG-0 skip-branch simm16 ─────────────────────────────
+    uint64 body_dwords = (asm_text_len / 4) - (gate_cmp_pos + 2)
+    asm_patch_u32(gate_cmp_pos + 1, 0xBFA20000 | (body_dwords & 0xFFFF))
+}
+
 // _emit_rmsnorm_wg_gated_m4_inline — speck4 m4 wrapper around the
 // WG-0-gated rmsnorm body.  Emits 4 sequential rmsnorm bodies for streams
 // m=0..3.  For each stream m, the input/output base pointers are offset
@@ -5037,7 +5232,16 @@ fn mega_emit_stub_kernel(uint64 kname_ptr, uint64 nl, uint64 body_node) -> uint6
     //                 out=b_x_norm_g(arg 17, 0x88).  wg_id_x is still in s15
     //                 (no prior phase has clobbered it yet).
     if _body_has_rmsnorm_wg0_marker(body_node) != 0 {
-        _emit_rmsnorm_wg_gated_inline(0x00, 0x30, 0x88, 15, 0)
+        // Phase 2.5 (2026-05-14): Llama-3B routes to the CPU-matching
+        // reduction tree variant so b_x_norm_g is bit-exact vs the CPU
+        // qwen3_dot_avx2 ssq reduction (8-lane stride-8 + 3-level
+        // XOR-bpermute reduce + v_mul+v_add two-rounding).  All other
+        // archs keep the proven 5-level wave32 reduce.
+        if MEGA_HIDDEN == 3072 {
+            _emit_rmsnorm_cputree_wg_gated_inline(0x00, 0x30, 0x88, 15, 0)
+        } else {
+            _emit_rmsnorm_wg_gated_inline(0x00, 0x30, 0x88, 15, 0)
+        }
     } else {
         asm_u32(0xBF800000)   // s_nop 0 (phase 1 stub)
     }
@@ -5143,7 +5347,12 @@ fn mega_emit_stub_kernel(uint64 kname_ptr, uint64 nl, uint64 body_node) -> uint6
     // Marker recognized inline (no `_body_has_post_norm_marker` wrapper) —
     // same fn-table-cap discipline as oproj_residual_marker at slice 4.19.5.
     if _body_has_marker(body_node, "post_norm_marker", 16) != 0 {
-        _emit_rmsnorm_wg_gated_inline(0xA0, 0x38, 0xA8, 28, 0)
+        // Phase 2.5 (2026-05-14): same Llama-3B cputree gating as phase 1.
+        if MEGA_HIDDEN == 3072 {
+            _emit_rmsnorm_cputree_wg_gated_inline(0xA0, 0x38, 0xA8, 28, 0)
+        } else {
+            _emit_rmsnorm_wg_gated_inline(0xA0, 0x38, 0xA8, 28, 0)
+        }
     } else {
         asm_u32(0xBF800000)   // s_nop 0 (phase 11 stub)
     }
