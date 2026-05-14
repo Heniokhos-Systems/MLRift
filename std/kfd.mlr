@@ -289,6 +289,16 @@ static uint64 _kfd_alloc_size    = 0
 static uint64 _kfd_alloc_host    = 0
 static uint64 _kfd_alloc_kind    = 0
 
+// Per-pool placement counters surfaced by kfd_print_alloc_summary().
+static uint64 _kfd_stat_vram_hv_ok_n     = 0
+static uint64 _kfd_stat_vram_hv_ok_bytes = 0
+static uint64 _kfd_stat_vram_only_n      = 0
+static uint64 _kfd_stat_vram_only_bytes  = 0
+static uint64 _kfd_stat_gtt_n            = 0
+static uint64 _kfd_stat_gtt_bytes        = 0
+static uint64 _kfd_stat_spill_n          = 0
+static uint64 _kfd_stat_spill_bytes      = 0
+
 fn _kfd_alloc_tab_ensure() {
     if _kfd_alloc_tab_cap != 0 { return }
     uint64 cap = 65536
@@ -423,6 +433,8 @@ fn dev_try_alloc_vram(uint64 nbytes) -> uint64 {
         return 0
     }
     _kfd_alloc_track_kind(va, handle, nbytes, 0, 0)        // kind=0: VRAM-only
+    _kfd_stat_vram_only_n     = _kfd_stat_vram_only_n + 1
+    _kfd_stat_vram_only_bytes = _kfd_stat_vram_only_bytes + nbytes
     return va
 }
 
@@ -456,6 +468,8 @@ fn dev_try_alloc_host_visible(uint64 nbytes) -> uint64 {
         return 0
     }
     _kfd_alloc_track_kind(va, handle, nbytes, host, 2)     // kind=2: GTT
+    _kfd_stat_gtt_n     = _kfd_stat_gtt_n + 1
+    _kfd_stat_gtt_bytes = _kfd_stat_gtt_bytes + nbytes
     return va
 }
 
@@ -500,17 +514,79 @@ fn dev_try_alloc_vram_hostvis(uint64 nbytes) -> uint64 {
         return 0
     }
     _kfd_alloc_track_kind(va, handle, nbytes, host, 1)     // kind=1: VRAM-host-vis
+    _kfd_stat_vram_hv_ok_n     = _kfd_stat_vram_hv_ok_n + 1
+    _kfd_stat_vram_hv_ok_bytes = _kfd_stat_vram_hv_ok_bytes + nbytes
     return va
 }
 
 // Smart allocator with host-visible preference: try host-visible VRAM
 // first (HBM bandwidth on device, ReBar-mapped on host), then host-
 // visible GTT (system RAM mapped to GPU). Always returns a buffer
-// with a real host pointer, so hipMemcpy keeps working.
+// with a real host pointer, so hipMemcpy keeps working.  When the
+// VRAM-hv attempt fails (typically ENOMEM once BAR1 / VRAM fills),
+// the spill to GTT is recorded in _kfd_stat_spill_* so the eventual
+// kfd_print_alloc_summary() can surface "X allocs spilled to GTT"
+// rather than letting the slowdown look mysterious.
 fn dev_alloc_smart_hostvis(uint64 nbytes) -> uint64 {
     uint64 va = dev_try_alloc_vram_hostvis(nbytes)
     if va != 0 { return va }
-    return dev_try_alloc_host_visible(nbytes)
+    uint64 gtt_va = dev_try_alloc_host_visible(nbytes)
+    if gtt_va != 0 {
+        _kfd_stat_spill_n     = _kfd_stat_spill_n + 1
+        _kfd_stat_spill_bytes = _kfd_stat_spill_bytes + nbytes
+        // Reclassify the placement: the GTT helper already incremented
+        // _kfd_stat_gtt_*, but this allocation was a SPILL (caller
+        // wanted VRAM and didn't get it), not an intentional GTT
+        // placement (KV cache, residuals). Subtract from gtt_* so the
+        // two counters partition the workload cleanly.
+        _kfd_stat_gtt_n     = _kfd_stat_gtt_n - 1
+        _kfd_stat_gtt_bytes = _kfd_stat_gtt_bytes - nbytes
+    }
+    return gtt_va
+}
+
+// Reset all alloc-placement counters. Useful for benchmarking when a
+// driver makes many tiny allocations at startup that aren't part of the
+// hot-path workload (e.g., the KFD scratch buffer itself).  Not called
+// automatically; callers can use it after init() to baseline the stats.
+fn kfd_reset_alloc_stats() {
+    _kfd_stat_vram_hv_ok_n     = 0
+    _kfd_stat_vram_hv_ok_bytes = 0
+    _kfd_stat_vram_only_n      = 0
+    _kfd_stat_vram_only_bytes  = 0
+    _kfd_stat_gtt_n            = 0
+    _kfd_stat_gtt_bytes        = 0
+    _kfd_stat_spill_n          = 0
+    _kfd_stat_spill_bytes      = 0
+}
+
+// Print a 1-line summary of where GPU allocations actually landed.
+// Called by hipkfd_teardown() so every launcher exit prints its own
+// VRAM/GTT split without the driver having to instrument.
+fn kfd_print_alloc_summary() {
+    uint64 total_vram_n     = _kfd_stat_vram_hv_ok_n + _kfd_stat_vram_only_n
+    uint64 total_vram_bytes = _kfd_stat_vram_hv_ok_bytes + _kfd_stat_vram_only_bytes
+    uint64 total_gtt_n      = _kfd_stat_gtt_n + _kfd_stat_spill_n
+    uint64 total_gtt_bytes  = _kfd_stat_gtt_bytes + _kfd_stat_spill_bytes
+    if total_vram_n == 0 && total_gtt_n == 0 { return }
+    uint64 mib = 1024 * 1024
+    _kfd_eprint_str("[KFD alloc summary] VRAM: ")
+    _kfd_eprint_u32(total_vram_n)
+    _kfd_eprint_str(" allocs / ")
+    _kfd_eprint_u32(total_vram_bytes / mib)
+    _kfd_eprint_str(" MiB  ·  GTT: ")
+    _kfd_eprint_u32(total_gtt_n)
+    _kfd_eprint_str(" allocs / ")
+    _kfd_eprint_u32(total_gtt_bytes / mib)
+    _kfd_eprint_str(" MiB")
+    if _kfd_stat_spill_n != 0 {
+        _kfd_eprint_str("  (")
+        _kfd_eprint_u32(_kfd_stat_spill_n)
+        _kfd_eprint_str(" spilled from VRAM, ")
+        _kfd_eprint_u32(_kfd_stat_spill_bytes / mib)
+        _kfd_eprint_str(" MiB — PCIe-bound, expect slowdown)")
+    }
+    _kfd_eprint_str("\n")
 }
 
 // Smart allocator: try VRAM first, fall back to host-visible GTT (i.e.
