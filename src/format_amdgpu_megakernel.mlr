@@ -111,6 +111,24 @@ static uint64 MEGA_HIDDEN_F32_BITS      = 0x44800000  // Qwen3 default (1024.0f)
 // flag — only the Llama-3B-gated phase-3/9/13 sites consult it.
 static uint64 MEGA_WEIGHT_DTYPE          = 0          // 0=bf16, 1=f32
 
+// Slice 8.3 path-B (2026-05-14) — phase-7 softmax `v_exp_f32` selector.
+// Default 0 = hardware `v_exp_f32_e32 v22, v20` (single VOP1 op; ≈1 ULP).
+// Set to 1 by `emit_amdgpu_llama_3b_megakernel_v2_swexp_blob` (and the
+// combined fp32+swexp variant) to emit the CPU-matching minimax exp
+// polynomial as ~22 ISA ops inline.  The flag is reset to 0 after each
+// such emit so subsequent default emits stay byte-identical.  All other
+// archs (Qwen3 / Llama-1B / Mistral) IGNORE this flag — the phase-7 emit
+// site additionally gates on `MEGA_HIDDEN == 3072` so a stray write to
+// this global cannot perturb the proven 20/20 sister-arch byte patterns.
+//
+// The polynomial mirrors `exp_f32_fast` in std/qwen3.mlr (lines 991-1054)
+// bit-for-bit: 5-term Horner schedule with constants
+//   c5=0x3AAEC3CD, c4=0x3C1D6AF5, c3=0x3D635847, c2=0x3E75FDF0, c1=0x3F317218,
+// argument-reduction via floor(|r|+0.5) using v_cvt_i32_f32 (truncation of
+// non-negative = floor) and explicit sign tracking via the input's sign
+// bit, and 2^n via manual exponent bit-injection (`(127±n_abs)<<23`).
+static uint64 MEGA_SOFTWARE_EXP         = 0          // 0=hw v_exp_f32, 1=poly
+
 // ── Slice 5.0 — arch setters + name-dispatch + bit-math helpers ───────────
 
 fn mega_set_arch_qwen3_06b() {
@@ -201,6 +219,15 @@ fn mega_set_arch_mistral_7b() {
 // bf16 emit path stays byte-identical.
 fn mega_set_weight_dtype(uint64 dtype) {
     MEGA_WEIGHT_DTYPE = dtype
+}
+
+// Slice 8.3 path-B (2026-05-14) — set the software-exp gate for the Llama-3B
+// phase-7 softmax.  Default 0 (hardware v_exp_f32); the swexp emit blobs
+// flip this to 1 before running the multi-phase body and reset it to 0
+// after, so the default bf16 emit path stays byte-identical to the pre-B
+// baseline.
+fn mega_set_software_exp(uint64 enable) {
+    MEGA_SOFTWARE_EXP = enable
 }
 
 // Returns the 32-bit f32 bit pattern of 1.0f/n for n a power of 2 in
@@ -4833,6 +4860,151 @@ fn _emit_phase5_qkv_split_qknorm_rope_speck4_inline() {
         0xBFA00000 | ((phase5_done - k_done_pos - 1) & 0xFFFF))
 }
 
+// ── Slice 8.3 path-B (2026-05-14) — software-exp polynomial helper ────────
+//
+// _emit_phase7_software_exp_poly_v22_from_v20 emits the CPU `exp_f32_fast`
+// minimax polynomial inline as ~22 ISA dwords, replacing the single
+// `v_exp_f32_e32 v22, v20` (0x7E2C4B14) when MEGA_SOFTWARE_EXP=1 AND
+// MEGA_HIDDEN=3072 (Llama-3B only).
+//
+// Input  v20 = r = (dot * scale_attn - m) * log2(e)         (CPU's `r = x * log2_e`)
+// Output v22 = exp(exp_arg) = 2^r
+// Scratch v25, v26, v27, v28, v29   (all dead between v_exp and the LDS write
+//   at line 5237 in base phase 7; v25 is overwritten by the immediately-
+//   following v_lshlrev_b32 anyway).  Phase 7 already reserves up through
+//   v25; v26..v29 are above the high-water mark and well within rsrc1=
+//   0xE0AF0006 (56 VGPRs).
+//
+// CPU reference: std/qwen3.mlr lines 991-1054.
+//   Saturation: x ∈ [-87, +88] (input domain).  Translated to post-log2e
+//     domain: r_min = -87*log2e = 0xC2FB0768, r_max = +88*log2e = 0x42FDEA11
+//     (numpy f32 mul of the saturated x by the same log2e bits).
+//   Argument reduction: r_abs = |r|; n_abs = floor(r_abs + 0.5); n_f =
+//     n_abs * sign(r);  f = r - n_f ∈ [-0.5, 0.5].
+//   Horner poly: p = ((((c5*f + c4)*f + c3)*f + c2)*f + c1)*f + 1.0
+//     c5=0x3AAEC3CD (0.00133335)
+//     c4=0x3C1D6AF5 (0.00960802)
+//     c3=0x3D635847 (0.05550411)
+//     c2=0x3E75FDF0 (0.24022651)
+//     c1=0x3F317218 (0.69314718)
+//   2^n via bit-injection: biased = clamp(127 + n_signed, 0, 254); twoN_bits
+//     = biased << 23; twoN = reinterpret_f32(twoN_bits).
+//   Result: w = twoN * p.
+//
+// Sign handling: rather than the CPU's explicit `neg` flag branch, we extract
+// the sign bit of r and XOR it into n_abs_f to produce n_f.  Result is bit-
+// identical to CPU for all finite inputs (verified: for r=±0 / negative-zero
+// edge case, both methods yield n_f=±0 with matching sign).
+//
+// Caller contract: emit ONLY when (MEGA_HIDDEN == 3072 && MEGA_SOFTWARE_EXP
+// == 1).  All other archs / configurations must keep the 1-dword 0x7E2C4B14.
+fn _emit_phase7_software_exp_poly_v22_from_v20() {
+    // ── Step 1: saturate v20 to CPU's post-log2e range ──────────────────
+    // v_max_f32_e32 v20, lit32(r_min), v20  (VOP2 op 0x10)
+    //   word = (0x10<<25)|(20<<17)|(20<<9)|0xFF + lit
+    asm_u32(0x202828FF)
+    asm_u32(0xC2FB0768)        // r_min = -87 * log2e (f32)
+    // v_min_f32_e32 v20, lit32(r_max), v20  (VOP2 op 0x0F)
+    asm_u32(0x1E2828FF)
+    asm_u32(0x42FDEA11)        // r_max = +88 * log2e (f32)
+
+    // ── Step 2: extract sign / abs of r ─────────────────────────────────
+    // v25 = r & 0x80000000  (sign bit, in [0, 0x80000000])
+    //   v_and_b32_e64 v25, lit32, v20  (VOP3 op 0x1B; 3 dwords)
+    asm_u32(0xD51B0019)
+    asm_u32(0x000228FF)
+    asm_u32(0x80000000)
+    // v26 = r & 0x7FFFFFFF  (= |r| for all finite r; -0 → +0)
+    //   v_and_b32_e64 v26, lit32, v20  (3 dwords)
+    asm_u32(0xD51B001A)
+    asm_u32(0x000228FF)
+    asm_u32(0x7FFFFFFF)
+
+    // ── Step 3: n_abs = floor(|r| + 0.5)  via add+truncate ──────────────
+    // v27 = |r| + 0.5   (v_add_f32_e32 v27, 0.5, v26 — inline-0.5 form 0xF0)
+    //   word = (3<<25)|(27<<17)|(26<<9)|0xF0 = 0x063634F0  (verified llvm-mc)
+    asm_u32(0x063634F0)
+    // v27 (i32) = trunc(v27)  (v_cvt_i32_f32_e32 v27, v27) — for non-neg = floor
+    asm_u32(0x7E36111B)
+    // v28 (f32) = float(v27)  (v_cvt_f32_i32_e32 v28, v27)
+    asm_u32(0x7E380B1B)
+
+    // ── Step 4: apply sign → n_f = sign(r) * n_abs_f  via XOR ───────────
+    // v28 = v25 ^ v28  (XOR the sign bit into n_abs_f's sign field)
+    //   v_xor_b32_e32 v28, v25, v28  (VOP2 op 0x1D)
+    asm_u32(0x3A383919)
+
+    // ── Step 5: f = r - n_f → v20  (v20 was r; now becomes f ∈ [-0.5, 0.5])
+    // v_subrev_f32_e32 v20, v28, v20  (VOP2 op 0x05)
+    //   word = (5<<25)|(20<<17)|(28<<9)|(0x100|20) = 0x0A28391C ? — verified above as 0x0A28291C
+    //   Actually the encoding has v_src1 in the high bits since e32 layout
+    //   is: src1<<9 | src0_enc. For v_subrev: dst = src1 - src0 (reverse).
+    //   We want v20 = v20 - v28 → result = src1 - src0 with src1=v20, src0=v28.
+    //   word = (5<<25)|(20<<17)|(20<<9)|(0x100|28) = 0x0A28291C  ✓
+    asm_u32(0x0A28291C)
+
+    // ── Step 6: 5-term Horner polynomial p = (((((c5*f)+c4)*f+c3)*f+c2)*f+c1)*f + 1 ──
+    // CRITICAL: emit as SEPARATE v_mul_f32 + v_add_f32 (NOT v_fma_f32) so that
+    // each Horner stage has TWO independent f32 roundings — matching CPU's
+    // x86 MULSS + ADDSS sequence.  MLRift's FFMA peephole (src/ir.mlr) is
+    // gated to fk==1 (f64 only), so CPU `c5*f + c4` compiles to mulss+addss
+    // = 2 roundings.  A fused v_fma_f32 here would yield 1 rounding instead
+    // and diverge in the low bit.
+    //
+    // v29 = c5 literal  (v_mov_b32_e32 v29, lit32)
+    //   word = (0x3F<<25)|(29<<17)|(0x02<<9)|0xFF = 0x7E3A02FF
+    asm_u32(0x7E3A02FF)
+    asm_u32(0x3AAEC3CD)            // c5
+    // Encodings (verified llvm-mc gfx1100):
+    //   v_mul_f32_e32 v29, v29, v20  : 0x103A291D
+    //   v_add_f32_e32 v29, lit, v29  : 0x063A3AFF + lit
+    // v29 = v29 * f   then   v29 += c4
+    asm_u32(0x103A291D); asm_u32(0x063A3AFF); asm_u32(0x3C1D6AF5)   // c4
+    // v29 = v29 * f   then   v29 += c3
+    asm_u32(0x103A291D); asm_u32(0x063A3AFF); asm_u32(0x3D635847)   // c3
+    // v29 = v29 * f   then   v29 += c2
+    asm_u32(0x103A291D); asm_u32(0x063A3AFF); asm_u32(0x3E75FDF0)   // c2
+    // v29 = v29 * f   then   v29 += c1
+    asm_u32(0x103A291D); asm_u32(0x063A3AFF); asm_u32(0x3F317218)   // c1
+    // v29 = v29 * f   then   v29 += 1.0  (use inline 1.0 encoding 0xF2 in lit slot? — no, use lit32 to preserve identical 2-rounding semantics)
+    asm_u32(0x103A291D); asm_u32(0x063A3AFF); asm_u32(0x3F800000)   // 1.0
+
+    // ── Step 7: 2^n via biased-exponent bit injection ───────────────────
+    // v27 currently holds n_abs as i32 (non-neg).  Apply sign: if r<0 then
+    // n_signed = -n_abs else n_signed = +n_abs.  v25 holds 0x80000000 (neg)
+    // or 0 (pos).  We need to negate v27 when v25 != 0.  Branchless:
+    //   mask = arithmetic-shift-right of v25 by 31 → 0xFFFFFFFF if neg, 0 if pos
+    //   n_signed = (v27 ^ mask) - mask
+    // Even simpler path: extract the sign bit's integer value (0 or 1) and
+    // do `n_signed = v27 - 2*sign*v27 + sign*0 = ...`  Cleanest: re-derive
+    // from n_f (v28) which already has the correct sign and integer value:
+    //   v27 = v_cvt_i32_f32(v28)   ← rounds toward zero; v28 is integer-valued
+    // This re-uses the conversion path and is cleaner.  v_cvt_i32_f32 of an
+    // integer-valued float is exact (no rounding error).
+    asm_u32(0x7E36111C)        // v_cvt_i32_f32_e32 v27, v28
+
+    // biased = v27 + 127   (v_add_nc_u32_e32 v27, 0x7F, v27)
+    //   word = (0x25<<25)|(27<<17)|(27<<9)|0xFF = 0x4A3636FF; lit = 0x7F
+    asm_u32(0x4A3636FF)
+    asm_u32(0x0000007F)
+
+    // biased = max(biased, 0)   (v_max_i32_e32 v27, 0, v27)
+    //   word = (0x12<<25)|(27<<17)|(27<<9)|0x80 = 0x24363680  ✓ (probe matched)
+    asm_u32(0x24363680)
+    // biased = min(biased, 254)   (v_min_i32_e32 v27, 0xFE, v27)
+    asm_u32(0x223636FF)
+    asm_u32(0x000000FE)
+
+    // twoN_bits = biased << 23   (v_lshlrev_b32_e32 v27, 23, v27)
+    //   word = (0x18<<25)|(27<<17)|(27<<9)|(0x80|23) = 0x30363697  ✓
+    asm_u32(0x30363697)
+
+    // ── Step 8: result v22 = twoN * p   (reinterpret v27 as f32 directly) ──
+    // v_mul_f32_e32 v22, v27, v29  (VOP2 op 0x08)
+    //   word = (8<<25)|(22<<17)|(29<<9)|(0x100|27) = 0x102C3B1B  ✓
+    asm_u32(0x102C3B1B)
+}
+
 // ── Phase 7 inline ISA emitter (attn_decode-coop) ─────────────────────────
 //
 // _emit_phase7_attn_decode_coop_inline — emits the cooperative-WG attn_decode
@@ -5223,9 +5395,17 @@ fn _emit_phase7_attn_decode_coop_inline() {
     asm_u32(0x3FB8AA3B)
 
     // ── w = exp(exp_arg) → v22 ───────────────────────────────────────────
-    // v_exp_f32_e32 v22, v20  (VOP1 op 0x25)
-    //   word = (0x3F<<25)|(22<<17)|(0x25<<9)|(0x100|20) = 0x7E000000|0x002C0000|0x00004A00|0x114 = 0x7E2C4B14
-    asm_u32(0x7E2C4B14)
+    // Default (MEGA_SOFTWARE_EXP=0): single hardware op v_exp_f32 (≈1 ULP).
+    //   v_exp_f32_e32 v22, v20  (VOP1 op 0x25)
+    //   word = (0x3F<<25)|(22<<17)|(0x25<<9)|(0x100|20) = 0x7E2C4B14
+    // Slice 8.3 path-B: when MEGA_HIDDEN=3072 (Llama-3B only) AND
+    // MEGA_SOFTWARE_EXP=1, emit the ~22-dword CPU-matching minimax poly
+    // instead.  All other archs / configurations stay on the hardware op.
+    if MEGA_HIDDEN == 3072 && MEGA_SOFTWARE_EXP == 1 {
+        _emit_phase7_software_exp_poly_v22_from_v20()
+    } else {
+        asm_u32(0x7E2C4B14)
+    }
 
     // ── ssum += w  (v23 += v22) ──────────────────────────────────────────
     // v_add_f32_e32 v23, v23, v22  (VOP2 op 0x03)

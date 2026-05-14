@@ -20436,6 +20436,224 @@ fn emit_amdgpu_llama_3b_megakernel_v2_f32_blob(uint64 out_path) -> uint64 {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// Slice 8.3 path-B — Llama-3.2-3B-Instruct M=1 mega-kernel, software-exp variant.
+//
+// Mirror of emit_amdgpu_llama_3b_megakernel_blob_v2 above, but flips
+// the MEGA_SOFTWARE_EXP gate to 1 before emitting so phase 7's softmax
+// `v_exp_f32` is replaced by the ~22-dword CPU-matching minimax exp
+// polynomial.  Weights remain bf16 (MEGA_WEIGHT_DTYPE stays at 0).
+//
+// MEGA_SOFTWARE_EXP is reset to 0 after emit so a subsequent default
+// emit stays byte-identical to the pre-B baseline.  Phase-7 internally
+// gates the polynomial on (MEGA_HIDDEN == 3072 && MEGA_SOFTWARE_EXP == 1),
+// so Qwen3 / Llama-1B / Mistral never see the polynomial path even if
+// some caller leaks MEGA_SOFTWARE_EXP=1 across emits.
+//
+// Build:
+//   ./build/mlrc --emit-amdgpu-llama-3b-megakernel-v2-swexp=/tmp/llama_3b_layer_megakernel_v2_swexp.co \
+//       examples/llm/llama_3b_layer_megakernel.mlr
+@export
+fn emit_amdgpu_llama_3b_megakernel_v2_swexp_blob(uint64 out_path) -> uint64 {
+    uint64 kname = "llama_3b_layer_megakernel"
+    uint64 klen  = 25
+
+    uint64 mlr_path = "examples/llm/llama_3b_layer_megakernel.mlr"
+    uint64 mlr_fd = file_open(mlr_path, 0)
+    if mlr_fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_llama_3b_megakernel_v2_swexp_blob: cannot open examples/llm/llama_3b_layer_megakernel.mlr\n", 102)
+        return 1
+    }
+    uint64 mlr_sz = file_size(mlr_fd)
+    if mlr_sz == 0 {
+        write(2, "emit_amdgpu_llama_3b_megakernel_v2_swexp_blob: empty .mlr file\n", 63)
+        file_close(mlr_fd)
+        return 1
+    }
+    uint64 v2_src = alloc(mlr_sz + 1)
+    file_read(mlr_fd, v2_src, mlr_sz)
+    file_close(mlr_fd)
+    uint64 v2_nul_p = v2_src + mlr_sz
+    uint8 v2_nul = 0
+    unsafe { *(v2_nul_p as uint8) = v2_nul }
+
+    uint64 v2_max_tok = 65536
+    uint64 v2_tokens = alloc(v2_max_tok * 16)
+    lexer_init(v2_src, mlr_sz, v2_tokens, v2_max_tok)
+    uint64 v2_tcount = lexer_run()
+    if v2_tcount == 0 {
+        write(2, "emit_amdgpu_llama_3b_megakernel_v2_swexp_blob: lexer produced 0 tokens -- syntax error in .mlr\n", 95)
+        return 1
+    }
+
+    ast_init(65536)
+    codegen_init(1048576, v2_src, v2_tokens)
+    parser_init(v2_tokens, v2_tcount)
+    uint64 v2_root = parse_module()
+    if v2_root == 0 {
+        write(2, "emit_amdgpu_llama_3b_megakernel_v2_swexp_blob: parse_module returned null -- syntax error in .mlr\n", 98)
+        return 1
+    }
+
+    uint64 fn_node = 0
+    uint32 wc = ast_child(v2_root)
+    while wc != 0 {
+        uint32 k = ast_kind(wc)
+        if k == 2 {
+            if ast_fn_is_kernel(wc) != 0 {
+                uint32 name_tok = ast_data1(wc)
+                if tok_matches(name_tok, "llama_3b_layer_megakernel", 25) != 0 {
+                    fn_node = wc
+                    wc = 0
+                } else {
+                    uint32 nxt = ast_next(wc)
+                    wc = nxt
+                }
+            } else {
+                uint32 nxt = ast_next(wc)
+                wc = nxt
+            }
+        } else {
+            uint32 nxt = ast_next(wc)
+            wc = nxt
+        }
+    }
+    if fn_node == 0 {
+        write(2, "emit_amdgpu_llama_3b_megakernel_v2_swexp_blob: @kernel fn llama_3b_layer_megakernel not found in .mlr\n", 102)
+        return 1
+    }
+
+    kt_reset()
+    // Slice 8.3 path-B: flip MEGA_SOFTWARE_EXP to 1 (poly) BEFORE the
+    // recognizer runs so phase 7 reads the flag correctly.  Reset to 0
+    // after emit so a subsequent default bf16 emit in the same process
+    // remains byte-identical to the pre-B baseline.
+    mega_set_software_exp(1)
+    uint64 rec_rc = recognize_megakernel_swiglu_dense_gqa(fn_node, v2_src, kname, klen)
+    mega_set_software_exp(0)
+    if rec_rc != 0 {
+        write(2, "emit_amdgpu_llama_3b_megakernel_v2_swexp_blob: recognizer shape mismatch\n", 73)
+        return 1
+    }
+
+    uint64 size = emit_amdgpu_multi_code_object()
+
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_llama_3b_megakernel_v2_swexp_blob: cannot open output\n", 66)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Slice 8.3 path-B + F3b combined — Llama-3.2-3B-Instruct M=1 mega-kernel,
+// fp32-weight + software-exp variant.  Flips BOTH MEGA_WEIGHT_DTYPE and
+// MEGA_SOFTWARE_EXP to 1 before the recognizer runs (and resets both to
+// 0 after).  This is the candidate combining path A (fp32 weights) and
+// path B (software exp) for true 20/20 bit-exactness on Llama-3B.
+//
+// Build:
+//   ./build/mlrc --emit-amdgpu-llama-3b-megakernel-v2-f32-swexp=/tmp/llama_3b_layer_megakernel_v2_f32_swexp.co \
+//       examples/llm/llama_3b_layer_megakernel.mlr
+@export
+fn emit_amdgpu_llama_3b_megakernel_v2_f32_swexp_blob(uint64 out_path) -> uint64 {
+    uint64 kname = "llama_3b_layer_megakernel"
+    uint64 klen  = 25
+
+    uint64 mlr_path = "examples/llm/llama_3b_layer_megakernel.mlr"
+    uint64 mlr_fd = file_open(mlr_path, 0)
+    if mlr_fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_llama_3b_megakernel_v2_f32_swexp_blob: cannot open examples/llm/llama_3b_layer_megakernel.mlr\n", 106)
+        return 1
+    }
+    uint64 mlr_sz = file_size(mlr_fd)
+    if mlr_sz == 0 {
+        write(2, "emit_amdgpu_llama_3b_megakernel_v2_f32_swexp_blob: empty .mlr file\n", 67)
+        file_close(mlr_fd)
+        return 1
+    }
+    uint64 v2_src = alloc(mlr_sz + 1)
+    file_read(mlr_fd, v2_src, mlr_sz)
+    file_close(mlr_fd)
+    uint64 v2_nul_p = v2_src + mlr_sz
+    uint8 v2_nul = 0
+    unsafe { *(v2_nul_p as uint8) = v2_nul }
+
+    uint64 v2_max_tok = 65536
+    uint64 v2_tokens = alloc(v2_max_tok * 16)
+    lexer_init(v2_src, mlr_sz, v2_tokens, v2_max_tok)
+    uint64 v2_tcount = lexer_run()
+    if v2_tcount == 0 {
+        write(2, "emit_amdgpu_llama_3b_megakernel_v2_f32_swexp_blob: lexer produced 0 tokens -- syntax error in .mlr\n", 99)
+        return 1
+    }
+
+    ast_init(65536)
+    codegen_init(1048576, v2_src, v2_tokens)
+    parser_init(v2_tokens, v2_tcount)
+    uint64 v2_root = parse_module()
+    if v2_root == 0 {
+        write(2, "emit_amdgpu_llama_3b_megakernel_v2_f32_swexp_blob: parse_module returned null -- syntax error in .mlr\n", 102)
+        return 1
+    }
+
+    uint64 fn_node = 0
+    uint32 wc = ast_child(v2_root)
+    while wc != 0 {
+        uint32 k = ast_kind(wc)
+        if k == 2 {
+            if ast_fn_is_kernel(wc) != 0 {
+                uint32 name_tok = ast_data1(wc)
+                if tok_matches(name_tok, "llama_3b_layer_megakernel", 25) != 0 {
+                    fn_node = wc
+                    wc = 0
+                } else {
+                    uint32 nxt = ast_next(wc)
+                    wc = nxt
+                }
+            } else {
+                uint32 nxt = ast_next(wc)
+                wc = nxt
+            }
+        } else {
+            uint32 nxt = ast_next(wc)
+            wc = nxt
+        }
+    }
+    if fn_node == 0 {
+        write(2, "emit_amdgpu_llama_3b_megakernel_v2_f32_swexp_blob: @kernel fn llama_3b_layer_megakernel not found in .mlr\n", 106)
+        return 1
+    }
+
+    kt_reset()
+    // Slice 8.3 path-B + F3b combined: enable fp32 weight loads AND
+    // the software exp polynomial in phase 7.  Reset both flags after
+    // emit so subsequent default emits stay byte-identical.
+    mega_set_weight_dtype(1)
+    mega_set_software_exp(1)
+    uint64 rec_rc = recognize_megakernel_swiglu_dense_gqa(fn_node, v2_src, kname, klen)
+    mega_set_weight_dtype(0)
+    mega_set_software_exp(0)
+    if rec_rc != 0 {
+        write(2, "emit_amdgpu_llama_3b_megakernel_v2_f32_swexp_blob: recognizer shape mismatch\n", 77)
+        return 1
+    }
+
+    uint64 size = emit_amdgpu_multi_code_object()
+
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_llama_3b_megakernel_v2_f32_swexp_blob: cannot open output\n", 70)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Slice 6.3 — Llama-3.2-1B SPECK4 (M_EFF=4) layer mega-kernel v2.
 //
 // Mirror of emit_amdgpu_qwen3_megakernel_speck4_blob_v2 above, but for
