@@ -88,6 +88,18 @@ static uint64 MEGA_RMSNORM_EPS_BITS    = 0x3727C5AC  // phase 1/11 RMSNorm eps.
 //   1/4096 = 0x39800000  (Mistral-7B)
 static uint64 MEGA_INV_HIDDEN_BITS      = 0x3A800000  // Qwen3 default (1/1024)
 
+// Slice 8.2-B Phase 2.6 (2026-05-14) — precomputed f32 bit pattern for N
+// (== MEGA_HIDDEN itself), used by the cputree rmsnorm helper to compute
+// mean_sq = ssq / N via correctly-rounded IEEE f32 div (matching CPU
+// vdivss).  Required when N is not a power of 2 (Llama-3B N=3072 → 1/N
+// is not exactly representable, so multiplying by MEGA_INV_HIDDEN_BITS
+// drifts by 1 ULP vs CPU).
+//   1024 → 0x44800000   (Qwen3)
+//   2048 → 0x45000000   (Llama-1B)
+//   3072 → 0x45400000   (Llama-3B)
+//   4096 → 0x45800000   (Mistral)
+static uint64 MEGA_HIDDEN_F32_BITS      = 0x44800000  // Qwen3 default (1024.0f)
+
 // ── Slice 5.0 — arch setters + name-dispatch + bit-math helpers ───────────
 
 fn mega_set_arch_qwen3_06b() {
@@ -103,6 +115,7 @@ fn mega_set_arch_qwen3_06b() {
     MEGA_RMSNORM_EPS_BITS= 0x3727C5AC   // 1e-5f (phase 1/11; phase-5 qknorm
                                         // hardcodes 0x358637BD = 1e-6 in slice 5.3)
     MEGA_INV_HIDDEN_BITS = 0x3A800000   // 1/1024 (slice 8.0)
+    MEGA_HIDDEN_F32_BITS = 0x44800000   // 1024.0f (slice 8.2-B phase 2.6)
 }
 
 fn mega_set_arch_llama_1b() {
@@ -117,6 +130,7 @@ fn mega_set_arch_llama_1b() {
                                   // mks8/16 for Llama is future work.
     MEGA_RMSNORM_EPS_BITS= 0x3727C5AC   // 1e-5f (Llama)
     MEGA_INV_HIDDEN_BITS = 0x3A000000   // 1/2048 (slice 8.0)
+    MEGA_HIDDEN_F32_BITS = 0x45000000   // 2048.0f (slice 8.2-B phase 2.6)
 }
 
 // Slice 8.0 (2026-05-13) — Llama-3.2-3B-Instruct.
@@ -144,6 +158,7 @@ fn mega_set_arch_llama_3b() {
                                   // is future work; M=1 base path first.
     MEGA_RMSNORM_EPS_BITS= 0x3727C5AC   // 1e-5f (Llama-3.x)
     MEGA_INV_HIDDEN_BITS = 0x39AAAAAB   // 1/3072 (slice 8.0) — non-pow2 HIDDEN
+    MEGA_HIDDEN_F32_BITS = 0x45400000   // 3072.0f (slice 8.2-B phase 2.6)
 }
 
 // Slice 7.0 (2026-05-13) — Mistral-7B-Instruct-v0.3.
@@ -166,6 +181,7 @@ fn mega_set_arch_mistral_7b() {
                                   // is future work; M=1 base path first.
     MEGA_RMSNORM_EPS_BITS= 0x3727C5AC   // 1e-5f (Mistral)
     MEGA_INV_HIDDEN_BITS = 0x39800000   // 1/4096 (slice 8.0)
+    MEGA_HIDDEN_F32_BITS = 0x45800000   // 4096.0f (slice 8.2-B phase 2.6)
 }
 
 // Returns the 32-bit f32 bit pattern of 1.0f/n for n a power of 2 in
@@ -977,14 +993,46 @@ fn _emit_rmsnorm_cputree_wg_gated_inline(uint64 in_kofs, uint64 norm_kofs,
     asm_s_waitcnt_lgkmcnt_zero()
     asm_u32(add_word)
 
-    // ── Lane-0: compute scale, store to LDS[512] ─────────────────────
-    asm_s_mov_b32(12, 0x7E)               // s12 = exec_lo
-    asm_u32(0x7D940080)                    // v_cmpx_eq_u32_e32 0, v0
-    asm_s_mov_b32_lit32(14, MEGA_INV_HIDDEN_BITS)
-    asm_u32(0x1004040E)                    // v_mul_f32 v2, s14, v2
+    // ── Lane-0: CPU-matching IEEE-correct scale pipeline ─────────────
+    // Phase 2.6 (slice 8.2-B, 2026-05-14).  The base helper uses:
+    //   v_mul_f32 v2, s14, v2        ; mean_sq = ssq * (1/N_bits)
+    //   v_add_f32 v2, s14, v2        ; mean_sq + eps
+    //   v_rsq_f32 v2, v2             ; rsqrt   (RDNA3 approx, ~1 ULP error)
+    // CPU does:
+    //   mean_sq = ssq / N            ; vdivss  (correctly rounded)
+    //   x       = mean_sq + eps      ; vaddss  (correctly rounded)
+    //   s       = sqrt_f32(x)        ; vsqrtss (correctly rounded)
+    //   rsq     = 1.0f / s           ; vdivss  (correctly rounded)
+    // Replace v_mul_f32(s14=1/N) → IEEE div by N, and v_rsq_f32 → sqrt + IEEE div.
+    //   When N is a power of 2 (Qwen3/Llama-1B/Mistral) the IEEE div by N is
+    //   bit-identical to the precomputed v_mul_f32(s14=1/N_bits) form, so the
+    //   sister archs stay 20/20.  Only Llama-3B (N=3072) actually changes
+    //   bits.  Similarly, v_sqrt_f32 + IEEE-div(1.0, sqrt) is bit-identical to
+    //   CPU's vsqrtss + vdivss, which v_rsq_f32 alone is not.
+    // VGPR usage: v2 holds ssq → rsq (final).  Scratch v10..v15 for div sequences.
+    asm_s_mov_b32(12, 0x7E)               // s12 = exec_lo (save full exec)
+    asm_u32(0x7D940080)                    // v_cmpx_eq_u32_e32 0, v0 (exec={lane 0})
+    // v_mov_b32 v10, lit32 = MEGA_HIDDEN_F32_BITS (N as f32 in VGPR for div)
+    //   VOP1 v_mov_b32_e32: (0x3F<<25) | (vdst<<17) | (0x01<<9) | src
+    //   For lit32 source: src=0xFF, then lit32 dword follows.
+    //   = 0x7E000000 | (10<<17) | (1<<9) | 0xFF = 0x7E1402FF
+    asm_u32(0x7E1402FF)
+    asm_u32(MEGA_HIDDEN_F32_BITS)
+    // IEEE-correct mean_sq = v2 (ssq) / v10 (N).  Result → v2.
+    // Scratch: v11=ds, v12=ns, v13=r, v14=r2, v15=q0.
+    asm_v_div_f32_ieee(2, 2, 10, 11, 12, 13, 14, 15)
+    // v_add_f32 v2, s14_eps, v2  (mean_sq + eps; s14 holds eps bits)
     asm_s_mov_b32_lit32(14, MEGA_RMSNORM_EPS_BITS)
-    asm_u32(0x0604040E)                    // v_add_f32 v2, s14, v2
-    asm_u32(0x7E045D02)                    // v_rsq_f32 v2, v2
+    asm_u32(0x0604040E)                    // v_add_f32 v2, s14, v2 (correctly-rounded)
+    // v_sqrt_f32 v2, v2  (correctly-rounded f32 sqrt)
+    asm_v_sqrt_f32_e32_v(2, 2)
+    // IEEE-correct rsq = 1.0 / v2.  Need 1.0 in a VGPR for the helper.
+    // v_mov_b32 v10, 0x3F800000   (1.0f)
+    asm_u32(0x7E1402FF)
+    asm_u32(0x3F800000)
+    // rsq = v10 (1.0) / v2 (sqrt).  Result → v2.
+    asm_v_div_f32_ieee(2, 10, 2, 11, 12, 13, 14, 15)
+    // Store rsq to LDS[512] for cross-lane broadcast.
     asm_v_mov_b32_inline_u(8, 0)           // v8 = 0 (LDS store addr)
     asm_u32(0xD8340200)
     asm_u32(0x00000208)                    // ds_store_b32 v8, v2 offset:512
@@ -1019,8 +1067,15 @@ fn _emit_rmsnorm_cputree_wg_gated_inline(uint64 in_kofs, uint64 norm_kofs,
     asm_u32(0xDC520000)
     asm_u32(0x0B7C0005)
     asm_s_waitcnt_vmcnt_zero()
-    asm_u32(0x10141502)
+    // ── Phase 2.6: CPU-matching per-element mul order ─────────────────
+    // CPU qwen3_scale_vvw_avx2 computes (v * w) * scale (vmulps v,w then
+    // vmulps * scale). The base helper computed (scale * v) * w, which
+    // can differ by 1 ULP at large magnitudes when intermediates round
+    // differently. Match CPU order exactly.
+    // v_mul_f32 v10, v10, v11   (v10 = x * w)
     asm_u32(0x1014170A)
+    // v_mul_f32 v10, v2, v10    (v10 = (x*w) * scale  ; commutative)
+    asm_u32(0x10141502)
     asm_u32(0xDC6A0000)
     asm_u32(0x007C0A07)
     asm_u32(0xD7006A03)
