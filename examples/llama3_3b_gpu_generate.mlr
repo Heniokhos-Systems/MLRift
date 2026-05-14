@@ -1,4 +1,39 @@
-// Llama-3.2-1B Q8_0 — GPU-matmul-offload greedy decode driver.
+// Llama-3.2-3B Q8_0 — GPU-matmul-offload greedy decode driver.
+//
+// =========================================================================
+// PRECISION NOTE — Llama-3.2-3B bf16 GPU path is 11/20 bit-exact vs CPU.
+// =========================================================================
+//
+// The bf16 mega-kernel path used by this driver matches the CPU bf16
+// reference for the first 11 of 20 greedy-decode tokens on prompt "hello",
+// then diverges (argmax flip at pos 11: CPU 8712 vs GPU 7434). The drift
+// is a *structural* precision floor inside phase-7 attention softmax:
+//
+//   1. `v_exp_f32` (RDNA3 ~1 ULP hardware approximation) vs CPU
+//      `exp_f32_fast` (custom 5-term minimax polynomial with bit-injection
+//      of 2^n). These are DIFFERENT approximations entirely; matching
+//      requires porting CPU's poly to gfx1100 ISA (research-level).
+//   2. Sum-reduce parallelism: CPU sequential left-fold over t-positions
+//      vs GPU XOR-butterfly over wave32 — no CPU-tree shape matches a
+//      sequential fold without destroying wave-parallel reduction.
+//   3. FMA-vs-mul+add semantics in Q·K dot, fused scale-adjust, V-axpy.
+//
+// All other drift sources have been eliminated: see commits 9e89233 /
+// 45a8c9c / d18448b / d83bd3a / e388636 / 3630a5a (slice 8.2-B Option A)
+// for the cputree gemv + IEEE-correct rmsnorm scalar pipeline fixes
+// that brought b_x_norm_g, b_attn_q_g, b_mid_g, gu_scratch all bit-exact.
+//
+// Other 3 archs (Qwen3, Llama-1B, Mistral) GPU paths remain 20/20 — they
+// happen to round-equal CPU vhaddps for their specific weight values
+// and their softmax 1-ULP drift falls below the argmax-flip threshold.
+//
+// **Planned fix:** ship an fp32 weight path as the new default for this
+// driver. fp32 cannot break the structural softmax floor (precision-
+// independent), but eliminates bf16 quantization noise as a *separate*
+// drift source. The bf16 path will remain available via opt-in env var
+// for users who prefer +86% perf over PT bf16 and accept 11/20 precision.
+// See LLAMA_3B_BIT_EXACT_FINDINGS.md for the journey and reproducer cmds.
+// =========================================================================
 //
 // Mirror of examples/llama3_generate.mlr (CPU-only Q8_0 path), but with
 // the heavy matmul ops (qkv, o_proj, gate/up, down_proj) offloaded to
@@ -674,6 +709,7 @@ fn main() {
                         }
                         eout("[llama32_3b_gpu] mega-kernel path ENABLED: KV cache + ping-pong residuals device-resident (")
                         eu64(total_cache * 2 + hidden * 8); eout(" bytes total)\n")
+                        eout("[llama32_3b_gpu] WARNING: bf16 precision path is 11/20 token-match vs CPU (phase-7 softmax structural floor; see source-file header). fp32 default path is in development.\n")
 
                         // The Llama mega-kernel reads ONE fused QKV bf16
                         // matrix [qkv_dim, hidden] and ONE fused gate_up
