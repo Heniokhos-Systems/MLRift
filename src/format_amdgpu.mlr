@@ -6626,6 +6626,186 @@ fn emit_amdgpu_gemv_coop_bf16_f32_cputree_blob(uint64 out_path) -> uint64 {
     return 0
 }
 
+// ─── Phase F3a: fp32 weight × fp32 act cooperative gemv with CPU-vhaddps tree ──
+//
+// Mirrors _emit_gemv_coop_bf16_f32_cputree_body with three differences:
+//   1. Weights are full f32 (4 bytes/elem) — global_load_b32 instead of
+//      global_load_u16, and the per-row W byte offset is n * K * 4.
+//   2. NO bf16 widen step (no v_lshlrev_b32 v9, 16, v9).
+//   3. Inner-loop w_ptr advance is +32 bytes (8 lanes × 4B f32), not +16.
+// Everything else (8-lane exec narrow, single v_fmac_f32, exec restore,
+// 3-level [4,1,2] XOR-bpermute reduce, lane-0 store) is identical.
+fn _emit_gemv_coop_f32_f32_cputree_body(uint64 args_desc) {
+    asm_init()
+
+    // ── Stash WG_ID_X (s15) before any kernarg load touches s4..s15 ──
+    // s_mov_b32 s2, s15  → 0xBE82000F
+    asm_u32(0xBE82000F)
+
+    // ── Load kernargs: W=s[4:5], X=s[6:7], Y=s[8:9], N=s[10:11], K=s[12:13]
+    asm_u32(0xF40C0100); asm_u32(0xF8000000)  // s_load_b256 s[4:11], s[0:1], null
+    asm_u32(0xF4040300); asm_u32(0xF8000020)  // s_load_b64  s[12:13], s[0:1], 0x20
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // ── Early exit: if wg_id_x (in s2) >= N (s10) skip body ────────────
+    // s_cmp_ge_u32 s2, s10
+    asm_u32(0xBF090A02)
+    uint64 cbranch_end_idx = asm_text_len / 4
+    asm_u32(0xBFA20000)                       // s_cbranch_scc1 .Lend (patched)
+
+    // ── W += n * K * 4  (f32 byte offset for row n) ────────────────────
+    // s_mul_i32 s14, s2, s12   ; s14 = n * K
+    asm_u32(0x960E0C02)
+    // s_lshl_b32 s14, s14, 2   ; ×4 bytes (f32) — was ×2 (bf16)
+    //   SOP2 op 0x08: word = (2<<30)|(0x08<<23)|(14<<16)|(0x82<<8)|14
+    //                      = 0x84000000|(14<<16)|0x8200|14 = 0x840E820E
+    asm_u32(0x840E820E)
+    // s_add_u32 s4, s4, s14
+    asm_u32(0x80040E04)
+    // s_addc_u32 s5, s5, 0
+    asm_u32(0x82058005)
+
+    // ── Y += n * 4 (output byte offset for row n) ──────────────────────
+    // s_lshl_b32 s14, s2, 2
+    asm_u32(0x840E8202)
+    // s_add_u32 s8, s8, s14
+    asm_u32(0x80080E08)
+    // s_addc_u32 s9, s9, 0
+    asm_u32(0x82098009)
+
+    // ── Per-lane init (FULL EXEC so inactive lanes' v2 stays 0) ────────
+    asm_v_mov_b32_inline_u(2, 0)
+    // v3 = lane*4  (f32 weight byte offset) — was lane*2 for bf16
+    asm_v_lshlrev_b32_imm(3, 2, 0)
+    // v4 = lane*4  (f32 act byte offset) — unchanged
+    asm_v_lshlrev_b32_imm(4, 2, 0)
+
+    // ── Narrow EXEC to lanes 0..7 ──────────────────────────────────────
+    asm_s_mov_b32_lit32(0x7E, 0x000000FF)     // s_mov_b32 exec_lo, 0xFF
+
+    // ── Per-lane weight ptr v[5:6] = W + lane*4 ────────────────────────
+    asm_v_mov_b32_inline_u(6, 0)
+    asm_v_add_co_u32_vcc_sv(5, 4, 3)                 // v5 = s4 + v3
+    asm_v_add_co_ci_u32_null_sv_vcc(6, 5, 6)         // v6 = s5 + v6 + carry
+
+    // ── Per-lane x ptr v[7:8] = X + lane*4 ─────────────────────────────
+    asm_v_mov_b32_inline_u(8, 0)
+    asm_v_add_co_u32_vcc_sv(7, 6, 4)                 // v7 = s6 + v4
+    asm_v_add_co_ci_u32_null_sv_vcc(8, 7, 8)         // v8 = s7 + v8 + carry
+
+    // ── K-loop counter: s14 = K / 8 ────────────────────────────────────
+    // s_lshr_b32 s14, s12, 3
+    asm_u32(0x850E830C)
+
+    // ── Inner K-loop ───────────────────────────────────────────────────
+    // Each iter: load b32 w (f32), load b32 x (f32), fmac, advance ptrs
+    // by (lanes*4)=32 bytes for w and (lanes*4)=32 bytes for x.
+    uint64 loop_idx = asm_text_len / 4
+
+    // global_load_b32 v9, v[5:6], off  ; f32 weight (was global_load_u16)
+    //   word1 = 0xDC520000 (op 0x14 = LOAD_B32), word2 = (vdst=9<<24)|(saddr=0x7C<<16)|vaddr=5
+    asm_u32(0xDC520000); asm_u32(0x097C0005)
+
+    // global_load_b32 v10, v[7:8], off  ; f32 x (unchanged)
+    asm_u32(0xDC520000); asm_u32(0x0A7C0007)
+
+    asm_s_waitcnt_vmcnt_zero()
+
+    // NOTE: bf16-widen step removed (no v_lshlrev_b32 v9, 16, v9).
+
+    // v_fmac_f32_e32 v2, v9, v10      ; acc += w * x
+    asm_v_fmac_f32_e32_vv(2, 9, 10)
+
+    // v_add_nc_u32 v5, 32, v5   ; w_ptr += 32 (8 lanes × 4B f32) — was 16
+    asm_u32(0x4A0A0AFF); asm_u32(32)
+    // v_add_nc_u32 v7, 32, v7   ; x_ptr += 32 — unchanged
+    asm_u32(0x4A0E0EFF); asm_u32(32)
+
+    // s_sub_u32 s14, s14, 1
+    asm_s_sub_u32_imm(14, 14, 1)
+    // s_cmp_lg_u32 s14, 0  (loop while != 0)
+    asm_u32(0xBF07800E)
+    uint64 loop_branch_idx = asm_text_len / 4
+    uint64 back_simm = (loop_idx - (loop_branch_idx + 1)) & 0xFFFF
+    asm_s_cbranch_scc1(back_simm)
+
+    // ── Restore EXEC to full wave32 for cross-lane reduce ──────────────
+    asm_s_mov_b32_lit32(0x7E, 0xFFFFFFFF)
+
+    // ── CPU-tree reduce: XOR offsets [4, 1, 2] in that order ───────────
+    // VOP2 v_add_f32_e32 v2, v2, v12 encoding:
+    uint64 add_word = 0x06000000 | (2 << 17) | (12 << 9) | (0x100 | 2)
+
+    // Step 1: offset 4
+    _emit_v_xor_b32_e32_imm_v0(11, 4)
+    asm_v_lshlrev_b32_imm(11, 2, 11)
+    asm_ds_bpermute_b32(12, 11, 2)
+    asm_s_waitcnt_lgkmcnt_zero()
+    asm_u32(add_word)
+
+    // Step 2: offset 1
+    _emit_v_xor_b32_e32_imm_v0(11, 1)
+    asm_v_lshlrev_b32_imm(11, 2, 11)
+    asm_ds_bpermute_b32(12, 11, 2)
+    asm_s_waitcnt_lgkmcnt_zero()
+    asm_u32(add_word)
+
+    // Step 3: offset 2
+    _emit_v_xor_b32_e32_imm_v0(11, 2)
+    asm_v_lshlrev_b32_imm(11, 2, 11)
+    asm_ds_bpermute_b32(12, 11, 2)
+    asm_s_waitcnt_lgkmcnt_zero()
+    asm_u32(add_word)
+
+    // ── Lane-0 gated store of v2 to Y[n] ───────────────────────────────
+    asm_v_cmp_eq_u32_imm_vgpr(0, 0)             // vcc_lo = (v0 == 0)
+    asm_s_and_saveexec_b32_vcc_lo(16)           // s16 = old exec; exec &= vcc_lo
+    asm_v_mov_b32_inline_u(1, 0)                // v1 = 0  (vaddr offset)
+    asm_global_store_b32(1, 2, 8)               // Y[n] = v2
+    // s_or_b32 exec_lo, exec_lo, s16
+    asm_u32(0x8C7E107E)
+
+    asm_s_endpgm()
+
+    // ── Patch the early-exit branch ────────────────────────────────────
+    uint64 total_dwords = asm_text_len / 4
+    uint64 fwd_simm = (total_dwords - cbranch_end_idx - 2) & 0xFFFF
+    asm_patch_u32(cbranch_end_idx, 0xBFA20000 | fwd_simm)
+
+    // ── Args descriptor: 5 args, all 8 bytes ──────────────────────────
+    uint64 a0 = args_desc + 0;   unsafe { *(a0 as uint64) = 8 }
+    uint64 a1 = args_desc + 8;   unsafe { *(a1 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a2 = args_desc + 16;  unsafe { *(a2 as uint64) = 8 }
+    uint64 a3 = args_desc + 24;  unsafe { *(a3 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a4 = args_desc + 32;  unsafe { *(a4 as uint64) = 8 }
+    uint64 a5 = args_desc + 40;  unsafe { *(a5 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a6 = args_desc + 48;  unsafe { *(a6 as uint64) = 8 }
+    uint64 a7 = args_desc + 56;  unsafe { *(a7 as uint64) = AMD_ARG_KIND_BY_VALUE }
+    uint64 a8 = args_desc + 64;  unsafe { *(a8 as uint64) = 8 }
+    uint64 a9 = args_desc + 72;  unsafe { *(a9 as uint64) = AMD_ARG_KIND_BY_VALUE }
+}
+
+fn emit_amdgpu_gemv_coop_f32_f32_cputree_blob(uint64 out_path) -> uint64 {
+    uint64[10] args_desc
+    _emit_gemv_coop_f32_f32_cputree_body(args_desc)
+
+    // Same KD as bf16 cputree (32 VGPRs, 18 SGPRs, rsrc2=0x9E, no LDS).
+    uint64 size = emit_amdgpu_code_object_lds("gemv_coop_f32_f32_cputree", 25,
+                                               asm_text_buf, asm_text_len,
+                                               40, 8, 18, 32,
+                                               0xE0AF0003, 0x0000009E, 0x00000010, 0x0408,
+                                               args_desc, 5,
+                                               0)
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_gemv_coop_f32_f32_cputree_blob: cannot open output\n", 63)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
 // ─── bf16-direct cooperative gemv, batched (M streams) ───────────────
 // Same shape as gemv_coop_bf16_f32 but reads wg_id_y from s16 (rsrc2 =
 // 0x019E) and shifts b_ptr by wg_y*K*4 / c_ptr by wg_y*N*4 so each
