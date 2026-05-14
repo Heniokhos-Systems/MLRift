@@ -100,6 +100,17 @@ static uint64 MEGA_INV_HIDDEN_BITS      = 0x3A800000  // Qwen3 default (1/1024)
 //   4096 → 0x45800000   (Mistral)
 static uint64 MEGA_HIDDEN_F32_BITS      = 0x44800000  // Qwen3 default (1024.0f)
 
+// Slice 8.3 F3b (2026-05-14) — selects weight load dtype in the Llama-3B
+// cputree gemv phases (3 / 9 / 13).  Default 0 = bf16 (`global_load_u16` +
+// lshl-16 widen, stride k_pad*2 bytes).  Set to 1 by
+// `emit_amdgpu_llama_3b_megakernel_v2_f32_blob` to emit f32 weight loads
+// (`global_load_b32`, no widen, stride k_pad*4 bytes) — used by the fp32
+// branch of the Llama-3B driver that uploads dequantized fp32 weights.
+// The flag is reset to 0 after emit so subsequent bf16 emits stay byte-
+// identical.  All other archs (Qwen3 / Llama-1B / Mistral) ignore this
+// flag — only the Llama-3B-gated phase-3/9/13 sites consult it.
+static uint64 MEGA_WEIGHT_DTYPE          = 0          // 0=bf16, 1=f32
+
 // ── Slice 5.0 — arch setters + name-dispatch + bit-math helpers ───────────
 
 fn mega_set_arch_qwen3_06b() {
@@ -182,6 +193,14 @@ fn mega_set_arch_mistral_7b() {
     MEGA_RMSNORM_EPS_BITS= 0x3727C5AC   // 1e-5f (Mistral)
     MEGA_INV_HIDDEN_BITS = 0x39800000   // 1/4096 (slice 8.0)
     MEGA_HIDDEN_F32_BITS = 0x45800000   // 4096.0f (slice 8.2-B phase 2.6)
+}
+
+// Slice 8.3 F3b (2026-05-14) — set the weight-dtype gate for the Llama-3B
+// cputree gemv phases.  Default 0 (bf16); the f32 emit blob flips this to
+// 1 before running the multi-phase body and resets it to 0 after, so the
+// bf16 emit path stays byte-identical.
+fn mega_set_weight_dtype(uint64 dtype) {
+    MEGA_WEIGHT_DTYPE = dtype
 }
 
 // Returns the 32-bit f32 bit pattern of 1.0f/n for n a power of 2 in
@@ -1834,6 +1853,200 @@ fn _emit_gemv_cputree_bf16_padded_strided_inline(uint64 n_out, uint64 k, uint64 
     asm_patch_u32(gate_cmp_pos + 2, 0xBFA20000 | (body_dwords & 0xFFFF))
 }
 
+// _emit_gemv_cputree_f32_padded_strided_inline — fp32-weight variant of
+// _emit_gemv_cputree_bf16_padded_strided_inline.  Slice 8.3 F3b
+// (2026-05-14) — used by phase 3 / phase 13 of the Llama-3B mega-kernel
+// when MEGA_WEIGHT_DTYPE == 1.
+//
+// Identical scaffolding to the bf16 cputree helper (WG gate, kernarg loads,
+// slice 6.7d per-WG weight base offset, outer-row loop, exec narrow to 8
+// lanes, 3-level [4,1,2] XOR-bpermute reduce, lane-0 store, outer advance,
+// gate patch).  Only the inner K-loop math differs:
+//   - weight load: global_load_b32 (4B) instead of global_load_u16 (2B)
+//   - NO bf16-widen step (no v_lshlrev_b32 v9, 16, v9)
+//   - per-lane w_ptr stride = lane*4 bytes (matches f32 act stride),
+//     mirrored on v8 (was lane*2 for bf16)
+//   - inner-loop w_ptr advance = +32 bytes per iter (8 lanes × 4B f32),
+//     was +16 for bf16
+//   - per-WG weight base offset uses k_pad*4 bytes (was k_pad*2 for bf16)
+//   - outer-row weight advance w_row_step = wg_active * k_pad * 4 (was *2)
+//
+// Inner-loop byte encodings cloned from
+// _emit_gemv_coop_f32_f32_cputree_body (src/format_amdgpu.mlr,
+// commit 1279bef) — the standalone fp32 cputree gemv validated at
+// K=3072 N=5120 (slice 8.3 F3a).
+//
+// VGPR usage (identical pressure to bf16 cputree; v8 just stores lane*4
+// now so both v7 and v8 carry the same value — kept for code symmetry):
+//   v0       = lane id (hardware, r/o)
+//   v1       = vaddr=0 for global_store_b32 saddr-form
+//   v2       = acc (f32 accumulator)
+//   v3:v4    = weight ptr per lane (init: s[w_lo:w_hi]+lane*4; +32 each iter)
+//   v5:v6    = x ptr per lane     (init: s[x_lo:x_hi]+lane*4; +32 each iter)
+//   v7       = lane*4 (f32 byte offset for x)
+//   v8       = lane*4 (f32 byte offset for w — was lane*2 for bf16)
+//   v9       = scratch f32 weight load → bpermute addr scratch
+//   v10      = scratch f32 x load → reduce tmp
+//   v11      = scratch bpermute addr (reduce)
+//   v12      = scratch bpermute tmp  (reduce)
+fn _emit_gemv_cputree_f32_padded_strided_inline(uint64 n_out, uint64 k, uint64 k_pad,
+                                    uint64 wg_active,
+                                    uint64 w_sdata_pair, uint64 x_sdata_pair,
+                                    uint64 out_sdata_pair,
+                                    uint64 w_kofs, uint64 x_kofs, uint64 out_kofs,
+                                    uint64 wg_id_sgpr) {
+    // ── WG gate (skip if wg_id >= wg_active) — identical to bf16 helper ──
+    uint64 gate_cmp_pos = asm_text_len / 4
+    asm_u32(0xBF09FF00 | (wg_id_sgpr & 0xFF))
+    asm_u32(wg_active)
+    asm_s_cbranch_scc1(0)   // patched at end
+
+    // ── Load base pointers ────────────────────────────────────────────────
+    asm_s_load_b64_off(w_sdata_pair,   0, w_kofs)
+    asm_s_load_b64_off(x_sdata_pair,   0, x_kofs)
+    asm_s_load_b64_off(out_sdata_pair, 0, out_kofs)
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    uint64 w_lo = w_sdata_pair * 2
+    uint64 w_hi = w_lo + 1
+    uint64 x_lo = x_sdata_pair * 2
+    uint64 x_hi = x_lo + 1
+    uint64 out_lo = out_sdata_pair * 2
+    uint64 out_hi = out_lo + 1
+
+    // ── Slice 6.7d: per-WG weight base offset ─────────────────────────────
+    // s14 = wg_id * (k_pad * 4);  s[w_lo:w_hi] += s14   (f32 row stride)
+    _emit_s_mul_u32_pow2_or_lit(14, wg_id_sgpr, k_pad * 4)
+    asm_u32(0x80000000 | (w_lo << 16) | (14 << 8) | w_lo)
+    asm_u32(0x82000000 | (w_hi << 16) | 0x8000 | w_hi)
+
+    // ── Constant lane offsets (f32: both lane*4) ──────────────────────────
+    asm_v_lshlrev_b32_imm(7, 2, 0)   // v7 = lane*4 (f32 byte offset for x)
+    asm_v_lshlrev_b32_imm(8, 2, 0)   // v8 = lane*4 (f32 byte offset for w)
+
+    // ── Outer-row loop init ───────────────────────────────────────────────
+    asm_s_mov_b32(13, wg_id_sgpr)            // s13 = row = wg_id
+    asm_s_mov_b32_inline_imm(12, 0)          // s12 = r_off = 0
+
+    uint64 w_row_step = wg_active * k_pad * 4
+    uint64 k_iters = k / 8                   // 8 active lanes per wave
+    uint64 rows_per_wg = (n_out + wg_active - 1) / wg_active
+
+    uint64 outer_top = asm_text_len / 4
+
+    // ── Per-row body ──────────────────────────────────────────────────────
+    // v2 = acc = 0.0 — set with FULL EXEC so lanes 8..31 keep v2=0.
+    asm_v_mov_b32_inline_u(2, 0)
+
+    // init weight ptr: v3:v4 = s[w_lo:w_hi] + lane*4 (= v8)
+    asm_v_mov_b32_inline_u(4, 0)
+    asm_v_add_co_u32_vcc_sv(3, w_lo, 8)
+    asm_v_add_co_ci_u32_null_sv_vcc(4, w_hi, 4)
+
+    // init x ptr: v5:v6 = s[x_lo:x_hi] + lane*4 (= v7)
+    asm_v_mov_b32_inline_u(6, 0)
+    asm_v_add_co_u32_vcc_sv(5, x_lo, 7)
+    asm_v_add_co_ci_u32_null_sv_vcc(6, x_hi, 6)
+
+    // ── Narrow EXEC to lanes 0..7 ─────────────────────────────────────────
+    asm_s_mov_b32_lit32(0x7E, 0x000000FF)
+
+    // ── K-loop counter: s14 = k_iters ─────────────────────────────────────
+    asm_s_mov_b32_inline_imm(14, k_iters)
+
+    uint64 loop_idx = asm_text_len / 4
+    // global_load_b32 v9, v[3:4], off   (f32 weight; was global_load_u16)
+    asm_u32(0xDC520000); asm_u32(0x097C0003)
+    // global_load_b32 v10, v[5:6], off  (f32 x — unchanged)
+    asm_u32(0xDC520000); asm_u32(0x0A7C0005)
+    asm_s_waitcnt_vmcnt_zero()
+    // NOTE: bf16-widen step removed (no v_lshlrev_b32 v9, 16, v9).
+    // v_fmac_f32_e32 v2, v9, v10
+    asm_v_fmac_f32_e32_vv(2, 9, 10)
+    // v_add_nc_u32 v3, 0x20, v3   (w_ptr += 32 bytes; 8 lanes × f32-4B) — was 16
+    asm_u32(0x4A0606FF); asm_u32(32)
+    // v_add_nc_u32 v5, 0x20, v5   (x_ptr += 32 bytes; unchanged)
+    asm_u32(0x4A0A0AFF); asm_u32(32)
+    asm_s_sub_u32_imm(14, 14, 1)
+    // s_cmp_lg_u32 s14, 0
+    asm_u32(0xBF07800E)
+    uint64 loop_branch_idx = asm_text_len / 4
+    uint64 back_simm = (loop_idx - (loop_branch_idx + 1)) & 0xFFFF
+    asm_s_cbranch_scc1(back_simm)
+
+    // ── Restore EXEC to full wave32 for cross-lane reduce ─────────────────
+    asm_s_mov_b32_lit32(0x7E, 0xFFFFFFFF)
+
+    // ── CPU-tree 3-level reduce, XOR offsets [4, 1, 2] in that order ──────
+    uint64 add_word = 0x06000000 | (2 << 17) | (12 << 9) | (0x100 | 2)
+
+    // Step 1: offset 4
+    _emit_v_xor_b32_e32_imm_v0(11, 4)
+    asm_v_lshlrev_b32_imm(11, 2, 11)
+    asm_ds_bpermute_b32(12, 11, 2)
+    asm_s_waitcnt_lgkmcnt_zero()
+    asm_u32(add_word)
+
+    // Step 2: offset 1
+    _emit_v_xor_b32_e32_imm_v0(11, 1)
+    asm_v_lshlrev_b32_imm(11, 2, 11)
+    asm_ds_bpermute_b32(12, 11, 2)
+    asm_s_waitcnt_lgkmcnt_zero()
+    asm_u32(add_word)
+
+    // Step 3: offset 2
+    _emit_v_xor_b32_e32_imm_v0(11, 2)
+    asm_v_lshlrev_b32_imm(11, 2, 11)
+    asm_ds_bpermute_b32(12, 11, 2)
+    asm_s_waitcnt_lgkmcnt_zero()
+    asm_u32(add_word)
+
+    // ── Lane-0 gated store of v2 to out[row] ──────────────────────────────
+    asm_v_cmp_eq_u32_imm_vgpr(0, 0)            // vcc_lo = (v0 == 0)
+    asm_s_and_saveexec_b32_vcc_lo(17)          // s17 = old exec; exec &= vcc_lo
+    asm_v_mov_b32_inline_u(1, 0)               // v1 = 0 (vaddr for store)
+
+    // output byte offset = row * 4
+    // s_lshl_b32 s14, s13, 2
+    asm_u32(0x840E820D)
+    // s_add_u32 out_lo, out_lo, s14
+    asm_u32(0x80000000 | (out_lo << 16) | (14 << 8) | out_lo)
+    // s_addc_u32 out_hi, out_hi, 0
+    asm_u32(0x82000000 | (out_hi << 16) | 0x8000 | out_hi)
+
+    // global_store_b32 v1, v2, s[out_lo:out_hi]
+    asm_u32(0xDC6A0000)
+    asm_u32((out_lo << 16) | (2 << 8) | 1)
+
+    // Restore exec: s_or_b32 exec_lo, exec_lo, s17
+    asm_u32(0x8C7E117E)
+
+    // ── Restore out ptr (undo the row*4 offset) ───────────────────────────
+    asm_u32(0x80800000 | (out_lo << 16) | (0x0E << 8) | out_lo)
+    asm_u32(0x82800000 | (out_hi << 16) | 0x8000 | out_hi)
+
+    // ── Outer loop advance ────────────────────────────────────────────────
+    // Advance weight ptr by w_row_step bytes (f32: wg_active * k_pad * 4)
+    asm_s_mov_b32_lit32(14, w_row_step & 0xFFFFFFFF)
+    asm_u32(0x80000000 | (w_lo << 16) | (0x0E << 8) | w_lo)
+    asm_u32(0x82000000 | (w_hi << 16) | 0x8000 | w_hi)
+
+    // Advance row: s13 += wg_active
+    asm_u32(0x800DFF0D)
+    asm_u32(wg_active)
+
+    // r_off += 1; if r_off < rows_per_wg loop
+    asm_u32(0x800C810C)
+    asm_u32(0xBF0AFF0C)
+    asm_u32(rows_per_wg & 0xFFFFFFFF)
+    uint64 outer_back = (outer_top - (asm_text_len / 4) - 1) & 0xFFFF
+    asm_s_cbranch_scc1(outer_back)
+
+    // ── Patch the WG gate skip-branch ─────────────────────────────────────
+    uint64 body_dwords = (asm_text_len / 4) - (gate_cmp_pos + 3)
+    asm_patch_u32(gate_cmp_pos + 2, 0xBFA20000 | (body_dwords & 0xFFFF))
+}
+
 // ── Phase 3 m4 inline ISA emitter — gemv-coop-bf16-padded-strided × 4 streams
 //
 // _emit_gemv_coop_bf16_padded_strided_m4_inline — speck4 phase-3 variant.
@@ -2719,6 +2932,198 @@ fn _emit_phase9_gemv_residual_cputree_inline(uint64 n_out, uint64 k, uint64 k_pa
 
     // ── Outer loop advance ────────────────────────────────────────────────
     // Advance weight ptr by w_row_step bytes
+    asm_s_mov_b32_lit32(14, w_row_step & 0xFFFFFFFF)
+    asm_u32(0x80000000 | (w_lo << 16) | (0x0E << 8) | w_lo)
+    asm_u32(0x82000000 | (w_hi << 16) | 0x8000 | w_hi)
+
+    // Advance row: s13 += wg_active
+    asm_u32(0x800DFF0D)
+    asm_u32(wg_active)
+
+    // r_off++; check r_off < rows_per_wg
+    asm_u32(0x800C810C)               // s_add_u32 s12, s12, 1
+    asm_u32(0xBF0AFF0C)               // s_cmp_lt_u32 s12, lit
+    asm_u32(rows_per_wg & 0xFFFFFFFF)
+    uint64 outer_back = (outer_top - (asm_text_len / 4) - 1) & 0xFFFF
+    asm_s_cbranch_scc1(outer_back)
+
+    // ── Patch the WG gate skip-branch ─────────────────────────────────────
+    uint64 body_dwords = (asm_text_len / 4) - (gate_cmp_pos + 3)
+    asm_patch_u32(gate_cmp_pos + 2, 0xBFA20000 | (body_dwords & 0xFFFF))
+}
+
+// _emit_phase9_gemv_residual_cputree_f32_inline — fp32-weight variant of
+// _emit_phase9_gemv_residual_cputree_inline.  Slice 8.3 F3b (2026-05-14) —
+// used by Llama-3B mega-kernel phase 9 when MEGA_WEIGHT_DTYPE == 1.
+//
+// Body identical to the bf16 cputree phase-9 helper EXCEPT the inner K-loop
+// loads f32 weights (`global_load_b32`, no widen, +32 byte advance) and the
+// per-WG / per-row weight strides are 4× k_pad instead of 2× k_pad.
+// Residual-load + add + store epilogue is unchanged (still reads f32
+// b_attn_out_g / writes f32 b_mid_g / adds f32 in_residual).
+//
+// SGPR layout, kernarg byte offsets, s28-saved wg_id pattern, s17 exec
+// save, sdata pair 9 (= s[18:19]) for residual, and v9-as-residual-load
+// destination are all preserved verbatim from the bf16 cputree variant.
+fn _emit_phase9_gemv_residual_cputree_f32_inline(uint64 n_out, uint64 k, uint64 k_pad,
+                                                  uint64 wg_active,
+                                                  uint64 w_kofs, uint64 x_kofs,
+                                                  uint64 res_kofs, uint64 out_kofs) {
+    // ── WG gate (skip if wg_id (s28) >= wg_active) ───────────────────────
+    uint64 gate_cmp_pos = asm_text_len / 4
+    asm_u32(0xBF09FF1C)
+    asm_u32(wg_active)
+    asm_s_cbranch_scc1(0)   // patched at end
+
+    // ── Load base pointers ────────────────────────────────────────────────
+    asm_s_load_b64_off(1, 0, w_kofs)     // o_w           → s[2:3]
+    asm_s_load_b64_off(2, 0, x_kofs)     // b_attn_out_g  → s[4:5]
+    asm_s_load_b64_off(3, 0, out_kofs)   // b_mid_g       → s[6:7]
+    asm_s_load_b64_off(9, 0, res_kofs)   // in_residual   → s[18:19]
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // ── Slice 6.7d: per-WG weight base offset (f32: k_pad*4 bytes) ───────
+    //     s14 = s28 * (k_pad * 4)
+    //     s[2:3] += s14
+    _emit_s_mul_u32_pow2_or_lit(14, 28, k_pad * 4)
+    // s_add_u32 s2, s2, s14
+    asm_u32(0x80000000 | (2 << 16) | (14 << 8) | 2)
+    // s_addc_u32 s3, s3, 0
+    asm_u32(0x82000000 | (3 << 16) | 0x8000 | 3)
+
+    // ── Constant lane offsets (f32: both lane*4) ──────────────────────────
+    asm_v_lshlrev_b32_imm(7, 2, 0)   // v7 = lane*4 (f32 byte offset for x)
+    asm_v_lshlrev_b32_imm(8, 2, 0)   // v8 = lane*4 (f32 byte offset for w)
+    asm_v_mov_b32_inline_u(1, 0)     // v1 = 0 (vaddr for load/store)
+
+    // ── Outer loop init ───────────────────────────────────────────────────
+    asm_s_mov_b32(13, 28)                    // s13 = row = saved wg_id_x (s28)
+    asm_s_mov_b32_inline_imm(12, 0)          // s12 = r_off = 0
+
+    uint64 w_lo = 2
+    uint64 w_hi = 3
+    uint64 x_lo = 4
+    uint64 x_hi = 5
+    uint64 out_lo = 6
+    uint64 out_hi = 7
+    uint64 res_lo = 18
+    uint64 res_hi = 19
+
+    uint64 w_row_step = wg_active * k_pad * 4
+    uint64 k_iters = k / 8                   // 8 active lanes per wave
+    uint64 rows_per_wg = (n_out + wg_active - 1) / wg_active
+
+    uint64 outer_top = asm_text_len / 4
+
+    // ── Per-row body ──────────────────────────────────────────────────────
+    asm_v_mov_b32_inline_u(2, 0)
+
+    // init weight ptr: v3:v4 = s[w_lo:w_hi] + lane*4 (= v8)
+    asm_v_mov_b32_inline_u(4, 0)
+    asm_v_add_co_u32_vcc_sv(3, w_lo, 8)
+    asm_v_add_co_ci_u32_null_sv_vcc(4, w_hi, 4)
+
+    // init x ptr: v5:v6 = s[x_lo:x_hi] + lane*4 (= v7)
+    asm_v_mov_b32_inline_u(6, 0)
+    asm_v_add_co_u32_vcc_sv(5, x_lo, 7)
+    asm_v_add_co_ci_u32_null_sv_vcc(6, x_hi, 6)
+
+    // ── Narrow EXEC to lanes 0..7 ─────────────────────────────────────────
+    asm_s_mov_b32_lit32(0x7E, 0x000000FF)
+
+    // ── K-loop counter: s14 = k_iters ─────────────────────────────────────
+    asm_s_mov_b32_inline_imm(14, k_iters)
+
+    uint64 loop_idx = asm_text_len / 4
+    // global_load_b32 v9, v[3:4], off   (f32 weight)
+    asm_u32(0xDC520000); asm_u32(0x097C0003)
+    // global_load_b32 v10, v[5:6], off  (f32 x)
+    asm_u32(0xDC520000); asm_u32(0x0A7C0005)
+    asm_s_waitcnt_vmcnt_zero()
+    // NOTE: bf16-widen step removed.
+    // v_fmac_f32_e32 v2, v9, v10
+    asm_v_fmac_f32_e32_vv(2, 9, 10)
+    // v_add_nc_u32 v3, 0x20, v3   (w_ptr += 32 bytes; 8 lanes × f32-4B)
+    asm_u32(0x4A0606FF); asm_u32(32)
+    // v_add_nc_u32 v5, 0x20, v5   (x_ptr += 32 bytes; unchanged)
+    asm_u32(0x4A0A0AFF); asm_u32(32)
+    asm_s_sub_u32_imm(14, 14, 1)
+    // s_cmp_lg_u32 s14, 0
+    asm_u32(0xBF07800E)
+    uint64 loop_branch_idx = asm_text_len / 4
+    uint64 back_simm = (loop_idx - (loop_branch_idx + 1)) & 0xFFFF
+    asm_s_cbranch_scc1(back_simm)
+
+    // ── Restore EXEC to full wave32 for cross-lane reduce ─────────────────
+    asm_s_mov_b32_lit32(0x7E, 0xFFFFFFFF)
+
+    // ── CPU-tree 3-level reduce, XOR offsets [4, 1, 2] in that order ──────
+    uint64 add_word = 0x06000000 | (2 << 17) | (12 << 9) | (0x100 | 2)
+
+    // Step 1: offset 4
+    _emit_v_xor_b32_e32_imm_v0(11, 4)
+    asm_v_lshlrev_b32_imm(11, 2, 11)
+    asm_ds_bpermute_b32(12, 11, 2)
+    asm_s_waitcnt_lgkmcnt_zero()
+    asm_u32(add_word)
+
+    // Step 2: offset 1
+    _emit_v_xor_b32_e32_imm_v0(11, 1)
+    asm_v_lshlrev_b32_imm(11, 2, 11)
+    asm_ds_bpermute_b32(12, 11, 2)
+    asm_s_waitcnt_lgkmcnt_zero()
+    asm_u32(add_word)
+
+    // Step 3: offset 2
+    _emit_v_xor_b32_e32_imm_v0(11, 2)
+    asm_v_lshlrev_b32_imm(11, 2, 11)
+    asm_ds_bpermute_b32(12, 11, 2)
+    asm_s_waitcnt_lgkmcnt_zero()
+    asm_u32(add_word)
+
+    // ── Lane-0 residual-add + store ──────────────────────────────────────
+    asm_v_cmp_eq_u32_imm_vgpr(0, 0)         // vcc_lo = (v0 == 0)
+    asm_s_and_saveexec_b32_vcc_lo(17)       // s17 = old exec; exec &= vcc_lo
+
+    // s14 = row * 4
+    asm_u32(0x840E820D)
+
+    // out_ptr += s14   (b_mid_g += row*4)
+    asm_u32(0x80000000 | (out_lo << 16) | (14 << 8) | out_lo)
+    asm_u32(0x82000000 | (out_hi << 16) | 0x8000 | out_hi)
+
+    // res_ptr += s14   (in_residual += row*4)
+    asm_u32(0x80000000 | (res_lo << 16) | (14 << 8) | res_lo)
+    asm_u32(0x82000000 | (res_hi << 16) | 0x8000 | res_hi)
+
+    // global_load_b32 v9, v1, s[res_lo:res_hi]
+    asm_u32(0xDC520000)
+    asm_u32((9 << 24) | ((res_lo & 0x7F) << 16) | 1)
+
+    // wait for residual load to retire
+    asm_s_waitcnt_vmcnt_zero()
+
+    // v_add_f32_e32 v2, v2, v9
+    asm_u32(0x06041302)
+
+    // gfx11 VALU→VMEM hazard: let v_add_f32 settle before global_store
+    asm_s_delay_alu(0x01)
+
+    // global_store_b32 v1, v2, s[out_lo:out_hi]
+    asm_u32(0xDC6A0000)
+    asm_u32(((out_lo & 0x7F) << 16) | (2 << 8) | 1)
+
+    // Restore exec: s_or_b32 exec_lo, exec_lo, s17
+    asm_u32(0x8C7E117E)
+
+    // ── Restore in_residual + b_mid_g ptrs (undo row*4 added above) ──────
+    asm_u32(0x80800000 | (out_lo << 16) | (0x0E << 8) | out_lo)
+    asm_u32(0x82800000 | (out_hi << 16) | 0x8000 | out_hi)
+    asm_u32(0x80800000 | (res_lo << 16) | (0x0E << 8) | res_lo)
+    asm_u32(0x82800000 | (res_hi << 16) | 0x8000 | res_hi)
+
+    // ── Outer loop advance ────────────────────────────────────────────────
+    // Advance weight ptr by w_row_step bytes (f32: wg_active * k_pad * 4)
     asm_s_mov_b32_lit32(14, w_row_step & 0xFFFFFFFF)
     asm_u32(0x80000000 | (w_lo << 16) | (0x0E << 8) | w_lo)
     asm_u32(0x82000000 | (w_hi << 16) | 0x8000 | w_hi)
@@ -5576,9 +5981,16 @@ fn mega_emit_stub_kernel(uint64 kname_ptr, uint64 nl, uint64 body_node) -> uint6
         // tree variant so phase-3 b_attn_q_g is bit-exact vs the CPU bf16
         // reference.  All other archs keep the proven unrolled emit.
         if MEGA_HIDDEN == 3072 {
-            _emit_gemv_cputree_bf16_padded_strided_inline(qkv_dim, MEGA_HIDDEN, hidden_pad, 256,
-                                                          1, 2, 3,
-                                                          0x10, 0x88, 0x90, 15)
+            // Slice 8.3 F3b (2026-05-14): Llama-3B fp32-weight emit path.
+            if MEGA_WEIGHT_DTYPE == 1 {
+                _emit_gemv_cputree_f32_padded_strided_inline(qkv_dim, MEGA_HIDDEN, hidden_pad, 256,
+                                                              1, 2, 3,
+                                                              0x10, 0x88, 0x90, 15)
+            } else {
+                _emit_gemv_cputree_bf16_padded_strided_inline(qkv_dim, MEGA_HIDDEN, hidden_pad, 256,
+                                                              1, 2, 3,
+                                                              0x10, 0x88, 0x90, 15)
+            }
         } else {
             _emit_gemv_coop_bf16_padded_strided_inline(qkv_dim, MEGA_HIDDEN, hidden_pad, 256,
                                                        1, 2, 3,
@@ -5636,8 +6048,14 @@ fn mega_emit_stub_kernel(uint64 kname_ptr, uint64 nl, uint64 body_node) -> uint6
         // tree variant so phase-9 b_mid_g is bit-exact vs the CPU bf16 ref.
         // All other archs keep the proven 8× unrolled emit.
         if MEGA_HIDDEN == 3072 {
-            _emit_phase9_gemv_residual_cputree_inline(MEGA_HIDDEN, q_dim, q_dim_pad, 256,
-                                                0x18, 0xB0, 0x00, 0xA0)
+            // Slice 8.3 F3b (2026-05-14): Llama-3B fp32-weight emit path.
+            if MEGA_WEIGHT_DTYPE == 1 {
+                _emit_phase9_gemv_residual_cputree_f32_inline(MEGA_HIDDEN, q_dim, q_dim_pad, 256,
+                                                    0x18, 0xB0, 0x00, 0xA0)
+            } else {
+                _emit_phase9_gemv_residual_cputree_inline(MEGA_HIDDEN, q_dim, q_dim_pad, 256,
+                                                    0x18, 0xB0, 0x00, 0xA0)
+            }
         } else {
             _emit_phase9_gemv_residual_inline(MEGA_HIDDEN, q_dim, q_dim_pad, 256,
                                                 0x18, 0xB0, 0x00, 0xA0)
@@ -5696,9 +6114,16 @@ fn mega_emit_stub_kernel(uint64 kname_ptr, uint64 nl, uint64 body_node) -> uint6
         // tree variant so phase-13 gu_scratch is bit-exact vs the CPU bf16 ref.
         // All other archs keep the proven 8× unrolled emit.
         if MEGA_HIDDEN == 3072 {
-            _emit_gemv_cputree_bf16_padded_strided_inline(2 * MEGA_FF, MEGA_HIDDEN, hidden_pad, 256,
-                                                        1, 2, 3,
-                                                        0x20, 0xA8, 0x80, 28)
+            // Slice 8.3 F3b (2026-05-14): Llama-3B fp32-weight emit path.
+            if MEGA_WEIGHT_DTYPE == 1 {
+                _emit_gemv_cputree_f32_padded_strided_inline(2 * MEGA_FF, MEGA_HIDDEN, hidden_pad, 256,
+                                                            1, 2, 3,
+                                                            0x20, 0xA8, 0x80, 28)
+            } else {
+                _emit_gemv_cputree_bf16_padded_strided_inline(2 * MEGA_FF, MEGA_HIDDEN, hidden_pad, 256,
+                                                            1, 2, 3,
+                                                            0x20, 0xA8, 0x80, 28)
+            }
         } else {
             _emit_gemv_coop_bf16_padded_strided_inline(2 * MEGA_FF, MEGA_HIDDEN, hidden_pad, 256,
                                                         1, 2, 3,

@@ -20324,6 +20324,118 @@ fn emit_amdgpu_llama_3b_megakernel_blob_v2(uint64 out_path) -> uint64 {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// Slice 8.3 F3b — Llama-3.2-3B-Instruct M=1 mega-kernel, fp32-weight variant.
+//
+// Mirror of emit_amdgpu_llama_3b_megakernel_blob_v2 above, but flips the
+// MEGA_WEIGHT_DTYPE gate to 1 before emitting so the phase-3/9/13 cputree
+// gemv helpers issue `global_load_b32` (4B f32 weights) instead of
+// `global_load_u16` + lshl-16 widen (2B bf16).  The kernarg layout is
+// unchanged — the driver (F4) decides whether to upload bf16 or fp32 to
+// each weight slot.
+//
+// MEGA_WEIGHT_DTYPE is reset to 0 after emit so subsequent bf16 emits
+// stay byte-identical to the pre-F3b baseline.
+//
+// Build:
+//   ./build/mlrc --emit-amdgpu-llama-3b-megakernel-v2-f32=/tmp/llama_3b_layer_megakernel_v2_f32.co \
+//       examples/llm/llama_3b_layer_megakernel.mlr
+@export
+fn emit_amdgpu_llama_3b_megakernel_v2_f32_blob(uint64 out_path) -> uint64 {
+    uint64 kname = "llama_3b_layer_megakernel"
+    uint64 klen  = 25
+
+    uint64 mlr_path = "examples/llm/llama_3b_layer_megakernel.mlr"
+    uint64 mlr_fd = file_open(mlr_path, 0)
+    if mlr_fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_llama_3b_megakernel_v2_f32_blob: cannot open examples/llm/llama_3b_layer_megakernel.mlr\n", 100)
+        return 1
+    }
+    uint64 mlr_sz = file_size(mlr_fd)
+    if mlr_sz == 0 {
+        write(2, "emit_amdgpu_llama_3b_megakernel_v2_f32_blob: empty .mlr file\n", 61)
+        file_close(mlr_fd)
+        return 1
+    }
+    uint64 v2_src = alloc(mlr_sz + 1)
+    file_read(mlr_fd, v2_src, mlr_sz)
+    file_close(mlr_fd)
+    uint64 v2_nul_p = v2_src + mlr_sz
+    uint8 v2_nul = 0
+    unsafe { *(v2_nul_p as uint8) = v2_nul }
+
+    uint64 v2_max_tok = 65536
+    uint64 v2_tokens = alloc(v2_max_tok * 16)
+    lexer_init(v2_src, mlr_sz, v2_tokens, v2_max_tok)
+    uint64 v2_tcount = lexer_run()
+    if v2_tcount == 0 {
+        write(2, "emit_amdgpu_llama_3b_megakernel_v2_f32_blob: lexer produced 0 tokens -- syntax error in .mlr\n", 93)
+        return 1
+    }
+
+    ast_init(65536)
+    codegen_init(1048576, v2_src, v2_tokens)
+    parser_init(v2_tokens, v2_tcount)
+    uint64 v2_root = parse_module()
+    if v2_root == 0 {
+        write(2, "emit_amdgpu_llama_3b_megakernel_v2_f32_blob: parse_module returned null -- syntax error in .mlr\n", 96)
+        return 1
+    }
+
+    uint64 fn_node = 0
+    uint32 wc = ast_child(v2_root)
+    while wc != 0 {
+        uint32 k = ast_kind(wc)
+        if k == 2 {
+            if ast_fn_is_kernel(wc) != 0 {
+                uint32 name_tok = ast_data1(wc)
+                if tok_matches(name_tok, "llama_3b_layer_megakernel", 25) != 0 {
+                    fn_node = wc
+                    wc = 0
+                } else {
+                    uint32 nxt = ast_next(wc)
+                    wc = nxt
+                }
+            } else {
+                uint32 nxt = ast_next(wc)
+                wc = nxt
+            }
+        } else {
+            uint32 nxt = ast_next(wc)
+            wc = nxt
+        }
+    }
+    if fn_node == 0 {
+        write(2, "emit_amdgpu_llama_3b_megakernel_v2_f32_blob: @kernel fn llama_3b_layer_megakernel not found in .mlr\n", 100)
+        return 1
+    }
+
+    kt_reset()
+    // Slice 8.3 F3b: flip the weight-dtype gate to 1 (f32) BEFORE the
+    // recognizer runs so name-dispatch'd arch globals + the MEGA_WEIGHT_DTYPE
+    // flag are both set when the phase emitters consult them.  Reset to 0
+    // after emit so a subsequent bf16 emit in the same process is byte-
+    // identical to the pre-F3b baseline.
+    mega_set_weight_dtype(1)
+    uint64 rec_rc = recognize_megakernel_swiglu_dense_gqa(fn_node, v2_src, kname, klen)
+    mega_set_weight_dtype(0)
+    if rec_rc != 0 {
+        write(2, "emit_amdgpu_llama_3b_megakernel_v2_f32_blob: recognizer shape mismatch\n", 71)
+        return 1
+    }
+
+    uint64 size = emit_amdgpu_multi_code_object()
+
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_llama_3b_megakernel_v2_f32_blob: cannot open output\n", 64)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Slice 6.3 — Llama-3.2-1B SPECK4 (M_EFF=4) layer mega-kernel v2.
 //
 // Mirror of emit_amdgpu_qwen3_megakernel_speck4_blob_v2 above, but for
