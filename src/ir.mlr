@@ -7383,6 +7383,19 @@ fn ir_emit_x86_insn(uint64 ii) {
             ir_emit_x86_win_syscall(imm, dest_v, dst_r)
             return
         }
+        // Auto-inject hipkfd_teardown() BEFORE exit_group (syscall 231)
+        // under --target=amdgpu-native. The exit code is in rdi (set by
+        // the preceding IR_ARG). Stash it in rbx (callee-saved) so the
+        // CALL doesn't clobber it. Only inject for syscall 231 — every
+        // other syscall site is normal program flow that the teardown
+        // would derail.
+        if imm == 231 && should_auto_inject_teardown() != 0 {
+            // mov rbx, rdi   ; stash exit code across the call
+            emit_byte(0x48); emit_byte(0x89); emit_byte(0xFB)
+            emit_call_hipkfd_teardown()
+            // mov rdi, rbx   ; restore exit code into rdi
+            emit_byte(0x48); emit_byte(0x89); emit_byte(0xDF)
+        }
         // Linux (0), macOS (1), Android (3): raw syscall with OS-specific numbers
         uint64 real_nr = ir_x86_syscall_nr(imm)
         ir_emit_mov_r64_imm64(0, real_nr)
@@ -10992,6 +11005,17 @@ fn ir_emit_x86_function(uint64 fn_node) {
             if wirt == 0 {
                 // void main: rax may hold scratch from last user op — zero it.
                 emit_byte(0x31); emit_byte(0xC0)         // xor eax, eax
+            }
+            // Auto-inject `hipkfd_teardown()` BEFORE the exit syscall
+            // under --target=amdgpu-native. Stash rax in rbx
+            // (callee-saved) across the call so the exit code survives.
+            // Wrapped in the freestanding-off branch above so freestanding
+            // mode (which omits the syscall entirely) also omits the
+            // teardown — caller knows what they're doing.
+            if should_auto_inject_teardown() != 0 {
+                emit_byte(0x48); emit_byte(0x89); emit_byte(0xC3)   // mov rbx, rax
+                emit_call_hipkfd_teardown()
+                emit_byte(0x48); emit_byte(0x89); emit_byte(0xD8)   // mov rax, rbx
             }
             if target_os == 2 {
                 // Windows: ExitProcess(rax) via IAT slot 0

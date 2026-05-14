@@ -83,6 +83,15 @@ static uint64 fixup_count = 0
 static uint64 fnaddr_fixup_table = 0
 static uint64 fnaddr_fixup_count = 0
 
+// Teardown fixup table: call sites synthesized by the compiler that target
+// `hipkfd_teardown` by NAME (no real token in the source). Resolved at the
+// same site as resolve_fixups via fn_lookup_by_str. Used by the
+// --target=amdgpu-native auto-injection at main epilogue + exit() builtin.
+// [patch_offset(4), unused(4)] × 1024
+static uint64 teardown_fixup_table = 0
+static uint64 teardown_fixup_count = 0
+static uint64 teardown_fixup_cap = 1024
+
 // Static variable table: maps name token → data offset in data section
 // [name_tok_idx(4), data_offset(4)] × 256
 static uint64 static_table = 0
@@ -316,6 +325,8 @@ fn codegen_init(uint64 capacity, uint64 source, uint64 tokens) {
     arr_elem_count = 0
     fnaddr_fixup_table = alloc(1024 * 8)
     fnaddr_fixup_count = 0
+    teardown_fixup_table = alloc(1024 * 8)
+    teardown_fixup_count = 0
     pin_param0_offset = 0xFFFFFFFF
     pin_param1_offset = 0xFFFFFFFF
     fn_ret_float_table = alloc(512 * 8)
@@ -1856,6 +1867,118 @@ fn fn_lookup(uint64 name_tok) -> uint64 {
         i = i + 1
     }
     return 0xFFFFFFFF
+}
+
+// Look up a function in the fn_table by literal name string (not token).
+// Used by the compiler-synthesized hipkfd_teardown auto-injection — the
+// CALL site doesn't correspond to any source token, so the regular
+// token-keyed fixup machinery doesn't apply. Returns 0xFFFFFFFF if not
+// found.
+@export
+fn fn_lookup_by_str(uint64 name_ptr, uint64 name_len) -> uint64 {
+    uint64 i = 0
+    while i < fn_count {
+        uint64 entry = fn_table + i * 8
+        uint32 stored_tok = 0
+        unsafe { *(entry as uint32) -> stored_tok }
+        uint64 ws = stored_tok
+        uint64 fn_tlen = tok_text_len(ws)
+        if fn_tlen == name_len {
+            uint64 fn_tstart = tok_text_start(ws)
+            uint64 eq = 1
+            uint64 ci = 0
+            while ci < name_len {
+                uint64 ap = cg_source + fn_tstart + ci
+                uint64 av = 0
+                unsafe { *(ap as uint8) -> av }
+                uint64 bp = name_ptr + ci
+                uint64 bv = 0
+                unsafe { *(bp as uint8) -> bv }
+                if av != bv { eq = 0 }
+                ci = ci + 1
+            }
+            if eq != 0 {
+                uint64 e4 = entry + 4
+                uint32 off = 0
+                unsafe { *(e4 as uint32) -> off }
+                return off
+            }
+        }
+        i = i + 1
+    }
+    return 0xFFFFFFFF
+}
+
+// Predicate: should the compiler auto-inject a `call hipkfd_teardown`
+// before this exit path? Returns 1 iff
+//   1. --target=amdgpu-native was passed (so the KFD shim drives the
+//      4 KFD queues that need draining), AND
+//   2. --no-auto-teardown was NOT passed (user opt-out), AND
+//   3. `hipkfd_teardown` is actually defined in the link set (the
+//      function exists in fn_table). Without (3) the synthesized CALL
+//      would patch to an undefined offset.
+// Reads cross-file statics target_amdgpu_native (format_amdgpu.mlr) and
+// auto_teardown_disabled (main.mlr). target_os is also checked to keep
+// the injection Linux-only — amdgpu-native is /dev/kfd, Linux-only by
+// construction, but the belt-and-braces guard means a future port to
+// another OS won't silently inject calls that don't make sense.
+@export
+fn should_auto_inject_teardown() -> uint64 {
+    if target_amdgpu_native == 0 { return 0 }
+    if auto_teardown_disabled != 0 { return 0 }
+    if target_os != 0 { return 0 }
+    uint64 td_name = "hipkfd_teardown"
+    uint64 off = fn_lookup_by_str(td_name, 15)
+    if off == 0xFFFFFFFF { return 0 }
+    return 1
+}
+
+// Emit `call hipkfd_teardown` (5 bytes: E8 + rel32). The rel32 placeholder
+// is patched at resolve time by resolve_teardown_fixups. Callers should
+// guard with should_auto_inject_teardown() == 1 first.
+@export
+fn emit_call_hipkfd_teardown() {
+    emit_byte(0xE8)
+    uint64 patch_off = out_len
+    emit_u32_le(0)
+    if teardown_fixup_count >= teardown_fixup_cap {
+        write(2, "error: teardown_fixup_table overflow (max 1024)\n", 48)
+        exit(1)
+    }
+    uint64 entry = teardown_fixup_table + teardown_fixup_count * 8
+    uint32 po = patch_off
+    unsafe { *(entry as uint32) = po }
+    teardown_fixup_count = teardown_fixup_count + 1
+    // CALL clobbers rax (return value of the callee), so invalidate the
+    // cache. Teardown is `fn hipkfd_teardown() { ... }` with no return,
+    // but the codegen treats every CALL as rax-clobbering anyway.
+    rax_invalidate()
+}
+
+// Resolve all synthesized `call hipkfd_teardown` fixups to the real
+// function offset. Called at the same site as resolve_fixups() in main.mlr.
+@export
+fn resolve_teardown_fixups() {
+    if teardown_fixup_count == 0 { return }
+    uint64 td_name = "hipkfd_teardown"
+    uint64 target_off = fn_lookup_by_str(td_name, 15)
+    if target_off == 0xFFFFFFFF {
+        // Should be impossible — emit_call_hipkfd_teardown is gated on
+        // should_auto_inject_teardown which already checked. Belt-and-
+        // braces: hard error rather than silent garbage CALL.
+        write(2, "error: hipkfd_teardown auto-inject fixups recorded but symbol not defined\n", 75)
+        exit(1)
+    }
+    uint64 i = 0
+    while i < teardown_fixup_count {
+        uint64 entry = teardown_fixup_table + i * 8
+        uint32 patch_off = 0
+        unsafe { *(entry as uint32) -> patch_off }
+        uint64 wpo = patch_off
+        uint64 disp = target_off - wpo - 4
+        patch_u32(wpo, disp)
+        i = i + 1
+    }
 }
 
 // Register an extern function. Returns its extern index for later use.
@@ -4575,6 +4698,14 @@ fn gen_expr(uint64 node) {
             uint32 first_arg = ast_child(node)
             uint64 wfa = first_arg
             gen_expr(wfa)
+            // Auto-inject hipkfd_teardown() under --target=amdgpu-native
+            // BEFORE the exit syscall. Stash rax (exit code) in rbx
+            // across the call; rbx is callee-saved per SysV.
+            if should_auto_inject_teardown() != 0 {
+                emit_byte(0x48); emit_byte(0x89); emit_byte(0xC3)   // mov rbx, rax
+                emit_call_hipkfd_teardown()
+                emit_byte(0x48); emit_byte(0x89); emit_byte(0xD8)   // mov rax, rbx
+            }
             if target_os == 2 {
                 // Windows: ExitProcess(code)
                 emit_mov_rcx_rax()
@@ -9941,6 +10072,18 @@ fn gen_function(uint64 fn_node) {
     if tok_matches(wnt_ep, "main", 4) != 0 && freestanding == 0 {
         if wrt == 0 {
             emit_byte(0x31); emit_byte(0xC0)            // xor eax, eax
+        }
+        // Auto-inject `hipkfd_teardown()` BEFORE the exit syscall under
+        // --target=amdgpu-native: drains the 4 KFD queues + prints the
+        // alloc summary. Preserve rax (the exit code) across the call
+        // by stashing it in rbx (callee-saved). hipkfd_teardown has no
+        // args — no register-pressure concerns at the call site.
+        if should_auto_inject_teardown() != 0 {
+            // mov rbx, rax   ; stash exit code across the call
+            emit_byte(0x48); emit_byte(0x89); emit_byte(0xC3)
+            emit_call_hipkfd_teardown()
+            // mov rax, rbx   ; restore exit code into rax
+            emit_byte(0x48); emit_byte(0x89); emit_byte(0xD8)
         }
         if target_os == 2 {
             emit_mov_rcx_rax()
