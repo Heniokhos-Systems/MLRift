@@ -1,0 +1,183 @@
+// Phase F2 validator for slice 8.3 (Llama-3.2-3B fp32 path, 2026-05-14).
+//
+// Exercises the CPU dispatch plumbing added to std/qwen3.mlr —
+// qwen3_set_matmul_kind(2) routes qwen3_main_matmul to the new
+// matmul_f32_weights_f32 entry shipped in F1.
+//
+// Strategy:
+//   1. Generate deterministic bf16 W [N, K] via xorshift32.
+//   2. Materialize a parallel f32 weight buffer Wf32 where every element
+//      is the bf16-widened form of the corresponding bf16 element
+//      (low 16 bits = 0). Same bit-pattern widening F1's test uses —
+//      this is what makes the bf16-path and f32-path bit-exact equal.
+//   3. Generate deterministic f32 X [K] via xorshift32.
+//   4. qwen3_set_matmul_kind(0); qwen3_main_matmul(...) → out_bf16[N]
+//      (CPU AVX2 fallback fires; GPU dispatcher returns 1 with no env).
+//   5. qwen3_set_matmul_kind(2); qwen3_main_matmul(...) → out_f32[N]
+//   6. Byte-compare out_bf16 vs out_f32. Expect mismatch_dwords == 0
+//      (F1 already proved the workers are bit-exact equivalent under
+//      the bf16-widen contract; F2 only validates the dispatch arm).
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --target=linux --emit=elfexe \
+//                -o /tmp/cpu_f32_dispatch_test \
+//                examples/llm/cpu_f32_dispatch_test.mlr
+// Run:
+//   /tmp/cpu_f32_dispatch_test
+// Success criterion: prints "cpu_f32_dispatch_test: PASS"
+
+import "../../std/io.mlr"
+import "../../std/fmt.mlr"
+import "../../std/string.mlr"
+import "../../std/matmul.mlr"
+import "../../std/qwen3.mlr"
+
+@dynamic extern fn exit(uint64 code)
+
+// Single-iteration xorshift32 — deterministic test data.
+fn xorshift32(u64 state) -> u64 {
+    u64 s = state & 0xFFFFFFFF
+    s = (s ^ (s << 13)) & 0xFFFFFFFF
+    s = (s ^ (s >> 17)) & 0xFFFFFFFF
+    s = (s ^ (s << 5))  & 0xFFFFFFFF
+    return s
+}
+
+// Build a sane f32 bit pattern from a 32-bit xorshift word:
+//   sign = bit 31, mantissa = bits 0..22, exponent = 0x7D (≈ 2^-2 .. 2^-1).
+// Avoids subnormals / inf / NaN so the matmul outputs stay finite.
+fn rand_word_to_f32_bits(u64 r) -> u64 {
+    u64 sign = (r >> 31) & 1
+    u64 mant = r & 0x7FFFFF
+    u64 exp  = 0x7D
+    u64 bits = (sign << 31) | (exp << 23) | mant
+    return bits & 0xFFFFFFFF
+}
+
+// bf16 = top 16 bits of f32.
+fn rand_word_to_bf16_bits(u64 r) -> u64 {
+    u64 f32_bits = rand_word_to_f32_bits(r)
+    return (f32_bits >> 16) & 0xFFFF
+}
+
+fn main() {
+    // Llama-3.2-3B output-projection scale (small N for fast test).
+    u64 N = 128
+    u64 K = 3072
+    u64 num_workers = 1   // single-thread for deterministic kind=0 AVX2 path
+
+    print_str("cpu_f32_dispatch_test: N="); u64 sn = fmt_dec(N); print_str(sn); dealloc(sn)
+    print_str(" K=");                       u64 sk = fmt_dec(K); print_str(sk); dealloc(sk)
+    print_str("\n")
+
+    u64 bytes_wb = N * K * 2
+    u64 bytes_wf = N * K * 4
+    u64 bytes_x  = K * 4
+    u64 bytes_y  = N * 4
+
+    u64 h_W_bf16 = alloc(bytes_wb)
+    u64 h_W_f32  = alloc(bytes_wf)
+    u64 h_X      = alloc(bytes_x)
+    u64 h_Y_bf16 = alloc(bytes_y)
+    u64 h_Y_f32  = alloc(bytes_y)
+
+    // Zero outputs (any garbage write would be detectable).
+    u64 i = 0
+    while i < bytes_y { uint8 z = 0; unsafe { *((h_Y_bf16 + i) as u8) = z }; i = i + 1 }
+    i = 0
+    while i < bytes_y { uint8 z = 0; unsafe { *((h_Y_f32 + i) as u8) = z }; i = i + 1 }
+
+    // Populate bf16 W + parallel widened f32 W.
+    u64 state = 0xDEADBEEF
+    u64 j = 0
+    while j < N * K {
+        state = xorshift32(state)
+        u64 b16 = rand_word_to_bf16_bits(state)
+        u64 pwb = h_W_bf16 + j * 2
+        uint8 b0 = b16 & 0xFF
+        uint8 b1 = (b16 >> 8) & 0xFF
+        unsafe { *(pwb as u8) = b0 }
+        unsafe { *((pwb + 1) as u8) = b1 }
+        // Widened f32 = bf16_bits << 16  (low 16 bits = 0).
+        u64 f32_bits = (b16 << 16) & 0xFFFFFFFF
+        u64 pwf = h_W_f32 + j * 4
+        uint8 c0 = f32_bits & 0xFF
+        uint8 c1 = (f32_bits >> 8) & 0xFF
+        uint8 c2 = (f32_bits >> 16) & 0xFF
+        uint8 c3 = (f32_bits >> 24) & 0xFF
+        unsafe { *(pwf as u8) = c0 }
+        unsafe { *((pwf + 1) as u8) = c1 }
+        unsafe { *((pwf + 2) as u8) = c2 }
+        unsafe { *((pwf + 3) as u8) = c3 }
+        j = j + 1
+    }
+
+    // Populate X (f32).
+    j = 0
+    while j < K {
+        state = xorshift32(state)
+        u64 bits = rand_word_to_f32_bits(state)
+        u64 p = h_X + j * 4
+        uint8 b0 = bits & 0xFF
+        uint8 b1 = (bits >> 8) & 0xFF
+        uint8 b2 = (bits >> 16) & 0xFF
+        uint8 b3 = (bits >> 24) & 0xFF
+        unsafe { *(p as u8) = b0 }
+        unsafe { *((p + 1) as u8) = b1 }
+        unsafe { *((p + 2) as u8) = b2 }
+        unsafe { *((p + 3) as u8) = b3 }
+        j = j + 1
+    }
+
+    // --- kind=0: bf16 dispatch (GPU env unset → CPU AVX2 fallback). ---
+    qwen3_set_matmul_kind(0)
+    qwen3_main_matmul(h_Y_bf16, h_X, h_W_bf16, 1, N, K, num_workers, 0)
+
+    // --- kind=2: f32-weights dispatch (new F2 arm). ---
+    qwen3_set_matmul_kind(2)
+    qwen3_main_matmul(h_Y_f32, h_X, h_W_f32, 1, N, K, num_workers, 0)
+
+    // --- Compare byte-for-byte ---
+    u64 mismatch = 0
+    u64 first_bad = 0xFFFFFFFFFFFFFFFF
+    u64 first_bad_bf16 = 0
+    u64 first_bad_f32  = 0
+    u64 n_i = 0
+    while n_i < N {
+        u64 cp = h_Y_bf16 + n_i * 4
+        u64 gp = h_Y_f32  + n_i * 4
+        u32 cv = 0; unsafe { *(cp as u32) -> cv }
+        u32 gv = 0; unsafe { *(gp as u32) -> gv }
+        if cv != gv {
+            mismatch = mismatch + 1
+            if first_bad == 0xFFFFFFFFFFFFFFFF {
+                first_bad = n_i
+                first_bad_bf16 = cv
+                first_bad_f32  = gv
+            }
+        }
+        n_i = n_i + 1
+    }
+
+    dealloc(h_W_bf16)
+    dealloc(h_W_f32)
+    dealloc(h_X)
+    dealloc(h_Y_bf16)
+    dealloc(h_Y_f32)
+
+    if mismatch == 0 {
+        print_str("cpu_f32_dispatch_test: PASS\n")
+        exit(0)
+    } else {
+        print_str("cpu_f32_dispatch_test: FAIL (")
+        u64 sm = fmt_dec(mismatch); print_str(sm); dealloc(sm)
+        print_str(" mismatches) first_bad_n=")
+        u64 sf = fmt_dec(first_bad); print_str(sf); dealloc(sf)
+        print_str(" bf16_bits=")
+        u64 sb = fmt_hex(first_bad_bf16); print_str(sb); dealloc(sb)
+        print_str(" f32_bits=")
+        u64 sf2 = fmt_hex(first_bad_f32); print_str(sf2); dealloc(sf2)
+        print_str("\n")
+        exit(1)
+    }
+}
