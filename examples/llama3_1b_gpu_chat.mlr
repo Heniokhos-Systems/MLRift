@@ -1,0 +1,585 @@
+// Llama-3.2-1B-Instruct GPU mega-kernel chat — interactive multi-turn REPL.
+//
+// Mirror of examples/qwen3_gpu_chat.mlr but for Llama-3 arch + tokenizer +
+// chat template.  Per-layer forward goes through MLRift's fused mega-kernel
+// emitted by `@kernel`→AMDGPU ISA (no hipcc / no LLVM / no clang).  CPU
+// bf16 fallback fires automatically once pos >= 64 because the mega-kernel
+// + per-op GPU attention paths are LDS-cap'd at max_seq=64.  KV cache
+// (max_seq=2048) is GTT-resident so the CPU fallback reads/writes the
+// same slab the mega-kernel does.
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native --emit=elfexe \
+//       examples/llama3_1b_gpu_chat.mlr -o /tmp/llama3_1b_gpu_chat
+// Run:
+//   MLRIFT_NATIVE_MEGAKERNEL=1 /tmp/llama3_1b_gpu_chat
+//
+// Type a message at the prompt and press Enter.  Type "/quit" or empty
+// line to exit.  KV cache + seq buffer persist across turns so the model
+// remembers earlier turns up to max_seq tokens.
+
+import "../std/qwen3.mlr"
+import "../std/gguf.mlr"
+import "../std/matmul.mlr"
+import "../std/inference.mlr"
+import "../std/inference_gpu.mlr"
+import "../std/tokenizer.mlr"
+import "../std/io.mlr"
+import "../std/fmt.mlr"
+import "../std/string.mlr"
+import "../std/thread.mlr"
+import "../std/time.mlr"
+import "../std/model_path.mlr"
+import "../std/hip.mlr"
+import "../std/kfd.mlr"
+
+// Q8_0 → bf16 host dequant.  34-byte blocks of [f16 scale | int8 qs[32]].
+fn q8_0_to_bf16_alloc(u64 src_q8, u64 n_elements) -> u64 {
+    u64 dst_bf16 = alloc(n_elements * 2)
+    u64 n_blocks = n_elements / 32
+    u64 scratch = alloc(4)
+    u64 bi = 0
+    while bi < n_blocks {
+        u64 block = src_q8 + bi * 34
+        u64 lo = load8(block)
+        u64 hi = load8(block + 1)
+        u64 dbits = lo | (hi << 8)
+        f32 d = gguf_f16_to_f32_exact(dbits)
+        u64 qs_base = block + 2
+        u64 j = 0
+        while j < 32 {
+            u64 bval = load8(qs_base + j)
+            f32 q = 0.0f
+            if bval >= 128 {
+                f32 pos = int_to_f32_gguf(256 - bval)
+                q = 0.0f - pos
+            } else {
+                q = int_to_f32_gguf(bval)
+            }
+            f32 out_val = d * q
+            unsafe { *(scratch as f32) = out_val }
+            u64 b0 = load8(scratch + 2)
+            u64 b1 = load8(scratch + 3)
+            u64 dst_off = (bi * 32 + j) * 2
+            u8 b0_8 = b0
+            u8 b1_8 = b1
+            unsafe { *((dst_bf16 + dst_off + 0) as u8) = b0_8 }
+            unsafe { *((dst_bf16 + dst_off + 1) as u8) = b1_8 }
+            j = j + 1
+        }
+        bi = bi + 1
+    }
+    dealloc(scratch)
+    return dst_bf16
+}
+
+fn main() {
+    u64 max_new      = 128
+    u64 max_seq      = 2048
+    u64 num_workers  = 16
+
+    thread_pool_init(num_workers)
+
+    qwen3_set_arch(2048, 64, 32, 8, 8192)
+    qwen3_set_matmul_kind(0)
+    qwen3_set_norm_kind(1)
+    qwen3_set_fuse_qkv(0)
+    qwen3_set_qknorm(0)
+    qwen3_set_rope_base(500000)
+    qwen3_set_rmsnorm_eps_bits(0x3727C5AC)
+    qwen3_set_rope_pair_layout(1)
+
+    u64 tok_default = "/home/pantelis/.cache/huggingface/hub/models--unsloth--Llama-3.2-1B-Instruct/snapshots/5a8abab4a5d6f164389b1079fb721cfab8d7126c/tokenizer.json"
+    u64 tok_path = resolve_model_path("MLRIFT_LLAMA3_TOKENIZER",
+                                       tok_default,
+                                       "llama-3.2-1b-gpu-chat")
+    Tokenizer tk = tokenizer_load(tok_path)
+    if tk.file_size == 0 {
+        print_str("[llama3_1b_gpu_chat] could not open tokenizer at "); print_str(tok_path); print_str("\n")
+        exit(1)
+    }
+    tokenizer_set_kind_gpt2(tk)
+
+    u64 BOS         = 128000
+    u64 START_HDR   = 128006
+    u64 END_HDR     = 128007
+    u64 EOT         = 128009
+    u64 NL2         = 271
+
+    u64 user_box       = alloc(8)
+    u64 user_cnt_box   = alloc(8)
+    u64 assist_box     = alloc(8)
+    u64 assist_cnt_box = alloc(8)
+    unsafe { *(user_box       as u64) = 0 }
+    unsafe { *(user_cnt_box   as u64) = 0 }
+    unsafe { *(assist_box     as u64) = 0 }
+    unsafe { *(assist_cnt_box as u64) = 0 }
+    tokenizer_encode(tk, "user",      4, user_box,   user_cnt_box)
+    tokenizer_encode(tk, "assistant", 9, assist_box, assist_cnt_box)
+    u64 user_ids   = 0
+    u64 user_cnt   = 0
+    u64 assist_ids = 0
+    u64 assist_cnt = 0
+    unsafe { *(user_box       as u64) -> user_ids   }
+    unsafe { *(user_cnt_box   as u64) -> user_cnt   }
+    unsafe { *(assist_box     as u64) -> assist_ids }
+    unsafe { *(assist_cnt_box as u64) -> assist_cnt }
+    dealloc(user_box); dealloc(user_cnt_box)
+    dealloc(assist_box); dealloc(assist_cnt_box)
+
+    u64 model_path = resolve_model_path("MLRIFT_LLAMA3_1B_GGUF",
+                                         "models/llama-3.2-1b-instruct-q8_0.gguf",
+                                         "llama-3.2-1b-gpu-chat")
+    GGUFFile gf = gguf_open(model_path)
+    if gf.file_size == 0 {
+        print_str("[llama3_1b_gpu_chat] gguf open failed\n"); exit(1)
+    }
+
+    u64 hidden    = QWEN3_HIDDEN
+    u64 q_dim     = QWEN3_Q_DIM
+    u64 kv_dim    = QWEN3_KV_DIM
+    u64 ff        = QWEN3_INTERMEDIATE
+    u64 n_layers  = 16
+    u64 vocab     = 128256
+
+    GGUFTensor embed_t = gguf_get(gf, "token_embd.weight")
+    if embed_t.ptr == 0 {
+        print_str("[llama3_1b_gpu_chat] missing token_embd.weight\n"); exit(1)
+    }
+    GGUFTensor norm_t = gguf_get(gf, "output_norm.weight")
+    if norm_t.ptr == 0 {
+        print_str("[llama3_1b_gpu_chat] missing output_norm.weight\n"); exit(1)
+    }
+    u64 lmhead_ptr = embed_t.ptr
+
+    GGUFTensor rope_freqs_t = gguf_get(gf, "rope_freqs.weight")
+    if rope_freqs_t.ptr != 0 {
+        qwen3_set_rope_freqs(rope_freqs_t.ptr)
+    }
+
+    u64 layers_arr = alloc(n_layers * 88)
+    u64 q_elems    = q_dim  * hidden
+    u64 kv_elems   = kv_dim * hidden
+    u64 o_elems    = hidden * q_dim
+    u64 gate_elems = ff     * hidden
+    u64 up_elems   = ff     * hidden
+    u64 down_elems = hidden * ff
+
+    print_str("[llama3_1b_gpu_chat] dequantising 16 layers of Q8_0 -> bf16 (host one-time)...\n")
+    u64 li = 0
+    while li < n_layers {
+        u64 base = layers_arr + li * 88
+        u64 li_s = fmt_dec(li)
+        u64 pre0 = str_cat("blk.", li_s)
+        u64 prefix = str_cat(pre0, ".")
+        dealloc(li_s); dealloc(pre0)
+
+        u64 n01 = str_cat(prefix, "attn_norm.weight")
+        GGUFTensor t01 = gguf_get(gf, n01)
+        unsafe { *((base + 0 * 8) as u64) = t01.ptr }
+        dealloc(n01)
+
+        u64 n02 = str_cat(prefix, "attn_q.weight")
+        GGUFTensor t02 = gguf_get(gf, n02)
+        u64 q_bf16 = q8_0_to_bf16_alloc(t02.ptr, q_elems)
+        unsafe { *((base + 1 * 8) as u64) = q_bf16 }
+        dealloc(n02)
+
+        u64 n03 = str_cat(prefix, "attn_k.weight")
+        GGUFTensor t03 = gguf_get(gf, n03)
+        u64 k_bf16 = q8_0_to_bf16_alloc(t03.ptr, kv_elems)
+        unsafe { *((base + 2 * 8) as u64) = k_bf16 }
+        dealloc(n03)
+
+        u64 n04 = str_cat(prefix, "attn_v.weight")
+        GGUFTensor t04 = gguf_get(gf, n04)
+        u64 v_bf16 = q8_0_to_bf16_alloc(t04.ptr, kv_elems)
+        unsafe { *((base + 3 * 8) as u64) = v_bf16 }
+        dealloc(n04)
+
+        unsafe { *((base + 4 * 8) as u64) = 0 }
+        unsafe { *((base + 5 * 8) as u64) = 0 }
+
+        u64 n07 = str_cat(prefix, "attn_output.weight")
+        GGUFTensor t07 = gguf_get(gf, n07)
+        u64 o_bf16 = q8_0_to_bf16_alloc(t07.ptr, o_elems)
+        unsafe { *((base + 6 * 8) as u64) = o_bf16 }
+        dealloc(n07)
+
+        u64 n08 = str_cat(prefix, "ffn_norm.weight")
+        GGUFTensor t08 = gguf_get(gf, n08)
+        unsafe { *((base + 7 * 8) as u64) = t08.ptr }
+        dealloc(n08)
+
+        u64 n09 = str_cat(prefix, "ffn_gate.weight")
+        GGUFTensor t09 = gguf_get(gf, n09)
+        u64 g_bf16 = q8_0_to_bf16_alloc(t09.ptr, gate_elems)
+        unsafe { *((base + 8 * 8) as u64) = g_bf16 }
+        dealloc(n09)
+
+        u64 n10 = str_cat(prefix, "ffn_up.weight")
+        GGUFTensor t10 = gguf_get(gf, n10)
+        u64 u_bf16 = q8_0_to_bf16_alloc(t10.ptr, up_elems)
+        unsafe { *((base + 9 * 8) as u64) = u_bf16 }
+        dealloc(n10)
+
+        u64 n11 = str_cat(prefix, "ffn_down.weight")
+        GGUFTensor t11 = gguf_get(gf, n11)
+        u64 d_bf16 = q8_0_to_bf16_alloc(t11.ptr, down_elems)
+        unsafe { *((base + 10 * 8) as u64) = d_bf16 }
+        dealloc(n11)
+
+        dealloc(prefix)
+        li = li + 1
+    }
+    print_str("[llama3_1b_gpu_chat] layers dequantised.\n")
+
+    u64 dummy_slot = alloc(8)
+    u32 de = hipMalloc(dummy_slot, 64)
+    if de != 0 {
+        print_str("[llama3_1b_gpu_chat] hipMalloc warmup failed (no GPU?)\n"); exit(1)
+    }
+    u64 dummy_va = 0
+    unsafe { *(dummy_slot as u64) -> dummy_va }
+    hipFree(dummy_va)
+    dealloc(dummy_slot)
+
+    u64 _force_init = gpu_matmul_enabled()
+    if gpu_pipeline_ready() == 0 {
+        print_str("[llama3_1b_gpu_chat] GPU pipeline not ready\n"); exit(1)
+    }
+    if gpu_llama_megakernel_ready() == 0 {
+        print_str("[llama3_1b_gpu_chat] llama mega-kernel .co not loaded\n"); exit(1)
+    }
+
+    u64 batch_size   = 1
+    u64 kv_row_bytes = kv_dim * 4
+    u64 layer_stride = max_seq * kv_row_bytes
+    u64 total_cache  = n_layers * batch_size * layer_stride
+    u64 k_cache_dev = dev_try_alloc_host_visible(total_cache)
+    u64 v_cache_dev = dev_try_alloc_host_visible(total_cache)
+    if k_cache_dev == 0 || v_cache_dev == 0 {
+        print_str("[llama3_1b_gpu_chat] KV GTT alloc failed\n"); exit(1)
+    }
+    u64 k_cache = dev_host_ptr(k_cache_dev)
+    u64 v_cache = dev_host_ptr(v_cache_dev)
+    u64 zi = 0
+    while zi < total_cache {
+        unsafe { *((k_cache + zi) as u8) = 0 }
+        unsafe { *((v_cache + zi) as u8) = 0 }
+        zi = zi + 1
+    }
+    qwen3_gpu_set_kv_cache_dev(k_cache_dev, v_cache_dev, layer_stride, batch_size)
+    qwen3_gpu_set_batch_size(1)
+
+    u64 d_x_A   = dev_try_alloc_host_visible(hidden * 4)
+    u64 d_x_B   = dev_try_alloc_host_visible(hidden * 4)
+    if d_x_A == 0 || d_x_B == 0 {
+        print_str("[llama3_1b_gpu_chat] residual GTT alloc failed\n"); exit(1)
+    }
+    u64 d_x_A_h = dev_host_ptr(d_x_A)
+    u64 d_x_B_h = dev_host_ptr(d_x_B)
+
+    u64 qkv_dim_elems    = q_dim + 2 * kv_dim
+    u64 qkv_row_bytes    = hidden * 2
+    u64 q_bytes_l        = q_dim  * qkv_row_bytes
+    u64 kv_bytes_l       = kv_dim * qkv_row_bytes
+    u64 stacked_bytes    = qkv_dim_elems * qkv_row_bytes
+    u64 gu_dim_elems     = 2 * ff
+    u64 gate_bytes_l     = ff * qkv_row_bytes
+    u64 gu_stacked_bytes = gu_dim_elems * qkv_row_bytes
+    print_str("[llama3_1b_gpu_chat] fusing QKV + gate/up bf16 weights...\n")
+    u64 lf = 0
+    while lf < n_layers {
+        u64 base_lf = layers_arr + lf * 88
+        u64 qp_lf = 0; unsafe { *((base_lf + 1 * 8) as u64) -> qp_lf }
+        u64 kp_lf = 0; unsafe { *((base_lf + 2 * 8) as u64) -> kp_lf }
+        u64 vp_lf = 0; unsafe { *((base_lf + 3 * 8) as u64) -> vp_lf }
+        u64 qkv_stacked = alloc(stacked_bytes)
+        memcpy(qkv_stacked,                          qp_lf, q_bytes_l)
+        memcpy(qkv_stacked + q_bytes_l,              kp_lf, kv_bytes_l)
+        memcpy(qkv_stacked + q_bytes_l + kv_bytes_l, vp_lf, kv_bytes_l)
+        dealloc(qp_lf); dealloc(kp_lf); dealloc(vp_lf)
+        unsafe { *((base_lf + 1 * 8) as u64) = qkv_stacked }
+        unsafe { *((base_lf + 2 * 8) as u64) = 0 }
+        unsafe { *((base_lf + 3 * 8) as u64) = 0 }
+
+        u64 gpw_lf = 0; unsafe { *((base_lf + 8 * 8) as u64) -> gpw_lf }
+        u64 upw_lf = 0; unsafe { *((base_lf + 9 * 8) as u64) -> upw_lf }
+        u64 gu_stacked = alloc(gu_stacked_bytes)
+        memcpy(gu_stacked,                gpw_lf, gate_bytes_l)
+        memcpy(gu_stacked + gate_bytes_l, upw_lf, gate_bytes_l)
+        dealloc(gpw_lf); dealloc(upw_lf)
+        unsafe { *((base_lf + 8 * 8) as u64) = gu_stacked }
+        unsafe { *((base_lf + 9 * 8) as u64) = 0 }
+        lf = lf + 1
+    }
+    qwen3_set_fuse_qkv(1)
+
+    print_str("[llama3_1b_gpu_chat] warming padded-row weight cache...\n")
+    u64 hidden_pad_w = hidden + 128
+    u64 q_dim_pad_w  = q_dim  + 128
+    u64 ff_pad_w     = ff     + 128
+    u64 qkv_dim_w    = q_dim + 2 * kv_dim
+    u64 lwarm = 0
+    while lwarm < n_layers {
+        Qwen3LayerWeights w = layers_arr + lwarm * 88
+        u64 _wq = gpu_get_or_upload_bf16_weight_padded(w.q_proj_w,    hidden, qkv_dim_w, hidden_pad_w)
+        u64 _wo = gpu_get_or_upload_bf16_weight_padded(w.o_proj_w,    q_dim,  hidden,    q_dim_pad_w)
+        u64 _wg = gpu_get_or_upload_bf16_weight_padded(w.gate_proj_w, hidden, 2 * ff,    hidden_pad_w)
+        u64 _wd = gpu_get_or_upload_bf16_weight_padded(w.down_proj_w, ff,     hidden,    ff_pad_w)
+        lwarm = lwarm + 1
+    }
+
+    print_str("[llama3_1b_gpu_chat] dequantising tied embedding for GPU lm_head (")
+    u64 lm_sz = fmt_dec(vocab * hidden * 2); print_str(lm_sz); dealloc(lm_sz); print_str(" bytes)...\n")
+    u64 lm_head_bf16_host = q8_0_to_bf16_alloc(embed_t.ptr, vocab * hidden)
+    u64 d_lm_in  = dev_try_alloc_host_visible(hidden * 4)
+    u64 d_lm_out = dev_try_alloc_host_visible(vocab  * 4)
+    if lm_head_bf16_host == 0 || d_lm_in == 0 || d_lm_out == 0 {
+        print_str("[llama3_1b_gpu_chat] lm_head GPU setup failed\n"); exit(1)
+    }
+    u64 d_lm_in_h  = dev_host_ptr(d_lm_in)
+    u64 d_lm_out_h = dev_host_ptr(d_lm_out)
+
+    u64 final_out = alloc(hidden * 4)
+    u64 logits    = alloc(vocab * 4)
+    u64 GPU_POS_CAP = 64
+    u64 x_cur = alloc(hidden * 4)
+    u64 x_nxt = alloc(hidden * 4)
+
+    u64 embed_base = embed_t.ptr
+    u64 row_blocks = hidden / 32
+    u64 row_bytes  = row_blocks * 34
+
+    u64 seq_cap = max_seq
+    u64 seq_ids = alloc(seq_cap * 4)
+    u64 seq_len = 0
+    u64 next_pos = 0
+
+    print_str("[llama3_1b_gpu_chat] ready. type '/quit' or empty line to exit.\n")
+
+    u64 first_turn = 1
+
+    while 1 == 1 {
+        print_str("\n> ")
+        u64 line = read_line(2048)
+        u64 line_len = str_len(line)
+        if line_len == 0 {
+            dealloc(line)
+            print_str("[llama3_1b_gpu_chat] bye.\n")
+            break
+        }
+        u64 is_quit = 0
+        if str_compare(line, "/quit") == 0 { is_quit = 1 }
+        if str_compare(line, "/exit") == 0 { is_quit = 1 }
+        if is_quit == 1 {
+            dealloc(line)
+            print_str("[llama3_1b_gpu_chat] bye.\n")
+            break
+        }
+
+        u64 msg_box     = alloc(8); unsafe { *(msg_box     as u64) = 0 }
+        u64 msg_cnt_box = alloc(8); unsafe { *(msg_cnt_box as u64) = 0 }
+        tokenizer_encode(tk, line, line_len, msg_box, msg_cnt_box)
+        u64 msg_ids = 0; unsafe { *(msg_box     as u64) -> msg_ids }
+        u64 msg_cnt = 0; unsafe { *(msg_cnt_box as u64) -> msg_cnt }
+        dealloc(msg_box); dealloc(msg_cnt_box)
+        dealloc(line)
+
+        u64 lead_bos = 0
+        if first_turn == 1 { lead_bos = 1 }
+        u64 ext_count = lead_bos + 1 + 1 + user_cnt + 1 + 1 + msg_cnt + 1 + 1 + 1 + assist_cnt + 1 + 1
+        if seq_len + ext_count + max_new > seq_cap {
+            print_str("[llama3_1b_gpu_chat] conversation exceeds max_seq="); u64 ms = fmt_dec(max_seq); print_str(ms); dealloc(ms)
+            print_str(" - start a new session.\n")
+            dealloc(msg_ids)
+            break
+        }
+
+        u32 bos32     = BOS
+        u32 shdr32    = START_HDR
+        u32 ehdr32    = END_HDR
+        u32 eot32     = EOT
+        u32 nl2_32    = NL2
+        if lead_bos == 1 {
+            unsafe { *((seq_ids + seq_len * 4) as uint32) = bos32 }
+            seq_len = seq_len + 1
+        }
+        unsafe { *((seq_ids + seq_len * 4) as uint32) = shdr32 }
+        seq_len = seq_len + 1
+        u64 r = 0
+        while r < user_cnt {
+            u32 t = 0
+            unsafe { *((user_ids + r * 4) as uint32) -> t }
+            unsafe { *((seq_ids + seq_len * 4) as uint32) = t }
+            seq_len = seq_len + 1
+            r = r + 1
+        }
+        unsafe { *((seq_ids + seq_len * 4) as uint32) = ehdr32 }
+        seq_len = seq_len + 1
+        unsafe { *((seq_ids + seq_len * 4) as uint32) = nl2_32 }
+        seq_len = seq_len + 1
+        r = 0
+        while r < msg_cnt {
+            u32 t = 0
+            unsafe { *((msg_ids + r * 4) as uint32) -> t }
+            unsafe { *((seq_ids + seq_len * 4) as uint32) = t }
+            seq_len = seq_len + 1
+            r = r + 1
+        }
+        unsafe { *((seq_ids + seq_len * 4) as uint32) = eot32 }
+        seq_len = seq_len + 1
+        unsafe { *((seq_ids + seq_len * 4) as uint32) = shdr32 }
+        seq_len = seq_len + 1
+        r = 0
+        while r < assist_cnt {
+            u32 t = 0
+            unsafe { *((assist_ids + r * 4) as uint32) -> t }
+            unsafe { *((seq_ids + seq_len * 4) as uint32) = t }
+            seq_len = seq_len + 1
+            r = r + 1
+        }
+        unsafe { *((seq_ids + seq_len * 4) as uint32) = ehdr32 }
+        seq_len = seq_len + 1
+        unsafe { *((seq_ids + seq_len * 4) as uint32) = nl2_32 }
+        seq_len = seq_len + 1
+        dealloc(msg_ids)
+
+        u64 d_in    = d_x_A
+        u64 d_out   = d_x_B
+        u64 d_in_h  = d_x_A_h
+        u64 d_out_h = d_x_B_h
+
+        u64 prefill_start_ns = time_now()
+        while next_pos + 1 < seq_len {
+            u32 pt32 = 0
+            unsafe { *((seq_ids + next_pos * 4) as uint32) -> pt32 }
+            u64 pt = pt32
+            if next_pos < GPU_POS_CAP {
+                gguf_deq_q8_0(d_in_h, embed_base + pt * row_bytes, hidden)
+                u64 layer = 0
+                while layer < n_layers {
+                    Qwen3LayerWeights w = layers_arr + layer * 88
+                    u64 kc = k_cache + layer * layer_stride
+                    u64 vc = v_cache + layer * layer_stride
+                    if qwen3_forward_layer_gpu(d_in, d_out, w, next_pos, kc, vc, num_workers, 0, 0xFF) != 0 {
+                        print_str("[llama3_1b_gpu_chat] forward_layer_gpu failed at prefill pos="); u64 ps = fmt_dec(next_pos); print_str(ps); dealloc(ps); print_str("\n")
+                        exit(1)
+                    }
+                    u64 td = d_in; d_in = d_out; d_out = td
+                    u64 th = d_in_h; d_in_h = d_out_h; d_out_h = th
+                    layer = layer + 1
+                }
+                gpu_pipeline_flush()
+            } else {
+                gguf_deq_q8_0(x_cur, embed_base + pt * row_bytes, hidden)
+                u64 layer = 0
+                while layer < n_layers {
+                    Qwen3LayerWeights w = layers_arr + layer * 88
+                    u64 kc = k_cache + layer * layer_stride
+                    u64 vc = v_cache + layer * layer_stride
+                    qwen3_forward_layer(x_nxt, x_cur, w, next_pos, kc, vc, num_workers)
+                    u64 tmp = x_cur; x_cur = x_nxt; x_nxt = tmp
+                    layer = layer + 1
+                }
+            }
+            next_pos = next_pos + 1
+        }
+        u64 prefill_ns = time_elapsed(prefill_start_ns)
+
+        u32 last_pt32 = 0
+        unsafe { *((seq_ids + (seq_len - 1) * 4) as uint32) -> last_pt32 }
+        u64 last_pt = last_pt32
+        gguf_deq_q8_0(x_cur, embed_base + last_pt * row_bytes, hidden)
+        memcpy(d_in_h, x_cur, hidden * 4)
+
+        u64 decode_start_ns = time_now()
+        u64 step = 0
+        u64 hit_eos = 0
+        while step < max_new {
+            u64 final_in_host = 0
+            if next_pos < GPU_POS_CAP {
+                u64 layer = 0
+                while layer < n_layers {
+                    Qwen3LayerWeights w = layers_arr + layer * 88
+                    u64 kc = k_cache + layer * layer_stride
+                    u64 vc = v_cache + layer * layer_stride
+                    if qwen3_forward_layer_gpu(d_in, d_out, w, next_pos, kc, vc, num_workers, 0, 0xFF) != 0 {
+                        print_str("[llama3_1b_gpu_chat] forward_layer_gpu failed at decode pos="); u64 ps = fmt_dec(next_pos); print_str(ps); dealloc(ps); print_str("\n")
+                        exit(1)
+                    }
+                    u64 td = d_in; d_in = d_out; d_out = td
+                    u64 th = d_in_h; d_in_h = d_out_h; d_out_h = th
+                    layer = layer + 1
+                }
+                gpu_pipeline_flush()
+                final_in_host = d_in_h
+            } else {
+                u64 layer = 0
+                while layer < n_layers {
+                    Qwen3LayerWeights w = layers_arr + layer * 88
+                    u64 kc = k_cache + layer * layer_stride
+                    u64 vc = v_cache + layer * layer_stride
+                    qwen3_forward_layer(x_nxt, x_cur, w, next_pos, kc, vc, num_workers)
+                    u64 tmp = x_cur; x_cur = x_nxt; x_nxt = tmp
+                    layer = layer + 1
+                }
+                final_in_host = x_cur
+            }
+
+            qwen3_rmsnorm_f32_weights(final_out, final_in_host, norm_t.ptr, hidden)
+            memcpy(d_lm_in_h, final_out, hidden * 4)
+            if gpu_matmul_to_dev(d_lm_out, d_lm_in, lm_head_bf16_host, vocab, hidden) != 0 {
+                matmul_q8_0_q8_0_f32(logits, final_out, lmhead_ptr, 1, vocab, hidden, num_workers)
+            } else {
+                gpu_pipeline_flush()
+                memcpy(logits, d_lm_out_h, vocab * 4)
+            }
+
+            u64 best_id = 0
+            f32 best_val = 0.0f
+            u64 first_lv = 1
+            u64 j = 0
+            while j < vocab {
+                f32 lv = 0.0f
+                unsafe { *((logits + j * 4) as f32) -> lv }
+                if first_lv == 1 { best_val = lv; best_id = j; first_lv = 0 }
+                else { if lv > best_val { best_val = lv; best_id = j } }
+                j = j + 1
+            }
+
+            u32 best_id32 = best_id
+            unsafe { *((seq_ids + seq_len * 4) as uint32) = best_id32 }
+            seq_len = seq_len + 1
+            next_pos = next_pos + 1
+
+            if best_id == EOT { hit_eos = 1; step = max_new; continue }
+            if best_id == 128001 { hit_eos = 1; step = max_new; continue }
+            if seq_len >= seq_cap { step = max_new; continue }
+
+            u32 stream_id = best_id
+            u64 stream_box = alloc(4)
+            unsafe { *(stream_box as uint32) = stream_id }
+            u64 tok_text = tokenizer_decode(tk, stream_box, 1)
+            print_str(tok_text)
+            dealloc(tok_text)
+            dealloc(stream_box)
+
+            gguf_deq_q8_0(x_cur, embed_base + best_id * row_bytes, hidden)
+            memcpy(d_in_h, x_cur, hidden * 4)
+            step = step + 1
+        }
+        u64 decode_ns = time_elapsed(decode_start_ns)
+        print_str("\n")
+
+        first_turn = 0
+    }
+
+    dealloc(user_ids); dealloc(assist_ids)
+    tokenizer_free(tk)
+    gguf_free(gf)
+    thread_pool_shutdown()
+    hipkfd_teardown()
+    exit(0)
+}

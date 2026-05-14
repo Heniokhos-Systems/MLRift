@@ -1,0 +1,506 @@
+// Qwen3-0.6B GPU mega-kernel chat — interactive multi-turn REPL.
+//
+// GPU-accelerated counterpart of examples/qwen3_generate_cpu.mlr.  The
+// per-layer forward call goes through MLRift's fused mega-kernel emitted
+// by `@kernel`→AMDGPU ISA (no hipcc / no LLVM / no clang).
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native --emit=elfexe \
+//       examples/qwen3_gpu_chat.mlr -o /tmp/qwen3_gpu_chat
+// Run:
+//   MLRIFT_NATIVE_MEGAKERNEL=1 /tmp/qwen3_gpu_chat
+//
+// At the prompt, type a message and press Enter.  Type "/quit" or an
+// empty line to exit.  KV cache + sequence buffer persist across turns
+// so the model remembers earlier turns up to max_seq tokens.  The
+// mega-kernel's LDS-resident attention caps pos < 64; past that the
+// driver auto-falls-back to the per-op GPU path (slower but correct).
+
+import "../std/qwen3.mlr"
+import "../std/safetensors.mlr"
+import "../std/inference.mlr"
+import "../std/inference_gpu.mlr"
+import "../std/tokenizer.mlr"
+import "../std/io.mlr"
+import "../std/fmt.mlr"
+import "../std/string.mlr"
+import "../std/thread.mlr"
+import "../std/time.mlr"
+import "../std/model_path.mlr"
+import "../std/hip.mlr"
+import "../std/kfd.mlr"
+
+fn main() {
+    u64 model_dir    = resolve_model_path("MLRIFT_QWEN3_0_6B_DIR",
+                                          "models/qwen3-0.6b",
+                                          "qwen3-0.6b")
+    u64 max_new      = 128
+    u64 max_seq      = 2048
+    u64 num_workers  = 16
+
+    thread_pool_init(num_workers)
+
+    u64 tok_path = str_cat(model_dir, "/tokenizer.json")
+    Tokenizer tk = tokenizer_load(tok_path)
+    if tk.file_size == 0 {
+        print_str("[qwen3_gpu_chat] could not open "); print_str(tok_path); print_str("\n")
+        print_str("[qwen3_gpu_chat] set MLRIFT_QWEN3_0_6B_DIR to a Qwen3-0.6B checkout\n")
+        exit(1)
+    }
+    tokenizer_set_kind_gpt2(tk)
+    dealloc(tok_path)
+
+    u64 IM_START = 151644
+    u64 IM_END   = 151645
+    u64 NL_TOK   = 198
+
+    u64 user_box       = alloc(8)
+    u64 user_cnt_box   = alloc(8)
+    u64 assist_box     = alloc(8)
+    u64 assist_cnt_box = alloc(8)
+    unsafe { *(user_box       as u64) = 0 }
+    unsafe { *(user_cnt_box   as u64) = 0 }
+    unsafe { *(assist_box     as u64) = 0 }
+    unsafe { *(assist_cnt_box as u64) = 0 }
+    tokenizer_encode(tk, "user",      4, user_box,   user_cnt_box)
+    tokenizer_encode(tk, "assistant", 9, assist_box, assist_cnt_box)
+    u64 user_ids   = 0
+    u64 user_cnt   = 0
+    u64 assist_ids = 0
+    u64 assist_cnt = 0
+    unsafe { *(user_box       as u64) -> user_ids   }
+    unsafe { *(user_cnt_box   as u64) -> user_cnt   }
+    unsafe { *(assist_box     as u64) -> assist_ids }
+    unsafe { *(assist_cnt_box as u64) -> assist_cnt }
+    dealloc(user_box); dealloc(user_cnt_box)
+    dealloc(assist_box); dealloc(assist_cnt_box)
+
+    u64 sf_path = str_cat(model_dir, "/model.safetensors")
+    SafetensorFile st = safetensors_open(sf_path)
+    if st.file_size == 0 {
+        print_str("[qwen3_gpu_chat] open safetensors failed\n"); exit(1)
+    }
+    dealloc(sf_path)
+
+    u64 n_layers = 28
+    u64 vocab    = 151936
+    u64 hidden = QWEN3_HIDDEN
+    u64 kv_dim = QWEN3_KV_DIM
+    u64 q_dim  = QWEN3_Q_DIM
+    u64 ff     = QWEN3_INTERMEDIATE
+
+    SafetensorView embed_v = safetensors_get(st, "model.embed_tokens.weight")
+    SafetensorView norm_v  = safetensors_get(st, "model.norm.weight")
+    u64 embed_ptr = embed_v.ptr
+    u64 norm_ptr  = norm_v.ptr
+    if embed_ptr == 0 || norm_ptr == 0 {
+        print_str("[qwen3_gpu_chat] missing embed or final norm\n"); exit(1)
+    }
+
+    u64 layers_arr = alloc(n_layers * 88)
+    u64 li = 0
+    while li < n_layers {
+        u64 base = layers_arr + li * 88
+        u64 li_s = fmt_dec(li)
+        u64 pre0 = str_cat("model.layers.", li_s)
+        u64 prefix = str_cat(pre0, ".")
+        dealloc(li_s); dealloc(pre0)
+
+        u64 n01 = str_cat(prefix, "input_layernorm.weight")
+        SafetensorView v01 = safetensors_get(st, n01)
+        unsafe { *((base + 0 * 8) as u64) = v01.ptr }
+        dealloc(n01)
+
+        u64 n02 = str_cat(prefix, "self_attn.q_proj.weight")
+        SafetensorView v02 = safetensors_get(st, n02)
+        unsafe { *((base + 1 * 8) as u64) = v02.ptr }
+        dealloc(n02)
+
+        u64 n03 = str_cat(prefix, "self_attn.k_proj.weight")
+        SafetensorView v03 = safetensors_get(st, n03)
+        unsafe { *((base + 2 * 8) as u64) = v03.ptr }
+        dealloc(n03)
+
+        u64 n04 = str_cat(prefix, "self_attn.v_proj.weight")
+        SafetensorView v04 = safetensors_get(st, n04)
+        unsafe { *((base + 3 * 8) as u64) = v04.ptr }
+        dealloc(n04)
+
+        u64 n05 = str_cat(prefix, "self_attn.q_norm.weight")
+        SafetensorView v05 = safetensors_get(st, n05)
+        unsafe { *((base + 4 * 8) as u64) = v05.ptr }
+        dealloc(n05)
+
+        u64 n06 = str_cat(prefix, "self_attn.k_norm.weight")
+        SafetensorView v06 = safetensors_get(st, n06)
+        unsafe { *((base + 5 * 8) as u64) = v06.ptr }
+        dealloc(n06)
+
+        u64 n07 = str_cat(prefix, "self_attn.o_proj.weight")
+        SafetensorView v07 = safetensors_get(st, n07)
+        unsafe { *((base + 6 * 8) as u64) = v07.ptr }
+        dealloc(n07)
+
+        u64 n08 = str_cat(prefix, "post_attention_layernorm.weight")
+        SafetensorView v08 = safetensors_get(st, n08)
+        unsafe { *((base + 7 * 8) as u64) = v08.ptr }
+        dealloc(n08)
+
+        u64 n09 = str_cat(prefix, "mlp.gate_proj.weight")
+        SafetensorView v09 = safetensors_get(st, n09)
+        unsafe { *((base + 8 * 8) as u64) = v09.ptr }
+        dealloc(n09)
+
+        u64 n10 = str_cat(prefix, "mlp.up_proj.weight")
+        SafetensorView v10 = safetensors_get(st, n10)
+        unsafe { *((base + 9 * 8) as u64) = v10.ptr }
+        dealloc(n10)
+
+        u64 n11 = str_cat(prefix, "mlp.down_proj.weight")
+        SafetensorView v11 = safetensors_get(st, n11)
+        unsafe { *((base + 10 * 8) as u64) = v11.ptr }
+        dealloc(n11)
+
+        dealloc(prefix)
+        li = li + 1
+    }
+
+    u64 qkv_dim_elems    = q_dim + 2 * kv_dim
+    u64 qkv_row_bytes    = hidden * 2
+    u64 q_bytes          = q_dim  * qkv_row_bytes
+    u64 kv_bytes         = kv_dim * qkv_row_bytes
+    u64 stacked_bytes    = qkv_dim_elems * qkv_row_bytes
+    u64 gu_dim_elems     = 2 * ff
+    u64 gate_bytes       = ff * qkv_row_bytes
+    u64 gu_stacked_bytes = gu_dim_elems * qkv_row_bytes
+    print_str("[qwen3_gpu_chat] loading model + fusing QKV/gate-up weights...\n")
+    li = 0
+    while li < n_layers {
+        u64 base = layers_arr + li * 88
+        u64 qp = 0; unsafe { *((base + 1 * 8) as u64) -> qp }
+        u64 kp = 0; unsafe { *((base + 2 * 8) as u64) -> kp }
+        u64 vp = 0; unsafe { *((base + 3 * 8) as u64) -> vp }
+        u64 stacked = alloc(stacked_bytes)
+        memcpy(stacked,                       qp, q_bytes)
+        memcpy(stacked + q_bytes,             kp, kv_bytes)
+        memcpy(stacked + q_bytes + kv_bytes,  vp, kv_bytes)
+        unsafe { *((base + 1 * 8) as u64) = stacked }
+
+        u64 gpw = 0; unsafe { *((base + 8 * 8) as u64) -> gpw }
+        u64 upw = 0; unsafe { *((base + 9 * 8) as u64) -> upw }
+        u64 gu_stacked = alloc(gu_stacked_bytes)
+        memcpy(gu_stacked,              gpw, gate_bytes)
+        memcpy(gu_stacked + gate_bytes, upw, gate_bytes)
+        unsafe { *((base + 8 * 8) as u64) = gu_stacked }
+        li = li + 1
+    }
+
+    // Force HIP-shim lazy-init via a dummy hipMalloc/Free, then check pipeline.
+    u64 dummy_slot = alloc(8)
+    u32 de = hipMalloc(dummy_slot, 64)
+    if de != 0 {
+        print_str("[qwen3_gpu_chat] hipMalloc warmup failed (no GPU?)\n"); exit(1)
+    }
+    u64 dummy_va = 0
+    unsafe { *(dummy_slot as u64) -> dummy_va }
+    hipFree(dummy_va)
+    dealloc(dummy_slot)
+
+    u64 _force_init = gpu_matmul_enabled()
+    if gpu_pipeline_ready() == 0 {
+        print_str("[qwen3_gpu_chat] GPU pipeline not ready\n"); exit(1)
+    }
+
+    // KV cache must live on GTT (host-visible device memory) so the
+    // mega-kernel can read/write directly via device VA.
+    u64 batch_size   = 1
+    u64 kv_row_bytes = kv_dim * 4
+    u64 layer_stride = max_seq * kv_row_bytes
+    u64 total_cache  = n_layers * batch_size * layer_stride
+    u64 k_cache_dev = dev_try_alloc_host_visible(total_cache)
+    u64 v_cache_dev = dev_try_alloc_host_visible(total_cache)
+    if k_cache_dev == 0 || v_cache_dev == 0 {
+        print_str("[qwen3_gpu_chat] KV GTT alloc failed\n"); exit(1)
+    }
+    u64 k_cache = dev_host_ptr(k_cache_dev)
+    u64 v_cache = dev_host_ptr(v_cache_dev)
+    qwen3_gpu_set_kv_cache_dev(k_cache_dev, v_cache_dev, layer_stride, batch_size)
+    qwen3_gpu_set_batch_size(1)
+
+    // Residual ping-pong on GTT — mega-kernel reads/writes via device
+    // VA; we copy embeddings in / read final residual out via host alias.
+    u64 d_x_A   = dev_try_alloc_host_visible(hidden * 4)
+    u64 d_x_B   = dev_try_alloc_host_visible(hidden * 4)
+    if d_x_A == 0 || d_x_B == 0 {
+        print_str("[qwen3_gpu_chat] residual GTT alloc failed\n"); exit(1)
+    }
+    u64 d_x_A_h = dev_host_ptr(d_x_A)
+    u64 d_x_B_h = dev_host_ptr(d_x_B)
+
+    // Pre-upload all 28 layers' bf16 weights into the padded-row cache so
+    // the first real token doesn't eat 3 s of cold uploads.
+    print_str("[qwen3_gpu_chat] warming padded-row weight cache...\n")
+    u64 lyr_w = 0
+    while lyr_w < n_layers {
+        Qwen3LayerWeights w = layers_arr + lyr_w * 88
+        u64 _wq = gpu_get_or_upload_bf16_weight_padded(w.q_proj_w,    hidden, q_dim + 2 * kv_dim, 1152)
+        u64 _wo = gpu_get_or_upload_bf16_weight_padded(w.o_proj_w,    q_dim,  hidden,             2176)
+        u64 _wg = gpu_get_or_upload_bf16_weight_padded(w.gate_proj_w, hidden, 2 * ff,             1152)
+        u64 _wd = gpu_get_or_upload_bf16_weight_padded(w.down_proj_w, ff,     hidden,             3200)
+        lyr_w = lyr_w + 1
+    }
+
+    u64 final_out = alloc(hidden * 4)
+    u64 logits    = alloc(vocab * 4)
+
+    // Host CPU residual buffers used when pos >= GPU_POS_CAP and the
+    // mega-kernel + per-op GPU attention kernel (both LDS-cap'd at 64)
+    // can't service the token.  The KV cache is GTT (host-visible) so
+    // the CPU forward layer reads/writes it without copy.
+    u64 GPU_POS_CAP = 64
+    u64 x_cur = alloc(hidden * 4)
+    u64 x_nxt = alloc(hidden * 4)
+
+    u64 seq_cap = max_seq
+    u64 seq_ids = alloc(seq_cap * 4)
+    u64 seq_len = 0
+    u64 next_pos = 0
+
+    print_str("[qwen3_gpu_chat] ready. type '/quit' or empty line to exit.\n")
+
+    u64 first_turn = 1
+
+    while 1 == 1 {
+        print_str("\n> ")
+        u64 line = read_line(2048)
+        u64 line_len = str_len(line)
+        if line_len == 0 {
+            dealloc(line)
+            print_str("[qwen3_gpu_chat] bye.\n")
+            break
+        }
+        u64 is_quit = 0
+        if str_compare(line, "/quit") == 0 { is_quit = 1 }
+        if str_compare(line, "/exit") == 0 { is_quit = 1 }
+        if is_quit == 1 {
+            dealloc(line)
+            print_str("[qwen3_gpu_chat] bye.\n")
+            break
+        }
+
+        u64 msg_box     = alloc(8); unsafe { *(msg_box     as u64) = 0 }
+        u64 msg_cnt_box = alloc(8); unsafe { *(msg_cnt_box as u64) = 0 }
+        tokenizer_encode(tk, line, line_len, msg_box, msg_cnt_box)
+        u64 msg_ids = 0; unsafe { *(msg_box     as u64) -> msg_ids }
+        u64 msg_cnt = 0; unsafe { *(msg_cnt_box as u64) -> msg_cnt }
+        dealloc(msg_box); dealloc(msg_cnt_box)
+        dealloc(line)
+
+        u64 lead = 0
+        if first_turn == 0 { lead = 1 }
+        u64 ext_count = lead + 1 + user_cnt + 1 + msg_cnt + 1 + 1 + 1 + assist_cnt + 1
+        if seq_len + ext_count + max_new > seq_cap {
+            print_str("[qwen3_gpu_chat] conversation exceeds max_seq="); u64 ms = fmt_dec(max_seq); print_str(ms); dealloc(ms)
+            print_str(" — start a new session.\n")
+            dealloc(msg_ids)
+            break
+        }
+
+        u32 ims32 = IM_START
+        u32 ime32 = IM_END
+        u32 nl32  = NL_TOK
+        if lead == 1 {
+            unsafe { *((seq_ids + seq_len * 4) as uint32) = nl32 }
+            seq_len = seq_len + 1
+        }
+        unsafe { *((seq_ids + seq_len * 4) as uint32) = ims32 }
+        seq_len = seq_len + 1
+        u64 r = 0
+        while r < user_cnt {
+            u32 t = 0
+            unsafe { *((user_ids + r * 4) as uint32) -> t }
+            unsafe { *((seq_ids + seq_len * 4) as uint32) = t }
+            seq_len = seq_len + 1
+            r = r + 1
+        }
+        unsafe { *((seq_ids + seq_len * 4) as uint32) = nl32 }
+        seq_len = seq_len + 1
+        r = 0
+        while r < msg_cnt {
+            u32 t = 0
+            unsafe { *((msg_ids + r * 4) as uint32) -> t }
+            unsafe { *((seq_ids + seq_len * 4) as uint32) = t }
+            seq_len = seq_len + 1
+            r = r + 1
+        }
+        unsafe { *((seq_ids + seq_len * 4) as uint32) = ime32 }
+        seq_len = seq_len + 1
+        unsafe { *((seq_ids + seq_len * 4) as uint32) = nl32  }
+        seq_len = seq_len + 1
+        unsafe { *((seq_ids + seq_len * 4) as uint32) = ims32 }
+        seq_len = seq_len + 1
+        r = 0
+        while r < assist_cnt {
+            u32 t = 0
+            unsafe { *((assist_ids + r * 4) as uint32) -> t }
+            unsafe { *((seq_ids + seq_len * 4) as uint32) = t }
+            seq_len = seq_len + 1
+            r = r + 1
+        }
+        unsafe { *((seq_ids + seq_len * 4) as uint32) = nl32 }
+        seq_len = seq_len + 1
+        dealloc(msg_ids)
+
+        // Active ping-pong residual buffers — reset every turn.  d_in
+        // and d_out are device VAs (passed to the mega-kernel); d_in_h
+        // and d_out_h are the host aliases used for embed copy / D2H.
+        u64 d_in    = d_x_A
+        u64 d_out   = d_x_B
+        u64 d_in_h  = d_x_A_h
+        u64 d_out_h = d_x_B_h
+
+        u64 prefill_start_ns = time_now()
+        while next_pos + 1 < seq_len {
+            u32 pt32 = 0
+            unsafe { *((seq_ids + next_pos * 4) as uint32) -> pt32 }
+            u64 pt = pt32
+            u64 row_p = embed_ptr + pt * hidden * 2
+            if next_pos < GPU_POS_CAP {
+                u64 ii = 0
+                while ii < hidden {
+                    f32 v = bf16_to_f32(row_p + ii * 2)
+                    unsafe { *((d_in_h + ii * 4) as f32) = v }
+                    ii = ii + 1
+                }
+                u64 layer = 0
+                while layer < n_layers {
+                    Qwen3LayerWeights w = layers_arr + layer * 88
+                    u64 kc = k_cache + layer * layer_stride
+                    u64 vc = v_cache + layer * layer_stride
+                    if qwen3_forward_layer_gpu(d_in, d_out, w, next_pos, kc, vc, num_workers, 0, 0xFF) != 0 {
+                        print_str("[qwen3_gpu_chat] forward_layer_gpu failed\n"); exit(1)
+                    }
+                    u64 td = d_in; d_in = d_out; d_out = td
+                    u64 th = d_in_h; d_in_h = d_out_h; d_out_h = th
+                    layer = layer + 1
+                }
+                gpu_pipeline_flush()
+            } else {
+                u64 ii = 0
+                while ii < hidden {
+                    f32 v = bf16_to_f32(row_p + ii * 2)
+                    unsafe { *((x_cur + ii * 4) as f32) = v }
+                    ii = ii + 1
+                }
+                u64 layer = 0
+                while layer < n_layers {
+                    Qwen3LayerWeights w = layers_arr + layer * 88
+                    u64 kc = k_cache + layer * layer_stride
+                    u64 vc = v_cache + layer * layer_stride
+                    qwen3_forward_layer(x_nxt, x_cur, w, next_pos, kc, vc, num_workers)
+                    u64 tmp = x_cur; x_cur = x_nxt; x_nxt = tmp
+                    layer = layer + 1
+                }
+            }
+            next_pos = next_pos + 1
+        }
+        u64 prefill_ns = time_elapsed(prefill_start_ns)
+
+        u32 last_pt32 = 0
+        unsafe { *((seq_ids + (seq_len - 1) * 4) as uint32) -> last_pt32 }
+        u64 last_pt = last_pt32
+        u64 row_l = embed_ptr + last_pt * hidden * 2
+        u64 jj = 0
+        while jj < hidden {
+            f32 v = bf16_to_f32(row_l + jj * 2)
+            unsafe { *((d_in_h + jj * 4) as f32) = v }
+            unsafe { *((x_cur  + jj * 4) as f32) = v }
+            jj = jj + 1
+        }
+
+        u64 decode_start_ns = time_now()
+        u64 step = 0
+        u64 hit_eos = 0
+        while step < max_new {
+            u64 final_in_host = 0
+            if next_pos < GPU_POS_CAP {
+                u64 layer = 0
+                while layer < n_layers {
+                    Qwen3LayerWeights w = layers_arr + layer * 88
+                    u64 kc = k_cache + layer * layer_stride
+                    u64 vc = v_cache + layer * layer_stride
+                    if qwen3_forward_layer_gpu(d_in, d_out, w, next_pos, kc, vc, num_workers, 0, 0xFF) != 0 {
+                        print_str("[qwen3_gpu_chat] forward_layer_gpu failed\n"); exit(1)
+                    }
+                    u64 td = d_in; d_in = d_out; d_out = td
+                    u64 th = d_in_h; d_in_h = d_out_h; d_out_h = th
+                    layer = layer + 1
+                }
+                gpu_pipeline_flush()
+                final_in_host = d_in_h
+            } else {
+                u64 layer = 0
+                while layer < n_layers {
+                    Qwen3LayerWeights w = layers_arr + layer * 88
+                    u64 kc = k_cache + layer * layer_stride
+                    u64 vc = v_cache + layer * layer_stride
+                    qwen3_forward_layer(x_nxt, x_cur, w, next_pos, kc, vc, num_workers)
+                    u64 tmp = x_cur; x_cur = x_nxt; x_nxt = tmp
+                    layer = layer + 1
+                }
+                final_in_host = x_cur
+            }
+
+            qwen3_rmsnorm_bf16(final_out, final_in_host, norm_ptr, hidden)
+            qwen3_main_matmul(logits, final_out, embed_ptr, 1, vocab, hidden, num_workers, 0)
+
+            u64 best_id = 0
+            f32 best_val = 0.0f
+            u64 first_lv = 1
+            u64 j = 0
+            while j < vocab {
+                f32 lv = 0.0f
+                unsafe { *((logits + j * 4) as f32) -> lv }
+                if first_lv == 1 { best_val = lv; best_id = j; first_lv = 0 }
+                else { if lv > best_val { best_val = lv; best_id = j } }
+                j = j + 1
+            }
+
+            u32 best_id32 = best_id
+            unsafe { *((seq_ids + seq_len * 4) as uint32) = best_id32 }
+            seq_len = seq_len + 1
+            next_pos = next_pos + 1
+
+            if best_id == 151645 { hit_eos = 1; step = max_new; continue }
+            if seq_len >= seq_cap { step = max_new; continue }
+
+            u32 stream_id = best_id
+            u64 stream_box = alloc(4)
+            unsafe { *(stream_box as uint32) = stream_id }
+            u64 tok_text = tokenizer_decode(tk, stream_box, 1)
+            print_str(tok_text)
+            dealloc(tok_text)
+            dealloc(stream_box)
+
+            u64 row_n = embed_ptr + best_id * hidden * 2
+            u64 kk = 0
+            while kk < hidden {
+                f32 v = bf16_to_f32(row_n + kk * 2)
+                unsafe { *((d_in_h + kk * 4) as f32) = v }
+                unsafe { *((x_cur  + kk * 4) as f32) = v }
+                kk = kk + 1
+            }
+            step = step + 1
+        }
+        u64 decode_ns = time_elapsed(decode_start_ns)
+        print_str("\n")
+
+        first_turn = 0
+    }
+
+    dealloc(user_ids); dealloc(assist_ids)
+    tokenizer_free(tk)
+    thread_pool_shutdown()
+    hipkfd_teardown()
+    exit(0)
+}

@@ -1,0 +1,623 @@
+// Mistral-7B-Instruct-v0.3 GPU mega-kernel chat — interactive multi-turn REPL.
+//
+// GPU-accelerated counterpart of examples/mistral_7b_gpu_generate.mlr.
+// Mirrors examples/qwen3_gpu_chat.mlr (slice 1 of the chat-REPL series)
+// for Mistral's architecture (HIDDEN=4096, N_HEADS=32, N_KV_HEADS=8 GQA,
+// FF=14336, 32 layers, vocab=32000, RoPE θ=1e6).
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native --emit=elfexe \
+//       examples/mistral_7b_gpu_chat.mlr -o /tmp/mistral_7b_gpu_chat
+// Run:
+//   MLRIFT_NATIVE_MEGAKERNEL=1 /tmp/mistral_7b_gpu_chat
+//
+// Tokenizer note: this driver loads the HF v0.3 tokenizer.json (vocab
+// 32768) but the Mistral mega-kernel + GGUF weights are v0.2 (vocab
+// 32000).  The two vocabs differ only by the 768 added_tokens prepended
+// at IDs 0..770 in v0.3 (BOS/EOS/[INST]/[/INST]/[control_*]).  Regular
+// text tokens shift by exactly 768: HF_id = GGUF_id + 768 for any
+// piece-level token.  We exploit this by shifting every encoded ID
+// down 768 before feeding the model, and shifting back up before
+// detokenizing for streaming output.  IDs that fall in the v0.3
+// special range (< 771) after encode are dropped — they don't exist
+// in the v0.2 vocab.  The chat-template specials [INST]/[/INST] are
+// spliced in via their v0.2 piece-level IDs (▁[=733 INST=16289 ]=28793,
+// ▁[=733 ▁/=732 INST=16289 ]=28793) since the GGUF v0.2 vocab has no
+// fused [INST] token.
+
+import "../std/qwen3.mlr"
+import "../std/gguf.mlr"
+import "../std/matmul.mlr"
+import "../std/inference.mlr"
+import "../std/inference_gpu.mlr"
+import "../std/tokenizer.mlr"
+import "../std/io.mlr"
+import "../std/fmt.mlr"
+import "../std/string.mlr"
+import "../std/thread.mlr"
+import "../std/time.mlr"
+import "../std/model_path.mlr"
+
+fn madv_dontneed_chat(u64 addr, u64 length) {
+    u64 page  = 4096
+    u64 mask  = 0 - page
+    u64 start = (addr + page - 1) & mask
+    u64 end   = (addr + length)   & mask
+    if end <= start { return }
+    u64 len = end - start
+    syscall_raw(28, start, len, 4, 0, 0, 0)
+}
+
+fn q8_0_to_bf16_alloc_chat(u64 src_q8, u64 n_elements) -> u64 {
+    u64 dst_bf16 = alloc(n_elements * 2)
+    u64 n_blocks = n_elements / 32
+    u64 scratch = alloc(4)
+    u64 bi = 0
+    while bi < n_blocks {
+        u64 block = src_q8 + bi * 34
+        u64 lo = load8(block)
+        u64 hi = load8(block + 1)
+        u64 dbits = lo | (hi << 8)
+        f32 d = gguf_f16_to_f32_exact(dbits)
+        u64 qs_base = block + 2
+        u64 j = 0
+        while j < 32 {
+            u64 bval = load8(qs_base + j)
+            f32 q = 0.0f
+            if bval >= 128 {
+                f32 pos = int_to_f32_gguf(256 - bval)
+                q = 0.0f - pos
+            } else {
+                q = int_to_f32_gguf(bval)
+            }
+            f32 out_val = d * q
+            unsafe { *(scratch as f32) = out_val }
+            u64 b0 = load8(scratch + 2)
+            u64 b1 = load8(scratch + 3)
+            u64 dst_off = (bi * 32 + j) * 2
+            u8 b0_8 = b0
+            u8 b1_8 = b1
+            unsafe { *((dst_bf16 + dst_off + 0) as u8) = b0_8 }
+            unsafe { *((dst_bf16 + dst_off + 1) as u8) = b1_8 }
+            j = j + 1
+        }
+        bi = bi + 1
+    }
+    dealloc(scratch)
+    return dst_bf16
+}
+
+fn main() {
+    u64 num_workers = 16
+    thread_pool_init(num_workers)
+
+    qwen3_set_arch(4096, 128, 32, 8, 14336)
+    qwen3_set_matmul_kind(0)
+    qwen3_set_norm_kind(1)
+    qwen3_set_fuse_qkv(0)
+    qwen3_set_qknorm(0)
+    qwen3_set_rope_base(1000000)
+    qwen3_set_rmsnorm_eps_bits(0x3727C5AC)
+    qwen3_set_rope_pair_layout(1)
+
+    u64 model_path = resolve_model_path("MLRIFT_MISTRAL_7B_GGUF",
+                                        "models/mistral-7b-instruct-v0.3-q8_0.gguf",
+                                        "mistral-7b-gpu-chat")
+
+    u64 max_new      = 128
+    u64 max_seq      = 2048
+
+    // Mega-kernel mandatory: this driver doesn't bother with a CPU-only fallback.
+    u64 _native_mk_env = getenv("MLRIFT_NATIVE_MEGAKERNEL")
+    if _native_mk_env == 0 {
+        print_str("[mistral_7b_gpu_chat] set MLRIFT_NATIVE_MEGAKERNEL=1 to run.\n")
+        thread_pool_shutdown(); exit(1)
+    }
+
+    u64 tok_path = ""
+    u64 _ev_tk = getenv("MLRIFT_MISTRAL_TOKENIZER")
+    if _ev_tk != 0 {
+        tok_path = _ev_tk
+    } else {
+        tok_path = "/home/pantelis/.cache/huggingface/hub/models--mistralai--Mistral-7B-Instruct-v0.3/snapshots/c170c708c41dac9275d15a8fff4eca08d52bab71/tokenizer.json"
+    }
+    Tokenizer tk = tokenizer_load(tok_path)
+    if tk.file_size == 0 {
+        print_str("[mistral_7b_gpu_chat] could not open tokenizer at ")
+        print_str(tok_path); print_str("\n")
+        print_str("[mistral_7b_gpu_chat] set MLRIFT_MISTRAL_TOKENIZER to a v0.3 tokenizer.json\n")
+        thread_pool_shutdown(); exit(1)
+    }
+    // SentencePiece (kind=0) is the default; explicit for clarity.
+
+    // Specials hardcoded by ID (GGUF v0.2 vocab space).
+    u64 BOS_ID      = 1
+    u64 EOS_ID      = 2
+    // [INST] = ▁[ INST ] = 733, 16289, 28793
+    // [/INST] = ▁[ ▁/ INST ] = 733, 732, 16289, 28793
+    u64 INST_OPEN_0 = 733
+    u64 INST_OPEN_1 = 16289
+    u64 INST_OPEN_2 = 28793
+    u64 INST_CLOSE_0 = 733
+    u64 INST_CLOSE_1 = 732
+    u64 INST_CLOSE_2 = 16289
+    u64 INST_CLOSE_3 = 28793
+
+    // v0.3 → v0.2 ID shift constant.  Used to translate text-piece IDs
+    // returned by tokenizer_encode into the GGUF vocab the model expects,
+    // and to translate model-emitted argmax IDs back into the HF vocab
+    // for tokenizer_decode.
+    u64 V3_SHIFT = 768
+
+    GGUFFile gf = gguf_open(model_path)
+    if gf.file_size == 0 {
+        print_str("[mistral_7b_gpu_chat] open GGUF failed at "); print_str(model_path); print_str("\n")
+        tokenizer_free(tk); thread_pool_shutdown(); exit(1)
+    }
+
+    u64 hidden    = QWEN3_HIDDEN
+    u64 q_dim     = QWEN3_Q_DIM
+    u64 kv_dim    = QWEN3_KV_DIM
+    u64 ff        = QWEN3_INTERMEDIATE
+    u64 n_layers  = 32
+    u64 vocab     = 32000
+
+    GGUFTensor embed_t = gguf_get(gf, "token_embd.weight")
+    GGUFTensor norm_t  = gguf_get(gf, "output_norm.weight")
+    if embed_t.ptr == 0 || norm_t.ptr == 0 {
+        print_str("[mistral_7b_gpu_chat] missing token_embd or output_norm\n")
+        gguf_free(gf); tokenizer_free(tk); thread_pool_shutdown(); exit(1)
+    }
+    GGUFTensor output_t = gguf_get(gf, "output.weight")
+    u64 lmhead_ptr = embed_t.ptr
+    if output_t.ptr != 0 { lmhead_ptr = output_t.ptr }
+
+    GGUFTensor rope_freqs_t = gguf_get(gf, "rope_freqs.weight")
+    if rope_freqs_t.ptr != 0 { qwen3_set_rope_freqs(rope_freqs_t.ptr) }
+
+    u64 layers_arr = alloc(n_layers * 88)
+    u64 q_elems    = q_dim  * hidden
+    u64 kv_elems   = kv_dim * hidden
+    u64 o_elems    = hidden * q_dim
+    u64 gate_elems = ff     * hidden
+    u64 up_elems   = ff     * hidden
+    u64 down_elems = hidden * ff
+
+    u64 q_q8_bytes    = (q_elems    / 32) * 34
+    u64 kv_q8_bytes   = (kv_elems   / 32) * 34
+    u64 o_q8_bytes    = (o_elems    / 32) * 34
+    u64 gate_q8_bytes = (gate_elems / 32) * 34
+    u64 up_q8_bytes   = (up_elems   / 32) * 34
+    u64 down_q8_bytes = (down_elems / 32) * 34
+
+    print_str("[mistral_7b_gpu_chat] dequantising "); u64 nls = fmt_dec(n_layers); print_str(nls); dealloc(nls)
+    print_str(" layers Q8_0 -> bf16 (this is one-time)...\n")
+    u64 li = 0
+    while li < n_layers {
+        u64 base = layers_arr + li * 88
+        u64 li_s = fmt_dec(li)
+        u64 pre0 = str_cat("blk.", li_s)
+        u64 prefix = str_cat(pre0, ".")
+        dealloc(li_s); dealloc(pre0)
+
+        u64 n01 = str_cat(prefix, "attn_norm.weight")
+        GGUFTensor t01 = gguf_get(gf, n01)
+        unsafe { *((base + 0 * 8) as u64) = t01.ptr }
+        dealloc(n01)
+
+        u64 n02 = str_cat(prefix, "attn_q.weight")
+        GGUFTensor t02 = gguf_get(gf, n02)
+        u64 q_bf16 = q8_0_to_bf16_alloc_chat(t02.ptr, q_elems)
+        unsafe { *((base + 1 * 8) as u64) = q_bf16 }
+        madv_dontneed_chat(t02.ptr, q_q8_bytes)
+        dealloc(n02)
+
+        u64 n03 = str_cat(prefix, "attn_k.weight")
+        GGUFTensor t03 = gguf_get(gf, n03)
+        u64 k_bf16 = q8_0_to_bf16_alloc_chat(t03.ptr, kv_elems)
+        unsafe { *((base + 2 * 8) as u64) = k_bf16 }
+        madv_dontneed_chat(t03.ptr, kv_q8_bytes)
+        dealloc(n03)
+
+        u64 n04 = str_cat(prefix, "attn_v.weight")
+        GGUFTensor t04 = gguf_get(gf, n04)
+        u64 v_bf16 = q8_0_to_bf16_alloc_chat(t04.ptr, kv_elems)
+        unsafe { *((base + 3 * 8) as u64) = v_bf16 }
+        madv_dontneed_chat(t04.ptr, kv_q8_bytes)
+        dealloc(n04)
+
+        unsafe { *((base + 4 * 8) as u64) = 0 }
+        unsafe { *((base + 5 * 8) as u64) = 0 }
+
+        u64 n07 = str_cat(prefix, "attn_output.weight")
+        GGUFTensor t07 = gguf_get(gf, n07)
+        u64 o_bf16 = q8_0_to_bf16_alloc_chat(t07.ptr, o_elems)
+        unsafe { *((base + 6 * 8) as u64) = o_bf16 }
+        madv_dontneed_chat(t07.ptr, o_q8_bytes)
+        dealloc(n07)
+
+        u64 n08 = str_cat(prefix, "ffn_norm.weight")
+        GGUFTensor t08 = gguf_get(gf, n08)
+        unsafe { *((base + 7 * 8) as u64) = t08.ptr }
+        dealloc(n08)
+
+        u64 n09 = str_cat(prefix, "ffn_gate.weight")
+        GGUFTensor t09 = gguf_get(gf, n09)
+        u64 g_bf16 = q8_0_to_bf16_alloc_chat(t09.ptr, gate_elems)
+        unsafe { *((base + 8 * 8) as u64) = g_bf16 }
+        madv_dontneed_chat(t09.ptr, gate_q8_bytes)
+        dealloc(n09)
+
+        u64 n10 = str_cat(prefix, "ffn_up.weight")
+        GGUFTensor t10 = gguf_get(gf, n10)
+        u64 u_bf16 = q8_0_to_bf16_alloc_chat(t10.ptr, up_elems)
+        unsafe { *((base + 9 * 8) as u64) = u_bf16 }
+        madv_dontneed_chat(t10.ptr, up_q8_bytes)
+        dealloc(n10)
+
+        u64 n11 = str_cat(prefix, "ffn_down.weight")
+        GGUFTensor t11 = gguf_get(gf, n11)
+        u64 d_bf16 = q8_0_to_bf16_alloc_chat(t11.ptr, down_elems)
+        unsafe { *((base + 10 * 8) as u64) = d_bf16 }
+        madv_dontneed_chat(t11.ptr, down_q8_bytes)
+        dealloc(n11)
+
+        dealloc(prefix)
+        li = li + 1
+    }
+    print_str("[mistral_7b_gpu_chat] layers dequantised\n")
+
+    // HIP/KFD lazy init.
+    u64 _dummy_slot = alloc(8)
+    u32 _dummy_err = hipMalloc(_dummy_slot, 64)
+    if _dummy_err != 0 {
+        print_str("[mistral_7b_gpu_chat] hipMalloc warmup failed (no GPU?)\n")
+        gguf_free(gf); tokenizer_free(tk); thread_pool_shutdown(); exit(1)
+    }
+    u64 _dummy_va = 0
+    unsafe { *(_dummy_slot as u64) -> _dummy_va }
+    hipFree(_dummy_va)
+    dealloc(_dummy_slot)
+
+    u64 _force_init = gpu_matmul_enabled()
+    if gpu_pipeline_ready() == 0 {
+        print_str("[mistral_7b_gpu_chat] GPU pipeline not ready\n")
+        gguf_free(gf); tokenizer_free(tk); thread_pool_shutdown(); exit(1)
+    }
+
+    u64 _mistral_fh = gpu_pipeline_load_alt_megakernel_co(
+        "/tmp/mistral_layer_megakernel_v2.co",
+        "mistral_layer_megakernel")
+    if _mistral_fh == 0 {
+        print_str("[mistral_7b_gpu_chat] /tmp/mistral_layer_megakernel_v2.co not loaded; rebuild with --emit-amdgpu-mistral-megakernel-v2\n")
+        gguf_free(gf); tokenizer_free(tk); thread_pool_shutdown(); exit(1)
+    }
+    if gpu_llama_megakernel_ready() == 0 {
+        print_str("[mistral_7b_gpu_chat] mistral mega-kernel handle not ready after alt load\n")
+        gguf_free(gf); tokenizer_free(tk); thread_pool_shutdown(); exit(1)
+    }
+
+    u64 batch_size   = 1
+    u64 kv_row_bytes = kv_dim * 4
+    u64 layer_stride = max_seq * kv_row_bytes
+    u64 total_cache  = n_layers * batch_size * layer_stride
+    u64 k_cache_dev = dev_try_alloc_host_visible(total_cache)
+    u64 v_cache_dev = dev_try_alloc_host_visible(total_cache)
+    if k_cache_dev == 0 || v_cache_dev == 0 {
+        print_str("[mistral_7b_gpu_chat] KV GTT alloc failed\n")
+        gguf_free(gf); tokenizer_free(tk); thread_pool_shutdown(); exit(1)
+    }
+    u64 k_cache = dev_host_ptr(k_cache_dev)
+    u64 v_cache = dev_host_ptr(v_cache_dev)
+    qwen3_gpu_set_kv_cache_dev(k_cache_dev, v_cache_dev, layer_stride, batch_size)
+    qwen3_gpu_set_batch_size(1)
+
+    u64 zi = 0
+    while zi < total_cache {
+        unsafe { *((k_cache + zi) as u8) = 0 }
+        unsafe { *((v_cache + zi) as u8) = 0 }
+        zi = zi + 1
+    }
+
+    u64 d_x_A   = dev_try_alloc_host_visible(hidden * 4)
+    u64 d_x_B   = dev_try_alloc_host_visible(hidden * 4)
+    if d_x_A == 0 || d_x_B == 0 {
+        print_str("[mistral_7b_gpu_chat] residual GTT alloc failed\n")
+        gguf_free(gf); tokenizer_free(tk); thread_pool_shutdown(); exit(1)
+    }
+    u64 d_x_A_h = dev_host_ptr(d_x_A)
+    u64 d_x_B_h = dev_host_ptr(d_x_B)
+
+    // Pre-stack the QKV + gate/up bf16 matrices: the mega-kernel reads
+    // a single fused weight tensor per layer, matching the existing
+    // mistral_7b_gpu_generate.mlr layout.
+    u64 qkv_dim_elems    = q_dim + 2 * kv_dim
+    u64 qkv_row_bytes    = hidden * 2
+    u64 q_bytes_l        = q_dim  * qkv_row_bytes
+    u64 kv_bytes_l       = kv_dim * qkv_row_bytes
+    u64 stacked_bytes    = qkv_dim_elems * qkv_row_bytes
+    u64 gu_dim_elems     = 2 * ff
+    u64 gate_bytes_l     = ff * qkv_row_bytes
+    u64 gu_stacked_bytes = gu_dim_elems * qkv_row_bytes
+    print_str("[mistral_7b_gpu_chat] fusing QKV + gate/up weights...\n")
+    u64 lf = 0
+    while lf < n_layers {
+        u64 base_lf = layers_arr + lf * 88
+        u64 qp_lf = 0; unsafe { *((base_lf + 1 * 8) as u64) -> qp_lf }
+        u64 kp_lf = 0; unsafe { *((base_lf + 2 * 8) as u64) -> kp_lf }
+        u64 vp_lf = 0; unsafe { *((base_lf + 3 * 8) as u64) -> vp_lf }
+        u64 qkv_stacked = alloc(stacked_bytes)
+        memcpy(qkv_stacked,                          qp_lf, q_bytes_l)
+        memcpy(qkv_stacked + q_bytes_l,              kp_lf, kv_bytes_l)
+        memcpy(qkv_stacked + q_bytes_l + kv_bytes_l, vp_lf, kv_bytes_l)
+        unsafe { *((base_lf + 1 * 8) as u64) = qkv_stacked }
+        unsafe { *((base_lf + 2 * 8) as u64) = 0 }
+        unsafe { *((base_lf + 3 * 8) as u64) = 0 }
+        dealloc(qp_lf); dealloc(kp_lf); dealloc(vp_lf)
+
+        u64 gpw_lf = 0; unsafe { *((base_lf + 8 * 8) as u64) -> gpw_lf }
+        u64 upw_lf = 0; unsafe { *((base_lf + 9 * 8) as u64) -> upw_lf }
+        u64 gu_stacked = alloc(gu_stacked_bytes)
+        memcpy(gu_stacked,                gpw_lf, gate_bytes_l)
+        memcpy(gu_stacked + gate_bytes_l, upw_lf, gate_bytes_l)
+        unsafe { *((base_lf + 8 * 8) as u64) = gu_stacked }
+        unsafe { *((base_lf + 9 * 8) as u64) = 0 }
+        dealloc(gpw_lf); dealloc(upw_lf)
+        lf = lf + 1
+    }
+    qwen3_set_fuse_qkv(1)
+
+    print_str("[mistral_7b_gpu_chat] warming padded-row weight cache...\n")
+    u64 hidden_pad_w = hidden + 128
+    u64 q_dim_pad_w  = q_dim  + 128
+    u64 ff_pad_w     = ff     + 128
+    u64 qkv_dim_w    = q_dim + 2 * kv_dim
+    u64 lyr_w = 0
+    while lyr_w < n_layers {
+        Qwen3LayerWeights w = layers_arr + lyr_w * 88
+        u64 _wq = gpu_get_or_upload_bf16_weight_padded(w.q_proj_w,    hidden, qkv_dim_w, hidden_pad_w)
+        u64 _wo = gpu_get_or_upload_bf16_weight_padded(w.o_proj_w,    q_dim,  hidden,    q_dim_pad_w)
+        u64 _wg = gpu_get_or_upload_bf16_weight_padded(w.gate_proj_w, hidden, 2 * ff,    hidden_pad_w)
+        u64 _wd = gpu_get_or_upload_bf16_weight_padded(w.down_proj_w, ff,     hidden,    ff_pad_w)
+        lyr_w = lyr_w + 1
+    }
+
+    // GPU lm_head: dequant tied-or-untied embedding once for the bf16
+    // gemv path; D2H back to host logits via GTT scratch.
+    print_str("[mistral_7b_gpu_chat] preparing GPU lm_head...\n")
+    u64 lm_head_bf16_host = q8_0_to_bf16_alloc_chat(lmhead_ptr, vocab * hidden)
+    u64 lmhead_q8_bytes = (vocab * hidden / 32) * 34
+    madv_dontneed_chat(lmhead_ptr, lmhead_q8_bytes)
+    u64 d_lm_in   = dev_try_alloc_host_visible(hidden * 4)
+    u64 d_lm_out  = dev_try_alloc_host_visible(vocab  * 4)
+    if d_lm_in == 0 || d_lm_out == 0 {
+        print_str("[mistral_7b_gpu_chat] lm_head GTT alloc failed\n")
+        gguf_free(gf); tokenizer_free(tk); thread_pool_shutdown(); exit(1)
+    }
+    u64 d_lm_in_h  = dev_host_ptr(d_lm_in)
+    u64 d_lm_out_h = dev_host_ptr(d_lm_out)
+
+    u64 final_out = alloc(hidden * 4)
+    u64 logits    = alloc(vocab * 4)
+    u64 x_cur     = alloc(hidden * 4)
+    u64 x_nxt     = alloc(hidden * 4)
+
+    u64 seq_cap = max_seq
+    u64 seq_ids = alloc(seq_cap * 4)
+    u64 seq_len = 0
+    u64 next_pos = 0
+
+    // Per-row Q8_0 decode geometry for embedding lookup.
+    u64 embed_base = embed_t.ptr
+    u64 row_blocks = hidden / 32
+    u64 row_bytes  = row_blocks * 34
+
+    print_str("[mistral_7b_gpu_chat] ready. type '/quit' or empty line to exit.\n")
+
+    u64 first_turn = 1
+
+    while 1 == 1 {
+        print_str("\n> ")
+        u64 line = read_line(2048)
+        u64 line_len = str_len(line)
+        if line_len == 0 {
+            dealloc(line)
+            print_str("[mistral_7b_gpu_chat] bye.\n")
+            break
+        }
+        u64 is_quit = 0
+        if str_compare(line, "/quit") == 0 { is_quit = 1 }
+        if str_compare(line, "/exit") == 0 { is_quit = 1 }
+        if is_quit == 1 {
+            dealloc(line)
+            print_str("[mistral_7b_gpu_chat] bye.\n")
+            break
+        }
+
+        // Tokenize user message via HF v0.3 tokenizer (SentencePiece).
+        u64 msg_box     = alloc(8); unsafe { *(msg_box     as u64) = 0 }
+        u64 msg_cnt_box = alloc(8); unsafe { *(msg_cnt_box as u64) = 0 }
+        tokenizer_encode(tk, line, line_len, msg_box, msg_cnt_box)
+        u64 msg_ids_hf = 0; unsafe { *(msg_box     as u64) -> msg_ids_hf }
+        u64 msg_cnt    = 0; unsafe { *(msg_cnt_box as u64) -> msg_cnt }
+        dealloc(msg_box); dealloc(msg_cnt_box)
+        dealloc(line)
+
+        // Filter v0.3 added_token range (< 771) — these don't exist in
+        // GGUF v0.2; the user is unlikely to type "[INST]" raw, but if
+        // they do, the bracket pieces will get spliced via the template.
+        // Shift remaining IDs down by V3_SHIFT to land in GGUF space.
+        u64 msg_ids_v2 = alloc(msg_cnt * 4 + 4)
+        u64 msg_cnt_v2 = 0
+        u64 mi = 0
+        while mi < msg_cnt {
+            u32 hid32 = 0
+            unsafe { *((msg_ids_hf + mi * 4) as uint32) -> hid32 }
+            u64 hid = hid32
+            if hid >= 771 {
+                u32 vid32 = hid - V3_SHIFT
+                unsafe { *((msg_ids_v2 + msg_cnt_v2 * 4) as uint32) = vid32 }
+                msg_cnt_v2 = msg_cnt_v2 + 1
+            }
+            mi = mi + 1
+        }
+        dealloc(msg_ids_hf)
+
+        // Mistral v0.2 chat template (multi-turn):
+        //   first turn:  <s> [INST] msg [/INST] <reply> </s>
+        //   later turns:     [INST] msg [/INST] <reply> </s>
+        // (BOS only on first turn; the previous </s> is already in seq.)
+        u64 ext_count = msg_cnt_v2 + 8     // +1 BOS (first only) + 3 [INST] + 4 [/INST]
+        if first_turn != 1 { ext_count = msg_cnt_v2 + 7 }
+        if seq_len + ext_count + max_new > seq_cap {
+            print_str("[mistral_7b_gpu_chat] conversation exceeds max_seq — start a new session.\n")
+            dealloc(msg_ids_v2)
+            break
+        }
+
+        if first_turn == 1 {
+            u32 t_bos = BOS_ID
+            unsafe { *((seq_ids + seq_len * 4) as uint32) = t_bos }
+            seq_len = seq_len + 1
+        }
+        u32 t_o0 = INST_OPEN_0
+        u32 t_o1 = INST_OPEN_1
+        u32 t_o2 = INST_OPEN_2
+        unsafe { *((seq_ids + seq_len * 4) as uint32) = t_o0 }; seq_len = seq_len + 1
+        unsafe { *((seq_ids + seq_len * 4) as uint32) = t_o1 }; seq_len = seq_len + 1
+        unsafe { *((seq_ids + seq_len * 4) as uint32) = t_o2 }; seq_len = seq_len + 1
+        u64 mr = 0
+        while mr < msg_cnt_v2 {
+            u32 t = 0
+            unsafe { *((msg_ids_v2 + mr * 4) as uint32) -> t }
+            unsafe { *((seq_ids + seq_len * 4) as uint32) = t }
+            seq_len = seq_len + 1
+            mr = mr + 1
+        }
+        u32 t_c0 = INST_CLOSE_0
+        u32 t_c1 = INST_CLOSE_1
+        u32 t_c2 = INST_CLOSE_2
+        u32 t_c3 = INST_CLOSE_3
+        unsafe { *((seq_ids + seq_len * 4) as uint32) = t_c0 }; seq_len = seq_len + 1
+        unsafe { *((seq_ids + seq_len * 4) as uint32) = t_c1 }; seq_len = seq_len + 1
+        unsafe { *((seq_ids + seq_len * 4) as uint32) = t_c2 }; seq_len = seq_len + 1
+        unsafe { *((seq_ids + seq_len * 4) as uint32) = t_c3 }; seq_len = seq_len + 1
+        dealloc(msg_ids_v2)
+
+        // Prefill every token before the last (the last drives step 0).
+        // Mega-kernel path only — pos < max_seq always (we already bounded
+        // seq_len above), so no CPU fallback dispatch is needed.
+        u64 d_in    = d_x_A
+        u64 d_out   = d_x_B
+        u64 d_in_h  = d_x_A_h
+        u64 d_out_h = d_x_B_h
+
+        u64 prefill_start_ns = time_now()
+        while next_pos + 1 < seq_len {
+            u32 pt32 = 0
+            unsafe { *((seq_ids + next_pos * 4) as uint32) -> pt32 }
+            u64 pt = pt32
+            gguf_deq_q8_0(d_in_h, embed_base + pt * row_bytes, hidden)
+            u64 layer = 0
+            while layer < n_layers {
+                Qwen3LayerWeights w = layers_arr + layer * 88
+                u64 kc = k_cache + layer * layer_stride
+                u64 vc = v_cache + layer * layer_stride
+                if qwen3_forward_layer_gpu(d_in, d_out, w, next_pos, kc, vc, num_workers, 0, 0xFF) != 0 {
+                    print_str("[mistral_7b_gpu_chat] forward_layer_gpu failed at prefill\n")
+                    exit(1)
+                }
+                u64 td = d_in; d_in = d_out; d_out = td
+                u64 th = d_in_h; d_in_h = d_out_h; d_out_h = th
+                layer = layer + 1
+            }
+            gpu_pipeline_flush()
+            next_pos = next_pos + 1
+        }
+        u64 prefill_ns = time_elapsed(prefill_start_ns)
+
+        // Load last prompt token's embedding for decode step 0.
+        u32 last_pt32 = 0
+        unsafe { *((seq_ids + (seq_len - 1) * 4) as uint32) -> last_pt32 }
+        u64 last_pt = last_pt32
+        gguf_deq_q8_0(d_in_h, embed_base + last_pt * row_bytes, hidden)
+
+        u64 decode_start_ns = time_now()
+        u64 step = 0
+        u64 hit_eos = 0
+        while step < max_new {
+            u64 layer = 0
+            while layer < n_layers {
+                Qwen3LayerWeights w = layers_arr + layer * 88
+                u64 kc = k_cache + layer * layer_stride
+                u64 vc = v_cache + layer * layer_stride
+                if qwen3_forward_layer_gpu(d_in, d_out, w, next_pos, kc, vc, num_workers, 0, 0xFF) != 0 {
+                    print_str("[mistral_7b_gpu_chat] forward_layer_gpu failed at decode\n")
+                    exit(1)
+                }
+                u64 td = d_in; d_in = d_out; d_out = td
+                u64 th = d_in_h; d_in_h = d_out_h; d_out_h = th
+                layer = layer + 1
+            }
+            gpu_pipeline_flush()
+
+            // Final RMSNorm on host (norm weight is F32 in GGUF).
+            qwen3_rmsnorm_f32_weights(final_out, d_in_h, norm_t.ptr, hidden)
+            // GPU lm_head bf16 gemv -> logits.
+            memcpy(d_lm_in_h, final_out, hidden * 4)
+            if gpu_matmul_to_dev(d_lm_out, d_lm_in, lm_head_bf16_host, vocab, hidden) != 0 {
+                matmul_q8_0_q8_0_f32(logits, final_out, lmhead_ptr, 1, vocab, hidden, num_workers)
+            } else {
+                gpu_pipeline_flush()
+                memcpy(logits, d_lm_out_h, vocab * 4)
+            }
+
+            u64 best_id = 0
+            f32 best_val = 0.0f
+            u64 first_lv = 1
+            u64 j = 0
+            while j < vocab {
+                f32 lv = 0.0f
+                unsafe { *((logits + j * 4) as f32) -> lv }
+                if first_lv == 1 { best_val = lv; best_id = j; first_lv = 0 }
+                else { if lv > best_val { best_val = lv; best_id = j } }
+                j = j + 1
+            }
+
+            u32 best_id32 = best_id
+            unsafe { *((seq_ids + seq_len * 4) as uint32) = best_id32 }
+            seq_len = seq_len + 1
+            next_pos = next_pos + 1
+
+            if best_id == EOS_ID { hit_eos = 1; step = max_new; continue }
+            if seq_len >= seq_cap { step = max_new; continue }
+
+            // Stream: shift v0.2 id back to v0.3 (id + 768) so the HF
+            // tokenizer.json decoder finds the right piece string.
+            u32 stream_hf32 = best_id + V3_SHIFT
+            u64 stream_box = alloc(4)
+            unsafe { *(stream_box as uint32) = stream_hf32 }
+            u64 tok_text = tokenizer_decode(tk, stream_box, 1)
+            print_str(tok_text)
+            dealloc(tok_text)
+            dealloc(stream_box)
+
+            // Load next embedding into d_in_h via Q8_0 dequant.
+            gguf_deq_q8_0(d_in_h, embed_base + best_id * row_bytes, hidden)
+            step = step + 1
+        }
+        u64 decode_ns = time_elapsed(decode_start_ns)
+        print_str("\n")
+
+        first_turn = 0
+    }
+
+    dealloc(final_out); dealloc(logits)
+    dealloc(x_cur); dealloc(x_nxt)
+    dealloc(seq_ids); dealloc(layers_arr)
+    gguf_free(gf)
+    tokenizer_free(tk)
+    thread_pool_shutdown()
+    hipkfd_teardown()
+    exit(0)
+}
