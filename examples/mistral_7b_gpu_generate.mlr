@@ -146,6 +146,25 @@ fn _dump_buf(u64 label, u64 ptr, u64 n) {
     eout("\n")
 }
 
+// fp32 dot(bf16 lm_head row at tok_id, f32 residual at last position).
+// Matches PT's fp32 dot product so the per-layer drift table is directly
+// comparable to /tmp/pt_layer_dump.py output.  Requires `scratch_f32` of
+// at least `hidden` floats (caller-owned; reused across layers/tokens).
+fn _probe_dot_f32(u64 scratch_f32, u64 lm_head_bf16_base, u64 tok_id,
+                  u64 resid_f32, u64 hidden) -> f64 {
+    u64 row_bf16 = lm_head_bf16_base + tok_id * hidden * 2
+    gguf_deq_bf16(scratch_f32, row_bf16, hidden)
+    f64 acc = 0.0
+    u64 i = 0
+    while i < hidden {
+        f32 w = 0.0f; unsafe { *((scratch_f32 + i * 4) as f32) -> w }
+        f32 x = 0.0f; unsafe { *((resid_f32   + i * 4) as f32) -> x }
+        acc = acc + f32_to_f64(w) * f32_to_f64(x)
+        i = i + 1
+    }
+    return acc
+}
+
 // Slice 6.7e-bis — speck4 per-phase dump.  D2H-copies n_elems f32 values
 // from d_ptr + stream_idx * n_elems * 4 into a scratch host buffer and
 // prints head8 / tail4 / sum / min / max.  Same level of detail as
@@ -383,6 +402,18 @@ fn main() {
     qwen3_set_rope_base(10000)              // Mistral v0.3 theta = 1e4
     qwen3_set_rmsnorm_eps_bits(0x3727C5AC)  // Mistral: rms_norm_eps = 1e-5
     qwen3_set_rope_pair_layout(1)           // NORM consecutive-pair RoPE
+
+    // Slice 6.8f — env-gated Kahan-compensated reduction for FFN down_proj
+    // (the FF=14336-wide reduction that bisection localised as the dominant
+    // PT divergence source).  Off by default; opt in with MLRIFT_DOWN_PROJ_KAHAN=1.
+    u64 _ev_dpk = sys_getenv("MLRIFT_DOWN_PROJ_KAHAN")
+    if _ev_dpk != 0 {
+        u8 _ev_dpk_c0 = 0; unsafe { *(_ev_dpk as u8) -> _ev_dpk_c0 }
+        if _ev_dpk_c0 == 49 {   // '1'
+            qwen3_set_down_proj_kahan(1)
+            eout("[mistral_7b_gpu] FFN down_proj: Kahan-compensated reduction ENABLED\n")
+        }
+    }
 
     // Force-init the GPU matmul dispatcher early so gpu_pipeline_ready()
     // and matmul_bf16_weights_f32_gpu work without first being touched
@@ -1341,11 +1372,45 @@ fn main() {
             }
         }
 
+        // Slice 6.8e — intra-layer probe gate (CPU path only; CPU=GPU
+        // bit-identical at layer outputs means CPU stand-in is sufficient).
+        u64 _intra_probe_on = 0
+        if lm_head_bf16_view_ptr != 0 && _native_mk_use == 0 {
+            u64 _ev_ip = getenv("MLRIFT_MISTRAL_PROBE_DOTS")
+            if _ev_ip != 0 {
+                u8 _ev_ip_c0 = 0; unsafe { *(_ev_ip as u8) -> _ev_ip_c0 }
+                if _ev_ip_c0 == 49 {   // '1'
+                    u64 _ev_ips = getenv("MLRIFT_MEGAK_DUMP_STEP")
+                    u64 _ip_step = 0
+                    if _ev_ips != 0 {
+                        u8 _ips_c0 = 0; unsafe { *(_ev_ips as u8) -> _ips_c0 }
+                        if _ips_c0 >= 48 && _ips_c0 <= 57 {
+                            u64 _ips_val = 0
+                            u64 _ips_i = 0
+                            while _ips_i < 4 {
+                                u8 _ips_c = 0; unsafe { *((_ev_ips + _ips_i) as u8) -> _ips_c }
+                                if _ips_c < 48 { _ips_i = 4 }
+                                else if _ips_c > 57 { _ips_i = 4 }
+                                else { _ips_val = _ips_val * 10 + (_ips_c - 48); _ips_i = _ips_i + 1 }
+                            }
+                            _ip_step = _ips_val
+                        }
+                    }
+                    if step == _ip_step {
+                        qwen3_set_probe(lm_head_bf16_view_ptr, 28737, 28710)
+                        _intra_probe_on = 1
+                    }
+                }
+            }
+        }
+
         u64 layer = 0
         while layer < n_layers {
             Qwen3LayerWeights w = layers_arr + layer * 88
             u64 kc = k_cache + layer * layer_stride
             u64 vc = v_cache + layer * layer_stride
+            if _intra_probe_on != 0 { qwen3_set_probe_active(1, layer) }
+            else                     { qwen3_set_probe_active(0, 0) }
             if _native_mk_use != 0 {
                 if _mk_fired_once == 0 {
                     eout("[mistral_7b_gpu] mega-kernel ACTUALLY FIRING (layer 0)\n")
@@ -1358,11 +1423,94 @@ fn main() {
                 }
                 u64 dtmp = d_x_cur; d_x_cur = d_x_nxt; d_x_nxt = dtmp
                 u64 dhtmp = d_x_cur_h; d_x_cur_h = d_x_nxt_h; d_x_nxt_h = dhtmp
+                // Slice 6.8e (2026-05-15) — per-layer fp32 dot probe for
+                // Mistral pos-6 (decode-step 3) argmax-flip bisection vs PT.
+                // Gated on MLRIFT_MISTRAL_PROBE_DOTS=1 AND step == MLRIFT_MEGAK_DUMP_STEP.
+                if lm_head_bf16_view_ptr != 0 {
+                    u64 _ev_pd = getenv("MLRIFT_MISTRAL_PROBE_DOTS")
+                    if _ev_pd != 0 {
+                        u8 _ev_pd_c0 = 0; unsafe { *(_ev_pd as u8) -> _ev_pd_c0 }
+                        if _ev_pd_c0 == 49 {   // '1'
+                            u64 _ev_pds = getenv("MLRIFT_MEGAK_DUMP_STEP")
+                            u64 _probe_step = 0
+                            if _ev_pds != 0 {
+                                u64 _pds_val = 0
+                                u64 _pds_i = 0
+                                u8 _pds_c0 = 0; unsafe { *(_ev_pds as u8) -> _pds_c0 }
+                                if _pds_c0 >= 48 && _pds_c0 <= 57 {
+                                    while _pds_i < 4 {
+                                        u8 _pds_c = 0; unsafe { *((_ev_pds + _pds_i) as u8) -> _pds_c }
+                                        if _pds_c < 48 { _pds_i = 4 }
+                                        else if _pds_c > 57 { _pds_i = 4 }
+                                        else { _pds_val = _pds_val * 10 + (_pds_c - 48); _pds_i = _pds_i + 1 }
+                                    }
+                                    _probe_step = _pds_val
+                                }
+                            }
+                            if step == _probe_step {
+                                u64 _probe_scratch = alloc(hidden * 4)
+                                f64 _da = _probe_dot_f32(_probe_scratch, lm_head_bf16_view_ptr, 28737, d_x_cur_h, hidden)
+                                f64 _db = _probe_dot_f32(_probe_scratch, lm_head_bf16_view_ptr, 28710, d_x_cur_h, hidden)
+                                dealloc(_probe_scratch)
+                                eout("[probe step="); eu64(step)
+                                eout(" layer="); eu64(layer)
+                                eout("] dot[28737]=")
+                                u64 _sa = fmt_f64(_da, 6); eout(_sa); dealloc(_sa)
+                                eout(" dot[28710]=")
+                                u64 _sb = fmt_f64(_db, 6); eout(_sb); dealloc(_sb)
+                                eout(" delta=")
+                                u64 _sd = fmt_f64(_da - _db, 6); eout(_sd); dealloc(_sd)
+                                eout("\n")
+                            }
+                        }
+                    }
+                }
             } else {
                 qwen3_forward_layer(x_nxt, x_cur, w, pos, kc, vc, num_workers)
                 u64 tmp = x_cur
                 x_cur = x_nxt
                 x_nxt = tmp
+                // Slice 6.8e (2026-05-15) — mirror per-layer dot probe on
+                // CPU bf16 path; same env-gate as GPU probe above.
+                if lm_head_bf16_view_ptr != 0 {
+                    u64 _ev_pdc = getenv("MLRIFT_MISTRAL_PROBE_DOTS")
+                    if _ev_pdc != 0 {
+                        u8 _ev_pdc_c0 = 0; unsafe { *(_ev_pdc as u8) -> _ev_pdc_c0 }
+                        if _ev_pdc_c0 == 49 {   // '1'
+                            u64 _ev_pdsc = getenv("MLRIFT_MEGAK_DUMP_STEP")
+                            u64 _probe_step_c = 0
+                            if _ev_pdsc != 0 {
+                                u64 _pdsc_val = 0
+                                u64 _pdsc_i = 0
+                                u8 _pdsc_c0 = 0; unsafe { *(_ev_pdsc as u8) -> _pdsc_c0 }
+                                if _pdsc_c0 >= 48 && _pdsc_c0 <= 57 {
+                                    while _pdsc_i < 4 {
+                                        u8 _pdsc_c = 0; unsafe { *((_ev_pdsc + _pdsc_i) as u8) -> _pdsc_c }
+                                        if _pdsc_c < 48 { _pdsc_i = 4 }
+                                        else if _pdsc_c > 57 { _pdsc_i = 4 }
+                                        else { _pdsc_val = _pdsc_val * 10 + (_pdsc_c - 48); _pdsc_i = _pdsc_i + 1 }
+                                    }
+                                    _probe_step_c = _pdsc_val
+                                }
+                            }
+                            if step == _probe_step_c {
+                                u64 _probe_scratch_c = alloc(hidden * 4)
+                                f64 _dac = _probe_dot_f32(_probe_scratch_c, lm_head_bf16_view_ptr, 28737, x_cur, hidden)
+                                f64 _dbc = _probe_dot_f32(_probe_scratch_c, lm_head_bf16_view_ptr, 28710, x_cur, hidden)
+                                dealloc(_probe_scratch_c)
+                                eout("[probe-cpu step="); eu64(step)
+                                eout(" layer="); eu64(layer)
+                                eout("] dot[28737]=")
+                                u64 _sac = fmt_f64(_dac, 6); eout(_sac); dealloc(_sac)
+                                eout(" dot[28710]=")
+                                u64 _sbc = fmt_f64(_dbc, 6); eout(_sbc); dealloc(_sbc)
+                                eout(" delta=")
+                                u64 _sdc = fmt_f64(_dac - _dbc, 6); eout(_sdc); dealloc(_sdc)
+                                eout("\n")
+                            }
+                        }
+                    }
+                }
             }
             // Slice 6.7b — per-layer output dump diagnostic.  Enabled when
             // MLRIFT_MEGAK_DUMP_LAYER=N matches the current layer (default

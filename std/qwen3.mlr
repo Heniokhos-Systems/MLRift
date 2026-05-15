@@ -300,6 +300,72 @@ fn qwen3_set_mk_weight_dtype(u64 dtype) { qwen3_mk_weight_dtype = dtype }
 static u64 qwen3_norm_kind = 0
 fn qwen3_set_norm_kind(u64 kind) { qwen3_norm_kind = kind }
 
+// Slice 6.8f (2026-05-15) — Kahan-compensated reduction for the FFN
+// down_proj matmul only.  Bisection localised Mistral pos-6 PT divergence
+// to late-layer FFN (-0.082 of -0.053 net, with attn partially canceling
+// at +0.029).  down_proj reduces over FF=14336 (3.5x wider than any
+// other matmul); its naive fp32 sum-of-products is the only ~24-bit-
+// precision reduction in the chain.  Kahan adds a compensation carry,
+// effectively ~50-bit accumulation.  Enable per-driver via setter; no
+// impact on Qwen3/Llama-1B/Llama-3B unless they opt in.
+static u64 qwen3_down_proj_kahan = 0
+fn qwen3_set_down_proj_kahan(u64 on) { qwen3_down_proj_kahan = on }
+
+// Slice 6.8e (2026-05-15) — intra-layer dot-product probe state for
+// PT-vs-MLRift drift bisection.  Driver populates these before the
+// per-layer loop; qwen3_forward_layer calls _qwen3_probe_dot() at two
+// checkpoints (post-attn-residual and post-ffn-residual = x_out).  All
+// no-op when qwen3_probe_lm_head_view == 0.
+static u64 qwen3_probe_lm_head_view  = 0
+static u64 qwen3_probe_token_a       = 0
+static u64 qwen3_probe_token_b       = 0
+static u64 qwen3_probe_active        = 0      // 1 = emit probe this layer
+static u64 qwen3_probe_current_layer = 0
+fn qwen3_set_probe(u64 lm_head_view, u64 tok_a, u64 tok_b) {
+    qwen3_probe_lm_head_view = lm_head_view
+    qwen3_probe_token_a      = tok_a
+    qwen3_probe_token_b      = tok_b
+}
+fn qwen3_set_probe_active(u64 a, u64 layer_idx) {
+    qwen3_probe_active        = a
+    qwen3_probe_current_layer = layer_idx
+}
+fn _qwen3_probe_dot(u64 label, u64 resid_f32, u64 hidden) {
+    if qwen3_probe_active == 0 { return }
+    if qwen3_probe_lm_head_view == 0 { return }
+    u64 scratch = alloc(hidden * 4)
+    u64 row_a = qwen3_probe_lm_head_view + qwen3_probe_token_a * hidden * 2
+    u64 row_b = qwen3_probe_lm_head_view + qwen3_probe_token_b * hidden * 2
+    gguf_deq_bf16(scratch, row_a, hidden)
+    f64 da = 0.0
+    u64 i = 0
+    while i < hidden {
+        f32 w = 0.0f; unsafe { *((scratch + i * 4) as f32) -> w }
+        f32 x = 0.0f; unsafe { *((resid_f32 + i * 4) as f32) -> x }
+        da = da + f32_to_f64(w) * f32_to_f64(x)
+        i = i + 1
+    }
+    gguf_deq_bf16(scratch, row_b, hidden)
+    f64 db = 0.0
+    i = 0
+    while i < hidden {
+        f32 w = 0.0f; unsafe { *((scratch + i * 4) as f32) -> w }
+        f32 x = 0.0f; unsafe { *((resid_f32 + i * 4) as f32) -> x }
+        db = db + f32_to_f64(w) * f32_to_f64(x)
+        i = i + 1
+    }
+    dealloc(scratch)
+    print_str(label); print_str(" layer=")
+    u64 sl = fmt_dec(qwen3_probe_current_layer); print_str(sl); dealloc(sl)
+    print_str(" dot[a]=")
+    u64 sa = fmt_f64(da, 6); print_str(sa); dealloc(sa)
+    print_str(" dot[b]=")
+    u64 sb = fmt_f64(db, 6); print_str(sb); dealloc(sb)
+    print_str(" delta=")
+    u64 sd = fmt_f64(da - db, 6); print_str(sd); dealloc(sd)
+    print_str("\n")
+}
+
 // Q/K-Norm gate. Qwen3 normalises each query / key head before RoPE
 // (Qwen3 paper §3.1); Llama / Mistral / Phi do not. Default 1 keeps
 // the existing Qwen3 behaviour. Llama callers set 0 before forward.
@@ -1409,12 +1475,14 @@ fn qwen3_forward_layer(u64 x_out, u64 x_in,
     }
     qwen3_t_oproj_res1 = qwen3_t_oproj_res1 + time_elapsed(p_t4)
     if _dbg_phase != 0 { _qwen3_dump_buf("b_mid_g", mid, hidden) }
+    _qwen3_probe_dot("[probe-mid]", mid, hidden)   // slice 6.8e: post-attn-residual
 
     u64 p_t5 = time_now()
     u64 mid_norm = alloc(hidden * 4)
     qwen3_main_rmsnorm(mid_norm, mid, w.post_norm_w, hidden)
     qwen3_t_post_norm = qwen3_t_post_norm + time_elapsed(p_t5)
     if _dbg_phase != 0 { _qwen3_dump_buf("b_mid_norm_g", mid_norm, hidden) }
+    _qwen3_probe_dot("[probe-midnrm]", mid_norm, hidden)   // slice 6.8e split-FFN
 
     // gate/up: same dual-path story as QKV above.
     u64 gate_buf = alloc(ff * 4)
@@ -1443,7 +1511,7 @@ fn qwen3_forward_layer(u64 x_out, u64 x_in,
     // hotspot.
     u64 ff_out = alloc(hidden * 4)
     u64 p_t8 = time_now()
-    qwen3_main_matmul(ff_out, ff_buf, w.down_proj_w, 1, hidden, ff, num_workers, 0)
+    qwen3_main_matmul(ff_out, ff_buf, w.down_proj_w, 1, hidden, ff, num_workers, qwen3_down_proj_kahan)
     // qwen3_dump5("ff_out", ff_out)
 
     // Second residual add: x_out = mid + ff_out
@@ -1460,6 +1528,7 @@ fn qwen3_forward_layer(u64 x_out, u64 x_in,
         _qwen3_dump_buf("out_resid", x_out, hidden)
         qwen3_phase_dump_state = 3   // disarm — fire only on first layer
     }
+    _qwen3_probe_dot("[probe-out]", x_out, hidden)   // slice 6.8e: post-ffn-residual
 
     dealloc(resid); dealloc(x_norm)
     dealloc(q_buf)
