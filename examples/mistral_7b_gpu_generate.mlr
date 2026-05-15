@@ -67,6 +67,8 @@ import "../std/string.mlr"
 import "../std/thread.mlr"
 import "../std/time.mlr"
 import "../std/model_path.mlr"
+import "../std/safetensors.mlr"
+import "../std/sys.mlr"
 
 static u64 g_fd = 0
 // Slice 6.5 — one-shot proof-of-firing flags.  Tests grep for the log
@@ -287,6 +289,39 @@ fn madv_dontneed(u64 addr, u64 length) {
     syscall_raw(28, start, len, 4, 0, 0, 0)
 }
 
+// Slice 7.6 (bf16 safetensors path, 2026-05-15) — allocate a fresh heap
+// bf16 buffer of `n_elements * 2` bytes and memcpy from a safetensors
+// mmap'd view.  Used to OWN the bf16 weights so that downstream code
+// can dealloc() them (e.g. after the QKV-fuse memcpy step).  Using the
+// raw mmap pointer would be cheaper, but the fuse path on line ~763
+// calls dealloc() which requires heap-backed memory.
+fn bf16_clone_alloc(u64 src_bf16, u64 n_elements) -> u64 {
+    u64 nbytes = n_elements * 2
+    u64 dst = alloc(nbytes)
+    memcpy(dst, src_bf16, nbytes)
+    return dst
+}
+
+// Slice 7.6 — allocate an f32 buffer and dequantise bf16 → f32 into it.
+// Used for the per-layer attn_norm / ffn_norm (Mistral GGUF stores them
+// as F32; safetensors stores them as BF16, but the mega-kernel + CPU
+// paths expect F32 norm weights via qwen3_set_norm_kind(1)).
+fn bf16_to_f32_alloc(u64 src_bf16, u64 n_elements) -> u64 {
+    u64 dst = alloc(n_elements * 4)
+    gguf_deq_bf16(dst, src_bf16, n_elements)
+    return dst
+}
+
+// Slice 7.6 — per-token bf16 embedding row → f32 expansion.  Used in
+// the decode loop instead of `gguf_deq_q8_0(...)` when the bf16
+// safetensors weight path is active.  `embed_bf16_base + tok_id * hidden * 2`
+// gives the start of the token's bf16 row; expand `hidden` elements
+// into `dst_f32`.  No allocation — caller owns dst_f32.
+fn bf16_embed_row_to_f32(u64 dst_f32, u64 embed_bf16_base, u64 tok_id, u64 hidden) {
+    u64 src = embed_bf16_base + tok_id * hidden * 2
+    gguf_deq_bf16(dst_f32, src, hidden)
+}
+
 // Dequantise a Q8_0 tensor of `n_elements` total values into a freshly
 // allocated bf16 buffer (2 bytes per element).  Q8_0 layout: 32-element
 // blocks of [f16 scale | int8 qs[32]] = 34 bytes each.  Output bf16:
@@ -371,19 +406,26 @@ fn main() {
         eout("[mistral_7b_gpu] hip/kfd lazy-init FAILED err="); eu64(_dummy_err); eout("\n")
     }
 
-    u64 path = resolve_model_path("MLRIFT_MISTRAL_7B_GGUF",
-                                   "models/mistral-7b-instruct-v0.3-q8_0.gguf",
-                                   "mistral-7b-gpu")
-    eout("[mistral_7b_gpu] loading weights from ")
-    eout(path)
-    eout("\n")
-    u64 load_start_ns = time_now()
-    GGUFFile gf = gguf_open(path)
-    if gf.file_size == 0 {
-        eout("open fail\n")
-        thread_pool_shutdown(); file_close(g_fd); exit(1)
+    // Slice 7.6 (2026-05-15) — Weight-loader selection.
+    //   MLRIFT_MISTRAL_WEIGHTS unset OR =bf16 (default): load bf16 safetensors
+    //     directly from the HuggingFace cache.  Bit-exact vs PyTorch bf16.
+    //   MLRIFT_MISTRAL_WEIGHTS=q8_0: load Q8_0 GGUF (Ollama blob), then
+    //     dequantise to bf16 at start-up.  Smaller VRAM, but Q8_0 noise
+    //     flips knife-edge argmax vs PT.
+    u64 _ev_w = sys_getenv("MLRIFT_MISTRAL_WEIGHTS")
+    u64 _use_bf16_weights = 1
+    if _ev_w != 0 {
+        u8 _wc0 = 0; unsafe { *(_ev_w as u8) -> _wc0 }
+        u8 _wc1 = 0; unsafe { *((_ev_w + 1) as u8) -> _wc1 }
+        // "q8_0" → q0 == 'q' (113), c1 == '8' (56)
+        if _wc0 == 113 && _wc1 == 56 { _use_bf16_weights = 0 }
+        // Allow explicit "bf16" too (no-op since default is bf16).
     }
 
+    // Shared variables across both load paths (declared up front so the
+    // post-load downstream code can see them).  `embed_base` is the raw
+    // byte pointer used by the per-token embedding lookup; for q8_0 it
+    // points into the Q8_0 GGUF, for bf16 it points into mmap'd safetensors.
     u64 hidden    = QWEN3_HIDDEN
     u64 q_dim     = QWEN3_Q_DIM
     u64 kv_dim    = QWEN3_KV_DIM
@@ -392,6 +434,52 @@ fn main() {
     u64 vocab     = 32000       // Mistral-7B-Instruct: V=32000 (32k SentencePiece tokens)
     u64 max_seq   = 128         // bumped from 64 for Mistral RoPE table coverage
     u64 max_new   = 20
+
+    // Open the weight source.  Both branches populate `embed_base`,
+    // `lmhead_ptr`, `output_norm_f32_ptr`, and per-layer `layers_arr`
+    // pointers.  rope_freqs.weight is GGUF-only (Mistral safetensors
+    // doesn't ship it); bf16 path leaves rope_freqs at its default
+    // theta-based computation (Mistral uses NORM consecutive-pair RoPE
+    // with theta=10000 already wired via qwen3_set_rope_base).
+    GGUFFile gf
+    gf.file_size = 0
+    gf.base_addr = 0
+    SafetensorShard _ms
+    _ms.n_shards = 0
+    _ms.shards = 0
+    u64 load_start_ns = time_now()
+
+    if _use_bf16_weights == 0 {
+        u64 path = resolve_model_path("MLRIFT_MISTRAL_7B_GGUF",
+                                       "models/mistral-7b-instruct-v0.3-q8_0.gguf",
+                                       "mistral-7b-gpu")
+        eout("[mistral_7b_gpu] loading Q8_0 GGUF weights from ")
+        eout(path); eout("\n")
+        gf = gguf_open(path)
+        if gf.file_size == 0 {
+            eout("open fail\n")
+            thread_pool_shutdown(); file_close(g_fd); exit(1)
+        }
+    } else {
+        u64 default_dir = "/home/pantelis/.cache/huggingface/hub/models--mistralai--Mistral-7B-Instruct-v0.2/snapshots/63a8b081895390a26e140280378bc85ec8bce07a"
+        u64 ev_dir = sys_getenv("MLRIFT_MISTRAL_7B_BF16_DIR")
+        u64 dir_path = default_dir
+        if ev_dir != 0 {
+            u8 _dc0 = 0; unsafe { *(ev_dir as u8) -> _dc0 }
+            if _dc0 != 0 { dir_path = ev_dir }
+        }
+        eout("[mistral_7b_gpu] loading bf16 safetensors weights from ")
+        eout(dir_path); eout("\n")
+        _ms = safetensors_shard_open(dir_path, 3)
+        if _ms.n_shards != 3 {
+            eout("[mistral_7b_gpu] safetensors_shard_open returned ")
+            eu64(_ms.n_shards); eout(" shards, expected 3 — bf16 path FAILED\n")
+            eout("  Set MLRIFT_MISTRAL_7B_BF16_DIR=<snapshot-dir> to override, or\n")
+            eout("  set MLRIFT_MISTRAL_WEIGHTS=q8_0 to fall back to Q8_0 GGUF.\n")
+            thread_pool_shutdown(); file_close(g_fd); exit(1)
+        }
+        eout("[mistral_7b_gpu] opened "); eu64(_ms.n_shards); eout(" bf16 shards\n")
+    }
     // MLRIFT_QWEN3_MAX_NEW: shorten the decode loop so dump/bisect runs
     // finish quickly (max_new=1 is enough to capture per-phase dumps).
     u64 _ev_mn_l = getenv("MLRIFT_QWEN3_MAX_NEW")
@@ -435,137 +523,299 @@ fn main() {
         if _mp_val <= 7 { _speck4_max_phase = _mp_val }
     }
 
-    GGUFTensor embed_t = gguf_get(gf, "token_embd.weight")
-    if embed_t.ptr == 0 {
-        eout("missing token_embd.weight\n")
-        gguf_free(gf); thread_pool_shutdown(); file_close(g_fd); exit(1)
-    }
-    GGUFTensor norm_t = gguf_get(gf, "output_norm.weight")
-    if norm_t.ptr == 0 {
-        eout("missing output_norm.weight\n")
-        gguf_free(gf); thread_pool_shutdown(); file_close(g_fd); exit(1)
-    }
-    // Mistral has a SEPARATE output.weight tensor (lm_head is NOT tied to
-    // the input embedding).  Fall back to embed_t.ptr if missing (some
-    // Mistral GGUF builds tie them anyway).
-    GGUFTensor output_t = gguf_get(gf, "output.weight")
+    // Shared post-load output pointers (populated by either branch).
+    //   embed_base — raw bytes used for per-token embedding lookup.
+    //     Q8_0: 34*hidden/32 byte rows; BF16: 2*hidden byte rows.
+    //   embed_row_bytes — byte stride between consecutive rows.
+    //   output_norm_f32_ptr — F32 RMS norm weight applied before lm_head.
+    //   lmhead_ptr — Q8_0 base for matmul_q8_0_q8_0_f32 (Q8_0 path only).
+    u64 embed_base = 0
+    u64 embed_row_bytes = 0
+    u64 output_norm_f32_ptr = 0
     u64 lmhead_ptr = 0
-    if output_t.ptr != 0 {
-        lmhead_ptr = output_t.ptr
-        eout("[mistral_7b_gpu] using untied output.weight for lm_head\n")
-    } else {
-        lmhead_ptr = embed_t.ptr   // fallback to tied embedding
-        eout("[mistral_7b_gpu] output.weight missing -- falling back to tied token_embd.weight\n")
-    }
-
-    GGUFTensor rope_freqs_t = gguf_get(gf, "rope_freqs.weight")
-    if rope_freqs_t.ptr != 0 {
-        qwen3_set_rope_freqs(rope_freqs_t.ptr)
-        eout("[mistral_7b_gpu] rope_freqs.weight wired\n")
-    }
+    // bf16 path: also exposes the bf16 lm_head matrix view, so we can
+    // skip the q8_0_to_bf16_alloc dequant step at line ~940.
+    u64 lm_head_bf16_view_ptr = 0
 
     // Per-layer weight pointer table — same 11-slot layout.  Slot 4
     // (q_norm) and 5 (k_norm) stay 0; qwen3_set_qknorm(0) gates them.
     // Slots 1,2,3 (q/k/v), 6 (o), 8 (gate), 9 (up), 10 (down) hold
-    // bf16 host pointers (dequantised from the GGUF Q8_0 tensors).
-    // Slots 0 (input_norm) and 7 (post_norm) hold the original f32
-    // pointers (Llama GGUF stores those as F32).
+    // bf16 host pointers.  Slots 0 (input_norm) and 7 (post_norm) hold
+    // F32 pointers (Mistral uses qwen3_set_norm_kind(1) = F32 norm wts).
     u64 layers_arr = alloc(n_layers * 88)
 
-    u64 q_elems    = q_dim  * hidden            // 2048×2048
-    u64 kv_elems   = kv_dim * hidden            //  512×2048
-    u64 o_elems    = hidden * q_dim             // 2048×2048
-    u64 gate_elems = ff     * hidden            // 8192×2048
+    u64 q_elems    = q_dim  * hidden            // 4096×4096
+    u64 kv_elems   = kv_dim * hidden            // 1024×4096
+    u64 o_elems    = hidden * q_dim             // 4096×4096
+    u64 gate_elems = ff     * hidden            // 14336×4096
     u64 up_elems   = ff     * hidden
     u64 down_elems = hidden * ff
 
-    // Q8_0 block-byte sizes for the madvise step (slice 4.27 pattern).
-    u64 q_q8_bytes    = (q_elems    / 32) * 34
-    u64 kv_q8_bytes   = (kv_elems   / 32) * 34
-    u64 o_q8_bytes    = (o_elems    / 32) * 34
-    u64 gate_q8_bytes = (gate_elems / 32) * 34
-    u64 up_q8_bytes   = (up_elems   / 32) * 34
-    u64 down_q8_bytes = (down_elems / 32) * 34
-    eout("[mistral_7b_gpu] dequantising "); eu64(n_layers); eout(" layers of Q8_0 → bf16 (host) — this is one-time...\n")
-    u64 li = 0
-    while li < n_layers {
-        u64 base = layers_arr + li * 88
-        u64 li_s = fmt_dec(li)
-        u64 pre0 = str_cat("blk.", li_s)
-        u64 prefix = str_cat(pre0, ".")
-        dealloc(li_s); dealloc(pre0)
-
-        u64 n01 = str_cat(prefix, "attn_norm.weight")
-        GGUFTensor t01 = gguf_get(gf, n01)
-        unsafe { *((base + 0 * 8) as u64) = t01.ptr }
-        dealloc(n01)
-
-        u64 n02 = str_cat(prefix, "attn_q.weight")
-        GGUFTensor t02 = gguf_get(gf, n02)
-        u64 q_bf16 = q8_0_to_bf16_alloc(t02.ptr, q_elems)
-        unsafe { *((base + 1 * 8) as u64) = q_bf16 }
-        madv_dontneed(t02.ptr, q_q8_bytes)
-        dealloc(n02)
-
-        u64 n03 = str_cat(prefix, "attn_k.weight")
-        GGUFTensor t03 = gguf_get(gf, n03)
-        u64 k_bf16 = q8_0_to_bf16_alloc(t03.ptr, kv_elems)
-        unsafe { *((base + 2 * 8) as u64) = k_bf16 }
-        madv_dontneed(t03.ptr, kv_q8_bytes)
-        dealloc(n03)
-
-        u64 n04 = str_cat(prefix, "attn_v.weight")
-        GGUFTensor t04 = gguf_get(gf, n04)
-        u64 v_bf16 = q8_0_to_bf16_alloc(t04.ptr, kv_elems)
-        unsafe { *((base + 3 * 8) as u64) = v_bf16 }
-        madv_dontneed(t04.ptr, kv_q8_bytes)
-        dealloc(n04)
-
-        unsafe { *((base + 4 * 8) as u64) = 0 }
-        unsafe { *((base + 5 * 8) as u64) = 0 }
-
-        u64 n07 = str_cat(prefix, "attn_output.weight")
-        GGUFTensor t07 = gguf_get(gf, n07)
-        u64 o_bf16 = q8_0_to_bf16_alloc(t07.ptr, o_elems)
-        unsafe { *((base + 6 * 8) as u64) = o_bf16 }
-        madv_dontneed(t07.ptr, o_q8_bytes)
-        dealloc(n07)
-
-        u64 n08 = str_cat(prefix, "ffn_norm.weight")
-        GGUFTensor t08 = gguf_get(gf, n08)
-        unsafe { *((base + 7 * 8) as u64) = t08.ptr }
-        dealloc(n08)
-
-        u64 n09 = str_cat(prefix, "ffn_gate.weight")
-        GGUFTensor t09 = gguf_get(gf, n09)
-        u64 g_bf16 = q8_0_to_bf16_alloc(t09.ptr, gate_elems)
-        unsafe { *((base + 8 * 8) as u64) = g_bf16 }
-        madv_dontneed(t09.ptr, gate_q8_bytes)
-        dealloc(n09)
-
-        u64 n10 = str_cat(prefix, "ffn_up.weight")
-        GGUFTensor t10 = gguf_get(gf, n10)
-        u64 u_bf16 = q8_0_to_bf16_alloc(t10.ptr, up_elems)
-        unsafe { *((base + 9 * 8) as u64) = u_bf16 }
-        madv_dontneed(t10.ptr, up_q8_bytes)
-        dealloc(n10)
-
-        u64 n11 = str_cat(prefix, "ffn_down.weight")
-        GGUFTensor t11 = gguf_get(gf, n11)
-        u64 d_bf16 = q8_0_to_bf16_alloc(t11.ptr, down_elems)
-        unsafe { *((base + 10 * 8) as u64) = d_bf16 }
-        madv_dontneed(t11.ptr, down_q8_bytes)
-        dealloc(n11)
-
-        dealloc(prefix)
-        if (li & 3) == 3 {
-            eout("  layer "); eu64(li); eout(" done\n")
-        }
-        li = li + 1
+    // bf16 path: track per-layer heap-allocated F32 norm buffers so we
+    // can free them at shutdown (one alloc per layer per norm = 64 small
+    // buffers total).  Pre-allocate the index array now.
+    u64 _bf16_norm_alloc_n = 0
+    u64 _bf16_norm_allocs = 0
+    if _use_bf16_weights != 0 {
+        // 2 norms/layer + 1 output_norm = 65 buffers max.
+        _bf16_norm_allocs = alloc((2 * n_layers + 1) * 8)
     }
-    u64 load_elapsed_ns = time_elapsed(load_start_ns)
-    eout("[mistral_7b_gpu] "); eu64(n_layers); eout(" layers indexed + dequantised; load_ms=")
-    eu64(load_elapsed_ns / 1000000); eout(" (Q8_0 source pages released via MADV_DONTNEED)\n")
+
+    if _use_bf16_weights == 0 {
+        GGUFTensor embed_t = gguf_get(gf, "token_embd.weight")
+        if embed_t.ptr == 0 {
+            eout("missing token_embd.weight\n")
+            gguf_free(gf); thread_pool_shutdown(); file_close(g_fd); exit(1)
+        }
+        GGUFTensor norm_t = gguf_get(gf, "output_norm.weight")
+        if norm_t.ptr == 0 {
+            eout("missing output_norm.weight\n")
+            gguf_free(gf); thread_pool_shutdown(); file_close(g_fd); exit(1)
+        }
+        // Mistral has a SEPARATE output.weight tensor (lm_head is NOT tied to
+        // the input embedding).  Fall back to embed_t.ptr if missing (some
+        // Mistral GGUF builds tie them anyway).
+        GGUFTensor output_t = gguf_get(gf, "output.weight")
+        if output_t.ptr != 0 {
+            lmhead_ptr = output_t.ptr
+            eout("[mistral_7b_gpu] using untied output.weight for lm_head\n")
+        } else {
+            lmhead_ptr = embed_t.ptr
+            eout("[mistral_7b_gpu] output.weight missing -- falling back to tied token_embd.weight\n")
+        }
+        GGUFTensor rope_freqs_t = gguf_get(gf, "rope_freqs.weight")
+        if rope_freqs_t.ptr != 0 {
+            qwen3_set_rope_freqs(rope_freqs_t.ptr)
+            eout("[mistral_7b_gpu] rope_freqs.weight wired\n")
+        }
+        embed_base = embed_t.ptr
+        embed_row_bytes = (hidden / 32) * 34
+        output_norm_f32_ptr = norm_t.ptr
+
+        // Q8_0 block-byte sizes for the madvise step (slice 4.27 pattern).
+        u64 q_q8_bytes    = (q_elems    / 32) * 34
+        u64 kv_q8_bytes   = (kv_elems   / 32) * 34
+        u64 o_q8_bytes    = (o_elems    / 32) * 34
+        u64 gate_q8_bytes = (gate_elems / 32) * 34
+        u64 up_q8_bytes   = (up_elems   / 32) * 34
+        u64 down_q8_bytes = (down_elems / 32) * 34
+        eout("[mistral_7b_gpu] dequantising "); eu64(n_layers); eout(" layers of Q8_0 → bf16 (host) — this is one-time...\n")
+        u64 li = 0
+        while li < n_layers {
+            u64 base = layers_arr + li * 88
+            u64 li_s = fmt_dec(li)
+            u64 pre0 = str_cat("blk.", li_s)
+            u64 prefix = str_cat(pre0, ".")
+            dealloc(li_s); dealloc(pre0)
+
+            u64 n01 = str_cat(prefix, "attn_norm.weight")
+            GGUFTensor t01 = gguf_get(gf, n01)
+            unsafe { *((base + 0 * 8) as u64) = t01.ptr }
+            dealloc(n01)
+
+            u64 n02 = str_cat(prefix, "attn_q.weight")
+            GGUFTensor t02 = gguf_get(gf, n02)
+            u64 q_bf16 = q8_0_to_bf16_alloc(t02.ptr, q_elems)
+            unsafe { *((base + 1 * 8) as u64) = q_bf16 }
+            madv_dontneed(t02.ptr, q_q8_bytes)
+            dealloc(n02)
+
+            u64 n03 = str_cat(prefix, "attn_k.weight")
+            GGUFTensor t03 = gguf_get(gf, n03)
+            u64 k_bf16 = q8_0_to_bf16_alloc(t03.ptr, kv_elems)
+            unsafe { *((base + 2 * 8) as u64) = k_bf16 }
+            madv_dontneed(t03.ptr, kv_q8_bytes)
+            dealloc(n03)
+
+            u64 n04 = str_cat(prefix, "attn_v.weight")
+            GGUFTensor t04 = gguf_get(gf, n04)
+            u64 v_bf16 = q8_0_to_bf16_alloc(t04.ptr, kv_elems)
+            unsafe { *((base + 3 * 8) as u64) = v_bf16 }
+            madv_dontneed(t04.ptr, kv_q8_bytes)
+            dealloc(n04)
+
+            unsafe { *((base + 4 * 8) as u64) = 0 }
+            unsafe { *((base + 5 * 8) as u64) = 0 }
+
+            u64 n07 = str_cat(prefix, "attn_output.weight")
+            GGUFTensor t07 = gguf_get(gf, n07)
+            u64 o_bf16 = q8_0_to_bf16_alloc(t07.ptr, o_elems)
+            unsafe { *((base + 6 * 8) as u64) = o_bf16 }
+            madv_dontneed(t07.ptr, o_q8_bytes)
+            dealloc(n07)
+
+            u64 n08 = str_cat(prefix, "ffn_norm.weight")
+            GGUFTensor t08 = gguf_get(gf, n08)
+            unsafe { *((base + 7 * 8) as u64) = t08.ptr }
+            dealloc(n08)
+
+            u64 n09 = str_cat(prefix, "ffn_gate.weight")
+            GGUFTensor t09 = gguf_get(gf, n09)
+            u64 g_bf16 = q8_0_to_bf16_alloc(t09.ptr, gate_elems)
+            unsafe { *((base + 8 * 8) as u64) = g_bf16 }
+            madv_dontneed(t09.ptr, gate_q8_bytes)
+            dealloc(n09)
+
+            u64 n10 = str_cat(prefix, "ffn_up.weight")
+            GGUFTensor t10 = gguf_get(gf, n10)
+            u64 u_bf16 = q8_0_to_bf16_alloc(t10.ptr, up_elems)
+            unsafe { *((base + 9 * 8) as u64) = u_bf16 }
+            madv_dontneed(t10.ptr, up_q8_bytes)
+            dealloc(n10)
+
+            u64 n11 = str_cat(prefix, "ffn_down.weight")
+            GGUFTensor t11 = gguf_get(gf, n11)
+            u64 d_bf16 = q8_0_to_bf16_alloc(t11.ptr, down_elems)
+            unsafe { *((base + 10 * 8) as u64) = d_bf16 }
+            madv_dontneed(t11.ptr, down_q8_bytes)
+            dealloc(n11)
+
+            dealloc(prefix)
+            if (li & 3) == 3 {
+                eout("  layer "); eu64(li); eout(" done\n")
+            }
+            li = li + 1
+        }
+        u64 load_elapsed_ns = time_elapsed(load_start_ns)
+        eout("[mistral_7b_gpu] "); eu64(n_layers); eout(" layers indexed + dequantised; load_ms=")
+        eu64(load_elapsed_ns / 1000000); eout(" (Q8_0 source pages released via MADV_DONTNEED)\n")
+    } else {
+        // ─── BF16 safetensors weight load ───────────────────────────────
+        // HuggingFace transformers convention:
+        //   model.embed_tokens.weight             → embed_base (bf16 [V, H])
+        //   model.norm.weight                     → output_norm (bf16 [H])
+        //   lm_head.weight                        → lmhead bf16 [V, H]
+        //   model.layers.N.input_layernorm.weight             → slot 0 (f32)
+        //   model.layers.N.self_attn.q_proj.weight            → slot 1 (bf16)
+        //   model.layers.N.self_attn.k_proj.weight            → slot 2
+        //   model.layers.N.self_attn.v_proj.weight            → slot 3
+        //   model.layers.N.self_attn.o_proj.weight            → slot 6
+        //   model.layers.N.post_attention_layernorm.weight    → slot 7 (f32)
+        //   model.layers.N.mlp.gate_proj.weight               → slot 8
+        //   model.layers.N.mlp.up_proj.weight                 → slot 9
+        //   model.layers.N.mlp.down_proj.weight               → slot 10
+        SafetensorView embed_view = safetensors_shard_get(_ms, "model.embed_tokens.weight")
+        if embed_view.ptr == 0 {
+            eout("[mistral_7b_gpu] bf16 load: missing model.embed_tokens.weight\n")
+            thread_pool_shutdown(); file_close(g_fd); exit(1)
+        }
+        SafetensorView outnorm_view = safetensors_shard_get(_ms, "model.norm.weight")
+        if outnorm_view.ptr == 0 {
+            eout("[mistral_7b_gpu] bf16 load: missing model.norm.weight\n")
+            thread_pool_shutdown(); file_close(g_fd); exit(1)
+        }
+        SafetensorView lmhead_view = safetensors_shard_get(_ms, "lm_head.weight")
+        if lmhead_view.ptr == 0 {
+            eout("[mistral_7b_gpu] bf16 load: missing lm_head.weight; falling back to tied embed\n")
+            lmhead_view = embed_view
+        } else {
+            eout("[mistral_7b_gpu] bf16 load: untied lm_head.weight found\n")
+        }
+
+        embed_base = embed_view.ptr
+        embed_row_bytes = hidden * 2          // bf16 row stride
+        // output_norm in safetensors is bf16; mega-kernel + CPU paths
+        // expect F32.  Dequant once into a heap buffer.
+        output_norm_f32_ptr = bf16_to_f32_alloc(outnorm_view.ptr, hidden)
+        unsafe { *((_bf16_norm_allocs + _bf16_norm_alloc_n * 8) as u64) = output_norm_f32_ptr }
+        _bf16_norm_alloc_n = _bf16_norm_alloc_n + 1
+        lm_head_bf16_view_ptr = lmhead_view.ptr
+        // lmhead_ptr is unused on the bf16 path (no Q8_0 lm_head matmul),
+        // but the Q8_0 fallback line at ~1318 will be guarded by
+        // _use_bf16_weights, so set lmhead_ptr to 0 defensively.
+        lmhead_ptr = 0
+
+        eout("[mistral_7b_gpu] copying "); eu64(n_layers); eout(" layers of bf16 weights from safetensors → heap (one-time)...\n")
+        u64 li_b = 0
+        while li_b < n_layers {
+            u64 base = layers_arr + li_b * 88
+            u64 li_s = fmt_dec(li_b)
+            // HuggingFace transformers naming.
+            u64 lpre0 = str_cat("model.layers.", li_s)
+            u64 lprefix = str_cat(lpre0, ".")
+            dealloc(li_s); dealloc(lpre0)
+
+            // input_layernorm — bf16 [hidden] → heap f32
+            u64 nb01 = str_cat(lprefix, "input_layernorm.weight")
+            SafetensorView v01 = safetensors_shard_get(_ms, nb01)
+            u64 norm_in_f32 = bf16_to_f32_alloc(v01.ptr, hidden)
+            unsafe { *((base + 0 * 8) as u64) = norm_in_f32 }
+            unsafe { *((_bf16_norm_allocs + _bf16_norm_alloc_n * 8) as u64) = norm_in_f32 }
+            _bf16_norm_alloc_n = _bf16_norm_alloc_n + 1
+            dealloc(nb01)
+
+            // q_proj — bf16 [q_dim, hidden]
+            u64 nb02 = str_cat(lprefix, "self_attn.q_proj.weight")
+            SafetensorView v02 = safetensors_shard_get(_ms, nb02)
+            u64 q_bf16_b = bf16_clone_alloc(v02.ptr, q_elems)
+            unsafe { *((base + 1 * 8) as u64) = q_bf16_b }
+            dealloc(nb02)
+
+            // k_proj — bf16 [kv_dim, hidden]
+            u64 nb03 = str_cat(lprefix, "self_attn.k_proj.weight")
+            SafetensorView v03 = safetensors_shard_get(_ms, nb03)
+            u64 k_bf16_b = bf16_clone_alloc(v03.ptr, kv_elems)
+            unsafe { *((base + 2 * 8) as u64) = k_bf16_b }
+            dealloc(nb03)
+
+            // v_proj — bf16 [kv_dim, hidden]
+            u64 nb04 = str_cat(lprefix, "self_attn.v_proj.weight")
+            SafetensorView v04 = safetensors_shard_get(_ms, nb04)
+            u64 v_bf16_b = bf16_clone_alloc(v04.ptr, kv_elems)
+            unsafe { *((base + 3 * 8) as u64) = v_bf16_b }
+            dealloc(nb04)
+
+            // No q/k norm on Mistral.
+            unsafe { *((base + 4 * 8) as u64) = 0 }
+            unsafe { *((base + 5 * 8) as u64) = 0 }
+
+            // o_proj — bf16 [hidden, q_dim]
+            u64 nb07 = str_cat(lprefix, "self_attn.o_proj.weight")
+            SafetensorView v07 = safetensors_shard_get(_ms, nb07)
+            u64 o_bf16_b = bf16_clone_alloc(v07.ptr, o_elems)
+            unsafe { *((base + 6 * 8) as u64) = o_bf16_b }
+            dealloc(nb07)
+
+            // post_attention_layernorm — bf16 [hidden] → heap f32
+            u64 nb08 = str_cat(lprefix, "post_attention_layernorm.weight")
+            SafetensorView v08 = safetensors_shard_get(_ms, nb08)
+            u64 norm_post_f32 = bf16_to_f32_alloc(v08.ptr, hidden)
+            unsafe { *((base + 7 * 8) as u64) = norm_post_f32 }
+            unsafe { *((_bf16_norm_allocs + _bf16_norm_alloc_n * 8) as u64) = norm_post_f32 }
+            _bf16_norm_alloc_n = _bf16_norm_alloc_n + 1
+            dealloc(nb08)
+
+            // gate_proj — bf16 [ff, hidden]
+            u64 nb09 = str_cat(lprefix, "mlp.gate_proj.weight")
+            SafetensorView v09 = safetensors_shard_get(_ms, nb09)
+            u64 g_bf16_b = bf16_clone_alloc(v09.ptr, gate_elems)
+            unsafe { *((base + 8 * 8) as u64) = g_bf16_b }
+            dealloc(nb09)
+
+            // up_proj — bf16 [ff, hidden]
+            u64 nb10 = str_cat(lprefix, "mlp.up_proj.weight")
+            SafetensorView v10 = safetensors_shard_get(_ms, nb10)
+            u64 u_bf16_b = bf16_clone_alloc(v10.ptr, up_elems)
+            unsafe { *((base + 9 * 8) as u64) = u_bf16_b }
+            dealloc(nb10)
+
+            // down_proj — bf16 [hidden, ff]
+            u64 nb11 = str_cat(lprefix, "mlp.down_proj.weight")
+            SafetensorView v11 = safetensors_shard_get(_ms, nb11)
+            u64 d_bf16_b = bf16_clone_alloc(v11.ptr, down_elems)
+            unsafe { *((base + 10 * 8) as u64) = d_bf16_b }
+            dealloc(nb11)
+
+            dealloc(lprefix)
+            if (li_b & 3) == 3 {
+                eout("  layer "); eu64(li_b); eout(" done\n")
+            }
+            li_b = li_b + 1
+        }
+        u64 load_elapsed_ns = time_elapsed(load_start_ns)
+        eout("[mistral_7b_gpu] "); eu64(n_layers); eout(" bf16 layers loaded; load_ms=")
+        eu64(load_elapsed_ns / 1000000); eout("\n")
+    }
 
     // KV cache + scratch buffers.  At slice 5.9, when MLRIFT_NATIVE_MEGAKERNEL
     // is requested, we allocate the KV cache as device-resident GTT so the
@@ -586,10 +836,11 @@ fn main() {
     u64 final_out = alloc(hidden * 4)
     u64 logits    = alloc(vocab * 4)
 
-    // Per-row Q8_0 decode geometry for the embedding lookup (CPU path).
-    u64 embed_base = embed_t.ptr
-    u64 row_blocks = hidden / 32
-    u64 row_bytes  = row_blocks * 34
+    // Per-row decode geometry for the embedding lookup (CPU path).
+    // Slice 7.6: embed_base + embed_row_bytes populated by the weight
+    // loader fork above; bf16 path uses bf16-row stride (hidden * 2),
+    // Q8_0 path uses Q8_0-block stride ((hidden/32) * 34).
+    u64 row_bytes = embed_row_bytes
 
     // MLRIFT_PLD_BENCH=1 swaps the default `[BOS, "hello"]` 2-token
     // prompt for a 16-token BOS + [15339, 11] × 7 + 15339 bigram-repeating
@@ -844,14 +1095,23 @@ fn main() {
     u64 d_lm_out          = 0
     u64 d_lm_out_h        = 0
     if _native_mk_use != 0 {
-        eout("[mistral_7b_gpu] dequantising lm_head Q8_0 → bf16 for GPU lm_head ("); eu64(vocab * hidden * 2); eout(" bytes)...\n")
-        lm_head_bf16_host = q8_0_to_bf16_alloc(lmhead_ptr, vocab * hidden)
-        // slice 4.27: drop the lm_head Q8_0 source pages.  The GPU lm_head
-        // path uses lm_head_bf16_host (bf16, already on GPU after upload),
-        // and the per-token embedding lookup uses embed_t.ptr (different
-        // tensor for Mistral since lm_head is UNTIED).
-        u64 lmhead_q8_bytes = (vocab * hidden / 32) * 34
-        madv_dontneed(lmhead_ptr, lmhead_q8_bytes)
+        if _use_bf16_weights != 0 {
+            // bf16 path: the lm_head weight is already bf16 in safetensors.
+            // Clone it onto the heap so _gpu_mm_get_or_upload_bf16's
+            // host-ptr-keyed cache treats it as a stable, dealloc'able
+            // buffer.  +268 MiB (vocab=32000 × hidden=4096 × 2 bytes).
+            eout("[mistral_7b_gpu] cloning bf16 lm_head from safetensors view ("); eu64(vocab * hidden * 2); eout(" bytes)...\n")
+            lm_head_bf16_host = bf16_clone_alloc(lm_head_bf16_view_ptr, vocab * hidden)
+        } else {
+            eout("[mistral_7b_gpu] dequantising lm_head Q8_0 → bf16 for GPU lm_head ("); eu64(vocab * hidden * 2); eout(" bytes)...\n")
+            lm_head_bf16_host = q8_0_to_bf16_alloc(lmhead_ptr, vocab * hidden)
+            // slice 4.27: drop the lm_head Q8_0 source pages.  The GPU lm_head
+            // path uses lm_head_bf16_host (bf16, already on GPU after upload),
+            // and the per-token embedding lookup uses embed_t.ptr (different
+            // tensor for Mistral since lm_head is UNTIED).
+            u64 lmhead_q8_bytes = (vocab * hidden / 32) * 34
+            madv_dontneed(lmhead_ptr, lmhead_q8_bytes)
+        }
         if lm_head_bf16_host != 0 {
             d_lm_in  = dev_try_alloc_host_visible(hidden * 4)
             d_lm_out = dev_try_alloc_host_visible(vocab  * 4)
@@ -995,7 +1255,11 @@ fn main() {
         u32 pt32 = 0
         unsafe { *((seq_ids32 + pos * 4) as uint32) -> pt32 }
         u64 pt = pt32
-        gguf_deq_q8_0(x_cur, embed_base + pt * row_bytes, hidden)
+        if _use_bf16_weights != 0 {
+            gguf_deq_bf16(x_cur, embed_base + pt * row_bytes, hidden)
+        } else {
+            gguf_deq_q8_0(x_cur, embed_base + pt * row_bytes, hidden)
+        }
         if _native_mk_use != 0 {
             // H2D upload of the freshly-embedded token.  d_x_cur_h is
             // GTT-mapped, so a plain memcpy is GPU-coherent on the next
@@ -1037,7 +1301,11 @@ fn main() {
     u32 last_pt32 = 0
     unsafe { *((seq_ids32 + (prompt_count - 1) * 4) as uint32) -> last_pt32 }
     u64 last_pt = last_pt32
-    gguf_deq_q8_0(x_cur, embed_base + last_pt * row_bytes, hidden)
+    if _use_bf16_weights != 0 {
+        gguf_deq_bf16(x_cur, embed_base + last_pt * row_bytes, hidden)
+    } else {
+        gguf_deq_q8_0(x_cur, embed_base + last_pt * row_bytes, hidden)
+    }
 
     qwen3_profile_reset()
     u64 step = 0
@@ -1216,18 +1484,28 @@ fn main() {
         // step time. lm_head_bf16_dev points at the VRAM-resident bf16
         // dequant of the tied embedding (one-time +526 MiB at startup).
         // d_lm_in / d_lm_out are GTT-resident host-visible scratch.
-        qwen3_rmsnorm_f32_weights(final_out, x_cur, norm_t.ptr, hidden)
+        qwen3_rmsnorm_f32_weights(final_out, x_cur, output_norm_f32_ptr, hidden)
         if lm_head_bf16_host != 0 {
             memcpy(d_lm_in_h, final_out, hidden * 4)
             if gpu_matmul_to_dev(d_lm_out, d_lm_in, lm_head_bf16_host, vocab, hidden) != 0 {
-                // GPU path failed; fall back to CPU.
-                matmul_q8_0_q8_0_f32(logits, final_out, lmhead_ptr, 1, vocab, hidden, num_workers)
+                // GPU path failed; fall back to CPU.  bf16 path uses the
+                // host bf16 lm_head buffer directly; Q8_0 path uses the
+                // raw Q8_0 GGUF pointer.
+                if _use_bf16_weights != 0 {
+                    matmul_bf16_weights_f32(logits, final_out, lm_head_bf16_host, 1, vocab, hidden, num_workers, 0)
+                } else {
+                    matmul_q8_0_q8_0_f32(logits, final_out, lmhead_ptr, 1, vocab, hidden, num_workers)
+                }
             } else {
                 gpu_pipeline_flush()
                 memcpy(logits, d_lm_out_h, vocab * 4)
             }
         } else {
-            matmul_q8_0_q8_0_f32(logits, final_out, lmhead_ptr, 1, vocab, hidden, num_workers)
+            if _use_bf16_weights != 0 {
+                matmul_bf16_weights_f32(logits, final_out, lm_head_bf16_view_ptr, 1, vocab, hidden, num_workers, 0)
+            } else {
+                matmul_q8_0_q8_0_f32(logits, final_out, lmhead_ptr, 1, vocab, hidden, num_workers)
+            }
         }
 
         // Greedy argmax.
@@ -1254,7 +1532,11 @@ fn main() {
         unsafe { *((seq_ids32 + seq_len * 4) as uint32) = best_id32 }
         seq_len = seq_len + 1
 
-        gguf_deq_q8_0(x_cur, embed_base + best_id * row_bytes, hidden)
+        if _use_bf16_weights != 0 {
+            gguf_deq_bf16(x_cur, embed_base + best_id * row_bytes, hidden)
+        } else {
+            gguf_deq_q8_0(x_cur, embed_base + best_id * row_bytes, hidden)
+        }
         pos = pos + 1
         step = step + 1
         total_steps = total_steps + 1
@@ -1289,7 +1571,11 @@ fn main() {
                             }
                         }
                         u64 dst_m = host_in_4 + m_in * hidden * 4
-                        gguf_deq_q8_0(dst_m, embed_base + tok * row_bytes, hidden)
+                        if _use_bf16_weights != 0 {
+                            gguf_deq_bf16(dst_m, embed_base + tok * row_bytes, hidden)
+                        } else {
+                            gguf_deq_q8_0(dst_m, embed_base + tok * row_bytes, hidden)
+                        }
                         m_in = m_in + 1
                     }
                     // Debug: dump first 4 floats of each stream's input embedding
@@ -1517,7 +1803,7 @@ fn main() {
                                     u64 mp = 0
                                     while mp < M_EFF_S4 {
                                         u64 stream_resid = host_resid_4 + mp * hidden * 4
-                                        qwen3_rmsnorm_f32_weights(final_out, stream_resid, norm_t.ptr, hidden)
+                                        qwen3_rmsnorm_f32_weights(final_out, stream_resid, output_norm_f32_ptr, hidden)
                                         // Slice 6.7f — port speck4 per-stream lm_head to GPU
                                         // bf16 gemv (mirrors M=1 path at line ~1115).
                                         // CPU Q8_0 was 572 ms/step (4 streams × 143 ms);
@@ -1532,7 +1818,13 @@ fn main() {
                                             }
                                         }
                                         if _lmh_ok == 0 {
-                                            matmul_q8_0_q8_0_f32(logits, final_out, lmhead_ptr, 1, vocab, hidden, num_workers)
+                                            if _use_bf16_weights != 0 {
+                                                u64 _lmw_b = lm_head_bf16_host
+                                                if _lmw_b == 0 { _lmw_b = lm_head_bf16_view_ptr }
+                                                matmul_bf16_weights_f32(logits, final_out, _lmw_b, 1, vocab, hidden, num_workers, 0)
+                                            } else {
+                                                matmul_q8_0_q8_0_f32(logits, final_out, lmhead_ptr, 1, vocab, hidden, num_workers)
+                                            }
                                         }
                                         u64 best_s_id = 0
                                         f32 best_s_val = 0.0f
@@ -1570,7 +1862,11 @@ fn main() {
                                             step     = step + 1
                                             accepted = accepted + 1
                                             u64 d_k_u = d_k32
-                                            gguf_deq_q8_0(x_cur, embed_base + d_k_u * row_bytes, hidden)
+                                            if _use_bf16_weights != 0 {
+                                                gguf_deq_bf16(x_cur, embed_base + d_k_u * row_bytes, hidden)
+                                            } else {
+                                                gguf_deq_q8_0(x_cur, embed_base + d_k_u * row_bytes, hidden)
+                                            }
                                             if step >= max_new {
                                                 k_chk = draft_n
                                             } else {
@@ -1664,7 +1960,21 @@ fn main() {
     dealloc(x_cur); dealloc(x_nxt); dealloc(final_out); dealloc(logits)
     dealloc(seq_ids32); dealloc(layers_arr)
     dealloc(k_cache); dealloc(v_cache)
-    gguf_free(gf)
+    if _use_bf16_weights == 0 {
+        gguf_free(gf)
+    } else {
+        // Free heap-allocated F32 norm buffers (output_norm + per-layer
+        // input/post-attn norms).
+        u64 ni = 0
+        while ni < _bf16_norm_alloc_n {
+            u64 np = 0
+            unsafe { *((_bf16_norm_allocs + ni * 8) as u64) -> np }
+            if np != 0 { dealloc(np) }
+            ni = ni + 1
+        }
+        if _bf16_norm_allocs != 0 { dealloc(_bf16_norm_allocs) }
+        safetensors_shard_free(_ms)
+    }
     thread_pool_shutdown()
     file_close(g_fd)
     hipkfd_teardown()
