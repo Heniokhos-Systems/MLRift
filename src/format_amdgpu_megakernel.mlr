@@ -6123,16 +6123,12 @@ fn mega_emit_stub_kernel(uint64 kname_ptr, uint64 nl, uint64 body_node) -> uint6
     //                 out=b_x_norm_g(arg 17, 0x88).  wg_id_x is still in s15
     //                 (no prior phase has clobbered it yet).
     if _body_has_rmsnorm_wg0_marker(body_node) != 0 {
-        // Phase 2.5 (2026-05-14): Llama-3B routes to the CPU-matching
-        // reduction tree variant so b_x_norm_g is bit-exact vs the CPU
-        // qwen3_dot_avx2 ssq reduction (8-lane stride-8 + 3-level
-        // XOR-bpermute reduce + v_mul+v_add two-rounding).  All other
-        // archs keep the proven 5-level wave32 reduce.
-        if MEGA_HIDDEN == 3072 {
-            _emit_rmsnorm_cputree_wg_gated_inline(0x00, 0x30, 0x88, 15, 0)
-        } else {
-            _emit_rmsnorm_wg_gated_inline(0x00, 0x30, 0x88, 15, 0)
-        }
+        // Slice 8.4 (2026-05-15): cputree dispatch removed for Llama-3B.
+        // The slice 8.2-B work tried to match MLRift CPU's reduction
+        // tree; reframe on 2026-05-14 proved CPU is the wrong reference
+        // (GPU already matches PyTorch).  Cputree variant added ~7×
+        // per-layer overhead with zero token impact — strict regression.
+        _emit_rmsnorm_wg_gated_inline(0x00, 0x30, 0x88, 15, 0)
     } else {
         asm_u32(0xBF800000)   // s_nop 0 (phase 1 stub)
     }
@@ -6157,25 +6153,12 @@ fn mega_emit_stub_kernel(uint64 kname_ptr, uint64 nl, uint64 body_node) -> uint6
         //   hidden_pad = HIDDEN + 128 = 1152 (Qwen3); 2176 (Llama)
         uint64 hidden_pad = MEGA_HIDDEN + 128
         uint64 qkv_dim    = MEGA_N_HEADS*MEGA_HEAD_DIM + 2*MEGA_N_KV_HEADS*MEGA_HEAD_DIM
-        // Phase 2 (2026-05-14): Llama-3B routes to the CPU-matching reduction
-        // tree variant so phase-3 b_attn_q_g is bit-exact vs the CPU bf16
-        // reference.  All other archs keep the proven unrolled emit.
-        if MEGA_HIDDEN == 3072 {
-            // Slice 8.3 F3b (2026-05-14): Llama-3B fp32-weight emit path.
-            if MEGA_WEIGHT_DTYPE == 1 {
-                _emit_gemv_cputree_f32_padded_strided_inline(qkv_dim, MEGA_HIDDEN, hidden_pad, 256,
-                                                              1, 2, 3,
-                                                              0x10, 0x88, 0x90, 15)
-            } else {
-                _emit_gemv_cputree_bf16_padded_strided_inline(qkv_dim, MEGA_HIDDEN, hidden_pad, 256,
-                                                              1, 2, 3,
-                                                              0x10, 0x88, 0x90, 15)
-            }
-        } else {
-            _emit_gemv_coop_bf16_padded_strided_inline(qkv_dim, MEGA_HIDDEN, hidden_pad, 256,
-                                                       1, 2, 3,
-                                                       0x10, 0x88, 0x90, 15)
-        }
+        // Slice 8.4 (2026-05-15): cputree/fp32 dispatch removed — slice 8.2-B + 8.3
+        // were built on the inverted "GPU vs CPU" premise the 2026-05-14 reframe
+        // collapsed.  All archs now share the proven unrolled bf16-coop emit.
+        _emit_gemv_coop_bf16_padded_strided_inline(qkv_dim, MEGA_HIDDEN, hidden_pad, 256,
+                                                   1, 2, 3,
+                                                   0x10, 0x88, 0x90, 15)
     } else {
         asm_u32(0xBF800000)   // s_nop 0 (phase 3 stub)
     }
@@ -6224,22 +6207,9 @@ fn mega_emit_stub_kernel(uint64 kname_ptr, uint64 nl, uint64 body_node) -> uint6
         //   q_dim_pad = q_dim + 128      = 2176 (Qwen3); 2176 (Llama)
         uint64 q_dim     = MEGA_N_HEADS * MEGA_HEAD_DIM
         uint64 q_dim_pad = q_dim + 128
-        // Phase 3 (2026-05-14): Llama-3B routes to the CPU-matching reduction
-        // tree variant so phase-9 b_mid_g is bit-exact vs the CPU bf16 ref.
-        // All other archs keep the proven 8× unrolled emit.
-        if MEGA_HIDDEN == 3072 {
-            // Slice 8.3 F3b (2026-05-14): Llama-3B fp32-weight emit path.
-            if MEGA_WEIGHT_DTYPE == 1 {
-                _emit_phase9_gemv_residual_cputree_f32_inline(MEGA_HIDDEN, q_dim, q_dim_pad, 256,
-                                                    0x18, 0xB0, 0x00, 0xA0)
-            } else {
-                _emit_phase9_gemv_residual_cputree_inline(MEGA_HIDDEN, q_dim, q_dim_pad, 256,
-                                                    0x18, 0xB0, 0x00, 0xA0)
-            }
-        } else {
-            _emit_phase9_gemv_residual_inline(MEGA_HIDDEN, q_dim, q_dim_pad, 256,
-                                                0x18, 0xB0, 0x00, 0xA0)
-        }
+        // Slice 8.4 (2026-05-15): cputree dispatch collapsed — see phase-3 note.
+        _emit_phase9_gemv_residual_inline(MEGA_HIDDEN, q_dim, q_dim_pad, 256,
+                                            0x18, 0xB0, 0x00, 0xA0)
     } else {
         asm_u32(0xBF800000)   // s_nop 0 (phase 9 stub)
     }
@@ -6259,12 +6229,8 @@ fn mega_emit_stub_kernel(uint64 kname_ptr, uint64 nl, uint64 body_node) -> uint6
     // Marker recognized inline (no `_body_has_post_norm_marker` wrapper) —
     // same fn-table-cap discipline as oproj_residual_marker at slice 4.19.5.
     if _body_has_marker(body_node, "post_norm_marker", 16) != 0 {
-        // Phase 2.5 (2026-05-14): same Llama-3B cputree gating as phase 1.
-        if MEGA_HIDDEN == 3072 {
-            _emit_rmsnorm_cputree_wg_gated_inline(0xA0, 0x38, 0xA8, 28, 0)
-        } else {
-            _emit_rmsnorm_wg_gated_inline(0xA0, 0x38, 0xA8, 28, 0)
-        }
+        // Slice 8.4 (2026-05-15): cputree dispatch collapsed — see phase-1 note.
+        _emit_rmsnorm_wg_gated_inline(0xA0, 0x38, 0xA8, 28, 0)
     } else {
         asm_u32(0xBF800000)   // s_nop 0 (phase 11 stub)
     }
@@ -6290,25 +6256,10 @@ fn mega_emit_stub_kernel(uint64 kname_ptr, uint64 nl, uint64 body_node) -> uint6
         //   2*MEGA_FF = 6144 (Qwen3); 16384 (Llama)
         //   hidden_pad = HIDDEN + 128 = 1152 (Qwen3); 2176 (Llama)
         uint64 hidden_pad = MEGA_HIDDEN + 128
-        // Phase 3 (2026-05-14): Llama-3B routes to the CPU-matching reduction
-        // tree variant so phase-13 gu_scratch is bit-exact vs the CPU bf16 ref.
-        // All other archs keep the proven 8× unrolled emit.
-        if MEGA_HIDDEN == 3072 {
-            // Slice 8.3 F3b (2026-05-14): Llama-3B fp32-weight emit path.
-            if MEGA_WEIGHT_DTYPE == 1 {
-                _emit_gemv_cputree_f32_padded_strided_inline(2 * MEGA_FF, MEGA_HIDDEN, hidden_pad, 256,
-                                                            1, 2, 3,
-                                                            0x20, 0xA8, 0x80, 28)
-            } else {
-                _emit_gemv_cputree_bf16_padded_strided_inline(2 * MEGA_FF, MEGA_HIDDEN, hidden_pad, 256,
-                                                            1, 2, 3,
-                                                            0x20, 0xA8, 0x80, 28)
-            }
-        } else {
-            _emit_gemv_coop_bf16_padded_strided_inline(2 * MEGA_FF, MEGA_HIDDEN, hidden_pad, 256,
-                                                        1, 2, 3,
-                                                        0x20, 0xA8, 0x80, 28)
-        }
+        // Slice 8.4 (2026-05-15): cputree dispatch collapsed — see phase-3 note.
+        _emit_gemv_coop_bf16_padded_strided_inline(2 * MEGA_FF, MEGA_HIDDEN, hidden_pad, 256,
+                                                    1, 2, 3,
+                                                    0x20, 0xA8, 0x80, 28)
     } else {
         asm_u32(0xBF800000)   // s_nop 0 (phase 13 stub)
     }
