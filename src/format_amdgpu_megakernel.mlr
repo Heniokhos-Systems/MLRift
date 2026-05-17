@@ -1778,6 +1778,285 @@ fn _emit_gemv_coop_bf16_padded_strided_inline(uint64 n_out, uint64 k, uint64 k_p
     asm_patch_u32(gate_cmp_pos + 2, 0xBFA20000 | (body_dwords & 0xFFFF))
 }
 
+// ── Slice 8.2-WMMA Task 2: WMMA bf16 inline helper (DORMANT) ──────────────
+//
+// _emit_wmma_bf16_inline — gfx1100 v_wmma_f32_16x16x16_bf16-tiled gemv,
+// emitted INLINE (no asm_init, no kernarg-load prologue, no s_endpgm).
+//
+// This is the inline-mega-kernel port of _emit_gemm_bf16f32_wmma_body
+// (src/format_amdgpu.mlr line 9061).  Same 11-arg signature as
+// _emit_gemv_coop_bf16_padded_strided_inline so Tasks 3-6 can drop-in-swap
+// the helper name at the phase 3 / 13 / 9 / 17 call sites.
+//
+// Shape: A = single row (M=1 broadcast) of K f32 activations from s[x],
+//        B = bf16 weight tile (n_out × K, padded row stride k_pad bf16 elems)
+//            from s[w],
+//        C = single row (M=1) of n_out f32 outputs written to s[out].
+//
+// Each WG processes one 16-column tile per outer iter, walking
+// `tile_idx = wg_id, wg_id + wg_active, ...` up to `n_tiles = ceil(n_out/16)`.
+// Per outer iter:
+//   - A-fragment (v9..v16): broadcast x[k_idx*16 .. k_idx*16+15] to all 16
+//     logical A-rows, cast f32 → bf16 RTNE.  M=1 means every A-row is the
+//     same row, so we just cast 16 f32s and replicate into v9..v16 lo/hi.
+//   - B-fragment (v1..v8): load a 16-row × 16-col bf16 tile from
+//     W[tile_col*16 .. +15, k_idx*16 .. +15].  Padded stride k_pad bf16
+//     elements per row.
+//   - WMMA: v17..v24 += A @ B.T  (encodings 0xCC414011 / 0x1C460309).
+//   - s_delay_alu(0x01) gates the C-frag store from WMMA's write.
+// After the K-loop, store v17..v24 (8 f32 per lane) to C row of 16 columns
+// (lane 0 holds col 0, lane 1 holds col 1, ..., lane 15 holds col 15 — but
+// for M=1 only row-0 of the 16-row C-frag is meaningful; lanes 0..15 each
+// store their column).
+//
+// VGPR map (no aliasing with phase 3/9/13/17 live VGPRs — verified via
+// scalar-emit register-use comments at megakernel.mlr lines 425, 1308,
+// 1371, 2167, 2507; v25..v30 are scratch for both this helper and the
+// scalar gemv helper):
+//   v0       = lane id (hw r/o)
+//   v1..v8   = B-frag bf16
+//   v9..v16  = A-frag bf16
+//   v17..v24 = C-frag f32 accum
+//   v25..v30 = address/cast scratch
+//
+// Parameters (same shape as _emit_gemv_coop_bf16_padded_strided_inline):
+//   n_out         = number of output columns (phase 3: 4096; phase 13: 6144)
+//   k             = inner K dimension
+//   k_pad         = padded weight row stride in bf16 elements
+//   wg_active     = active-WG count for this phase's per-WG tile assignment
+//   sdata_pair_w  = sdata pair (s[w_lo:w_hi]) for weight base ptr
+//   sdata_pair_x  = sdata pair for input ptr
+//   sdata_pair_out= sdata pair for output ptr
+//   w_kofs        = kernarg byte offset for weight ptr
+//   x_kofs        = kernarg byte offset for input ptr
+//   out_kofs      = kernarg byte offset for output ptr
+//   wg_id_sgpr    = SGPR # holding wg_id_x (15 phase 3, 28 phase 9/13/17)
+//
+// DORMANT: this helper is not called from any current emit site.  Tasks
+// 3-6 will swap _emit_gemv_coop_bf16_padded_strided_inline with this
+// helper at the phase 3 / 13 / 9 / 17 call sites.  Until then, all .co
+// byte outputs must be unchanged.
+fn _emit_wmma_bf16_inline(uint64 n_out, uint64 k, uint64 k_pad,
+                          uint64 wg_active,
+                          uint64 sdata_pair_w, uint64 sdata_pair_x,
+                          uint64 sdata_pair_out,
+                          uint64 w_kofs, uint64 x_kofs, uint64 out_kofs,
+                          uint64 wg_id_sgpr) {
+    // Derived geometry --------------------------------------------------
+    // n_tiles = ceil(n_out / 16) — each WMMA tile is 16 output columns.
+    uint64 n_tiles = (n_out + 15) / 16
+    // tiles_per_wg = ceil(n_tiles / wg_active) — outer loop count.
+    uint64 tiles_per_wg = (n_tiles + wg_active - 1) / wg_active
+    if tiles_per_wg == 0 { tiles_per_wg = 1 }
+    // k_tiles = ceil(k / 16) — inner K-loop count (each WMMA consumes 16 K).
+    uint64 k_tiles = (k + 15) / 16
+    // k_pad bytes-per-bf16-row (used for B-frag global_load offsets).
+    uint64 k_pad_bytes = k_pad * 2
+    // n_out_bytes (used by store-offset advance per WMMA C-row).
+    uint64 n_out_bytes = n_out * 4
+
+    // SGPR pair indices -------------------------------------------------
+    uint64 w_lo = sdata_pair_w * 2
+    uint64 w_hi = w_lo + 1
+    uint64 x_lo = sdata_pair_x * 2
+    uint64 x_hi = x_lo + 1
+    uint64 out_lo = sdata_pair_out * 2
+    uint64 out_hi = out_lo + 1
+
+    // ── WG gate (single-tile case only — skip if wg_id >= n_tiles) ────────
+    // For multi-tile (tiles_per_wg > 1) we still emit the gate against
+    // n_tiles so any WG with wg_id >= n_tiles exits cleanly.  The outer
+    // tile loop in the body handles wg_active < n_tiles via stride wg_active.
+    uint64 gate_threshold = n_tiles
+    if gate_threshold > wg_active { gate_threshold = wg_active }
+    uint64 gate_cmp_pos = asm_text_len / 4
+    // s_cmp_ge_u32 s<wg_id_sgpr>, gate_threshold
+    asm_u32(0xBF09FF00 | (wg_id_sgpr & 0xFF))
+    asm_u32(gate_threshold)
+    asm_s_cbranch_scc1(0)   // patched at end
+
+    // ── Load base pointers ────────────────────────────────────────────────
+    asm_s_load_b64_off(sdata_pair_w,   0, w_kofs)
+    asm_s_load_b64_off(sdata_pair_x,   0, x_kofs)
+    asm_s_load_b64_off(sdata_pair_out, 0, out_kofs)
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // ── Lane decompose (matches standalone body) ──────────────────────────
+    // v26 = lane & 15  (column index within 16x16 tile, also A-row index
+    //                   for M=16 case; for M=1 inline this drives which f32
+    //                   activation gets cast into the A-frag for this lane).
+    // v25 = lane >> 4  (wave-half: 0 for lanes 0..15, 1 for lanes 16..31).
+    asm_u32(0x3634008F)   // v_and_b32 v26, 15, v0
+    asm_u32(0x32320084)   // v_lshrrev_b32 v25, 4, v0
+
+    // ── Outer tile loop init ──────────────────────────────────────────────
+    // s13 = tile_col = wg_id (col-tile index; advances by wg_active each iter).
+    asm_s_mov_b32(13, wg_id_sgpr)
+    // s12 = r_off = 0 (outer loop counter; bounded by tiles_per_wg).
+    asm_s_mov_b32_inline_imm(12, 0)
+
+    uint64 outer_top = asm_text_len / 4
+
+    // ── Per-tile body ─────────────────────────────────────────────────────
+    // s17 = tile_col * 16 (the byte/element column offset within W for this
+    //       tile — matches standalone's s17 = WG_ID_X * 16).
+    // s_lshl_b32 s17, s13, 4: SOP2 op=0x08, sdst=s17=0x11, ssrc1=inline 4=0x84, ssrc0=s13=0x0D
+    asm_u32(0x8411840D)
+
+    // C-frag init: v17..v24 = 0.0 (8 f32 accumulators per lane).
+    asm_u32(0x7E220280); asm_u32(0x7E240280)
+    asm_u32(0x7E260280); asm_u32(0x7E280280)
+    asm_u32(0x7E2A0280); asm_u32(0x7E2C0280)
+    asm_u32(0x7E2E0280); asm_u32(0x7E300280)
+
+    // ── Address setup ─────────────────────────────────────────────────────
+    // A v_off (v27): byte offset into x[] for lane L's K-element load.
+    //   M=1 broadcast: lane L reads x[lane & 15] = 4 bytes per lane.
+    // For now we use the same v27 = (s16 + v26) * s14 * 2 form as the
+    // standalone (gemm M-row gather); Task 3 (when wiring up phase 3) will
+    // refine this to the M=1 broadcast form.  This is dormant scaffolding.
+    asm_u32(0x4A363410)                         // v_add_nc_u32 v27, s16, v26
+    asm_u32(0xD72C001B); asm_u32(0x00001D1B)   // v_mul_lo_u32 v27, v27, s14
+    asm_u32(0x30363681)                         // v_lshlrev_b32 v27, 1, v27
+
+    // B v_off lo (v28) = (s17 + v26) * 2  [col within 16-col tile, *2 = bf16]
+    asm_u32(0x4A383411)                         // v_add_nc_u32 v28, s17, v26
+    asm_u32(0x30383881)                         // v_lshlrev_b32 v28, 1, v28
+    // B v_off hi (v29) = v28 + k_pad_bytes*2 (next B row stride)
+    //   In the standalone this is v_add_nc_u32 v29, s19, v28 with s19 = N*2.
+    //   For inline use: s19 must be set to k_pad_bytes (one bf16-row stride).
+    //   We load s19 = k_pad_bytes as a literal here so the standalone-shape
+    //   advance pattern `v28 += s20`, `v29 += s20` still works (s20 = stride*2).
+    asm_s_mov_b32_lit32(19, k_pad_bytes & 0xFFFFFFFF)
+    asm_s_mov_b32_lit32(20, (k_pad_bytes * 2) & 0xFFFFFFFF)
+    asm_s_mov_b32_lit32(23, (k_pad_bytes * 4) & 0xFFFFFFFF)
+    asm_u32(0x4A3A3813)                         // v_add_nc_u32 v29, s19, v28
+
+    // C v_off (v30) = lane * 4 (each lane stores its column of the 16-col
+    //   C-frag row).  M=1: only lanes 0..15 produce meaningful output.
+    //   Standalone uses ((s16 + v25) * s12 + s17 + v26) * 4 for M=16; inline
+    //   needs the M=1 simplification (lane * 4 + tile_col * 64) — Task 3/4/5/6
+    //   refines.  For dormant scaffolding we use lane * 4.
+    asm_u32(0x303C0082)                         // v_lshlrev_b32 v30, 2, v0
+
+    // num_kt = k_tiles (s21), kt counter = 0 (s22).
+    asm_s_mov_b32_inline_imm(21, 0)   // placeholder; patched to literal next
+    asm_s_mov_b32_lit32(21, k_tiles & 0xFFFFFFFF)
+    asm_u32(0xBE960080)                         // s_mov_b32 s22, 0
+
+    // Skip K-loop if k_tiles == 0.
+    asm_u32(0xBF068015)                         // s_cmp_eq_u32 s21, 0
+    uint64 kskip_branch_pos = asm_text_len / 4
+    asm_s_cbranch_scc1(0)   // patched at end of K-loop
+
+    // ── K-loop body (verbatim port of standalone lines 9099-9139) ─────────
+    // SGPR substitutions vs standalone:
+    //   standalone s4 (A_ptr) → inline x_lo
+    //   standalone s6 (B_ptr) → inline w_lo
+    //   standalone s8 (C_ptr) → inline out_lo  (used at store time)
+    // VGPR layout unchanged (v1..v30).
+    //
+    // The bytes below encode the same instructions as the standalone body
+    // at format_amdgpu.mlr lines 9099-9139.  Each global_load_b128 /
+    // global_load_d16_b16 has its saddr field rewritten to use the caller-
+    // provided sdata pair.
+    //
+    // global_load_b128 layout: word0 = 0xDC5E_0000 | offset12, word1 =
+    //   (vdst<<24) | (saddr<<8) | vaddr.
+    // For x_lo / w_lo we OR the saddr in directly:
+    uint64 a_load0 = (9 << 24) | ((x_lo & 0xFF) << 8) | 0x1B   // v[9:12] from v27, s[x_lo:x_hi]
+    uint64 a_load1 = (13 << 24) | ((x_lo & 0xFF) << 8) | 0x1B  // v[13:16] from v27, s[x_lo:x_hi] offset:16
+    uint64 b_load_lo = (1 << 24) | ((w_lo & 0xFF) << 8) | 0x1C // d16_b16 v1, v28 from s[w_lo:w_hi]
+    uint64 b_load_hi = (1 << 24) | ((w_lo & 0xFF) << 8) | 0x1D // d16_hi_b16 v1, v29 from s[w_lo:w_hi]
+
+    uint64 kloop_top = asm_text_len / 4
+
+    // s_delay_alu instid0(VALU_DEP_1) — required gate before A-frag load.
+    asm_u32(0xBF870001)
+    // global_load_b128 v[9:12], v27, s[x_lo:x_hi]
+    asm_u32(0xDC5E0000); asm_u32(a_load0 & 0xFFFFFFFF)
+    // global_load_b128 v[13:16], v27, s[x_lo:x_hi] offset:16
+    asm_u32(0xDC5E0010); asm_u32(a_load1 & 0xFFFFFFFF)
+
+    // 8 pairs of B-frag d16 loads (1 lo + 1 hi per row pair, advance v28/v29
+    // by s20 = 2 row-strides between pairs).  Total = 16 rows × 16 cols bf16.
+    uint64 i = 0
+    while i < 8 {
+        asm_u32(0xBF870001)                                    // s_delay_alu
+        // d16_b16 — opcode 0xDC820000, vdst-byte advances by (i+1)<<8.
+        asm_u32(0xDC820000)
+        asm_u32(((b_load_lo & 0xFFFFFF00FF) | (((i + 1) & 0xFF) << 8)) & 0xFFFFFFFF)
+        // d16_hi_b16 — opcode 0xDC8E0000.
+        asm_u32(0xDC8E0000)
+        asm_u32(((b_load_hi & 0xFFFFFF00FF) | (((i + 1) & 0xFF) << 8)) & 0xFFFFFFFF)
+        // v28 += s20; v29 += s20  (advance B row pointers by 2*row-stride bytes).
+        asm_u32(0x4A383814)
+        asm_u32(0x4A3A3A14)
+        i = i + 1
+    }
+
+    // A v_off += 32 (next K-tile, 16 bf16 = 32 bytes).
+    asm_u32(0x4A3636A0)
+    // s_waitcnt vmcnt(0) — wait for all global loads.
+    asm_u32(0xBF8903F7)
+    // ── WMMA: v_wmma_f32_16x16x16_bf16 v[17:24], v[9:16], v[1:8] ──────────
+    // Encodings 0xCC414011 / 0x1C460309 (from standalone line 9136).
+    asm_u32(0xCC414011); asm_u32(0x1C460309)
+    // s_add_u32 s22, s22, 1
+    asm_u32(0x80168116)
+    // s_cmp_lt_u32 s22, s21
+    asm_u32(0xBF0A1516)
+    uint64 kloop_back = (kloop_top - (asm_text_len / 4) - 1) & 0xFFFF
+    asm_s_cbranch_scc1(kloop_back)
+
+    // Patch the K-skip branch target (forward to .Lstore at end of K-loop).
+    uint64 kstore_pos = asm_text_len / 4
+    uint64 kskip_off = (kstore_pos - (kskip_branch_pos + 1)) & 0xFFFF
+    asm_patch_u32(kskip_branch_pos, 0xBFA20000 | kskip_off)
+
+    // ── .Lstore: drain WMMA writes, then store 8 C-frag rows ──────────────
+    // Critical: s_delay_alu(0x01) = instid0(VALU_DEP_1) gates the first
+    // C-frag read from WMMA's write.  The standalone gets away without this
+    // because of K-loop body length; inline form has shorter consumer
+    // distance for partial-K tail, so we emit it defensively.
+    asm_s_delay_alu(0x01)
+
+    // 8 global_store_b32 — encode opcode 0xDC6A0000, word1 = (saddr<<16) |
+    //   (vdata<<8) | vaddr.  Standalone uses 0x00081{1..8}1E with saddr=s8.
+    // Inline saddr = out_lo.
+    uint64 store_base = ((out_lo & 0xFF) << 16) | 0x1E    // vaddr=v30, saddr=out_lo
+    uint64 si = 0
+    while si < 8 {
+        uint64 vdata = (17 + si) & 0xFF
+        asm_u32(0xDC6A0000)
+        asm_u32((store_base | (vdata << 8)) & 0xFFFFFFFF)
+        // Between stores, advance v30 by s23 (= 8 * k_pad bytes — standalone
+        // form for N*8 row stride).  Last store skips the advance.
+        if si < 7 {
+            asm_u32(0x4A3C3C17)                             // v_add_nc_u32 v30, s23, v30
+        }
+        si = si + 1
+    }
+
+    // s_waitcnt_vscnt null, 0 — drain VS counter before tile-loop advance.
+    asm_u32(0xBC7C0000)
+
+    // ── Outer tile loop advance ───────────────────────────────────────────
+    // Advance tile_col: s13 += wg_active.
+    asm_u32(0x800DFF0D)
+    asm_u32(wg_active)
+    // Increment r_off (s12 += 1) and check < tiles_per_wg.
+    asm_u32(0x800C810C)
+    asm_u32(0xBF0AFF0C)
+    asm_u32(tiles_per_wg & 0xFFFFFFFF)
+    uint64 outer_back = (outer_top - (asm_text_len / 4) - 1) & 0xFFFF
+    asm_s_cbranch_scc1(outer_back)
+
+    // ── Patch the WG gate skip-branch ─────────────────────────────────────
+    uint64 body_dwords = (asm_text_len / 4) - (gate_cmp_pos + 3)
+    asm_patch_u32(gate_cmp_pos + 2, 0xBFA20000 | (body_dwords & 0xFFFF))
+}
+
 // ── Phase 2 cputree inline ISA emitter ────────────────────────────────────
 //
 // _emit_gemv_cputree_bf16_padded_strided_inline — CPU-matching reduction-tree
