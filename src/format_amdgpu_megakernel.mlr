@@ -1486,7 +1486,18 @@ fn _emit_gemv_coop_bf16_padded_strided_inline(uint64 n_out, uint64 k, uint64 k_p
     uint64 outer_top = asm_text_len / 4
 
     // ── Per-row body ──────────────────────────────────────────────────────
-    asm_v_mov_b32_inline_u(2, 0)   // acc = 0.0
+    // Slice 7.6a (2026-05-17): 8-way multi-accumulator.  acc[0..7] live in
+    // v2, v41, v42, v43, v44, v45, v46, v47.  Even-VGPR/odd-VGPR pairing
+    // (X-slot even, Y-slot odd) satisfies VOPD's vdst parity constraint so
+    // Ramp 2 (slice 7.6b) can pack adjacent FMAs as v_dual_fmac_f32.
+    asm_v_mov_b32_inline_u(2,  0)   // acc[0] = 0.0 (X-slot, even — keeps v2 for wave-reduce target)
+    asm_v_mov_b32_inline_u(41, 0)   // acc[1] = 0.0 (Y-slot, odd)
+    asm_v_mov_b32_inline_u(42, 0)   // acc[2] = 0.0 (X-slot, even)
+    asm_v_mov_b32_inline_u(43, 0)   // acc[3] = 0.0 (Y-slot, odd)
+    asm_v_mov_b32_inline_u(44, 0)   // acc[4] = 0.0
+    asm_v_mov_b32_inline_u(45, 0)   // acc[5] = 0.0
+    asm_v_mov_b32_inline_u(46, 0)   // acc[6] = 0.0
+    asm_v_mov_b32_inline_u(47, 0)   // acc[7] = 0.0
 
     // init weight ptr: v3:v4 = s[w_lo:w_hi] + lane*4
     asm_v_mov_b32_inline_u(4, 0)
@@ -1498,14 +1509,24 @@ fn _emit_gemv_coop_bf16_padded_strided_inline(uint64 n_out, uint64 k, uint64 k_p
     asm_v_add_co_u32_vcc_sv(5, x_lo, 8)
     asm_v_add_co_ci_u32_null_sv_vcc(6, x_hi, 6)
 
-    // ── Inner K loop (8× unrolled) ────────────────────────────────────────
+    // ── Inner K loop (8× unrolled, 8-way multi-accumulator) ──────────────
     // Slice 7.5 (2026-05-13): extended from 4× to 8× unroll.  Each iter
     // issues 24 loads in a clause (8 weight pairs + 16 x elements) with
     // one waitcnt, 16 FMAs, one ptr-advance per ptr.  Exposes ~24 VMEM ops
     // in flight to mask the ~300-cycle global_load latency more
-    // aggressively than the 4× version's 12 in flight.  Also widens the
-    // independent-FMA window from 8 → 16 instructions, opening the door
-    // to a future VOPD v_dual_fmac_f32 pairing (task #273).
+    // aggressively than the 4× version's 12 in flight.
+    //
+    // Slice 7.6a (2026-05-17): split the single v2 accumulator into 8
+    // independent accumulators (v2/v41/v42/v43/v44/v45/v46/v47) so the 16
+    // FMAs in the body form 8 independent dependency chains rather than one
+    // serial chain through v2.  This eliminates the v_fmac→v_fmac RAW
+    // serialization that the gfx11 issue queue could not hide even with the
+    // 8× unroll's wider load window, AND lays the groundwork for slice 7.6b
+    // (VOPD v_dual_fmac_f32 pairing — task #273) by aligning even/odd vdst
+    // parity for adjacent FMAs.  Post-inner-loop epilogue sums acc[1..7]
+    // back into acc[0]=v2 BEFORE the wave-XOR reduce (which still operates
+    // on v2 alone).
+    //
     // Precondition: k_iters_outer = k / 16 / 32 must be integer.  Llama-1B
     // (k ∈ {2048, 8192}) → k_iters/8 ∈ {4, 16}.  Qwen3-0.6B (k ∈ {1024,
     // 3072, 2048}) → k_iters/8 ∈ {2, 6, 4}.  Mistral-7B (k ∈ {4096, 14336})
@@ -1514,7 +1535,8 @@ fn _emit_gemv_coop_bf16_padded_strided_inline(uint64 n_out, uint64 k, uint64 k_p
     // VGPR pressure: v9, v13, v17, v21, v25, v29, v33, v37 (weights, stride 4)
     // plus v10/v14/v18/v22/v26/v30/v34/v38 (lo-bf16 unpacks) plus
     // v11/v12, v15/v16, v19/v20, v23/v24, v27/v28, v31/v32, v35/v36, v39/v40
-    // (x pairs).  Peak v40, well within rsrc1=0xE0AF0006 (56-VGPR) budget.
+    // (x pairs) plus v2/v41..v47 (8 accumulators).  Peak v47, well within
+    // rsrc1=0xE0AF0006 (56-VGPR) budget.
     // global_load_b32 offset max u12 = 0xFFF; max used here = 0x704 (x[15]).
     uint64 k_iters_unrolled = k_iters / 8
     asm_s_mov_b32_inline_imm(14, k_iters_unrolled)
@@ -1564,22 +1586,26 @@ fn _emit_gemv_coop_bf16_padded_strided_inline(uint64 n_out, uint64 k, uint64 k_p
     asm_v_lshlrev_b32_imm(38, 16, 37)           // v38 = bf16-lo[7] as f32
     asm_u32(0x364A4AFF); asm_u32(0xFFFF0000)    // v37 = bf16-hi[7] as f32
 
-    asm_v_fmac_f32_e32_vv(2, 10, 11)            // acc += w0_lo * x[0]
-    asm_v_fmac_f32_e32_vv(2, 9, 12)             // acc += w0_hi * x[1]
-    asm_v_fmac_f32_e32_vv(2, 14, 15)            // acc += w1_lo * x[2]
-    asm_v_fmac_f32_e32_vv(2, 13, 16)            // acc += w1_hi * x[3]
-    asm_v_fmac_f32_e32_vv(2, 18, 19)            // acc += w2_lo * x[4]
-    asm_v_fmac_f32_e32_vv(2, 17, 20)            // acc += w2_hi * x[5]
-    asm_v_fmac_f32_e32_vv(2, 22, 23)            // acc += w3_lo * x[6]
-    asm_v_fmac_f32_e32_vv(2, 21, 24)            // acc += w3_hi * x[7]
-    asm_v_fmac_f32_e32_vv(2, 26, 27)            // acc += w4_lo * x[8]
-    asm_v_fmac_f32_e32_vv(2, 25, 28)            // acc += w4_hi * x[9]
-    asm_v_fmac_f32_e32_vv(2, 30, 31)            // acc += w5_lo * x[10]
-    asm_v_fmac_f32_e32_vv(2, 29, 32)            // acc += w5_hi * x[11]
-    asm_v_fmac_f32_e32_vv(2, 34, 35)            // acc += w6_lo * x[12]
-    asm_v_fmac_f32_e32_vv(2, 33, 36)            // acc += w6_hi * x[13]
-    asm_v_fmac_f32_e32_vv(2, 38, 39)            // acc += w7_lo * x[14]
-    asm_v_fmac_f32_e32_vv(2, 37, 40)            // acc += w7_hi * x[15]
+    // 16 FMAs into 8 independent accumulators (acc[i] = v2 if i==0, else v(40+i)).
+    // Pairing (X=lo*x_even, Y=hi*x_odd) by weight-pair satisfies VOPD bank
+    // constraints for slice 7.6b: src0_X∈bank2 vs src0_Y∈bank1, src1_X∈bank3
+    // vs src1_Y∈bank0 (vgpr % 4 = bank).  vdst parities are even/odd alternating.
+    asm_v_fmac_f32_e32_vv(2,  10, 11)           // acc[0] += w0_lo * x[0]
+    asm_v_fmac_f32_e32_vv(41, 9,  12)           // acc[1] += w0_hi * x[1]
+    asm_v_fmac_f32_e32_vv(42, 14, 15)           // acc[2] += w1_lo * x[2]
+    asm_v_fmac_f32_e32_vv(43, 13, 16)           // acc[3] += w1_hi * x[3]
+    asm_v_fmac_f32_e32_vv(44, 18, 19)           // acc[4] += w2_lo * x[4]
+    asm_v_fmac_f32_e32_vv(45, 17, 20)           // acc[5] += w2_hi * x[5]
+    asm_v_fmac_f32_e32_vv(46, 22, 23)           // acc[6] += w3_lo * x[6]
+    asm_v_fmac_f32_e32_vv(47, 21, 24)           // acc[7] += w3_hi * x[7]
+    asm_v_fmac_f32_e32_vv(2,  26, 27)           // acc[0] += w4_lo * x[8]
+    asm_v_fmac_f32_e32_vv(41, 25, 28)           // acc[1] += w4_hi * x[9]
+    asm_v_fmac_f32_e32_vv(42, 30, 31)           // acc[2] += w5_lo * x[10]
+    asm_v_fmac_f32_e32_vv(43, 29, 32)           // acc[3] += w5_hi * x[11]
+    asm_v_fmac_f32_e32_vv(44, 34, 35)           // acc[4] += w6_lo * x[12]
+    asm_v_fmac_f32_e32_vv(45, 33, 36)           // acc[5] += w6_hi * x[13]
+    asm_v_fmac_f32_e32_vv(46, 38, 39)           // acc[6] += w7_lo * x[14]
+    asm_v_fmac_f32_e32_vv(47, 37, 40)           // acc[7] += w7_hi * x[15]
 
     // advance weight ptr +1024 bytes (8 weights × 128B stride)
     asm_u32(0xD7006A03); asm_u32(0x000206FF); asm_u32(1024)
@@ -1592,6 +1618,19 @@ fn _emit_gemv_coop_bf16_padded_strided_inline(uint64 n_out, uint64 k, uint64 k_p
     asm_s_cmp_eq_u32(14, 0x80)
     uint64 inner_back = (0 - ((asm_text_len / 4) - inner_top) - 1) & 0xFFFF
     asm_s_cbranch_scc0(inner_back)
+
+    // ── Sum 8 accumulators back into v2 (Ramp 7.6a) ──────────────────────
+    // Must run BEFORE the wave-XOR reduce, which uses v2 as acc and v9/v10
+    // as scratch (clobbering w0_hi/w0_lo, both dead now).  This is per-lane
+    // reduction; the wave-XOR then reduces across lanes as before.
+    //   v_add_f32_e32 v2, v2, v41   = 0x06045302  (vsrc1=v41=0x29 → 0x29<<9=0x5200; src0=v2|0x100=0x102)
+    asm_u32(0x06045302)                          // v2 += v41
+    asm_u32(0x06045502)                          // v2 += v42
+    asm_u32(0x06045702)                          // v2 += v43
+    asm_u32(0x06045902)                          // v2 += v44
+    asm_u32(0x06045B02)                          // v2 += v45
+    asm_u32(0x06045D02)                          // v2 += v46
+    asm_u32(0x06045F02)                          // v2 += v47
 
     // ── Wave XOR reduce ───────────────────────────────────────────────────
     // acc=v2, addr=v9 (free after inner loop), tmp=v10
@@ -2552,6 +2591,15 @@ fn _emit_phase9_gemv_residual_inline(uint64 n_out, uint64 k, uint64 k_pad,
     uint64 outer_top = asm_text_len / 4
 
     // ── Per-row body ──────────────────────────────────────────────────────
+    // Slice 7.6a (2026-05-17): Phase 9 (residual gemv) RETAINS the single-
+    // accumulator slice-7.5 pattern.  Mistral down_proj (k=14336, 28 inner
+    // iters per row × 16 rows × 256 WGs) wedges the KFD queue at >=4
+    // accumulators in this emitter — Phase 3's identical multi-acc body is
+    // fine on the same model, and Llama/Qwen3 don't surface it in either
+    // phase.  Root cause not pinpointed; ruled out: bank conflicts, VGPR
+    // budget (within rsrc1=56), branch range, VALU→LDS s_delay_alu.  Holding
+    // phase-3 multi-acc as the slice-7.6a deliverable; phase-9 follow-up
+    // tracked separately.
     asm_v_mov_b32_inline_u(2, 0)   // acc = 0.0
 
     // init weight ptr: v3:v4 = s[w_lo:w_hi] + lane*4
@@ -2564,24 +2612,7 @@ fn _emit_phase9_gemv_residual_inline(uint64 n_out, uint64 k, uint64 k_pad,
     asm_v_add_co_u32_vcc_sv(5, x_lo, 8)
     asm_v_add_co_ci_u32_null_sv_vcc(6, x_hi, 6)
 
-    // ── Inner K loop (8× unrolled) ────────────────────────────────────────
-    // Slice 7.5 (2026-05-13): extended from 4× to 8× unroll.  Each iter
-    // issues 24 loads in a clause (8 weight pairs + 16 x elements) with
-    // one waitcnt, 16 FMAs, one ptr-advance per ptr.  Exposes ~24 VMEM ops
-    // in flight to mask the ~300-cycle global_load latency more
-    // aggressively than the 4× version's 12 in flight.  Also widens the
-    // independent-FMA window from 8 → 16 instructions, opening the door
-    // to a future VOPD v_dual_fmac_f32 pairing (task #273).
-    // Precondition: k_iters_outer = k / 16 / 32 must be integer.  Llama-1B
-    // (k ∈ {2048, 8192}) → k_iters/8 ∈ {4, 16}.  Qwen3-0.6B (k ∈ {1024,
-    // 3072, 2048}) → k_iters/8 ∈ {2, 6, 4}.  Mistral-7B (k ∈ {4096, 14336})
-    // → k_iters/8 ∈ {8, 28}.  All integer.
-    //
-    // VGPR pressure: v9, v13, v17, v21, v25, v29, v33, v37 (weights, stride 4)
-    // plus v10/v14/v18/v22/v26/v30/v34/v38 (lo-bf16 unpacks) plus
-    // v11/v12, v15/v16, v19/v20, v23/v24, v27/v28, v31/v32, v35/v36, v39/v40
-    // (x pairs).  Peak v40, well within rsrc1=0xE0AF0006 (56-VGPR) budget.
-    // global_load_b32 offset max u12 = 0xFFF; max used here = 0x704 (x[15]).
+    // ── Inner K loop (8× unrolled, single-accumulator — slice 7.5 baseline) ──
     uint64 k_iters_unrolled = k_iters / 8
     asm_s_mov_b32_inline_imm(14, k_iters_unrolled)
     uint64 inner_top = asm_text_len / 4
