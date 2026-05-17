@@ -74,7 +74,12 @@ mlr hello.mlrbo                 # runs the host slice
 Real LLM inference is already running end-to-end through the existing
 MLRift compiler + a small ML stdlib (`std/qwen3.mlr`,
 `std/matmul.mlr`, `std/tokenizer.mlr`, `std/gguf.mlr`) — no external
-runtime, no Python.
+runtime, no Python.  Slice 9 (2026-05-17, commit 147fbe2) added
+`tokenizer_load_from_gguf(gf)` so chat REPLs can read the vocab + BPE
+merges + special-token IDs + chat template directly from the GGUF
+metadata, removing the dependency on external HuggingFace
+`tokenizer.json` files (the Mistral chat REPL was the first to migrate;
+the v0.3→v0.2 ID-shift hack vanished along with the JSON dependency).
 
 | Model | Quant | tok/s (CPU) | tok/s (GPU mega) | vs PyTorch bf16 GPU | Peak RSS / VRAM |
 |---|---|---:|---:|---:|---|
