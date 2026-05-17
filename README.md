@@ -91,7 +91,7 @@ corpus.
 | Qwen3-0.6B | bf16 (HF safetensors) | 32.0 | **119.7** (M=1) / **264** (mks16+PLD) | **~2.0× / 4.4-5.3× GPU** | 1.76-1.98 GB / ~2.0 GB |
 | **Llama-3.2-1B-Instruct** | Q8_0→bf16 (CPU) / bf16 (GPU) | **16.2** | **99.8** (M=1) / **84.8** (speck4+PLD) | **+6.7% CPU, +95% GPU** | 2.39 GB / ~2.1 GB |
 | **Llama-3.2-3B-Instruct** | Q8_0→bf16 (GPU) | — | **40.7** (M=1) | **+28% GPU** | 9.63 GB / ~5.8 GB |
-| **Mistral-7B-Instruct-v0.2** | Q8_0 (GGUF) / bf16 (safetensors) | — | **22.9** (Q8_0) / **22.7** (bf16) | **+80% / +79% GPU** | 14.0 / 27.8 GB |
+| **Mistral-7B-Instruct-v0.2** | Q8_0 (GGUF) / bf16 (safetensors) | — | **24.9** (Q8_0) / **22.7** (bf16) | **+96% / +79% GPU** | 14.0 / 27.8 GB |
 | Qwen3-0.6B | bf16 (GGUF) | 32.3 | ~33 (matmul-only) | **1.25×** CPU | 1.67 GB |
 | **Qwen3-14B** | **Q8_0 (GGUF)** | **0.479** | — | **3.63×** CPU | **14.81 GB** |
 
@@ -109,17 +109,20 @@ Methodology + commit-by-commit perf history:
 
 - `docs/bench_2026-05-17.md` — post-reboot verified scorecard for the
   4 GPU models (Qwen3-0.6B 119.7-264 tok/s, Llama-1B 99.8, Llama-3B 40.7,
-  Mistral-7B 22.7-22.9), with single-env reproducers + caveats. Updated
+  Mistral-7B 22.7-24.9), with single-env reproducers + caveats. Updated
   for slice 7.6 (multi-accumulator + VOPD `v_dual_fmac_f32`); Mistral
   Q8_0 21.7 → 22.9 (+5.5%), Qwen3 M=1 118 → 119.7, Llama-1B flat.
-  Slice 7.7 added a 5-second time-based wedge watchdog in
-  `std/kfd.mlr` + `std/hip_kfd.mlr`: when MES firmware enters its
-  "not responding to host messages" state (`failed to remove hardware
-  queue from MES, doorbell=0xNNN` in dmesg) the launcher now prints a
-  single `[KFD-WEDGE]` line and exits in <100 ms instead of hanging
-  60+ seconds at `hipDeviceSynchronize` + `DESTROY_QUEUE`. Reboot still
-  required to clear MES, but the user-visible symptom is no longer
-  opaque.
+  Slice 7.7 added a 5-second time-based wedge watchdog (one
+  `[KFD-WEDGE]` line + fast exit) in `std/kfd.mlr` + `std/hip_kfd.mlr`;
+  slice 7.7b closed four post-wedge block sites to drop launcher-exit
+  time from 115 s to ~13 s. Slice 7.9 split phase 9/17 (gemv +
+  residual-add) into two pieces with a cross-WG barrier between them,
+  unlocking multi-accumulator + VOPD on Mistral's o_proj + down_proj
+  paths: Mistral Q8_0 22.9 → **24.9 tok/s (+8.7%, +96% vs PT bf16
+  GPU)**. The slice-7.6 multi-acc body was structurally incompatible
+  with the lane-0 residual-load + add + store epilogue (firmware-level
+  interaction, not a code bug); the split lets the gemv match phase
+  3's proven shape.
 - `docs/bench_2026-05-13.md` — Llama-3.2-1B vs PyTorch ROCm fp32/bf16
   on RX 7800 XT (CPU bf16 +11 %, GPU M=1 +59 % vs PT bf16, +162 % vs
   PT fp32).  Session evolution `M=1: 33 → 81.8 → 99.8 tok/s` across
