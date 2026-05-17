@@ -1,0 +1,141 @@
+// Phase 1 compute-submit primitives.  Bypasses _kfd_dispatch_core in
+// std/kfd.mlr but uses the SAME KFD-allocated queue.  Diff vs the
+// canonical path:
+//   * Caller pre-builds packet body via std/aql.mlr (no inline byte
+//     writes).
+//   * Back-pressure spin gates on (wp - rp) < ring_capacity before
+//     writing — matches std/kfd.mlr:1925-1935 so multi-packet decode
+//     streams cannot overrun the ring.
+//   * No wedge gate (kept simple).  Callers wrap in their own timeout.
+//
+// Queue struct field offsets (must match std/kfd.mlr:1013-1028):
+//   q + 0x10  ring_capacity     (u64, packet count)
+//   q + 0x18  ring_host_ptr     (u64, host VA of ring base)
+//   q + 0x28  doorbell_host     (u64, host VA of doorbell page)
+//   q + 0x40  write_ptr_host    (u64, host VA of write_pointer u64)
+//   q + 0x60  read_ptr_host     (u64, host VA of read_pointer u64)
+//
+// Doorbell semantics: the value written is the index of the LAST VALID
+// packet (= new_wp - 1).  See std/kfd.mlr:1993-2003 for the rationale
+// (writing `new_wp` makes the CP wait on a packet that does not exist).
+
+import "sys.mlr"
+import "time.mlr"
+import "kfd.mlr"
+
+// Submit a single AQL packet.  packet_body is a 64-byte buffer whose
+// bytes 0x04..0x3F are pre-filled (header word at 0x00 is ignored — we
+// write header_setup ourselves last to honour the AQL "header-store-
+// last" release).  Returns the post-submit wp value (new_wp = wp + 1)
+// on success, or 0xFFFFFFFFFFFFFFFF on back-pressure timeout.
+fn phase1_submit_packet(uint64 q, uint64 packet_body, uint32 header_setup) -> uint64 {
+    uint64 ring_host     = 0; unsafe { *((q + 0x18) as uint64) -> ring_host }
+    uint64 ring_capacity = 0; unsafe { *((q + 0x10) as uint64) -> ring_capacity }
+    uint64 wp_host       = 0; unsafe { *((q + 0x40) as uint64) -> wp_host }
+    uint64 rp_host       = 0; unsafe { *((q + 0x60) as uint64) -> rp_host }
+    uint64 db_host       = 0; unsafe { *((q + 0x28) as uint64) -> db_host }
+
+    uint64 wp = 0; unsafe { *(wp_host as uint64) -> wp }
+
+    // Back-pressure: wait for the CP to drain enough that this packet
+    // does not overwrite a still-in-flight slot.  Mirrors the gate at
+    // std/kfd.mlr:1925-1935 but uses a pure-spin cap (~2^31 spins ≈
+    // 5–30 s on this CPU) so we never depend on a wall-clock watchdog
+    // here.  Callers can layer their own timeouts on top.
+    uint64 spin = 0
+    uint64 rp = 0
+    unsafe { *(rp_host as uint64) -> rp }
+    while (wp - rp) >= ring_capacity {
+        spin = spin + 1
+        if (spin & 0xFFFFF) == 0 {
+            if spin > 0x80000000 { return 0xFFFFFFFFFFFFFFFF }
+        }
+        unsafe { *(rp_host as uint64) -> rp }
+    }
+
+    uint64 slot = wp - (wp / ring_capacity) * ring_capacity
+    uint64 ring_slot = ring_host + slot * 64
+
+    // Copy bytes 0x08..0x3F from caller-owned buffer into ring slot in
+    // 8-byte chunks (7 quads).  Bytes 0x04..0x07 are copied separately
+    // as a single u32 to keep the reserved word correct without
+    // requiring the loop to start at 0x04.
+    uint64 i = 8
+    while i < 64 {
+        uint64 src = packet_body + i
+        uint64 dst = ring_slot + i
+        uint64 v = 0
+        unsafe { *(src as uint64) -> v }
+        unsafe { *(dst as uint64) = v }
+        i = i + 8
+    }
+    uint32 w1 = 0
+    unsafe { *((packet_body + 0x04) as uint32) -> w1 }
+    unsafe { *((ring_slot + 0x04) as uint32) = w1 }
+
+    // Fence before header store: ring slot is WB memory and the header
+    // store must be observed strictly AFTER bytes 0x04..0x3F.
+    _kfd_fence()
+    unsafe { *((ring_slot + 0x00) as uint32) = header_setup }
+    // Fence before wp/doorbell: the doorbell page is UC/WC; without
+    // mfence the CP can ring before the new header is visible.
+    _kfd_fence()
+
+    uint64 new_wp = wp + 1
+    unsafe { *(wp_host as uint64) = new_wp }
+    _kfd_fence()
+    uint64 db_value = new_wp - 1
+    unsafe { *(db_host as uint64) = db_value }
+    return new_wp
+}
+
+// Busy-poll on an amd_signal_t value word at sig_va+0x08 until it
+// reads `expected`, with a hard-wall ns timeout.  Returns 1 on
+// success, 0 on timeout.  Does NOT consult kfd_wedge_seen — Phase 1
+// wants the raw signal so callers can attribute timeouts to the
+// submit path rather than to an upstream wedge gate.
+fn phase1_wait_signal(uint64 sig_va, uint64 expected, uint64 timeout_ns) -> uint64 {
+    uint64 sig_host = dev_host_ptr(sig_va)
+    uint64 sig_addr = sig_host + 0x08
+    uint64 t0 = time_now()
+    uint64 v = 0
+    unsafe { *(sig_addr as uint64) -> v }
+    uint64 spin = 0
+    while v != expected {
+        spin = spin + 1
+        // Check wall-clock every 2^20 spins so time_now() does not
+        // dominate the busy loop on hot paths.
+        if (spin & 0xFFFFF) == 0 {
+            uint64 dt = time_now() - t0
+            if dt > timeout_ns { return 0 }
+        }
+        unsafe { *(sig_addr as uint64) -> v }
+    }
+    return 1
+}
+
+// Dump wp/rp + the header_setup word at the last-published slot for
+// human inspection.  `tag` is a cstring label printed verbatim before
+// the values.  Safe to call before any submit (last_slot wraps but the
+// printed word is whatever currently sits there).
+fn phase1_dump_queue(uint64 q, uint64 tag) {
+    uint64 ring_host     = 0; unsafe { *((q + 0x18) as uint64) -> ring_host }
+    uint64 ring_capacity = 0; unsafe { *((q + 0x10) as uint64) -> ring_capacity }
+    uint64 wp_host       = 0; unsafe { *((q + 0x40) as uint64) -> wp_host }
+    uint64 rp_host       = 0; unsafe { *((q + 0x60) as uint64) -> rp_host }
+    uint64 wp = 0; unsafe { *(wp_host as uint64) -> wp }
+    uint64 rp = 0; unsafe { *(rp_host as uint64) -> rp }
+    print_str(tag)
+    print_str("\n")
+    print_str("  wp=")
+    print(wp)
+    print_str(" rp=")
+    println(rp)
+    uint64 last_slot = (wp - 1) - ((wp - 1) / ring_capacity) * ring_capacity
+    uint64 slot_ptr = ring_host + last_slot * 64
+    uint32 hdr = 0; unsafe { *((slot_ptr + 0) as uint32) -> hdr }
+    print_str("  last_slot=")
+    print(last_slot)
+    print_str(" header_setup_word=")
+    println(hdr)
+}
