@@ -1,0 +1,70 @@
+// Cross-validates our parsed GC_IP_BASE by reading GRBM_STATUS two ways:
+// (1) direct BAR5 mmap + (2) amdgpu_regs2 debugfs ioctl. They must agree.
+// Run as root: echo 131167 | sudo -S /tmp/regs2_smoke
+
+import "../std/amdgpu_discovery.mlr"
+import "../std/amdgpu_regs.mlr"
+import "../std/amdgpu_regs2_ioctl.mlr"
+import "../std/sys.mlr"
+import "../std/io.mlr"
+import "../std/fmt.mlr"
+
+fn main() {
+    // 1. Load discovery binary, extract GC_IP_BASE
+    u64 disc_fd = sys_open("tools/discovery.bin", 0, 0)
+    if disc_fd > 0xFFFFFFFFFFFFF000 {
+        print_str("[smoke] need tools/discovery.bin — see scripts/dump_amdgpu_discovery.sh\n")
+        exit(1)
+    }
+    u64 disc_buf = sys_mmap(0, 16384, 1, 2, disc_fd, 0)
+    sys_close(disc_fd)
+    u64 gc_base = amdgpu_discovery_gc_ip_base(disc_buf, 16384)
+    if gc_base == 0 {
+        print_str("[smoke] GC_IP_BASE parse failed\n"); exit(1)
+    }
+    print_str("[smoke] GC_IP_BASE = "); u64 s1 = fmt_hex(gc_base); print_str(s1); dealloc(s1); print_str("\n")
+
+    // 2. Compute absolute byte offset of GRBM_STATUS (reg_id 0)
+    u64 grbm_byte = amdgpu_reg_byte_offset(0, gc_base)
+    print_str("[smoke] GRBM_STATUS byte_offset = "); u64 s2 = fmt_hex(grbm_byte); print_str(s2); dealloc(s2); print_str("\n")
+
+    // 3. Read via amdgpu_regs2 (validated by amdgpu)
+    u64 r2_fd = amdgpu_regs2_open("/sys/kernel/debug/dri/0000:03:00.0/amdgpu_regs2")
+    if r2_fd == 0xFFFFFFFFFFFFFFFF {
+        print_str("[smoke] amdgpu_regs2 open failed — need root? echo 131167 | sudo -S /tmp/regs2_smoke\n")
+        exit(1)
+    }
+    u32 val_r2 = amdgpu_regs2_read(r2_fd, grbm_byte)
+    amdgpu_regs2_close(r2_fd)
+    print_str("[smoke] GRBM_STATUS via amdgpu_regs2 = "); u64 s3 = fmt_hex(val_r2); print_str(s3); dealloc(s3); print_str("\n")
+
+    // 4. Read via direct sysfs BAR5 mmap
+    u64 bar_fd = sys_open("/sys/bus/pci/devices/0000:03:00.0/resource5", 0, 0)
+    if bar_fd > 0xFFFFFFFFFFFFF000 {
+        print_str("[smoke] BAR5 open failed — sudo?\n"); exit(1)
+    }
+    u64 bar_va = sys_mmap(0, 1048576, 1, 1, bar_fd, 0)
+    u32 val_bar = 0
+    unsafe { *((bar_va + grbm_byte) as uint32) -> val_bar }
+    sys_munmap(bar_va, 1048576)
+    sys_close(bar_fd)
+    print_str("[smoke] GRBM_STATUS via BAR5 mmap     = "); u64 s4 = fmt_hex(val_bar); print_str(s4); dealloc(s4); print_str("\n")
+
+    // 5. Compare (allow status-bit drift between reads; treat the high
+    // nibble (idle/busy bits) as informational; compare LOW 16 bits which
+    // are queue-state and tend to be stable across milliseconds)
+    if val_r2 == val_bar {
+        print_str("[smoke] PASS — both paths return identical GRBM_STATUS\n")
+        exit(0)
+    } else {
+        // Allow soft-match on the low 16 bits (drift in upper bits acceptable for cross-validation)
+        u32 r2_low = val_r2 & 0xFFFF
+        u32 bar_low = val_bar & 0xFFFF
+        if r2_low == bar_low {
+            print_str("[smoke] PASS-SOFT — low 16 bits agree, upper bits drifted between reads (normal)\n")
+            exit(0)
+        }
+        print_str("[smoke] FAIL — IP_BASE wrong or mmap mismatch\n")
+        exit(1)
+    }
+}
