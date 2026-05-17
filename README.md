@@ -112,6 +112,14 @@ Methodology + commit-by-commit perf history:
   Mistral-7B 22.7-22.9), with single-env reproducers + caveats. Updated
   for slice 7.6 (multi-accumulator + VOPD `v_dual_fmac_f32`); Mistral
   Q8_0 21.7 → 22.9 (+5.5%), Qwen3 M=1 118 → 119.7, Llama-1B flat.
+  Slice 7.7 added a 5-second time-based wedge watchdog in
+  `std/kfd.mlr` + `std/hip_kfd.mlr`: when MES firmware enters its
+  "not responding to host messages" state (`failed to remove hardware
+  queue from MES, doorbell=0xNNN` in dmesg) the launcher now prints a
+  single `[KFD-WEDGE]` line and exits in <100 ms instead of hanging
+  60+ seconds at `hipDeviceSynchronize` + `DESTROY_QUEUE`. Reboot still
+  required to clear MES, but the user-visible symptom is no longer
+  opaque.
 - `docs/bench_2026-05-13.md` — Llama-3.2-1B vs PyTorch ROCm fp32/bf16
   on RX 7800 XT (CPU bf16 +11 %, GPU M=1 +59 % vs PT bf16, +162 % vs
   PT fp32).  Session evolution `M=1: 33 → 81.8 → 99.8 tok/s` across
