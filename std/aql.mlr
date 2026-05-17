@@ -1,0 +1,76 @@
+// Phase 1 AQL packet builders.  Each emitter writes into a caller-owned
+// 64-byte slot (typically a ring slot at ring_host + slot_idx * 64), then
+// returns the (header | setup<<16) word the caller must store LAST (after
+// an mfence) to make the packet visible to the CP.  Splitting that final
+// store out lets the caller sequence header-write + wp-advance + doorbell
+// under one fence regime.
+
+// Header values.
+//   HSA_PACKET_TYPE_KERNEL_DISPATCH = 2
+//   HSA_PACKET_TYPE_BARRIER_AND     = 3
+//   header[7:0]    = type
+//   header[8]      = barrier
+//   header[10:9]   = acquire fence scope (system = 2)
+//   header[12:11]  = release fence scope (system = 2)
+// kernel-dispatch: 0x2 | (1<<8) | (2<<9) | (2<<11) = 0x1502 (matches std/kfd.mlr:1984).
+// barrier-and:     0x3 | (1<<8) | (2<<9) | (2<<11) = 0x1503.
+static uint32 AQL_HDR_KERNEL_DISPATCH = 0x1502
+static uint32 AQL_HDR_BARRIER_AND     = 0x1503
+static uint32 AQL_TYPE_KERNEL_DISPATCH = 2
+static uint32 AQL_TYPE_BARRIER_AND     = 3
+
+// Fill bytes 0x04..0x3F of a kernel-dispatch packet.  Returns the
+// header_setup word (header in low 16, setup in high 16) the caller
+// stores at packet[0x00] LAST.  Mirrors std/kfd.mlr:1955-1985 byte-for-
+// byte; the only deltas vs the inline copy are (a) it takes a packet
+// pointer rather than reading the queue struct, and (b) it does NOT
+// emit fences — caller controls ordering.
+fn aql_build_kernel_dispatch(uint64 packet,
+                              uint64 grid_x, uint64 grid_y, uint64 grid_z,
+                              uint64 block_x, uint64 block_y, uint64 block_z,
+                              uint64 private_segment_size,
+                              uint64 group_segment_size,
+                              uint64 kernel_object,
+                              uint64 kernarg_addr,
+                              uint64 completion_signal) -> uint32 {
+    uint32 setup = 1
+    if grid_y > 1 { setup = 2 }
+    if grid_z > 1 { setup = 3 }
+    uint16 bx = block_x; unsafe { *((packet + 0x04) as uint16) = bx }
+    uint16 by = block_y; unsafe { *((packet + 0x06) as uint16) = by }
+    uint16 bz = block_z; unsafe { *((packet + 0x08) as uint16) = bz }
+    uint16 r0 = 0;       unsafe { *((packet + 0x0A) as uint16) = r0 }
+    uint32 gx = grid_x * block_x; unsafe { *((packet + 0x0C) as uint32) = gx }
+    uint32 gy = grid_y * block_y; unsafe { *((packet + 0x10) as uint32) = gy }
+    uint32 gz = grid_z * block_z; unsafe { *((packet + 0x14) as uint32) = gz }
+    uint32 priv = private_segment_size; unsafe { *((packet + 0x18) as uint32) = priv }
+    uint32 grp  = group_segment_size;   unsafe { *((packet + 0x1C) as uint32) = grp  }
+    unsafe { *((packet + 0x20) as uint64) = kernel_object }
+    unsafe { *((packet + 0x28) as uint64) = kernarg_addr }
+    uint64 r2 = 0;       unsafe { *((packet + 0x30) as uint64) = r2 }
+    unsafe { *((packet + 0x38) as uint64) = completion_signal }
+    return (setup << 16) | AQL_HDR_KERNEL_DISPATCH
+}
+
+// Fill bytes 0x04..0x3F of a barrier-and packet.  Per HSA AQL spec the
+// payload is up to 5 dependent-signal pointers at offsets 0x08..0x28
+// plus a completion-signal at 0x38.  Pass 0 for dep_signal slots you do
+// not use.
+fn aql_build_barrier_and(uint64 packet,
+                          uint64 dep0, uint64 dep1, uint64 dep2,
+                          uint64 dep3, uint64 dep4,
+                          uint64 completion_signal) -> uint32 {
+    uint16 r0 = 0
+    unsafe { *((packet + 0x04) as uint16) = r0 }
+    uint32 r1 = 0
+    unsafe { *((packet + 0x04) as uint32) = r1 }
+    unsafe { *((packet + 0x08) as uint64) = dep0 }
+    unsafe { *((packet + 0x10) as uint64) = dep1 }
+    unsafe { *((packet + 0x18) as uint64) = dep2 }
+    unsafe { *((packet + 0x20) as uint64) = dep3 }
+    unsafe { *((packet + 0x28) as uint64) = dep4 }
+    uint64 r2 = 0
+    unsafe { *((packet + 0x30) as uint64) = r2 }
+    unsafe { *((packet + 0x38) as uint64) = completion_signal }
+    return AQL_HDR_BARRIER_AND
+}
