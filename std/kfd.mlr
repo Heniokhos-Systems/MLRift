@@ -6,6 +6,8 @@
 
 import "kfd_raw.mlr"
 import "sys.mlr"
+import "time.mlr"
+import "fmt.mlr"
 
 // write/exit are codegen builtins (emit raw Linux syscalls 1/231 inline).
 // puts was declared but unused; removed.
@@ -246,6 +248,66 @@ fn kfd_fd() -> uint32 { return _kfd_fd }
 fn kfd_drm_fd() -> uint32 { return _kfd_drm_fd }
 fn kfd_gpuvm_base() -> uint64 { return _kfd_gpuvm_base }
 fn kfd_gpuvm_limit() -> uint64 { return _kfd_gpuvm_limit }
+
+// ---------------------------------------------------------------------------
+// MES-wedge watchdog (slice 7.7 — task #321).
+//
+// Symptom (captured 2026-05-17): an MLRift launch occasionally triggers a
+// state where MES firmware silently stops responding to host control
+// messages.  Our AQL ring's `rp` never advances past `wp`, so existing
+// 30-billion-spin timeouts in hipDeviceSynchronize / kfd_wait fire after
+// ~30 seconds of pure CPU spin and call kfd_die().  At process exit,
+// KFD's REMOVE_QUEUE ioctl also times out because MES won't ack — adding
+// another ~30 seconds of hang.  amdgpu's TDR eventually fires a mode-1
+// GPU reset, but the reset only partially recovers; reboot is needed.
+//
+// The watchdog catches this fingerprint EARLY (5-second time-based
+// timeout, not spin-count) and sets `_kfd_wedge_seen = 1` instead of
+// calling kfd_die.  Every dispatch / sync path then short-circuits to a
+// no-op, and hipkfd_teardown skips the blocking REMOVE_QUEUE — so the
+// process exits in well under a second instead of hanging 60+ seconds.
+//
+// The GPU state itself is unchanged by the watchdog; reboot is still
+// required to clear MES.  This just makes the wedge symptom less
+// punishing for the user.
+static uint64 _kfd_wedge_seen     = 0
+static uint64 _kfd_wedge_diag_done = 0
+static uint64 KFD_WEDGE_TIMEOUT_NS = 5000000000   // 5 s; csr_build kernels can take ~2 s legit
+static uint64 KFD_WEDGE_CHECK_SPINS = 1048576     // 2^20 — check time_now() every ~1 M spins
+
+fn kfd_wedge_seen() -> uint64 { return _kfd_wedge_seen }
+
+// Emit a one-shot wedge diagnostic and set the global flag.  Subsequent
+// detections are silenced (one cluster of REMOVE_QUEUE waits all hit the
+// same timeout; we don't want N copies of the same message).
+fn _kfd_wedge_mark(uint64 where_msg, uint64 wp, uint64 rp, uint64 elapsed_ms) {
+    _kfd_wedge_seen = 1
+    if _kfd_wedge_diag_done != 0 { return }
+    _kfd_wedge_diag_done = 1
+    // Compute string lengths so we don't overflow into rodata.
+    uint64 mlen = 0
+    while 1 == 1 {
+        uint64 ch = 0
+        unsafe { *((where_msg + mlen) as uint8) -> ch }
+        if ch == 0 { break }
+        mlen = mlen + 1
+    }
+    write(2, "[KFD-WEDGE] ", 12)
+    write(2, where_msg, mlen)
+    write(2, " (wp=", 5)
+    uint64 s1 = fmt_dec(wp); uint64 l1 = 0
+    while 1 == 1 { uint64 c = 0; unsafe { *((s1 + l1) as uint8) -> c }; if c == 0 { break } l1 = l1 + 1 }
+    write(2, s1, l1); dealloc(s1)
+    write(2, " rp=", 4)
+    uint64 s2 = fmt_dec(rp); uint64 l2 = 0
+    while 1 == 1 { uint64 c = 0; unsafe { *((s2 + l2) as uint8) -> c }; if c == 0 { break } l2 = l2 + 1 }
+    write(2, s2, l2); dealloc(s2)
+    write(2, " elapsed_ms=", 12)
+    uint64 s3 = fmt_dec(elapsed_ms); uint64 l3 = 0
+    while 1 == 1 { uint64 c = 0; unsafe { *((s3 + l3) as uint8) -> c }; if c == 0 { break } l3 = l3 + 1 }
+    write(2, s3, l3); dealloc(s3)
+    write(2, ") — MES not responding; will short-circuit remaining work and skip REMOVE_QUEUE at teardown. Reboot required to clear.\n", 119)
+}
 
 // memcpy is a codegen builtin (rep movsb / unrolled). mmap/munmap are
 // now native syscall wrappers in std/sys.mlr (sys_mmap / sys_munmap),
@@ -1820,6 +1882,10 @@ fn _kfd_dispatch_core(uint64 q, uint64 kernel,
                        uint64 grid_x, uint64 grid_y, uint64 grid_z,
                        uint64 block_x, uint64 block_y, uint64 block_z,
                        uint64 kernarg_ptr, uint64 kernarg_size, uint64 signal_va) {
+    // Wedge watchdog: once a wedge is detected upstream, all further
+    // dispatches are no-ops so the launcher exits quickly with a clear
+    // diagnostic instead of spinning on doorbells that MES won't ack.
+    if _kfd_wedge_seen != 0 { return }
     uint64 ring_host = 0;     unsafe { *((q + 0x18) as uint64) -> ring_host }
     uint64 ring_capacity = 0; unsafe { *((q + 0x10) as uint64) -> ring_capacity }
     uint64 wp_host = 0;       unsafe { *((q + 0x40) as uint64) -> wp_host }
@@ -1834,9 +1900,22 @@ fn _kfd_dispatch_core(uint64 q, uint64 kernel,
     // we'd write to still holds an in-flight packet. Spin until at
     // least one slot drains. Without this, async dispatch streams
     // (Stage-2 sim loop, LLM forward) silently overwrite live packets.
+    // 5-second watchdog: if MES has wedged, rp never advances — detect
+    // and short-circuit (don't spin forever, don't write into a slot
+    // that's still in-flight).
     uint64 rp = 0
     unsafe { *(rp_host as uint64) -> rp }
+    uint64 bp_t_start = time_now()
+    uint64 bp_spin = 0
     while (wp - rp) >= ring_capacity {
+        bp_spin = bp_spin + 1
+        if (bp_spin & 0xFFFFF) == 0 {
+            uint64 bp_elapsed = time_now() - bp_t_start
+            if bp_elapsed > KFD_WEDGE_TIMEOUT_NS {
+                _kfd_wedge_mark("dispatch back-pressure timeout", wp, rp, bp_elapsed / 1000000)
+                return
+            }
+        }
         unsafe { *(rp_host as uint64) -> rp }
     }
 
@@ -1940,21 +2019,28 @@ fn kfd_dispatch_async(uint64 q, uint64 kernel,
 // poll instead of N — and is the basis for the async-launch fast path
 // in the HIP shim.
 fn kfd_wait_idle(uint64 q) {
+    if _kfd_wedge_seen != 0 { return }
     uint64 wp_host = 0; unsafe { *((q + 0x40) as uint64) -> wp_host }
     uint64 rp_host = 0; unsafe { *((q + 0x60) as uint64) -> rp_host }
     uint64 wp = 0; unsafe { *(wp_host as uint64) -> wp }
     uint64 rp = 0; unsafe { *(rp_host as uint64) -> rp }
+    uint64 t_start = time_now()
     uint64 spin = 0
     while rp < wp {
         spin = spin + 1
-        if spin > 30000000000 {
-            kfd_die("kfd_wait_idle: timeout waiting for queue drain", spin)
+        if (spin & 0xFFFFF) == 0 {
+            uint64 elapsed = time_now() - t_start
+            if elapsed > KFD_WEDGE_TIMEOUT_NS {
+                _kfd_wedge_mark("kfd_wait_idle timeout", wp, rp, elapsed / 1000000)
+                return
+            }
         }
         unsafe { *(rp_host as uint64) -> rp }
     }
 }
 
 fn kfd_wait(uint64 q, uint64 signal_va) {
+    if _kfd_wedge_seen != 0 { return }
     uint32 wait_mode = 0; unsafe { *((q + 0x58) as uint32) -> wait_mode }
     if wait_mode == KFD_WAIT_BUSY_POLL {
         // Cache the signal's host pointer ONCE before the spin loop.
@@ -1966,16 +2052,21 @@ fn kfd_wait(uint64 q, uint64 signal_va) {
         uint64 sig_value_addr = sig_host + 0x08
         uint64 v = 0
         unsafe { *(sig_value_addr as uint64) -> v }
+        uint64 t_start = time_now()
         uint64 spin = 0
         while v != 0 {
             spin = spin + 1
-            // 30 billion spins ≈ 30s on a modern x86 — long enough for
-            // big multi-billion-thread kernels (e.g. csr_build at
-            // N=60M takes ~1-2s of GPU time, but the busy-poll
-            // counter is CPU-bound so the same kernel triggered the
-            // old 1-billion limit despite the GPU being healthy).
-            if spin > 30000000000 {
-                kfd_die("kfd_wait: timeout busy-polling signal", spin)
+            // Time-based wedge detection (slice 7.7): check every ~1M
+            // spins so the time_now() syscall doesn't dominate the busy
+            // poll cost.  5-second timeout accommodates legit long
+            // kernels (csr_build at N=60M takes ~1-2 s) but fires fast
+            // vs the prior 30 s spin-count timeout.
+            if (spin & 0xFFFFF) == 0 {
+                uint64 elapsed = time_now() - t_start
+                if elapsed > KFD_WEDGE_TIMEOUT_NS {
+                    _kfd_wedge_mark("kfd_wait timeout (busy-poll signal)", v, 0, elapsed / 1000000)
+                    return
+                }
             }
             unsafe { *(sig_value_addr as uint64) -> v }
         }

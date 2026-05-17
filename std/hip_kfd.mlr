@@ -1067,6 +1067,11 @@ fn hipDeviceSynchronize() -> uint32 {
     _hipkfd_sync_count = _hipkfd_sync_count + 1
     if _hipkfd_q == 0 { return 0 }
     if _hipkfd_signal_h == 0 { return 0 }
+    // If a wedge has been detected earlier, every subsequent sync is a
+    // no-op (the signal will never reach _hipkfd_pending because MES is
+    // not retiring our queue).  Returning 0 lets the launcher continue
+    // and exit; teardown will skip REMOVE_QUEUE.
+    if kfd_wedge_seen() != 0 { return 0 }
 
     // Chain mode: ring the doorbell now for the most recently queued
     // packet.  CP processes the entire batch (slots up to and including
@@ -1089,11 +1094,21 @@ fn hipDeviceSynchronize() -> uint32 {
     uint64 was_busy = 0
     if v != _hipkfd_pending { was_busy = 1 }
 
+    // Time-based wedge detection (slice 7.7): 5-second timeout, checked
+    // every ~1M spins.  Replaces the old 30-billion-spin timeout that
+    // kfd_die'd after ~30 s — the wedge now surfaces 6× faster AND we
+    // exit cleanly instead of dying with a confusing error.
     uint64 spin = 0
     while v != _hipkfd_pending {
         spin = spin + 1
-        if spin > 30000000000 {
-            kfd_die("hipDeviceSynchronize: timeout draining queue", spin)
+        if (spin & 0xFFFFF) == 0 {
+            uint64 elapsed_ns = time_now() - t_start
+            if elapsed_ns > 5000000000 {
+                _kfd_wedge_mark("hipDeviceSynchronize timeout", _hipkfd_pending, v, elapsed_ns / 1000000)
+                _hipkfd_sync_total_ns = _hipkfd_sync_total_ns + elapsed_ns
+                if was_busy != 0 { _hipkfd_sync_busy_calls = _hipkfd_sync_busy_calls + 1 }
+                return 0
+            }
         }
         unsafe { *(sig_addr as uint64) -> v }
     }
@@ -1134,30 +1149,43 @@ fn hipkfd_get_sync_busy_calls() -> uint64 {
 // then BOOST compute, then BOOST SDMA. Boost queues drain to 4096-iter
 // caps so a wedged boost wave doesn't hang the launcher's exit path.
 fn hipkfd_teardown() {
+    // If a wedge has been detected, the queue's signal will never settle
+    // and KFD's DESTROY_QUEUE → MES REMOVE_QUEUE ack also will not come
+    // back.  Skip the blocking calls; kernel fd-close will still reclaim
+    // the queue eventually, and amdgpu's mode-1 TDR will reset MES.
+    // Result: launcher exits in <100 ms instead of hanging ~60 s.
+    uint64 wedged = kfd_wedge_seen()
+
     // 1. User compute queue — drain via hipDeviceSynchronize, then destroy.
     if _hipkfd_q != 0 {
-        hipDeviceSynchronize()
-        kfd_destroy_queue(_hipkfd_q)
+        if wedged == 0 {
+            hipDeviceSynchronize()
+            kfd_destroy_queue(_hipkfd_q)
+        }
         _hipkfd_q = 0
     }
     // 2. User SDMA queue — kfd_sdma_copy is synchronous so rp == wp by
-    //    construction. Just destroy.
+    //    construction. Just destroy. (SDMA does not go through MES, so
+    //    destroy is safe even when compute is wedged.)
     if _hipkfd_sdma_q != 0 {
         kfd_destroy_queue(_hipkfd_sdma_q)
         _hipkfd_sdma_q = 0
         _hipkfd_sdma_init_done = 0
     }
     // 3. Boost compute queue — short 65k-VALU waves complete in ~75 µs,
-    //    so spin briefly for rp to catch wp before destroying.
+    //    so spin briefly for rp to catch wp before destroying. Skip the
+    //    drain spin (and the destroy, which goes through MES) if wedged.
     if _hipkfd_boost_q != 0 {
-        uint64 wp_b = 0; unsafe { *(_hipkfd_boost_q_wp_host as uint64) -> wp_b }
-        uint64 rp_b = 0; unsafe { *(_hipkfd_boost_q_rp_host as uint64) -> rp_b }
-        uint64 spin_b = 0
-        while rp_b != wp_b && spin_b < 100000000 {
-            spin_b = spin_b + 1
-            unsafe { *(_hipkfd_boost_q_rp_host as uint64) -> rp_b }
+        if wedged == 0 {
+            uint64 wp_b = 0; unsafe { *(_hipkfd_boost_q_wp_host as uint64) -> wp_b }
+            uint64 rp_b = 0; unsafe { *(_hipkfd_boost_q_rp_host as uint64) -> rp_b }
+            uint64 spin_b = 0
+            while rp_b != wp_b && spin_b < 100000000 {
+                spin_b = spin_b + 1
+                unsafe { *(_hipkfd_boost_q_rp_host as uint64) -> rp_b }
+            }
+            kfd_destroy_queue(_hipkfd_boost_q)
         }
-        kfd_destroy_queue(_hipkfd_boost_q)
         _hipkfd_boost_q = 0
     }
     // 4. Boost SDMA queue — depth-32 VRAM↔VRAM 64 KiB packets, each
