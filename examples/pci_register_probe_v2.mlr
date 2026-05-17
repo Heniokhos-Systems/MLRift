@@ -1,0 +1,62 @@
+// Safe MMIO register probe for gfx1100. Reads ONLY the whitelisted
+// register set in std/amdgpu_regs.mlr. Will NOT panic the kernel.
+// Run as root: echo 131167 | sudo -S /tmp/pci_register_probe_v2
+
+import "../std/amdgpu_discovery.mlr"
+import "../std/amdgpu_regs.mlr"
+import "../std/sys.mlr"
+import "../std/io.mlr"
+import "../std/fmt.mlr"
+
+fn main() {
+    // 1. Load IP_BASE from discovery binary
+    u64 disc_fd = sys_open("tools/discovery.bin", 0, 0)
+    if disc_fd > 0xFFFFFFFFFFFFF000 {
+        print_str("need tools/discovery.bin — run scripts/dump_amdgpu_discovery.sh first\n"); exit(1)
+    }
+    u64 disc_buf = sys_mmap(0, 16384, 1, 2, disc_fd, 0)
+    sys_close(disc_fd)
+    u64 gc_base = amdgpu_discovery_gc_ip_base(disc_buf, 16384)
+    if gc_base == 0 { print_str("GC_IP_BASE parse failed\n"); exit(1) }
+
+    // 2. Open + mmap BAR5
+    u64 fd = sys_open("/sys/bus/pci/devices/0000:03:00.0/resource5", 0, 0)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        print_str("BAR5 open failed — sudo? echo 131167 | sudo -S\n"); exit(1)
+    }
+    u64 va = sys_mmap(0, 1048576, 1, 1, fd, 0)
+    if va > 0xFFFFFFFFFFFFF000 { print_str("BAR5 mmap failed\n"); exit(1) }
+
+    // 3. Walk the whitelist
+    print_str("=== gfx1100 MMIO register snapshot (GC_IP_BASE = 0x")
+    u64 gs = fmt_hex(gc_base); print_str(gs + 2); dealloc(gs); print_str(") ===\n")
+    u64 i = 0
+    while i < 9 {
+        u64 byte_off = amdgpu_reg_byte_offset(i, gc_base)
+        u32 val = 0
+        unsafe { *((va + byte_off) as uint32) -> val }
+        u64 name = amdgpu_reg_name(i)
+        print_str("  ")
+        print_str(name)
+        // pad name to 24 chars
+        u64 nlen = 0
+        while 1 == 1 {
+            u64 c = 0
+            unsafe { *((name + nlen) as uint8) -> c }
+            if c == 0 { break }
+            nlen = nlen + 1
+        }
+        u64 pad = 24
+        while pad > nlen { print_str(" "); pad = pad - 1 }
+        print_str(" @0x")
+        u64 hs = fmt_hex(byte_off); print_str(hs + 2); dealloc(hs)
+        print_str(" = 0x")
+        u64 vs = fmt_hex(val); print_str(vs + 2); dealloc(vs)
+        print_str("\n")
+        i = i + 1
+    }
+
+    sys_munmap(va, 1048576)
+    sys_close(fd)
+    exit(0)
+}
