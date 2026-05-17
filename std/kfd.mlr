@@ -918,6 +918,19 @@ fn dev_free(uint64 dev_ptr) {
 // 0 always points to "next to release" until the table is empty.
 fn kfd_release_all_allocations() {
     if _kfd_fd == 0 { return }
+    // Slice 7.7b: when MES is wedged, AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU
+    // (which routes through MES to invalidate VM mappings on the queue
+    // side) hangs for ~30 s per call.  With hundreds of tracked
+    // allocations (one per .co kernel image + every weight buffer),
+    // walking the whole table would dominate launcher-exit time and
+    // explains the ~115 s post-wedge silence the user observed.
+    //
+    // On wedge we skip BOTH ioctls — the kernel's fd-close handler
+    // reclaims everything via the same code path eventually, just
+    // without the synchronous round-trip per VA.  Host-side munmaps
+    // are MES-independent so we keep them (they release process VM
+    // and BAR1 mmaps without touching the GPU).
+    uint64 wedged = _kfd_wedge_seen
     uint64 guard = 0
     uint64 guard_cap = 200000
     while _kfd_alloc_tab_n > 0 {
@@ -948,8 +961,10 @@ fn kfd_release_all_allocations() {
         if kind != 3 {
             if host != 0 { sys_munmap(host, size) }
         }
-        raw_kfd_unmap_memory_from_gpu(_kfd_fd, handle, _kfd_gpu_id)
-        raw_kfd_free_memory_of_gpu(_kfd_fd, handle)
+        if wedged == 0 {
+            raw_kfd_unmap_memory_from_gpu(_kfd_fd, handle, _kfd_gpu_id)
+            raw_kfd_free_memory_of_gpu(_kfd_fd, handle)
+        }
         if kind != 3 {
             if host == 0 { sys_munmap(va, size) }
         }
