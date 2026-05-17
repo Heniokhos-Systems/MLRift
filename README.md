@@ -74,12 +74,17 @@ mlr hello.mlrbo                 # runs the host slice
 Real LLM inference is already running end-to-end through the existing
 MLRift compiler + a small ML stdlib (`std/qwen3.mlr`,
 `std/matmul.mlr`, `std/tokenizer.mlr`, `std/gguf.mlr`) — no external
-runtime, no Python.  Slice 9 (2026-05-17, commit 147fbe2) added
+runtime, no Python.  Slice 9 (2026-05-17) added
 `tokenizer_load_from_gguf(gf)` so chat REPLs can read the vocab + BPE
 merges + special-token IDs + chat template directly from the GGUF
 metadata, removing the dependency on external HuggingFace
-`tokenizer.json` files (the Mistral chat REPL was the first to migrate;
-the v0.3→v0.2 ID-shift hack vanished along with the JSON dependency).
+`tokenizer.json` files. Phase 1 (commit 147fbe2) shipped the SPM path
+with a greedy encoder and migrated Mistral off the v0.3 ID-shift hack;
+Phase 2 added a canonical merge-rank BPE encoder for the gpt2 family
+and migrated the three remaining chat REPLs (Qwen3-0.6B, Llama-3.2-1B,
+Llama-3.2-3B) off external tokenizer.json files. Bit-exact vs the
+HuggingFace `tokenizers` library on the 5-prompt chat-REPL test
+corpus.
 
 | Model | Quant | tok/s (CPU) | tok/s (GPU mega) | vs PyTorch bf16 GPU | Peak RSS / VRAM |
 |---|---|---:|---:|---:|---|

@@ -85,22 +85,40 @@ fn main() {
     qwen3_set_rmsnorm_eps_bits(0x3727C5AC)
     qwen3_set_rope_pair_layout(1)
 
-    u64 tok_default = "/home/pantelis/.cache/huggingface/hub/models--unsloth--Llama-3.2-1B-Instruct/snapshots/5a8abab4a5d6f164389b1079fb721cfab8d7126c/tokenizer.json"
-    u64 tok_path = resolve_model_path("MLRIFT_LLAMA3_TOKENIZER",
-                                       tok_default,
-                                       "llama-3.2-3b-gpu-chat")
-    Tokenizer tk = tokenizer_load(tok_path)
-    if tk.file_size == 0 {
-        print_str("[llama3_3b_gpu_chat] could not open tokenizer at "); print_str(tok_path); print_str("\n")
+    // Tokenizer + weights now share the same GGUF (task #297 Phase 2).
+    // Open the GGUF once, load the tokenizer from it, then read weights
+    // and chat-template token IDs out of the same file.
+    u64 model_path = resolve_model_path("MLRIFT_LLAMA3_3B_GGUF",
+                                         "models/llama-3.2-3b-instruct-q8_0.gguf",
+                                         "llama-3.2-3b-gpu-chat")
+    GGUFFile gf = gguf_open(model_path)
+    if gf.file_size == 0 {
+        print_str("[llama3_3b_gpu_chat] gguf open failed\n"); exit(1)
+    }
+
+    Tokenizer tk = tokenizer_load_from_gguf(gf)
+    if tk.vocab_count == 0 {
+        print_str("[llama3_3b_gpu_chat] tokenizer_load_from_gguf failed at "); print_str(model_path); print_str("\n")
         exit(1)
     }
-    tokenizer_set_kind_gpt2(tk)
-
-    u64 BOS         = 128000
-    u64 START_HDR   = 128006
-    u64 END_HDR     = 128007
-    u64 EOT         = 128009
-    u64 NL2         = 271
+    // BOS comes from GGUF metadata. EOT is also in tk.eos_id (the Llama-3
+    // GGUF maps tokenizer.ggml.eos_token_id to 128009 = <|eot_id|>, which
+    // is what the chat REPL treats as end-of-turn). START_HDR/END_HDR/NL2
+    // are NOT in the special-token metadata — they're regular vocab
+    // entries we look up by their byte-mapped string forms.
+    u64 BOS       = tk.bos_id
+    u64 EOT       = tk.eos_id
+    u64 START_HDR = tokenizer_id_of(tk, "<|start_header_id|>", 19)
+    u64 END_HDR   = tokenizer_id_of(tk, "<|end_header_id|>",   17)
+    u64 NL2       = tokenizer_id_of(tk, "\xC4\x8A\xC4\x8A",     4)  // "ĊĊ" = U+010A U+010A = double newline
+    if BOS != 128000 || START_HDR != 128006 || END_HDR != 128007 || EOT != 128009 || NL2 != 271 {
+        print_str("[llama3_3b_gpu_chat] WARNING: Llama-3 chat-template token IDs differ from canonical (BOS=")
+        u64 sa = fmt_dec(BOS);       print_str(sa); dealloc(sa); print_str(", SHDR=")
+        u64 sb = fmt_dec(START_HDR); print_str(sb); dealloc(sb); print_str(", EHDR=")
+        u64 sc = fmt_dec(END_HDR);   print_str(sc); dealloc(sc); print_str(", EOT=")
+        u64 sd = fmt_dec(EOT);       print_str(sd); dealloc(sd); print_str(", NL2=")
+        u64 se = fmt_dec(NL2);       print_str(se); dealloc(se); print_str(")\n")
+    }
 
     u64 user_box       = alloc(8)
     u64 user_cnt_box   = alloc(8)
@@ -122,14 +140,6 @@ fn main() {
     unsafe { *(assist_cnt_box as u64) -> assist_cnt }
     dealloc(user_box); dealloc(user_cnt_box)
     dealloc(assist_box); dealloc(assist_cnt_box)
-
-    u64 model_path = resolve_model_path("MLRIFT_LLAMA3_3B_GGUF",
-                                         "models/llama-3.2-3b-instruct-q8_0.gguf",
-                                         "llama-3.2-3b-gpu-chat")
-    GGUFFile gf = gguf_open(model_path)
-    if gf.file_size == 0 {
-        print_str("[llama3_3b_gpu_chat] gguf open failed\n"); exit(1)
-    }
 
     u64 hidden    = QWEN3_HIDDEN
     u64 q_dim     = QWEN3_Q_DIM

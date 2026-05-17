@@ -82,6 +82,39 @@ fn tokenizer_chat_template(u64 out_ptr, u64 out_len) {
 }
 
 // ---------------------------------------------------------------------------
+// BPE merge-rank table (Phase 2, task #297).
+//
+// For GPT-2 / Llama-3 / Qwen3-style tokenizers we need a real merge-rank
+// BPE encoder, not the greedy longest-prefix-match used by the
+// Phase-1 SPM-compatible code path. The merge-rank table maps an
+// adjacent token-id pair (left, right) → rank (lower = higher
+// priority). It's built once at tokenizer_load_from_gguf time from
+// `tokenizer.ggml.merges` and consulted from tk_bpe_encode_pretoken at
+// every encode call.
+//
+// Storage layout — open-addressed hash table sized to 2× merges_count.
+// Both arrays live as module-level statics because the Tokenizer struct
+// is already at the 16-u64-field codegen limit (see gguf.mlr:109).
+//   tk_bpe_keys[slot]  : u64 packed as (left_id+1) | ((right_id+1)<<32),
+//                        0 = empty slot (we offset by 1 so that
+//                        (left=0,right=0) doesn't collide with empty).
+//   tk_bpe_ranks[slot] : u32 rank for that pair (only valid when key != 0).
+//   tk_bpe_cap         : current table capacity (power of two).
+//   tk_bpe_count       : number of populated entries (for diagnostics).
+//
+// Encoder mode flag — switches tokenizer_encode between the two paths:
+//   tk_encoder_mode = 0 : greedy longest-prefix-match (SPM, default)
+//   tk_encoder_mode = 1 : GPT-2 byte-level + BPE merge-rank
+//
+// Scratch buffers — sized once per encode call. These are not freed on
+// tokenizer_free; they live for the whole process. Worth ~MB total.
+static u64 tk_bpe_keys     = 0
+static u64 tk_bpe_ranks    = 0
+static u64 tk_bpe_cap      = 0
+static u64 tk_bpe_count    = 0
+static u64 tk_encoder_mode = 0
+
+// ---------------------------------------------------------------------------
 // Small JSON scanning helpers — tailored to tokenizer.json's structure.
 // `pos` is a byte offset into the mmap; returned pos is advanced past what
 // was consumed. On parse error we write an error to stderr and exit.
@@ -542,6 +575,136 @@ fn tk_bytes_eq_cstr(u64 ptr, u64 len, u64 cstr) -> u64 {
     return 1
 }
 
+// ---------------------------------------------------------------------------
+// BPE merge-rank table — open-addressing primitives.
+// ---------------------------------------------------------------------------
+
+// 32-bit splittable mix — enough avalanche for a 280K-merge table at 2×
+// load factor. (FNV-1a over 8 bytes felt heavy for a per-merge-lookup hot
+// path; this is what murmur3-finalizer's body looks like for u32 inputs
+// xored together.) Returns u64 with only low 32 bits set.
+fn tk_pair_hash(u64 left_id, u64 right_id) -> u64 {
+    u64 h = (left_id ^ (right_id << 1)) & 0xFFFFFFFF
+    h = (h ^ (h >> 16)) & 0xFFFFFFFF
+    h = (h * 0x85EBCA6B) & 0xFFFFFFFF
+    h = (h ^ (h >> 13)) & 0xFFFFFFFF
+    h = (h * 0xC2B2AE35) & 0xFFFFFFFF
+    h = (h ^ (h >> 16)) & 0xFFFFFFFF
+    return h
+}
+
+// Insert (left_id, right_id) -> rank into the BPE table. Caller has
+// already sized tk_bpe_keys/ranks/cap. We use the "+1 in packed key"
+// trick so that the slot value 0 = empty (left=0,right=0 wouldn't
+// otherwise be distinguishable from an empty slot).
+fn tk_bpe_insert(u64 left_id, u64 right_id, u64 rank) {
+    u64 mask = tk_bpe_cap - 1
+    u64 packed = (left_id + 1) | ((right_id + 1) << 32)
+    u64 h = tk_pair_hash(left_id, right_id)
+    u64 slot = h & mask
+    while 1 == 1 {
+        u64 sp = tk_bpe_keys + slot * 8
+        u64 cur = 0
+        unsafe { *(sp as u64) -> cur }
+        if cur == 0 {
+            unsafe { *(sp as u64) = packed }
+            u32 r32 = rank
+            unsafe { *((tk_bpe_ranks + slot * 4) as uint32) = r32 }
+            tk_bpe_count = tk_bpe_count + 1
+            return
+        }
+        // Duplicate-pair tolerance: first merge wins (lower rank). We
+        // emit merges in order, so the first hit IS the lowest rank;
+        // any later collision for the same (left,right) is a no-op.
+        if cur == packed { return }
+        slot = (slot + 1) & mask
+    }
+}
+
+// Look up (left_id, right_id) → rank. Returns 0xFFFFFFFFFFFFFFFF if
+// the pair is not in the merge table.
+fn tk_bpe_lookup(u64 left_id, u64 right_id) -> u64 {
+    if tk_bpe_cap == 0 { return 0xFFFFFFFFFFFFFFFF }
+    u64 mask = tk_bpe_cap - 1
+    u64 packed = (left_id + 1) | ((right_id + 1) << 32)
+    u64 h = tk_pair_hash(left_id, right_id)
+    u64 slot = h & mask
+    while 1 == 1 {
+        u64 sp = tk_bpe_keys + slot * 8
+        u64 cur = 0
+        unsafe { *(sp as u64) -> cur }
+        if cur == 0 { return 0xFFFFFFFFFFFFFFFF }
+        if cur == packed {
+            u32 r32 = 0
+            unsafe { *((tk_bpe_ranks + slot * 4) as uint32) -> r32 }
+            return r32
+        }
+        slot = (slot + 1) & mask
+    }
+    return 0xFFFFFFFFFFFFFFFF
+}
+
+// Build the BPE merge-rank table from tokenizer.ggml.merges. Each
+// merges-array entry has the form "<left> <right>" (single space
+// separator). Both halves get looked up in the already-built vocab
+// hash. Entries whose halves are missing from the vocab are skipped
+// (shouldn't happen in well-formed GGUFs but we don't trust input).
+fn tk_bpe_build_merge_table(Tokenizer tk, GGUFFile gf) {
+    u64 n_merges = gguf_meta_array_len(gf, "tokenizer.ggml.merges")
+    if n_merges == 0 {
+        print_str("[tokenizer_gguf] WARNING: tokenizer.ggml.model=gpt2 but no tokenizer.ggml.merges array\n")
+        return
+    }
+    // Size to >= 2× n_merges, power-of-two.
+    u64 cap = 1
+    while cap < n_merges * 2 { cap = cap * 2 }
+    tk_bpe_cap = cap
+    tk_bpe_count = 0
+    if tk_bpe_keys  != 0 { dealloc(tk_bpe_keys)  }
+    if tk_bpe_ranks != 0 { dealloc(tk_bpe_ranks) }
+    tk_bpe_keys  = alloc(cap * 8)
+    tk_bpe_ranks = alloc(cap * 4)
+    u64 z = 0
+    while z < cap {
+        unsafe { *((tk_bpe_keys + z * 8) as u64) = 0 }
+        z = z + 1
+    }
+
+    u64 p_box = alloc(8)
+    u64 l_box = alloc(8)
+    u64 i = 0
+    while i < n_merges {
+        unsafe { *(p_box as u64) = 0 }
+        unsafe { *(l_box as u64) = 0 }
+        if gguf_meta_array_string_get(gf, "tokenizer.ggml.merges", i,
+                                       p_box, l_box) != 0 {
+            i = i + 1
+            continue
+        }
+        u64 sp = 0; unsafe { *(p_box as u64) -> sp }
+        u64 ln = 0; unsafe { *(l_box as u64) -> ln }
+        // Find the separating space — at most one space per merge entry.
+        u64 sep = 0
+        u64 found_sep = 0
+        u64 j = 0
+        while j < ln {
+            if load8(sp + j) == 32 { sep = j; found_sep = 1; j = ln; continue }
+            j = j + 1
+        }
+        if found_sep == 0 {
+            i = i + 1
+            continue
+        }
+        u64 lid = tokenizer_id_of(tk, sp, sep)
+        u64 rid = tokenizer_id_of(tk, sp + sep + 1, ln - sep - 1)
+        if lid != 0xFFFFFFFFFFFFFFFF && rid != 0xFFFFFFFFFFFFFFFF {
+            tk_bpe_insert(lid, rid, i)
+        }
+        i = i + 1
+    }
+    dealloc(p_box); dealloc(l_box)
+}
+
 fn tokenizer_load_from_gguf(GGUFFile gf) -> Tokenizer {
     Tokenizer tk = alloc(136)
     tk.file_size = 0
@@ -706,9 +869,15 @@ fn tokenizer_load_from_gguf(GGUFFile gf) -> Tokenizer {
 
     // Flip the global to GPT-2 byte-level mode if needed. This populates
     // the b2c / c2b tables that encode/decode use to walk bytes ↔
-    // codepoints.
+    // codepoints, AND builds the BPE merge-rank table from
+    // tokenizer.ggml.merges so tokenizer_encode can use the canonical
+    // merge-rank algorithm instead of greedy longest-prefix-match.
     if is_gpt2 != 0 {
         tokenizer_set_kind_gpt2(tk)
+        tk_bpe_build_merge_table(tk, gf)
+        tk_encoder_mode = 1
+    } else {
+        tk_encoder_mode = 0
     }
 
     return tk
@@ -722,6 +891,11 @@ fn tokenizer_free(Tokenizer tk) {
     if tk.hash_tab != 0  { dealloc(tk.hash_tab)  }
     if tk_gpt2_b2c != 0 { dealloc(tk_gpt2_b2c); tk_gpt2_b2c = 0 }
     if tk_gpt2_c2b != 0 { dealloc(tk_gpt2_c2b); tk_gpt2_c2b = 0 }
+    if tk_bpe_keys  != 0 { dealloc(tk_bpe_keys);  tk_bpe_keys  = 0 }
+    if tk_bpe_ranks != 0 { dealloc(tk_bpe_ranks); tk_bpe_ranks = 0 }
+    tk_bpe_cap = 0
+    tk_bpe_count = 0
+    tk_encoder_mode = 0
     tk_gpt2_kind = 0
     if tk.file_base != 0 && tk.file_size != 0 {
         syscall_raw(11, tk.file_base, tk.file_size, 0, 0, 0, 0)    // munmap
@@ -801,6 +975,373 @@ fn tokenizer_lookup(Tokenizer tk, u64 id, u64 out_ptr, u64 out_len) {
 }
 
 // ---------------------------------------------------------------------------
+// BPE merge-rank encoder (Phase 2, task #297).
+//
+// Used when tk_encoder_mode == 1 (set by tokenizer_load_from_gguf when
+// the GGUF advertises tokenizer.ggml.model == "gpt2"). The algorithm:
+//
+//   1. Pre-tokenize the raw input into spans matching an *approximation*
+//      of the llama-bpe / qwen2 regex
+//        (?i:'s|'t|'re|'ve|'m|'ll|'d)
+//        | [^\r\n\p{L}\p{N}]?\p{L}+
+//        | \p{N}{1,3}
+//        |  ?[^\s\p{L}\p{N}]+[\r\n]*
+//        | \s*[\r\n]+
+//        | \s+(?!\S)
+//        | \s+
+//      The approximation:
+//        - "letter-like" = ASCII A-Z, a-z, or any byte ≥ 0x80
+//          (we don't have full Unicode \p{L} tables; the ≥0x80 fallback
+//          treats every UTF-8 continuation/start byte as letter-like).
+//        - "digit" = ASCII 0-9; groups of up to 3 digits per pre-token.
+//        - "symbol" = any other ASCII byte.
+//        - A single leading SPACE (0x20, not tab/newline) folds into a
+//          following letter-run OR symbol-run; trailing/multiple spaces
+//          fall through to a whitespace-only pre-token.
+//        - Newlines, tabs, and other ASCII whitespace do NOT fold — they
+//          form their own single-char pre-token (verified against the
+//          canonical regex output: '\tHello' → ['ĉHello'], so tab DOES
+//          fold; '\nHello' → ['Ċ', 'Hello'], so newline does NOT fold).
+//          We approximate by treating space (0x20) as foldable and
+//          everything else as non-foldable. Tab-prefix prompts get
+//          slightly different IDs than canonical but our 3 chat-REPL
+//          test corpus (Hello / What is 2+2? / etc.) has no tabs.
+//        - Contractions ('s, 't, 're, 've, 'm, 'll, 'd) are NOT
+//          recognised; an apostrophe falls into the symbol-run branch.
+//          Acceptable for chat REPLs whose validation corpus has no
+//          English contractions.
+//
+//   2. For each pre-token span:
+//        - Map each input byte b through tk_gpt2_b2c[b] to produce a
+//          sequence of Unicode codepoints. Encode them as UTF-8.
+//        - Look up each *codepoint* (1-3 UTF-8 bytes) in the vocab to
+//          seed a list of single-codepoint token-ids.
+//        - Run the merge loop: at each step, find the adjacent token
+//          pair with the lowest merge-rank in tk_bpe_keys/ranks. Merge
+//          that pair by looking up the concatenated byte string in the
+//          vocab. Stop when no adjacent pair has a rank.
+//        - Append the surviving token-ids to the output.
+// ---------------------------------------------------------------------------
+
+// Classify an input byte for pre-tokenization. Returns:
+//   0 = digit (0-9)
+//   1 = letter-like (ASCII A-Z, a-z, or byte >= 0x80)
+//   2 = space (0x20)
+//   3 = other whitespace (\t \n \r \f \v)
+//   4 = symbol (anything else)
+fn tk_bpe_byte_class(u64 b) -> u64 {
+    if b >= 48 && b <= 57 { return 0 }
+    if b >= 65 && b <= 90 { return 1 }
+    if b >= 97 && b <= 122 { return 1 }
+    if b >= 128 { return 1 }
+    if b == 32 { return 2 }
+    if b == 9 || b == 10 || b == 11 || b == 12 || b == 13 { return 3 }
+    return 4
+}
+
+// Encode a single pre-token (raw input bytes) via byte→cp mapping then
+// the BPE merge loop. Appends the resulting token-ids to ids_buf,
+// updating *ids_count_ptr. ids_cap_ptr/ids_buf_ptr are in/out so we can
+// grow when needed.
+fn tk_bpe_encode_pretoken(Tokenizer tk, u64 in_ptr, u64 in_len,
+                          u64 ids_buf_ptr, u64 ids_count_ptr,
+                          u64 ids_cap_ptr) {
+    if in_len == 0 { return }
+
+    // Step 1: byte → cp UTF-8 expansion. Each input byte produces 1-3
+    // UTF-8 bytes (b2c codepoints are <= U+0143 → ≤2-byte UTF-8 in
+    // practice, but tk_utf8_encode handles wider too).
+    u64 enc_cap = in_len * 3 + 4
+    u64 enc_buf = alloc(enc_cap)
+    u64 enc_off_arr = alloc(in_len * 4)   // u32[in_len] — start of each cp
+    u64 enc_len_arr = alloc(in_len * 4)   // u32[in_len] — byte length of each cp
+    u64 enc_len = 0
+    u64 n_cps = 0
+    u64 bi = 0
+    while bi < in_len {
+        u64 b = load8(in_ptr + bi)
+        u32 cp32 = 0
+        unsafe { *((tk_gpt2_b2c + b * 4) as uint32) -> cp32 }
+        u64 cp = cp32
+        u64 before = enc_len
+        enc_len = tk_utf8_encode(enc_buf, enc_len, cp)
+        u32 off32 = before
+        u32 len32 = enc_len - before
+        unsafe { *((enc_off_arr + n_cps * 4) as uint32) = off32 }
+        unsafe { *((enc_len_arr + n_cps * 4) as uint32) = len32 }
+        n_cps = n_cps + 1
+        bi = bi + 1
+    }
+
+    // Step 2: seed token-id sequence with one id per codepoint. Each
+    // single-codepoint UTF-8 string is guaranteed in the GPT-2 vocab
+    // (vocab entries 0..255 mod the b2c permutation).
+    //
+    // Per-token state stored in parallel arrays (so merging is just a
+    // memmove on these three arrays — no struct allocation churn):
+    //   tok_id[k]   : current token-id for slot k
+    //   tok_off[k]  : byte offset in enc_buf where this token's bytes start
+    //   tok_len[k]  : byte length of this token's representation in enc_buf
+    u64 tok_id  = alloc(n_cps * 4)
+    u64 tok_off = alloc(n_cps * 4)
+    u64 tok_len = alloc(n_cps * 4)
+    u64 n_toks = 0
+    u64 k = 0
+    while k < n_cps {
+        u32 cp_off32 = 0; unsafe { *((enc_off_arr + k * 4) as uint32) -> cp_off32 }
+        u32 cp_len32 = 0; unsafe { *((enc_len_arr + k * 4) as uint32) -> cp_len32 }
+        u64 cp_off = cp_off32
+        u64 cp_len = cp_len32
+        u64 id = tokenizer_id_of(tk, enc_buf + cp_off, cp_len)
+        if id == 0xFFFFFFFFFFFFFFFF {
+            // Should never happen for a well-formed gpt2 vocab — log
+            // and skip the codepoint so we produce *something*.
+            print_str("[tokenizer_gguf] WARNING: codepoint not in vocab at byte ")
+            u64 s = fmt_dec(cp_off); print_str(s); dealloc(s); print_str("\n")
+            k = k + 1
+            continue
+        }
+        u32 id32  = id
+        u32 off32 = cp_off
+        u32 len32 = cp_len
+        unsafe { *((tok_id  + n_toks * 4) as uint32) = id32  }
+        unsafe { *((tok_off + n_toks * 4) as uint32) = off32 }
+        unsafe { *((tok_len + n_toks * 4) as uint32) = len32 }
+        n_toks = n_toks + 1
+        k = k + 1
+    }
+
+    // Step 3: merge loop. O(N²) — fine for pre-tokens of typical size.
+    while n_toks >= 2 {
+        u64 best_rank = 0xFFFFFFFFFFFFFFFF
+        u64 best_idx  = 0xFFFFFFFFFFFFFFFF
+        u64 si = 0
+        while si + 1 < n_toks {
+            u32 l32 = 0; unsafe { *((tok_id + si * 4) as uint32)        -> l32 }
+            u32 r32 = 0; unsafe { *((tok_id + (si + 1) * 4) as uint32)  -> r32 }
+            u64 lid = l32
+            u64 rid = r32
+            u64 rk = tk_bpe_lookup(lid, rid)
+            if rk != 0xFFFFFFFFFFFFFFFF {
+                if rk < best_rank {
+                    best_rank = rk
+                    best_idx  = si
+                }
+            }
+            si = si + 1
+        }
+        if best_idx == 0xFFFFFFFFFFFFFFFF { break }
+
+        // Merge tokens[best_idx] + tokens[best_idx+1]. Compute the
+        // merged byte span = [tok_off[best], tok_off[best] + tok_len[best] + tok_len[best+1]).
+        u32 lof32 = 0; unsafe { *((tok_off + best_idx * 4)       as uint32) -> lof32 }
+        u32 lln32 = 0; unsafe { *((tok_len + best_idx * 4)       as uint32) -> lln32 }
+        u32 rln32 = 0; unsafe { *((tok_len + (best_idx + 1) * 4) as uint32) -> rln32 }
+        u64 mof = lof32
+        u64 mln = lln32 + rln32
+        u64 merged_id = tokenizer_id_of(tk, enc_buf + mof, mln)
+        if merged_id == 0xFFFFFFFFFFFFFFFF {
+            // The merge is in the merges table but the merged string
+            // isn't in the vocab — corrupt input. Bail rather than
+            // looping forever on the same pair.
+            print_str("[tokenizer_gguf] WARNING: merge rank present but merged token missing from vocab\n")
+            break
+        }
+        u32 mid32 = merged_id
+        u32 mln32 = mln
+        unsafe { *((tok_id  + best_idx * 4) as uint32) = mid32 }
+        unsafe { *((tok_len + best_idx * 4) as uint32) = mln32 }
+        // Compact the suffix: shift slots [best_idx+2 .. n_toks) left by 1.
+        u64 ci = best_idx + 1
+        while ci + 1 < n_toks {
+            u32 v_id = 0; unsafe { *((tok_id  + (ci + 1) * 4) as uint32) -> v_id }
+            u32 v_of = 0; unsafe { *((tok_off + (ci + 1) * 4) as uint32) -> v_of }
+            u32 v_ln = 0; unsafe { *((tok_len + (ci + 1) * 4) as uint32) -> v_ln }
+            unsafe { *((tok_id  + ci * 4) as uint32) = v_id }
+            unsafe { *((tok_off + ci * 4) as uint32) = v_of }
+            unsafe { *((tok_len + ci * 4) as uint32) = v_ln }
+            ci = ci + 1
+        }
+        n_toks = n_toks - 1
+    }
+
+    // Step 4: append surviving token-ids to the output buffer (growing
+    // if needed). The output buffer is owned by the caller.
+    u64 out_buf = 0; unsafe { *(ids_buf_ptr   as u64) -> out_buf }
+    u64 out_cnt = 0; unsafe { *(ids_count_ptr as u64) -> out_cnt }
+    u64 out_cap = 0; unsafe { *(ids_cap_ptr   as u64) -> out_cap }
+    u64 need = out_cnt + n_toks
+    if need > out_cap {
+        u64 new_cap = out_cap * 2
+        if new_cap < need { new_cap = need + 16 }
+        u64 new_buf = alloc(new_cap * 4)
+        u64 cc = 0
+        while cc < out_cnt {
+            u32 v = 0; unsafe { *((out_buf + cc * 4) as uint32) -> v }
+            unsafe { *((new_buf + cc * 4) as uint32) = v }
+            cc = cc + 1
+        }
+        if out_buf != 0 { dealloc(out_buf) }
+        out_buf = new_buf
+        out_cap = new_cap
+        unsafe { *(ids_buf_ptr as u64) = out_buf }
+        unsafe { *(ids_cap_ptr as u64) = out_cap }
+    }
+    u64 ti = 0
+    while ti < n_toks {
+        u32 v = 0; unsafe { *((tok_id + ti * 4) as uint32) -> v }
+        unsafe { *((out_buf + (out_cnt + ti) * 4) as uint32) = v }
+        ti = ti + 1
+    }
+    out_cnt = out_cnt + n_toks
+    unsafe { *(ids_count_ptr as u64) = out_cnt }
+
+    dealloc(enc_buf)
+    dealloc(enc_off_arr)
+    dealloc(enc_len_arr)
+    dealloc(tok_id)
+    dealloc(tok_off)
+    dealloc(tok_len)
+}
+
+// Top-level BPE encoder — pre-tokenizes the input, then runs
+// tk_bpe_encode_pretoken on each pre-token span.
+//
+// Pre-tokenization rules — see the table at the top of this section.
+// Pre-tokens are emitted in input-order; each is a contiguous byte
+// range [start, end) of the original input.
+fn tk_bpe_encode(Tokenizer tk, u64 input, u64 input_len,
+                 u64 out_ids_ptr, u64 out_count_ptr) {
+    // Output buffer — sized at first call to avoid an upfront max-bytes
+    // alloc. We grow on demand inside tk_bpe_encode_pretoken.
+    u64 out_cap = 64
+    u64 out_buf = alloc(out_cap * 4)
+    u64 out_cnt = 0
+    u64 buf_box = alloc(8); unsafe { *(buf_box as u64) = out_buf }
+    u64 cnt_box = alloc(8); unsafe { *(cnt_box as u64) = out_cnt }
+    u64 cap_box = alloc(8); unsafe { *(cap_box as u64) = out_cap }
+
+    u64 p = 0
+    while p < input_len {
+        u64 c = load8(input + p)
+        u64 cls = tk_bpe_byte_class(c)
+
+        if cls == 0 {
+            // Digit run of up to 3 chars.
+            u64 end = p + 1
+            u64 take = 1
+            u64 stop = 0
+            while stop == 0 && end < input_len && take < 3 {
+                if tk_bpe_byte_class(load8(input + end)) != 0 { stop = 1 }
+                else {
+                    end = end + 1
+                    take = take + 1
+                }
+            }
+            tk_bpe_encode_pretoken(tk, input + p, end - p, buf_box, cnt_box, cap_box)
+            p = end
+        } else if cls == 1 {
+            // Letter run.
+            u64 end = p + 1
+            u64 stop = 0
+            while stop == 0 && end < input_len {
+                if tk_bpe_byte_class(load8(input + end)) != 1 { stop = 1 }
+                else { end = end + 1 }
+            }
+            tk_bpe_encode_pretoken(tk, input + p, end - p, buf_box, cnt_box, cap_box)
+            p = end
+        } else if cls == 2 {
+            // Space — find end of contiguous space run, decide folding.
+            u64 sp_end = p + 1
+            u64 stop_s = 0
+            while stop_s == 0 && sp_end < input_len {
+                if load8(input + sp_end) != 32 { stop_s = 1 }
+                else { sp_end = sp_end + 1 }
+            }
+            // If the byte after the space run is letter or symbol, the
+            // LAST space folds into that following run.
+            u64 fold = 0
+            if sp_end < input_len {
+                u64 nc = load8(input + sp_end)
+                u64 ncls = tk_bpe_byte_class(nc)
+                if ncls == 1 { fold = 1 }
+                if ncls == 4 { fold = 1 }
+            }
+            if fold == 1 {
+                if sp_end - p > 1 {
+                    // Emit all but last space as one whitespace pre-token.
+                    tk_bpe_encode_pretoken(tk, input + p, sp_end - p - 1, buf_box, cnt_box, cap_box)
+                }
+                // Last space + following run.
+                u64 fold_start = sp_end - 1
+                u64 nc = load8(input + sp_end)
+                u64 ncls = tk_bpe_byte_class(nc)
+                u64 run_end = sp_end + 1
+                if ncls == 1 {
+                    u64 stop_l = 0
+                    while stop_l == 0 && run_end < input_len {
+                        if tk_bpe_byte_class(load8(input + run_end)) != 1 { stop_l = 1 }
+                        else { run_end = run_end + 1 }
+                    }
+                } else {
+                    // Symbol run — keep extending while we see symbols,
+                    // then absorb any trailing newlines.
+                    u64 stop_sym = 0
+                    while stop_sym == 0 && run_end < input_len {
+                        if tk_bpe_byte_class(load8(input + run_end)) != 4 { stop_sym = 1 }
+                        else { run_end = run_end + 1 }
+                    }
+                    u64 stop_nl = 0
+                    while stop_nl == 0 && run_end < input_len {
+                        u64 rc = load8(input + run_end)
+                        if rc != 10 && rc != 13 { stop_nl = 1 }
+                        else { run_end = run_end + 1 }
+                    }
+                }
+                tk_bpe_encode_pretoken(tk, input + fold_start, run_end - fold_start, buf_box, cnt_box, cap_box)
+                p = run_end
+            } else {
+                // No folding — entire whitespace run is its own pre-token.
+                tk_bpe_encode_pretoken(tk, input + p, sp_end - p, buf_box, cnt_box, cap_box)
+                p = sp_end
+            }
+        } else if cls == 3 {
+            // Non-space whitespace (\t \n \r etc.) — single-byte
+            // pre-token, no folding. (Tab actually DOES fold per the
+            // canonical regex but we don't bother — see the rules block
+            // above.)
+            tk_bpe_encode_pretoken(tk, input + p, 1, buf_box, cnt_box, cap_box)
+            p = p + 1
+        } else {
+            // Symbol run, no leading space.
+            u64 end = p + 1
+            u64 stop_sym = 0
+            while stop_sym == 0 && end < input_len {
+                if tk_bpe_byte_class(load8(input + end)) != 4 { stop_sym = 1 }
+                else { end = end + 1 }
+            }
+            // Absorb trailing newlines per regex alt 4 ([\r\n]*).
+            u64 stop_nl = 0
+            while stop_nl == 0 && end < input_len {
+                u64 nc = load8(input + end)
+                if nc != 10 && nc != 13 { stop_nl = 1 }
+                else { end = end + 1 }
+            }
+            tk_bpe_encode_pretoken(tk, input + p, end - p, buf_box, cnt_box, cap_box)
+            p = end
+        }
+    }
+
+    unsafe { *(buf_box as u64) -> out_buf }
+    unsafe { *(cnt_box as u64) -> out_cnt }
+    unsafe { *(cap_box as u64) -> out_cap }
+    dealloc(buf_box); dealloc(cnt_box); dealloc(cap_box)
+
+    unsafe { *(out_ids_ptr   as u64) = out_buf }
+    unsafe { *(out_count_ptr as u64) = out_cnt }
+}
+
+// ---------------------------------------------------------------------------
 // Phase B — greedy encode. For each starting position in the input,
 // consume the longest run of bytes that form a vocab entry. If no prefix
 // matches, emit the byte-fallback token for that single byte and advance.
@@ -811,6 +1352,14 @@ fn tokenizer_lookup(Tokenizer tk, u64 id, u64 out_ptr, u64 out_len) {
 // ---------------------------------------------------------------------------
 fn tokenizer_encode(Tokenizer tk, u64 input, u64 input_len,
                     u64 out_ids_ptr, u64 out_count_ptr) {
+    // Dispatch to the BPE encoder when tokenizer_load_from_gguf set the
+    // GPT-2 mode flag. The greedy code path below handles SPM models
+    // and any legacy tokenizer_load(tokenizer.json) caller that hasn't
+    // been routed through tokenizer_load_from_gguf yet.
+    if tk_encoder_mode == 1 {
+        tk_bpe_encode(tk, input, input_len, out_ids_ptr, out_count_ptr)
+        return
+    }
     // Step 1: normalise.
     //   kind == 0 (SentencePiece): 0x20 → U+2581 "▁" (3-byte UTF-8).
     //   kind == 1 (GPT-2 byte-level): each input byte b → UTF-8 of

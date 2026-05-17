@@ -17,6 +17,7 @@
 // driver auto-falls-back to the per-op GPU path (slower but correct).
 
 import "../std/qwen3.mlr"
+import "../std/gguf.mlr"
 import "../std/safetensors.mlr"
 import "../std/inference.mlr"
 import "../std/inference_gpu.mlr"
@@ -40,19 +41,43 @@ fn main() {
 
     thread_pool_init(num_workers)
 
-    u64 tok_path = str_cat(model_dir, "/tokenizer.json")
-    Tokenizer tk = tokenizer_load(tok_path)
-    if tk.file_size == 0 {
-        print_str("[qwen3_gpu_chat] could not open "); print_str(tok_path); print_str("\n")
-        print_str("[qwen3_gpu_chat] set MLRIFT_QWEN3_0_6B_DIR to a Qwen3-0.6B checkout\n")
+    // Tokenizer: GGUF-embedded vocab + BPE merges (task #297 Phase 2).
+    // No external tokenizer.json — the Qwen3 GGUF carries `tokenizer.ggml.tokens`
+    // and `tokenizer.ggml.merges` directly. The chat REPL still uses safetensors
+    // for *weights*; the GGUF here is tokenizer-only. Default location lives
+    // next to the safetensors so a single MLRIFT_QWEN3_0_6B_DIR points both.
+    u64 gguf_default = str_cat(model_dir, "/qwen3-0.6b.gguf")
+    u64 gguf_path = resolve_model_path("MLRIFT_QWEN3_0_6B_GGUF",
+                                        gguf_default,
+                                        "qwen3-0.6b")
+    GGUFFile tk_gf = gguf_open(gguf_path)
+    if tk_gf.file_size == 0 {
+        print_str("[qwen3_gpu_chat] could not open Qwen3 GGUF at "); print_str(gguf_path); print_str("\n")
+        print_str("[qwen3_gpu_chat] set MLRIFT_QWEN3_0_6B_GGUF to a Qwen3-0.6B .gguf (used for tokenizer only)\n")
         exit(1)
     }
-    tokenizer_set_kind_gpt2(tk)
-    dealloc(tok_path)
+    Tokenizer tk = tokenizer_load_from_gguf(tk_gf)
+    if tk.vocab_count == 0 {
+        print_str("[qwen3_gpu_chat] tokenizer_load_from_gguf failed at "); print_str(gguf_path); print_str("\n")
+        exit(1)
+    }
+    // gguf_default isn't dealloc'd — if resolve_model_path returned it
+    // (env unset), gguf_path is still pointing at this buffer. Leaks once
+    // for process lifetime.
 
-    u64 IM_START = 151644
-    u64 IM_END   = 151645
-    u64 NL_TOK   = 198
+    // IM_START/IM_END/NL_TOK are regular vocab IDs (not special-token
+    // metadata in the GGUF). Look them up at startup so a future vocab
+    // version that shifts them surfaces here, not as silent garbage in
+    // the prompt.
+    u64 IM_START = tokenizer_id_of(tk, "<|im_start|>", 12)
+    u64 IM_END   = tokenizer_id_of(tk, "<|im_end|>",   10)
+    u64 NL_TOK   = tokenizer_id_of(tk, "\xC4\x8A",     2)   // GPT-2 "Ċ" = U+010A (newline byte-mapped)
+    if IM_START != 151644 || IM_END != 151645 || NL_TOK != 198 {
+        print_str("[qwen3_gpu_chat] WARNING: chat-template token IDs differ from canonical Qwen3 (IM_START=")
+        u64 sa = fmt_dec(IM_START); print_str(sa); dealloc(sa); print_str(", IM_END=")
+        u64 sb = fmt_dec(IM_END);   print_str(sb); dealloc(sb); print_str(", NL=")
+        u64 sc = fmt_dec(NL_TOK);   print_str(sc); dealloc(sc); print_str(")\n")
+    }
 
     u64 user_box       = alloc(8)
     u64 user_cnt_box   = alloc(8)
