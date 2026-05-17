@@ -811,25 +811,35 @@ fn main() {
             }
 
             u64 layer = 0
-            // Slice 8.6 (2026-05-17) — when the active mks-K variant's
-            // pos cap is exceeded, demote to M=1 mega-kernel instead of
-            // falling into the per-op chain.  The per-op chain fires
-            // ~32 launches per layer × 28 layers + 16 lm_head ≈ 940
-            // launches/step, which overruns the shim's 64-slot AQL ring
-            // and wedges the GPU at ~step 14 with "hipDeviceSynchronize:
-            // timeout draining queue errno=30000000001" (the chronic
-            // mks16 intra-process wedge).  M=1 mega-kernel = 1 dispatch
-            // per layer × 28 + lm_head = 29 launches/step, comfortably
-            // under the ring size.  Per-K caps: mks4 + mks8 = pos<=128,
-            // mks16 = pos<=96.
+            // Slice 8.6 (2026-05-17) — clean termination when mks-K cap is
+            // exceeded.  Previously, after pos>96 (mks16) / pos>128 (mks4/8),
+            // the per-op fallback chain at lines 996-1137 fired ~32 launches
+            // per layer × 28 + 16 lm_head ≈ 940 launches/step.  That overran
+            // the shim's 64-slot AQL ring (KFD_QUEUE_RING_BYTES=4096) and
+            // wedged the GPU at ~step 14 with "hipDeviceSynchronize: timeout
+            // draining queue errno=30000000001" — the chronic mks16
+            // intra-process wedge, distinct from slice 6.8d's inter-process
+            // MES wedge.  Routing those steps through the M=1 mega-kernel
+            // doesn't help here because qwen3_forward_layer_gpu's mega-kernel
+            // path also caps at pos<64 (std/qwen3.mlr:2081).
+            //
+            // Cleanest fix: detect the cap, print a clear message, and end
+            // the decode loop with `step = max_new` so the run completes with
+            // its accumulated timing/tok-count printouts intact.  Caller can
+            // still read the per-step output up to the cap point.  No more
+            // wedge.  Per-K caps: mks4+mks8 = pos<=128, mks16 = pos<=96.
             if is_spec != 0 {
                 u64 _mks_cap_exceeded = 0
                 if M_eff == 16 { if pos + 16 > 96  { _mks_cap_exceeded = 1 } }
                 if M_eff ==  8 { if pos +  8 > 128 { _mks_cap_exceeded = 1 } }
                 if M_eff ==  4 { if pos +  4 > 128 { _mks_cap_exceeded = 1 } }
                 if _mks_cap_exceeded != 0 {
-                    M_eff = 1
-                    is_spec = 0
+                    eout("[qwen3_generate] mks")
+                    eu64(M_eff); eout(" pos cap exceeded at pos=")
+                    eu64(pos)
+                    eout("; ending decode to avoid AQL-ring wedge\n")
+                    step = max_new   // force step loop termination
+                    layer = n_layers // skip remaining layer dispatches
                 }
             }
             // Slice 4.14 — speck4 mega-kernel: at spec_K=4 + env, replaces
