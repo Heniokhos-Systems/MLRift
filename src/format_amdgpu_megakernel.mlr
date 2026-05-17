@@ -2779,6 +2779,123 @@ fn _emit_phase9_gemv_residual_inline(uint64 n_out, uint64 k, uint64 k_pad,
     asm_patch_u32(gate_cmp_pos + 2, 0xBFA20000 | (body_dwords & 0xFFFF))
 }
 
+// ── Slice 7.9 (2026-05-17): cross-WG residual-add helper for split phase 9/17 ──
+//
+// _emit_residual_add_inline — streamed lane-wise f32 add.
+//
+//   out[i] = in_a[i] + in_b[i]    for i in 0..n_out
+//
+// Phase 9 split (Mistral only — gated on MEGA_HIDDEN==4096 in mega_emit_stub_kernel):
+//   Step A emits the multi-acc gemv to an intermediate buffer (b_attn_q_g),
+//   then a cross-WG barrier, then this helper does the residual-add.
+//
+// Why split:
+//   Slice 7.6a's multi-acc + tree-reduce body wedged the KFD queue when used
+//   in _emit_phase9_gemv_residual_inline (Mistral: o_proj K=4096 AND
+//   down_proj K=14336 both wedged).  Slice-7.7 F4 evidence (multi-acc on
+//   o_proj + single-acc on down_proj still wedged at layer 0) ruled out K as
+//   the trigger.  The structural shape `dependent-VALU reduce → VMEM
+//   residual-load → add → store` in the lane-0 epilogue is what MES chokes
+//   on; phase 3 has the same multi-acc body but ends in `wave-XOR → LDS →
+//   plain store` (no residual load) and works fine.  Split breaks the bad
+//   pattern: gemv ends in plain store (phase-3 shape), residual-add becomes
+//   a separate streamed elementwise op.
+//
+// Layout — each WG handles exactly 32 elements via 32 lanes (one f32/lane):
+//   wg_id  = saved-wg_id from s28 (matches phase 9/11/13/15/17 convention)
+//   idx    = wg_id * 32 + lane
+//   in_a[idx]  loaded from kernarg byte off a_kofs
+//   in_b[idx]  loaded from kernarg byte off b_kofs
+//   out[idx]   stored at kernarg byte off out_kofs
+//   WG gate skips if wg_id >= ceil(n_out / 32).
+//   Per-lane gate skips if idx >= n_out (defensive; Mistral n_out=4096 is
+//                                        exact multiple of 32, so no skip).
+//
+// SGPRs / VGPRs (all dead by the time this fires; no live state to preserve
+// beyond s[8:9]/s[10:11]/s28 set up in the prologue):
+//   s[2:3]  = in_a   ptr
+//   s[4:5]  = in_b   ptr
+//   s[6:7]  = out    ptr
+//   s14     = wg_id<<5 scratch
+//   s17     = saved exec for per-lane gate
+//   v0      = lane id (HW, r/o)
+//   v2      = idx
+//   v3      = byte_off = idx*4
+//   v8      = in_a[idx]
+//   v9      = in_b[idx]
+fn _emit_residual_add_inline(uint64 n_out, uint64 a_kofs,
+                              uint64 b_kofs, uint64 out_kofs) {
+    // ── WG gate: skip if s28 >= ceil(n_out / 32) ────────────────────────
+    // s_cmp_ge_u32 s28, lit (SOPC op 0x09, ssrc1=0xFF=lit32 follows)
+    uint64 wg_count = (n_out + 31) / 32
+    uint64 wg_gate_pos = asm_text_len / 4
+    asm_u32(0xBF09FF1C)            // s_cmp_ge_u32 s28, lit
+    asm_u32(wg_count & 0xFFFFFFFF)
+    asm_s_cbranch_scc1(0)          // patched at end
+
+    // ── Load base ptrs ──────────────────────────────────────────────────
+    asm_s_load_b64_off(1, 0, a_kofs)     // in_a   → s[2:3]
+    asm_s_load_b64_off(2, 0, b_kofs)     // in_b   → s[4:5]
+    asm_s_load_b64_off(3, 0, out_kofs)   // out    → s[6:7]
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // ── Compute idx = wg_id*32 + lane = (s28<<5) + v0 → v2 ──────────────
+    // s_lshl_b32 s14, s28, 5: SOP2 op 0x08
+    //   word = (2<<30)|(8<<23)|(0x0E<<16)|(0x85<<8)|0x1C = 0x840E851C
+    asm_u32(0x840E851C)
+    // v_add_nc_u32_e32 v2, s14, v0: VOP2 op 0x25
+    //   word = (0x25<<25)|(2<<17)|(0<<9)|0x0E = 0x4A04000E
+    asm_u32(0x4A04000E)
+    // v_lshlrev_b32_e32 v3, 2, v2: byte_off = idx*4
+    asm_v_lshlrev_b32_imm(3, 2, 2)
+
+    // ── Per-lane gate: skip if idx >= n_out ─────────────────────────────
+    // v_cmp_gt_u32_e32 vcc_lo, n_out, v2 → vcc_lo = (n_out > idx) = (idx < n_out)
+    //   word1 = (0x3E<<25)|(0x4C<<17)|(2<<9)|0xFF = 0x7C9804FF
+    asm_u32(0x7C9804FF)
+    asm_u32(n_out & 0xFFFFFFFF)
+    // s_and_saveexec_b32 s17, vcc_lo
+    asm_s_and_saveexec_b32_vcc_lo(17)
+    // s_cbranch_execz .lane_done (patched after body)
+    uint64 lane_execz_pos = asm_text_len / 4
+    asm_s_cbranch_execz(0)
+
+    asm_s_delay_alu(0x01)          // VALU→VMEM hazard (v3 just written)
+
+    // ── Load in_a[idx] and in_b[idx] ────────────────────────────────────
+    // global_load_b32 v8, v3, s[2:3]: word2 = (vdst=8<<24)|(saddr=2<<16)|vaddr=3
+    asm_u32(0xDC520000)
+    asm_u32(0x08020003)
+    // global_load_b32 v9, v3, s[4:5]: word2 = (vdst=9<<24)|(saddr=4<<16)|vaddr=3
+    asm_u32(0xDC520000)
+    asm_u32(0x09040003)
+    asm_s_waitcnt_vmcnt_zero()
+
+    // ── Add: v8 = v8 + v9 ───────────────────────────────────────────────
+    // v_add_f32_e32 v8, v8, v9 — VOP2 op 0x03
+    //   word = (3<<25)|(v8=8<<17)|(v9=9<<9)|(0x100|v8) = 0x06000000|0x00100000|0x00001200|0x108
+    //        = 0x06101308
+    asm_u32(0x06101308)
+
+    // ── Store out[idx] = v8 ─────────────────────────────────────────────
+    asm_s_delay_alu(0x01)          // gfx11 VALU→VMEM hazard
+    // global_store_b32 v3, v8, s[6:7]: word2 = (saddr=6<<16)|(vdata=8<<8)|vaddr=3
+    asm_u32(0xDC6A0000)
+    asm_u32(0x00060803)
+    asm_s_waitcnt_vscnt_zero()     // drain store before exec restore
+
+    // ── .lane_done: patch per-lane skip target + restore exec ──────────
+    uint64 lane_done = asm_text_len / 4
+    uint64 lane_off = lane_done - lane_execz_pos - 1
+    asm_patch_u32(lane_execz_pos, 0xBFA50000 | (lane_off & 0xFFFF))
+    // s_or_b32 exec_lo, exec_lo, s17 (restore full exec for the WG)
+    asm_u32(0x8C7E117E)
+
+    // ── Patch WG gate skip-branch to here ───────────────────────────────
+    uint64 body_dwords = (asm_text_len / 4) - (wg_gate_pos + 3)
+    asm_patch_u32(wg_gate_pos + 2, 0xBFA20000 | (body_dwords & 0xFFFF))
+}
+
 // ── Phase 9 inline ISA emitter — gemv-residual-fused, CPU-matching reduce ──
 //
 // _emit_phase9_gemv_residual_cputree_inline — CPU-matching reduction-tree
@@ -6234,19 +6351,75 @@ fn mega_emit_stub_kernel(uint64 kname_ptr, uint64 nl, uint64 body_node) -> uint6
     // 11-17 will each have a similar marker; once the cap is bumped (or the
     // bootstrap rebuilt), a future polish pass can restore the wrapper for
     // symmetry with phases 1/3/5/7.
+    //
+    // Slice 7.9 (2026-05-17): Mistral path (MEGA_HIDDEN==4096) splits this
+    // phase into (multi-acc gemv → cross-WG barrier → residual-add).  The
+    // monolithic emitter wedged the KFD queue when multi-acc was applied to
+    // its lane-0 residual-load+add+store epilogue (slice 7.7 F1/F4 evidence);
+    // the split lets the gemv body match phase 3's proven shape (multi-acc
+    // → plain store).  Other archs (Llama-1B/3B, Qwen3) keep the monolithic
+    // path with single-acc bodies — they have not been re-validated against
+    // the split, and the constraint is to keep their byte-identical baseline.
+    //
+    // Mistral split uses b_attn_q_g (kernarg 0x98) as the intermediate buffer
+    // (dead after phase 7; size q_dim*4 = 4096*4 = HIDDEN*4 = MEGA_HIDDEN*4
+    // bytes — exact match for the gemv output size).
+    //
+    // Barrier renumbering for Mistral path:
+    //   barrier 4 = "phase-9 gemv done"  (NEW for split)
+    //   barrier 5 = "phase-9 residual-add done"  (shifted from 4 → 5)
+    //   barrier 6 = phase 11 done  (shifted from 5)
+    //   barrier 7 = phase 13 done  (shifted from 6)
+    //   barrier 8 = phase 15 done  (shifted from 7)
+    //   barrier 9 = "phase-17 gemv done"  (NEW for split)
+    //   phase-17 residual-add has no trailing barrier (last phase).
+    // Max threshold under split = 10 * 512 = 5120 ≤ 0xFFFF.
+    uint64 is_mistral_split = 0
+    if MEGA_HIDDEN == 4096 { is_mistral_split = 1 }
+
     if _body_has_marker(body_node, "oproj_residual_marker", 21) != 0 {
         // Slice 5.5: shape args derived from arch globals.
         //   q_dim     = N_HEADS*HEAD_DIM = 16*128 = 2048 (Qwen3); 32*64 = 2048 (Llama)
         //   q_dim_pad = q_dim + 128      = 2176 (Qwen3); 2176 (Llama)
         uint64 q_dim     = MEGA_N_HEADS * MEGA_HEAD_DIM
         uint64 q_dim_pad = q_dim + 128
-        // Slice 8.4 (2026-05-15): cputree dispatch collapsed — see phase-3 note.
-        _emit_phase9_gemv_residual_inline(MEGA_HIDDEN, q_dim, q_dim_pad, 256,
-                                            0x18, 0xB0, 0x00, 0xA0)
+        if is_mistral_split != 0 {
+            // Mistral phase-9 split: gemv → barrier → residual-add.
+            // Gemv writes to b_attn_q_g (kernarg 0x98, dead since phase 7).
+            // Same emitter as phase 3 — multi-acc + tree-reduce + plain store.
+            //   w=o_w(0x18), x=b_attn_out_g(0xB0), out=b_attn_q_g(0x98).
+            _emit_gemv_coop_bf16_padded_strided_inline(MEGA_HIDDEN, q_dim, q_dim_pad, 256,
+                                                       1, 2, 3,
+                                                       0x18, 0xB0, 0x98, 28)
+            // Barrier 4: gemv stores complete + visible to all WGs.
+            mega_emit_barrier_isa(4, MEGA_WG_PERSIST)
+            // Residual-add: out[i] = b_attn_q_g[i] + in_residual[i] → b_mid_g[i].
+            //   a=b_attn_q_g(0x98), b=in_residual(0x00), out=b_mid_g(0xA0).
+            _emit_residual_add_inline(MEGA_HIDDEN, 0x98, 0x00, 0xA0)
+        } else {
+            // Slice 8.4 (2026-05-15): cputree dispatch collapsed — see phase-3 note.
+            _emit_phase9_gemv_residual_inline(MEGA_HIDDEN, q_dim, q_dim_pad, 256,
+                                                0x18, 0xB0, 0x00, 0xA0)
+        }
     } else {
         asm_u32(0xBF800000)   // s_nop 0 (phase 9 stub)
+        if is_mistral_split != 0 {
+            // Keep barrier count parity with the active-marker Mistral path
+            // so subsequent barrier indices line up.  Without this the stub
+            // path would have a different barrier index sequence and shift
+            // every downstream barrier's threshold, which the marker-active
+            // path's runtime would deadlock on.  In practice this stub path
+            // is unreachable for production drivers (markers are always
+            // present in mistral_layer_megakernel.mlr), but keep it correct
+            // for completeness.
+            mega_emit_barrier_isa(4, MEGA_WG_PERSIST)
+        }
     }
-    mega_emit_barrier_isa(4, MEGA_WG_PERSIST)
+    // "phase-9 done" barrier (idx 4 normal, idx 5 for Mistral split — the
+    // Mistral path already emitted barrier 4 between gemv and residual-add).
+    uint64 b_phase9_done = 4
+    if is_mistral_split != 0 { b_phase9_done = 5 }
+    mega_emit_barrier_isa(b_phase9_done, MEGA_WG_PERSIST)
     asm_s_cmp_lt_u32(10, 0x85)
     uint64 mp5_cbranch_pos = asm_text_len / 4
     asm_s_cbranch_scc1(0)
@@ -6267,7 +6440,10 @@ fn mega_emit_stub_kernel(uint64 kname_ptr, uint64 nl, uint64 body_node) -> uint6
     } else {
         asm_u32(0xBF800000)   // s_nop 0 (phase 11 stub)
     }
-    mega_emit_barrier_isa(5, MEGA_WG_PERSIST)
+    // Slice 7.9: barrier idx 5 normal, idx 6 for Mistral split (renumbered).
+    uint64 b_phase11_done = 5
+    if is_mistral_split != 0 { b_phase11_done = 6 }
+    mega_emit_barrier_isa(b_phase11_done, MEGA_WG_PERSIST)
     asm_s_cmp_lt_u32(10, 0x86)
     uint64 mp6_cbranch_pos = asm_text_len / 4
     asm_s_cbranch_scc1(0)
@@ -6296,7 +6472,10 @@ fn mega_emit_stub_kernel(uint64 kname_ptr, uint64 nl, uint64 body_node) -> uint6
     } else {
         asm_u32(0xBF800000)   // s_nop 0 (phase 13 stub)
     }
-    mega_emit_barrier_isa(6, MEGA_WG_PERSIST)
+    // Slice 7.9: barrier idx 6 normal, idx 7 for Mistral split (renumbered).
+    uint64 b_phase13_done = 6
+    if is_mistral_split != 0 { b_phase13_done = 7 }
+    mega_emit_barrier_isa(b_phase13_done, MEGA_WG_PERSIST)
     asm_s_cmp_lt_u32(10, 0x87)
     uint64 mp7_cbranch_pos = asm_text_len / 4
     asm_s_cbranch_scc1(0)
@@ -6422,7 +6601,10 @@ fn mega_emit_stub_kernel(uint64 kname_ptr, uint64 nl, uint64 body_node) -> uint6
     } else {
         asm_u32(0xBF800000)   // s_nop 0 (phase 15 stub)
     }
-    mega_emit_barrier_isa(7, MEGA_WG_PERSIST)
+    // Slice 7.9: barrier idx 7 normal, idx 8 for Mistral split (renumbered).
+    uint64 b_phase15_done = 7
+    if is_mistral_split != 0 { b_phase15_done = 8 }
+    mega_emit_barrier_isa(b_phase15_done, MEGA_WG_PERSIST)
 
     // ── Phase 17: down_w matmul + final residual-add (WG < 256) ───────────
     // Kernarg layout: w=down_w(arg 5, 0x28), x=gu_scratch(arg 16, 0x80),
@@ -6441,12 +6623,33 @@ fn mega_emit_stub_kernel(uint64 kname_ptr, uint64 nl, uint64 body_node) -> uint6
     // Phase 17 is the LAST phase: no trailing mega_emit_barrier_isa(8, ...)
     // because no later phase reads phase 17's output.  Control falls through
     // to s_endpgm directly.
+    //
+    // Slice 7.9 (2026-05-17): Mistral path splits this phase identically to
+    // phase 9 — gemv (multi-acc + plain store, writes to b_attn_q_g 0x98)
+    // → cross-WG barrier (idx 9) → residual-add (b_attn_q_g + b_mid_g →
+    // out_residual).  Phase-17 residual-add has no trailing barrier (last
+    // phase; control falls through to s_endpgm).  b_attn_q_g is still dead
+    // here (phase 7 was last to read it; phase 9 gemv reused it and the
+    // phase-9 residual-add was its last read).
     if _body_has_marker(body_node, "down_residual_marker", 20) != 0 {
         // Slice 5.5: shape args derived from arch globals.
         //   ff_pad = MEGA_FF + 128 = 3200 (Qwen3); 8320 (Llama)
         uint64 ff_pad = MEGA_FF + 128
-        _emit_phase9_gemv_residual_inline(MEGA_HIDDEN, MEGA_FF, ff_pad, 256,
-                                            0x28, 0x80, 0xA0, 0x08)
+        if is_mistral_split != 0 {
+            // Gemv-only: writes to b_attn_q_g (kernarg 0x98), reusing phase-3
+            // shape.  w=down_w(0x28), x=gu_scratch(0x80), out=b_attn_q_g(0x98).
+            _emit_gemv_coop_bf16_padded_strided_inline(MEGA_HIDDEN, MEGA_FF, ff_pad, 256,
+                                                       1, 2, 3,
+                                                       0x28, 0x80, 0x98, 28)
+            // Barrier 9: gemv stores complete + visible to all WGs.
+            mega_emit_barrier_isa(9, MEGA_WG_PERSIST)
+            // Residual-add: out[i] = b_attn_q_g[i] + b_mid_g[i] → out_residual[i].
+            //   a=b_attn_q_g(0x98), b=b_mid_g(0xA0), out=out_residual(0x08).
+            _emit_residual_add_inline(MEGA_HIDDEN, 0x98, 0xA0, 0x08)
+        } else {
+            _emit_phase9_gemv_residual_inline(MEGA_HIDDEN, MEGA_FF, ff_pad, 256,
+                                                0x28, 0x80, 0xA0, 0x08)
+        }
     } else {
         asm_u32(0xBF800000)   // s_nop 0 (phase 17 stub)
     }
