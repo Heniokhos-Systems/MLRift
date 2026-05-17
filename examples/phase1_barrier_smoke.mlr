@@ -1,0 +1,56 @@
+// 5b-compute Phase 1 — Task 3: barrier-and smoke test.
+//
+// Submits a single AQL BARRIER_AND packet through the Phase 1 submit
+// primitive (std/kfd_phase1.mlr) and confirms the completion signal
+// retires. Validates the packet builder + doorbell ring + signal poll
+// path WITHOUT any compute kernel — first proof-of-life that Phase 1
+// can talk to the CP.
+//
+// BARRIER_AND retires immediately when all dep-signal values are 0; we
+// pass zero deps so the packet is always-satisfied. The completion
+// signal is reset to 1 (in-flight) before submit and the GPU
+// decrements it to 0 on retire.
+
+import "../std/kfd.mlr"
+import "../std/aql.mlr"
+import "../std/kfd_phase1.mlr"
+import "../std/hip_kfd.mlr"
+
+fn main() {
+    kfd_init()
+    uint64 q   = kfd_create_queue(KFD_WAIT_BUSY_POLL)
+    uint64 sig = kfd_signal_alloc()
+
+    // Caller-owned 64-byte packet scratch (NOT the ring slot — the
+    // submit primitive copies bytes 0x04..0x3F into the live ring
+    // slot and then writes the header word last under an mfence).
+    uint64 buf = alloc(64)
+    uint64 zi = 0
+    while zi < 64 {
+        uint64 p = buf + zi
+        unsafe { *(p as uint8) = 0 }
+        zi = zi + 1
+    }
+    uint32 hs = aql_build_barrier_and(buf, 0, 0, 0, 0, 0, sig)
+
+    // Reset completion signal to 1 (HSA "in-flight" default) so we
+    // can observe the GPU's decrement to 0.
+    kfd_signal_reset(sig)
+
+    uint64 new_wp = phase1_submit_packet(q, buf, hs)
+    phase1_dump_queue(q, "phase1_barrier: post-submit")
+
+    uint64 ok = phase1_wait_signal(sig, 0, 2000000000)
+    if ok == 0 {
+        print_str("FAIL: barrier-and signal did not retire (timeout)\n")
+        phase1_dump_queue(q, "phase1_barrier: timeout")
+        hipkfd_teardown()
+        exit(1)
+    }
+
+    phase1_dump_queue(q, "phase1_barrier: post-retire")
+    print_str("phase1_barrier_smoke: GREEN wp=")
+    println(new_wp)
+    hipkfd_teardown()
+    exit(0)
+}
