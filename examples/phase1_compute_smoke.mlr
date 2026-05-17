@@ -1,0 +1,122 @@
+// 5b-compute Phase 1 — Task 4: tiny compute dispatch bit-exact A/B.
+//
+// Dispatches the SAME compute kernel through two paths on the SAME
+// KFD queue and verifies they produce bit-identical results:
+//
+//   Path A (reference): kfd_dispatch(...) + kfd_wait(...)
+//                        — the canonical _kfd_dispatch_core path that
+//                          already drives the ~100 .co files in tree.
+//
+//   Path B (phase1):     aql_build_kernel_dispatch(...) writes a
+//                        caller-owned 64-byte buffer, phase1_submit_packet
+//                        copies it into the live ring + rings the
+//                        doorbell, phase1_wait_signal busy-polls the
+//                        completion signal.  No use of _kfd_dispatch_core.
+//
+// Kernel under test: atomic_cas_demo from /tmp/m1o.co (single-thread
+// global_atomic_cmpswap_b64 that swaps *out from 0 to 7).  Already
+// proven through path A by examples/b5b_kfd_smoke_multidispatch.mlr,
+// so any A/B divergence is attributable to the Phase 1 substrate.
+//
+// Kernarg layout (positional, AMDGPU native ABI): a single u64 holding
+// the device VA of the 8-byte output buffer.  Same layout the b5b smoke
+// uses; we just keep TWO independent output buffers (ref_va, our_va)
+// each with its own kernarg blob so we can host-compare post-fact.
+
+import "../std/kfd.mlr"
+import "../std/aql.mlr"
+import "../std/kfd_phase1.mlr"
+import "../std/hip_kfd.mlr"
+
+fn main() {
+    kfd_init()
+
+    uint64 q   = kfd_create_queue(KFD_WAIT_BUSY_POLL)
+    uint64 sig = kfd_signal_alloc()
+
+    uint64 mod = kernel_load("/tmp/m1o.co")
+    uint64 kn  = "atomic_cas_demo"
+    uint64 kd  = kernel_get_function(mod, kn)
+    uint64 gss = kernel_group_segment_size(mod, kd)
+
+    // Two distinct host-visible 8-byte output buffers — one per path —
+    // so the host-side compare is unambiguous.
+    uint64 ref_va    = dev_alloc_host_visible(8)
+    uint64 ref_host  = dev_host_ptr(ref_va)
+    uint64 our_va    = dev_alloc_host_visible(8)
+    uint64 our_host  = dev_host_ptr(our_va)
+
+    // Matching kernarg blobs.  atomic_cas_demo takes a single u64* arg
+    // so the blob is just [out_va u64].
+    uint64 karg_ref      = dev_alloc_host_visible(8)
+    uint64 karg_ref_host = dev_host_ptr(karg_ref)
+    unsafe { *(karg_ref_host as uint64) = ref_va }
+    uint64 karg_our      = dev_alloc_host_visible(8)
+    uint64 karg_our_host = dev_host_ptr(karg_our)
+    unsafe { *(karg_our_host as uint64) = our_va }
+
+    // ---------- Path A: kfd_dispatch (reference) ----------
+    unsafe { *(ref_host as uint64) = 0 }
+    kfd_dispatch(q, kd, 1, 1, 1, 1, 1, 1, karg_ref, 8, sig)
+    kfd_wait(q, sig)
+    phase1_dump_queue(q, "after kfd_dispatch")
+
+    uint64 ref_val = 0
+    unsafe { *(ref_host as uint64) -> ref_val }
+
+    // ---------- Path B: phase1 packet submit ----------
+    unsafe { *(our_host as uint64) = 0 }
+
+    uint64 buf = alloc(64)
+    uint64 zi = 0
+    while zi < 64 {
+        uint64 p = buf + zi
+        unsafe { *(p as uint8) = 0 }
+        zi = zi + 1
+    }
+    uint32 hs = aql_build_kernel_dispatch(buf,
+                                           1, 1, 1,
+                                           1, 1, 1,
+                                           0, gss,
+                                           kd, karg_our, sig)
+
+    kfd_signal_reset(sig)
+    uint64 new_wp = phase1_submit_packet(q, buf, hs)
+    if new_wp == 0xFFFFFFFFFFFFFFFF {
+        print_str("FAIL: phase1_submit_packet back-pressure timeout\n")
+        hipkfd_teardown()
+        exit(1)
+    }
+
+    uint64 ok = phase1_wait_signal(sig, 0, 5000000000)
+    phase1_dump_queue(q, "after phase1_submit")
+    if ok == 0 {
+        print_str("FAIL: phase1 completion signal timeout\n")
+        hipkfd_teardown()
+        exit(1)
+    }
+
+    uint64 our_val = 0
+    unsafe { *(our_host as uint64) -> our_val }
+
+    // ---------- Verify ----------
+    print_str("ref_val=")
+    println(ref_val)
+    print_str("our_val=")
+    println(our_val)
+
+    if ref_val != 7 {
+        print_str("FAIL: reference path did not produce 7\n")
+        hipkfd_teardown()
+        exit(1)
+    }
+    if ref_val != our_val {
+        print_str("FAIL: phase1 result differs from kfd_dispatch\n")
+        hipkfd_teardown()
+        exit(1)
+    }
+
+    print_str("phase1_compute_smoke: GREEN (bit-exact vs kfd_dispatch)\n")
+    hipkfd_teardown()
+    exit(0)
+}
