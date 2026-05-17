@@ -284,14 +284,28 @@ fn main() {
         }
     }
 
+    // Slice 8.5 (2026-05-17) — master-switch: MLRIFT_NATIVE_MEGAKERNEL=2
+    // implies MLRIFT_QWEN3_MEGAKERNEL=1 and MLRIFT_GPU_FULL_FORWARD=1
+    // when those are not explicitly set.  Mirrors the Llama-1B/3B/Mistral
+    // drivers where MLRIFT_NATIVE_MEGAKERNEL=1 is the single opt-in.
+    // Without this shortcut Qwen3 default decode bounces to CPU forward
+    // (~30 tok/s) instead of the M=1 mega-kernel fast path (~140 tok/s).
+    u64 _mk_master_on = 0
+    u64 _ev_nmk = getenv("MLRIFT_NATIVE_MEGAKERNEL")
+    if _ev_nmk != 0 {
+        u8 _nmk_c0 = 0; unsafe { *(_ev_nmk as u8) -> _nmk_c0 }
+        if _nmk_c0 == 50 { _mk_master_on = 1 }   // '2' = unified v2 mega-kernel
+    }
+
     // Detect MLRIFT_GPU_FULL_FORWARD early so we know whether to put
     // the kv_cache in GTT (needed for the fused-attention kernel that
     // reads K/V via device VA).
-    u64 want_gpu_full = 0
+    u64 want_gpu_full = _mk_master_on
     u64 ev_full_early = getenv("MLRIFT_GPU_FULL_FORWARD")
     if ev_full_early != 0 {
         u8 cf_e = 0; unsafe { *(ev_full_early as u8) -> cf_e }
-        if cf_e != 48 { want_gpu_full = 1 }
+        if cf_e == 48 { want_gpu_full = 0 }   // '0' = explicit opt-out
+        else          { want_gpu_full = 1 }
     }
 
     // KV cache — 4D slab [batch, layer, max_seq, n_kv_heads, head_dim].
@@ -451,10 +465,15 @@ fn main() {
     // 2 resid_adds per layer can fire as ONE batched dispatch each.
     u64 d_x_A = 0; u64 d_x_A_h = 0
     u64 d_x_B = 0; u64 d_x_B_h = 0
+    // Slice 8.5 — accept either MLRIFT_GPU_FULL_FORWARD=1 OR
+    // MLRIFT_NATIVE_MEGAKERNEL=2 (master switch).
     u64 ev_full = getenv("MLRIFT_GPU_FULL_FORWARD")
+    u64 _full_active = _mk_master_on
     if ev_full != 0 {
-        u8 cf = 0; unsafe { *(ev_full as u8) -> cf }
-        if cf != 48 {
+        u8 _fa_c = 0; unsafe { *(ev_full as u8) -> _fa_c }
+        if _fa_c == 48 { _full_active = 0 } else { _full_active = 1 }
+    }
+    if _full_active != 0 {
             // Force _gpu_mm_init_once via gpu_matmul_enabled() so
             // gpu_pipeline_ready() can return 1.  Without this, the
             // pipeline_ready check returns 0 at startup (no GPU op has
@@ -485,7 +504,6 @@ fn main() {
                     }
                 }
             }
-        }
     }
 
     // Slice 1.5: batched lm_head buffers (allocated when M_eff > 1, i.e.
@@ -626,11 +644,12 @@ fn main() {
     // 28 layers × 4 matmuls × ~3 MB ≈ 3 s cold-start that would otherwise
     // be charged against decode.  Walk every layer here (BEFORE the timer)
     // and trigger the uploads — subsequent calls hit the cache.
+    // Slice 8.5 — MLRIFT_NATIVE_MEGAKERNEL=2 implies QWEN3_MEGAKERNEL=1.
     u64 ev_megak_warmup = getenv("MLRIFT_QWEN3_MEGAKERNEL")
-    u64 want_warmup = 0
+    u64 want_warmup = _mk_master_on
     if ev_megak_warmup != 0 {
         u8 c0w = 0; unsafe { *(ev_megak_warmup as u8) -> c0w }
-        if c0w != 48 { want_warmup = 1 }
+        if c0w == 48 { want_warmup = 0 } else { want_warmup = 1 }
     }
     if want_warmup != 0 {
         u64 ev_vt0 = getenv("MLRIFT_VRAM_TRACE")
@@ -1117,10 +1136,10 @@ fn main() {
                     // requires a clean 0xFF mask) and skip the post-
                     // call qwen3_gpu_chain_resid_to_next_norm.
                     u64 _ev_megak = getenv("MLRIFT_QWEN3_MEGAKERNEL")
-                    u64 _use_megak_self = 0
+                    u64 _use_megak_self = _mk_master_on
                     if _ev_megak != 0 {
                         u8 _mk_c0 = 0; unsafe { *(_ev_megak as u8) -> _mk_c0 }
-                        if _mk_c0 != 48 { _use_megak_self = 1 }
+                        if _mk_c0 == 48 { _use_megak_self = 0 } else { _use_megak_self = 1 }
                     }
                     if hidden == 1024 && _use_megak_self == 0 {
                         if layer > 0 { mask_self = mask_self | 0x8000 }
