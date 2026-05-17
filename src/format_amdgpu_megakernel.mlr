@@ -1483,6 +1483,28 @@ fn _emit_gemv_coop_bf16_padded_strided_inline(uint64 n_out, uint64 k, uint64 k_p
     // rows_per_wg = ceil(n_out / wg_active)
     uint64 rows_per_wg = (n_out + wg_active - 1) / wg_active
 
+    // ── Slice 7.10: arch-gate single-acc fallback for k_iters_outer == 6 ──
+    // The slice 7.6a 8-way multi-accumulator + VOPD body wedges MES firmware
+    // deterministically when k_iters_outer = k_iters / 8 = 6.  Llama-3B's
+    // phase 13 o_proj hits this: k = q_dim = N_HEADS*HEAD_DIM = 24*128 = 3072
+    // → k_iters = 48 → k_iters_outer = 6.  Production-arch coverage:
+    //   Llama-1B: k ∈ {2048, 8192}        → k_iters_outer ∈ {4, 16}
+    //   Llama-3B: k ∈ {3072, ...}         → k_iters_outer ∈ {6, ...} ← WEDGES
+    //   Qwen3-0.6B: k ∈ {1024, 2048}      → k_iters_outer ∈ {2, 4}
+    //   Mistral-7B: k ∈ {4096, 14336}     → k_iters_outer ∈ {8, 28}
+    //
+    // The earlier "fix properly" attempt (balanced-tree reduce + s_delay_alu)
+    // also wedged, so the hazard is subtler than just the 7-add chain.  Until
+    // root-caused, fall back to the slice-7.5 single-accumulator form for
+    // k_iters_outer==6 only.  All other values keep the slice-7.6a/b
+    // multi-acc + VOPD path unchanged — Qwen3 / Llama-1B / Mistral .co bytes
+    // must remain byte-identical to pre-slice-7.10 HEAD.
+    uint64 k_iters_outer_gate = k_iters / 8
+    uint64 use_single_acc = 0
+    if k_iters_outer_gate == 6 {
+        use_single_acc = 1
+    }
+
     uint64 outer_top = asm_text_len / 4
 
     // ── Per-row body ──────────────────────────────────────────────────────
@@ -1490,14 +1512,20 @@ fn _emit_gemv_coop_bf16_padded_strided_inline(uint64 n_out, uint64 k, uint64 k_p
     // v2, v41, v42, v43, v44, v45, v46, v47.  Even-VGPR/odd-VGPR pairing
     // (X-slot even, Y-slot odd) satisfies VOPD's vdst parity constraint so
     // Ramp 2 (slice 7.6b) can pack adjacent FMAs as v_dual_fmac_f32.
+    //
+    // Slice 7.10 (2026-05-17): when use_single_acc==1, only v2 is initialised;
+    // the inner body uses 16 single-FMA v_fmac_f32_e32 into v2 (slice-7.5
+    // form), and the reduce tail is skipped.
     asm_v_mov_b32_inline_u(2,  0)   // acc[0] = 0.0 (X-slot, even — keeps v2 for wave-reduce target)
-    asm_v_mov_b32_inline_u(41, 0)   // acc[1] = 0.0 (Y-slot, odd)
-    asm_v_mov_b32_inline_u(42, 0)   // acc[2] = 0.0 (X-slot, even)
-    asm_v_mov_b32_inline_u(43, 0)   // acc[3] = 0.0 (Y-slot, odd)
-    asm_v_mov_b32_inline_u(44, 0)   // acc[4] = 0.0
-    asm_v_mov_b32_inline_u(45, 0)   // acc[5] = 0.0
-    asm_v_mov_b32_inline_u(46, 0)   // acc[6] = 0.0
-    asm_v_mov_b32_inline_u(47, 0)   // acc[7] = 0.0
+    if use_single_acc == 0 {
+        asm_v_mov_b32_inline_u(41, 0)   // acc[1] = 0.0 (Y-slot, odd)
+        asm_v_mov_b32_inline_u(42, 0)   // acc[2] = 0.0 (X-slot, even)
+        asm_v_mov_b32_inline_u(43, 0)   // acc[3] = 0.0 (Y-slot, odd)
+        asm_v_mov_b32_inline_u(44, 0)   // acc[4] = 0.0
+        asm_v_mov_b32_inline_u(45, 0)   // acc[5] = 0.0
+        asm_v_mov_b32_inline_u(46, 0)   // acc[6] = 0.0
+        asm_v_mov_b32_inline_u(47, 0)   // acc[7] = 0.0
+    }
 
     // init weight ptr: v3:v4 = s[w_lo:w_hi] + lane*4
     asm_v_mov_b32_inline_u(4, 0)
@@ -1600,14 +1628,35 @@ fn _emit_gemv_coop_bf16_padded_strided_inline(uint64 n_out, uint64 k, uint64 k_p
     //   src0:  X=lo (v10,v14,v18,...) bank 2  |  Y=hi (v9,v13,v17,...) bank 1
     //   src1:  X=x_even (v11,v15,...) bank 3  |  Y=x_odd (v12,v16,...) bank 0
     //   vdst:  X∈{v2,v42,v44,v46} even        |  Y∈{v41,v43,v45,v47} odd
-    asm_v_dual_fmac_f32(2,  10, 11,  41, 9,  12)   // acc[0]+=w0_lo*x[0] :: acc[1]+=w0_hi*x[1]
-    asm_v_dual_fmac_f32(42, 14, 15,  43, 13, 16)   // acc[2]+=w1_lo*x[2] :: acc[3]+=w1_hi*x[3]
-    asm_v_dual_fmac_f32(44, 18, 19,  45, 17, 20)   // acc[4]+=w2_lo*x[4] :: acc[5]+=w2_hi*x[5]
-    asm_v_dual_fmac_f32(46, 22, 23,  47, 21, 24)   // acc[6]+=w3_lo*x[6] :: acc[7]+=w3_hi*x[7]
-    asm_v_dual_fmac_f32(2,  26, 27,  41, 25, 28)   // acc[0]+=w4_lo*x[8] :: acc[1]+=w4_hi*x[9]
-    asm_v_dual_fmac_f32(42, 30, 31,  43, 29, 32)   // acc[2]+=w5_lo*x[10]:: acc[3]+=w5_hi*x[11]
-    asm_v_dual_fmac_f32(44, 34, 35,  45, 33, 36)   // acc[4]+=w6_lo*x[12]:: acc[5]+=w6_hi*x[13]
-    asm_v_dual_fmac_f32(46, 38, 39,  47, 37, 40)   // acc[6]+=w7_lo*x[14]:: acc[7]+=w7_hi*x[15]
+    if use_single_acc == 1 {
+        // Slice 7.10 single-acc fallback (k_iters_outer==6): 16 sequential FMAs
+        // into v2 only.  Matches slice-7.5 emit (commit 4958215 of this fn).
+        asm_v_fmac_f32_e32_vv(2, 10, 11)            // acc += w0_lo * x[0]
+        asm_v_fmac_f32_e32_vv(2, 9, 12)             // acc += w0_hi * x[1]
+        asm_v_fmac_f32_e32_vv(2, 14, 15)            // acc += w1_lo * x[2]
+        asm_v_fmac_f32_e32_vv(2, 13, 16)            // acc += w1_hi * x[3]
+        asm_v_fmac_f32_e32_vv(2, 18, 19)            // acc += w2_lo * x[4]
+        asm_v_fmac_f32_e32_vv(2, 17, 20)            // acc += w2_hi * x[5]
+        asm_v_fmac_f32_e32_vv(2, 22, 23)            // acc += w3_lo * x[6]
+        asm_v_fmac_f32_e32_vv(2, 21, 24)            // acc += w3_hi * x[7]
+        asm_v_fmac_f32_e32_vv(2, 26, 27)            // acc += w4_lo * x[8]
+        asm_v_fmac_f32_e32_vv(2, 25, 28)            // acc += w4_hi * x[9]
+        asm_v_fmac_f32_e32_vv(2, 30, 31)            // acc += w5_lo * x[10]
+        asm_v_fmac_f32_e32_vv(2, 29, 32)            // acc += w5_hi * x[11]
+        asm_v_fmac_f32_e32_vv(2, 34, 35)            // acc += w6_lo * x[12]
+        asm_v_fmac_f32_e32_vv(2, 33, 36)            // acc += w6_hi * x[13]
+        asm_v_fmac_f32_e32_vv(2, 38, 39)            // acc += w7_lo * x[14]
+        asm_v_fmac_f32_e32_vv(2, 37, 40)            // acc += w7_hi * x[15]
+    } else {
+        asm_v_dual_fmac_f32(2,  10, 11,  41, 9,  12)   // acc[0]+=w0_lo*x[0] :: acc[1]+=w0_hi*x[1]
+        asm_v_dual_fmac_f32(42, 14, 15,  43, 13, 16)   // acc[2]+=w1_lo*x[2] :: acc[3]+=w1_hi*x[3]
+        asm_v_dual_fmac_f32(44, 18, 19,  45, 17, 20)   // acc[4]+=w2_lo*x[4] :: acc[5]+=w2_hi*x[5]
+        asm_v_dual_fmac_f32(46, 22, 23,  47, 21, 24)   // acc[6]+=w3_lo*x[6] :: acc[7]+=w3_hi*x[7]
+        asm_v_dual_fmac_f32(2,  26, 27,  41, 25, 28)   // acc[0]+=w4_lo*x[8] :: acc[1]+=w4_hi*x[9]
+        asm_v_dual_fmac_f32(42, 30, 31,  43, 29, 32)   // acc[2]+=w5_lo*x[10]:: acc[3]+=w5_hi*x[11]
+        asm_v_dual_fmac_f32(44, 34, 35,  45, 33, 36)   // acc[4]+=w6_lo*x[12]:: acc[5]+=w6_hi*x[13]
+        asm_v_dual_fmac_f32(46, 38, 39,  47, 37, 40)   // acc[6]+=w7_lo*x[14]:: acc[7]+=w7_hi*x[15]
+    }
 
     // advance weight ptr +1024 bytes (8 weights × 128B stride)
     asm_u32(0xD7006A03); asm_u32(0x000206FF); asm_u32(1024)
@@ -1626,13 +1675,18 @@ fn _emit_gemv_coop_bf16_padded_strided_inline(uint64 n_out, uint64 k, uint64 k_p
     // as scratch (clobbering w0_hi/w0_lo, both dead now).  This is per-lane
     // reduction; the wave-XOR then reduces across lanes as before.
     //   v_add_f32_e32 v2, v2, v41   = 0x06045302  (vsrc1=v41=0x29 → 0x29<<9=0x5200; src0=v2|0x100=0x102)
-    asm_u32(0x06045302)                          // v2 += v41
-    asm_u32(0x06045502)                          // v2 += v42
-    asm_u32(0x06045702)                          // v2 += v43
-    asm_u32(0x06045902)                          // v2 += v44
-    asm_u32(0x06045B02)                          // v2 += v45
-    asm_u32(0x06045D02)                          // v2 += v46
-    asm_u32(0x06045F02)                          // v2 += v47
+    //
+    // Slice 7.10 (2026-05-17): skipped under use_single_acc==1 (k_iters_outer==6)
+    // since v41..v47 were never initialised and v2 already holds the full sum.
+    if use_single_acc == 0 {
+        asm_u32(0x06045302)                          // v2 += v41
+        asm_u32(0x06045502)                          // v2 += v42
+        asm_u32(0x06045702)                          // v2 += v43
+        asm_u32(0x06045902)                          // v2 += v44
+        asm_u32(0x06045B02)                          // v2 += v45
+        asm_u32(0x06045D02)                          // v2 += v46
+        asm_u32(0x06045F02)                          // v2 += v47
+    }
 
     // ── Wave XOR reduce ───────────────────────────────────────────────────
     // acc=v2, addr=v9 (free after inner loop), tmp=v10
