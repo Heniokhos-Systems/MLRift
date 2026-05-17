@@ -76,25 +76,34 @@ MLRift compiler + a small ML stdlib (`std/qwen3.mlr`,
 `std/matmul.mlr`, `std/tokenizer.mlr`, `std/gguf.mlr`) — no external
 runtime, no Python.
 
-| Model | Quant | tok/s (CPU) | tok/s (GPU mega) | vs PyTorch bf16 (best) | Peak RSS / VRAM |
+| Model | Quant | tok/s (CPU) | tok/s (GPU mega) | vs PyTorch bf16 GPU | Peak RSS / VRAM |
 |---|---|---:|---:|---:|---|
-| **Llama-3.2-1B-Instruct** | Q8_0→bf16 (CPU) / bf16 (GPU) | **16.2** | **81.8** (M=1) / **84.8** (speck4+PLD) | **+6.7% CPU, +59% GPU** | 2.39 GB / ~2.1 GB |
-| Qwen3-0.6B | bf16 (HF safetensors) | 32.03 | **229.8** (mks16+PLD) | **+24% CPU, 3.68× GPU** | 1.67 GB / 2.05 GB |
-| Qwen3-0.6B | bf16 (GGUF) | 32.27 | ~33 (matmul-only) | **1.25×** CPU | 1.67 GB |
+| Qwen3-0.6B | bf16 (HF safetensors) | 32.0 | **118** (M=1) / **264** (mks16+PLD) | **~2.0× / 4.4-5.3× GPU** | 1.76-1.98 GB / ~2.0 GB |
+| **Llama-3.2-1B-Instruct** | Q8_0→bf16 (CPU) / bf16 (GPU) | **16.2** | **99.8** (M=1) / **84.8** (speck4+PLD) | **+6.7% CPU, +95% GPU** | 2.39 GB / ~2.1 GB |
+| **Llama-3.2-3B-Instruct** | Q8_0→bf16 (GPU) | — | **40.7** (M=1) | **+28% GPU** | 9.63 GB / ~5.8 GB |
+| **Mistral-7B-Instruct-v0.2** | Q8_0 (GGUF) / bf16 (safetensors) | — | **21.7** (Q8_0) / **22.1** (bf16) | **+71% / +74% GPU** | 14.0 / 27.8 GB |
+| Qwen3-0.6B | bf16 (GGUF) | 32.3 | ~33 (matmul-only) | **1.25×** CPU | 1.67 GB |
 | **Qwen3-14B** | **Q8_0 (GGUF)** | **0.479** | — | **3.63×** CPU | **14.81 GB** |
 
 7900X / 24 threads / greedy decode / use_cache.  GPU rows: RX 7800 XT
 gfx1100, native KFD shim, `--target=amdgpu-native`, mega-kernel emitted
-by MLRift's `@kernel` AST-walker (no hipcc on the Llama-1B M=1 path).
-Tokens are bit-identical to `llama.cpp` greedy on every row (Llama-1B
-20 / 20 on prompt `"hello"`).  Llama-1B CPU uses
+by MLRift's `@kernel` AST-walker (no hipcc / LLVM / clang on the
+Llama-1B / Llama-3B / Mistral M=1 paths).  Tokens are bit-identical to
+`llama.cpp` / PyTorch greedy on every row (20/20 on `"hello"` for
+Qwen3 / Llama-1B / Llama-3B; Mistral-7B matches 22/23 — pos 6 lands on
+the opposite side of a 1-bf16-ULP knife edge in the lm_head output,
+bisected to reduction-tree topology, not precision).  Llama-1B CPU uses
 `MLRIFT_CPU_BF16=1` (dequant once at load, AVX2 2-wide bf16 matmul).
+Verified post-reboot 2026-05-17 — see `docs/bench_2026-05-17.md`.
 Methodology + commit-by-commit perf history:
 
+- `docs/bench_2026-05-17.md` — post-reboot verified scorecard for the
+  4 GPU models (Qwen3-0.6B 118-264 tok/s, Llama-1B 99.8, Llama-3B 40.7,
+  Mistral-7B 21.7-22.1), with single-env reproducers + caveats.
 - `docs/bench_2026-05-13.md` — Llama-3.2-1B vs PyTorch ROCm fp32/bf16
   on RX 7800 XT (CPU bf16 +11 %, GPU M=1 +59 % vs PT bf16, +162 % vs
-  PT fp32).  Session evolution `M=1: 33 → 81.8 tok/s` across slices
-  6.7e/f/g + 4.23 + 4.24 + 4.25.
+  PT fp32).  Session evolution `M=1: 33 → 81.8 → 99.8 tok/s` across
+  slices 6.7e/f/g + 4.23 + 4.24 + 4.25 + 7.5.
 - `docs/BENCH_QWEN3.md` — Qwen3-0.6B (78× from scalar baseline, 3.27×
   vs PyTorch F32, full per-op breakdown).
 - `docs/BENCH_QWEN3_14B.md` — Qwen3-14B Q8_0 vs PyTorch BF16 (3.63×
@@ -163,6 +172,8 @@ Token-id output of every MLRift row is bit-identical to HuggingFace
 | **+ `MLRIFT_QWEN3_MEGAKERNEL_SPECK16=1` + `SPEC_K=16` + LONG_PROMPT (slice 4.18 — M=16 mega-kernel; slice 4.17 unblocks max_seq=128)** | bf16 / f32 | **200.9** | 3 400 | **2.71× vs ROCm bf16** |
 | **+ slice 4.20 — VRAM chase, mks-K cap correction, mks16 LDS bump 64→96** | bf16 / f32 | **216.4** | **2 046** | **3.46× vs ROCm bf16** |
 | **+ post-4.20 lm_head bf16-direct (fb2de6a + 226b2e2, 2026-05-12)** | bf16 / f32 | **229.8** | **2 046** | **3.68× vs ROCm bf16** |
+| **+ slice 8.5 single-env reproducer re-verified post-reboot 2026-05-17** | bf16 / f32 | **264.2** | **2 046** | **4.23× vs ROCm bf16** (peak, 5 spec steps) |
+| **+ slice 8.5 M=1 single-env reproducer (`MLRIFT_NATIVE_MEGAKERNEL=2` only)** | bf16 / f32 | **118** | ~2 100 | **~2.0× vs ROCm bf16** (any prompt, no PLD) |
 | MLRift + `GPU_FULL_FORWARD` + `SPEC_K=4` + LONG-prompt (per-op PLD path, pre-mega) | bf16 / f32 | 72.0 | 1 920 | 0.97× vs ROCm bf16 |
 
 > **Caveat (2026-05-12): mks8 / mks16 are still hipcc-compiled.**  The
@@ -178,17 +189,16 @@ Token-id output of every MLRift row is bit-identical to HuggingFace
 > the same AST-walker pipeline; until they land, the mks-K rows above
 > have an hipcc footnote.
 >
-> **Reproducing the 229.8 tok/s mks16 number** requires
-> `MLRIFT_PLD_BENCH=1` alongside `MLRIFT_LONG_PROMPT=1` — the latter
-> alone now uses a human-readable "Hello, who are you?" prefill
-> (CPU-driver smoke), which has no repeating 2-grams and starves PLD
-> speculation.  `PLD_BENCH=1` restores the original `[14990,14582]×8`
-> bigram pattern that gives the mks-K paths 99-100 % accept rate at
-> their designed peak.  Also run `scripts/rebuild_helper_cos.sh`
-> first — mks8/mks16 are hipcc-compiled (no v2 AST-walker port yet)
-> and are absent from `/tmp` after machine reset.  See
-> [`docs/SLICE4_MEGAKERNEL_DESIGN.md`](docs/SLICE4_MEGAKERNEL_DESIGN.md#reproducer-2026-05-12)
-> for the full env block.
+> **Reproducing the 264 tok/s mks16 peak (slice 8.5, 2026-05-17)**:
+> `MLRIFT_NATIVE_MEGAKERNEL=2 MLRIFT_QWEN3_MEGAKERNEL_SPECK16=1
+> MLRIFT_SPEC_K=16 MLRIFT_LONG_PROMPT=1 MLRIFT_PLD_BENCH=1` —
+> slice 8.5 collapsed the prior 3-env opt-in (`QWEN3_MEGAKERNEL=1`
+> + `GPU_FULL_FORWARD=1`) into the single `MLRIFT_NATIVE_MEGAKERNEL=2`
+> master switch.  Also run `scripts/rebuild_helper_cos.sh` first —
+> mks8/mks16 are hipcc-compiled (no v2 AST-walker port yet) and are
+> absent from `/tmp` after machine reset.  See
+> [`docs/bench_2026-05-17.md`](docs/bench_2026-05-17.md) for the
+> full env block + the 4-model scorecard.
 
 The matmul-only rows route only the matmul + lm_head through native
 gfx1100 ISA; qknorm, rope, attn, residuals still run CPU.  The
@@ -324,7 +334,7 @@ prompt `"hello"`, N=20, median of 3 runs.
 | PyTorch ROCm fp32 | f32 / f32 | 31.2 | 4 749 MiB | ~4.7 GiB | 1.00× (PT fp32 baseline) |
 | PyTorch CPU bf16 (MKL + oneDNN) | bf16 / f32 | 15.2 | — | ~3.8 GiB | 1.00× (PT CPU bf16 baseline) |
 | PyTorch ROCm bf16 (SDPA) | bf16 / bf16 | 51.3 | 2 392 MiB | ~3.8 GiB | 1.00× (PT GPU bf16 baseline) |
-| **MLRift M=1 mega** (slice 4.25) | bf16 / f32 | **81.8** | ~2 100 MiB | 1.27 GiB | **1.59× PT GPU bf16 (+59%)** |
+| **MLRift M=1 mega** (slice 7.5) | bf16 / f32 | **99.8** | ~2 100 MiB | 3.71 GiB | **1.95× PT GPU bf16 (+95%)** |
 | **MLRift speck4 + PLD** | bf16 / f32 | **84.8** | ~2 100 MiB | 1.27 GiB | **1.65× PT GPU bf16 (+65%)** |
 
 **MLRift > PyTorch on both CPU and GPU for Llama-3.2-1B.**
@@ -346,7 +356,8 @@ evolution on M=1:
 | 6.7e/f/g | Per-layer flush + GPU lm_head + GTT residuals (correctness fixes) | 33 |
 | 4.23 | Drop `buffer_gl1_inv` from cross-WG barrier spin loop | 37 |
 | 4.24 | 2× unroll inner K-loop + `s_clause(5)` on 6-load batch | 58.3 |
-| **4.25** | **4× unroll inner K-loop + `s_clause(11)` on 12-load batch** | **81.8** |
+| 4.25 | 4× unroll inner K-loop + `s_clause(11)` on 12-load batch | 81.8 |
+| **7.5** | **8× unroll inner K-loop + `s_clause(23)` on 24-load / 16-FMA batch** | **99.8** |
 
 2.48× cumulative on M=1 from a single session of inner-loop optimisation,
 all in MLRift's `_emit_gemv_coop_bf16_padded_strided_inline`
