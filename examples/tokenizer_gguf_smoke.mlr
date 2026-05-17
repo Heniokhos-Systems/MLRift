@@ -1,0 +1,129 @@
+// GGUF-embedded tokenizer smoke test.
+//
+// Opens a GGUF, loads the tokenizer directly from its metadata (no
+// external tokenizer.json), encodes a fixed prompt, prints token IDs +
+// the special-token table, decodes back. Used for task #297 Phase 1
+// verification.
+//
+// Usage:
+//   /tmp/tokenizer_gguf_smoke <path/to/model.gguf> [prompt]
+
+import "../std/tokenizer.mlr"
+import "../std/gguf.mlr"
+import "../std/io.mlr"
+import "../std/fmt.mlr"
+import "../std/string.mlr"
+
+static uint64 cli_argc = 0
+static uint64 cli_argv = 0
+
+fn put(u64 s) { print_str(s) }
+fn putu(u64 v) { u64 s = fmt_dec(v); put(s); dealloc(s) }
+fn puti_signed(u64 v) {
+    if v == 0xFFFFFFFFFFFFFFFF { put("(unset)"); return }
+    putu(v)
+}
+
+fn argv_at(u64 i) -> u64 {
+    u64 slot = cli_argv + i * 8
+    u64 v = 0
+    unsafe { *(slot as u64) -> v }
+    return v
+}
+
+fn main() {
+    if cli_argc < 2 {
+        put("usage: tokenizer_gguf_smoke <model.gguf> [prompt]\n")
+        exit(1)
+    }
+    u64 model_path = argv_at(1)
+    u64 prompt = "[INST] hello [/INST]"
+    if cli_argc >= 3 { prompt = argv_at(2) }
+
+    put("[smoke] opening GGUF: "); put(model_path); put("\n")
+    GGUFFile gf = gguf_open(model_path)
+    if gf.file_size == 0 {
+        put("[smoke] gguf_open failed\n"); exit(1)
+    }
+
+    // Surface the tokenizer model string for context.
+    u64 mp_box = alloc(8); unsafe { *(mp_box as u64) = 0 }
+    u64 ml_box = alloc(8); unsafe { *(ml_box as u64) = 0 }
+    gguf_meta_string(gf, "tokenizer.ggml.model", mp_box, ml_box)
+    u64 mp = 0; unsafe { *(mp_box as u64) -> mp }
+    u64 ml = 0; unsafe { *(ml_box as u64) -> ml }
+    dealloc(mp_box); dealloc(ml_box)
+    put("[smoke] tokenizer.ggml.model = \"")
+    if mp != 0 { write(1, mp, ml) }
+    put("\"\n")
+
+    Tokenizer tk = tokenizer_load_from_gguf(gf)
+    if tk.vocab_count == 0 {
+        put("[smoke] tokenizer_load_from_gguf failed\n"); exit(1)
+    }
+    put("[smoke] vocab_count = "); putu(tk.vocab_count); put("\n")
+    put("[smoke] max_tok_len = "); putu(tk.max_tok_len); put("\n")
+    put("[smoke] bos_id   = "); puti_signed(tk.bos_id); put("\n")
+    put("[smoke] eos_id   = "); puti_signed(tk.eos_id); put("\n")
+    put("[smoke] pad_id   = "); puti_signed(tk.pad_id); put("\n")
+    put("[smoke] unk_id   = "); puti_signed(tk.unk_id); put("\n")
+    put("[smoke] eot_id   = "); puti_signed(tokenizer_eot_id()); put("\n")
+    put("[smoke] bf_base  = "); puti_signed(tk.byte_fallback_base); put("\n")
+    put("[smoke] kind     = "); putu(tk_gpt2_kind); put(" (0=SPM, 1=GPT-2 byte-level)\n")
+
+    // Print a few sample tokens (raw bytes, lossy printable view).
+    u64 i = 0
+    while i < 4 {
+        u64 lp_box = alloc(8); unsafe { *(lp_box as u64) = 0 }
+        u64 ll_box = alloc(8); unsafe { *(ll_box as u64) = 0 }
+        tokenizer_lookup(tk, i, lp_box, ll_box)
+        u64 lp = 0; unsafe { *(lp_box as u64) -> lp }
+        u64 ll = 0; unsafe { *(ll_box as u64) -> ll }
+        dealloc(lp_box); dealloc(ll_box)
+        put("[smoke] token["); putu(i); put("] len="); putu(ll); put(" raw=")
+        u64 k = 0
+        while k < ll {
+            u64 b = load8(lp + k)
+            if k != 0 { put(" ") }
+            putu(b)
+            k = k + 1
+        }
+        put("\n")
+        i = i + 1
+    }
+
+    // Encode the prompt.
+    u64 plen = str_len(prompt)
+    put("[smoke] prompt = \""); put(prompt); put("\" (len="); putu(plen); put(")\n")
+
+    u64 ids = 0
+    u64 cnt = 0
+    u64 ids_box = alloc(8); unsafe { *(ids_box as u64) = 0 }
+    u64 cnt_box = alloc(8); unsafe { *(cnt_box as u64) = 0 }
+    tokenizer_encode(tk, prompt, plen, ids_box, cnt_box)
+    unsafe { *(ids_box as u64) -> ids }
+    unsafe { *(cnt_box as u64) -> cnt }
+    dealloc(ids_box); dealloc(cnt_box)
+
+    put("[smoke] tokens="); putu(cnt); put(" ids=[")
+    u64 j = 0
+    while j < cnt {
+        if j != 0 { put(", ") }
+        u32 id32 = 0
+        unsafe { *((ids + j * 4) as uint32) -> id32 }
+        u64 id = id32
+        putu(id)
+        j = j + 1
+    }
+    put("]\n")
+
+    // Decode round-trip.
+    u64 txt = tokenizer_decode(tk, ids, cnt)
+    put("[smoke] roundtrip = \""); put(txt); put("\"\n")
+    dealloc(txt)
+    if ids != 0 { dealloc(ids) }
+
+    tokenizer_free(tk)
+    gguf_free(gf)
+    exit(0)
+}

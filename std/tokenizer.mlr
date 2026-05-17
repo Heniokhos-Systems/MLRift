@@ -20,6 +20,7 @@
 import "io.mlr"
 import "string.mlr"
 import "fmt.mlr"
+import "gguf.mlr"
 
 // ---------------------------------------------------------------------------
 // Tokenizer handle
@@ -59,6 +60,26 @@ struct Tokenizer {
 static u64 tk_gpt2_kind = 0
 static u64 tk_gpt2_b2c  = 0
 static u64 tk_gpt2_c2b  = 0
+
+// Extra GGUF-only special-token slots. The Tokenizer struct is locked at
+// 16 u64 fields (see gguf.mlr:109 for the codegen note); these live here
+// so GGUF-loaded tokenizers can still surface IDs like Llama-3's
+// `<|eot_id|>`. 0xFFFFFFFFFFFFFFFF = unset.
+//   tk_eot_id          : Llama-3 / Qwen end-of-turn token, or "unset"
+//   tk_chat_template_p : pointer into the GGUF mmap for the chat-template
+//                        Jinja2 source (read-only, lifetime = gguf_free)
+//   tk_chat_template_l : byte length of the template (0 = absent)
+static u64 tk_eot_id          = 0xFFFFFFFFFFFFFFFF
+static u64 tk_chat_template_p = 0
+static u64 tk_chat_template_l = 0
+
+// Accessor — returns 0xFFFFFFFFFFFFFFFF if no <|eot_id|>-style token was
+// recorded on the loaded tokenizer.
+fn tokenizer_eot_id() -> u64 { return tk_eot_id }
+fn tokenizer_chat_template(u64 out_ptr, u64 out_len) {
+    unsafe { *(out_ptr as u64) = tk_chat_template_p }
+    unsafe { *(out_len as u64) = tk_chat_template_l }
+}
 
 // ---------------------------------------------------------------------------
 // Small JSON scanning helpers — tailored to tokenizer.json's structure.
@@ -478,6 +499,217 @@ fn tokenizer_load(u64 path) -> Tokenizer {
     tk.pad_id = tokenizer_id_of(tk, "<pad>", 5)
     tk.unk_id = tokenizer_id_of(tk, "<unk>", 5)
     tk.byte_fallback_base = tokenizer_id_of(tk, "<0x00>", 6)
+
+    return tk
+}
+
+// ---------------------------------------------------------------------------
+// GGUF-embedded tokenizer loader.
+//
+// Reads vocab + special-token IDs out of an already-opened GGUFFile (so
+// the caller can reuse the mmap that holds weights). Unlike tokenizer_load,
+// nothing is mmap'd by this function — token-string memory still lives in
+// the GGUF's mmap (via tk.strs_blob, which we point at a freshly-allocated
+// blob copy so encode/decode work the same way).
+//
+// Supported `tokenizer.ggml.model` values:
+//   "gpt2"  — byte-level BPE (Llama-3, Qwen3). Auto-switches to GPT-2 mode.
+//   "llama" — SentencePiece (Mistral, Gemma2). Default mode.
+//   anything else — exit with an error message; we don't try to guess.
+//
+// Phase-1 scope: vocab + special IDs only. Merges, scores, and the chat
+// template are exposed but not interpreted — greedy longest-prefix-match
+// stays in charge of encoding. The chat template's text lives in the
+// GGUF mmap; tokenizer_chat_template() returns (ptr, len) for callers
+// that want to print it.
+//
+// Returns a Tokenizer with file_base = 0 / file_size = 0 (since we don't
+// own the mmap). tokenizer_free is safe to call on the result — it only
+// frees the heap arrays it allocated and skips the munmap path when
+// file_base is zero.
+// ---------------------------------------------------------------------------
+
+// Compare a (ptr,len) byte range against a NUL-terminated C string.
+// Returns 1 on match, 0 on mismatch.
+fn tk_bytes_eq_cstr(u64 ptr, u64 len, u64 cstr) -> u64 {
+    u64 cl = str_len(cstr)
+    if cl != len { return 0 }
+    u64 i = 0
+    while i < len {
+        if load8(ptr + i) != load8(cstr + i) { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn tokenizer_load_from_gguf(GGUFFile gf) -> Tokenizer {
+    Tokenizer tk = alloc(136)
+    tk.file_size = 0
+    tk.file_base = 0
+    tk.strs_blob = 0
+    tk.id_to_off = 0
+    tk.id_to_len = 0
+    tk.hash_tab  = 0
+    tk.vocab_count = 0
+    tk.strs_blob_len = 0
+    tk.max_tok_len = 0
+    tk.hash_cap = 0
+    tk.bos_id = 0xFFFFFFFFFFFFFFFF
+    tk.eos_id = 0xFFFFFFFFFFFFFFFF
+    tk.pad_id = 0xFFFFFFFFFFFFFFFF
+    tk.unk_id = 0xFFFFFFFFFFFFFFFF
+    tk.byte_fallback_base = 0xFFFFFFFFFFFFFFFF
+    tk_eot_id = 0xFFFFFFFFFFFFFFFF
+    tk_chat_template_p = 0
+    tk_chat_template_l = 0
+
+    // -----------------------------------------------------------------------
+    // Decide kind from tokenizer.ggml.model
+    // -----------------------------------------------------------------------
+    u64 model_p_box = alloc(8); unsafe { *(model_p_box as u64) = 0 }
+    u64 model_l_box = alloc(8); unsafe { *(model_l_box as u64) = 0 }
+    gguf_meta_string(gf, "tokenizer.ggml.model", model_p_box, model_l_box)
+    u64 model_p = 0; unsafe { *(model_p_box as u64) -> model_p }
+    u64 model_l = 0; unsafe { *(model_l_box as u64) -> model_l }
+    dealloc(model_p_box); dealloc(model_l_box)
+    if model_p == 0 {
+        print_str("[tokenizer_gguf] no tokenizer.ggml.model in GGUF\n")
+        return tk
+    }
+    u64 is_gpt2 = tk_bytes_eq_cstr(model_p, model_l, "gpt2")
+    u64 is_spm  = tk_bytes_eq_cstr(model_p, model_l, "llama")
+    if is_gpt2 == 0 && is_spm == 0 {
+        print_str("[tokenizer_gguf] unsupported tokenizer.ggml.model: ")
+        write(1, model_p, model_l)
+        print_str("\n")
+        return tk
+    }
+
+    // -----------------------------------------------------------------------
+    // Vocab — tokens array. Walk once to size the strs_blob, then a second
+    // pass to copy and hash. The token-string bodies stay in the GGUF mmap;
+    // we copy them into our own blob so that strs_blob stays consistent
+    // with tokenizer_load (which owns its blob) and so the per-token
+    // offsets fit in u32.
+    // -----------------------------------------------------------------------
+    u64 vocab_count = gguf_meta_array_len(gf, "tokenizer.ggml.tokens")
+    if vocab_count == 0 {
+        print_str("[tokenizer_gguf] tokenizer.ggml.tokens missing/empty\n")
+        return tk
+    }
+
+    // First pass — measure total byte length and longest token.
+    u64 total_bytes = 0
+    u64 max_len = 0
+    u64 tok_p_box = alloc(8)
+    u64 tok_l_box = alloc(8)
+    u64 i = 0
+    while i < vocab_count {
+        unsafe { *(tok_p_box as u64) = 0 }
+        unsafe { *(tok_l_box as u64) = 0 }
+        if gguf_meta_array_string_get(gf, "tokenizer.ggml.tokens", i,
+                                       tok_p_box, tok_l_box) != 0 {
+            print_str("[tokenizer_gguf] tokens array read failed at idx=")
+            u64 s = fmt_dec(i); print_str(s); dealloc(s); print_str("\n")
+            dealloc(tok_p_box); dealloc(tok_l_box)
+            return tk
+        }
+        u64 ln = 0; unsafe { *(tok_l_box as u64) -> ln }
+        total_bytes = total_bytes + ln
+        if ln > max_len { max_len = ln }
+        i = i + 1
+    }
+
+    // Allocate blob + id tables. We don't have a hard upper bound on id,
+    // so size by vocab_count exactly.
+    u64 blob_cap = total_bytes
+    if blob_cap < 16 { blob_cap = 16 }
+    tk.strs_blob = alloc(blob_cap)
+    tk.id_to_off = alloc(vocab_count * 4)
+    tk.id_to_len = alloc(vocab_count * 4)
+    tk.vocab_count = vocab_count
+    tk.max_tok_len = max_len
+
+    // Second pass — copy bytes, fill id_to_off/id_to_len.
+    u64 blob_off = 0
+    i = 0
+    while i < vocab_count {
+        unsafe { *(tok_p_box as u64) = 0 }
+        unsafe { *(tok_l_box as u64) = 0 }
+        gguf_meta_array_string_get(gf, "tokenizer.ggml.tokens", i,
+                                    tok_p_box, tok_l_box)
+        u64 sp = 0; unsafe { *(tok_p_box as u64) -> sp }
+        u64 ln = 0; unsafe { *(tok_l_box as u64) -> ln }
+        memcpy(tk.strs_blob + blob_off, sp, ln)
+        u32 off32 = blob_off
+        u32 len32 = ln
+        unsafe { *((tk.id_to_off + i * 4) as uint32) = off32 }
+        unsafe { *((tk.id_to_len + i * 4) as uint32) = len32 }
+        blob_off = blob_off + ln
+        i = i + 1
+    }
+    tk.strs_blob_len = blob_off
+    dealloc(tok_p_box); dealloc(tok_l_box)
+
+    // -----------------------------------------------------------------------
+    // Build the hash table (same shape as tokenizer_load).
+    // -----------------------------------------------------------------------
+    u64 hcap = 1
+    while hcap < vocab_count * 2 { hcap = hcap * 2 }
+    tk.hash_cap = hcap
+    tk.hash_tab = alloc(hcap * 8)
+    u64 k = 0
+    while k < hcap {
+        unsafe { *((tk.hash_tab + k * 8) as u64) = 0 }
+        k = k + 1
+    }
+    k = 0
+    while k < vocab_count {
+        u64 off = 0
+        unsafe { *((tk.id_to_off + k * 4) as uint32) -> off }
+        u64 ln = 0
+        unsafe { *((tk.id_to_len + k * 4) as uint32) -> ln }
+        if ln != 0 {
+            tk_hash_insert(tk, tk.strs_blob + off, ln, k)
+        }
+        k = k + 1
+    }
+
+    // -----------------------------------------------------------------------
+    // Special tokens.
+    // -----------------------------------------------------------------------
+    u64 bos = gguf_meta_u32(gf, "tokenizer.ggml.bos_token_id", 0xFFFFFFFF)
+    u64 eos = gguf_meta_u32(gf, "tokenizer.ggml.eos_token_id", 0xFFFFFFFF)
+    u64 pad = gguf_meta_u32(gf, "tokenizer.ggml.padding_token_id", 0xFFFFFFFF)
+    u64 unk = gguf_meta_u32(gf, "tokenizer.ggml.unknown_token_id", 0xFFFFFFFF)
+    u64 eot = gguf_meta_u32(gf, "tokenizer.ggml.eot_token_id", 0xFFFFFFFF)
+    if bos != 0xFFFFFFFF { tk.bos_id = bos }
+    if eos != 0xFFFFFFFF { tk.eos_id = eos }
+    if pad != 0xFFFFFFFF { tk.pad_id = pad }
+    if unk != 0xFFFFFFFF { tk.unk_id = unk }
+    if eot != 0xFFFFFFFF { tk_eot_id = eot }
+
+    // SPM byte-fallback base: look up "<0x00>" — present on Mistral / Gemma2 /
+    // Llama-2 SPM vocabs and the encoder relies on it. GPT-2 byte-level vocabs
+    // have no such token; the encode path skips this branch.
+    if is_spm != 0 {
+        tk.byte_fallback_base = tokenizer_id_of(tk, "<0x00>", 6)
+    }
+
+    // Chat template — store ptr/len for callers; we don't interpret it.
+    u64 ct_p_box = alloc(8); unsafe { *(ct_p_box as u64) = 0 }
+    u64 ct_l_box = alloc(8); unsafe { *(ct_l_box as u64) = 0 }
+    gguf_meta_string(gf, "tokenizer.chat_template", ct_p_box, ct_l_box)
+    unsafe { *(ct_p_box as u64) -> tk_chat_template_p }
+    unsafe { *(ct_l_box as u64) -> tk_chat_template_l }
+    dealloc(ct_p_box); dealloc(ct_l_box)
+
+    // Flip the global to GPT-2 byte-level mode if needed. This populates
+    // the b2c / c2b tables that encode/decode use to walk bytes ↔
+    // codepoints.
+    if is_gpt2 != 0 {
+        tokenizer_set_kind_gpt2(tk)
+    }
 
     return tk
 }

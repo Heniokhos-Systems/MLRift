@@ -281,6 +281,203 @@ fn gguf_meta_u64(GGUFFile gf, u64 name, u64 default_val) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// Array-typed metadata accessors
+//
+// GGUF arrays are stored as:
+//   [u32 elem_type][u64 count][items...]
+// Scalar element types pack at fixed stride; string elements are
+// length-prefixed (u64 + bytes) so random access requires walking the array
+// once to build a per-element offset table.
+//
+// Performance note: the vocab is 32K-128K entries and is read once per
+// tokenizer load. Without caching, gguf_meta_array_string_get would be
+// O(N²). We build an index on first access, keyed by (gf.base_addr,
+// metadata_idx), and reuse it for every subsequent call.
+// ---------------------------------------------------------------------------
+
+// LRU-ish cache of per-array offset tables. Each slot holds:
+//   base : gf.base_addr  (0 = empty slot)
+//   midx : metadata index in that gf
+//   itab : alloc'd u64[count] of absolute pointers to each element header
+//           (for strings: points at the [u64 len] prefix;
+//            for scalars: points at the first element — caller knows stride)
+//   cnt  : element count
+// Linear probe; small fixed size — the 4 chat REPLs touch <10 distinct
+// arrays apiece.
+static u64 gguf_arr_cache_cap = 32
+static u64 gguf_arr_cache_bases = 0   // u64[cap]
+static u64 gguf_arr_cache_midx  = 0   // u64[cap]
+static u64 gguf_arr_cache_itab  = 0   // u64[cap]
+static u64 gguf_arr_cache_cnt   = 0   // u64[cap]
+
+fn gg_arr_cache_init() {
+    if gguf_arr_cache_bases != 0 { return }
+    gguf_arr_cache_bases = alloc(gguf_arr_cache_cap * 8)
+    gguf_arr_cache_midx  = alloc(gguf_arr_cache_cap * 8)
+    gguf_arr_cache_itab  = alloc(gguf_arr_cache_cap * 8)
+    gguf_arr_cache_cnt   = alloc(gguf_arr_cache_cap * 8)
+    u64 i = 0
+    while i < gguf_arr_cache_cap {
+        unsafe { *((gguf_arr_cache_bases + i * 8) as u64) = 0 }
+        unsafe { *((gguf_arr_cache_midx  + i * 8) as u64) = 0 }
+        unsafe { *((gguf_arr_cache_itab  + i * 8) as u64) = 0 }
+        unsafe { *((gguf_arr_cache_cnt   + i * 8) as u64) = 0 }
+        i = i + 1
+    }
+}
+
+// Returns the index of the cache slot for (base, midx). Allocates+populates
+// it on miss. itab is a u64[count] of per-element pointers.
+fn gg_arr_cache_get_or_build(GGUFFile gf, u64 midx,
+                              u64 out_itab_ptr, u64 out_cnt_ptr) {
+    gg_arr_cache_init()
+    u64 base = gf.base_addr
+    u64 slot = 0
+    while slot < gguf_arr_cache_cap {
+        u64 b = 0
+        unsafe { *((gguf_arr_cache_bases + slot * 8) as u64) -> b }
+        u64 m = 0
+        unsafe { *((gguf_arr_cache_midx  + slot * 8) as u64) -> m }
+        if b == base && m == midx {
+            u64 itab = 0
+            unsafe { *((gguf_arr_cache_itab + slot * 8) as u64) -> itab }
+            u64 cnt = 0
+            unsafe { *((gguf_arr_cache_cnt  + slot * 8) as u64) -> cnt }
+            unsafe { *(out_itab_ptr as u64) = itab }
+            unsafe { *(out_cnt_ptr  as u64) = cnt }
+            return
+        }
+        slot = slot + 1
+    }
+    // Miss — walk the array and build an index.
+    u64 vp = gguf_meta_value_ptr(gf, midx)
+    u64 elem_t = gg_read_u32(vp)
+    u64 count  = gg_read_u64(vp + 4)
+    u64 p = vp + 12
+    u64 itab = alloc(count * 8)
+    u64 ss = gg_scalar_size(elem_t)
+    if ss != 0xFFFFFFFFFFFFFFFF {
+        u64 i = 0
+        while i < count {
+            unsafe { *((itab + i * 8) as u64) = p }
+            p = p + ss
+            i = i + 1
+        }
+    } else {
+        // Non-scalar — walk per element (used for STRING arrays).
+        u64 i = 0
+        while i < count {
+            unsafe { *((itab + i * 8) as u64) = p }
+            p = gg_skip_value(p, elem_t)
+            i = i + 1
+        }
+    }
+    // Find a free slot (or overwrite slot 0 if full — small workloads).
+    u64 free_slot = 0xFFFFFFFFFFFFFFFF
+    u64 ss2 = 0
+    while ss2 < gguf_arr_cache_cap {
+        u64 b = 0
+        unsafe { *((gguf_arr_cache_bases + ss2 * 8) as u64) -> b }
+        if b == 0 { free_slot = ss2; ss2 = gguf_arr_cache_cap; continue }
+        ss2 = ss2 + 1
+    }
+    if free_slot == 0xFFFFFFFFFFFFFFFF {
+        // Evict slot 0. Old itab leaks until gguf_free; acceptable for
+        // the bounded workloads here.
+        free_slot = 0
+        u64 old_itab = 0
+        unsafe { *((gguf_arr_cache_itab + 0) as u64) -> old_itab }
+        if old_itab != 0 { dealloc(old_itab) }
+    }
+    unsafe { *((gguf_arr_cache_bases + free_slot * 8) as u64) = base }
+    unsafe { *((gguf_arr_cache_midx  + free_slot * 8) as u64) = midx }
+    unsafe { *((gguf_arr_cache_itab  + free_slot * 8) as u64) = itab }
+    unsafe { *((gguf_arr_cache_cnt   + free_slot * 8) as u64) = count }
+    unsafe { *(out_itab_ptr as u64) = itab }
+    unsafe { *(out_cnt_ptr  as u64) = count }
+}
+
+// Returns the count of elements in array-typed metadata `name`, or 0 if
+// the key is absent or not an array.
+fn gguf_meta_array_len(GGUFFile gf, u64 name) -> u64 {
+    u64 idx = gguf_meta_find(gf, name)
+    if idx == 0xFFFFFFFFFFFFFFFF { return 0 }
+    if gguf_meta_type(gf, idx) != GGUF_TYPE_ARRAY { return 0 }
+    u64 vp = gguf_meta_value_ptr(gf, idx)
+    return gg_read_u64(vp + 4)
+}
+
+// String-array element accessor. Sets *out_ptr = string body ptr (into
+// mmap), *out_len = string byte length. Returns 0 on success, 1 if out of
+// bounds or wrong type.
+fn gguf_meta_array_string_get(GGUFFile gf, u64 name, u64 idx_in,
+                               u64 out_ptr, u64 out_len) -> u64 {
+    u64 midx = gguf_meta_find(gf, name)
+    if midx == 0xFFFFFFFFFFFFFFFF { return 1 }
+    if gguf_meta_type(gf, midx) != GGUF_TYPE_ARRAY { return 1 }
+    u64 vp = gguf_meta_value_ptr(gf, midx)
+    if gg_read_u32(vp) != GGUF_TYPE_STRING { return 1 }
+    u64 box_itab = alloc(8)
+    u64 box_cnt  = alloc(8)
+    gg_arr_cache_get_or_build(gf, midx, box_itab, box_cnt)
+    u64 itab = 0; unsafe { *(box_itab as u64) -> itab }
+    u64 cnt  = 0; unsafe { *(box_cnt  as u64) -> cnt }
+    dealloc(box_itab); dealloc(box_cnt)
+    if idx_in >= cnt { return 1 }
+    u64 ep = 0
+    unsafe { *((itab + idx_in * 8) as u64) -> ep }
+    u64 ln = gg_read_u64(ep)
+    unsafe { *(out_ptr as u64) = (ep + 8) }
+    unsafe { *(out_len as u64) = ln }
+    return 0
+}
+
+// u32/i32 array length (treats UINT32 and INT32 identically). The token-
+// type table (`tokenizer.ggml.token_type`) is i32 in the spec.
+fn gguf_meta_array_u32_len(GGUFFile gf, u64 name) -> u64 {
+    u64 midx = gguf_meta_find(gf, name)
+    if midx == 0xFFFFFFFFFFFFFFFF { return 0 }
+    if gguf_meta_type(gf, midx) != GGUF_TYPE_ARRAY { return 0 }
+    u64 vp = gguf_meta_value_ptr(gf, midx)
+    u64 et = gg_read_u32(vp)
+    if et != GGUF_TYPE_UINT32 && et != GGUF_TYPE_INT32 { return 0 }
+    return gg_read_u64(vp + 4)
+}
+
+// Read element `idx_in` of a u32/i32 array as a u64. Returns 0 if out of
+// bounds or wrong type (callers that need to distinguish "absent" from
+// "0" should call gguf_meta_array_u32_len first).
+fn gguf_meta_array_u32_get(GGUFFile gf, u64 name, u64 idx_in) -> u64 {
+    u64 midx = gguf_meta_find(gf, name)
+    if midx == 0xFFFFFFFFFFFFFFFF { return 0 }
+    if gguf_meta_type(gf, midx) != GGUF_TYPE_ARRAY { return 0 }
+    u64 vp = gguf_meta_value_ptr(gf, midx)
+    u64 et = gg_read_u32(vp)
+    if et != GGUF_TYPE_UINT32 && et != GGUF_TYPE_INT32 { return 0 }
+    u64 cnt = gg_read_u64(vp + 4)
+    if idx_in >= cnt { return 0 }
+    // Scalar stride is 4 bytes; element 0 sits at vp + 12.
+    return gg_read_u32(vp + 12 + idx_in * 4)
+}
+
+// Read element `idx_in` of an f32 array as an f32. Returns 0.0 on miss /
+// out of bounds — SPM scores are non-positive in practice so 0.0 reads
+// as "no score" by the caller.
+fn gguf_meta_array_f32_get(GGUFFile gf, u64 name, u64 idx_in) -> f32 {
+    u64 midx = gguf_meta_find(gf, name)
+    if midx == 0xFFFFFFFFFFFFFFFF { return 0.0f }
+    if gguf_meta_type(gf, midx) != GGUF_TYPE_ARRAY { return 0.0f }
+    u64 vp = gguf_meta_value_ptr(gf, midx)
+    if gg_read_u32(vp) != GGUF_TYPE_FLOAT32 { return 0.0f }
+    u64 cnt = gg_read_u64(vp + 4)
+    if idx_in >= cnt { return 0.0f }
+    u64 elem_ptr = vp + 12 + idx_in * 4
+    f32 v = 0.0f
+    unsafe { *(elem_ptr as f32) -> v }
+    return v
+}
+
+// ---------------------------------------------------------------------------
 // Tensor lookup
 // ---------------------------------------------------------------------------
 

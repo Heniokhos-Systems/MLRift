@@ -11,19 +11,16 @@
 // Run:
 //   MLRIFT_NATIVE_MEGAKERNEL=1 /tmp/mistral_7b_gpu_chat
 //
-// Tokenizer note: this driver loads the HF v0.3 tokenizer.json (vocab
-// 32768) but the Mistral mega-kernel + GGUF weights are v0.2 (vocab
-// 32000).  The two vocabs differ only by the 768 added_tokens prepended
-// at IDs 0..770 in v0.3 (BOS/EOS/[INST]/[/INST]/[control_*]).  Regular
-// text tokens shift by exactly 768: HF_id = GGUF_id + 768 for any
-// piece-level token.  We exploit this by shifting every encoded ID
-// down 768 before feeding the model, and shifting back up before
-// detokenizing for streaming output.  IDs that fall in the v0.3
-// special range (< 771) after encode are dropped — they don't exist
-// in the v0.2 vocab.  The chat-template specials [INST]/[/INST] are
-// spliced in via their v0.2 piece-level IDs (▁[=733 INST=16289 ]=28793,
-// ▁[=733 ▁/=732 INST=16289 ]=28793) since the GGUF v0.2 vocab has no
-// fused [INST] token.
+// Tokenizer: GGUF-embedded vocab (task #297). The previous incarnation of
+// this driver loaded the external HF v0.3 tokenizer.json (vocab 32 768)
+// and applied an ID-shift hack to translate into the GGUF v0.2 vocab
+// (32 000).  By reading `tokenizer.ggml.tokens` directly we land in the
+// model's native ID space — no shift required.  The [INST]/[/INST]
+// markers are not single special tokens in the v0.2 vocab; they encode as
+// multi-token sequences (▁[=733 INST=16289 ]=28793 etc.), which the
+// greedy encoder will produce when those literal characters appear in
+// input.  We splice them at the encoding boundary as plain text in the
+// chat template.
 
 import "../std/qwen3.mlr"
 import "../std/gguf.mlr"
@@ -114,25 +111,33 @@ fn main() {
         thread_pool_shutdown(); exit(1)
     }
 
-    u64 tok_path = ""
-    u64 _ev_tk = getenv("MLRIFT_MISTRAL_TOKENIZER")
-    if _ev_tk != 0 {
-        tok_path = _ev_tk
-    } else {
-        tok_path = "/home/pantelis/.cache/huggingface/hub/models--mistralai--Mistral-7B-Instruct-v0.3/snapshots/c170c708c41dac9275d15a8fff4eca08d52bab71/tokenizer.json"
-    }
-    Tokenizer tk = tokenizer_load(tok_path)
-    if tk.file_size == 0 {
-        print_str("[mistral_7b_gpu_chat] could not open tokenizer at ")
-        print_str(tok_path); print_str("\n")
-        print_str("[mistral_7b_gpu_chat] set MLRIFT_MISTRAL_TOKENIZER to a v0.3 tokenizer.json\n")
+    GGUFFile gf = gguf_open(model_path)
+    if gf.file_size == 0 {
+        print_str("[mistral_7b_gpu_chat] open GGUF failed at "); print_str(model_path); print_str("\n")
         thread_pool_shutdown(); exit(1)
     }
-    // SentencePiece (kind=0) is the default; explicit for clarity.
 
-    // Specials hardcoded by ID (GGUF v0.2 vocab space).
-    u64 BOS_ID      = 1
-    u64 EOS_ID      = 2
+    // Tokenizer comes from the GGUF (task #297). No external tokenizer.json
+    // and no v0.3→v0.2 ID-shift translation — the GGUF carries the v0.2
+    // vocab directly.
+    Tokenizer tk = tokenizer_load_from_gguf(gf)
+    if tk.vocab_count == 0 {
+        print_str("[mistral_7b_gpu_chat] tokenizer_load_from_gguf failed — missing tokenizer.ggml.* keys?\n")
+        gguf_free(gf); thread_pool_shutdown(); exit(1)
+    }
+    // SentencePiece (kind=0). tokenizer_load_from_gguf already picked this
+    // because the Mistral GGUF advertises tokenizer.ggml.model = "llama".
+
+    // Specials sourced from GGUF metadata where available, with the
+    // [INST]/[/INST] marker pieces encoded at startup (the v0.2 vocab
+    // has no fused [INST]/[/INST] token — they tokenize as 3- and 4-piece
+    // sequences respectively, but the IDs are stable across vocabs since
+    // the underlying tokens ▁[ / ▁/ / INST / ] are vocab IDs 733, 732,
+    // 16289 and 28793 respectively in Mistral v0.2 SPM).
+    u64 BOS_ID = tk.bos_id
+    u64 EOS_ID = tk.eos_id
+    if BOS_ID == 0xFFFFFFFFFFFFFFFF { BOS_ID = 1 }
+    if EOS_ID == 0xFFFFFFFFFFFFFFFF { EOS_ID = 2 }
     // [INST] = ▁[ INST ] = 733, 16289, 28793
     // [/INST] = ▁[ ▁/ INST ] = 733, 732, 16289, 28793
     u64 INST_OPEN_0 = 733
@@ -142,18 +147,6 @@ fn main() {
     u64 INST_CLOSE_1 = 732
     u64 INST_CLOSE_2 = 16289
     u64 INST_CLOSE_3 = 28793
-
-    // v0.3 → v0.2 ID shift constant.  Used to translate text-piece IDs
-    // returned by tokenizer_encode into the GGUF vocab the model expects,
-    // and to translate model-emitted argmax IDs back into the HF vocab
-    // for tokenizer_decode.
-    u64 V3_SHIFT = 768
-
-    GGUFFile gf = gguf_open(model_path)
-    if gf.file_size == 0 {
-        print_str("[mistral_7b_gpu_chat] open GGUF failed at "); print_str(model_path); print_str("\n")
-        tokenizer_free(tk); thread_pool_shutdown(); exit(1)
-    }
 
     u64 hidden    = QWEN3_HIDDEN
     u64 q_dim     = QWEN3_Q_DIM
@@ -434,34 +427,14 @@ fn main() {
             break
         }
 
-        // Tokenize user message via HF v0.3 tokenizer (SentencePiece).
+        // Tokenize user message — GGUF-embedded SPM vocab, no ID translation.
         u64 msg_box     = alloc(8); unsafe { *(msg_box     as u64) = 0 }
         u64 msg_cnt_box = alloc(8); unsafe { *(msg_cnt_box as u64) = 0 }
         tokenizer_encode(tk, line, line_len, msg_box, msg_cnt_box)
-        u64 msg_ids_hf = 0; unsafe { *(msg_box     as u64) -> msg_ids_hf }
-        u64 msg_cnt    = 0; unsafe { *(msg_cnt_box as u64) -> msg_cnt }
+        u64 msg_ids_v2 = 0; unsafe { *(msg_box     as u64) -> msg_ids_v2 }
+        u64 msg_cnt_v2 = 0; unsafe { *(msg_cnt_box as u64) -> msg_cnt_v2 }
         dealloc(msg_box); dealloc(msg_cnt_box)
         dealloc(line)
-
-        // Filter v0.3 added_token range (< 771) — these don't exist in
-        // GGUF v0.2; the user is unlikely to type "[INST]" raw, but if
-        // they do, the bracket pieces will get spliced via the template.
-        // Shift remaining IDs down by V3_SHIFT to land in GGUF space.
-        u64 msg_ids_v2 = alloc(msg_cnt * 4 + 4)
-        u64 msg_cnt_v2 = 0
-        u64 mi = 0
-        while mi < msg_cnt {
-            u32 hid32 = 0
-            unsafe { *((msg_ids_hf + mi * 4) as uint32) -> hid32 }
-            u64 hid = hid32
-            if hid >= 771 {
-                u32 vid32 = hid - V3_SHIFT
-                unsafe { *((msg_ids_v2 + msg_cnt_v2 * 4) as uint32) = vid32 }
-                msg_cnt_v2 = msg_cnt_v2 + 1
-            }
-            mi = mi + 1
-        }
-        dealloc(msg_ids_hf)
 
         // Mistral v0.2 chat template (multi-turn):
         //   first turn:  <s> [INST] msg [/INST] <reply> </s>
@@ -592,11 +565,10 @@ fn main() {
             if best_id == EOS_ID { hit_eos = 1; step = max_new; continue }
             if seq_len >= seq_cap { step = max_new; continue }
 
-            // Stream: shift v0.2 id back to v0.3 (id + 768) so the HF
-            // tokenizer.json decoder finds the right piece string.
-            u32 stream_hf32 = best_id + V3_SHIFT
+            // Stream: decode directly in the v0.2 GGUF vocab space.
+            u32 stream_id32 = best_id
             u64 stream_box = alloc(4)
-            unsafe { *(stream_box as uint32) = stream_hf32 }
+            unsafe { *(stream_box as uint32) = stream_id32 }
             u64 tok_text = tokenizer_decode(tk, stream_box, 1)
             print_str(tok_text)
             dealloc(tok_text)
