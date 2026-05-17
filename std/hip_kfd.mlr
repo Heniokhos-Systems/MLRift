@@ -29,6 +29,8 @@ import "kfd.mlr"
 import "thread.mlr"
 import "time.mlr"
 import "sys.mlr"
+import "aql.mlr"
+import "kfd_phase1.mlr"
 
 // Native getenv (sys_getenv from std/sys.mlr) replaces the libc symbol
 // previously pulled in via `@dynamic extern`. Used to gate MLRIFT_BOOST /
@@ -82,6 +84,14 @@ static uint64 _hipkfd_sync_busy_calls = 0   // syncs where v != _hipkfd_pending 
 // per token to 1, and 32 syncs to ~1.
 static uint64 _hipkfd_chain_mode        = 0  // 0 = per-launch doorbell (legacy); 1 = chain
 static uint64 _hipkfd_chain_mode_init   = 0  // env-gate read once
+// 5b-compute Task 5: MLRIFT_PHASE1_DISPATCH=1 routes every launch through
+// std/kfd_phase1.mlr's phase1_submit_packet (builder-based, no inline AQL
+// writes).  Parity-tested vs the legacy inline path; off by default.
+// _hipkfd_phase1_pbuf is a 64-byte scratch buffer the AQL builder fills
+// before phase1_submit_packet copies the body into the ring slot.
+static uint64 _hipkfd_phase1_mode        = 0
+static uint64 _hipkfd_phase1_mode_init   = 0
+static uint64 _hipkfd_phase1_pbuf        = 0
 // Stored as new_wp (one past the last-written slot).  Zero ⇒ nothing
 // pending; non-zero ⇒ doorbell value to ring is `_hipkfd_chain_pending_wp - 1`.
 // Avoids the slot-0 sentinel collision on the very first deferred launch.
@@ -1420,6 +1430,74 @@ fn hipModuleLaunchKernel(
     if block_z > 1 { ndim = 3 }
     unsafe { *((hidden_base + 64) as uint16) = ndim }
     // remainder_*, global_offset_* already zero from the slot pre-zero.
+
+    // 5b-compute Task 5: optional Phase 1 dispatch path.  Reads
+    // MLRIFT_PHASE1_DISPATCH once at first launch; when 1, every subsequent
+    // launch builds the AQL packet via std/aql.mlr and submits via
+    // std/kfd_phase1.mlr's phase1_submit_packet (which rings the doorbell
+    // unconditionally — incompatible with AQL chain mode, so we force chain
+    // mode off here).  Same queue, same kernarg slot, same signal — the
+    // ONLY thing that changes is HOW the packet body and header land in
+    // the ring slot.  Parity expected vs the inline path immediately below.
+    if _hipkfd_phase1_mode_init == 0 {
+        _hipkfd_phase1_mode_init = 1
+        uint64 p1_env = sys_getenv("MLRIFT_PHASE1_DISPATCH")
+        if p1_env != 0 {
+            uint8 p1c = 0; unsafe { *(p1_env as uint8) -> p1c }
+            if p1c != 48 {
+                _hipkfd_phase1_mode = 1
+                // Phase 1 rings the doorbell on every packet — chain mode
+                // would defer it, breaking the queue.  Force chain off.
+                _hipkfd_chain_mode = 0
+                _hipkfd_chain_mode_init = 1
+                _hipkfd_phase1_pbuf = alloc(64)
+            }
+        }
+    }
+
+    if _hipkfd_phase1_mode != 0 {
+        // Mirror the inline path's pending-signal decrement so a
+        // hipDeviceSynchronize on this queue still terminates correctly.
+        uint64 one_p1 = 1
+        _hipkfd_pending = _hipkfd_pending - one_p1
+
+        // Build the kernel-dispatch packet into our scratch buffer, then
+        // hand it to phase1_submit_packet which copies into the ring slot,
+        // bumps wp, and rings the doorbell under the documented fences.
+        uint32 hdr_setup = aql_build_kernel_dispatch(_hipkfd_phase1_pbuf,
+                                                     grid_x, grid_y, grid_z,
+                                                     block_x, block_y, block_z,
+                                                     0,
+                                                     gss + shared_bytes,
+                                                     kd_va,
+                                                     karg_va,
+                                                     _hipkfd_signal)
+        uint64 new_wp_p1 = phase1_submit_packet(_hipkfd_q, _hipkfd_phase1_pbuf, hdr_setup)
+        if new_wp_p1 == 0xFFFFFFFFFFFFFFFF {
+            kfd_die("hipModuleLaunchKernel: phase1_submit_packet back-pressure timeout", 0)
+        }
+        // hist: slot = (new_wp_p1 - 1) mod ring_cap; wp_at_write = new_wp_p1 - 1.
+        uint64 wp_at_write = new_wp_p1 - 1
+        uint64 ring_cap_p1 = _hipkfd_q_ring_cap
+        uint64 slot_p1 = wp_at_write - (wp_at_write / ring_cap_p1) * ring_cap_p1
+        _hipkfd_hist_record(kd_va, karg_va, hdr_setup, slot_p1, wp_at_write, 0)
+
+        // Keep the boost queue topped up so clock state matches the
+        // inline path's behaviour (same env gate, same calls).
+        uint64 boost_env_p1 = sys_getenv("MLRIFT_BOOST")
+        uint64 boost_off_p1 = 0
+        if boost_env_p1 != 0 {
+            uint8 bc1 = 0; unsafe { *(boost_env_p1 as uint8) -> bc1 }
+            if bc1 == 48 { boost_off_p1 = 1 }
+        }
+        if boost_off_p1 == 0 {
+            _hipkfd_boost_topup()
+            _hipkfd_sdma_boost_topup()
+        }
+
+        _hipkfd_launch_count = _hipkfd_launch_count + 1
+        return 0
+    }
 
     // Async dispatch with shared completion signal.
     uint64 one = 1
