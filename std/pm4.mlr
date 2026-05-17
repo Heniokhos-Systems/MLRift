@@ -1,0 +1,134 @@
+// Phase 2a PM4 packet builders (gfx11).  Each emitter writes packet
+// dwords into a caller-owned buffer and returns the number of dwords
+// written so the caller can append further packets contiguously.
+//
+// PM4 type-3 header formula (verified against
+// /tmp/tinygrad/tinygrad/runtime/autogen/am/pm4_nv.py:53):
+//
+//   header = (3 << 30) | ((opcode & 0xFF) << 8) | ((count & 0x3FFF) << 16)
+//
+// where `count = body_dwords - 1` (body excludes the header word).
+//
+// All COMPUTE_* register offsets below are "SET_SH_REG packet offsets",
+// i.e. `native_offset - 0x19A0`, where `0x19A0 = 0x2c00 - 0x1260` is
+// PACKET3_SET_SH_REG_START minus GC_BASE__INST0_SEG0.  See
+// /tmp/phase2_pm4_findings.md sections 3-4 for the derivation.  Numbers
+// cross-checked with /tmp/tinygrad/extra/hip_gpu_driver/test_pm4.py:19-26
+// — for example regCOMPUTE_PGM_LO (native 0x1bac) lands at packet
+// offset 0x20C, matching tinygrad's `0x1bac - SUB`.
+
+// PM4 type-3 opcodes used by Phase 2a (subset of pm4_nv.py).
+static uint32 PM4_PACKET3_TYPE          = 3
+static uint32 PM4_NOP                   = 0x10
+static uint32 PM4_SET_SH_REG            = 0x76
+static uint32 PM4_DISPATCH_DIRECT       = 0x15
+static uint32 PM4_RELEASE_MEM           = 0x49
+static uint32 PM4_ACQUIRE_MEM           = 0x58
+static uint32 PM4_EVENT_WRITE           = 0x46
+static uint32 PM4_INDIRECT_BUFFER       = 0x3F
+
+// gfx11 compute register PM4 SET_SH_REG offsets (native - 0x19A0).
+// Native values from gc_11_0_0_offset.h; SUB = 0x19A0; result fits in
+// the SH-range [0x000..0x400).
+static uint32 PM4_REG_COMPUTE_DISPATCH_INITIATOR = 0x200
+static uint32 PM4_REG_COMPUTE_START_X            = 0x204
+static uint32 PM4_REG_COMPUTE_NUM_THREAD_X       = 0x207
+static uint32 PM4_REG_COMPUTE_PGM_LO             = 0x20C
+static uint32 PM4_REG_COMPUTE_PGM_HI             = 0x20D
+static uint32 PM4_REG_COMPUTE_PGM_RSRC1          = 0x212
+static uint32 PM4_REG_COMPUTE_PGM_RSRC2          = 0x213
+static uint32 PM4_REG_COMPUTE_USER_DATA_0        = 0x240
+
+// DISPATCH_INITIATOR bit mask for a wave32 compute kernel on gfx11.
+// Bit 0  = COMPUTE_SHADER_EN, bit 5 = USE_THREAD_DIMENSIONS,
+// bit 15 = CS_W32_EN.  Value = 0x8021, matching tinygrad's worked
+// example DISPATCH_INIT_VALUE at test_pm4.py:10.
+static uint32 PM4_DISPATCH_INIT_W32_THREADDIM    = 0x8021
+
+// Build the PACKET3 header word for the given opcode + body length in
+// dwords.  `body_dw` MUST be >= 1; the PM4 count field stores
+// body_dw - 1.  The encoded layout is identical to tinygrad's
+// PACKET3 lambda — only the dword-counting convention differs by name.
+fn pm4_build_header(uint32 opcode, uint32 body_dw) -> uint32 {
+    uint32 count = body_dw - 1
+    return (PM4_PACKET3_TYPE << 30) | ((count & 0x3FFF) << 16) | ((opcode & 0xFF) << 8)
+}
+
+// Build a PACKET3_SET_SH_REG that writes `n_regs` consecutive 32-bit
+// values starting at `reg_offset` (a "PM4 SET_SH_REG packet offset" as
+// in the PM4_REG_* constants above).  `values` is a host buffer of
+// n_regs * 4 bytes.  Body layout = reg_offset followed by n_regs
+// values.  Returns total dwords written (1 header + 1 offset + n_regs).
+fn pm4_build_set_sh_reg(uint64 packet, uint32 reg_offset, uint64 values, uint32 n_regs) -> uint32 {
+    uint32 body = n_regs + 1
+    uint32 hdr = pm4_build_header(PM4_SET_SH_REG, body)
+    unsafe { *((packet + 0) as uint32) = hdr }
+    unsafe { *((packet + 4) as uint32) = reg_offset }
+    uint32 i = 0
+    while i < n_regs {
+        uint32 v = 0
+        uint64 src = values + i * 4
+        unsafe { *(src as uint32) -> v }
+        uint64 dst = packet + 8 + i * 4
+        unsafe { *(dst as uint32) = v }
+        i = i + 1
+    }
+    return 2 + n_regs
+}
+
+// Build a PACKET3_DISPATCH_DIRECT: 3 grid dims + dispatch_initiator.
+// Body has 4 dwords; total packet = 5 dwords.
+fn pm4_build_dispatch_direct(uint64 packet,
+                              uint32 grid_x, uint32 grid_y, uint32 grid_z,
+                              uint32 initiator) -> uint32 {
+    uint32 hdr = pm4_build_header(PM4_DISPATCH_DIRECT, 4)
+    unsafe { *((packet + 0)  as uint32) = hdr }
+    unsafe { *((packet + 4)  as uint32) = grid_x }
+    unsafe { *((packet + 8)  as uint32) = grid_y }
+    unsafe { *((packet + 12) as uint32) = grid_z }
+    unsafe { *((packet + 16) as uint32) = initiator }
+    return 5
+}
+
+// Build a PACKET3_RELEASE_MEM that writes a 32-bit `value` to GPU VA
+// `signal_va` after end-of-pipe drain.  Body has 6 dwords; total
+// packet = 7 dwords.
+//
+//   event_dw  = EVENT_TYPE(CACHE_FLUSH_AND_INV_TS=20) |
+//               EVENT_INDEX(end_of_pipe=5) << 8        = 0x0514
+//   memsel_dw = DATA_SEL(send_32_bit_low=1) << 29       = 0x20000000
+//
+// The trailing dword is value_hi (0 for a 32-bit write).
+fn pm4_build_release_mem(uint64 packet, uint64 signal_va, uint32 value) -> uint32 {
+    uint32 hdr = pm4_build_header(PM4_RELEASE_MEM, 6)
+    uint32 event_dw  = 0x0514
+    uint32 memsel_dw = 0x20000000
+    uint32 sig_lo = signal_va & 0xFFFFFFFF
+    uint32 sig_hi = (signal_va >> 32) & 0xFFFFFFFF
+    unsafe { *((packet + 0)  as uint32) = hdr }
+    unsafe { *((packet + 4)  as uint32) = event_dw }
+    unsafe { *((packet + 8)  as uint32) = memsel_dw }
+    unsafe { *((packet + 12) as uint32) = sig_lo }
+    unsafe { *((packet + 16) as uint32) = sig_hi }
+    unsafe { *((packet + 20) as uint32) = value }
+    uint32 zero32 = 0
+    unsafe { *((packet + 24) as uint32) = zero32 }
+    return 7
+}
+
+// Build a PACKET3_NOP.  Useful for padding the ring up to a power-of-2
+// or aligning a subsequent packet.  `body_dw` >= 1 (a 0-body NOP would
+// underflow the count field).  Body bytes are left zero — gfx11 CP
+// firmware accepts arbitrary NOP payloads.
+fn pm4_build_nop(uint64 packet, uint32 body_dw) -> uint32 {
+    uint32 hdr = pm4_build_header(PM4_NOP, body_dw)
+    unsafe { *((packet + 0) as uint32) = hdr }
+    uint32 i = 0
+    while i < body_dw {
+        uint64 dst = packet + 4 + i * 4
+        uint32 zero32 = 0
+        unsafe { *(dst as uint32) = zero32 }
+        i = i + 1
+    }
+    return 1 + body_dw
+}

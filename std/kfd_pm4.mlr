@@ -1,0 +1,224 @@
+// Phase 2a — COMPUTE (non-AQL) KFD queue + PM4 submit primitives.
+//
+// This is the PM4 sibling of std/kfd.mlr:kfd_create_queue + std/
+// kfd_phase1.mlr:phase1_submit_packet.  The KFD queue lives on the
+// same hardware MES/CP scheduler as Phase 1's AQL queue but is created
+// with queue_type = KFD_IOC_QUEUE_TYPE_COMPUTE (0) so the CP firmware
+// decodes raw PM4 packets from the ring instead of 64-byte AQL slots.
+//
+// Reference: /tmp/tinygrad/extra/hip_gpu_driver/test_pm4.py lines 58..132
+// (the only known-good gfx11 PM4-on-KFD recipe).  Key deltas from the
+// AQL queue:
+//
+//   * No EOP buffer, no ctx_save/restore (tinygrad explicitly omits
+//     them in the commented kio.create_queue and it works).
+//   * wp/rp live in a separate uncached GTT page (no amd_queue_t
+//     overlay — that's an AQL-only contract from ROCR-Runtime).
+//   * Ring is indexed in **DWORDS** (32-bit words), not 64-byte AQL
+//     slots.  wp/rp are dword indices.  Doorbell receives the dword
+//     wp.
+//
+// Queue handle layout (~112 bytes — same shape as the AQL queue handle
+// so callers can reuse phase1_dump_queue / sanity helpers):
+//   [0x00] queue_id        (u32)
+//   [0x04] gpu_id          (u32)
+//   [0x08] ring_va         (u64)
+//   [0x10] ring_capacity   (u64)    DWORDS in the ring
+//   [0x18] ring_host_ptr   (u64)    host-mapped ring base
+//   [0x20] doorbell_offset (u64)
+//   [0x28] doorbell_host   (u64)
+//   [0x30] write_ptr_va    (u64)
+//   [0x38] read_ptr_va     (u64)
+//   [0x40] write_ptr_host  (u64)
+//   [0x60] read_ptr_host   (u64)
+
+import "sys.mlr"
+import "time.mlr"
+import "kfd.mlr"
+import "pm4.mlr"
+
+static uint64 PM4_QUEUE_RING_BYTES = 0x8000        // 32 KiB ring => 8192 dwords
+
+fn pm4_create_queue() -> uint64 {
+    if _kfd_initialized == 0 { kfd_init() }
+
+    uint64 q = alloc(112)
+    uint64 i = 0
+    while i < 112 { uint64 p = q + i; unsafe { *(p as uint8) = 0 }; i = i + 1 }
+
+    // Ring lives in uncached GTT so CPU stores are immediately visible
+    // to the CP fetcher (same flag set as the AQL ring).  We reuse the
+    // existing AQL ring allocator because the GTT+UNCACHED+COHERENT
+    // flag combination is exactly what we need; the AQL-specific
+    // metadata-page bookkeeping in dev_alloc_aql_ring is a benign
+    // superset.
+    uint64 ring_va   = dev_alloc_aql_ring(PM4_QUEUE_RING_BYTES)
+    uint64 ring_host = dev_host_ptr(ring_va)
+    // Zero the ring (CP treats undefined opcodes as garbage; clean
+    // start avoids spurious dispatches if firmware fetches past wp).
+    uint64 z = 0
+    while z < PM4_QUEUE_RING_BYTES {
+        uint64 p = ring_host + z; unsafe { *(p as uint64) = 0 }
+        z = z + 8
+    }
+
+    // wp/rp page: separate 4 KiB uncached GTT BO (tinygrad's
+    // gart_compute).  wp at byte 0, rp at byte 8.  This is the
+    // non-AQL contract — there is no amd_queue_t overlay here.
+    uint64 wprp_va   = dev_alloc_host_visible(64)
+    uint64 wprp_host = dev_host_ptr(wprp_va)
+    unsafe { *(wprp_host as uint64) = 0 }
+    unsafe { *((wprp_host + 8) as uint64) = 0 }
+    uint64 wp_va   = wprp_va
+    uint64 rp_va   = wprp_va + 8
+    uint64 wp_host = wprp_host
+    uint64 rp_host = wprp_host + 8
+
+    uint64 qid_slot = alloc(4); uint64 db_slot = alloc(8)
+    uint64 wp_out_slot = alloc(8); uint64 rp_out_slot = alloc(8)
+
+    // KFD_IOC_QUEUE_TYPE_COMPUTE = 0 (vs AQL = 2).  gfx11 MEC firmware
+    // requires EOP + ctx_save BOs on the COMPUTE (PM4) queue path —
+    // tinygrad's test_pm4.py runs them commented because its KFD has
+    // *all* queues sharing a process-wide EOP/ctx pool that's pre-
+    // primed elsewhere, but our launcher is the only KFD client and
+    // needs to provide them itself.  Reuse the AQL queue's gfx1100
+    // sizes (validated against kfd_queue_ctx_save_restore_size for
+    // gfx_target_version 110001).
+    uint64 eop_va = dev_alloc_vram_exec(KFD_EOP_BYTES)
+    uint64 cwsr_total = 28839936    // = ALIGN((CWSR + debug_mem) * num_xcc, 4 KiB)
+    uint64 ctx_va = dev_alloc_vram(cwsr_total)
+    uint32 r = raw_kfd_create_queue(_kfd_fd,
+                                     ring_va, PM4_QUEUE_RING_BYTES,
+                                     _kfd_gpu_id, KFD_IOC_QUEUE_TYPE_COMPUTE, 7,
+                                     eop_va, KFD_EOP_BYTES,
+                                     ctx_va, KFD_CTX_SAVE_BYTES, KFD_CTL_STACK_BYTES,
+                                     wp_va, rp_va,
+                                     qid_slot, db_slot, wp_out_slot, rp_out_slot)
+    if r != 0 {
+        uint64 r64 = r
+        kfd_die("pm4_create_queue: CREATE_QUEUE failed", r64)
+    }
+
+    uint32 qid = 0; unsafe { *(qid_slot as uint32) -> qid }
+    uint64 db_off = 0; unsafe { *(db_slot as uint64) -> db_off }
+
+    // Same doorbell-page mapping dance as the AQL queue: KFD packs
+    // every queue's 8-byte doorbell into a single shared page; mmap
+    // requires a page-aligned offset.
+    uint64 db_page  = db_off & 0xFFFFFFFFFFFFE000
+    uint64 db_in_pg = db_off - db_page
+
+    uint64 db_host = sys_mmap(0, KFD_DOORBELL_PAGE, KFD_DOORBELL_PROT, KFD_DOORBELL_FLAGS,
+                           _kfd_drm_fd, db_page)
+    if db_host > 0xFFFFFFFFFFFFF000 {
+        db_host = sys_mmap(0, KFD_DOORBELL_PAGE, KFD_DOORBELL_PROT, KFD_DOORBELL_FLAGS,
+                        _kfd_fd, db_page)
+        if db_host > 0xFFFFFFFFFFFFF000 {
+            kfd_die("pm4_create_queue: doorbell mmap failed (both fds)", db_host)
+        }
+    }
+    db_host = db_host + db_in_pg
+
+    unsafe { *((q + 0x00) as uint32) = qid }
+    unsafe { *((q + 0x04) as uint32) = _kfd_gpu_id }
+    unsafe { *((q + 0x08) as uint64) = ring_va }
+    // Capacity stored as DWORDS (PM4 wp is a dword index).
+    unsafe { *((q + 0x10) as uint64) = PM4_QUEUE_RING_BYTES / 4 }
+    unsafe { *((q + 0x18) as uint64) = ring_host }
+    unsafe { *((q + 0x20) as uint64) = db_off }
+    unsafe { *((q + 0x28) as uint64) = db_host }
+    unsafe { *((q + 0x30) as uint64) = wp_va }
+    unsafe { *((q + 0x38) as uint64) = rp_va }
+    unsafe { *((q + 0x40) as uint64) = wp_host }
+    unsafe { *((q + 0x60) as uint64) = rp_host }
+
+    return q
+}
+
+// Submit a PM4 packet stream of `n_dwords` 32-bit words starting at
+// `packet_bytes`.  Copies the dwords into the ring at the current wp,
+// advances wp by n_dwords, and rings the doorbell with the new wp.
+// Returns the post-submit wp on success.
+//
+// This mirrors phase1_submit_packet but the ring is dword-indexed
+// (not slot-indexed) — the doorbell receives the dword count directly
+// (NOT new_wp - 1 — that's an AQL contract; non-AQL CP firmware polls
+// wp == doorbell and dispatches up to that dword index).
+fn pm4_submit_dispatch(uint64 q, uint64 packet_bytes, uint64 n_dwords) -> uint64 {
+    uint64 ring_host     = 0; unsafe { *((q + 0x18) as uint64) -> ring_host }
+    uint64 ring_capacity = 0; unsafe { *((q + 0x10) as uint64) -> ring_capacity }
+    uint64 wp_host       = 0; unsafe { *((q + 0x40) as uint64) -> wp_host }
+    uint64 rp_host       = 0; unsafe { *((q + 0x60) as uint64) -> rp_host }
+    uint64 db_host       = 0; unsafe { *((q + 0x28) as uint64) -> db_host }
+
+    uint64 wp = 0; unsafe { *(wp_host as uint64) -> wp }
+
+    // Back-pressure: spin until enough dwords drain that this packet
+    // fits.  ring_capacity is the total dword count of the ring.
+    uint64 rp = 0
+    unsafe { *(rp_host as uint64) -> rp }
+    uint64 spin = 0
+    while (wp - rp + n_dwords) > ring_capacity {
+        spin = spin + 1
+        if (spin & 0xFFFFF) == 0 {
+            if spin > 0x80000000 { return 0xFFFFFFFFFFFFFFFF }
+        }
+        unsafe { *(rp_host as uint64) -> rp }
+    }
+
+    // Compute starting dword index in the ring (handles wrap).  For
+    // simplicity we require the packet not to straddle the ring end;
+    // for Phase 2a smoke n_dwords is small (~32) and the ring is
+    // 8192 dwords, so the first dispatch lands at wp=0 with plenty
+    // of headroom.
+    uint64 slot_dw = wp - (wp / ring_capacity) * ring_capacity
+    uint64 ring_slot = ring_host + slot_dw * 4
+
+    // Copy packet body dword-by-dword.
+    uint64 i = 0
+    while i < n_dwords {
+        uint64 src = packet_bytes + i * 4
+        uint64 dst = ring_slot + i * 4
+        uint32 v = 0
+        unsafe { *(src as uint32) -> v }
+        unsafe { *(dst as uint32) = v }
+        i = i + 1
+    }
+
+    // Fence so body stores precede the wp update (ring is WB,
+    // wp/doorbell are uncached GTT — without mfence the CP can poll
+    // a wp value before the matching body bytes are visible).
+    _kfd_fence()
+
+    uint64 new_wp = wp + n_dwords
+    unsafe { *(wp_host as uint64) = new_wp }
+    _kfd_fence()
+    // PM4 doorbell convention: the value written IS the new wp (dword
+    // count).  See tinygrad test_pm4.py:127 — `compute_doorbell[0] =
+    // wptr` immediately after `compute_write_pointer[0] = wptr`.
+    // Doorbell slot is 8 bytes (u64) on gfx11.
+    unsafe { *(db_host as uint64) = new_wp }
+    return new_wp
+}
+
+// Busy-poll until the CP advances rp to >= `target_wp` (== submitted
+// dword index after our packet).  Mirrors tinygrad's
+// `compute_read_pointer[0] == compute_write_pointer[0]` loop.  Returns
+// 1 on success, 0 on timeout.
+fn pm4_wait_idle(uint64 q, uint64 target_wp, uint64 timeout_ns) -> uint64 {
+    uint64 rp_host = 0; unsafe { *((q + 0x60) as uint64) -> rp_host }
+    uint64 t0 = time_now()
+    uint64 rp = 0
+    unsafe { *(rp_host as uint64) -> rp }
+    uint64 spin = 0
+    while rp < target_wp {
+        spin = spin + 1
+        if (spin & 0xFFFFF) == 0 {
+            uint64 dt = time_now() - t0
+            if dt > timeout_ns { return 0 }
+        }
+        unsafe { *(rp_host as uint64) -> rp }
+    }
+    return 1
+}

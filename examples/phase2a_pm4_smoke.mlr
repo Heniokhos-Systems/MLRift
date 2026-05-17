@@ -1,0 +1,253 @@
+// 5b-compute Phase 2a — PM4 dispatch on a COMPUTE (non-AQL) KFD queue.
+//
+// Dispatches the same `atomic_cas_demo` kernel (from /tmp/m1o.co)
+// twice on the SAME process / SAME GPU through two distinct
+// transports and verifies both produce out_val == 7:
+//
+//   Path A (reference): Phase 1 AQL — kfd_create_queue + aql_build_*
+//                        + phase1_submit_packet.  Already proven by
+//                        examples/phase1_compute_smoke.mlr; here it
+//                        serves as the "GPU is healthy this run"
+//                        ground truth.
+//
+//   Path B (Phase 2a):  PM4 — pm4_create_queue (COMPUTE, queue_type=0)
+//                        + pm4_build_* helpers + pm4_submit_dispatch.
+//                        The CP firmware decodes raw PM4 packets from
+//                        the ring; we drive every step via
+//                        SET_SH_REG packets matching tinygrad's
+//                        extra/hip_gpu_driver/test_pm4.py:88..99.
+//
+// Kernarg ABI for atomic_cas_demo: a single u64* pointing at the
+// 8-byte output slot.  Each path uses its own output buffer + kernarg
+// so a host-side memcmp tells us whether both paths arrived at 7
+// independently.
+
+import "../std/kfd.mlr"
+import "../std/aql.mlr"
+import "../std/kfd_phase1.mlr"
+import "../std/kfd_pm4.mlr"
+import "../std/pm4.mlr"
+import "../std/hip_kfd.mlr"
+
+fn main() {
+    kfd_init()
+
+    // ---------- Module load ----------
+    uint64 mod = kernel_load("/tmp/m1o.co")
+    uint64 kn  = "atomic_cas_demo"
+    uint64 kd  = kernel_get_function(mod, kn)
+    if kd == 0 {
+        print_str("FAIL: kernel_get_function returned 0\n")
+        hipkfd_teardown()
+        exit(1)
+    }
+
+    // Read fields out of the AMDHSA kernel descriptor (layout from
+    // src/format_amdgpu.mlr:493).  Offsets:
+    //   +0x00 group_segment_fixed_size (u32)
+    //   +0x10 kernel_code_entry_byte_offset (i64) — signed; positive in practice
+    //   +0x30 compute_pgm_rsrc1 (u32)
+    //   +0x34 compute_pgm_rsrc2 (u32)
+    uint64 image_base_va   = 0; unsafe { *((mod + 0x10) as uint64) -> image_base_va }
+    uint64 image_base_host = 0; unsafe { *((mod + 0x20) as uint64) -> image_base_host }
+    uint64 kd_host = image_base_host + (kd - image_base_va)
+
+    uint32 gss32 = 0; unsafe { *((kd_host + 0x00) as uint32) -> gss32 }
+    uint64 gss   = gss32
+    uint64 entry_off = 0; unsafe { *((kd_host + 0x10) as uint64) -> entry_off }
+    uint32 rsrc1 = 0; unsafe { *((kd_host + 0x30) as uint32) -> rsrc1 }
+    uint32 rsrc2 = 0; unsafe { *((kd_host + 0x34) as uint32) -> rsrc2 }
+
+    // For PM4 we set PGM_LO/HI to (kernel_object_va >> 8), where the
+    // kernel object is the KD start + entry_byte_offset (matches
+    // tinygrad: `(prg.handle + code.kernel_code_entry_byte_offset) >> 8`).
+    uint64 kobj_va = kd + entry_off
+    uint64 kobj_shifted = kobj_va >> 8
+    uint32 pgm_lo = kobj_shifted & 0xFFFFFFFF
+    uint32 pgm_hi = (kobj_shifted >> 32) & 0xFF
+
+    print_str("kd_va=")
+    println(kd)
+    print_str("entry_off=")
+    println(entry_off)
+    print_str("kobj_va=")
+    println(kobj_va)
+    print_str("rsrc1=")
+    println(rsrc1)
+    print_str("rsrc2=")
+    println(rsrc2)
+
+    // ---------- Buffers ----------
+    uint64 ref_va    = dev_alloc_host_visible(8)
+    uint64 ref_host  = dev_host_ptr(ref_va)
+    uint64 our_va    = dev_alloc_host_visible(8)
+    uint64 our_host  = dev_host_ptr(our_va)
+
+    uint64 karg_ref      = dev_alloc_host_visible(8)
+    uint64 karg_ref_host = dev_host_ptr(karg_ref)
+    unsafe { *(karg_ref_host as uint64) = ref_va }
+    uint64 karg_our      = dev_alloc_host_visible(8)
+    uint64 karg_our_host = dev_host_ptr(karg_our)
+    unsafe { *(karg_our_host as uint64) = our_va }
+
+    // ---------- Path A: Phase 1 AQL reference ----------
+    unsafe { *(ref_host as uint64) = 0 }
+
+    uint64 qa  = kfd_create_queue(KFD_WAIT_BUSY_POLL)
+    uint64 sig = kfd_signal_alloc()
+
+    kfd_signal_reset(sig)
+    uint64 abuf = alloc(64)
+    uint64 azi = 0
+    while azi < 64 {
+        uint64 p = abuf + azi
+        unsafe { *(p as uint8) = 0 }
+        azi = azi + 1
+    }
+    uint32 ahs = aql_build_kernel_dispatch(abuf,
+                                            1, 1, 1,
+                                            1, 1, 1,
+                                            0, gss,
+                                            kd, karg_ref, sig)
+    uint64 a_wp = phase1_submit_packet(qa, abuf, ahs)
+    if a_wp == 0xFFFFFFFFFFFFFFFF {
+        print_str("FAIL: Phase 1 AQL submit back-pressure timeout\n")
+        hipkfd_teardown()
+        exit(1)
+    }
+    uint64 a_ok = phase1_wait_signal(sig, 0, 5000000000)
+    if a_ok == 0 {
+        print_str("FAIL: Phase 1 AQL completion timeout\n")
+        hipkfd_teardown()
+        exit(1)
+    }
+
+    uint64 ref_val = 0
+    unsafe { *(ref_host as uint64) -> ref_val }
+    print_str("ref_val=")
+    println(ref_val)
+    if ref_val != 7 {
+        print_str("FAIL: Phase 1 AQL reference did not produce 7\n")
+        hipkfd_teardown()
+        exit(1)
+    }
+
+    // ---------- Path B: Phase 2a PM4 dispatch ----------
+    unsafe { *(our_host as uint64) = 0 }
+
+    uint64 qb = pm4_create_queue()
+
+    // Build the PM4 packet stream in a host buffer, then submit.
+    // Layout (matches tinygrad test_pm4.py:88..99 with USER_DATA pair
+    // for the kernarg pointer):
+    //
+    //   PACKET3_SET_SH_REG(PGM_LO, 6 regs): pgm_lo, pgm_hi, 0, 0, 0, 0
+    //   PACKET3_SET_SH_REG(RSRC1, 2 regs): rsrc1, rsrc2
+    //   PACKET3_SET_SH_REG(USER_DATA_0, 2 regs): karg_lo, karg_hi
+    //   PACKET3_SET_SH_REG(START_X, 8 regs): 0,0,0, 1,1,1, 0,0
+    //   PACKET3_DISPATCH_DIRECT: 1,1,1, init=CS_W32|THREADDIM|CS_EN
+    //
+    // Max dwords: (1+1+6)+(1+1+2)+(1+1+2)+(1+1+8)+(1+4) = 30 dwords.
+    uint64 pkt = alloc(256)
+    uint64 piz = 0
+    while piz < 256 { uint64 p = pkt + piz; unsafe { *(p as uint8) = 0 }; piz = piz + 1 }
+    uint64 vbuf = alloc(64)
+
+    uint64 cursor = 0
+
+    // SET_SH_REG(PGM_LO, 6) — PGM_LO, PGM_HI, 0, 0, SCRATCH_LO, SCRATCH_HI
+    uint32 v0 = pgm_lo;  unsafe { *((vbuf + 0)  as uint32) = v0 }
+    uint32 v1 = pgm_hi;  unsafe { *((vbuf + 4)  as uint32) = v1 }
+    uint32 vz = 0
+    unsafe { *((vbuf + 8)  as uint32) = vz }
+    unsafe { *((vbuf + 12) as uint32) = vz }
+    unsafe { *((vbuf + 16) as uint32) = vz }
+    unsafe { *((vbuf + 20) as uint32) = vz }
+    uint32 dw = pm4_build_set_sh_reg(pkt + cursor, PM4_REG_COMPUTE_PGM_LO, vbuf, 6)
+    cursor = cursor + dw * 4
+
+    // SET_SH_REG(RSRC1, 2) — rsrc1, rsrc2.
+    uint32 r1 = rsrc1; unsafe { *((vbuf + 0) as uint32) = r1 }
+    uint32 r2 = rsrc2; unsafe { *((vbuf + 4) as uint32) = r2 }
+    dw = pm4_build_set_sh_reg(pkt + cursor, PM4_REG_COMPUTE_PGM_RSRC1, vbuf, 2)
+    cursor = cursor + dw * 4
+
+    // SET_SH_REG(USER_DATA_0, 2) — kernarg ptr lo, hi.
+    uint32 ka_lo = karg_our & 0xFFFFFFFF
+    uint32 ka_hi = (karg_our >> 32) & 0xFFFFFFFF
+    unsafe { *((vbuf + 0) as uint32) = ka_lo }
+    unsafe { *((vbuf + 4) as uint32) = ka_hi }
+    dw = pm4_build_set_sh_reg(pkt + cursor, PM4_REG_COMPUTE_USER_DATA_0, vbuf, 2)
+    cursor = cursor + dw * 4
+
+    // SET_SH_REG(START_X, 8) — START_X/Y/Z=0, NUM_THREAD_X/Y/Z=1,1,1,
+    // then two reserved zeros (PIPELINESTAT/PERFCOUNT_ENABLE).
+    unsafe { *((vbuf + 0)  as uint32) = vz }
+    unsafe { *((vbuf + 4)  as uint32) = vz }
+    unsafe { *((vbuf + 8)  as uint32) = vz }
+    uint32 one = 1
+    unsafe { *((vbuf + 12) as uint32) = one }
+    unsafe { *((vbuf + 16) as uint32) = one }
+    unsafe { *((vbuf + 20) as uint32) = one }
+    unsafe { *((vbuf + 24) as uint32) = vz }
+    unsafe { *((vbuf + 28) as uint32) = vz }
+    dw = pm4_build_set_sh_reg(pkt + cursor, PM4_REG_COMPUTE_START_X, vbuf, 8)
+    cursor = cursor + dw * 4
+
+    // DISPATCH_DIRECT(1, 1, 1, init).  init = CS_W32_EN |
+    // USE_THREAD_DIMENSIONS | COMPUTE_SHADER_EN = 0x8021.
+    dw = pm4_build_dispatch_direct(pkt + cursor, 1, 1, 1,
+                                    PM4_DISPATCH_INIT_W32_THREADDIM)
+    cursor = cursor + dw * 4
+
+    uint64 total_dw = cursor / 4
+    print_str("pm4 total_dw=")
+    println(total_dw)
+
+    uint64 b_wp = pm4_submit_dispatch(qb, pkt, total_dw)
+    if b_wp == 0xFFFFFFFFFFFFFFFF {
+        print_str("FAIL: Phase 2a PM4 submit back-pressure timeout\n")
+        hipkfd_teardown()
+        exit(1)
+    }
+
+    // Wait for CP to drain (rp catches up to wp).  5 s timeout — the
+    // atomic_cas_demo kernel is single-thread and finishes in <1 µs;
+    // anything longer is a wedge.
+    uint64 b_ok = pm4_wait_idle(qb, b_wp, 5000000000)
+    if b_ok == 0 {
+        print_str("FAIL: Phase 2a PM4 completion timeout (wp/rp diverged)\n")
+        uint64 rp_host_b = 0; unsafe { *((qb + 0x60) as uint64) -> rp_host_b }
+        uint64 wp_host_b = 0; unsafe { *((qb + 0x40) as uint64) -> wp_host_b }
+        uint64 rpb = 0; unsafe { *(rp_host_b as uint64) -> rpb }
+        uint64 wpb = 0; unsafe { *(wp_host_b as uint64) -> wpb }
+        print_str("  rp=")
+        println(rpb)
+        print_str("  wp=")
+        println(wpb)
+        hipkfd_teardown()
+        exit(1)
+    }
+
+    uint64 our_val = 0
+    unsafe { *(our_host as uint64) -> our_val }
+
+    // ---------- Verify ----------
+    print_str("our_val=")
+    println(our_val)
+
+    if our_val != 7 {
+        print_str("FAIL: Phase 2a PM4 dispatch did not produce 7\n")
+        hipkfd_teardown()
+        exit(1)
+    }
+    if ref_val != our_val {
+        print_str("FAIL: PM4 result differs from Phase 1 AQL reference\n")
+        hipkfd_teardown()
+        exit(1)
+    }
+
+    print_str("phase2a_pm4_smoke: GREEN (PM4 == AQL == 7)\n")
+    hipkfd_teardown()
+    exit(0)
+}
