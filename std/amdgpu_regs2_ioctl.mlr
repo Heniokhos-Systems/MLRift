@@ -1,31 +1,82 @@
 // Wrapper for amdgpu's amdgpu_regs2 debugfs ioctl. Used only as a
-// cross-validator for our parsed GC_IP_BASE — NOT a runtime path.
+// cross-validator for our parsed GC_IP_BASE and for SRBM-selected
+// per-queue register reads — NOT a runtime path.
 // amdgpu_regs2 is root-only, so callers must invoke as sudo.
 
 import "sys.mlr"
 
 // _IOWR(0x20, 0, struct amdgpu_debugfs_regs2_iocdata)
-// struct is 8 u32 = 32 bytes. Direction _IOWR = 3, size = 32, type = 0x20, nr = 0.
-// ioctl_cmd = (3 << 30) | (32 << 16) | (0x20 << 8) | 0 = 0xC0202000
-static u64 AMDGPU_DEBUGFS_REGS2_IOC_SET_STATE = 0xC0202000
+//
+// Verified against torvalds/linux drivers/gpu/drm/amd/amdgpu/amdgpu_umr.h:
+//   struct amdgpu_debugfs_regs2_iocdata {
+//       __u32 use_srbm, use_grbm, pg_lock;          // off 0,4,8
+//       struct { __u32 se, sh, instance; } grbm;    // off 12,16,20
+//       struct { __u32 me, pipe, queue, vmid; } srbm; // off 24,28,32,36
+//   };
+// 10 * u32 = 40 bytes. Direction _IOWR = 3, size = 40, type = 0x20, nr = 0.
+// ioctl_cmd = (3 << 30) | (40 << 16) | (0x20 << 8) | 0 = 0xC0282000
+//
+// v1 used 0xC0202000 (size=32) which silently failed the kernel ioctl
+// switch case (fell through to -EINVAL) — but GRBM_STATUS reads still
+// worked because the fd defaults to broadcast and the read path doesn't
+// need a successful SET_STATE for global registers. For per-queue
+// CP_HQD_* reads via SRBM we MUST get the size right.
+static u64 AMDGPU_DEBUGFS_REGS2_IOC_SET_STATE = 0xC0282000
 
-// Open + initialize state with broadcast instance.
-fn amdgpu_regs2_open(u64 path) -> u64 {
+// Field byte offsets within amdgpu_debugfs_regs2_iocdata (10 u32, 40 B):
+static u64 REGS2_OFF_USE_SRBM      = 0
+static u64 REGS2_OFF_USE_GRBM      = 4
+static u64 REGS2_OFF_PG_LOCK       = 8
+static u64 REGS2_OFF_GRBM_SE       = 12
+static u64 REGS2_OFF_GRBM_SH       = 16
+static u64 REGS2_OFF_GRBM_INSTANCE = 20
+static u64 REGS2_OFF_SRBM_ME       = 24
+static u64 REGS2_OFF_SRBM_PIPE     = 28
+static u64 REGS2_OFF_SRBM_QUEUE    = 32
+static u64 REGS2_OFF_SRBM_VMID     = 36
+static u64 REGS2_IOCDATA_SIZE      = 40
+
+// Open + initialize state with full GRBM+SRBM selector control.
+// For broadcast / global registers, callers should pass use_grbm=0,
+// use_srbm=0, grbm_instance=0xFFFFFFFF, all else 0.
+// For per-queue CP_HQD_* reads, pass use_srbm=1 with me/pipe/queue
+// matching the target HQD slot (typically MEC me=1 + KFD pipes/queues).
+fn amdgpu_regs2_open_full(u64 path,
+                          u64 use_grbm, u64 se, u64 sh, u64 grbm_instance,
+                          u64 use_srbm, u64 me, u64 pipe, u64 queue, u64 vmid) -> u64 {
     // O_RDWR = 2 (we lseek + read; ioctl wants RDWR)
     u64 fd = sys_open(path, 2, 0)
     if fd > 0xFFFFFFFFFFFFF000 { return 0xFFFFFFFFFFFFFFFF }
-    // amdgpu_debugfs_regs2_iocdata = { use_srbm, use_grbm, pg_lock,
-    //   grbm.{se,sh,instance}, srbm.{me,pipe,queue,vmid} } = 8 * u32 = 32 B
-    u64 iocdata = alloc(32)
+    u64 iocdata = alloc(REGS2_IOCDATA_SIZE)
     u64 z = 0
-    while z < 32 { unsafe { *((iocdata + z) as uint8) = 0 } z = z + 1 }
-    // grbm.instance lives at u32-offset 5 (use_srbm/use_grbm/pg_lock then
-    // grbm{se,sh,instance}). Byte offset = 5*4 = 20. Set to 0xFFFFFFFF
-    // (broadcast — read from any instance).
-    unsafe { *((iocdata + 20) as uint32) = 0xFFFFFFFF }
+    while z < REGS2_IOCDATA_SIZE { unsafe { *((iocdata + z) as uint8) = 0 } z = z + 1 }
+    u32 usrbm_w = use_srbm
+    u32 ugrbm_w = use_grbm
+    u32 se_w = se
+    u32 sh_w = sh
+    u32 ginst_w = grbm_instance
+    u32 me_w = me
+    u32 pipe_w = pipe
+    u32 queue_w = queue
+    u32 vmid_w = vmid
+    unsafe { *((iocdata + REGS2_OFF_USE_SRBM)      as uint32) = usrbm_w }
+    unsafe { *((iocdata + REGS2_OFF_USE_GRBM)      as uint32) = ugrbm_w }
+    unsafe { *((iocdata + REGS2_OFF_GRBM_SE)       as uint32) = se_w }
+    unsafe { *((iocdata + REGS2_OFF_GRBM_SH)       as uint32) = sh_w }
+    unsafe { *((iocdata + REGS2_OFF_GRBM_INSTANCE) as uint32) = ginst_w }
+    unsafe { *((iocdata + REGS2_OFF_SRBM_ME)       as uint32) = me_w }
+    unsafe { *((iocdata + REGS2_OFF_SRBM_PIPE)     as uint32) = pipe_w }
+    unsafe { *((iocdata + REGS2_OFF_SRBM_QUEUE)    as uint32) = queue_w }
+    unsafe { *((iocdata + REGS2_OFF_SRBM_VMID)     as uint32) = vmid_w }
     sys_ioctl(fd, AMDGPU_DEBUGFS_REGS2_IOC_SET_STATE, iocdata)
     dealloc(iocdata)
     return fd
+}
+
+// Open + initialize state with broadcast instance (v1 behavior).
+// Byte-identical to v1: use_grbm=0, use_srbm=0, grbm.instance=0xFFFFFFFF.
+fn amdgpu_regs2_open(u64 path) -> u64 {
+    return amdgpu_regs2_open_full(path, 0, 0, 0, 0xFFFFFFFF, 0, 0, 0, 0, 0)
 }
 
 // Read 4 bytes at the given absolute MMIO byte offset via amdgpu_regs2.
