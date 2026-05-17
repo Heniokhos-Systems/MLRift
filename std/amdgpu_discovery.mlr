@@ -1,0 +1,136 @@
+// IP-discovery binary parser for AMD GPUs (SOC15/SOC21).
+//
+// Parses the in-memory image of the GPU's embedded IP-discovery table
+// (the same data exposed via /sys/class/drm/card0/device/ip_discovery/die/).
+// Returns the first base address of the GC (Graphics+Compute) block, which
+// is hw_id == 11. This address is used as the BAR5 window base for register
+// access without HIP/ROCm.
+//
+// Format reference: linux/drivers/gpu/drm/amd/include/discovery.h
+//
+//   File offset 0:       u32 magic = 0x28211407
+//   IPDS section (found by scanning first 0x100 bytes for sig 0x53444950):
+//     u16 version
+//     u16 size_bytes
+//     u32 pad
+//     u16 num_dies
+//     die_info[num_dies]:
+//       u16 die_id
+//       u16 die_offset   <- file offset of that die's header
+//   Die header at die_offset:
+//     u16 die_id
+//     u16 num_ips
+//     ip_v4[num_ips]:
+//       u16 hw_id
+//       u8  num_instance
+//       u8  num_base_address
+//       u8  major, minor, rev, variant
+//       u8  reserved, harvest
+//       u16 dummy
+//       u32 base_address[num_base_address]
+//
+// GC block hw_id = 11.  We return base_address[0] of instance 0.
+// Returns 0 on any parse error.
+
+fn amdgpu_discovery_gc_ip_base(u64 buf, u64 buf_size) -> u64 {
+    // --- locate IPDS signature ---
+    // Scan first 0x100 bytes for the 4-byte signature 0x53444950 ("IPDS" LE).
+    u64 ipds_off = 0
+    u64 found = 0
+    u64 scan = 0
+    while scan < 0x100 {
+        if scan + 4 > buf_size { scan = 0x100 }
+        else {
+            u32 word = 0
+            unsafe { *((buf + scan) as uint32) -> word }
+            if word == 0x53445049 {
+                ipds_off = scan
+                found = 1
+                scan = 0x100
+            } else {
+                scan = scan + 1
+            }
+        }
+    }
+    if found == 0 { return 0 }
+
+    // --- parse IPDS header ---
+    // Skip 4-byte signature
+    u64 p = ipds_off + 4
+    if p + 10 > buf_size { return 0 }
+
+    u16 version = 0; unsafe { *((buf + p) as uint16) -> version }; p = p + 2
+    u16 size_bytes = 0; unsafe { *((buf + p) as uint16) -> size_bytes }; p = p + 2
+    // skip pad (u32)
+    p = p + 4
+    u16 num_dies = 0; unsafe { *((buf + p) as uint16) -> num_dies }; p = p + 2
+
+    if num_dies == 0 { return 0 }
+    if num_dies > 16 { return 0 }  // sanity cap
+
+    // --- find die 0 offset ---
+    u64 die0_offset = 0
+    u64 found_die0 = 0
+    u64 d = 0
+    while d < num_dies {
+        if p + 4 > buf_size { return 0 }
+        u16 die_id = 0; unsafe { *((buf + p) as uint16) -> die_id }; p = p + 2
+        u16 die_off = 0; unsafe { *((buf + p) as uint16) -> die_off }; p = p + 2
+        if die_id == 0 {
+            die0_offset = die_off
+            found_die0 = 1
+        }
+        d = d + 1
+    }
+    if found_die0 == 0 { return 0 }
+    if die0_offset + 4 > buf_size { return 0 }
+
+    // --- parse die 0 header ---
+    u64 dh = die0_offset
+    u16 dh_die_id = 0; unsafe { *((buf + dh) as uint16) -> dh_die_id }
+    dh = dh + 2
+    u16 num_ips = 0; unsafe { *((buf + dh) as uint16) -> num_ips }
+    dh = dh + 2
+
+    if num_ips == 0 { return 0 }
+    if num_ips > 256 { return 0 }  // sanity cap
+
+    // --- walk ip_v4 entries looking for hw_id == 11 (GC) ---
+    u64 ip_ptr = dh
+    u64 i = 0
+    while i < num_ips {
+        // Each ip_v4 fixed header is 12 bytes:
+        //   [0..1]  hw_id        u16
+        //   [2]     num_instance u8
+        //   [3]     num_base_address u8
+        //   [4]     major        u8
+        //   [5]     minor        u8
+        //   [6]     rev          u8
+        //   [7]     variant      u8
+        //   [8]     reserved     u8
+        //   [9]     harvest      u8
+        //   [10..11] dummy       u16
+        // Followed by num_base_address * 4 bytes of u32 base addresses.
+        if ip_ptr + 12 > buf_size { return 0 }
+
+        u16 hw_id = 0; unsafe { *((buf + ip_ptr) as uint16) -> hw_id }
+        u8 num_inst = 0; unsafe { *((buf + ip_ptr + 2) as uint8) -> num_inst }
+        u8 num_bases = 0; unsafe { *((buf + ip_ptr + 3) as uint8) -> num_bases }
+
+        if hw_id == 11 {
+            // Found GC block. Return base_address[0].
+            if num_bases == 0 { return 0 }
+            if ip_ptr + 12 + 4 > buf_size { return 0 }
+            u32 base0 = 0
+            unsafe { *((buf + ip_ptr + 12) as uint32) -> base0 }
+            return base0
+        }
+
+        // Advance past this entry
+        ip_ptr = ip_ptr + 12 + num_bases * 4
+        i = i + 1
+    }
+
+    // GC block not found
+    return 0
+}
