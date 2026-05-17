@@ -1,0 +1,158 @@
+// SRBM-selected register probe for gfx1100. Reads global registers via
+// BAR5 mmap (fast path), then iterates (me=1, pipe=0..3, queue=0..7)
+// via amdgpu_regs2's SRBM selectors to find live MEC compute queues.
+//
+// Whitelist-only — uses std/amdgpu_regs.mlr. Will NOT panic the kernel.
+// Run as root: echo 131167 | sudo -S /tmp/pci_register_probe_v3
+
+import "../std/amdgpu_discovery.mlr"
+import "../std/amdgpu_regs.mlr"
+import "../std/amdgpu_regs2_ioctl.mlr"
+import "../std/sys.mlr"
+import "../std/io.mlr"
+import "../std/fmt.mlr"
+
+// Print "  NAME" padded to column 26, where NAME comes from amdgpu_reg_name.
+fn print_reg_name_padded(u64 reg_id) {
+    print_str("    ")
+    u64 name = amdgpu_reg_name(reg_id)
+    print_str(name)
+    // Measure C-string length
+    u64 nlen = 0
+    while 1 == 1 {
+        u64 c = 0
+        unsafe { *((name + nlen) as uint8) -> c }
+        if c == 0 { break }
+        nlen = nlen + 1
+    }
+    u64 pad = 22
+    while pad > nlen { print_str(" "); pad = pad - 1 }
+}
+
+// Print " @0x{off} = 0x{val}\n"
+fn print_off_val(u64 byte_off, u32 val) {
+    print_str(" @0x")
+    u64 hs = fmt_hex(byte_off); print_str(hs + 2); dealloc(hs)
+    print_str(" = 0x")
+    u64 vs = fmt_hex(val); print_str(vs + 2); dealloc(vs)
+    print_str("\n")
+}
+
+fn main() {
+    // 1. Load IP_BASE from discovery binary
+    u64 disc_fd = sys_open("tools/discovery.bin", 0, 0)
+    if disc_fd > 0xFFFFFFFFFFFFF000 {
+        print_str("need tools/discovery.bin — run scripts/dump_amdgpu_discovery.sh first\n"); exit(1)
+    }
+    u64 disc_buf = sys_mmap(0, 16384, 1, 2, disc_fd, 0)
+    sys_close(disc_fd)
+    u64 gc_base = amdgpu_discovery_gc_ip_base(disc_buf, 16384)
+    if gc_base == 0 { print_str("GC_IP_BASE parse failed\n"); exit(1) }
+
+    // 2. Open + mmap BAR5 (global-register fast path)
+    u64 bar_fd = sys_open("/sys/bus/pci/devices/0000:03:00.0/resource5", 0, 0)
+    if bar_fd > 0xFFFFFFFFFFFFF000 {
+        print_str("BAR5 open failed — sudo? echo 131167 | sudo -S\n"); exit(1)
+    }
+    u64 bar_va = sys_mmap(0, 1048576, 1, 1, bar_fd, 0)
+    if bar_va > 0xFFFFFFFFFFFFF000 { print_str("BAR5 mmap failed\n"); exit(1) }
+
+    // 3. Print GLOBAL section header
+    print_str("=== gfx1100 GLOBAL registers (GC_IP_BASE = 0x")
+    u64 gs = fmt_hex(gc_base); print_str(gs + 2); dealloc(gs); print_str(") ===\n")
+
+    // Globals: GRBM_STATUS, SCRATCH_REG0, CP_MEC_RS64_INSTR_PNTR
+    u64 globals_ids = alloc(3 * 8)
+    unsafe { *((globals_ids + 0) as uint64) = REG_GRBM_STATUS }
+    unsafe { *((globals_ids + 8) as uint64) = REG_SCRATCH_REG0 }
+    unsafe { *((globals_ids + 16) as uint64) = REG_CP_MEC_RS64_INSTR_PNTR }
+    u64 gi = 0
+    while gi < 3 {
+        u64 rid = 0
+        unsafe { *((globals_ids + gi * 8) as uint64) -> rid }
+        u64 byte_off = amdgpu_reg_byte_offset(rid, gc_base)
+        u32 val = 0
+        unsafe { *((bar_va + byte_off) as uint32) -> val }
+        // Print "  NAME ..." but with 2-space leading indent (not 4); use a small inline copy.
+        print_str("  ")
+        u64 name = amdgpu_reg_name(rid)
+        print_str(name)
+        u64 nlen = 0
+        while 1 == 1 {
+            u64 c = 0
+            unsafe { *((name + nlen) as uint8) -> c }
+            if c == 0 { break }
+            nlen = nlen + 1
+        }
+        u64 pad = 24
+        while pad > nlen { print_str(" "); pad = pad - 1 }
+        print_off_val(byte_off, val)
+        gi = gi + 1
+    }
+    dealloc(globals_ids)
+
+    // 4. HQD scan via amdgpu_regs2 SRBM selectors
+    print_str("=== MEC HQD scan (me=1, pipe=0..3, queue=0..7) ===\n")
+
+    u64 hqd_ids = alloc(5 * 8)
+    unsafe { *((hqd_ids + 0)  as uint64) = REG_CP_HQD_PQ_RPTR }
+    unsafe { *((hqd_ids + 8)  as uint64) = REG_CP_HQD_PQ_WPTR_LO }
+    unsafe { *((hqd_ids + 16) as uint64) = REG_CP_HQD_PQ_BASE }
+    unsafe { *((hqd_ids + 24) as uint64) = REG_CP_CPC_STATUS }
+    unsafe { *((hqd_ids + 32) as uint64) = REG_CP_CPF_STATUS }
+
+    u64 live_count = 0
+    u64 active_byte = amdgpu_reg_byte_offset(REG_CP_HQD_ACTIVE, gc_base)
+    u64 pipe = 0
+    while pipe < 4 {
+        u64 queue = 0
+        while queue < 8 {
+            u64 r2_fd = amdgpu_regs2_open_full(
+                "/sys/kernel/debug/dri/0000:03:00.0/amdgpu_regs2",
+                0, 0, 0, 0xFFFFFFFF,
+                1, 1, pipe, queue, 0)
+            if r2_fd == 0xFFFFFFFFFFFFFFFF {
+                print_str("  amdgpu_regs2 open failed (need root?)\n")
+                exit(1)
+            }
+            u32 active = amdgpu_regs2_read(r2_fd, active_byte)
+            if active != 0 {
+                live_count = live_count + 1
+                print_str("  me=1 pipe=")
+                u64 ps = fmt_dec(pipe); print_str(ps); dealloc(ps)
+                print_str(" queue=")
+                u64 qs = fmt_dec(queue); print_str(qs); dealloc(qs)
+                print_str("  CP_HQD_ACTIVE=0x")
+                u64 as_ = fmt_hex(active); print_str(as_ + 2); dealloc(as_)
+                print_str("\n")
+                // Dump the 5 HQD registers
+                u64 hi = 0
+                while hi < 5 {
+                    u64 hrid = 0
+                    unsafe { *((hqd_ids + hi * 8) as uint64) -> hrid }
+                    u64 hoff = amdgpu_reg_byte_offset(hrid, gc_base)
+                    u32 hval = amdgpu_regs2_read(r2_fd, hoff)
+                    print_reg_name_padded(hrid)
+                    print_off_val(hoff, hval)
+                    hi = hi + 1
+                }
+            }
+            amdgpu_regs2_close(r2_fd)
+            queue = queue + 1
+        }
+        pipe = pipe + 1
+    }
+    dealloc(hqd_ids)
+
+    // 5. Summary
+    if live_count == 0 {
+        print_str("  (no live HQDs found — KFD queue may be idle, or amdgpu didn't bind any)\n")
+    }
+    print_str("=== summary: live HQD count = ")
+    u64 cs = fmt_dec(live_count); print_str(cs); dealloc(cs)
+    print_str(" ===\n")
+
+    sys_munmap(bar_va, 1048576)
+    sys_close(bar_fd)
+    exit(0)
+}
