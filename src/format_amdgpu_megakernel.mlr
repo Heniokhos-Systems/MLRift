@@ -1521,11 +1521,17 @@ fn _emit_gemv_coop_bf16_padded_strided_inline(uint64 n_out, uint64 k, uint64 k_p
     // FMAs in the body form 8 independent dependency chains rather than one
     // serial chain through v2.  This eliminates the v_fmac→v_fmac RAW
     // serialization that the gfx11 issue queue could not hide even with the
-    // 8× unroll's wider load window, AND lays the groundwork for slice 7.6b
-    // (VOPD v_dual_fmac_f32 pairing — task #273) by aligning even/odd vdst
-    // parity for adjacent FMAs.  Post-inner-loop epilogue sums acc[1..7]
-    // back into acc[0]=v2 BEFORE the wave-XOR reduce (which still operates
-    // on v2 alone).
+    // 8× unroll's wider load window.  Post-inner-loop epilogue sums
+    // acc[1..7] back into acc[0]=v2 BEFORE the wave-XOR reduce (which still
+    // operates on v2 alone).
+    //
+    // Slice 7.6b (2026-05-17): the 16 FMAs are now emitted as 8 VOPD pairs
+    // (v_dual_fmac_f32 :: v_dual_fmac_f32) — each pair issues the lo*x_even
+    // half on slot X and the hi*x_odd half on slot Y in a single 64-bit
+    // VOPD instruction, engaging gfx11 dual-issue.  Bank constraints (src0_X
+    // bank != src0_Y bank, src1_X bank != src1_Y bank, vdst even/odd
+    // parity) are satisfied by pairing within a single weight-pair: src0 is
+    // (lo bank 2, hi bank 1), src1 is (x_even bank 3, x_odd bank 0).
     //
     // Precondition: k_iters_outer = k / 16 / 32 must be integer.  Llama-1B
     // (k ∈ {2048, 8192}) → k_iters/8 ∈ {4, 16}.  Qwen3-0.6B (k ∈ {1024,
@@ -1586,26 +1592,22 @@ fn _emit_gemv_coop_bf16_padded_strided_inline(uint64 n_out, uint64 k, uint64 k_p
     asm_v_lshlrev_b32_imm(38, 16, 37)           // v38 = bf16-lo[7] as f32
     asm_u32(0x364A4AFF); asm_u32(0xFFFF0000)    // v37 = bf16-hi[7] as f32
 
-    // 16 FMAs into 8 independent accumulators (acc[i] = v2 if i==0, else v(40+i)).
-    // Pairing (X=lo*x_even, Y=hi*x_odd) by weight-pair satisfies VOPD bank
-    // constraints for slice 7.6b: src0_X∈bank2 vs src0_Y∈bank1, src1_X∈bank3
-    // vs src1_Y∈bank0 (vgpr % 4 = bank).  vdst parities are even/odd alternating.
-    asm_v_fmac_f32_e32_vv(2,  10, 11)           // acc[0] += w0_lo * x[0]
-    asm_v_fmac_f32_e32_vv(41, 9,  12)           // acc[1] += w0_hi * x[1]
-    asm_v_fmac_f32_e32_vv(42, 14, 15)           // acc[2] += w1_lo * x[2]
-    asm_v_fmac_f32_e32_vv(43, 13, 16)           // acc[3] += w1_hi * x[3]
-    asm_v_fmac_f32_e32_vv(44, 18, 19)           // acc[4] += w2_lo * x[4]
-    asm_v_fmac_f32_e32_vv(45, 17, 20)           // acc[5] += w2_hi * x[5]
-    asm_v_fmac_f32_e32_vv(46, 22, 23)           // acc[6] += w3_lo * x[6]
-    asm_v_fmac_f32_e32_vv(47, 21, 24)           // acc[7] += w3_hi * x[7]
-    asm_v_fmac_f32_e32_vv(2,  26, 27)           // acc[0] += w4_lo * x[8]
-    asm_v_fmac_f32_e32_vv(41, 25, 28)           // acc[1] += w4_hi * x[9]
-    asm_v_fmac_f32_e32_vv(42, 30, 31)           // acc[2] += w5_lo * x[10]
-    asm_v_fmac_f32_e32_vv(43, 29, 32)           // acc[3] += w5_hi * x[11]
-    asm_v_fmac_f32_e32_vv(44, 34, 35)           // acc[4] += w6_lo * x[12]
-    asm_v_fmac_f32_e32_vv(45, 33, 36)           // acc[5] += w6_hi * x[13]
-    asm_v_fmac_f32_e32_vv(46, 38, 39)           // acc[6] += w7_lo * x[14]
-    asm_v_fmac_f32_e32_vv(47, 37, 40)           // acc[7] += w7_hi * x[15]
+    // 16 FMAs into 8 independent accumulators, packed as 8 VOPD pairs.
+    // Slice 7.6b (2026-05-17): adjacent (lo*x_even, hi*x_odd) FMAs that
+    // target the X/Y accumulators of one weight-pair are now issued as a
+    // single v_dual_fmac_f32 to engage gfx11 dual-issue.  Per-pair bank
+    // layout (verified — see asm_v_dual_fmac_f32 docstring):
+    //   src0:  X=lo (v10,v14,v18,...) bank 2  |  Y=hi (v9,v13,v17,...) bank 1
+    //   src1:  X=x_even (v11,v15,...) bank 3  |  Y=x_odd (v12,v16,...) bank 0
+    //   vdst:  X∈{v2,v42,v44,v46} even        |  Y∈{v41,v43,v45,v47} odd
+    asm_v_dual_fmac_f32(2,  10, 11,  41, 9,  12)   // acc[0]+=w0_lo*x[0] :: acc[1]+=w0_hi*x[1]
+    asm_v_dual_fmac_f32(42, 14, 15,  43, 13, 16)   // acc[2]+=w1_lo*x[2] :: acc[3]+=w1_hi*x[3]
+    asm_v_dual_fmac_f32(44, 18, 19,  45, 17, 20)   // acc[4]+=w2_lo*x[4] :: acc[5]+=w2_hi*x[5]
+    asm_v_dual_fmac_f32(46, 22, 23,  47, 21, 24)   // acc[6]+=w3_lo*x[6] :: acc[7]+=w3_hi*x[7]
+    asm_v_dual_fmac_f32(2,  26, 27,  41, 25, 28)   // acc[0]+=w4_lo*x[8] :: acc[1]+=w4_hi*x[9]
+    asm_v_dual_fmac_f32(42, 30, 31,  43, 29, 32)   // acc[2]+=w5_lo*x[10]:: acc[3]+=w5_hi*x[11]
+    asm_v_dual_fmac_f32(44, 34, 35,  45, 33, 36)   // acc[4]+=w6_lo*x[12]:: acc[5]+=w6_hi*x[13]
+    asm_v_dual_fmac_f32(46, 38, 39,  47, 37, 40)   // acc[6]+=w7_lo*x[14]:: acc[7]+=w7_hi*x[15]
 
     // advance weight ptr +1024 bytes (8 weights × 128B stride)
     asm_u32(0xD7006A03); asm_u32(0x000206FF); asm_u32(1024)
