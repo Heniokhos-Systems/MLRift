@@ -1,0 +1,208 @@
+// std/psp.mlr — PSP v13 (gc_11_0_3 / Navi 32) bootloader handshake.
+//
+// Slice δ.1 publishes the read-only and helper surface; the live
+// load_kdb / load_sys_drv / load_sos commands land in δ.2 / δ.3 / δ.4.
+//
+// Register access model (all via BAR5):
+//   byte_off = (amdgpu_ip_mp0_base_0 + reg_dw) * 4
+// where reg_dw is the dword offset published in mp_13_0_*_offset.h.
+// Both mp_13_0_2 (Navi 31) and mp_13_0_6 (MI300) agree on the C2PMSG
+// dword offsets, so we use them for mp_13_0_10 (Navi 32) too.
+//
+// Critical handshake facts (cross-checked with amdgpu's psp_v13_0.c):
+//   * Bootloader-ready signal:  C2PMSG_35 reads exactly 0x80000000
+//                               (bit 31 set, all other bits clear).
+//                               If bits[7:0] != 0, that is an error
+//                               code from the previous command.
+//   * Buffer address goes to C2PMSG_36, value = (gpu_bus_va >> 20).
+//     The buffer must be 1 MiB-aligned at the GPU bus address.
+//   * Command word goes to C2PMSG_35 (low-bits encoding). Writing it
+//     clears bit 31 (cmd in flight); PSP re-asserts bit 31 on done.
+//   * SOS-alive signal: C2PMSG_81 changes from its pre-command value
+//     (typically 0 → non-zero) after a successful SOSDRV load.
+//   * SOS firmware version after SOS-alive: read C2PMSG_58.
+
+import "pcidev.mlr"
+import "amdgpu_ip_discovery.mlr"
+import "sys.mlr"
+
+// =====================================================================
+// MP0 C2PMSG register dword offsets (BASE_IDX 0). Source:
+// drivers/gpu/drm/amd/include/asic_reg/mp/mp_13_0_{2,6}_offset.h.
+// =====================================================================
+static uint64 PSP_REG_C2PMSG_33  = 0x0061   // KDB-ready bit 31
+static uint64 PSP_REG_C2PMSG_35  = 0x0063   // bootloader cmd + ready
+static uint64 PSP_REG_C2PMSG_36  = 0x0064   // buffer addr (>>20)
+static uint64 PSP_REG_C2PMSG_58  = 0x007A   // SOS fw version
+static uint64 PSP_REG_C2PMSG_64  = 0x0080   // ring create / kernel cmd
+static uint64 PSP_REG_C2PMSG_67  = 0x0083   // ring wptr (kernel side)
+static uint64 PSP_REG_C2PMSG_69  = 0x0085   // ring base lo
+static uint64 PSP_REG_C2PMSG_70  = 0x0086   // ring base hi
+static uint64 PSP_REG_C2PMSG_71  = 0x0087   // ring size
+static uint64 PSP_REG_C2PMSG_81  = 0x0091   // SOS sign-of-life
+static uint64 PSP_REG_C2PMSG_103 = 0x00A7   // SR-IOV ring hi
+static uint64 PSP_REG_C2PMSG_115 = 0x00B3   // TOS state
+
+// =====================================================================
+// Command words (psp_bootloader_cmd enum from amdgpu_psp.h).
+// =====================================================================
+static uint64 PSP_BL_LOAD_SYSDRV         = 0x00010000
+static uint64 PSP_BL_LOAD_SOSDRV         = 0x00020000
+static uint64 PSP_BL_LOAD_KEY_DATABASE   = 0x00080000
+static uint64 PSP_BL_LOAD_SOCDRV         = 0x000B0000
+static uint64 PSP_BL_LOAD_DBGDRV         = 0x000C0000
+static uint64 PSP_BL_LOAD_INTFDRV        = 0x000D0000
+static uint64 PSP_BL_LOAD_RASDRV         = 0x000E0000
+static uint64 PSP_BL_LOAD_TOS_SPL_TABLE  = 0x10000000
+
+// Ready signal returned in C2PMSG_35 when PSP is idle and the last
+// command (if any) succeeded.
+static uint64 PSP_BL_READY               = 0x80000000
+
+// 1 MiB — both the alignment of the fw buffer and (per amdgpu) the
+// fixed buffer size.
+static uint64 PSP_FW_BUF_SIZE            = 0x100000   // 1 MiB
+
+// Polling budget. amdgpu sleeps msec-scale between polls; we use a
+// raw spin (with sched_yield via nanosleep) and a generous count.
+static uint64 PSP_POLL_BUDGET            = 200000
+
+// =====================================================================
+// Low-level register read/write.
+// =====================================================================
+fn psp_read32(uint64 bar5_host, uint64 reg_dw) -> uint64 {
+    uint64 byte_off = (amdgpu_ip_mp0_base_0 + reg_dw) * 4
+    uint32 v = 0
+    unsafe { *((bar5_host + byte_off) as uint32) -> v }
+    uint64 ret = v
+    return ret
+}
+
+fn psp_write32(uint64 bar5_host, uint64 reg_dw, uint64 val) {
+    uint64 byte_off = (amdgpu_ip_mp0_base_0 + reg_dw) * 4
+    uint32 v = val
+    unsafe { *((bar5_host + byte_off) as uint32) = v }
+}
+
+// =====================================================================
+// State queries (always safe; pure reads).
+// =====================================================================
+
+// Returns 1 if the bootloader is idle and ready for a command
+// (C2PMSG_35 == 0x80000000 exactly). Returns 0 if busy or in error.
+fn psp_is_bootloader_ready(uint64 bar5_host) -> uint64 {
+    uint64 v = psp_read32(bar5_host, PSP_REG_C2PMSG_35)
+    if v == PSP_BL_READY { return 1 }
+    return 0
+}
+
+// Returns the raw C2PMSG_35 value — useful for error-code inspection
+// (bits [7:0] are non-zero on PSP-side command failure).
+fn psp_bootloader_status_raw(uint64 bar5_host) -> uint64 {
+    return psp_read32(bar5_host, PSP_REG_C2PMSG_35)
+}
+
+// Returns 1 if SOS is up (C2PMSG_81 != 0). Mirrors
+// psp_v13_0_is_sos_alive() from the kernel driver.
+fn psp_is_sos_alive(uint64 bar5_host) -> uint64 {
+    uint64 v = psp_read32(bar5_host, PSP_REG_C2PMSG_81)
+    if v != 0 { return 1 }
+    return 0
+}
+
+// Returns the SOS firmware version (valid only after psp_is_sos_alive
+// returns 1).
+fn psp_sos_fw_version(uint64 bar5_host) -> uint64 {
+    return psp_read32(bar5_host, PSP_REG_C2PMSG_58)
+}
+
+// =====================================================================
+// Polling helpers. Spin reads with a small sleep between polls so we
+// don't pin a CPU core.
+// =====================================================================
+
+// Sleep ~1 ms via clock_nanosleep (avoids dragging libc in by name).
+// Falls through silently if the syscall is unavailable.
+fn _psp_msleep(uint64 ms) {
+    uint64 ts = alloc(16)
+    unsafe { *((ts + 0) as uint64) = ms / 1000 }                 // sec
+    unsafe { *((ts + 8) as uint64) = (ms - (ms / 1000) * 1000) * 1000000 }  // nsec
+    // sys_nanosleep = 35 on x86_64
+    syscall_raw(35, ts, 0, 0, 0, 0, 0)
+    dealloc(ts)
+}
+
+// Wait for C2PMSG_35 to settle on PSP_BL_READY. Returns 0 on success,
+// 1 on timeout. The bits [7:0] of the LAST read are placed in
+// *out_err_bits if non-NULL (caller can pass 0 to ignore).
+fn psp_wait_for_bootloader(uint64 bar5_host, uint64 out_err_bits) -> uint64 {
+    uint64 i = 0
+    uint64 last = 0
+    while i < PSP_POLL_BUDGET {
+        last = psp_read32(bar5_host, PSP_REG_C2PMSG_35)
+        if last == PSP_BL_READY {
+            if out_err_bits != 0 { unsafe { *(out_err_bits as uint64) = 0 } }
+            return 0
+        }
+        _psp_msleep(1)
+        i = i + 1
+    }
+    if out_err_bits != 0 {
+        uint64 errb = last & 0xFF
+        unsafe { *(out_err_bits as uint64) = errb }
+    }
+    return 1
+}
+
+// Wait until C2PMSG_81 changes from `snapshot`. Used after the
+// load_sos cmd. Returns 0 on success, 1 on timeout.
+fn psp_wait_for_sos_alive(uint64 bar5_host, uint64 snapshot) -> uint64 {
+    uint64 i = 0
+    while i < PSP_POLL_BUDGET {
+        uint64 v = psp_read32(bar5_host, PSP_REG_C2PMSG_81)
+        if v != snapshot { return 0 }
+        _psp_msleep(1)
+        i = i + 1
+    }
+    return 1
+}
+
+// =====================================================================
+// DMA buffer management.
+// =====================================================================
+
+// Allocate the 1 MiB PSP firmware staging buffer. 1 MiB aligned at the
+// GPU bus address as required by C2PMSG_36's (>> 20) encoding. Writes
+// (host_va, gpu_va) through the output pointers. Returns the same
+// error codes as pci_alloc_sysmem.
+fn psp_alloc_fw_buf(uint64 out_host_va_ptr, uint64 out_gpu_va_ptr) -> uint64 {
+    return pci_alloc_sysmem_aligned(PSP_FW_BUF_SIZE, PSP_FW_BUF_SIZE,
+                                    out_host_va_ptr, out_gpu_va_ptr)
+}
+
+fn psp_free_fw_buf(uint64 host_va, uint64 gpu_va) {
+    pci_free_sysmem(host_va, gpu_va, PSP_FW_BUF_SIZE)
+}
+
+// memset a buffer to zero, byte-by-byte (slow but obviously correct).
+fn psp_zero_buf(uint64 host_va, uint64 size) {
+    uint64 i = 0
+    while i < size {
+        uint8 z = 0
+        unsafe { *((host_va + i) as uint8) = z }
+        i = i + 1
+    }
+}
+
+// Byte-copy a sub-blob into the staging buffer at offset 0. Caller is
+// responsible for having called psp_zero_buf first if zero-padding is
+// expected past `size`.
+fn psp_copy_blob(uint64 host_buf, uint64 src, uint64 size) {
+    uint64 i = 0
+    while i < size {
+        uint8 b = 0
+        unsafe { *((src + i) as uint8) -> b }
+        unsafe { *((host_buf + i) as uint8) = b }
+        i = i + 1
+    }
+}

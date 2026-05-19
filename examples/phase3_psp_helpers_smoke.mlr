@@ -1,0 +1,188 @@
+// Phase 3 slice δ.1 — std/psp.mlr helpers (READ-ONLY).
+//
+// Exercises every pure-read helper plus the DMA buffer allocator.
+// Zero writes to PSP cmd registers. Verifies:
+//   * psp_read32 / psp_is_bootloader_ready / psp_bootloader_status_raw
+//   * psp_is_sos_alive / psp_sos_fw_version
+//   * psp_alloc_fw_buf — confirms (gpu_va & 0xFFFFF) == 0
+//   * psp_zero_buf / psp_copy_blob — local memory operations only
+//
+// Side effects: pci_alloc_sysmem_aligned bumps the IOMMU cursor by
+// 1 MiB but the mapping is freed via psp_free_fw_buf before exit.
+
+import "../std/pcidev.mlr"
+import "../std/amdgpu_ip_discovery.mlr"
+import "../std/psp.mlr"
+import "../std/sys.mlr"
+
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn puts(uint64 s) -> uint32
+
+fn _hex32(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(64)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint8 zx = 48; unsafe { *((b + ll + 1) as uint8) = zx }
+    uint8 xc = 120; unsafe { *((b + ll + 2) as uint8) = xc }
+    uint64 j = 0
+    while j < 8 {
+        uint64 sh = (7 - j) * 4
+        uint64 nyb = (v >> sh) & 0xF
+        uint8 ch = nyb + 48
+        if nyb >= 10 { ch = nyb + 87 }
+        unsafe { *((b + ll + 3 + j) as uint8) = ch }
+        j = j + 1
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 11) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+fn _hex64(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(64)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint8 zx = 48; unsafe { *((b + ll + 1) as uint8) = zx }
+    uint8 xc = 120; unsafe { *((b + ll + 2) as uint8) = xc }
+    uint64 j = 0
+    while j < 16 {
+        uint64 sh = (15 - j) * 4
+        uint64 nyb = (v >> sh) & 0xF
+        uint8 ch = nyb + 48
+        if nyb >= 10 { ch = nyb + 87 }
+        unsafe { *((b + ll + 3 + j) as uint8) = ch }
+        j = j + 1
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 19) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+fn _dec(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(64)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint64 digits = 0
+    if v == 0 {
+        uint8 z = 48; unsafe { *((b + ll + 1) as uint8) = z }; digits = 1
+    } else {
+        uint64 t = v
+        while t > 0 { digits = digits + 1; t = t / 10 }
+        uint64 k = digits
+        t = v
+        while k > 0 {
+            k = k - 1
+            uint64 d = t - (t / 10) * 10
+            uint8 db = d + 48
+            unsafe { *((b + ll + 1 + k) as uint8) = db }
+            t = t / 10
+        }
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 1 + digits) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+fn main() {
+    puts("phase3_psp_helpers_smoke (READ-ONLY)")
+
+    // 1) Open device + map BAR5.
+    uint64 e = pci_open("0000:03:00.0", 14)
+    if e != 0 {
+        _dec("FAIL pci_open", 13, e)
+        _dec("  sys_errno", 11, sys_errno_get())
+        exit(1)
+    }
+    amdgpu_load_navi32_bases()
+    uint64 bar5 = pci_map_bar(PCI_BAR5_REGION_INDEX)
+    if bar5 == PCI_MAP_FAILED_SENTINEL {
+        puts("FAIL: BAR5 mmap")
+        pci_close(); exit(2)
+    }
+
+    // 2) Read-only state queries.
+    _hex32("C2PMSG_35_raw", 13, psp_bootloader_status_raw(bar5))
+    _dec("bootloader_ready",  16, psp_is_bootloader_ready(bar5))
+    _dec("sos_alive",         9,  psp_is_sos_alive(bar5))
+    _hex32("sos_fw_version",  14, psp_sos_fw_version(bar5))
+
+    // 3) Allocate the PSP 1 MiB staging buffer.
+    uint64 hp = alloc(8); unsafe { *(hp as uint64) = 0 }
+    uint64 gp = alloc(8); unsafe { *(gp as uint64) = 0 }
+    uint64 ae = psp_alloc_fw_buf(hp, gp)
+    if ae != 0 {
+        _dec("FAIL psp_alloc_fw_buf", 21, ae)
+        dealloc(hp); dealloc(gp); pci_close(); exit(3)
+    }
+    uint64 hva = 0; unsafe { *(hp as uint64) -> hva }
+    uint64 gva = 0; unsafe { *(gp as uint64) -> gva }
+    dealloc(hp); dealloc(gp)
+    _hex64("psp_fw_buf_host", 15, hva)
+    _hex64("psp_fw_buf_gpu",  14, gva)
+
+    // 4) Verify 1 MiB alignment of the GPU VA.
+    uint64 align_mask = 0xFFFFF
+    uint64 align_check = gva & align_mask
+    _hex64("gva_low20_bits", 14, align_check)
+    if align_check != 0 {
+        puts("FAIL: gpu_va not 1 MiB aligned")
+        psp_free_fw_buf(hva, gva); pci_close(); exit(4)
+    }
+    uint64 c2pmsg36_value = gva >> 20
+    _hex32("C2PMSG_36_would_be", 18, c2pmsg36_value)
+
+    // 5) Local-memory tests: zero a small region and write a sentinel.
+    psp_zero_buf(hva, 4096)
+    uint8 sent_byte = 0
+    unsafe { *((hva + 100) as uint8) -> sent_byte }
+    uint64 sent_u64 = sent_byte
+    _dec("zero_buf_read_back", 18, sent_u64)
+    if sent_byte != 0 {
+        puts("FAIL: zero_buf did not zero")
+        psp_free_fw_buf(hva, gva); pci_close(); exit(5)
+    }
+
+    // psp_copy_blob: write a tiny pattern at host_va source, copy to
+    // dest at offset 8192 of buf, verify.
+    uint64 src = alloc(16)
+    uint64 i = 0
+    while i < 16 {
+        uint8 b = i + 33  // ASCII '!' onward, easy to spot
+        unsafe { *((src + i) as uint8) = b }
+        i = i + 1
+    }
+    psp_copy_blob(hva + 8192, src, 16)
+    uint64 ok = 1
+    uint64 j = 0
+    while j < 16 {
+        uint8 dst_b = 0
+        unsafe { *((hva + 8192 + j) as uint8) -> dst_b }
+        uint8 src_b = 0
+        unsafe { *((src + j) as uint8) -> src_b }
+        if dst_b != src_b { ok = 0 }
+        j = j + 1
+    }
+    dealloc(src)
+    _dec("copy_blob_ok", 12, ok)
+    if ok == 0 {
+        puts("FAIL: copy_blob")
+        psp_free_fw_buf(hva, gva); pci_close(); exit(6)
+    }
+
+    // 6) Re-read PSP regs to confirm no inadvertent state change.
+    _hex32("C2PMSG_35_after", 15, psp_bootloader_status_raw(bar5))
+
+    psp_free_fw_buf(hva, gva)
+    pci_close()
+    puts("phase3_psp_helpers_smoke: GREEN")
+    exit(0)
+}
