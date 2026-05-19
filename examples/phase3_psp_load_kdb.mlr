@@ -23,6 +23,7 @@ import "../std/pcidev.mlr"
 import "../std/amdgpu_ip_discovery.mlr"
 import "../std/amdgpu_firmware.mlr"
 import "../std/psp.mlr"
+import "../std/atom.mlr"
 import "../std/sys.mlr"
 
 @dynamic extern fn exit(uint64 code)
@@ -131,6 +132,34 @@ fn main() {
         pci_close(); dealloc(fw_buf); exit(11)
     }
     _hex32("pci_cmd_after_bm", 16, pci_read_config32(0x04))
+
+    // 2b) Run ATOM AsicInit so the GPU's clock/power state is coherent
+    //     before we issue the PSP DMA command.
+    puts("--- ATOM AsicInit (pre-PSP) ---")
+    uint64 vbp = alloc(8); unsafe { *(vbp as uint64) = 0 }
+    uint64 vsp = alloc(8); unsafe { *(vsp as uint64) = 0 }
+    uint64 vle = atom_load_image("/tmp/mlrift_vbios.rom", vbp, vsp)
+    if vle != 0 {
+        _dec("FAIL atom_load_image", 20, vle)
+        dealloc(vbp); dealloc(vsp)
+        pci_close(); dealloc(fw_buf); exit(8)
+    }
+    uint64 vbios_buf  = 0; unsafe { *(vbp as uint64) -> vbios_buf }
+    uint64 vbios_size = 0; unsafe { *(vsp as uint64) -> vbios_size }
+    dealloc(vbp); dealloc(vsp)
+    uint64 actx = atom_context_init(vbios_buf, vbios_size, bar5)
+    if actx == 0 {
+        puts("FAIL: atom_context_init")
+        dealloc(vbios_buf); pci_close(); dealloc(fw_buf); exit(9)
+    }
+    uint64 ai_params = alloc(64)
+    uint64 ai_i = 0
+    while ai_i < 64 { uint8 z = 0; unsafe { *((ai_params + ai_i) as uint8) = z }; ai_i = ai_i + 1 }
+    uint64 ai_rc = atom_execute_table_by_index(actx, 0, ai_params, 16)
+    _dec("AsicInit_rc", 11, ai_rc)
+    dealloc(ai_params)
+    atom_context_free(actx)
+    dealloc(vbios_buf)
 
     // 3) Pre-state snapshot.
     puts("--- pre ---")
