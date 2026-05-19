@@ -1,0 +1,492 @@
+// Phase 3 slice δ.4 — PSP load_sos + SOS-alive confirm.
+//
+// Final stage of the PSP bootloader sequence. After SOS is loaded and
+// alive, PSP becomes the secure OS for the GPU: it accepts higher-level
+// commands via the SOS ring buffer (separate from C2PMSG_35/36) and
+// owns SMU/RLC/MEC firmware loading. SOS sign-of-life shows up in
+// C2PMSG_81 (transitions from 0 to a non-zero version word).
+//
+// Canonical kernel sequence (amdgpu/psp_v13_0):
+//   load_kdb → load_spl* → load_sysdrv → load_soc_drv* → load_intf_drv*
+//   → load_dbg_drv* → load_ras_drv* → load_sos
+// Sub-blobs marked * are OPTIONAL — not every psp_13_0 firmware variant
+// includes them. We try each in order; if psp_v2_find returns "not in
+// blob", we skip without erroring.
+//
+// Same aperture-identity chassis as ε.0c / δ.3: single buffer at iova
+// 0x40000000, single GMC init, _send_bl_cmd helper inlined.
+//
+// Expected pass shape:
+//   Each cmd completes at poll_iter=0 with err_byte=0.
+//   After SOS cmd: poll C2PMSG_81 for non-zero (SOS sign-of-life).
+//   Final state: post_C2PMSG_81 != 0 == SOS version word.
+
+import "../std/pcidev.mlr"
+import "../std/amdgpu_ip_discovery.mlr"
+import "../std/amdgpu_firmware.mlr"
+import "../std/gmc.mlr"
+import "../std/psp.mlr"
+import "../std/sys.mlr"
+
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn puts(uint64 s) -> uint32
+
+fn _hex32(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(64)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint8 zx = 48; unsafe { *((b + ll + 1) as uint8) = zx }
+    uint8 xc = 120; unsafe { *((b + ll + 2) as uint8) = xc }
+    uint64 j = 0
+    while j < 8 {
+        uint64 sh = (7 - j) * 4
+        uint64 nyb = (v >> sh) & 0xF
+        uint8 ch = nyb + 48
+        if nyb >= 10 { ch = nyb + 87 }
+        unsafe { *((b + ll + 3 + j) as uint8) = ch }
+        j = j + 1
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 11) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+fn _dec(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(64)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint64 digits = 0
+    if v == 0 {
+        uint8 z = 48; unsafe { *((b + ll + 1) as uint8) = z }; digits = 1
+    } else {
+        uint64 t = v
+        while t > 0 { digits = digits + 1; t = t / 10 }
+        uint64 k = digits
+        t = v
+        while k > 0 {
+            k = k - 1
+            uint64 d = t - (t / 10) * 10
+            uint8 db = d + 48
+            unsafe { *((b + ll + 1 + k) as uint8) = db }
+            t = t / 10
+        }
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 1 + digits) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+// Issue one bootloader cmd: zero the buffer, copy the sub-blob, write
+// C2PMSG_36 + C2PMSG_35, poll for bit-31 set. Returns 0 on success
+// (poll saw 0x80000000), 1 on timeout.
+fn _send_bl_cmd(uint64 bar5,
+                uint64 buf_host,
+                uint64 buf_iova,
+                uint64 buf_size,
+                uint64 blob_ptr,
+                uint64 blob_size,
+                uint64 cmd_word) -> uint64 {
+    psp_zero_buf(buf_host, buf_size)
+    psp_copy_blob(buf_host, blob_ptr, blob_size)
+    psp_write32(bar5, PSP_REG_C2PMSG_36, buf_iova >> 20)
+    psp_write32(bar5, PSP_REG_C2PMSG_35, cmd_word)
+    uint64 pi = 0
+    uint64 plast = 0
+    uint64 rc = 1
+    while pi < 30000 {
+        plast = psp_read32(bar5, PSP_REG_C2PMSG_35)
+        if plast == 0x80000000 {
+            rc = 0
+            pi = 30001
+        }
+        if pi != 30001 {
+            if (pi & 0xFFF) == 0 {
+                _hex32("poll_C2PMSG_35", 14, plast)
+                _dec("poll_iter",        9, pi)
+            }
+            uint64 ts = alloc(16)
+            unsafe { *((ts + 0) as uint64) = 0 }
+            unsafe { *((ts + 8) as uint64) = 1000000 }
+            syscall_raw(35, ts, 0, 0, 0, 0, 0)
+            dealloc(ts)
+            pi = pi + 1
+        }
+    }
+    _hex32("final_C2PMSG_35", 15, plast)
+    return rc
+}
+
+// Try to issue an OPTIONAL load cmd. Returns:
+//   0 = success (sub-blob found, cmd completed with err=0)
+//   1 = sub-blob not in firmware (skipped, NOT an error)
+//   2 = cmd timed out
+//   3 = cmd completed but PSP set an err_byte
+fn _try_load(uint64 bar5,
+             uint64 buf_host,
+             uint64 buf_iova,
+             uint64 buf_size,
+             uint64 fw_buf,
+             uint64 fw_sz,
+             uint64 uaob,
+             uint64 fw_type,
+             uint64 cmd_word) -> uint64 {
+    uint64 lp = alloc(16)
+    unsafe { *((lp + 0) as uint64) = 0 }
+    unsafe { *((lp + 8) as uint64) = 0 }
+    uint64 fr = psp_v2_find(fw_buf, fw_sz, fw_type, lp + 0, lp + 8)
+    if fr != 0 {
+        dealloc(lp)
+        return 1
+    }
+    uint64 rel_off = 0; unsafe { *((lp + 0) as uint64) -> rel_off }
+    uint64 sub_size = 0; unsafe { *((lp + 8) as uint64) -> sub_size }
+    dealloc(lp)
+    uint64 sub_ptr = fw_buf + uaob + rel_off
+    _dec("sub_size", 8, sub_size)
+
+    if sub_size > buf_size { return 2 }
+
+    uint64 rc = _send_bl_cmd(bar5, buf_host, buf_iova, buf_size, sub_ptr, sub_size, cmd_word)
+    if rc != 0 { return 2 }
+
+    // Check err_byte of the final C2PMSG_35 reading (success has byte 0).
+    uint64 final_v = psp_read32(bar5, PSP_REG_C2PMSG_35)
+    uint64 errb = final_v & 0xFF
+    if errb != 0 {
+        _hex32("err_byte", 8, errb)
+        return 3
+    }
+    return 0
+}
+
+// Wait for SOS sign of life: C2PMSG_81 transitions from 0 to a
+// non-zero version word. 30 second budget. Also prints C2PMSG_58
+// (SOS fw version) periodically so we can see partial SOS progress
+// even if C2PMSG_81 never goes alive.
+fn _wait_sos_alive(uint64 bar5) -> uint64 {
+    // 20 ms initial settle — kernel does mdelay(20) after writing
+    // C2PMSG_35 with PSP_BL_LOAD_SOSDRV before polling C2PMSG_81.
+    uint64 ts0 = alloc(16)
+    unsafe { *((ts0 + 0) as uint64) = 0 }
+    unsafe { *((ts0 + 8) as uint64) = 20000000 }
+    syscall_raw(35, ts0, 0, 0, 0, 0, 0)
+    dealloc(ts0)
+
+    uint64 i = 0
+    uint64 last = 0
+    while i < 30000 {
+        last = psp_read32(bar5, PSP_REG_C2PMSG_81)
+        if last != 0 {
+            _hex32("sos_C2PMSG_81", 13, last)
+            _dec("sos_alive_iter", 14, i)
+            return 0
+        }
+        if (i & 0x3FF) == 0 {
+            _hex32("wait_C2PMSG_81", 14, last)
+            _hex32("wait_C2PMSG_58", 14, psp_read32(bar5, PSP_REG_C2PMSG_58))
+            _hex32("wait_C2PMSG_35", 14, psp_read32(bar5, PSP_REG_C2PMSG_35))
+            _dec("wait_iter",        9, i)
+        }
+        uint64 ts = alloc(16)
+        unsafe { *((ts + 0) as uint64) = 0 }
+        unsafe { *((ts + 8) as uint64) = 1000000 }
+        syscall_raw(35, ts, 0, 0, 0, 0, 0)
+        dealloc(ts)
+        i = i + 1
+    }
+    return 1
+}
+
+fn main() {
+    puts("phase3_psp_load_sos (δ.4)")
+
+    // ---------------------------------------------------------------
+    // Step 1: Load PSP firmware blob, get ucode-array base.
+    // ---------------------------------------------------------------
+    uint64 bp = alloc(8); unsafe { *(bp as uint64) = 0 }
+    uint64 sp = alloc(8); unsafe { *(sp as uint64) = 0 }
+    uint64 le = fw_load_file("/tmp/mlrift_fw/psp_13_0_10_sos.bin", bp, sp)
+    if le != 0 {
+        _dec("FAIL fw_load_file", 17, le)
+        exit(1)
+    }
+    uint64 fw_buf = 0; unsafe { *(bp as uint64) -> fw_buf }
+    uint64 fw_sz  = 0; unsafe { *(sp as uint64) -> fw_sz }
+    dealloc(bp); dealloc(sp)
+    uint64 uaob = fw_ucode_array_offset_bytes(fw_buf)
+    _hex32("uaob", 4, uaob)
+    _dec("fw_sz",  5, fw_sz)
+
+    // ---------------------------------------------------------------
+    // Step 2: Open device + map BAR5 + Bus Master.
+    // ---------------------------------------------------------------
+    uint64 oe = pci_open("0000:03:00.0", 14)
+    if oe != 0 {
+        _dec("FAIL pci_open", 13, oe)
+        dealloc(fw_buf); exit(2)
+    }
+    amdgpu_load_navi32_bases()
+    uint64 bar5 = pci_map_bar(PCI_BAR5_REGION_INDEX)
+    if bar5 == PCI_MAP_FAILED_SENTINEL {
+        puts("FAIL: BAR5 mmap")
+        pci_close(); dealloc(fw_buf); exit(3)
+    }
+    uint64 bme = pci_set_bus_master()
+    if bme != 0 {
+        _dec("FAIL pci_set_bus_master", 23, bme)
+        pci_close(); dealloc(fw_buf); exit(4)
+    }
+    _hex32("bar5_host_lo", 12, bar5 & 0xFFFFFFFF)
+
+    // ---------------------------------------------------------------
+    // Step 3: Allocate buffer at iova 0x40000000 + scratch page.
+    // ---------------------------------------------------------------
+    // 4 MiB buffer (was 1 MiB). Some psp_13_0 SOS variants are reported
+    // to need more headroom during SOS internal setup; cheap to give it.
+    uint64 hp = alloc(8); unsafe { *(hp as uint64) = 0 }
+    uint64 buf_target_iova = 0x40000000
+    uint64 buf_size_bytes  = 0x400000
+    uint64 ae = pci_alloc_sysmem_at_iova(buf_size_bytes, buf_target_iova, hp)
+    if ae != 0 {
+        _dec("FAIL pci_alloc_sysmem_at_iova", 29, ae)
+        dealloc(hp); pci_close(); dealloc(fw_buf); exit(5)
+    }
+    uint64 buf_host = 0; unsafe { *(hp as uint64) -> buf_host }
+    dealloc(hp)
+    _hex32("buf_size_bytes", 14, buf_size_bytes)
+
+    uint64 sph = alloc(8); unsafe { *(sph as uint64) = 0 }
+    uint64 spg = alloc(8); unsafe { *(spg as uint64) = 0 }
+    uint64 sae = pci_alloc_sysmem_aligned(4096, 4096, sph, spg)
+    if sae != 0 {
+        _dec("FAIL scratch alloc", 18, sae)
+        pci_free_sysmem(buf_host, buf_target_iova, buf_size_bytes)
+        dealloc(sph); dealloc(spg); pci_close(); dealloc(fw_buf); exit(6)
+    }
+    uint64 scratch_iova = 0; unsafe { *(spg as uint64) -> scratch_iova }
+    dealloc(sph); dealloc(spg)
+
+    // ---------------------------------------------------------------
+    // Step 4: GMC aperture identity.
+    // ---------------------------------------------------------------
+    // Aperture covers MC VA [0x40000000, 0x40400000) = 4 MiB.
+    //   LO = 0x40000000 >> 18 = 0x1000
+    //   HI = 0x403FFFFF >> 18 = 0x100F
+    puts("--- GMC aperture-identity init ---")
+    uint64 ie = gmc_init_aperture_identity(bar5, 0x1000, 0x100F, scratch_iova)
+    _dec("gmc_init_rc", 11, ie)
+    if ie != 0 {
+        puts("BAIL: gmc_init failed")
+        pci_free_sysmem(0, scratch_iova, 4096)
+        pci_free_sysmem(buf_host, buf_target_iova, buf_size_bytes)
+        pci_close(); dealloc(fw_buf); exit(7)
+    }
+
+    // ---------------------------------------------------------------
+    // Step 5: Pre-state sanity.
+    // ---------------------------------------------------------------
+    puts("--- pre-PSP state ---")
+    _hex32("pre_C2PMSG_35", 13, psp_bootloader_status_raw(bar5))
+    _hex32("pre_C2PMSG_81", 13, psp_read32(bar5, PSP_REG_C2PMSG_81))
+    _hex32("pre_C2PMSG_58", 13, psp_read32(bar5, PSP_REG_C2PMSG_58))
+    _hex32("pre_C2PMSG_33", 13, psp_read32(bar5, PSP_REG_C2PMSG_33))
+    _hex32("pre_C2PMSG_115", 14, psp_read32(bar5, PSP_REG_C2PMSG_115))
+    if psp_is_bootloader_ready(bar5) == 0 {
+        puts("FAIL: bootloader not ready at entry")
+        pci_free_sysmem(0, scratch_iova, 4096)
+        pci_free_sysmem(buf_host, buf_target_iova, buf_size_bytes)
+        pci_close(); dealloc(fw_buf); exit(8)
+    }
+    if psp_is_sos_alive(bar5) != 0 {
+        puts("WARN: SOS already alive (post-reboot? bailing on load chain)")
+        pci_free_sysmem(0, scratch_iova, 4096)
+        pci_free_sysmem(buf_host, buf_target_iova, buf_size_bytes)
+        pci_close(); dealloc(fw_buf); exit(9)
+    }
+
+    // ---------------------------------------------------------------
+    // Step 6: Required cmds — KDB then SYS_DRV.
+    // ---------------------------------------------------------------
+    puts("=== Cmd: KDB ===")
+    uint64 r_kdb = _try_load(bar5, buf_host, buf_target_iova, buf_size_bytes,
+                              fw_buf, fw_sz, uaob,
+                              PSP_FW_TYPE_KDB, PSP_BL_LOAD_KEY_DATABASE)
+    _dec("kdb_rc", 6, r_kdb)
+    _hex32("post_kdb_C2PMSG_58", 18, psp_read32(bar5, PSP_REG_C2PMSG_58))
+    if r_kdb != 0 {
+        puts("FAIL: KDB not loadable (required)")
+        pci_free_sysmem(0, scratch_iova, 4096)
+        pci_free_sysmem(buf_host, buf_target_iova, buf_size_bytes)
+        pci_close(); dealloc(fw_buf); exit(10)
+    }
+
+    // SPL (Secondary Program Loader) — some psp_13_0 firmwares require
+    // this between KDB and SYS_DRV. Optional — skip if not in blob.
+    puts("=== Cmd: SPL (optional) ===")
+    uint64 r_spl = _try_load(bar5, buf_host, buf_target_iova, buf_size_bytes,
+                              fw_buf, fw_sz, uaob,
+                              PSP_FW_TYPE_SPL, PSP_BL_LOAD_TOS_SPL_TABLE)
+    _dec("spl_rc", 6, r_spl)
+    if r_spl == 1 { puts("  (skipped — SPL not in firmware)") }
+    if r_spl > 1 {
+        puts("FAIL: SPL cmd error")
+        pci_free_sysmem(0, scratch_iova, 4096)
+        pci_free_sysmem(buf_host, buf_target_iova, buf_size_bytes)
+        pci_close(); dealloc(fw_buf); exit(18)
+    }
+    _hex32("post_spl_C2PMSG_58", 18, psp_read32(bar5, PSP_REG_C2PMSG_58))
+
+    puts("=== Cmd: SYS_DRV ===")
+    uint64 r_sys = _try_load(bar5, buf_host, buf_target_iova, buf_size_bytes,
+                              fw_buf, fw_sz, uaob,
+                              PSP_FW_TYPE_SYS_DRV, PSP_BL_LOAD_SYSDRV)
+    _dec("sys_drv_rc", 10, r_sys)
+    _hex32("post_sys_drv_C2PMSG_58", 22, psp_read32(bar5, PSP_REG_C2PMSG_58))
+    if r_sys != 0 {
+        puts("FAIL: SYS_DRV not loadable (required)")
+        pci_free_sysmem(0, scratch_iova, 4096)
+        pci_free_sysmem(buf_host, buf_target_iova, buf_size_bytes)
+        pci_close(); dealloc(fw_buf); exit(11)
+    }
+
+    // ---------------------------------------------------------------
+    // Step 7: Optional intermediate drivers (skip if not in blob).
+    //         Per amdgpu_psp.c order: SOC_DRV, INTF_DRV, DBG_DRV, RAS_DRV.
+    // ---------------------------------------------------------------
+    puts("=== Cmd: SOC_DRV (optional) ===")
+    uint64 r_soc = _try_load(bar5, buf_host, buf_target_iova, buf_size_bytes,
+                              fw_buf, fw_sz, uaob,
+                              PSP_FW_TYPE_SOC_DRV, PSP_BL_LOAD_SOCDRV)
+    _dec("soc_drv_rc", 10, r_soc)
+    if r_soc == 1 { puts("  (skipped — sub-blob not in firmware)") }
+    if r_soc > 1 {
+        puts("FAIL: SOC_DRV cmd error")
+        pci_free_sysmem(0, scratch_iova, 4096)
+        pci_free_sysmem(buf_host, buf_target_iova, buf_size_bytes)
+        pci_close(); dealloc(fw_buf); exit(12)
+    }
+
+    puts("=== Cmd: INTF_DRV (optional) ===")
+    uint64 r_intf = _try_load(bar5, buf_host, buf_target_iova, buf_size_bytes,
+                              fw_buf, fw_sz, uaob,
+                              PSP_FW_TYPE_INTF_DRV, PSP_BL_LOAD_INTFDRV)
+    _dec("intf_drv_rc", 11, r_intf)
+    if r_intf == 1 { puts("  (skipped)") }
+    if r_intf > 1 {
+        puts("FAIL: INTF_DRV cmd error")
+        pci_free_sysmem(0, scratch_iova, 4096)
+        pci_free_sysmem(buf_host, buf_target_iova, buf_size_bytes)
+        pci_close(); dealloc(fw_buf); exit(13)
+    }
+
+    puts("=== Cmd: DBG_DRV (optional) ===")
+    uint64 r_dbg = _try_load(bar5, buf_host, buf_target_iova, buf_size_bytes,
+                              fw_buf, fw_sz, uaob,
+                              PSP_FW_TYPE_DBG_DRV, PSP_BL_LOAD_DBGDRV)
+    _dec("dbg_drv_rc", 10, r_dbg)
+    if r_dbg == 1 { puts("  (skipped)") }
+    if r_dbg > 1 {
+        puts("FAIL: DBG_DRV cmd error")
+        pci_free_sysmem(0, scratch_iova, 4096)
+        pci_free_sysmem(buf_host, buf_target_iova, buf_size_bytes)
+        pci_close(); dealloc(fw_buf); exit(14)
+    }
+
+    puts("=== Cmd: RAS_DRV (optional) ===")
+    uint64 r_ras = _try_load(bar5, buf_host, buf_target_iova, buf_size_bytes,
+                              fw_buf, fw_sz, uaob,
+                              PSP_FW_TYPE_RAS_DRV, PSP_BL_LOAD_RASDRV)
+    _dec("ras_drv_rc", 10, r_ras)
+    if r_ras == 1 { puts("  (skipped)") }
+    if r_ras > 1 {
+        puts("FAIL: RAS_DRV cmd error")
+        pci_free_sysmem(0, scratch_iova, 4096)
+        pci_free_sysmem(buf_host, buf_target_iova, buf_size_bytes)
+        pci_close(); dealloc(fw_buf); exit(15)
+    }
+
+    // ---------------------------------------------------------------
+    // Step 8: Final cmd — SOS_DRV. DIFFERENT WAIT PATTERN than the
+    // other bootloader cmds: SOS is the bootloader's last cmd. After
+    // it loads, the bootloader hands control to SOS itself. C2PMSG_35
+    // does NOT return to 0x80000000 (no bootloader to wait on). SOS
+    // sign-of-life shows up via C2PMSG_81 transitioning from 0 to a
+    // non-zero version word.
+    //
+    // We inline the cmd issue here (don't use _try_load + _send_bl_cmd)
+    // because their wait-for-bootloader pattern would time out.
+    // ---------------------------------------------------------------
+    puts("=== Cmd: SOS_DRV (wait for C2PMSG_81, not BL) ===")
+    uint64 lp_sos = alloc(16)
+    unsafe { *((lp_sos + 0) as uint64) = 0 }
+    unsafe { *((lp_sos + 8) as uint64) = 0 }
+    uint64 fr_sos = psp_v2_find(fw_buf, fw_sz, PSP_FW_TYPE_SOS, lp_sos + 0, lp_sos + 8)
+    if fr_sos != 0 {
+        puts("FAIL: SOS sub-blob not in firmware (required!)")
+        dealloc(lp_sos)
+        pci_free_sysmem(0, scratch_iova, 4096)
+        pci_free_sysmem(buf_host, buf_target_iova, buf_size_bytes)
+        pci_close(); dealloc(fw_buf); exit(16)
+    }
+    uint64 sos_rel_off = 0; unsafe { *((lp_sos + 0) as uint64) -> sos_rel_off }
+    uint64 sos_size    = 0; unsafe { *((lp_sos + 8) as uint64) -> sos_size }
+    dealloc(lp_sos)
+    uint64 sos_ptr = fw_buf + uaob + sos_rel_off
+    _dec("sos_blob_size", 13, sos_size)
+    if sos_size > buf_size_bytes {
+        puts("FAIL: SOS blob exceeds 1 MiB buffer")
+        pci_free_sysmem(0, scratch_iova, 4096)
+        pci_free_sysmem(buf_host, buf_target_iova, buf_size_bytes)
+        pci_close(); dealloc(fw_buf); exit(17)
+    }
+
+    psp_zero_buf(buf_host, buf_size_bytes)
+    psp_copy_blob(buf_host, sos_ptr, sos_size)
+    psp_write32(bar5, PSP_REG_C2PMSG_36, buf_target_iova >> 20)
+    psp_write32(bar5, PSP_REG_C2PMSG_35, PSP_BL_LOAD_SOSDRV)
+    puts("--- SOS_DRV cmd written; now polling C2PMSG_81 for sign-of-life ---")
+
+    // ---------------------------------------------------------------
+    // Step 9: Wait for SOS sign-of-life (C2PMSG_81 non-zero).
+    // ---------------------------------------------------------------
+    uint64 r_alive = _wait_sos_alive(bar5)
+    _dec("sos_alive_rc", 12, r_alive)
+    puts("--- post-SOS-cmd GMC fault status ---")
+    gmc_dump_fault_status(bar5)
+
+    // ---------------------------------------------------------------
+    // Step 10: Post-state.
+    // ---------------------------------------------------------------
+    puts("--- post-PSP state ---")
+    _hex32("post_C2PMSG_35", 14, psp_bootloader_status_raw(bar5))
+    _hex32("post_C2PMSG_81", 14, psp_read32(bar5, PSP_REG_C2PMSG_81))
+    _hex32("post_C2PMSG_33", 14, psp_read32(bar5, PSP_REG_C2PMSG_33))
+    _hex32("post_C2PMSG_58", 14, psp_read32(bar5, PSP_REG_C2PMSG_58))
+    _dec("post_bl_ready",   13, psp_is_bootloader_ready(bar5))
+    _dec("post_sos_alive",  14, psp_is_sos_alive(bar5))
+    if psp_is_sos_alive(bar5) != 0 {
+        _hex32("sos_fw_version", 14, psp_sos_fw_version(bar5))
+    }
+
+    pci_free_sysmem(0, scratch_iova, 4096)
+    pci_free_sysmem(buf_host, buf_target_iova, buf_size_bytes)
+    pci_close()
+    dealloc(fw_buf)
+
+    if r_alive != 0 {
+        puts("verdict: SOS_DRV cmd completed but C2PMSG_81 never went non-zero")
+        puts("  → SOS may need additional drivers loaded first")
+        puts("  → check post-SOS-cmd fault status for clues")
+        puts("phase3_psp_load_sos: FAIL")
+        exit(17)
+    }
+    puts("verdict: SOS ALIVE ✓ — PSP is operational")
+    puts("phase3_psp_load_sos: GREEN")
+    exit(0)
+}
