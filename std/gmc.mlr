@@ -1,0 +1,92 @@
+// std/gmc.mlr — Navi 32 (gc_11_0_3) MMHUB GMC GART setup.
+//
+// Slice ε.0a deliverable: bring the GPU's MMHUB MMU up enough that a
+// chosen MC virtual address range translates through a software-defined
+// 2-level GART (PD0 + one PT) to an IOMMU-mapped sysmem buffer. After
+// this, the PSP bootloader can DMA-fetch firmware buffers via that MC
+// VA range (covered by follow-up slice ε.0b).
+//
+// Reference: tinygrad runtime/support/am/ip.py:117-152 (init_hub) and
+// kernel drivers/gpu/drm/amd/amdgpu/gmc_v11_0.c + mmhub_v3_0.c.
+//
+// All MMIO is direct BAR5 writes through the byte offset
+//   byte_off = (amdgpu_ip_mmhub_base_0 + reg_dw) * 4
+// where amdgpu_ip_mmhub_base_0 = 0x1A000 on Navi 32.
+
+import "pcidev.mlr"
+import "amdgpu_ip_discovery.mlr"
+import "gmc_constants.mlr"
+import "sys.mlr"
+
+// =====================================================================
+// Page-table context — 32-byte struct holding both pages' host + iova.
+// =====================================================================
+static uint64 GMC_PT_OFF_PD_HOST   = 0     // uint64 — PD0 host VA
+static uint64 GMC_PT_OFF_PD_IOVA   = 8     // uint64 — PD0 GPU iova
+static uint64 GMC_PT_OFF_PT_HOST   = 16    // uint64 — PT host VA
+static uint64 GMC_PT_OFF_PT_IOVA   = 24    // uint64 — PT GPU iova
+static uint64 GMC_PT_CTX_SIZE      = 32
+
+// =====================================================================
+// gmc_alloc_page_table — allocate PD0 + PT pages (4 KiB each, IOMMU-
+// mapped, zero-filled). Writes the new 32-byte ctx pointer through
+// out_pt_ctx_ptr.
+//
+// Returns:
+//   0 on success.
+//   N — the rc from pci_alloc_sysmem_aligned of the failing alloc.
+// =====================================================================
+fn gmc_alloc_page_table(uint64 out_pt_ctx_ptr) -> uint64 {
+    // Allocate two pages via IOMMU mapping. Both 4 KiB, both 4 KiB-aligned.
+    uint64 pd_hp = alloc(8); unsafe { *(pd_hp as uint64) = 0 }
+    uint64 pd_gp = alloc(8); unsafe { *(pd_gp as uint64) = 0 }
+    uint64 e1 = pci_alloc_sysmem_aligned(GMC_PAGE_SIZE_BYTES,
+                                          GMC_PAGE_SIZE_BYTES,
+                                          pd_hp, pd_gp)
+    if e1 != 0 { dealloc(pd_hp); dealloc(pd_gp); return e1 }
+    uint64 pd_host = 0; unsafe { *(pd_hp as uint64) -> pd_host }
+    uint64 pd_iova = 0; unsafe { *(pd_gp as uint64) -> pd_iova }
+    dealloc(pd_hp); dealloc(pd_gp)
+
+    uint64 pt_hp = alloc(8); unsafe { *(pt_hp as uint64) = 0 }
+    uint64 pt_gp = alloc(8); unsafe { *(pt_gp as uint64) = 0 }
+    uint64 e2 = pci_alloc_sysmem_aligned(GMC_PAGE_SIZE_BYTES,
+                                          GMC_PAGE_SIZE_BYTES,
+                                          pt_hp, pt_gp)
+    if e2 != 0 {
+        pci_free_sysmem(pd_host, pd_iova, GMC_PAGE_SIZE_BYTES)
+        dealloc(pt_hp); dealloc(pt_gp); return e2
+    }
+    uint64 pt_host = 0; unsafe { *(pt_hp as uint64) -> pt_host }
+    uint64 pt_iova = 0; unsafe { *(pt_gp as uint64) -> pt_iova }
+    dealloc(pt_hp); dealloc(pt_gp)
+
+    // Zero-fill both pages (they're freshly mmap'd MAP_ANONYMOUS so
+    // should already be zero, but be explicit).
+    uint64 i = 0
+    while i < GMC_PAGE_SIZE_BYTES {
+        uint8 z = 0
+        unsafe { *((pd_host + i) as uint8) = z }
+        unsafe { *((pt_host + i) as uint8) = z }
+        i = i + 1
+    }
+
+    uint64 ctx = alloc(GMC_PT_CTX_SIZE)
+    unsafe { *((ctx + GMC_PT_OFF_PD_HOST) as uint64) = pd_host }
+    unsafe { *((ctx + GMC_PT_OFF_PD_IOVA) as uint64) = pd_iova }
+    unsafe { *((ctx + GMC_PT_OFF_PT_HOST) as uint64) = pt_host }
+    unsafe { *((ctx + GMC_PT_OFF_PT_IOVA) as uint64) = pt_iova }
+
+    unsafe { *(out_pt_ctx_ptr as uint64) = ctx }
+    return 0
+}
+
+fn gmc_page_table_free(uint64 pt_ctx) {
+    uint64 pd_host = 0; unsafe { *((pt_ctx + GMC_PT_OFF_PD_HOST) as uint64) -> pd_host }
+    uint64 pd_iova = 0; unsafe { *((pt_ctx + GMC_PT_OFF_PD_IOVA) as uint64) -> pd_iova }
+    uint64 pt_host = 0; unsafe { *((pt_ctx + GMC_PT_OFF_PT_HOST) as uint64) -> pt_host }
+    uint64 pt_iova = 0; unsafe { *((pt_ctx + GMC_PT_OFF_PT_IOVA) as uint64) -> pt_iova }
+    pci_free_sysmem(pt_host, pt_iova, GMC_PAGE_SIZE_BYTES)
+    pci_free_sysmem(pd_host, pd_iova, GMC_PAGE_SIZE_BYTES)
+    dealloc(pt_ctx)
+}
