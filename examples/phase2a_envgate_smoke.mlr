@@ -1,0 +1,164 @@
+// 5b-compute attempt #6 — env-gate parity smoke.
+//
+// Dispatches rmsnorm_f32_1024 via the HIP-API path (hipModuleLoadData
+// + hipModuleGetFunction + hipModuleLaunchKernel + hipDeviceSynchronize)
+// so that MLRIFT_PHASE2A_DISPATCH=1 routes through the new PM4 gate in
+// std/hip_kfd.mlr.  Without the env var it falls through to the legacy
+// inline AQL path.
+//
+// Run twice and diff outputs:
+//   /tmp/phase2a_envgate_smoke                          > /tmp/aql_out.bin
+//   MLRIFT_PHASE2A_DISPATCH=1 /tmp/phase2a_envgate_smoke > /tmp/pm4_out.bin
+//   diff /tmp/aql_out.bin /tmp/pm4_out.bin   # expected: empty
+//
+// In-process, the smoke also prints out[0] bits — the bit-exact value
+// proven in commit e23d94c against rmsnorm_f32_1024 is 0xBF55D8AF
+// (decimal 3209991279) for the standalone test inputs.  This launcher
+// uses different inputs (ramp 0.1..2.148 + non-trivial gamma) so its
+// value will differ, but the AQL and PM4 runs must match each other.
+
+import "../std/hip.mlr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn write(int32 fd, uint64 buf, uint64 n) -> int64
+@dynamic extern fn exit(uint64 code)
+
+fn u64_to_ascii(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 { uint8 z = 48; unsafe { *(buf as uint8) = z }; return 1 }
+    uint64 n = 0; uint64 tmp = val
+    while tmp > 0 { n = n + 1; tmp = tmp / 10 }
+    uint64 i = n; tmp = val
+    while i > 0 {
+        i = i - 1
+        uint64 d = tmp - (tmp / 10) * 10
+        uint64 p = buf + i; uint8 c = d + 48
+        unsafe { *(p as uint8) = c }
+        tmp = tmp / 10
+    }
+    return n
+}
+
+fn print_label_u64(uint64 label, uint64 label_len, uint64 val) {
+    uint64 buf = alloc(160); uint64 i = 0
+    while i < label_len {
+        uint64 sp = label + i; uint64 c = 0
+        unsafe { *(sp as uint8) -> c }
+        uint64 dp = buf + i; uint8 cb = c
+        unsafe { *(dp as uint8) = cb }
+        i = i + 1
+    }
+    uint64 cp = buf + label_len; uint8 col = 58; unsafe { *(cp as uint8) = col }
+    uint64 sp2 = buf + label_len + 1; uint8 space = 32; unsafe { *(sp2 as uint8) = space }
+    uint64 nb  = buf + label_len + 2
+    uint64 dl  = u64_to_ascii(val, nb)
+    uint64 np  = buf + label_len + 2 + dl
+    uint8 nul  = 0; unsafe { *(np as uint8) = nul }
+    puts(buf)
+}
+
+fn die(uint64 msg, uint64 code) { puts(msg); print_label_u64("err", 3, code); exit(1) }
+
+fn main() {
+    uint32 err = hipSetDevice(0); if err != 0 { die("setDev", err) }
+
+    uint64 fd = file_open("/tmp/rmsnorm_f32_1024.co", 0)
+    if fd > 0xFFFFFFFFFFFFF000 { puts("missing /tmp/rmsnorm_f32_1024.co"); exit(1) }
+    uint64 sz = file_size(fd); uint64 blob = alloc(sz)
+    file_read(fd, blob, sz); file_close(fd)
+
+    uint64 mod_slot = alloc(8)
+    err = hipModuleLoadData(mod_slot, blob); if err != 0 { die("LoadData", err) }
+    uint64 mod = 0; unsafe { *(mod_slot as uint64) -> mod }
+
+    uint64 fh_slot = alloc(8)
+    err = hipModuleGetFunction(fh_slot, mod, "rmsnorm_f32"); if err != 0 { die("getFn", err) }
+    uint64 fh = 0; unsafe { *(fh_slot as uint64) -> fh }
+
+    uint64 M = 2
+    uint64 N = 1024
+    uint64 bytes  = M * N * 4
+    uint64 gbytes = N * 4
+
+    uint64 d_in = 0; uint64 d_out = 0; uint64 d_gam = 0
+    uint64 slot = alloc(8); err = hipMalloc(slot, bytes);  if err != 0 { die("mIn",  err) }; unsafe { *(slot as uint64) -> d_in }
+    slot = alloc(8); err = hipMalloc(slot, bytes);  if err != 0 { die("mOut", err) }; unsafe { *(slot as uint64) -> d_out }
+    slot = alloc(8); err = hipMalloc(slot, gbytes); if err != 0 { die("mGam", err) }; unsafe { *(slot as uint64) -> d_gam }
+
+    // Fill input: ramp + offset.  Same pattern as the standalone smoke.
+    uint64 h_in = alloc(bytes)
+    uint64 r = 0
+    while r < M {
+        uint64 c = 0
+        while c < N {
+            f64 vd = int_to_f64(r + 1) * 0.1 + (int_to_f64(c) - 512.0) * 0.005
+            f32 v  = f64_to_f32(vd)
+            uint64 p = h_in + (r * N + c) * 4
+            unsafe { *(p as f32) = v }
+            c = c + 1
+        }
+        r = r + 1
+    }
+    err = hipMemcpy(d_in, h_in, bytes, 1); if err != 0 { die("H2D_in", err) }
+
+    uint64 h_gam = alloc(gbytes)
+    uint64 c2 = 0
+    while c2 < N {
+        f64 vd = 0.5 + int_to_f64(c2) / 1024.0
+        f32 v  = f64_to_f32(vd)
+        uint64 p = h_gam + c2 * 4
+        unsafe { *(p as f32) = v }
+        c2 = c2 + 1
+    }
+    err = hipMemcpy(d_gam, h_gam, gbytes, 1); if err != 0 { die("H2D_gam", err) }
+
+    // Kernarg = (in, out, gamma, M, N).
+    uint64 k_in  = alloc(8); unsafe { *(k_in  as uint64) = d_in  }
+    uint64 k_out = alloc(8); unsafe { *(k_out as uint64) = d_out }
+    uint64 k_gam = alloc(8); unsafe { *(k_gam as uint64) = d_gam }
+    uint64 k_m   = alloc(8); uint64 mv = M; unsafe { *(k_m as uint64) = mv }
+    uint64 k_n   = alloc(8); unsafe { *(k_n as uint64) = N }
+    uint64 kp = alloc(5 * 8)
+    unsafe { *((kp +  0) as uint64) = k_in }
+    unsafe { *((kp +  8) as uint64) = k_out }
+    unsafe { *((kp + 16) as uint64) = k_gam }
+    unsafe { *((kp + 24) as uint64) = k_m }
+    unsafe { *((kp + 32) as uint64) = k_n }
+
+    uint32 grid_x  = M
+    uint32 block_x = 1024
+
+    // Multi-dispatch stability: 64 back-to-back launches.  Same kernarg
+    // each time so output buffer ends up with whatever the LAST run
+    // wrote — that's what we hash and compare across AQL vs PM4 modes.
+    uint64 nlaunch = 64
+    uint64 li = 0
+    while li < nlaunch {
+        err = hipModuleLaunchKernel(fh, grid_x, 1, 1, block_x, 1, 1, 0, 0, kp, 0)
+        if err != 0 { die("launch", err) }
+        li = li + 1
+    }
+    err = hipDeviceSynchronize(); if err != 0 { die("sync", err) }
+
+    uint64 h_out = alloc(bytes)
+    err = hipMemcpy(h_out, d_out, bytes, 2); if err != 0 { die("D2H", err) }
+
+    // FNV-1a 64-bit hash of the M*N*4-byte output buffer.  Run twice
+    // (with/without PHASE2A=1); the two hashes must match to validate
+    // the env-gate produces bit-exact output vs the legacy AQL path.
+    uint64 h = 14695981039346656037   // FNV offset basis
+    uint64 prime = 1099511628211      // FNV prime
+    uint64 ii = 0
+    while ii < bytes {
+        uint8 b = 0; unsafe { *((h_out + ii) as uint8) -> b }
+        uint64 bx = b
+        h = h ^ bx
+        h = h * prime
+        ii = ii + 1
+    }
+
+    uint32 v0 = 0; unsafe { *(h_out as uint32) -> v0 }
+    print_label_u64("out0_bits",  9, v0)
+    print_label_u64("out_fnv1a", 9, h)
+
+    exit(0)
+}

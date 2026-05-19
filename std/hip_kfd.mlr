@@ -31,6 +31,8 @@ import "time.mlr"
 import "sys.mlr"
 import "aql.mlr"
 import "kfd_phase1.mlr"
+import "pm4.mlr"
+import "kfd_pm4.mlr"
 
 // Native getenv (sys_getenv from std/sys.mlr) replaces the libc symbol
 // previously pulled in via `@dynamic extern`. Used to gate MLRIFT_BOOST /
@@ -92,6 +94,25 @@ static uint64 _hipkfd_chain_mode_init   = 0  // env-gate read once
 static uint64 _hipkfd_phase1_mode        = 0
 static uint64 _hipkfd_phase1_mode_init   = 0
 static uint64 _hipkfd_phase1_pbuf        = 0
+// 5b-compute attempt #6: MLRIFT_PHASE2A_DISPATCH=1 routes every launch
+// through std/kfd_pm4.mlr's pm4_submit_dispatch onto a SEPARATE
+// COMPUTE (non-AQL) KFD queue. Bundle proven bit-exact vs AQL on
+// rmsnorm + Llama mega-kernel phase-1 (commits e23d94c / ebba032):
+// ACQUIRE_MEM full-invalidate + RSRC1|=PRIV + RSRC2|=LDS_SIZE +
+// initiator=0x8005 + EVENT_WRITE(CS_PARTIAL_FLUSH) + RELEASE_MEM with
+// CACHE_FLUSH_AND_INV_TS + 32-bit sentinel write. Synchronous wait on
+// sentinel inside each launch — slow but simplest correct semantics
+// for parity-validation. Async lift is a follow-up.
+//
+// Mutually exclusive with PHASE1 mode (different queue, different
+// transport). When both env vars are set, PHASE2A wins.
+static uint64 _hipkfd_phase2a_mode         = 0
+static uint64 _hipkfd_phase2a_mode_init    = 0
+static uint64 _hipkfd_phase2a_q            = 0  // PM4 queue handle
+static uint64 _hipkfd_phase2a_pkt          = 0  // 512-byte scratch packet buf
+static uint64 _hipkfd_phase2a_sentinel     = 0  // 8-byte host-visible sentinel
+static uint64 _hipkfd_phase2a_sentinel_h   = 0  // its host pointer
+static uint32 _hipkfd_phase2a_sentinel_ctr = 0  // sentinel value counter
 // Stored as new_wp (one past the last-written slot).  Zero ⇒ nothing
 // pending; non-zero ⇒ doorbell value to ring is `_hipkfd_chain_pending_wp - 1`.
 // Avoids the slot-0 sentinel collision on the very first deferred launch.
@@ -1082,6 +1103,12 @@ fn hipDeviceSynchronize() -> uint32 {
     // not retiring our queue).  Returning 0 lets the launcher continue
     // and exit; teardown will skip REMOVE_QUEUE.
     if kfd_wedge_seen() != 0 { return 0 }
+    // PHASE2A: each launch already busy-polls the per-launch sentinel
+    // synchronously before returning, so there is nothing left to wait
+    // on. The AQL signal (`_hipkfd_signal_h + 0x08`) is not advanced by
+    // PM4 dispatches, so without this short-circuit the AQL-style wait
+    // below would hit its 5 s wedge timeout on every sync.
+    if _hipkfd_phase2a_mode != 0 { return 0 }
 
     // Chain mode: ring the doorbell now for the most recently queued
     // packet.  CP processes the entire batch (slots up to and including
@@ -1283,14 +1310,19 @@ fn hipModuleLoadData(uint64 mod_out, uint64 blob_ptr) -> uint32 {
     return 0
 }
 
-// hipModuleGetFunction returns a function handle. We need to remember
-// kernarg_size for hipModuleLaunchKernel, so the handle is a small
-// wrapper struct (32 bytes):
+// hipModuleGetFunction returns a function handle. The wrapper struct
+// is 64 bytes; the first 0x20 is the original AQL-path layout
+// (callers reading only that prefix continue to work). Phase 2a PM4
+// dispatch reads the extra fields at 0x20-0x2F to avoid an extra mod
+// lookup per launch.
 //   [0x00] kd_va               (u64)  — what kfd_dispatch wants
 //   [0x08] kernarg_size        (u64)  — read from the kernel descriptor
 //   [0x10] nargs               (u64)  — kernarg_size/8, precomputed
-//   [0x18] group_segment_size  (u64)  — KD's static LDS bytes; the shim
-//                                       needs this to populate AQL
+//   [0x18] group_segment_size  (u64)  — KD's static LDS bytes
+//   [0x20] entry_byte_offset   (u64)  — KD+0x10; PM4 needs kd_va+entry_off
+//                                       for PGM_LO/HI (kobj_va >> 8)
+//   [0x28] compute_pgm_rsrc1   (u32)  — KD+0x30; PM4 OR's PRIV bit in
+//   [0x2C] compute_pgm_rsrc2   (u32)  — KD+0x34; PM4 OR's LDS_SIZE in
 fn hipModuleGetFunction(uint64 fn_out, uint64 mod, uint64 name_cstr) -> uint32 {
     uint64 kd_va = kernel_get_function(mod, name_cstr)
     if kd_va == 0 {
@@ -1299,14 +1331,20 @@ fn hipModuleGetFunction(uint64 fn_out, uint64 mod, uint64 name_cstr) -> uint32 {
         // against a different module rather than dying.
         return 500
     }
-    uint64 ks    = kernel_kernarg_size(mod, kd_va)
-    uint64 gss   = kernel_group_segment_size(mod, kd_va)
-    uint64 wrap  = alloc(32)
+    uint64 ks        = kernel_kernarg_size(mod, kd_va)
+    uint64 gss       = kernel_group_segment_size(mod, kd_va)
+    uint64 entry_off = kernel_entry_byte_offset(mod, kd_va)
+    uint32 rsrc1_kd  = kernel_compute_pgm_rsrc1(mod, kd_va)
+    uint32 rsrc2_kd  = kernel_compute_pgm_rsrc2(mod, kd_va)
+    uint64 wrap      = alloc(64)
     unsafe { *((wrap + 0x00) as uint64) = kd_va }
     unsafe { *((wrap + 0x08) as uint64) = ks }
     uint64 nargs = ks / 8
     unsafe { *((wrap + 0x10) as uint64) = nargs }
     unsafe { *((wrap + 0x18) as uint64) = gss }
+    unsafe { *((wrap + 0x20) as uint64) = entry_off }
+    unsafe { *((wrap + 0x28) as uint32) = rsrc1_kd }
+    unsafe { *((wrap + 0x2C) as uint32) = rsrc2_kd }
     unsafe { *(fn_out as uint64) = wrap }
     return 0
 }
@@ -1430,6 +1468,167 @@ fn hipModuleLaunchKernel(
     if block_z > 1 { ndim = 3 }
     unsafe { *((hidden_base + 64) as uint16) = ndim }
     // remainder_*, global_offset_* already zero from the slot pre-zero.
+
+    // 5b-compute attempt #6: optional Phase 2a PM4 dispatch path.  Reads
+    // MLRIFT_PHASE2A_DISPATCH once at first launch; when 1, every subsequent
+    // launch builds a PM4 packet stream (ACQUIRE_MEM + 5×SET_SH_REG +
+    // DISPATCH_DIRECT + EVENT_WRITE + RELEASE_MEM) and submits to a
+    // SEPARATE COMPUTE (non-AQL) KFD queue created lazily here.  The
+    // RELEASE_MEM at the tail performs CACHE_FLUSH_AND_INV_TS and writes
+    // a per-launch sentinel value to host-visible GTT — we busy-poll the
+    // sentinel synchronously inside this function before returning.
+    //
+    // Checked BEFORE Phase 1 so that with both env vars set, PHASE2A wins
+    // (the modes use different queues/transports — they can't coexist on
+    // the same launch).
+    if _hipkfd_phase2a_mode_init == 0 {
+        _hipkfd_phase2a_mode_init = 1
+        uint64 p2a_env = sys_getenv("MLRIFT_PHASE2A_DISPATCH")
+        if p2a_env != 0 {
+            uint8 p2ac = 0; unsafe { *(p2a_env as uint8) -> p2ac }
+            if p2ac != 48 {
+                _hipkfd_phase2a_mode = 1
+                // PHASE2A uses its own queue + sentinel — neither AQL
+                // chain mode nor Phase 1 should fire below.
+                _hipkfd_chain_mode = 0
+                _hipkfd_chain_mode_init = 1
+                _hipkfd_phase1_mode = 0
+                _hipkfd_phase1_mode_init = 1
+                _hipkfd_phase2a_q          = pm4_create_queue()
+                _hipkfd_phase2a_pkt        = alloc(512)
+                _hipkfd_phase2a_sentinel   = dev_alloc_host_visible(8)
+                _hipkfd_phase2a_sentinel_h = dev_host_ptr(_hipkfd_phase2a_sentinel)
+                uint64 sz = 0
+                unsafe { *(_hipkfd_phase2a_sentinel_h as uint64) = sz }
+            }
+        }
+    }
+
+    if _hipkfd_phase2a_mode != 0 {
+        // Mirror the inline path's pending-signal decrement so a
+        // hipDeviceSynchronize on this queue still terminates correctly.
+        // PHASE2A waits synchronously below — sync becomes a no-op.
+        uint64 one_p2a = 1
+        _hipkfd_pending = _hipkfd_pending - one_p2a
+
+        // Read cached KD-derived fields from the fn_handle wrapper
+        // (filled in hipModuleGetFunction; offsets 0x20..0x2F).
+        uint64 entry_off = 0; unsafe { *((fn_handle + 0x20) as uint64) -> entry_off }
+        uint32 rsrc1_kd  = 0; unsafe { *((fn_handle + 0x28) as uint32) -> rsrc1_kd }
+        uint32 rsrc2_kd  = 0; unsafe { *((fn_handle + 0x2C) as uint32) -> rsrc2_kd }
+
+        uint64 kobj_va     = kd_va + entry_off
+        uint64 kobj_shift  = kobj_va >> 8
+        uint32 pgm_lo      = kobj_shift & 0xFFFFFFFF
+        uint32 pgm_hi      = (kobj_shift >> 32) & 0xFF
+        uint32 rsrc1_enc   = pm4_rsrc1_with_priv(rsrc1_kd)
+        uint64 total_gss   = gss + shared_bytes
+        uint32 lds_bits    = pm4_lds_encode_for_rsrc2(total_gss)
+        uint32 rsrc2_enc   = rsrc2_kd | lds_bits
+
+        uint64 pkt = _hipkfd_phase2a_pkt
+        // Zero the first 256 bytes of scratch — we never write past
+        // ~50 dwords, but stale dwords in unused trailer would otherwise
+        // be visible to any future debug code dumping the buffer.
+        uint64 pz = 0
+        while pz < 200 {
+            uint32 zero32 = 0
+            unsafe { *((pkt + pz) as uint32) = zero32 }
+            pz = pz + 4
+        }
+        uint64 vbuf = pkt + 256   // 256 B reg-value scratch tucked in tail
+        uint64 cursor = 0
+        uint32 dw = 0
+        uint32 vz = 0
+
+        // (1) ACQUIRE_MEM with full cache invalidate.
+        dw = pm4_build_acquire_mem(pkt + cursor, PM4_GCR_CNTL_FULL_INVAL)
+        cursor = cursor + dw * 4
+
+        // (2) SET_SH_REG(PGM_LO, 6) — PGM_LO,HI, 0, 0, SCRATCH_LO,HI=0.
+        unsafe { *((vbuf +  0) as uint32) = pgm_lo }
+        unsafe { *((vbuf +  4) as uint32) = pgm_hi }
+        unsafe { *((vbuf +  8) as uint32) = vz }
+        unsafe { *((vbuf + 12) as uint32) = vz }
+        unsafe { *((vbuf + 16) as uint32) = vz }
+        unsafe { *((vbuf + 20) as uint32) = vz }
+        dw = pm4_build_set_sh_reg(pkt + cursor, PM4_REG_COMPUTE_PGM_LO, vbuf, 6)
+        cursor = cursor + dw * 4
+
+        // (3) SET_SH_REG(RSRC1, 2) — PRIV-OR'd RSRC1 + LDS-OR'd RSRC2.
+        unsafe { *((vbuf + 0) as uint32) = rsrc1_enc }
+        unsafe { *((vbuf + 4) as uint32) = rsrc2_enc }
+        dw = pm4_build_set_sh_reg(pkt + cursor, PM4_REG_COMPUTE_PGM_RSRC1, vbuf, 2)
+        cursor = cursor + dw * 4
+
+        // (4) SET_SH_REG(USER_DATA_0, 2) — kernarg ptr lo/hi.
+        uint32 ka_lo = karg_va & 0xFFFFFFFF
+        uint32 ka_hi = (karg_va >> 32) & 0xFFFFFFFF
+        unsafe { *((vbuf + 0) as uint32) = ka_lo }
+        unsafe { *((vbuf + 4) as uint32) = ka_hi }
+        dw = pm4_build_set_sh_reg(pkt + cursor, PM4_REG_COMPUTE_USER_DATA_0, vbuf, 2)
+        cursor = cursor + dw * 4
+
+        // (5) SET_SH_REG(START_X, 8) — START=0, NUM_THREAD=(bx,by,bz).
+        uint32 nbx = block_x; uint32 nby = block_y; uint32 nbz = block_z
+        unsafe { *((vbuf +  0) as uint32) = vz }
+        unsafe { *((vbuf +  4) as uint32) = vz }
+        unsafe { *((vbuf +  8) as uint32) = vz }
+        unsafe { *((vbuf + 12) as uint32) = nbx }
+        unsafe { *((vbuf + 16) as uint32) = nby }
+        unsafe { *((vbuf + 20) as uint32) = nbz }
+        unsafe { *((vbuf + 24) as uint32) = vz }
+        unsafe { *((vbuf + 28) as uint32) = vz }
+        dw = pm4_build_set_sh_reg(pkt + cursor, PM4_REG_COMPUTE_START_X, vbuf, 8)
+        cursor = cursor + dw * 4
+
+        // (6) DISPATCH_DIRECT(grid_x, grid_y, grid_z, force_start_at_000).
+        uint32 init_force = 0x8005
+        uint32 gx32 = grid_x; uint32 gy32 = grid_y; uint32 gz32 = grid_z
+        dw = pm4_build_dispatch_direct(pkt + cursor, gx32, gy32, gz32, init_force)
+        cursor = cursor + dw * 4
+
+        // (7) EVENT_WRITE(CS_PARTIAL_FLUSH).
+        dw = pm4_build_event_write_cs_flush(pkt + cursor)
+        cursor = cursor + dw * 4
+
+        // (8) RELEASE_MEM completion fence with sentinel.  Per-launch
+        // sentinel value (counter+1) so consecutive launches don't see
+        // a stale match.  Counter increments AFTER stream-build so the
+        // value we wrote into the packet matches the value we poll for.
+        _hipkfd_phase2a_sentinel_ctr = _hipkfd_phase2a_sentinel_ctr + 1
+        uint32 sentinel_value = _hipkfd_phase2a_sentinel_ctr
+        dw = pm4_build_release_mem(pkt + cursor, _hipkfd_phase2a_sentinel, sentinel_value)
+        cursor = cursor + dw * 4
+
+        uint64 total_dw = cursor / 4
+
+        uint64 new_wp_p2a = pm4_submit_dispatch(_hipkfd_phase2a_q, pkt, total_dw)
+        if new_wp_p2a == 0xFFFFFFFFFFFFFFFF {
+            kfd_die("hipModuleLaunchKernel: pm4_submit_dispatch back-pressure timeout", 0)
+        }
+
+        // Busy-poll the sentinel.  15 s budget — wedge gate catches
+        // hangs at the firmware level; non-wedge waits are < 1 ms.
+        uint64 timeout_ns_p2a = 15000000000
+        uint64 t0_p2a = time_now()
+        uint32 s_val = 0
+        uint64 spin = 0
+        while 1 == 1 {
+            unsafe { *(_hipkfd_phase2a_sentinel_h as uint32) -> s_val }
+            if s_val == sentinel_value { break }
+            spin = spin + 1
+            if (spin & 0xFFFFF) == 0 {
+                uint64 dt = time_now() - t0_p2a
+                if dt > timeout_ns_p2a {
+                    kfd_die("hipModuleLaunchKernel: phase2a sentinel timeout", sentinel_value)
+                }
+            }
+        }
+
+        _hipkfd_launch_count = _hipkfd_launch_count + 1
+        return 0
+    }
 
     // 5b-compute Task 5: optional Phase 1 dispatch path.  Reads
     // MLRIFT_PHASE1_DISPATCH once at first launch; when 1, every subsequent
