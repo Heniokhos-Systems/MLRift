@@ -126,12 +126,14 @@ fn gmc_map(uint64 pt_ctx, uint64 mc_va_base, uint64 buf_gpu_iova,
     uint64 pt_host = 0; unsafe { *((pt_ctx + GMC_PT_OFF_PT_HOST) as uint64) -> pt_host }
     uint64 pt_iova = 0; unsafe { *((pt_ctx + GMC_PT_OFF_PT_IOVA) as uint64) -> pt_iova }
 
-    // PDE[pde_idx] = pt_iova | AMDGPU_PTE_VALID.
+    // 2-LEVEL GART (CONTEXT0 with depth=1): PD0[pde_idx] points at PT,
+    // then PT[pte_idx] holds the leaf PTE. pde_idx = mc_va[29:21],
+    // pte_idx within the PT = mc_va[20:12]. PDE includes SYSTEM+SNOOPED
+    // so GMC walker knows the target PT page is in sysmem.
     uint64 pde_idx = (mc_va_base >> 21) & 0x1FF
-    uint64 pde_val = (pt_iova & 0xFFFFFFFFFFFFF000) | AMDGPU_PTE_VALID
+    uint64 pde_val = (pt_iova & 0xFFFFFFFFFFFFF000) | AMDGPU_PTE_VALID | AMDGPU_PTE_SYSTEM | AMDGPU_PTE_SNOOPED
     unsafe { *((pd_host + pde_idx * 8) as uint64) = pde_val }
 
-    // PT[pt_start_idx + i] = (buf_gpu_iova + i*4096) | leaf_flags.
     uint64 pt_start_idx = (mc_va_base >> 12) & 0x1FF
     uint64 leaf_flags = AMDGPU_PTE_VALID | AMDGPU_PTE_SYSTEM | AMDGPU_PTE_SNOOPED | AMDGPU_PTE_READABLE | AMDGPU_PTE_WRITEABLE | AMDGPU_PTE_EXECUTABLE
     uint64 n_pages = size_bytes / GMC_PAGE_SIZE_BYTES
@@ -199,11 +201,16 @@ fn gmc_init_mmhub(uint64 bar5_host, uint64 pt_ctx,
                   uint64 mc_va_base, uint64 mc_va_size,
                   uint64 sys_apert_lo, uint64 sys_apert_hi,
                   uint64 default_addr_phys) -> uint64 {
+    // CONTEXT0 uses a 2-LEVEL GART (PD0 + PT) per tinygrad's amdev
+    // enable_vm_addressing: page_table_depth = (3 - root.lv) for gfx11
+    // trans_futher=False; root.lv=2 → depth=1 (2-level).
     uint64 pd_iova = 0; unsafe { *((pt_ctx + GMC_PT_OFF_PD_IOVA) as uint64) -> pd_iova }
 
-    // ---- AGP aperture: disabled (tinygrad pattern). ----
+    // ---- AGP aperture: disabled (tinygrad pattern). BOT = 0xFFFFFF
+    // (24 ones, = 0xffffffffffff >> 24), TOP = 0, BASE = 0; BOT > TOP
+    // ⇒ disabled.
     _mmhub_write32(bar5_host, regMMMC_VM_AGP_BASE, 0)
-    _mmhub_write32(bar5_host, regMMMC_VM_AGP_BOT,  0xFFFFFFFF)   // bot > top => disabled
+    _mmhub_write32(bar5_host, regMMMC_VM_AGP_BOT,  0xFFFFFF)
     _mmhub_write32(bar5_host, regMMMC_VM_AGP_TOP,  0)
 
     // ---- System aperture (unused/fast-path-disabled). ----
@@ -219,12 +226,13 @@ fn gmc_init_mmhub(uint64 bar5_host, uint64 pt_ctx,
     _mmhub_write32(bar5_host, regMMVM_L2_PROTECTION_FAULT_CNTL2, 0x1000)
 
     // ---- L1 TLB enable. ----
-    // enable_l1_tlb = bit 0
-    // system_access_mode = bits 3..4 set to 3
-    // enable_advanced_driver_model = bit 6
-    // system_aperture_unmapped_access = bits 5..5 cleared
-    // mtype = bits 7..9 (MTYPE_UC = 0)
-    // -> 0x1 | (3 << 3) | (1 << 6) = 0x1 | 0x18 | 0x40 = 0x59
+    // Matches tinygrad amdev init_hub + amdgpu mmhub_v3_0_init_tlb_regs:
+    //   enable_l1_tlb = bit 0                = 1
+    //   system_access_mode = bits 3..4       = 3 (aperture-check)
+    //   system_aperture_unmapped_access = b5 = 0 (passthru)
+    //   enable_advanced_driver_model = bit 6 = 1
+    //   mtype = bits 11..13 (MTYPE_UC)       = 0
+    // = 0x1 | (3 << 3) | (1 << 6) = 0x59
     uint64 mx_l1_tlb_val = 0x59
     _mmhub_write32(bar5_host, regMMMC_VM_MX_L1_TLB_CNTL, mx_l1_tlb_val)
     // Fence: readback.
@@ -266,8 +274,13 @@ fn gmc_init_mmhub(uint64 bar5_host, uint64 pt_ctx,
     _mmhub_write32(bar5_host, regMMVM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32,   pt_end)
     _mmhub_write32(bar5_host, regMMVM_CONTEXT0_PAGE_TABLE_END_ADDR_HI32,   pt_end >> 32)
 
-    // PAGE_TABLE_BASE_ADDR carries pd_iova | AMDGPU_PTE_VALID in the low bits.
-    uint64 pt_base_full = (pd_iova & 0xFFFFFFFFFFFFF000) | AMDGPU_PTE_VALID
+    // PAGE_TABLE_BASE_ADDR carries pd_iova | VALID | SYSTEM | SNOOPED.
+    // The SYSTEM bit (bit 1) tells GMC's PT walker that the root table
+    // lives in system memory, not VRAM — without it the walker tries to
+    // read PD via the VRAM controller (which doesn't exist for us) and
+    // raises WALKER_ERROR. Last run's FAULT_STATUS=0xd32 + FAULT_ADDR=
+    // 0x100000 (our MC VA) confirmed this exact failure path.
+    uint64 pt_base_full = (pd_iova & 0xFFFFFFFFFFFFF000) | AMDGPU_PTE_VALID | AMDGPU_PTE_SYSTEM | AMDGPU_PTE_SNOOPED
     _mmhub_write32(bar5_host, regMMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32, pt_base_full & 0xFFFFFFFF)
     _mmhub_write32(bar5_host, regMMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_HI32, pt_base_full >> 32)
     // Fence: readback BASE_LO and confirm it matches our write.
@@ -290,18 +303,119 @@ fn gmc_init_mmhub(uint64 bar5_host, uint64 pt_ctx,
     }
 
     // ---- THE LAST WRITE: VM_CONTEXT0_CNTL.enable_context = 1.
-    //      enable_context = bit 0
-    //      page_table_depth = bits 1..2 = 1 (= 2-level PD0 + PT)
-    //      page_table_block_size = bits 24..27 = 0
-    //      fault flags = bits 6..12 (all set: pde0/dummy/range/valid/r/w/x)
-    //      default flags = bits 19..25 (all set)
-    //      -> 0x1 | (1 << 1) | (0x7F << 6) | (0x7F << 19) = 0x3FC1FC3
-    uint64 ctx0_cntl_val = 0x3FC1FC3
+    //
+    // Bit layout (mmvm_3_0_0 / kernel pattern):
+    //   bit 0    ENABLE_CONTEXT                                   = 1
+    //   bits 1-2 PAGE_TABLE_DEPTH                                  = 1 (2-level)
+    //   bits 3-5 PAGE_TABLE_BLOCK_SIZE                             = 0
+    //   bit 6    RETRY_PERMISSION_OR_INVALID_PAGE_FAULT            = 1
+    //   bit 7    RETRY_OTHER_FAULT                                 = 1
+    //   bits 8,9   RANGE_PROTECTION_FAULT   INT, DEFAULT           = 1, 1
+    //   bits 10,11 DUMMY_PAGE_PROTECTION_FAULT INT, DEFAULT        = 1, 1
+    //   bits 12,13 PDE0_PROTECTION_FAULT    INT, DEFAULT           = 1, 1
+    //   bits 14,15 VALID_PROTECTION_FAULT   INT, DEFAULT           = 1, 1
+    //   bits 16,17 READ_PROTECTION_FAULT    INT, DEFAULT           = 1, 1
+    //   bits 18,19 WRITE_PROTECTION_FAULT   INT, DEFAULT           = 1, 1
+    //   bits 20,21 EXECUTE_PROTECTION_FAULT INT, DEFAULT           = 1, 1
+    //
+    // = 0x1 | (1<<1) | 0xC0 | 0x3FFF00 = 0x3FFFC3
+    // DEFAULT bits redirect silently to scratch on fault; INT raises an
+    // interrupt visible via dmesg / amdgpu_regs2 — gives us debug signal
+    // if the PT walk fails this run too.
+    uint64 ctx0_cntl_val = 0x3FFFC3
     _mmhub_write32(bar5_host, regMMVM_CONTEXT0_CNTL, ctx0_cntl_val)
     uint64 rb_ctx = _mmhub_read32(bar5_host, regMMVM_CONTEXT0_CNTL)
     if rb_ctx == 0xFFFFFFFF { return 5 }
     if (rb_ctx & 0x1) == 0 { return 2 }
 
+    return 0
+}
+
+// =====================================================================
+// gmc_init_aperture_identity — bring MMHUB up for system-aperture
+// identity translation ONLY (no PT walker). For MC VAs in
+// [apert_mc_lo, apert_mc_hi], GMC routes the access directly to the
+// bus: bus iova = MC VA. Caller is responsible for mapping that iova
+// range via pci_alloc_sysmem_at_iova so the platform IOMMU resolves it.
+//
+// This sidesteps GMC's PT walker entirely — the walker on Navi 3x
+// cannot read PT pages that live in sysmem accessed via the platform
+// IOMMU. WALKER_ERROR+MAPPING_ERROR is the failure signature; we hit it
+// every config we tried in gmc_init_mmhub. The aperture path doesn't
+// need a PT, so it works even with no VRAM trained.
+//
+// Inputs:
+//   bar5_host           Host VA of mmapped BAR5.
+//   apert_mc_lo         Aperture range LOW (units: MC VA >> 18).
+//   apert_mc_hi         Aperture range HIGH (units: MC VA >> 18).
+//                       MC VA in [lo<<18, hi<<18] → identity.
+//   default_addr_phys   4 KiB-aligned bus iova of a zero-filled scratch
+//                       page (fallback when an MC VA falls OUTSIDE the
+//                       aperture and would otherwise wedge).
+//
+// Returns:
+//   0  success.
+//   3  L1 TLB enable readback bit 0 not set.
+//   4  L2 cache enable readback bit 0 not set.
+//   5  readback returned 0xFFFFFFFF on any reg.
+// =====================================================================
+fn gmc_init_aperture_identity(uint64 bar5_host,
+                              uint64 apert_mc_lo, uint64 apert_mc_hi,
+                              uint64 default_addr_phys) -> uint64 {
+    // AGP disabled (tinygrad pattern).
+    _mmhub_write32(bar5_host, regMMMC_VM_AGP_BASE, 0)
+    _mmhub_write32(bar5_host, regMMMC_VM_AGP_BOT,  0xFFFFFF)
+    _mmhub_write32(bar5_host, regMMMC_VM_AGP_TOP,  0)
+
+    // System aperture: COVERS our buffer's MC VA range. MC VAs in here
+    // get identity-translated to bus iova directly (no PT walk).
+    _mmhub_write32(bar5_host, regMMMC_VM_SYSTEM_APERTURE_LOW_ADDR,  apert_mc_lo)
+    _mmhub_write32(bar5_host, regMMMC_VM_SYSTEM_APERTURE_HIGH_ADDR, apert_mc_hi)
+    _mmhub_write32(bar5_host, regMMMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_LSB, default_addr_phys >> 12)
+    _mmhub_write32(bar5_host, regMMMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_MSB, (default_addr_phys >> 12) >> 32)
+
+    // L2 protection-fault redirect to scratch.
+    _mmhub_write32(bar5_host, regMMVM_L2_PROTECTION_FAULT_DEFAULT_ADDR_LO32, default_addr_phys >> 12)
+    _mmhub_write32(bar5_host, regMMVM_L2_PROTECTION_FAULT_DEFAULT_ADDR_HI32, (default_addr_phys >> 12) >> 32)
+    _mmhub_write32(bar5_host, regMMVM_L2_PROTECTION_FAULT_CNTL2, 0x1000)
+
+    // L1 TLB: mode 3 (use aperture check), adv driver model.
+    uint64 mx_l1_tlb_val = 0x59
+    _mmhub_write32(bar5_host, regMMMC_VM_MX_L1_TLB_CNTL, mx_l1_tlb_val)
+    uint64 rb_tlb = _mmhub_read32(bar5_host, regMMMC_VM_MX_L1_TLB_CNTL)
+    if rb_tlb == 0xFFFFFFFF { return 5 }
+    if (rb_tlb & 0x1) == 0 { return 3 }
+
+    // L2 cache enable.
+    uint64 l2_cntl_val = 0x40003
+    _mmhub_write32(bar5_host, regMMVM_L2_CNTL, l2_cntl_val)
+    uint64 rb_l2 = _mmhub_read32(bar5_host, regMMVM_L2_CNTL)
+    if rb_l2 == 0xFFFFFFFF { return 5 }
+    if (rb_l2 & 0x1) == 0 { return 4 }
+
+    _mmhub_write32(bar5_host, regMMVM_L2_CNTL2,  0x3)
+    _mmhub_write32(bar5_host, regMMVM_L2_CNTL3,  0x30131)
+    _mmhub_write32(bar5_host, regMMVM_L2_CNTL4,  0x1)
+    _mmhub_write32(bar5_host, regMMVM_L2_CNTL5,  0x1FF)
+
+    // Identity aperture (CONTEXT1) DISABLED — we use SYSTEM aperture
+    // for identity, not the L2 IDENTITY_APERTURE which is per-CONTEXT.
+    _mmhub_write32(bar5_host, regMMVM_L2_CONTEXT1_IDENTITY_APERTURE_LOW_ADDR_LO32,  0xFFFFFFFF)
+    _mmhub_write32(bar5_host, regMMVM_L2_CONTEXT1_IDENTITY_APERTURE_LOW_ADDR_HI32,  0xF)
+    _mmhub_write32(bar5_host, regMMVM_L2_CONTEXT1_IDENTITY_APERTURE_HIGH_ADDR_LO32, 0)
+    _mmhub_write32(bar5_host, regMMVM_L2_CONTEXT1_IDENTITY_APERTURE_HIGH_ADDR_HI32, 0)
+
+    // Pre-size the invalidate engines (defensive).
+    uint64 eng_i = 0
+    while eng_i < 18 {
+        _mmhub_write32(bar5_host, regMMVM_INVALIDATE_ENG0_ADDR_RANGE_LO32 + eng_i * 2, 0xFFFFFFFF)
+        _mmhub_write32(bar5_host, regMMVM_INVALIDATE_ENG0_ADDR_RANGE_HI32 + eng_i * 2, 0x1F)
+        eng_i = eng_i + 1
+    }
+
+    // CONTEXT0 NOT enabled — we don't want PT walks. Aperture path
+    // bypasses CONTEXT0 entirely for in-aperture accesses.
+    _mmhub_write32(bar5_host, regMMVM_CONTEXT0_CNTL, 0)
     return 0
 }
 
@@ -352,4 +466,32 @@ fn gmc_readback_sanity(uint64 bar5_host) -> uint64 {
     _gmc_print_hex32("L2_CNTL",     7, l2_cntl)
     if (ctx0_cntl & 0x1) == 0 { return 1 }
     return 0
+}
+
+// =====================================================================
+// gmc_dump_fault_status — read L2 protection-fault status registers.
+// These latch the LAST fault GMC's PT walker raised internally (PDE0
+// invalid, VALID, RANGE, etc.). Faults fire on the GPU's IH ring; with
+// no amdgpu IH consumer we don't see them in dmesg, but the latched
+// regs survive. Read AFTER a suspected failure to know whether GMC
+// silently redirected to default_addr.
+//
+// STATUS bit decoding (top bits are non-zero only on actual fault):
+//   bit 0    MORE_FAULTS
+//   bit 1    WALKER_ERROR
+//   bit 2    PERMISSION_FAULTS
+//   bit 3    MAPPING_ERROR
+//   bit 4    CID
+//   bits 7-5 RW
+//   bits 12-9 VMID (which CONTEXT had the fault — 0=our CTX0)
+// =====================================================================
+fn gmc_dump_fault_status(uint64 bar5_host) {
+    uint64 status   = _mmhub_read32(bar5_host, regMMVM_L2_PROTECTION_FAULT_STATUS)
+    uint64 addr_lo  = _mmhub_read32(bar5_host, regMMVM_L2_PROTECTION_FAULT_ADDR_LO32)
+    uint64 addr_hi  = _mmhub_read32(bar5_host, regMMVM_L2_PROTECTION_FAULT_ADDR_HI32)
+    uint64 cntl     = _mmhub_read32(bar5_host, regMMVM_L2_PROTECTION_FAULT_CNTL)
+    _gmc_print_hex32("FAULT_STATUS",   12, status)
+    _gmc_print_hex32("FAULT_ADDR_LO",  13, addr_lo)
+    _gmc_print_hex32("FAULT_ADDR_HI",  13, addr_hi)
+    _gmc_print_hex32("FAULT_CNTL",     10, cntl)
 }

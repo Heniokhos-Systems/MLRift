@@ -1,0 +1,362 @@
+// Phase 3 slice ε.0b — retry PSP load_kdb through the live GMC GART.
+//
+// ε.0a (phase3_gmc_init_live.mlr) proved the MMHUB GART registers can be
+// written without wedging the machine. This smoke issues the actual
+// PSP_BL_LOAD_KEY_DATABASE command with C2PMSG_36 = MC_VA >> 20 = 0x1 so
+// PSP DMA-fetches our buffer through GMC translation rather than the raw
+// IOMMU iova that wedged in the earlier δ.2 attempt.
+//
+// Critical change vs phase3_psp_load_kdb (δ.2):
+//   - δ.2 passed gpu_va = buf_iova (= 0x200000100000 → C2PMSG_36=0x02000000).
+//     GMC had no GART entry for that MC VA — PSP DMA panicked the firmware.
+//   - ε.0b maps buf_iova at MC VA 0x100000 via gmc_map, then passes
+//     fw_buf_gpu_va = 0x100000 (→ C2PMSG_36 = 0x1). PSP → MC VA 0x100000 →
+//     GMC PTE → IOMMU iova → our host buffer.
+//
+// Anticipated outcomes:
+//   GREEN: rc=0, post_C2PMSG_35=0x80000000, err_byte=0.
+//   SOFT FAIL: rc=3 + err_byte != 0 — PSP rejected (sig/version). No wedge.
+//   HARD FAIL: rc=3 + err_byte=0 + post != 0x80000000 — GART still broken.
+//   HANG (>30 s in wait_for_bootloader) — PSP wedge. Reboot required.
+//
+// Post-state is printed regardless of rc.
+
+import "../std/pcidev.mlr"
+import "../std/amdgpu_ip_discovery.mlr"
+import "../std/amdgpu_firmware.mlr"
+import "../std/gmc.mlr"
+import "../std/psp.mlr"
+import "../std/sys.mlr"
+
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn puts(uint64 s) -> uint32
+
+fn _hex32(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(64)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint8 zx = 48; unsafe { *((b + ll + 1) as uint8) = zx }
+    uint8 xc = 120; unsafe { *((b + ll + 2) as uint8) = xc }
+    uint64 j = 0
+    while j < 8 {
+        uint64 sh = (7 - j) * 4
+        uint64 nyb = (v >> sh) & 0xF
+        uint8 ch = nyb + 48
+        if nyb >= 10 { ch = nyb + 87 }
+        unsafe { *((b + ll + 3 + j) as uint8) = ch }
+        j = j + 1
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 11) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+fn _dec(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(64)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint64 digits = 0
+    if v == 0 {
+        uint8 z = 48; unsafe { *((b + ll + 1) as uint8) = z }; digits = 1
+    } else {
+        uint64 t = v
+        while t > 0 { digits = digits + 1; t = t / 10 }
+        uint64 k = digits
+        t = v
+        while k > 0 {
+            k = k - 1
+            uint64 d = t - (t / 10) * 10
+            uint8 db = d + 48
+            unsafe { *((b + ll + 1 + k) as uint8) = db }
+            t = t / 10
+        }
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 1 + digits) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+fn main() {
+    puts("phase3_psp_load_kdb_via_gart (ε.0b)")
+
+    // ---------------------------------------------------------------
+    // Step 8: Load SOS firmware blob from disk + locate KDB sub-blob.
+    // (Done first so we bail cheaply if the file is absent, before any
+    // MMIO writes.)
+    // ---------------------------------------------------------------
+    uint64 bp = alloc(8); unsafe { *(bp as uint64) = 0 }
+    uint64 szp = alloc(8); unsafe { *(szp as uint64) = 0 }
+    uint64 le = fw_load_file("/tmp/mlrift_fw/psp_13_0_10_sos.bin", bp, szp)
+    if le != 0 {
+        _dec("FAIL fw_load_file", 17, le)
+        dealloc(bp); dealloc(szp); exit(1)
+    }
+    uint64 fw_buf = 0; unsafe { *(bp as uint64) -> fw_buf }
+    uint64 fw_sz  = 0; unsafe { *(szp as uint64) -> fw_sz }
+    dealloc(bp); dealloc(szp)
+
+    // Step 9: locate KDB sub-blob.
+    uint64 lp = alloc(16)
+    unsafe { *((lp + 0) as uint64) = 0 }
+    unsafe { *((lp + 8) as uint64) = 0 }
+    uint64 fr = psp_v2_find(fw_buf, fw_sz, PSP_FW_TYPE_KDB, lp + 0, lp + 8)
+    if fr != 0 {
+        puts("FAIL: KDB not in firmware blob")
+        dealloc(lp); dealloc(fw_buf); exit(2)
+    }
+    uint64 kdb_rel_off = 0; unsafe { *((lp + 0) as uint64) -> kdb_rel_off }
+    uint64 kdb_size    = 0; unsafe { *((lp + 8) as uint64) -> kdb_size }
+    dealloc(lp)
+
+    // Step 10: compute kdb_ptr.
+    uint64 uaob = fw_ucode_array_offset_bytes(fw_buf)
+    uint64 kdb_file_off = uaob + kdb_rel_off
+    uint64 kdb_ptr      = fw_buf + kdb_file_off
+    _hex32("kdb_file_offset", 15, kdb_file_off)
+    _dec("kdb_size_bytes",  14, kdb_size)
+
+    // ---------------------------------------------------------------
+    // Step 1: pci_open + map BAR5 + bus master + load IP bases.
+    // ---------------------------------------------------------------
+    uint64 oe = pci_open("0000:03:00.0", 14)
+    if oe != 0 {
+        _dec("FAIL pci_open", 13, oe)
+        dealloc(fw_buf); exit(3)
+    }
+    amdgpu_load_navi32_bases()
+    uint64 bar5 = pci_map_bar(PCI_BAR5_REGION_INDEX)
+    if bar5 == PCI_MAP_FAILED_SENTINEL {
+        puts("FAIL BAR5 mmap")
+        pci_close(); dealloc(fw_buf); exit(4)
+    }
+    uint64 bme = pci_set_bus_master()
+    if bme != 0 {
+        _dec("FAIL set_bus_master", 19, bme)
+        pci_close(); dealloc(fw_buf); exit(5)
+    }
+    _hex32("bar5_host_lo", 12, bar5 & 0xFFFFFFFF)
+
+    // ---------------------------------------------------------------
+    // Step 2: Allocate the 2-page GART (PD0 + PT).
+    // ---------------------------------------------------------------
+    uint64 pp = alloc(8); unsafe { *(pp as uint64) = 0 }
+    uint64 pe = gmc_alloc_page_table(pp)
+    if pe != 0 {
+        _dec("FAIL gmc_alloc_page_table", 24, pe)
+        dealloc(pp); pci_close(); dealloc(fw_buf); exit(6)
+    }
+    uint64 pt_ctx = 0; unsafe { *(pp as uint64) -> pt_ctx }
+    dealloc(pp)
+    uint64 pd_iova = 0; unsafe { *((pt_ctx + GMC_PT_OFF_PD_IOVA) as uint64) -> pd_iova }
+    uint64 pt_iova = 0; unsafe { *((pt_ctx + GMC_PT_OFF_PT_IOVA) as uint64) -> pt_iova }
+    _hex32("PD0_iova_lo", 11, pd_iova & 0xFFFFFFFF)
+    _hex32("PT_iova_lo",  10, pt_iova & 0xFFFFFFFF)
+
+    // ---------------------------------------------------------------
+    // Step 3: Allocate the PSP 1 MiB staging buffer.
+    //         This is the SAME buffer the GMC GART will point at and
+    //         that psp_load_component will copy the KDB blob into.
+    // ---------------------------------------------------------------
+    uint64 hp = alloc(8); unsafe { *(hp as uint64) = 0 }
+    uint64 gp = alloc(8); unsafe { *(gp as uint64) = 0 }
+    uint64 pae = psp_alloc_fw_buf(hp, gp)
+    if pae != 0 {
+        _dec("FAIL psp_alloc_fw_buf", 21, pae)
+        gmc_page_table_free(pt_ctx)
+        dealloc(hp); dealloc(gp); pci_close(); dealloc(fw_buf); exit(7)
+    }
+    uint64 buf_iova = 0; unsafe { *(gp as uint64) -> buf_iova }
+    uint64 buf_host = 0; unsafe { *(hp as uint64) -> buf_host }
+    dealloc(hp); dealloc(gp)
+    _hex32("buf_iova_lo", 11, buf_iova & 0xFFFFFFFF)
+    _hex32("buf_host_lo", 11, buf_host & 0xFFFFFFFF)
+
+    // ---------------------------------------------------------------
+    // Step 4: Allocate a 4 KiB scratch page for SYSTEM_APERTURE_DEFAULT.
+    // ---------------------------------------------------------------
+    uint64 sp = alloc(8); unsafe { *(sp as uint64) = 0 }
+    uint64 sg = alloc(8); unsafe { *(sg as uint64) = 0 }
+    uint64 sae = pci_alloc_sysmem_aligned(4096, 4096, sp, sg)
+    if sae != 0 {
+        _dec("FAIL scratch alloc", 18, sae)
+        psp_free_fw_buf(buf_host, buf_iova)
+        gmc_page_table_free(pt_ctx)
+        dealloc(sp); dealloc(sg); pci_close(); dealloc(fw_buf); exit(8)
+    }
+    uint64 scratch_iova = 0; unsafe { *(sg as uint64) -> scratch_iova }
+    dealloc(sp); dealloc(sg)
+
+    // ---------------------------------------------------------------
+    // Step 5: Map the PSP buffer at MC VA 0x100000 (1 MiB).
+    //         PSP will receive C2PMSG_36 = 0x100000 >> 20 = 0x1.
+    // ---------------------------------------------------------------
+    uint64 me = gmc_map(pt_ctx, 0x100000, buf_iova, 0x100000)
+    if me != 0 {
+        _dec("FAIL gmc_map", 12, me)
+        pci_free_sysmem(0, scratch_iova, 4096)
+        psp_free_fw_buf(buf_host, buf_iova)
+        gmc_page_table_free(pt_ctx)
+        pci_close(); dealloc(fw_buf); exit(9)
+    }
+    _hex32("mc_va_base",          10, 0x100000)
+    _hex32("mc_va_size",          10, 0x100000)
+    _hex32("expected_c2pmsg_36",  19, 0x100000 >> 20)
+
+    // ---------------------------------------------------------------
+    // Step 6: Run the live MMHUB init. BAIL if it fails — we must not
+    //         issue PSP commands without a working GART.
+    // ---------------------------------------------------------------
+    puts("ABOUT TO WRITE MMHUB GART REGISTERS")
+    // sys_apert_lo=0, sys_apert_hi=0 ⇒ aperture covers MC VA [0, 256 KiB)
+    // (1 entry of 0x40000 each). Matches tinygrad with fb_base=fb_end=0.
+    // Our MC VA 0x100000 (1 MiB) is OUTSIDE this range ⇒ falls through
+    // to CONTEXT0 PT walk via depth=1 GART.
+    uint64 ie = gmc_init_mmhub(bar5, pt_ctx, 0x100000, 0x100000,
+                                0, 0, scratch_iova)
+    _dec("gmc_init_mmhub_rc", 17, ie)
+    if ie != 0 {
+        puts("BAIL: gmc_init_mmhub failed — not issuing PSP cmd")
+        // Step 7 readback for diagnostics even on bail.
+        puts("--- readback (bail path) ---")
+        uint64 rb = gmc_readback_sanity(bar5)
+        _dec("readback_rc", 11, rb)
+        pci_free_sysmem(0, scratch_iova, 4096)
+        psp_free_fw_buf(buf_host, buf_iova)
+        gmc_page_table_free(pt_ctx)
+        pci_close(); dealloc(fw_buf); exit(10)
+    }
+
+    // ---------------------------------------------------------------
+    // Step 7: Diagnostic readback after successful MMHUB init.
+    // ---------------------------------------------------------------
+    puts("--- GART readback ---")
+    uint64 re = gmc_readback_sanity(bar5)
+    _dec("readback_rc", 11, re)
+
+    // ---------------------------------------------------------------
+    // Step 11: Pre-state snapshot.
+    // ---------------------------------------------------------------
+    puts("--- pre-PSP state ---")
+    _hex32("pre_C2PMSG_35", 13, psp_bootloader_status_raw(bar5))
+    _hex32("pre_C2PMSG_81", 13, psp_read32(bar5, PSP_REG_C2PMSG_81))
+    _hex32("pre_C2PMSG_33", 13, psp_read32(bar5, PSP_REG_C2PMSG_33))
+    _dec("pre_bl_ready",   12, psp_is_bootloader_ready(bar5))
+    _dec("pre_sos_alive",  13, psp_is_sos_alive(bar5))
+    if psp_is_bootloader_ready(bar5) == 0 {
+        puts("FAIL: bootloader not ready before PSP cmd")
+        // Still print post-state so we have diagnostics.
+        puts("--- post-PSP state (bootloader-not-ready bail) ---")
+        _hex32("post_C2PMSG_35", 14, psp_bootloader_status_raw(bar5))
+        _hex32("post_C2PMSG_81", 14, psp_read32(bar5, PSP_REG_C2PMSG_81))
+        pci_free_sysmem(0, scratch_iova, 4096)
+        psp_free_fw_buf(buf_host, buf_iova)
+        gmc_page_table_free(pt_ctx)
+        pci_close(); dealloc(fw_buf); exit(11)
+    }
+
+    // ---------------------------------------------------------------
+    // Step 12: Issue PSP_BL_LOAD_KEY_DATABASE via GMC GART.
+    //
+    //   fw_buf_host_va = buf_host  — psp_load_component zeros & copies
+    //                                the KDB blob into this buffer.
+    //   fw_buf_gpu_va  = 0x100000  — MC VA; >> 20 = 0x1 → C2PMSG_36.
+    //                                GMC translates 0x100000 through our
+    //                                GART entry to buf_iova.
+    // ---------------------------------------------------------------
+    puts("--- sending PSP_BL_LOAD_KEY_DATABASE via GART (C2PMSG_36=0x1) ---")
+    // Inline expansion of psp_load_component with periodic C2PMSG_35
+    // prints so we can see PSP's response evolve in real time. 30 s
+    // budget; PSP cmds should complete in well under that.
+    psp_zero_buf(buf_host, 0x100000)
+    psp_copy_blob(buf_host, kdb_ptr, kdb_size)
+    psp_write32(bar5, PSP_REG_C2PMSG_36, 0x100000 >> 20)
+    psp_write32(bar5, PSP_REG_C2PMSG_35, PSP_BL_LOAD_KEY_DATABASE)
+    puts("--- polling C2PMSG_35 (prints every ~2 s; 30 s budget) ---")
+    uint64 pi = 0
+    uint64 plast = 0
+    uint64 lr = 3
+    uint64 err_byte = 0
+    while pi < 30000 {
+        plast = psp_read32(bar5, PSP_REG_C2PMSG_35)
+        if plast == 0x80000000 {
+            lr = 0
+            err_byte = 0
+            pi = 30001
+        }
+        if pi != 30001 {
+            if (pi & 0x7FF) == 0 {
+                _hex32("poll_C2PMSG_35", 14, plast)
+                _dec("poll_iter",        9, pi)
+            }
+            uint64 ts = alloc(16)
+            unsafe { *((ts + 0) as uint64) = 0 }
+            unsafe { *((ts + 8) as uint64) = 1000000 }
+            syscall_raw(35, ts, 0, 0, 0, 0, 0)
+            dealloc(ts)
+            pi = pi + 1
+        }
+    }
+    if lr != 0 {
+        err_byte = plast & 0xFF
+    }
+    _dec("psp_load_component_rc", 21, lr)
+    _hex32("err_byte",             8, err_byte)
+    _hex32("final_C2PMSG_35",     15, plast)
+
+    // Post-failure GMC fault status. Reads L2_PROTECTION_FAULT_STATUS /
+    // _ADDR_LO/HI / _CNTL. If GMC silently redirected PT walks to
+    // default_addr (scratch zeros), STATUS will have non-zero bits and
+    // ADDR_LO will hold the offending MC VA. STATUS = 0 means GMC saw
+    // no fault → PSP actually got our buffer bytes and rejected them
+    // for some other reason.
+    puts("--- GMC L2 protection fault status ---")
+    gmc_dump_fault_status(bar5)
+
+    // ---------------------------------------------------------------
+    // Steps 13+14: Post-state snapshot — printed regardless of rc.
+    // ---------------------------------------------------------------
+    puts("--- post-PSP state ---")
+    _hex32("post_C2PMSG_35", 14, psp_bootloader_status_raw(bar5))
+    _hex32("post_C2PMSG_81", 14, psp_read32(bar5, PSP_REG_C2PMSG_81))
+    _hex32("post_C2PMSG_33", 14, psp_read32(bar5, PSP_REG_C2PMSG_33))
+    _dec("post_bl_ready",   13, psp_is_bootloader_ready(bar5))
+
+    // Outcome interpretation hints for the user.
+    if lr == 0 {
+        puts("verdict: GREEN — psp_load_component returned 0")
+        puts("         check post_C2PMSG_35=0x80000000 + err_byte=0x00000000")
+    }
+    if lr == 3 {
+        if err_byte != 0 {
+            puts("verdict: SOFT FAIL — PSP rejected (err_byte non-zero, no wedge)")
+        }
+        if err_byte == 0 {
+            puts("verdict: HARD FAIL — timeout, err_byte=0 (GART may still be broken)")
+        }
+    }
+    if lr == 2 {
+        puts("verdict: pre-cmd BL not ready (unexpected given pre-check above)")
+    }
+
+    // ---------------------------------------------------------------
+    // Step 15: Cleanup.
+    // ---------------------------------------------------------------
+    pci_free_sysmem(0, scratch_iova, 4096)
+    psp_free_fw_buf(buf_host, buf_iova)
+    gmc_page_table_free(pt_ctx)
+    pci_close()
+    dealloc(fw_buf)
+
+    if lr != 0 {
+        puts("phase3_psp_load_kdb_via_gart: FAIL")
+        exit(12)
+    }
+    puts("phase3_psp_load_kdb_via_gart: GREEN")
+    exit(0)
+}

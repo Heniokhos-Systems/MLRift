@@ -396,6 +396,52 @@ fn pci_alloc_sysmem_aligned(uint64 size,
     return pci_alloc_sysmem(sz_aligned, out_host_va_ptr, out_gpu_va_ptr)
 }
 
+// pci_alloc_sysmem_at_iova — allocate page-aligned host memory and
+// IOMMU-map it at a CALLER-SPECIFIED iova. Useful when MC VA must equal
+// bus iova (e.g., GMC system-aperture identity translation path, where
+// the GMC bypasses the PT walker for MC VAs falling inside the
+// system-aperture range and routes them straight to the bus).
+//
+// desired_iova MUST be 4 KiB-aligned and MUST NOT overlap any iova
+// already mapped through pci_alloc_sysmem (no overlap-check is done
+// here — caller's responsibility). VFIO will reject the MAP_DMA ioctl
+// if the iova lies in a kernel-reserved range; returns error 4 in that
+// case.
+//
+// Error codes match pci_alloc_sysmem (1/3/4) plus:
+//   5 = desired_iova not 4 KiB-aligned.
+fn pci_alloc_sysmem_at_iova(uint64 size,
+                            uint64 desired_iova,
+                            uint64 out_host_va_ptr) -> uint64 {
+    if _pcidev_container_fd == 0xFFFFFFFFFFFFFFFF { return 1 }
+    if (desired_iova & 0xFFF) != 0 { return 5 }
+    uint64 sz = _pcidev_page_up(size)
+
+    uint64 host = sys_mmap(0, sz, PCI_PROT_RW,
+                           PCI_MAP_PRIVATE | PCI_MAP_ANON | PCI_MAP_LOCKED,
+                           0xFFFFFFFFFFFFFFFF, 0)
+    if host > PCI_MMAP_ERR_SENTINEL { return 3 }
+
+    uint64 m = alloc(SZ_VFIO_IOMMU_TYPE1_DMA_MAP)
+    _pcidev_zero(m, SZ_VFIO_IOMMU_TYPE1_DMA_MAP)
+    uint32 argsz_w = SZ_VFIO_IOMMU_TYPE1_DMA_MAP
+    uint32 flags_w = VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE
+    unsafe { *((m + 0)  as uint32) = argsz_w }
+    unsafe { *((m + 4)  as uint32) = flags_w }
+    unsafe { *((m + 8)  as uint64) = host }
+    unsafe { *((m + 16) as uint64) = desired_iova }
+    unsafe { *((m + 24) as uint64) = sz }
+    uint64 r = sys_ioctl(_pcidev_container_fd, VFIO_IOMMU_MAP_DMA, m)
+    dealloc(m)
+    if r > PCI_MMAP_ERR_SENTINEL {
+        sys_munmap(host, sz)
+        return 4
+    }
+
+    unsafe { *(out_host_va_ptr as uint64) = host }
+    return 0
+}
+
 // pci_free_sysmem — undo a pci_alloc_sysmem. The GPU VA is NOT
 // returned to the bump allocator (we don't coalesce); this is a leak
 // across long-lived processes but irrelevant for the cold-init use
