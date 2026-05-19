@@ -1,0 +1,131 @@
+// std/atom.mlr — ATOM BIOS bytecode interpreter (MLRift port of
+// amdgpu/atom.c).
+//
+// Slice δ.0d (this file) ships only the image loader and the
+// table-of-contents walkers. Slices δ.0e onward layer in the
+// dispatch loop + opcodes + I/O port handlers.
+//
+// Reference: drivers/gpu/drm/amd/amdgpu/atom.{c,h} (linux 6.12.27).
+// All multi-byte reads are little-endian (CU16 / CU32 in the C
+// source map directly to MLRift's unaligned uint16/uint32 loads).
+
+import "atom_constants.mlr"
+import "sys.mlr"
+
+// =====================================================================
+// Image loader — read /tmp/mlrift_vbios.rom (or any other path) into a
+// fresh heap buffer. Mirrors fw_load_file from std/amdgpu_firmware.mlr.
+// Returns 0 on success, non-zero on failure; writes (buf_ptr, size)
+// through out_*.
+//
+// Errors:
+//   1 = open failed
+//   2 = lseek SEEK_END failed
+//   3 = lseek back-to-zero failed
+//   4 = read returned fewer bytes than expected
+// =====================================================================
+fn atom_load_image(uint64 path, uint64 out_buf_ptr, uint64 out_size_ptr) -> uint64 {
+    uint64 fd = sys_open(path, 0, 0)
+    if fd > 0xFFFFFFFFFFFFF000 { return 1 }
+    uint64 size = syscall_raw(8, fd, 0, 2, 0, 0, 0)
+    if size > 0xFFFFFFFFFFFFF000 { sys_close(fd); return 2 }
+    uint64 r2 = syscall_raw(8, fd, 0, 0, 0, 0, 0)
+    if r2 > 0xFFFFFFFFFFFFF000 { sys_close(fd); return 3 }
+    uint64 buf = alloc(size)
+    uint64 nread = syscall_raw(0, fd, buf, size, 0, 0, 0)
+    sys_close(fd)
+    if nread != size { dealloc(buf); return 4 }
+    unsafe { *(out_buf_ptr  as uint64) = buf }
+    unsafe { *(out_size_ptr as uint64) = size }
+    return 0
+}
+
+// =====================================================================
+// Header walkers — pure-read primitives over the image buffer.
+//
+// atom_get_rom_header_offset(buf):
+//   Returns CU16(buf + ATOM_ROM_TABLE_PTR) = byte offset of the
+//   ATOM_ROM_HEADER structure within the ROM image.
+//
+// atom_get_cmd_table_list_base(buf):
+//   Returns CU16(rom_hdr + ATOM_ROM_CMD_PTR) = byte offset of the
+//   master CommandTable list. The list is laid out as:
+//     [0..3]:  ATOM_COMMON_TABLE_HEADER (size + fmt rev + content rev)
+//     [4..]:   u16 array of per-table offsets
+//
+// atom_get_data_table_list_base(buf):
+//   Same idea for the master DataTable list.
+//
+// atom_cmd_table_offset_by_index(buf, idx):
+//   Resolves cmd table N's bytecode-base byte offset. Note: the
+//   returned offset is the base of the per-cmd-table HEADER, which is
+//   what amdgpu_atom_execute_table_locked expects (it does
+//   CU16(base + ATOM_CT_SIZE_PTR), etc.).
+// =====================================================================
+fn atom_get_rom_header_offset(uint64 buf) -> uint64 {
+    uint16 v = 0
+    unsafe { *((buf + ATOM_ROM_TABLE_PTR) as uint16) -> v }
+    uint64 ret = v
+    return ret
+}
+
+fn atom_get_cmd_table_list_base(uint64 buf) -> uint64 {
+    uint64 rom_hdr = atom_get_rom_header_offset(buf)
+    uint16 v = 0
+    unsafe { *((buf + rom_hdr + ATOM_ROM_CMD_PTR) as uint16) -> v }
+    uint64 ret = v
+    return ret
+}
+
+fn atom_get_data_table_list_base(uint64 buf) -> uint64 {
+    uint64 rom_hdr = atom_get_rom_header_offset(buf)
+    uint16 v = 0
+    unsafe { *((buf + rom_hdr + ATOM_ROM_DATA_PTR) as uint16) -> v }
+    uint64 ret = v
+    return ret
+}
+
+fn atom_cmd_table_offset_by_index(uint64 buf, uint64 idx) -> uint64 {
+    uint64 base = atom_get_cmd_table_list_base(buf)
+    uint16 v = 0
+    unsafe { *((buf + base + 4 + 2 * idx) as uint16) -> v }
+    uint64 ret = v
+    return ret
+}
+
+fn atom_data_table_offset_by_index(uint64 buf, uint64 idx) -> uint64 {
+    uint64 base = atom_get_data_table_list_base(buf)
+    uint16 v = 0
+    unsafe { *((buf + base + 4 + 2 * idx) as uint16) -> v }
+    uint64 ret = v
+    return ret
+}
+
+// =====================================================================
+// Sanity-check the image: PCI expansion ROM magic (0xAA55) at byte 0,
+// and the ASCII "ATOM" string four bytes into the ROM header.
+// Returns 0 if valid; non-zero error codes:
+//   1 = file too small
+//   2 = no 0xAA55 magic
+//   3 = ROM header offset out of range
+//   4 = no "ATOM" signature 4 bytes into the ROM header
+// =====================================================================
+fn atom_validate_image(uint64 buf, uint64 size) -> uint64 {
+    if size < 0x60 { return 1 }
+    uint8 b0 = 0; unsafe { *((buf + 0) as uint8) -> b0 }
+    uint8 b1 = 0; unsafe { *((buf + 1) as uint8) -> b1 }
+    if b0 != 0x55 { return 2 }
+    if b1 != 0xAA { return 2 }
+    uint64 rom_hdr = atom_get_rom_header_offset(buf)
+    if rom_hdr == 0 { return 3 }
+    if rom_hdr + 0x10 >= size { return 3 }
+    uint8 m0 = 0; unsafe { *((buf + rom_hdr + ATOM_ROM_MAGIC_PTR + 0) as uint8) -> m0 }
+    uint8 m1 = 0; unsafe { *((buf + rom_hdr + ATOM_ROM_MAGIC_PTR + 1) as uint8) -> m1 }
+    uint8 m2 = 0; unsafe { *((buf + rom_hdr + ATOM_ROM_MAGIC_PTR + 2) as uint8) -> m2 }
+    uint8 m3 = 0; unsafe { *((buf + rom_hdr + ATOM_ROM_MAGIC_PTR + 3) as uint8) -> m3 }
+    if m0 != 65 { return 4 }   // 'A'
+    if m1 != 84 { return 4 }   // 'T'
+    if m2 != 79 { return 4 }   // 'O'
+    if m3 != 77 { return 4 }   // 'M'
+    return 0
+}
