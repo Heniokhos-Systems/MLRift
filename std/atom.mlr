@@ -1867,3 +1867,72 @@ fn _atom_put_dst(uint64 ectx, uint64 arg, uint64 attr, uint64 ptr_ptr, uint64 va
     // cases except ATOM_ARG_MC (which has an early return). We have no debug
     // output so there's nothing extra to do here.
 }
+
+// =====================================================================
+// slice δ.0k — context builder + image bind
+//
+// atom_context_init(image_buf, image_size, bar5_host) → ctx or 0
+//   Allocates and zeroes an atom_context (ATOM_CONTEXT_SIZE bytes),
+//   wires the image fields, resolves the command/data table-of-contents
+//   base offsets, and allocates a 64 KiB host scratch backing store for
+//   ATOM_ARG_FB ops. Pass bar5_host = 0 for synthetic / CPU-only mode.
+//
+// atom_context_free(ctx)
+//   Frees the scratch buffer then the ctx block. Caller frees image_buf.
+//
+// atom_execute_table_by_index(ctx, idx, ps_ptr, ps_size) → rc
+//   Convenience: resolves cmd-table index → byte offset and delegates
+//   to atom_execute_table. Returns 1 if the table is not present
+//   (offset == 0 or out-of-range index).
+// =====================================================================
+
+fn atom_context_init(uint64 image_buf, uint64 image_size, uint64 bar5_host) -> uint64 {
+    if image_buf == 0 { return 0 }
+
+    // Allocate and zero the context block.
+    uint64 ctx = alloc(ATOM_CONTEXT_SIZE)
+    uint64 zi = 0
+    while zi < ATOM_CONTEXT_SIZE {
+        uint8 z = 0; unsafe { *((ctx + zi) as uint8) = z }; zi = zi + 1
+    }
+
+    // Allocate 64 KiB host scratch for ATOM_ARG_FB ops.
+    uint64 scratch_size = 65536
+    uint64 scratch = alloc(scratch_size)
+    if scratch == 0 { dealloc(ctx); return 0 }
+    uint64 si = 0
+    while si < scratch_size {
+        uint8 z = 0; unsafe { *((scratch + si) as uint8) = z }; si = si + 1
+    }
+
+    // Resolve table-of-contents offsets from the image.
+    uint64 cmd_base  = atom_get_cmd_table_list_base(image_buf)
+    uint64 data_base = atom_get_data_table_list_base(image_buf)
+
+    // Populate context fields.
+    unsafe { *((ctx + AC_OFF_IMAGE_BUF)       as uint64) = image_buf  }
+    unsafe { *((ctx + AC_OFF_IMAGE_SIZE)      as uint64) = image_size }
+    unsafe { *((ctx + AC_OFF_CMD_TABLE_BASE)  as uint64) = cmd_base   }
+    unsafe { *((ctx + AC_OFF_DATA_TABLE_BASE) as uint64) = data_base  }
+    unsafe { *((ctx + AC_OFF_FB_BASE)         as uint64) = scratch    }
+    unsafe { *((ctx + AC_OFF_FB_SIZE)         as uint64) = scratch_size }
+    unsafe { *((ctx + AC_OFF_SCRATCH)         as uint64) = scratch    }
+    unsafe { *((ctx + AC_OFF_SCRATCH_SIZE)    as uint64) = scratch_size }
+    unsafe { *((ctx + AC_OFF_IO_MODE)         as uint64) = ATOM_IO_MM }
+    unsafe { *((ctx + AC_OFF_BAR5_HOST)       as uint64) = bar5_host  }
+
+    return ctx
+}
+
+fn atom_context_free(uint64 ctx) {
+    if ctx == 0 { return }
+    uint64 scratch = 0; unsafe { *((ctx + AC_OFF_SCRATCH) as uint64) -> scratch }
+    if scratch != 0 { dealloc(scratch) }
+    dealloc(ctx)
+}
+
+fn atom_execute_table_by_index(uint64 ctx, uint64 idx, uint64 ps_ptr, uint64 ps_size) -> uint64 {
+    uint64 image = 0; unsafe { *((ctx + AC_OFF_IMAGE_BUF) as uint64) -> image }
+    uint64 off = atom_cmd_table_offset_by_index(image, idx)
+    return atom_execute_table(ctx, off, ps_ptr, ps_size)
+}
