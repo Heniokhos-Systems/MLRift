@@ -206,3 +206,50 @@ fn psp_copy_blob(uint64 host_buf, uint64 src, uint64 size) {
         i = i + 1
     }
 }
+
+// =====================================================================
+// Single-component bootloader load. Mirrors amdgpu's
+// psp_v13_0_bootloader_load_component() — used for KDB, SYS_DRV,
+// SOC_DRV, INTF_DRV, DBG_DRV, etc. (NOT for SOS itself — that uses
+// psp_load_sos below which has the SOS-alive-poll tail.)
+//
+// Recipe:
+//   1. Refuse if SOS is already alive (the bootloader has handed
+//      control off to the runtime; further BL commands will be ignored).
+//   2. Wait for the bootloader to be in the ready state.
+//   3. Zero the 1 MiB staging buffer (the kernel driver does this too).
+//   4. Copy the sub-blob payload to offset 0 of the staging buffer.
+//   5. Write (gpu_va >> 20) to C2PMSG_36.
+//   6. Write cmd_word to C2PMSG_35 (this clears bit 31 — cmd in flight).
+//   7. Poll C2PMSG_35 for ready (bit 31 re-asserted, bits[7:0] clear).
+//
+// Returns 0 on success. Non-zero values + meaning of *out_err_byte:
+//   1 = SOS already alive — bootloader will refuse further cmds.
+//       *out_err_byte unchanged.
+//   2 = pre-command wait_for_bootloader timed out. *out_err_byte holds
+//       the last C2PMSG_35[7:0].
+//   3 = post-command wait_for_bootloader timed out. *out_err_byte holds
+//       the last C2PMSG_35[7:0] — PSP error code if non-zero.
+//   4 = sub_blob_size exceeds PSP_FW_BUF_SIZE — caller bug.
+//
+// out_err_byte may be 0 to skip writing the error byte.
+fn psp_load_component(uint64 bar5_host,
+                      uint64 fw_buf_host_va,
+                      uint64 fw_buf_gpu_va,
+                      uint64 sub_blob_ptr,
+                      uint64 sub_blob_size,
+                      uint64 cmd_word,
+                      uint64 out_err_byte) -> uint64 {
+    if sub_blob_size > PSP_FW_BUF_SIZE { return 4 }
+    if psp_is_sos_alive(bar5_host) != 0 { return 1 }
+    uint64 r1 = psp_wait_for_bootloader(bar5_host, out_err_byte)
+    if r1 != 0 { return 2 }
+    psp_zero_buf(fw_buf_host_va, PSP_FW_BUF_SIZE)
+    psp_copy_blob(fw_buf_host_va, sub_blob_ptr, sub_blob_size)
+    uint64 addr_word = fw_buf_gpu_va >> 20
+    psp_write32(bar5_host, PSP_REG_C2PMSG_36, addr_word)
+    psp_write32(bar5_host, PSP_REG_C2PMSG_35, cmd_word)
+    uint64 r2 = psp_wait_for_bootloader(bar5_host, out_err_byte)
+    if r2 != 0 { return 3 }
+    return 0
+}
