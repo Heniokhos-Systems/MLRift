@@ -1,0 +1,461 @@
+// std/pcidev.mlr — PCI device HAL for MLRift's userspace GPU driver.
+//
+// Cross-platform boundary: every BAR-mapping and DMA-mapping operation
+// for the userspace GPU substrate goes through this file. Linux uses
+// VFIO; Windows + macOS get their own backends matching the same
+// function surface. The PSP/MEC/GFX/SDMA cold-init code (slices δ-ζ)
+// must never touch /dev/vfio/* directly — only through these wrappers.
+//
+// Single-device assumption: one dGPU per process, state in file-scope
+// statics. Multi-dGPU is a later refactor that promotes the statics to
+// a returned handle struct.
+//
+// Return-code convention: 0 = success, non-zero = error number. Specific
+// codes are documented per-function; callers can branch on them. The
+// underlying errno (from the failed syscall) is also stashed via
+// sys_errno_get() — useful for diagnostics.
+//
+// Verified 2026-05-19 against linux/vfio.h on Linux 6.17 and against a
+// stand-alone C VFIO probe that successfully read BAR5 on the dGPU.
+
+import "sys.mlr"
+
+// ---------------------------------------------------------------------
+// VFIO ioctl numbers — verified against the host kernel's
+// /usr/include/linux/vfio.h via a tiny gcc probe.
+// All VFIO ioctls use _IO(';',N), so cmd = 0x3B00 + N.
+// ---------------------------------------------------------------------
+static uint64 VFIO_GET_API_VERSION        = 0x3B64
+static uint64 VFIO_CHECK_EXTENSION        = 0x3B65
+static uint64 VFIO_SET_IOMMU              = 0x3B66
+static uint64 VFIO_GROUP_GET_STATUS       = 0x3B67
+static uint64 VFIO_GROUP_SET_CONTAINER    = 0x3B68
+static uint64 VFIO_GROUP_GET_DEVICE_FD    = 0x3B6A
+static uint64 VFIO_DEVICE_GET_INFO        = 0x3B6B
+static uint64 VFIO_DEVICE_GET_REGION_INFO = 0x3B6C
+static uint64 VFIO_IOMMU_GET_INFO         = 0x3B70
+static uint64 VFIO_IOMMU_MAP_DMA          = 0x3B71
+static uint64 VFIO_IOMMU_UNMAP_DMA        = 0x3B72
+
+static uint64 VFIO_TYPE1_IOMMU                 = 1
+static uint64 VFIO_GROUP_FLAGS_VIABLE          = 0x1
+static uint64 VFIO_GROUP_FLAGS_CONTAINER_SET   = 0x2
+static uint64 VFIO_DMA_MAP_FLAG_READ           = 0x1
+static uint64 VFIO_DMA_MAP_FLAG_WRITE          = 0x2
+
+// VFIO region info flags (bit positions in vfio_region_info.flags):
+static uint64 VFIO_REGION_INFO_FLAG_READ  = 0x1
+static uint64 VFIO_REGION_INFO_FLAG_WRITE = 0x2
+static uint64 VFIO_REGION_INFO_FLAG_MMAP  = 0x4
+
+// ---------------------------------------------------------------------
+// Struct sizes (bytes). Verified by sizeof(struct ...) in a C probe.
+// ---------------------------------------------------------------------
+static uint64 SZ_VFIO_GROUP_STATUS          = 8
+static uint64 SZ_VFIO_DEVICE_INFO           = 24
+static uint64 SZ_VFIO_REGION_INFO           = 32
+static uint64 SZ_VFIO_IOMMU_TYPE1_DMA_MAP   = 32
+static uint64 SZ_VFIO_IOMMU_TYPE1_DMA_UNMAP = 24
+
+// ---------------------------------------------------------------------
+// mmap() prot + flags (Linux x86_64). Match glibc's sys/mman.h values.
+// ---------------------------------------------------------------------
+static uint64 PCI_PROT_READ  = 1
+static uint64 PCI_PROT_WRITE = 2
+static uint64 PCI_PROT_RW    = 3
+static uint64 PCI_MAP_SHARED  = 1
+static uint64 PCI_MAP_PRIVATE = 2
+static uint64 PCI_MAP_ANON    = 0x20
+static uint64 PCI_MAP_LOCKED  = 0x2000
+
+// mmap() returns -errno on failure; the kernel reserves the top 4 KiB
+// as the error window, so any return value above this sentinel is a
+// failure code.
+static uint64 PCI_MMAP_ERR_SENTINEL = 0xFFFFFFFFFFFFF000
+static uint64 PCI_MAP_FAILED_SENTINEL = 0xFFFFFFFFFFFFFFFF
+
+// VFIO PCI region indices (linux/vfio.h enum).
+static uint64 PCI_BAR0_REGION_INDEX   = 0
+static uint64 PCI_BAR1_REGION_INDEX   = 1
+static uint64 PCI_BAR2_REGION_INDEX   = 2
+static uint64 PCI_BAR3_REGION_INDEX   = 3
+static uint64 PCI_BAR4_REGION_INDEX   = 4
+static uint64 PCI_BAR5_REGION_INDEX   = 5
+static uint64 PCI_ROM_REGION_INDEX    = 6
+static uint64 PCI_CONFIG_REGION_INDEX = 7
+
+// ---------------------------------------------------------------------
+// Device-handle state. -1ULL sentinels mean "not initialized."
+// ---------------------------------------------------------------------
+static uint64 _pcidev_container_fd = 0xFFFFFFFFFFFFFFFF
+static uint64 _pcidev_group_fd     = 0xFFFFFFFFFFFFFFFF
+static uint64 _pcidev_device_fd    = 0xFFFFFFFFFFFFFFFF
+
+// GPU virtual-address bump allocator. tinygrad uses the range
+// 0x200000000000–0x2ffffffff000 (44-bit) for VMID 0; we follow.
+static uint64 PCI_IOMMU_VA_BASE  = 0x200000000000
+static uint64 PCI_IOMMU_VA_LIMIT = 0x300000000000
+static uint64 _pcidev_iommu_va_cursor = 0x200000000000
+
+// ---------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------
+
+// Zero `n` bytes at `p`. Used for ioctl arg structs that must start
+// zeroed (VFIO_*_INFO ioctls discriminate on argsz + zero-fill).
+fn _pcidev_zero(uint64 p, uint64 n) {
+    uint64 i = 0
+    uint8 zb = 0
+    while i < n {
+        unsafe { *((p + i) as uint8) = zb }
+        i = i + 1
+    }
+}
+
+// Page-align `n` up to 4 KiB. Used for both the IOMMU map size (the
+// kernel requires page alignment) and the bump-allocator advance.
+fn _pcidev_page_up(uint64 n) -> uint64 {
+    return (n + 0xFFF) & 0xFFFFFFFFFFFFF000
+}
+
+// Append the decimal representation of `n` to the byte buffer at `dst`,
+// starting at byte offset `start`. Writes a trailing NUL. Returns the
+// total length written, including the NUL.
+//
+// Used to build "/dev/vfio/<group_num>" without depending on string
+// formatting helpers from std/fmt.mlr (this file should stay
+// self-contained for the bootstrap path).
+fn _pcidev_append_u64(uint64 dst, uint64 start, uint64 n) -> uint64 {
+    uint64 digits = 0
+    if n == 0 {
+        uint8 zero = 48
+        unsafe { *((dst + start) as uint8) = zero }
+        digits = 1
+    } else {
+        uint64 t = n
+        while t > 0 { digits = digits + 1; t = t / 10 }
+        uint64 j = digits
+        t = n
+        while j > 0 {
+            j = j - 1
+            uint64 d = t - (t / 10) * 10
+            uint8 db = d + 48
+            unsafe { *((dst + start + j) as uint8) = db }
+            t = t / 10
+        }
+    }
+    uint8 nul = 0
+    unsafe { *((dst + start + digits) as uint8) = nul }
+    return digits + 1
+}
+
+// ---------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------
+
+// pci_open — open the VFIO container, group, and device for the GPU at
+// the given PCI BDF (e.g., "0000:03:00.0") in the given IOMMU group.
+//
+// Returns 0 on success or one of these error codes:
+//   1 = open(/dev/vfio/vfio) failed
+//   2 = VFIO_GET_API_VERSION mismatch (kernel/userspace ABI drift)
+//   3 = VFIO_TYPE1_IOMMU not supported
+//   4 = open(/dev/vfio/<group>) failed
+//   5 = VFIO_GROUP_GET_STATUS ioctl failed
+//   6 = group not viable (another device in the group is not bound to vfio-pci)
+//   7 = VFIO_GROUP_SET_CONTAINER ioctl failed
+//   8 = VFIO_SET_IOMMU ioctl failed
+//   9 = VFIO_GROUP_GET_DEVICE_FD ioctl failed
+fn pci_open(uint64 bdf_str, uint64 group_num) -> uint64 {
+    // 1) Container fd
+    uint64 cont_path = "/dev/vfio/vfio"
+    uint64 cfd = sys_open(cont_path, 2, 0)   // O_RDWR=2
+    if cfd > PCI_MMAP_ERR_SENTINEL { return 1 }
+
+    // 2) API version (must equal VFIO_API_VERSION=0)
+    uint64 api = sys_ioctl(cfd, VFIO_GET_API_VERSION, 0)
+    if api != 0 { sys_close(cfd); return 2 }
+
+    // 3) Type1 IOMMU extension
+    uint64 t1 = sys_ioctl(cfd, VFIO_CHECK_EXTENSION, VFIO_TYPE1_IOMMU)
+    if t1 == 0 { sys_close(cfd); return 3 }
+
+    // 4) Group fd. Build "/dev/vfio/<group_num>" in a 64-byte scratch.
+    uint64 gpath = alloc(64)
+    _pcidev_zero(gpath, 64)
+    uint64 prefix = "/dev/vfio/"
+    uint64 i = 0
+    while i < 10 {
+        uint8 c = 0
+        unsafe { *((prefix + i) as uint8) -> c }
+        unsafe { *((gpath + i) as uint8) = c }
+        i = i + 1
+    }
+    _pcidev_append_u64(gpath, 10, group_num)
+    uint64 gfd = sys_open(gpath, 2, 0)
+    dealloc(gpath)
+    if gfd > PCI_MMAP_ERR_SENTINEL { sys_close(cfd); return 4 }
+
+    // 5) Status check — must be viable before SET_CONTAINER.
+    uint64 gs = alloc(SZ_VFIO_GROUP_STATUS)
+    _pcidev_zero(gs, SZ_VFIO_GROUP_STATUS)
+    uint32 gs_argsz_w = SZ_VFIO_GROUP_STATUS
+    unsafe { *((gs + 0) as uint32) = gs_argsz_w }
+    uint64 sr = sys_ioctl(gfd, VFIO_GROUP_GET_STATUS, gs)
+    if sr > PCI_MMAP_ERR_SENTINEL {
+        dealloc(gs); sys_close(gfd); sys_close(cfd); return 5
+    }
+    uint32 gs_flags = 0
+    unsafe { *((gs + 4) as uint32) -> gs_flags }
+    dealloc(gs)
+    uint64 gs_flags_u64 = gs_flags
+    if (gs_flags_u64 & VFIO_GROUP_FLAGS_VIABLE) == 0 {
+        sys_close(gfd); sys_close(cfd); return 6
+    }
+
+    // 6) Attach group to container. SET_CONTAINER takes a pointer to
+    //    the container fd (int *), not the fd itself.
+    uint64 fdptr = alloc(4)
+    uint32 cfd_w = cfd
+    unsafe { *(fdptr as uint32) = cfd_w }
+    uint64 sr2 = sys_ioctl(gfd, VFIO_GROUP_SET_CONTAINER, fdptr)
+    dealloc(fdptr)
+    if sr2 > PCI_MMAP_ERR_SENTINEL {
+        sys_close(gfd); sys_close(cfd); return 7
+    }
+
+    // 7) Set IOMMU mode. Must happen AFTER SET_CONTAINER for the first
+    //    group in the container.
+    uint64 sr3 = sys_ioctl(cfd, VFIO_SET_IOMMU, VFIO_TYPE1_IOMMU)
+    if sr3 > PCI_MMAP_ERR_SENTINEL {
+        sys_close(gfd); sys_close(cfd); return 8
+    }
+
+    // 8) Pull the device fd out of the group by BDF string.
+    uint64 dfd = sys_ioctl(gfd, VFIO_GROUP_GET_DEVICE_FD, bdf_str)
+    if dfd > PCI_MMAP_ERR_SENTINEL {
+        sys_close(gfd); sys_close(cfd); return 9
+    }
+
+    _pcidev_container_fd = cfd
+    _pcidev_group_fd     = gfd
+    _pcidev_device_fd    = dfd
+    return 0
+}
+
+// pci_close — release the device, group, and container fds in reverse
+// order. Safe to call when uninitialized (no-op).
+fn pci_close() {
+    if _pcidev_device_fd != 0xFFFFFFFFFFFFFFFF {
+        sys_close(_pcidev_device_fd)
+        _pcidev_device_fd = 0xFFFFFFFFFFFFFFFF
+    }
+    if _pcidev_group_fd != 0xFFFFFFFFFFFFFFFF {
+        sys_close(_pcidev_group_fd)
+        _pcidev_group_fd = 0xFFFFFFFFFFFFFFFF
+    }
+    if _pcidev_container_fd != 0xFFFFFFFFFFFFFFFF {
+        sys_close(_pcidev_container_fd)
+        _pcidev_container_fd = 0xFFFFFFFFFFFFFFFF
+    }
+}
+
+// Accessors for the underlying fds. Slices that need to issue more
+// exotic ioctls (e.g. config-space pread/pwrite) reach in here.
+fn pci_device_fd() -> uint64    { return _pcidev_device_fd }
+fn pci_container_fd() -> uint64 { return _pcidev_container_fd }
+fn pci_group_fd() -> uint64     { return _pcidev_group_fd }
+
+// pci_bar_info — query a region's size, mmap offset, and flags. Writes
+// into the three out-pointers. Returns 0 on success.
+//
+//   *out_size_ptr   — region size in bytes
+//   *out_offset_ptr — offset to pass to sys_mmap on the device fd
+//   *out_flags_ptr  — VFIO region flags (bit 0=READ, 1=WRITE, 2=MMAP)
+//
+// Error codes:
+//   1 = device not open
+//   2 = VFIO_DEVICE_GET_REGION_INFO ioctl failed (likely invalid index)
+fn pci_bar_info(uint64 bar_idx,
+                uint64 out_size_ptr,
+                uint64 out_offset_ptr,
+                uint64 out_flags_ptr) -> uint64 {
+    if _pcidev_device_fd == 0xFFFFFFFFFFFFFFFF { return 1 }
+    uint64 ri = alloc(SZ_VFIO_REGION_INFO)
+    _pcidev_zero(ri, SZ_VFIO_REGION_INFO)
+    uint32 argsz_w = SZ_VFIO_REGION_INFO
+    unsafe { *((ri + 0) as uint32) = argsz_w }
+    uint32 idx_w = bar_idx
+    unsafe { *((ri + 8) as uint32) = idx_w }
+    uint64 r = sys_ioctl(_pcidev_device_fd, VFIO_DEVICE_GET_REGION_INFO, ri)
+    if r > PCI_MMAP_ERR_SENTINEL { dealloc(ri); return 2 }
+    uint32 flags = 0; unsafe { *((ri + 4) as uint32) -> flags }
+    uint64 sz  = 0;   unsafe { *((ri + 16) as uint64) -> sz }
+    uint64 off = 0;   unsafe { *((ri + 24) as uint64) -> off }
+    dealloc(ri)
+    unsafe { *(out_size_ptr   as uint64) = sz }
+    unsafe { *(out_offset_ptr as uint64) = off }
+    uint64 flags_u64 = flags
+    unsafe { *(out_flags_ptr  as uint64) = flags_u64 }
+    return 0
+}
+
+// pci_map_bar — mmap a BAR region via the VFIO device fd. Returns the
+// host virtual address on success, or PCI_MAP_FAILED_SENTINEL
+// (0xFFFFFFFFFFFFFFFF) on any failure.
+//
+// The returned mapping is process-shared, R+W. Caller is responsible
+// for sys_munmap when done.
+fn pci_map_bar(uint64 bar_idx) -> uint64 {
+    uint64 sb = alloc(24)
+    _pcidev_zero(sb, 24)
+    uint64 e = pci_bar_info(bar_idx, sb + 0, sb + 8, sb + 16)
+    if e != 0 { dealloc(sb); return PCI_MAP_FAILED_SENTINEL }
+    uint64 sz  = 0; unsafe { *((sb + 0) as uint64) -> sz }
+    uint64 off = 0; unsafe { *((sb + 8) as uint64) -> off }
+    uint64 fl  = 0; unsafe { *((sb + 16) as uint64) -> fl }
+    dealloc(sb)
+    if (fl & VFIO_REGION_INFO_FLAG_MMAP) == 0 { return PCI_MAP_FAILED_SENTINEL }
+    if sz == 0 { return PCI_MAP_FAILED_SENTINEL }
+    uint64 host = sys_mmap(0, sz, PCI_PROT_RW, PCI_MAP_SHARED,
+                           _pcidev_device_fd, off)
+    if host > PCI_MMAP_ERR_SENTINEL { return PCI_MAP_FAILED_SENTINEL }
+    return host
+}
+
+// pci_alloc_sysmem — allocate page-aligned host memory and IOMMU-map
+// it for GPU access. The GPU side gets a virtual address from the
+// bump allocator (PCI_IOMMU_VA_BASE upward, 44-bit window matching
+// the GPU's MM hub aperture).
+//
+// Writes the host-side virtual address into *out_host_va_ptr and the
+// GPU-side virtual address into *out_gpu_va_ptr. Returns 0 on success.
+//
+// Error codes:
+//   1 = container not open
+//   2 = bump allocator exhausted (no GPU VA space left)
+//   3 = host mmap failed
+//   4 = VFIO_IOMMU_MAP_DMA ioctl failed (host mmap rolled back)
+fn pci_alloc_sysmem(uint64 size,
+                    uint64 out_host_va_ptr,
+                    uint64 out_gpu_va_ptr) -> uint64 {
+    if _pcidev_container_fd == 0xFFFFFFFFFFFFFFFF { return 1 }
+    uint64 sz = _pcidev_page_up(size)
+    if _pcidev_iommu_va_cursor + sz > PCI_IOMMU_VA_LIMIT { return 2 }
+
+    // Host-side: anonymous, private, locked. MAP_LOCKED makes mlock
+    // implicit so the pages can't be swapped/migrated while the GPU
+    // has an IOMMU mapping to them.
+    uint64 host = sys_mmap(0, sz, PCI_PROT_RW,
+                           PCI_MAP_PRIVATE | PCI_MAP_ANON | PCI_MAP_LOCKED,
+                           0xFFFFFFFFFFFFFFFF, 0)
+    if host > PCI_MMAP_ERR_SENTINEL { return 3 }
+
+    uint64 gpu_va = _pcidev_iommu_va_cursor
+    _pcidev_iommu_va_cursor = _pcidev_iommu_va_cursor + sz
+
+    uint64 m = alloc(SZ_VFIO_IOMMU_TYPE1_DMA_MAP)
+    _pcidev_zero(m, SZ_VFIO_IOMMU_TYPE1_DMA_MAP)
+    uint32 argsz_w = SZ_VFIO_IOMMU_TYPE1_DMA_MAP
+    uint32 flags_w = VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE
+    unsafe { *((m + 0)  as uint32) = argsz_w }
+    unsafe { *((m + 4)  as uint32) = flags_w }
+    unsafe { *((m + 8)  as uint64) = host }
+    unsafe { *((m + 16) as uint64) = gpu_va }
+    unsafe { *((m + 24) as uint64) = sz }
+    uint64 r = sys_ioctl(_pcidev_container_fd, VFIO_IOMMU_MAP_DMA, m)
+    dealloc(m)
+    if r > PCI_MMAP_ERR_SENTINEL {
+        sys_munmap(host, sz)
+        return 4
+    }
+
+    unsafe { *(out_host_va_ptr as uint64) = host }
+    unsafe { *(out_gpu_va_ptr  as uint64) = gpu_va }
+    return 0
+}
+
+// pci_free_sysmem — undo a pci_alloc_sysmem. The GPU VA is NOT
+// returned to the bump allocator (we don't coalesce); this is a leak
+// across long-lived processes but irrelevant for the cold-init use
+// case (which allocates a fixed set of GPU buffers and frees them
+// only at teardown).
+fn pci_free_sysmem(uint64 host_va, uint64 gpu_va, uint64 size) -> uint64 {
+    uint64 sz = _pcidev_page_up(size)
+    uint64 u = alloc(SZ_VFIO_IOMMU_TYPE1_DMA_UNMAP)
+    _pcidev_zero(u, SZ_VFIO_IOMMU_TYPE1_DMA_UNMAP)
+    uint32 argsz_w = SZ_VFIO_IOMMU_TYPE1_DMA_UNMAP
+    unsafe { *((u + 0)  as uint32) = argsz_w }
+    unsafe { *((u + 8)  as uint64) = gpu_va }
+    unsafe { *((u + 16) as uint64) = sz }
+    uint64 r = sys_ioctl(_pcidev_container_fd, VFIO_IOMMU_UNMAP_DMA, u)
+    dealloc(u)
+    sys_munmap(host_va, sz)
+    if r > PCI_MMAP_ERR_SENTINEL { return 1 }
+    return 0
+}
+
+// pci_read_config32 — read a 32-bit dword from PCI config space via
+// the device fd's CONFIG region.  Returns the value; sets errno via
+// sys_errno_get on failure.
+//
+// VFIO config region supports read()/pread() at the region's offset
+// + the config-space byte offset. No mmap (config space is special).
+fn pci_read_config32(uint64 off) -> uint32 {
+    uint64 sb = alloc(24)
+    _pcidev_zero(sb, 24)
+    uint64 e = pci_bar_info(PCI_CONFIG_REGION_INDEX, sb + 0, sb + 8, sb + 16)
+    if e != 0 { dealloc(sb); return 0xFFFFFFFF }
+    uint64 base_off = 0; unsafe { *((sb + 8) as uint64) -> base_off }
+    dealloc(sb)
+    uint64 vp = alloc(4)
+    unsafe { *(vp as uint32) = 0 }
+    // SYS_pread64 = 17 on x86_64: pread(fd, buf, count, offset)
+    syscall_raw(17, _pcidev_device_fd, vp, 4, base_off + off, 0, 0)
+    uint32 v = 0
+    unsafe { *(vp as uint32) -> v }
+    dealloc(vp)
+    return v
+}
+
+// pci_set_bus_master — turn on Bus Master + Memory + I/O space in the
+// PCI Command register (config offset 0x04, low 16 bits).
+//
+// vfio-pci leaves Bus Master disabled by default — without it the
+// GPU's internal memory controller can't fetch from VRAM, and BAR0
+// reads return all-1s. amdgpu sets BM=1 during its probe path; for
+// our cold-init flow we must do it ourselves before reading the
+// discovery table.
+//
+// Bits: bit 0 = I/O space, bit 1 = Memory space, bit 2 = Bus Master.
+// Returns 0 on success, 1 on config-space read failure, 2 on write.
+fn pci_set_bus_master() -> uint64 {
+    uint32 cmd_status = pci_read_config32(0x04)
+    if cmd_status == 0xFFFFFFFF { return 1 }
+    uint64 cs64 = cmd_status
+    uint64 new_cs = cs64 | 0x7    // bit 0 | bit 1 | bit 2 (Mem+IO+BM)
+    // Preserve high 16 bits (Status word) by writing back unchanged
+    // — Status bits are RW1C, but bits set in our read-back are the
+    // ones currently set, and writing them back as 1 clears them.
+    // For a fresh post-open call, Status is normally clean (0).
+    uint32 new_cs_w = new_cs
+    return pci_write_config32(0x04, new_cs_w)
+}
+
+// pci_write_config32 — write a 32-bit dword to PCI config space.
+// Returns 0 on success.
+fn pci_write_config32(uint64 off, uint32 val) -> uint64 {
+    uint64 sb = alloc(24)
+    _pcidev_zero(sb, 24)
+    uint64 e = pci_bar_info(PCI_CONFIG_REGION_INDEX, sb + 0, sb + 8, sb + 16)
+    if e != 0 { dealloc(sb); return 1 }
+    uint64 base_off = 0; unsafe { *((sb + 8) as uint64) -> base_off }
+    dealloc(sb)
+    uint64 vp = alloc(4)
+    unsafe { *(vp as uint32) = val }
+    // SYS_pwrite64 = 18 on x86_64
+    uint64 r = syscall_raw(18, _pcidev_device_fd, vp, 4, base_off + off, 0, 0)
+    dealloc(vp)
+    if r > PCI_MMAP_ERR_SENTINEL { return 2 }
+    return 0
+}

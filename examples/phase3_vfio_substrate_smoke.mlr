@@ -1,0 +1,234 @@
+// Phase 3 slice α — VFIO substrate smoke.
+//
+// Replicates /tmp/vfio_probe.c (which is in C) but written entirely in
+// MLRift via std/pcidev.mlr. Proof that the HAL works end-to-end:
+//
+//   1. Open the VFIO container + group 14 + device 0000:03:00.0.
+//   2. Walk regions 0-6 and print sizes + flags.
+//   3. mmap BAR5 (MMIO regs) and print the first 16 dwords.
+//   4. pci_alloc_sysmem a 4 KiB buffer (proves IOMMU MAP_DMA works).
+//   5. Close.
+//
+// Expected output mirrors /tmp/vfio_probe — BAR0=16 GiB, BAR2=256 MiB,
+// BAR5=1 MiB, BAR5[0]=0xfec07ffc with the same structured-data pattern.
+//
+// Requires: sudo (only root can open /dev/vfio/14).
+// Requires: dGPU bound to vfio-pci (see /etc/modprobe.d/vfio-dgpu.conf).
+
+import "../std/pcidev.mlr"
+import "../std/sys.mlr"
+
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn puts(uint64 s) -> uint32
+
+// ---------------------------------------------------------------------
+// Small print helpers (pure MLRift, no libc beyond puts).
+// ---------------------------------------------------------------------
+
+fn _print_u64_hex(uint64 label, uint64 lab_len, uint64 val) {
+    uint64 buf = alloc(64)
+    uint64 i = 0
+    while i < lab_len {
+        uint8 c = 0
+        unsafe { *((label + i) as uint8) -> c }
+        unsafe { *((buf + i) as uint8) = c }
+        i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((buf + lab_len) as uint8) = eq }
+    uint8 zx = 48; unsafe { *((buf + lab_len + 1) as uint8) = zx }
+    uint8 xc = 120; unsafe { *((buf + lab_len + 2) as uint8) = xc }
+    // 16 hex digits (32 bits => 8 digits, but use 16 for 64-bit) — we
+    // strip trailing zeros for readability by printing top-down.
+    uint64 j = 0
+    while j < 16 {
+        uint64 shift = (15 - j) * 4
+        uint64 nyb = (val >> shift) & 0xF
+        uint8 ch = nyb + 48
+        if nyb >= 10 { ch = nyb + 87 }   // 'a' = 97 = 87 + 10
+        unsafe { *((buf + lab_len + 3 + j) as uint8) = ch }
+        j = j + 1
+    }
+    uint8 nul = 0; unsafe { *((buf + lab_len + 19) as uint8) = nul }
+    puts(buf)
+    dealloc(buf)
+}
+
+fn _print_u64_dec(uint64 label, uint64 lab_len, uint64 val) {
+    uint64 buf = alloc(64)
+    uint64 i = 0
+    while i < lab_len {
+        uint8 c = 0
+        unsafe { *((label + i) as uint8) -> c }
+        unsafe { *((buf + i) as uint8) = c }
+        i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((buf + lab_len) as uint8) = eq }
+    uint64 digits = 0
+    if val == 0 {
+        uint8 z = 48
+        unsafe { *((buf + lab_len + 1) as uint8) = z }
+        digits = 1
+    } else {
+        uint64 t = val
+        while t > 0 { digits = digits + 1; t = t / 10 }
+        uint64 k = digits
+        t = val
+        while k > 0 {
+            k = k - 1
+            uint64 d = t - (t / 10) * 10
+            uint8 db = d + 48
+            unsafe { *((buf + lab_len + 1 + k) as uint8) = db }
+            t = t / 10
+        }
+    }
+    uint8 nul = 0; unsafe { *((buf + lab_len + 1 + digits) as uint8) = nul }
+    puts(buf)
+    dealloc(buf)
+}
+
+fn main() {
+    // 1) Open the device.
+    uint64 bdf = "0000:03:00.0"
+    uint64 e = pci_open(bdf, 14)
+    if e != 0 {
+        uint64 lab1 = "pci_open errno"
+        _print_u64_dec(lab1, 14, e)
+        uint64 lab2 = "sys_errno"
+        _print_u64_dec(lab2, 9, sys_errno_get())
+        exit(1)
+    }
+    puts("pci_open: OK")
+    _print_u64_dec("device_fd", 9, pci_device_fd())
+
+    // 2) Walk regions 0-6 (the BAR + ROM range).
+    uint64 idx = 0
+    while idx < 7 {
+        uint64 sb = alloc(24)
+        unsafe { *((sb + 0)  as uint64) = 0 }
+        unsafe { *((sb + 8)  as uint64) = 0 }
+        unsafe { *((sb + 16) as uint64) = 0 }
+        uint64 re = pci_bar_info(idx, sb + 0, sb + 8, sb + 16)
+        if re != 0 {
+            _print_u64_dec("region_err_idx", 14, idx)
+            dealloc(sb)
+            idx = idx + 1
+        } else {
+            uint64 sz = 0; unsafe { *((sb + 0)  as uint64) -> sz }
+            uint64 of = 0; unsafe { *((sb + 8)  as uint64) -> of }
+            uint64 fl = 0; unsafe { *((sb + 16) as uint64) -> fl }
+            dealloc(sb)
+            // Print: "region<idx> size=<hex> flags=<dec>"
+            uint64 banner = alloc(32)
+            uint64 prefix = "region"
+            uint64 p = 0
+            while p < 6 {
+                uint8 c = 0
+                unsafe { *((prefix + p) as uint8) -> c }
+                unsafe { *((banner + p) as uint8) = c }
+                p = p + 1
+            }
+            uint8 ddig = idx + 48
+            unsafe { *((banner + 6) as uint8) = ddig }
+            uint8 nul = 0; unsafe { *((banner + 7) as uint8) = nul }
+            puts(banner)
+            dealloc(banner)
+            _print_u64_hex("  size", 6, sz)
+            _print_u64_hex("  off",  5, of)
+            _print_u64_dec("  flags", 7, fl)
+            idx = idx + 1
+        }
+    }
+
+    // 3) mmap BAR5 and read first 16 dwords. The C probe showed
+    //    BAR5[0]=0xfec07ffc with structured data — we should match.
+    uint64 mmio = pci_map_bar(PCI_BAR5_REGION_INDEX)
+    if mmio == PCI_MAP_FAILED_SENTINEL {
+        puts("FAIL: BAR5 mmap failed")
+        pci_close()
+        exit(2)
+    }
+    _print_u64_hex("BAR5_host", 9, mmio)
+    puts("BAR5 first 16 dwords:")
+    uint64 k = 0
+    while k < 16 {
+        uint64 dwp = mmio + k * 4
+        uint32 v = 0
+        unsafe { *(dwp as uint32) -> v }
+        uint64 vu64 = v
+        // Print as "  [0xNN] = 0xVVVVVVVV"
+        uint64 prefix2 = "  ["
+        uint64 buf = alloc(32)
+        uint64 i = 0
+        while i < 3 {
+            uint8 c = 0
+            unsafe { *((prefix2 + i) as uint8) -> c }
+            unsafe { *((buf + i) as uint8) = c }
+            i = i + 1
+        }
+        // 2-digit hex for the byte offset
+        uint64 off_b = k * 4
+        uint64 hi = (off_b >> 4) & 0xF
+        uint64 lo = off_b & 0xF
+        uint8 hic = hi + 48
+        if hi >= 10 { hic = hi + 87 }
+        uint8 loc = lo + 48
+        if lo >= 10 { loc = lo + 87 }
+        unsafe { *((buf + 3) as uint8) = hic }
+        unsafe { *((buf + 4) as uint8) = loc }
+        uint8 cb = 93; unsafe { *((buf + 5) as uint8) = cb }   // ']'
+        uint8 sp = 32; unsafe { *((buf + 6) as uint8) = sp }
+        uint8 eq = 61; unsafe { *((buf + 7) as uint8) = eq }
+        uint8 sp2 = 32; unsafe { *((buf + 8) as uint8) = sp2 }
+        uint8 zx = 48; unsafe { *((buf + 9) as uint8) = zx }
+        uint8 xc = 120; unsafe { *((buf + 10) as uint8) = xc }
+        uint64 j = 0
+        while j < 8 {
+            uint64 sh = (7 - j) * 4
+            uint64 nyb = (vu64 >> sh) & 0xF
+            uint8 ch = nyb + 48
+            if nyb >= 10 { ch = nyb + 87 }
+            unsafe { *((buf + 11 + j) as uint8) = ch }
+            j = j + 1
+        }
+        uint8 nul2 = 0; unsafe { *((buf + 19) as uint8) = nul2 }
+        puts(buf)
+        dealloc(buf)
+        k = k + 1
+    }
+
+    // 4) IOMMU DMA-map test: allocate a 4 KiB host buffer and map it
+    //    for GPU access. Proves the container's IOMMU MAP_DMA path
+    //    works. Slices δ-ζ depend on this primitive.
+    uint64 hva_ptr = alloc(8)
+    uint64 gva_ptr = alloc(8)
+    unsafe { *(hva_ptr as uint64) = 0 }
+    unsafe { *(gva_ptr as uint64) = 0 }
+    uint64 ae = pci_alloc_sysmem(4096, hva_ptr, gva_ptr)
+    if ae != 0 {
+        _print_u64_dec("FAIL pci_alloc_sysmem errno", 27, ae)
+        _print_u64_dec("  sys_errno", 11, sys_errno_get())
+        dealloc(hva_ptr); dealloc(gva_ptr)
+        pci_close()
+        exit(3)
+    }
+    uint64 hva = 0; unsafe { *(hva_ptr as uint64) -> hva }
+    uint64 gva = 0; unsafe { *(gva_ptr as uint64) -> gva }
+    dealloc(hva_ptr); dealloc(gva_ptr)
+    _print_u64_hex("sysmem host_va", 14, hva)
+    _print_u64_hex("sysmem gpu_va",  13, gva)
+
+    // Write a sentinel into the host buffer (we can't read it back
+    // from the GPU yet — no dispatch path until slice η — but the
+    // host write proves the host mmap is alive).
+    unsafe { *(hva as uint32) = 0xDEADBEEF }
+    uint32 read_back = 0
+    unsafe { *(hva as uint32) -> read_back }
+    _print_u64_hex("sysmem sentinel readback", 24, read_back)
+
+    // Cleanup.
+    pci_free_sysmem(hva, gva, 4096)
+    sys_munmap(mmio, 0x100000)
+    pci_close()
+    puts("phase3_vfio_substrate_smoke: GREEN")
+    exit(0)
+}
