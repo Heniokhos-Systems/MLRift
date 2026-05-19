@@ -144,3 +144,163 @@ fn gmc_map(uint64 pt_ctx, uint64 mc_va_base, uint64 buf_gpu_iova,
     }
     return 0
 }
+
+// =====================================================================
+// MMHUB MMIO write/read primitives. Byte offset within BAR5 is
+// (amdgpu_ip_mmhub_base_0 + reg_dw) * 4.
+// =====================================================================
+fn _mmhub_write32(uint64 bar5_host, uint64 reg_dw, uint64 val) {
+    uint64 byte_off = (amdgpu_ip_mmhub_base_0 + reg_dw) * 4
+    uint32 v = val
+    unsafe { *((bar5_host + byte_off) as uint32) = v }
+}
+fn _mmhub_read32(uint64 bar5_host, uint64 reg_dw) -> uint64 {
+    uint64 byte_off = (amdgpu_ip_mmhub_base_0 + reg_dw) * 4
+    uint32 v = 0
+    unsafe { *((bar5_host + byte_off) as uint32) -> v }
+    uint64 ret = v
+    return ret
+}
+
+// =====================================================================
+// gmc_init_mmhub — write the MMHUB GART-init register sequence in the
+// same order tinygrad's init_hub("MM") does (ip.py:117-152), but
+// skipping the FB_LOCATION / VRAM-aperture writes (our VRAM is cold).
+// Per-group readback fences abort BEFORE the final
+// VM_CONTEXT0_CNTL.enable_context = 1 commit if any prior group
+// silently dropped writes.
+//
+// Inputs:
+//   bar5_host           Host VA of the mmap'd BAR5.
+//   pt_ctx              Output of gmc_alloc_page_table (after gmc_map).
+//   mc_va_base          Starting MC VA the GART covers.
+//   mc_va_size          Size of the GART region (must match gmc_map).
+//   sys_apert_lo,
+//   sys_apert_hi        Values for the system aperture LOW/HIGH regs
+//                       (units: MC VA >> 18). lo=0, hi=0xFFFF disables
+//                       the system aperture's identity fast-path so
+//                       all translations go through PTEs.
+//   default_addr_phys   Page-aligned iova of a zero-filled scratch page
+//                       (the fallback target for faulting accesses).
+//
+// Returns:
+//   0 success.
+//   1 PAGE_TABLE_BASE_LO readback != pd_iova low32.
+//   2 CONTEXT0_CNTL.enable_context not set after final write.
+//   3 MC_VM_MX_L1_TLB_CNTL.enable_l1_tlb not set after write.
+//   4 VM_L2_CNTL.enable_l2_cache not set after write.
+//   5 readback returned 0xFFFFFFFF on any reg (suspected wedge).
+//
+// All readbacks are checked. The function aborts early on any
+// fence mismatch — pages remain allocated, caller is responsible
+// for gmc_page_table_free.
+// =====================================================================
+fn gmc_init_mmhub(uint64 bar5_host, uint64 pt_ctx,
+                  uint64 mc_va_base, uint64 mc_va_size,
+                  uint64 sys_apert_lo, uint64 sys_apert_hi,
+                  uint64 default_addr_phys) -> uint64 {
+    uint64 pd_iova = 0; unsafe { *((pt_ctx + GMC_PT_OFF_PD_IOVA) as uint64) -> pd_iova }
+
+    // ---- AGP aperture: disabled (tinygrad pattern). ----
+    _mmhub_write32(bar5_host, regMMMC_VM_AGP_BASE, 0)
+    _mmhub_write32(bar5_host, regMMMC_VM_AGP_BOT,  0xFFFFFFFF)   // bot > top => disabled
+    _mmhub_write32(bar5_host, regMMMC_VM_AGP_TOP,  0)
+
+    // ---- System aperture (unused/fast-path-disabled). ----
+    _mmhub_write32(bar5_host, regMMMC_VM_SYSTEM_APERTURE_LOW_ADDR,  sys_apert_lo)
+    _mmhub_write32(bar5_host, regMMMC_VM_SYSTEM_APERTURE_HIGH_ADDR, sys_apert_hi)
+    _mmhub_write32(bar5_host, regMMMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_LSB, default_addr_phys >> 12)
+    _mmhub_write32(bar5_host, regMMMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_MSB, (default_addr_phys >> 12) >> 32)
+
+    // ---- L2 protection-fault redirect. ----
+    _mmhub_write32(bar5_host, regMMVM_L2_PROTECTION_FAULT_DEFAULT_ADDR_LO32, default_addr_phys >> 12)
+    _mmhub_write32(bar5_host, regMMVM_L2_PROTECTION_FAULT_DEFAULT_ADDR_HI32, (default_addr_phys >> 12) >> 32)
+    // PROTECTION_FAULT_CNTL2.active_page_migration_pte_read_retry = bit 12 (= 0x1000).
+    _mmhub_write32(bar5_host, regMMVM_L2_PROTECTION_FAULT_CNTL2, 0x1000)
+
+    // ---- L1 TLB enable. ----
+    // enable_l1_tlb = bit 0
+    // system_access_mode = bits 3..4 set to 3
+    // enable_advanced_driver_model = bit 6
+    // system_aperture_unmapped_access = bits 5..5 cleared
+    // mtype = bits 7..9 (MTYPE_UC = 0)
+    // -> 0x1 | (3 << 3) | (1 << 6) = 0x1 | 0x18 | 0x40 = 0x59
+    uint64 mx_l1_tlb_val = 0x59
+    _mmhub_write32(bar5_host, regMMMC_VM_MX_L1_TLB_CNTL, mx_l1_tlb_val)
+    // Fence: readback.
+    uint64 rb_tlb = _mmhub_read32(bar5_host, regMMMC_VM_MX_L1_TLB_CNTL)
+    if rb_tlb == 0xFFFFFFFF { return 5 }
+    if (rb_tlb & 0x1) == 0 { return 3 }
+
+    // ---- L2 cache enable. ----
+    // enable_l2_cache = bit 0
+    // enable_default_page_out_to_system_memory = bit 1
+    // l2_pde0_cache_tag_generation_mode = bit 6 (0 = standard)
+    // pde_fault_classification = bit 7 (0)
+    // context1_identity_access_mode = bits 18..19 = 1
+    // identity_mode_fragment_size = bits 20..24 = 0
+    // -> 0x1 | 0x2 | (1 << 18) = 0x40003
+    uint64 l2_cntl_val = 0x40003
+    _mmhub_write32(bar5_host, regMMVM_L2_CNTL, l2_cntl_val)
+    uint64 rb_l2 = _mmhub_read32(bar5_host, regMMVM_L2_CNTL)
+    if rb_l2 == 0xFFFFFFFF { return 5 }
+    if (rb_l2 & 0x1) == 0 { return 4 }
+
+    // L2_CNTL2: invalidate_all_l1_tlbs=bit 0, invalidate_l2_cache=bit 1 -> 0x3
+    _mmhub_write32(bar5_host, regMMVM_L2_CNTL2, 0x3)
+    // L2_CNTL3: l2_cache_4k_associativity=bit 0, bigk_associativity=bit 4,
+    //   bank_select=bits 5..9 (9), bigk_fragment_size=bits 15..20 (6).
+    //   -> 0x1 | 0x10 | (9 << 5) | (6 << 15) = 0x131 | 0x30000 = 0x30131
+    _mmhub_write32(bar5_host, regMMVM_L2_CNTL3, 0x30131)
+    // L2_CNTL4: l2_cache_4k_partition_count = bits 0..4 = 1 -> 0x1
+    _mmhub_write32(bar5_host, regMMVM_L2_CNTL4, 0x1)
+    // L2_CNTL5: walker_priority_client_id = bits 0..8 = 0x1ff -> 0x1FF
+    _mmhub_write32(bar5_host, regMMVM_L2_CNTL5, 0x1FF)
+
+    // ---- VM_CONTEXT0 page-table pointers + bounds. ----
+    uint64 pt_start = mc_va_base >> 12
+    uint64 pt_end   = (mc_va_base + mc_va_size - 1) >> 12
+
+    _mmhub_write32(bar5_host, regMMVM_CONTEXT0_PAGE_TABLE_START_ADDR_LO32, pt_start)
+    _mmhub_write32(bar5_host, regMMVM_CONTEXT0_PAGE_TABLE_START_ADDR_HI32, pt_start >> 32)
+    _mmhub_write32(bar5_host, regMMVM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32,   pt_end)
+    _mmhub_write32(bar5_host, regMMVM_CONTEXT0_PAGE_TABLE_END_ADDR_HI32,   pt_end >> 32)
+
+    // PAGE_TABLE_BASE_ADDR carries pd_iova | AMDGPU_PTE_VALID in the low bits.
+    uint64 pt_base_full = (pd_iova & 0xFFFFFFFFFFFFF000) | AMDGPU_PTE_VALID
+    _mmhub_write32(bar5_host, regMMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32, pt_base_full & 0xFFFFFFFF)
+    _mmhub_write32(bar5_host, regMMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_HI32, pt_base_full >> 32)
+    // Fence: readback BASE_LO and confirm it matches our write.
+    uint64 rb_base = _mmhub_read32(bar5_host, regMMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32)
+    if rb_base == 0xFFFFFFFF { return 5 }
+    if rb_base != (pt_base_full & 0xFFFFFFFF) { return 1 }
+
+    // ---- Disable identity aperture (tinygrad sets to 0xFFFFFFFFF/0). ----
+    _mmhub_write32(bar5_host, regMMVM_L2_CONTEXT1_IDENTITY_APERTURE_LOW_ADDR_LO32,  0xFFFFFFFF)
+    _mmhub_write32(bar5_host, regMMVM_L2_CONTEXT1_IDENTITY_APERTURE_LOW_ADDR_HI32,  0xF)
+    _mmhub_write32(bar5_host, regMMVM_L2_CONTEXT1_IDENTITY_APERTURE_HIGH_ADDR_LO32, 0)
+    _mmhub_write32(bar5_host, regMMVM_L2_CONTEXT1_IDENTITY_APERTURE_HIGH_ADDR_HI32, 0)
+
+    // ---- Pre-size the 18 invalidate engines to a generous range. ----
+    uint64 eng_i = 0
+    while eng_i < 18 {
+        _mmhub_write32(bar5_host, regMMVM_INVALIDATE_ENG0_ADDR_RANGE_LO32 + eng_i * 2, 0xFFFFFFFF)
+        _mmhub_write32(bar5_host, regMMVM_INVALIDATE_ENG0_ADDR_RANGE_HI32 + eng_i * 2, 0x1F)
+        eng_i = eng_i + 1
+    }
+
+    // ---- THE LAST WRITE: VM_CONTEXT0_CNTL.enable_context = 1.
+    //      enable_context = bit 0
+    //      page_table_depth = bits 1..2 = 1 (= 2-level PD0 + PT)
+    //      page_table_block_size = bits 24..27 = 0
+    //      fault flags = bits 6..12 (all set: pde0/dummy/range/valid/r/w/x)
+    //      default flags = bits 19..25 (all set)
+    //      -> 0x1 | (1 << 1) | (0x7F << 6) | (0x7F << 19) = 0x3FC1FC3
+    uint64 ctx0_cntl_val = 0x3FC1FC3
+    _mmhub_write32(bar5_host, regMMVM_CONTEXT0_CNTL, ctx0_cntl_val)
+    uint64 rb_ctx = _mmhub_read32(bar5_host, regMMVM_CONTEXT0_CNTL)
+    if rb_ctx == 0xFFFFFFFF { return 5 }
+    if (rb_ctx & 0x1) == 0 { return 2 }
+
+    return 0
+}
