@@ -1,0 +1,300 @@
+// std/amdgpu_ip_discovery.mlr — IP base address registry for the
+// MLRift userspace GPU driver.
+//
+// Every later cold-init slice (PSP, SMU, GFX, MMHUB, SDMA, IH) needs
+// to compute MMIO register byte-offsets from per-IP "base addresses"
+// that AMD publishes through the GPU's embedded IP discovery binary.
+//
+// Two paths populate the *_base_N statics below:
+//
+//   1) **Runtime walker** — read VRAM[end-64KB] (where VBIOS places
+//      the discovery binary) and parse it. Works only when VBIOS POST
+//      has run for this device, which requires the dGPU to have been
+//      the boot-display device. On systems where the iGPU is primary
+//      (our user's setup), the dGPU never gets POSTed and BAR0 reads
+//      return all-1s. This path is preserved for future cross-ASIC
+//      portability once we add an ATOM BIOS interpreter (Phase 3
+//      Option B per project_phase3_slice_a_green_b_blocked.md).
+//
+//   2) **Hardcoded** — values dumped from sysfs while amdgpu was
+//      temporarily bound to the dGPU on 2026-05-19. Stored verbatim
+//      in `amdgpu_load_navi32_bases()` below. This is what slices
+//      δ-ζ will use to talk to the GPU on RX 7800 XT (Navi 32,
+//      gc_11_0_3). Reference dump (local, not committed):
+//      /sys/class/drm/card1/device/ip_discovery/die/0/...
+//
+// Public API:
+//   amdgpu_walk_discovery(bar5_host) → 0 on success, populates statics
+//        via runtime path. Falls back to hardcoded when cold VRAM is
+//        unreadable.
+//   amdgpu_load_navi32_bases() → hardcoded path only. Always succeeds.
+//   amdgpu_ip_<name>_base_<N> → byte offset of IP block's MMIO aperture
+//        index N within BAR5. 0 = aperture not applicable.
+//   amdgpu_ip_<name>_version → packed (major<<16)|(minor<<8)|rev.
+
+import "pcidev.mlr"
+import "sys.mlr"
+
+// =====================================================================
+// IP hw_id constants — values OBSERVED on our Navi 32 (gc_11_0_3) via
+// the sysfs dump, NOT generic constants from amd_shared.h. Different
+// chips assign different hw_ids to the same logical block; these are
+// the ones we use for this specific ASIC.
+// =====================================================================
+static uint64 IP_HW_ID_MP1      = 1      // SMU
+static uint64 IP_HW_ID_THM      = 3
+static uint64 IP_HW_ID_SMUIO    = 4
+static uint64 IP_HW_ID_FUSE     = 5
+static uint64 IP_HW_ID_CLKA     = 6
+static uint64 IP_HW_ID_PWR      = 10
+static uint64 IP_HW_ID_GC       = 11     // Graphics + Compute (MEC, MES, RLC, PFP/ME)
+static uint64 IP_HW_ID_UVD      = 12
+static uint64 IP_HW_ID_MMHUB    = 34
+static uint64 IP_HW_ID_ATHUB    = 35
+static uint64 IP_HW_ID_DBGU_NBIO = 36
+static uint64 IP_HW_ID_DFX      = 37
+static uint64 IP_HW_ID_OSSSYS   = 40     // Houses the Interrupt Handler (IH) on this chip
+static uint64 IP_HW_ID_HDP      = 41     // Host Data Path
+static uint64 IP_HW_ID_SDMA0    = 42
+static uint64 IP_HW_ID_SDMA1    = 43
+static uint64 IP_HW_ID_DF       = 46
+static uint64 IP_HW_ID_DFX_DAP  = 49
+static uint64 IP_HW_ID_PCIE     = 70     // Same base block as NBIF on gfx11
+static uint64 IP_HW_ID_PCS      = 80
+static uint64 IP_HW_ID_LSDMA    = 91
+static uint64 IP_HW_ID_NBIF     = 108    // Replaces "NBIO" naming on gfx11
+static uint64 IP_HW_ID_SYSTEMHUB = 128
+static uint64 IP_HW_ID_UMC      = 150
+static uint64 IP_HW_ID_USB      = 170
+static uint64 IP_HW_ID_MP0      = 255    // PSP
+
+// =====================================================================
+// Per-IP base address statics. Up to 6 bases per IP (max observed for
+// NBIF/PCIE on Navi 32). Each value is the byte offset of that
+// aperture inside BAR5. 0 = aperture not applicable.
+//
+// Versions are packed as (major<<16)|(minor<<8)|revision.
+// =====================================================================
+static uint64 amdgpu_vram_size_bytes = 0
+
+static uint64 amdgpu_ip_gc_base_0    = 0
+static uint64 amdgpu_ip_gc_base_1    = 0
+static uint64 amdgpu_ip_gc_base_2    = 0
+static uint64 amdgpu_ip_gc_base_3    = 0
+static uint64 amdgpu_ip_gc_version   = 0
+
+static uint64 amdgpu_ip_mp0_base_0   = 0
+static uint64 amdgpu_ip_mp0_base_1   = 0
+static uint64 amdgpu_ip_mp0_base_2   = 0
+static uint64 amdgpu_ip_mp0_base_3   = 0
+static uint64 amdgpu_ip_mp0_base_4   = 0
+static uint64 amdgpu_ip_mp0_version  = 0
+
+static uint64 amdgpu_ip_mp1_base_0   = 0
+static uint64 amdgpu_ip_mp1_base_1   = 0
+static uint64 amdgpu_ip_mp1_base_2   = 0
+static uint64 amdgpu_ip_mp1_base_3   = 0
+static uint64 amdgpu_ip_mp1_base_4   = 0
+static uint64 amdgpu_ip_mp1_version  = 0
+
+static uint64 amdgpu_ip_mmhub_base_0 = 0
+static uint64 amdgpu_ip_mmhub_base_1 = 0
+static uint64 amdgpu_ip_mmhub_version = 0
+
+static uint64 amdgpu_ip_athub_base_0 = 0
+static uint64 amdgpu_ip_athub_base_1 = 0
+static uint64 amdgpu_ip_athub_version = 0
+
+static uint64 amdgpu_ip_hdp_base_0   = 0
+static uint64 amdgpu_ip_hdp_base_1   = 0
+static uint64 amdgpu_ip_hdp_version  = 0
+
+static uint64 amdgpu_ip_oss_base_0   = 0     // OSSSYS — houses IH on this chip
+static uint64 amdgpu_ip_oss_base_1   = 0
+static uint64 amdgpu_ip_oss_version  = 0
+
+static uint64 amdgpu_ip_sdma0_base_0 = 0
+static uint64 amdgpu_ip_sdma0_base_1 = 0
+static uint64 amdgpu_ip_sdma0_base_2 = 0
+static uint64 amdgpu_ip_sdma0_base_3 = 0
+static uint64 amdgpu_ip_sdma0_version = 0
+
+static uint64 amdgpu_ip_nbif_base_0  = 0     // NBIO replacement on gfx11
+static uint64 amdgpu_ip_nbif_base_1  = 0
+static uint64 amdgpu_ip_nbif_base_2  = 0
+static uint64 amdgpu_ip_nbif_base_3  = 0
+static uint64 amdgpu_ip_nbif_base_4  = 0
+static uint64 amdgpu_ip_nbif_base_5  = 0
+static uint64 amdgpu_ip_nbif_version = 0
+
+static uint64 amdgpu_ip_smuio_base_0 = 0
+static uint64 amdgpu_ip_smuio_base_1 = 0
+static uint64 amdgpu_ip_smuio_base_2 = 0
+static uint64 amdgpu_ip_smuio_base_3 = 0
+static uint64 amdgpu_ip_smuio_version = 0
+
+// =====================================================================
+// Hardcoded path — populates all statics with values dumped from sysfs
+// on 2026-05-19 (RX 7800 XT, Navi 32, gc_11_0_3). Source of truth was
+// /sys/class/drm/card1/device/ip_discovery/die/0/ on a temporary
+// amdgpu bind.
+//
+// Versions encoded as (major<<16)|(minor<<8)|rev:
+//   11.0.3 = 0x000B0003
+//   13.0.10 = 0x000D000A
+//   6.0.3 = 0x00060003
+//   6.0.0 = 0x00060000
+//   3.0.0 = 0x00030000
+//   4.3.0 = 0x00040300
+//   13.0.6 = 0x000D0006
+// =====================================================================
+fn amdgpu_load_navi32_bases() {
+    amdgpu_vram_size_bytes = 16368 * 1024 * 1024   // 16368 MiB per dmesg
+
+    // GC 11.0.3
+    amdgpu_ip_gc_base_0    = 0x00001260
+    amdgpu_ip_gc_base_1    = 0x0000A000
+    amdgpu_ip_gc_base_2    = 0x0001C000
+    amdgpu_ip_gc_base_3    = 0x02402C00
+    amdgpu_ip_gc_version   = 0x000B0003
+
+    // MP0 (PSP) 13.0.10
+    amdgpu_ip_mp0_base_0   = 0x00016000
+    amdgpu_ip_mp0_base_1   = 0x00DC0000
+    amdgpu_ip_mp0_base_2   = 0x00E00000
+    amdgpu_ip_mp0_base_3   = 0x00E40000
+    amdgpu_ip_mp0_base_4   = 0x0243FC00
+    amdgpu_ip_mp0_version  = 0x000D000A
+
+    // MP1 (SMU) 13.0.10 — shares bases with MP0 on this chip
+    amdgpu_ip_mp1_base_0   = 0x00016000
+    amdgpu_ip_mp1_base_1   = 0x00DC0000
+    amdgpu_ip_mp1_base_2   = 0x00E00000
+    amdgpu_ip_mp1_base_3   = 0x00E40000
+    amdgpu_ip_mp1_base_4   = 0x0243FC00
+    amdgpu_ip_mp1_version  = 0x000D000A
+
+    // MMHUB 3.0.0
+    amdgpu_ip_mmhub_base_0 = 0x0001A000
+    amdgpu_ip_mmhub_base_1 = 0x02408800
+    amdgpu_ip_mmhub_version = 0x00030000
+
+    // ATHUB 3.0.0
+    amdgpu_ip_athub_base_0 = 0x00000C00
+    amdgpu_ip_athub_base_1 = 0x02408C00
+    amdgpu_ip_athub_version = 0x00030000
+
+    // HDP 6.0.0
+    amdgpu_ip_hdp_base_0   = 0x00000F20
+    amdgpu_ip_hdp_base_1   = 0x0240A400
+    amdgpu_ip_hdp_version  = 0x00060000
+
+    // OSSSYS/IH 6.0.0
+    amdgpu_ip_oss_base_0   = 0x000010A0
+    amdgpu_ip_oss_base_1   = 0x0240A000
+    amdgpu_ip_oss_version  = 0x00060000
+
+    // SDMA0 6.0.3 — shares register addresses with GC on this chip
+    amdgpu_ip_sdma0_base_0 = 0x00001260
+    amdgpu_ip_sdma0_base_1 = 0x0000A000
+    amdgpu_ip_sdma0_base_2 = 0x0001C000
+    amdgpu_ip_sdma0_base_3 = 0x02402C00
+    amdgpu_ip_sdma0_version = 0x00060003
+
+    // NBIF 4.3.0
+    amdgpu_ip_nbif_base_0  = 0x00000000
+    amdgpu_ip_nbif_base_1  = 0x00000014
+    amdgpu_ip_nbif_base_2  = 0x00000D20
+    amdgpu_ip_nbif_base_3  = 0x00010400
+    amdgpu_ip_nbif_base_4  = 0x0241B000
+    amdgpu_ip_nbif_base_5  = 0x04040000
+    amdgpu_ip_nbif_version = 0x00040300
+
+    // SMUIO 13.0.6
+    amdgpu_ip_smuio_base_0 = 0x00016800
+    amdgpu_ip_smuio_base_1 = 0x00016A00
+    amdgpu_ip_smuio_base_2 = 0x02401000
+    amdgpu_ip_smuio_base_3 = 0x03440000
+    amdgpu_ip_smuio_version = 0x000D0006
+}
+
+// =====================================================================
+// Runtime walker — preserved for future cross-ASIC use once ATOM BIOS
+// interpretation is in place. Currently dormant: on our hardware the
+// dGPU is never POSTed (iGPU is primary), so VRAM reads return all-1s
+// and this path fails at the binary_signature check.
+// =====================================================================
+
+// Read RCC_CONFIG_MEMSIZE from BAR5. Returns VRAM size in MiB. On our
+// chip this returns 0 in cold state (NBIO RCC aperture is not at
+// BAR5 byte 0); the read works only after PSP/SMU brings up the
+// NBIF/PCIE block.
+fn amdgpu_read_vram_size_mib(uint64 bar5_host) -> uint64 {
+    uint32 mib = 0
+    unsafe { *((bar5_host + 0x37CC) as uint32) -> mib }
+    uint64 m = mib
+    return m
+}
+
+// Parse the discovery binary at `buf` (full binary, including
+// binary_header at offset 0). Layout reference: tinygrad amdev.py +
+// linux/drivers/gpu/drm/amd/include/discovery.h.
+fn _amdgpu_disc_walk(uint64 buf, uint64 buf_size) -> uint64 {
+    if buf_size < 60 { return 1 }
+    uint32 bin_sig = 0
+    unsafe { *((buf + 0) as uint32) -> bin_sig }
+    if bin_sig != 0x28211407 { return 1 }
+    uint16 ipds_off_u16 = 0
+    unsafe { *((buf + 12) as uint16) -> ipds_off_u16 }
+    uint64 ipds_off = ipds_off_u16
+    if ipds_off == 0 { return 2 }
+    if ipds_off + 80 > buf_size { return 2 }
+    uint32 ipds_sig = 0
+    unsafe { *((buf + ipds_off) as uint32) -> ipds_sig }
+    if ipds_sig != 0x53445049 { return 12 }
+    // Future: walk dies + ip_v4 entries and call hardcoded-population
+    // helpers. For now the runtime path bails here — callers should
+    // use amdgpu_load_navi32_bases() instead.
+    return 99
+}
+
+// Try the runtime walker; on any failure fall back to the hardcoded
+// Navi 32 bases. Returns 0 on success.
+fn amdgpu_walk_discovery(uint64 bar5_host) -> uint64 {
+    uint64 sb = alloc(24)
+    unsafe { *((sb + 0)  as uint64) = 0 }
+    unsafe { *((sb + 8)  as uint64) = 0 }
+    unsafe { *((sb + 16) as uint64) = 0 }
+    uint64 ie = pci_bar_info(0, sb + 0, sb + 8, sb + 16)
+    if ie != 0 { dealloc(sb); amdgpu_load_navi32_bases(); return 0 }
+    uint64 bar0_size = 0; unsafe { *((sb + 0) as uint64) -> bar0_size }
+    uint64 bar0_voff = 0; unsafe { *((sb + 8) as uint64) -> bar0_voff }
+    dealloc(sb)
+
+    uint64 vram_mib = amdgpu_read_vram_size_mib(bar5_host)
+    uint64 vram_bytes = vram_mib << 20
+    if vram_bytes == 0 { vram_bytes = bar0_size }
+    if vram_bytes == 0 || bar0_size < vram_bytes {
+        amdgpu_load_navi32_bases()
+        return 0
+    }
+
+    uint64 disc_size = 64 * 1024
+    uint64 disc_off  = bar0_voff + (vram_bytes - disc_size)
+    uint64 disc_host = sys_mmap(0, disc_size, PCI_PROT_READ,
+                                PCI_MAP_SHARED, pci_device_fd(), disc_off)
+    if disc_host > PCI_MMAP_ERR_SENTINEL {
+        amdgpu_load_navi32_bases()
+        return 0
+    }
+
+    uint64 we = _amdgpu_disc_walk(disc_host, disc_size)
+    sys_munmap(disc_host, disc_size)
+    if we != 0 {
+        // Runtime walker failed (expected in cold state on this hardware).
+        // Fall through to the hardcoded path.
+        amdgpu_load_navi32_bases()
+        return 0
+    }
+    return 0
+}

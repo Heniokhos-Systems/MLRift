@@ -1,0 +1,174 @@
+// Phase 3 slice β — IP discovery smoke.
+//
+// Opens VFIO, mmaps BAR5, calls amdgpu_walk_discovery() which on this
+// hardware falls back to hardcoded Navi 32 bases (the runtime VRAM
+// path is blocked: cold dGPU is never POSTed when iGPU is primary, so
+// BAR0 reads return all-1s and the discovery binary in VRAM is
+// unreachable). Prints every IP block's bases + version. The numbers
+// should match `cat /sys/class/drm/card1/device/ip_discovery/die/0/...`
+// byte-for-byte while amdgpu is bound.
+//
+// Requires sudo + dGPU on vfio-pci.
+
+import "../std/pcidev.mlr"
+import "../std/amdgpu_ip_discovery.mlr"
+import "../std/sys.mlr"
+
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn puts(uint64 s) -> uint32
+
+fn _print_label_hex(uint64 lab, uint64 lab_len, uint64 val) {
+    uint64 buf = alloc(64)
+    uint64 i = 0
+    while i < lab_len {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((buf + i) as uint8) = c }
+        i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((buf + lab_len) as uint8) = eq }
+    uint8 zx = 48; unsafe { *((buf + lab_len + 1) as uint8) = zx }
+    uint8 xc = 120; unsafe { *((buf + lab_len + 2) as uint8) = xc }
+    uint64 j = 0
+    while j < 8 {
+        uint64 sh = (7 - j) * 4
+        uint64 nyb = (val >> sh) & 0xF
+        uint8 ch = nyb + 48
+        if nyb >= 10 { ch = nyb + 87 }
+        unsafe { *((buf + lab_len + 3 + j) as uint8) = ch }
+        j = j + 1
+    }
+    uint8 nul = 0; unsafe { *((buf + lab_len + 11) as uint8) = nul }
+    puts(buf)
+    dealloc(buf)
+}
+
+fn _print_ip_version(uint64 lab, uint64 lab_len, uint64 ver) {
+    uint64 mj = (ver >> 16) & 0xFF
+    uint64 mn = (ver >> 8)  & 0xFF
+    uint64 rv = ver & 0xFF
+    uint64 buf = alloc(64)
+    uint64 i = 0
+    while i < lab_len {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((buf + i) as uint8) = c }
+        i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((buf + lab_len) as uint8) = eq }
+    uint64 pos = lab_len + 1
+    if mj >= 10 {
+        uint8 d1 = (mj / 10) + 48
+        uint8 d2 = (mj - (mj / 10) * 10) + 48
+        unsafe { *((buf + pos) as uint8) = d1 }; pos = pos + 1
+        unsafe { *((buf + pos) as uint8) = d2 }; pos = pos + 1
+    } else {
+        uint8 d = mj + 48
+        unsafe { *((buf + pos) as uint8) = d }; pos = pos + 1
+    }
+    uint8 dot1 = 46; unsafe { *((buf + pos) as uint8) = dot1 }; pos = pos + 1
+    uint8 dm = mn + 48; unsafe { *((buf + pos) as uint8) = dm }; pos = pos + 1
+    uint8 dot2 = 46; unsafe { *((buf + pos) as uint8) = dot2 }; pos = pos + 1
+    if rv >= 10 {
+        uint8 d1 = (rv / 10) + 48
+        uint8 d2 = (rv - (rv / 10) * 10) + 48
+        unsafe { *((buf + pos) as uint8) = d1 }; pos = pos + 1
+        unsafe { *((buf + pos) as uint8) = d2 }; pos = pos + 1
+    } else {
+        uint8 dr = rv + 48
+        unsafe { *((buf + pos) as uint8) = dr }; pos = pos + 1
+    }
+    uint8 nul = 0; unsafe { *((buf + pos) as uint8) = nul }
+    puts(buf)
+    dealloc(buf)
+}
+
+fn _dump_ip(uint64 name, uint64 name_len, uint64 version,
+            uint64 b0, uint64 b1, uint64 b2, uint64 b3, uint64 b4, uint64 b5) {
+    puts("")
+    _print_ip_version(name, name_len, version)
+    if b0 != 0 { _print_label_hex("  base[0]", 9, b0) }
+    if b1 != 0 { _print_label_hex("  base[1]", 9, b1) }
+    if b2 != 0 { _print_label_hex("  base[2]", 9, b2) }
+    if b3 != 0 { _print_label_hex("  base[3]", 9, b3) }
+    if b4 != 0 { _print_label_hex("  base[4]", 9, b4) }
+    if b5 != 0 { _print_label_hex("  base[5]", 9, b5) }
+}
+
+fn main() {
+    uint64 bdf = "0000:03:00.0"
+    uint64 e = pci_open(bdf, 14)
+    if e != 0 {
+        _print_label_hex("pci_open errno", 14, e)
+        exit(1)
+    }
+    puts("pci_open: OK")
+
+    uint64 bm = pci_set_bus_master()
+    if bm != 0 {
+        _print_label_hex("set_bus_master errno", 20, bm)
+        pci_close()
+        exit(1)
+    }
+
+    uint64 bar5 = pci_map_bar(PCI_BAR5_REGION_INDEX)
+    if bar5 == PCI_MAP_FAILED_SENTINEL {
+        puts("FAIL: pci_map_bar(5)")
+        pci_close()
+        exit(2)
+    }
+
+    uint64 we = amdgpu_walk_discovery(bar5)
+    if we != 0 {
+        _print_label_hex("walk_discovery errno", 20, we)
+        sys_munmap(bar5, 0x100000)
+        pci_close()
+        exit(3)
+    }
+    puts("amdgpu_walk_discovery: OK (hardcoded path on cold-VRAM hardware)")
+
+    _print_label_hex("vram_size_bytes", 15, amdgpu_vram_size_bytes)
+
+    _dump_ip("GC",    2, amdgpu_ip_gc_version,
+             amdgpu_ip_gc_base_0, amdgpu_ip_gc_base_1,
+             amdgpu_ip_gc_base_2, amdgpu_ip_gc_base_3, 0, 0)
+
+    _dump_ip("MP0",   3, amdgpu_ip_mp0_version,
+             amdgpu_ip_mp0_base_0, amdgpu_ip_mp0_base_1,
+             amdgpu_ip_mp0_base_2, amdgpu_ip_mp0_base_3,
+             amdgpu_ip_mp0_base_4, 0)
+
+    _dump_ip("MP1",   3, amdgpu_ip_mp1_version,
+             amdgpu_ip_mp1_base_0, amdgpu_ip_mp1_base_1,
+             amdgpu_ip_mp1_base_2, amdgpu_ip_mp1_base_3,
+             amdgpu_ip_mp1_base_4, 0)
+
+    _dump_ip("MMHUB", 5, amdgpu_ip_mmhub_version,
+             amdgpu_ip_mmhub_base_0, amdgpu_ip_mmhub_base_1, 0, 0, 0, 0)
+
+    _dump_ip("ATHUB", 5, amdgpu_ip_athub_version,
+             amdgpu_ip_athub_base_0, amdgpu_ip_athub_base_1, 0, 0, 0, 0)
+
+    _dump_ip("HDP",   3, amdgpu_ip_hdp_version,
+             amdgpu_ip_hdp_base_0, amdgpu_ip_hdp_base_1, 0, 0, 0, 0)
+
+    _dump_ip("OSSSYS", 6, amdgpu_ip_oss_version,
+             amdgpu_ip_oss_base_0, amdgpu_ip_oss_base_1, 0, 0, 0, 0)
+
+    _dump_ip("SDMA0", 5, amdgpu_ip_sdma0_version,
+             amdgpu_ip_sdma0_base_0, amdgpu_ip_sdma0_base_1,
+             amdgpu_ip_sdma0_base_2, amdgpu_ip_sdma0_base_3, 0, 0)
+
+    _dump_ip("NBIF",  4, amdgpu_ip_nbif_version,
+             amdgpu_ip_nbif_base_0, amdgpu_ip_nbif_base_1,
+             amdgpu_ip_nbif_base_2, amdgpu_ip_nbif_base_3,
+             amdgpu_ip_nbif_base_4, amdgpu_ip_nbif_base_5)
+
+    _dump_ip("SMUIO", 5, amdgpu_ip_smuio_version,
+             amdgpu_ip_smuio_base_0, amdgpu_ip_smuio_base_1,
+             amdgpu_ip_smuio_base_2, amdgpu_ip_smuio_base_3, 0, 0)
+
+    sys_munmap(bar5, 0x100000)
+    pci_close()
+    puts("")
+    puts("phase3_discovery_smoke: GREEN")
+    exit(0)
+}

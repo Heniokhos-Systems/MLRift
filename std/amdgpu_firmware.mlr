@@ -1,0 +1,174 @@
+// std/amdgpu_firmware.mlr — load + parse AMDGPU firmware blobs.
+//
+// Reads .bin firmware files from disk into MLRift heap memory and
+// parses the per-blob AMDGPU common_firmware_header (32 bytes) plus
+// the most common extended-header field (`ucode_start_addr` for GFX
+// PFP/ME/MEC, where slice ζ needs it for the PRGRM_CNTR_START
+// register write that boots each engine).
+//
+// Reference layout (drivers/gpu/drm/amd/include/cgs_common.h):
+//   struct common_firmware_header {
+//       uint32_t size_bytes;
+//       uint32_t header_size_bytes;
+//       uint16_t header_version_major;
+//       uint16_t header_version_minor;
+//       uint16_t ip_version_major;
+//       uint16_t ip_version_minor;
+//       uint32_t ucode_version;
+//       uint32_t ucode_size_bytes;
+//       uint32_t ucode_array_offset_bytes;
+//       uint32_t crc32;
+//   };
+//
+// GFX extended header (PFP/ME/MEC, struct gfx_firmware_header_v1_0):
+//   common_firmware_header (32 bytes)
+//   + u32 ucode_feature_version
+//   + u32 jt_offset
+//   + u32 jt_size
+//
+// GFX v2_0 (gc_11_0_3 uses this) adds ucode_start_addr_lo/hi after
+// the common header (skipping jt_*). Field order on v2_0:
+//   common_firmware_header (32 bytes)
+//   + u32 ucode_feature_version
+//   + u32 ucode_start_addr_lo
+//   + u32 ucode_start_addr_hi
+//
+// Slice γ.1 (this file) only handles the COMMON 32-byte header. The
+// extended fields are exposed via byte-offset helpers so slice ζ can
+// read them when needed without us pre-committing to one of the many
+// per-IP extended layouts.
+//
+// Input: paths to pre-decompressed firmware (slice γ.2 will add the
+// zstd decompressor that lets us read .bin.zst directly).
+
+import "sys.mlr"
+
+// Common firmware header field byte offsets:
+static uint64 FW_OFF_SIZE_BYTES               = 0
+static uint64 FW_OFF_HEADER_SIZE_BYTES        = 4
+static uint64 FW_OFF_HEADER_VERSION_MAJOR     = 8
+static uint64 FW_OFF_HEADER_VERSION_MINOR     = 10
+static uint64 FW_OFF_IP_VERSION_MAJOR         = 12
+static uint64 FW_OFF_IP_VERSION_MINOR         = 14
+static uint64 FW_OFF_UCODE_VERSION            = 16
+static uint64 FW_OFF_UCODE_SIZE_BYTES         = 20
+static uint64 FW_OFF_UCODE_ARRAY_OFFSET_BYTES = 24
+static uint64 FW_OFF_CRC32                    = 28
+
+static uint64 FW_COMMON_HEADER_SIZE = 32
+
+// fw_load_file — open, sys_read entire contents into a fresh heap
+// buffer, close. Returns 0 on success and writes the buffer pointer
+// + size into out_buf_ptr / out_size_ptr.
+//
+// Error codes:
+//   1 = open failed (file missing / permission)
+//   2 = lseek SEEK_END failed
+//   3 = lseek back-to-zero failed
+//   4 = read returned fewer bytes than expected
+fn fw_load_file(uint64 path,
+                uint64 out_buf_ptr,
+                uint64 out_size_ptr) -> uint64 {
+    // O_RDONLY = 0
+    uint64 fd = sys_open(path, 0, 0)
+    if fd > 0xFFFFFFFFFFFFF000 { return 1 }
+
+    // lseek(fd, 0, SEEK_END=2) → returns file size in bytes.
+    // sys_lseek = 8 on x86_64. syscall_raw takes (nr, a0, a1, a2, a3, a4, a5).
+    uint64 size = syscall_raw(8, fd, 0, 2, 0, 0, 0)
+    if size > 0xFFFFFFFFFFFFF000 { sys_close(fd); return 2 }
+
+    uint64 r2 = syscall_raw(8, fd, 0, 0, 0, 0, 0)   // SEEK_SET = 0
+    if r2 > 0xFFFFFFFFFFFFF000 { sys_close(fd); return 3 }
+
+    uint64 buf = alloc(size)
+    // sys_read = 0 on x86_64. Read whole file in one syscall —
+    // amdgpu firmware blobs are small enough (< 500 KB each) that a
+    // single read is fine.
+    uint64 nread = syscall_raw(0, fd, buf, size, 0, 0, 0)
+    sys_close(fd)
+    if nread != size { dealloc(buf); return 4 }
+
+    unsafe { *(out_buf_ptr  as uint64) = buf }
+    unsafe { *(out_size_ptr as uint64) = size }
+    return 0
+}
+
+fn fw_unload(uint64 buf) {
+    dealloc(buf)
+}
+
+// Common-header field accessors. All return raw values from the
+// 32-byte header — no validation, no version-handling.
+fn fw_size_bytes(uint64 buf) -> uint32 {
+    uint32 v = 0
+    unsafe { *((buf + FW_OFF_SIZE_BYTES) as uint32) -> v }
+    return v
+}
+fn fw_header_size_bytes(uint64 buf) -> uint32 {
+    uint32 v = 0
+    unsafe { *((buf + FW_OFF_HEADER_SIZE_BYTES) as uint32) -> v }
+    return v
+}
+fn fw_header_version_major(uint64 buf) -> uint16 {
+    uint16 v = 0
+    unsafe { *((buf + FW_OFF_HEADER_VERSION_MAJOR) as uint16) -> v }
+    return v
+}
+fn fw_header_version_minor(uint64 buf) -> uint16 {
+    uint16 v = 0
+    unsafe { *((buf + FW_OFF_HEADER_VERSION_MINOR) as uint16) -> v }
+    return v
+}
+fn fw_ip_version_major(uint64 buf) -> uint16 {
+    uint16 v = 0
+    unsafe { *((buf + FW_OFF_IP_VERSION_MAJOR) as uint16) -> v }
+    return v
+}
+fn fw_ip_version_minor(uint64 buf) -> uint16 {
+    uint16 v = 0
+    unsafe { *((buf + FW_OFF_IP_VERSION_MINOR) as uint16) -> v }
+    return v
+}
+fn fw_ucode_version(uint64 buf) -> uint32 {
+    uint32 v = 0
+    unsafe { *((buf + FW_OFF_UCODE_VERSION) as uint32) -> v }
+    return v
+}
+fn fw_ucode_size_bytes(uint64 buf) -> uint32 {
+    uint32 v = 0
+    unsafe { *((buf + FW_OFF_UCODE_SIZE_BYTES) as uint32) -> v }
+    return v
+}
+fn fw_ucode_array_offset_bytes(uint64 buf) -> uint32 {
+    uint32 v = 0
+    unsafe { *((buf + FW_OFF_UCODE_ARRAY_OFFSET_BYTES) as uint32) -> v }
+    return v
+}
+
+// Pointer to the ucode payload itself. Slices δ/ζ DMA this into VRAM
+// via pci_alloc_sysmem (PSP, MEC, etc).
+fn fw_ucode_data_ptr(uint64 buf) -> uint64 {
+    uint32 off = fw_ucode_array_offset_bytes(buf)
+    return buf + off
+}
+
+// Sanity check — reject the blob if header_size_bytes is implausible.
+// Returns 0 if header looks valid, non-zero otherwise.
+//
+// AMDGPU firmware always has header_size_bytes >= 32 (the common
+// header) and the ucode payload offset must be at least that big.
+fn fw_validate_common_header(uint64 buf, uint64 file_size) -> uint64 {
+    if file_size < FW_COMMON_HEADER_SIZE { return 1 }
+    uint64 sz = fw_size_bytes(buf)
+    if sz == 0 { return 2 }
+    if sz > file_size { return 3 }
+    uint64 hsz = fw_header_size_bytes(buf)
+    if hsz < FW_COMMON_HEADER_SIZE { return 4 }
+    if hsz > sz { return 5 }
+    uint64 uo = fw_ucode_array_offset_bytes(buf)
+    if uo < hsz { return 6 }
+    uint64 us = fw_ucode_size_bytes(buf)
+    if uo + us > sz { return 7 }
+    return 0
+}
