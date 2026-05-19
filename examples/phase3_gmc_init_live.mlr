@@ -1,0 +1,174 @@
+// Phase 3 slice ε.0a-6 — Layer 2 LIVE GMC GART bring-up.
+//
+// First live MMHUB write sequence. Build-then-walk-then-user-runs
+// pattern: implementer builds only; the controller orchestrates the
+// sudo run + commit based on the actual outcome.
+//
+// Sequence:
+//   1. pci_open + map BAR5 + bus master.
+//   2. Allocate GART pages (PD0 + PT) via gmc_alloc_page_table.
+//   3. Allocate the PSP staging buffer (1 MiB, 1-MiB aligned) via
+//      psp_alloc_fw_buf — this is what we'll point GART at.
+//   4. Allocate a 4 KiB scratch page for SYSTEM_APERTURE_DEFAULT_ADDR.
+//   5. gmc_map: mc_va=0x100000 → buf_gpu_iova, size=1 MiB.
+//   6. gmc_init_mmhub.
+//   7. gmc_readback_sanity for visibility.
+//   8. Cleanup.
+
+import "../std/pcidev.mlr"
+import "../std/amdgpu_ip_discovery.mlr"
+import "../std/gmc.mlr"
+import "../std/psp.mlr"
+import "../std/sys.mlr"
+
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn puts(uint64 s) -> uint32
+
+fn _hex32(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(64)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint8 zx = 48; unsafe { *((b + ll + 1) as uint8) = zx }
+    uint8 xc = 120; unsafe { *((b + ll + 2) as uint8) = xc }
+    uint64 j = 0
+    while j < 8 {
+        uint64 sh = (7 - j) * 4
+        uint64 nyb = (v >> sh) & 0xF
+        uint8 ch = nyb + 48
+        if nyb >= 10 { ch = nyb + 87 }
+        unsafe { *((b + ll + 3 + j) as uint8) = ch }
+        j = j + 1
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 11) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+fn _dec(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(64)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint64 digits = 0
+    if v == 0 {
+        uint8 z = 48; unsafe { *((b + ll + 1) as uint8) = z }; digits = 1
+    } else {
+        uint64 t = v
+        while t > 0 { digits = digits + 1; t = t / 10 }
+        uint64 k = digits
+        t = v
+        while k > 0 {
+            k = k - 1
+            uint64 d = t - (t / 10) * 10
+            uint8 db = d + 48
+            unsafe { *((b + ll + 1 + k) as uint8) = db }
+            t = t / 10
+        }
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 1 + digits) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+fn main() {
+    puts("phase3_gmc_init_live (LIVE GMC GART)")
+
+    // 1) Open device, map BAR5, enable Bus Master, load IP bases.
+    uint64 oe = pci_open("0000:03:00.0", 14)
+    if oe != 0 { _dec("FAIL pci_open", 13, oe); exit(1) }
+    amdgpu_load_navi32_bases()
+    uint64 bar5 = pci_map_bar(PCI_BAR5_REGION_INDEX)
+    if bar5 == PCI_MAP_FAILED_SENTINEL { puts("FAIL BAR5 mmap"); pci_close(); exit(2) }
+    uint64 bme = pci_set_bus_master()
+    if bme != 0 { _dec("FAIL set_bus_master", 19, bme); pci_close(); exit(3) }
+    _hex32("bar5_host_lo", 12, bar5 & 0xFFFFFFFF)
+
+    // 2) Allocate the 2-page GART (PD0 + PT).
+    uint64 pp = alloc(8); unsafe { *(pp as uint64) = 0 }
+    uint64 pe = gmc_alloc_page_table(pp)
+    if pe != 0 {
+        _dec("FAIL gmc_alloc_page_table", 24, pe)
+        dealloc(pp); pci_close(); exit(4)
+    }
+    uint64 pt_ctx = 0; unsafe { *(pp as uint64) -> pt_ctx }
+    dealloc(pp)
+    uint64 pd_iova = 0; unsafe { *((pt_ctx + GMC_PT_OFF_PD_IOVA) as uint64) -> pd_iova }
+    uint64 pt_iova = 0; unsafe { *((pt_ctx + GMC_PT_OFF_PT_IOVA) as uint64) -> pt_iova }
+    _hex32("PD0_iova_lo", 11, pd_iova & 0xFFFFFFFF)
+    _hex32("PT_iova_lo",  10, pt_iova & 0xFFFFFFFF)
+
+    // 3) Allocate the PSP 1 MiB buffer.
+    uint64 hp = alloc(8); unsafe { *(hp as uint64) = 0 }
+    uint64 gp = alloc(8); unsafe { *(gp as uint64) = 0 }
+    uint64 pae = psp_alloc_fw_buf(hp, gp)
+    if pae != 0 {
+        _dec("FAIL psp_alloc_fw_buf", 21, pae)
+        gmc_page_table_free(pt_ctx)
+        dealloc(hp); dealloc(gp); pci_close(); exit(5)
+    }
+    uint64 buf_iova = 0; unsafe { *(gp as uint64) -> buf_iova }
+    uint64 buf_host = 0; unsafe { *(hp as uint64) -> buf_host }
+    dealloc(hp); dealloc(gp)
+    _hex32("buf_iova_lo", 11, buf_iova & 0xFFFFFFFF)
+
+    // 4) Allocate a 4 KiB scratch page for SYSTEM_APERTURE_DEFAULT_ADDR.
+    uint64 sp = alloc(8); unsafe { *(sp as uint64) = 0 }
+    uint64 sg = alloc(8); unsafe { *(sg as uint64) = 0 }
+    uint64 sae = pci_alloc_sysmem_aligned(4096, 4096, sp, sg)
+    if sae != 0 {
+        _dec("FAIL scratch alloc", 18, sae)
+        psp_free_fw_buf(buf_host, buf_iova)
+        gmc_page_table_free(pt_ctx)
+        dealloc(sp); dealloc(sg); pci_close(); exit(6)
+    }
+    uint64 scratch_iova = 0; unsafe { *(sg as uint64) -> scratch_iova }
+    dealloc(sp); dealloc(sg)
+
+    // 5) Map the PSP buffer at MC VA 0x100000 (1 MiB).
+    uint64 me = gmc_map(pt_ctx, 0x100000, buf_iova, 0x100000)
+    if me != 0 {
+        _dec("FAIL gmc_map", 12, me)
+        pci_free_sysmem(0, scratch_iova, 4096)
+        psp_free_fw_buf(buf_host, buf_iova)
+        gmc_page_table_free(pt_ctx)
+        pci_close(); exit(7)
+    }
+    _hex32("mc_va_base",   10, 0x100000)
+    _hex32("mc_va_size",   10, 0x100000)
+    _hex32("expected_c2pmsg_36", 19, 0x100000 >> 20)
+
+    // 6) Run the live MMHUB init.
+    puts("ABOUT TO WRITE MMHUB GART REGISTERS")
+    uint64 ie = gmc_init_mmhub(bar5, pt_ctx, 0x100000, 0x100000,
+                                0, 0xFFFF, scratch_iova)
+    _dec("gmc_init_mmhub_rc", 17, ie)
+
+    // 7) Diagnostic readback regardless of rc.
+    puts("--- readback ---")
+    uint64 re = gmc_readback_sanity(bar5)
+    _dec("readback_rc", 11, re)
+
+    // Verdict.
+    uint64 verdict = 0
+    if ie != 0 { verdict = 1 }
+    if re != 0 { verdict = 1 }
+    if verdict == 0 {
+        puts("phase3_gmc_init_live: GREEN — GMC GART live")
+    } else {
+        puts("phase3_gmc_init_live: FAIL")
+    }
+
+    // 8) Cleanup.
+    pci_free_sysmem(0, scratch_iova, 4096)
+    psp_free_fw_buf(buf_host, buf_iova)
+    gmc_page_table_free(pt_ctx)
+    pci_close()
+
+    if verdict != 0 { exit(8) }
+    exit(0)
+}
