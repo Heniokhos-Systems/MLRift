@@ -1,0 +1,361 @@
+// 5b-compute Phase 2a — PM4 dispatch of rmsnorm_f32_1024 with the
+// tinygrad/ROCR-matched dispatch sequence.
+//
+// Why: the original phase2a_pm4_smoke.mlr proves PM4 dispatch works
+// for a trivial kernel (atomic_cas_demo, 1×1×1 grid, 8-byte kernarg,
+// no LDS).  Five prior hardening attempts to extend that path to the
+// Llama-1B mega-kernel wedged with signature wp=N rp=0 (CP refuses to
+// consume IB).  This smoke fills the gap between trivial and mega by
+// dispatching rmsnorm_f32_1024 — a real MLRift-emitted kernel with
+// LDS (GSS=4096), 1024 threads/WG, multi-row grid, 5-arg kernarg —
+// through PM4 with the four additions that the tinygrad reference
+// proves are load-bearing for non-trivial dispatches:
+//
+//   1. PACKET3_ACQUIRE_MEM with full cache invalidate prepended.
+//      Without it, stale I-cache entries (from prior AQL kernel loads
+//      via DMA) can corrupt fetched shader instructions for any kernel
+//      that spans multiple I-cache lines.
+//   2. RSRC1 |= (1<<20) for the gfx11 CWSR-WA PRIV bit.  Multi-wave
+//      dispatches can have CWSR fire mid-flight; without PRIV the
+//      save-state read faults.
+//   3. RSRC2 |= (lds_blocks << 15) for LDS allocation.  For GSS=4096
+//      that's 8 blocks → 0x40000.
+//   4. PACKET3_EVENT_WRITE(CS_PARTIAL_FLUSH) appended after the
+//      DISPATCH_DIRECT to guarantee rp advances on dispatch completion.
+//
+// Validation: both Phase 1 AQL and Phase 2a PM4 dispatch the SAME
+// rmsnorm_f32_1024 kernel against identical inputs.  Outputs must be
+// bit-identical (the kernel is deterministic).
+
+import "../std/kfd.mlr"
+import "../std/aql.mlr"
+import "../std/kfd_phase1.mlr"
+import "../std/kfd_pm4.mlr"
+import "../std/pm4.mlr"
+import "../std/hip_kfd.mlr"
+
+fn main() {
+    kfd_init()
+
+    // ---------- Module load ----------
+    uint64 mod = kernel_load("/tmp/rmsnorm_f32_1024.co")
+    uint64 kn  = "rmsnorm_f32"
+    uint64 kd  = kernel_get_function(mod, kn)
+    if kd == 0 {
+        print_str("FAIL: rmsnorm_f32 kernel not found in /tmp/rmsnorm_f32_1024.co\n")
+        hipkfd_teardown()
+        exit(1)
+    }
+
+    // Read AMDHSA kernel descriptor fields.  Layout per
+    // /tmp/AMDHSAKernelDescriptor.h:
+    //   +0x00 group_segment_fixed_size (u32)
+    //   +0x04 private_segment_fixed_size (u32)
+    //   +0x08 kernarg_size (u32)
+    //   +0x10 kernel_code_entry_byte_offset (i64)
+    //   +0x30 compute_pgm_rsrc1 (u32)
+    //   +0x34 compute_pgm_rsrc2 (u32)
+    uint64 image_base_va   = 0; unsafe { *((mod + 0x10) as uint64) -> image_base_va }
+    uint64 image_base_host = 0; unsafe { *((mod + 0x20) as uint64) -> image_base_host }
+    uint64 kd_host = image_base_host + (kd - image_base_va)
+
+    uint32 gss32 = 0; unsafe { *((kd_host + 0x00) as uint32) -> gss32 }
+    uint64 gss   = gss32
+    uint64 entry_off = 0; unsafe { *((kd_host + 0x10) as uint64) -> entry_off }
+    uint32 rsrc1_kd = 0; unsafe { *((kd_host + 0x30) as uint32) -> rsrc1_kd }
+    uint32 rsrc2_kd = 0; unsafe { *((kd_host + 0x34) as uint32) -> rsrc2_kd }
+
+    uint64 kobj_va = kd + entry_off
+    uint64 kobj_shifted = kobj_va >> 8
+    uint32 pgm_lo = kobj_shifted & 0xFFFFFFFF
+    uint32 pgm_hi = (kobj_shifted >> 32) & 0xFF
+
+    // Encode RSRC1/RSRC2 per tinygrad ops_amd.py:594-595.
+    uint32 rsrc1_enc = pm4_rsrc1_with_priv(rsrc1_kd)
+    uint32 lds_bits  = pm4_lds_encode_for_rsrc2(gss)
+    uint32 rsrc2_enc = rsrc2_kd | lds_bits
+
+    print_str("kd_va=")           ; println(kd)
+    print_str("entry_off=")       ; println(entry_off)
+    print_str("gss=")             ; println(gss)
+    print_str("rsrc1_kd=")        ; println(rsrc1_kd)
+    print_str("rsrc2_kd=")        ; println(rsrc2_kd)
+    print_str("rsrc1_enc(+PRIV)=") ; println(rsrc1_enc)
+    print_str("rsrc2_enc(+LDS)=") ; println(rsrc2_enc)
+
+    // ---------- Buffers ----------
+    // M=2 rows × N=1024 cols.  Small enough to memcmp host-side; large
+    // enough that the kernel spans many waves (1024 threads/WG = 32
+    // wave32 waves).
+    uint64 M = 2
+    uint64 N = 1024
+    uint64 row_bytes = N * 4
+    uint64 in_bytes  = M * row_bytes
+    uint64 gam_bytes = row_bytes
+
+    uint64 d_in    = dev_alloc_host_visible(in_bytes)
+    uint64 d_in_h  = dev_host_ptr(d_in)
+    uint64 d_gam   = dev_alloc_host_visible(gam_bytes)
+    uint64 d_gam_h = dev_host_ptr(d_gam)
+    uint64 d_out_a = dev_alloc_host_visible(in_bytes)   // AQL output
+    uint64 d_out_a_h = dev_host_ptr(d_out_a)
+    uint64 d_out_b = dev_alloc_host_visible(in_bytes)   // PM4 output
+    uint64 d_out_b_h = dev_host_ptr(d_out_b)
+
+    // Fill input: x[r,c] = (r+1)*0.1 + (c-512)*0.005 — same pattern as
+    // examples/llm/rmsnorm_f32_launch.mlr but at N=1024.
+    uint64 r = 0
+    while r < M {
+        uint64 c = 0
+        while c < N {
+            f64 vd = int_to_f64(r + 1) * 0.1 + (int_to_f64(c) - 512.0) * 0.005
+            f32 v  = f64_to_f32(vd)
+            uint64 p = d_in_h + (r * N + c) * 4
+            unsafe { *(p as f32) = v }
+            c = c + 1
+        }
+        r = r + 1
+    }
+    // Gamma: gamma[c] = 0.5 + c/1024.
+    uint64 c2 = 0
+    while c2 < N {
+        f64 vd = 0.5 + int_to_f64(c2) / 1024.0
+        f32 v  = f64_to_f32(vd)
+        uint64 p = d_gam_h + c2 * 4
+        unsafe { *(p as f32) = v }
+        c2 = c2 + 1
+    }
+    // Zero both outputs so any "no write" path is detectable.
+    uint64 zi = 0
+    while zi < in_bytes {
+        uint64 pa = d_out_a_h + zi; unsafe { *(pa as uint8) = 0 }
+        uint64 pb = d_out_b_h + zi; unsafe { *(pb as uint8) = 0 }
+        zi = zi + 1
+    }
+
+    // ---------- Kernarg blobs (identical for AQL and PM4) ----------
+    // 5 args × 8 bytes = 40 bytes.  Two separate blobs so that each
+    // path can use its own output pointer.
+    uint64 karg_a = dev_alloc_host_visible(40)
+    uint64 karg_a_h = dev_host_ptr(karg_a)
+    unsafe { *((karg_a_h +  0) as uint64) = d_in    }
+    unsafe { *((karg_a_h +  8) as uint64) = d_out_a }
+    unsafe { *((karg_a_h + 16) as uint64) = d_gam   }
+    unsafe { *((karg_a_h + 24) as uint64) = M       }
+    unsafe { *((karg_a_h + 32) as uint64) = N       }
+
+    uint64 karg_b = dev_alloc_host_visible(40)
+    uint64 karg_b_h = dev_host_ptr(karg_b)
+    unsafe { *((karg_b_h +  0) as uint64) = d_in    }
+    unsafe { *((karg_b_h +  8) as uint64) = d_out_b }
+    unsafe { *((karg_b_h + 16) as uint64) = d_gam   }
+    unsafe { *((karg_b_h + 24) as uint64) = M       }
+    unsafe { *((karg_b_h + 32) as uint64) = N       }
+
+    // ---------- Path A: Phase 1 AQL reference ----------
+    uint64 qa  = kfd_create_queue(KFD_WAIT_BUSY_POLL)
+    uint64 sig = kfd_signal_alloc()
+
+    kfd_signal_reset(sig)
+    uint64 abuf = alloc(64)
+    uint64 azi = 0
+    while azi < 64 { uint64 p = abuf + azi; unsafe { *(p as uint8) = 0 }; azi = azi + 1 }
+    // aql_build_kernel_dispatch signature: grid (WG count) first, then
+    // block (WG size).  M workgroups × 1024 threads/WG.
+    uint32 ahs = aql_build_kernel_dispatch(abuf,
+                                            M, 1, 1,         // grid (WG count)
+                                            1024, 1, 1,      // block (WG size)
+                                            0, gss,          // private_seg, group_seg
+                                            kd, karg_a, sig)
+    uint64 a_wp = phase1_submit_packet(qa, abuf, ahs)
+    if a_wp == 0xFFFFFFFFFFFFFFFF {
+        print_str("FAIL: Phase 1 AQL submit timed out\n")
+        hipkfd_teardown()
+        exit(1)
+    }
+    uint64 a_ok = phase1_wait_signal(sig, 0, 5000000000)
+    if a_ok == 0 {
+        print_str("FAIL: Phase 1 AQL completion timed out\n")
+        hipkfd_teardown()
+        exit(1)
+    }
+    print_str("AQL path: ok\n")
+
+    // ---------- Path B: Phase 2a PM4 dispatch ----------
+    uint64 qb = pm4_create_queue()
+
+    // Build the full tinygrad-style PM4 packet stream.  Conservative
+    // upper bound on dwords: ACQUIRE_MEM(8) + 5×SET_SH_REG(2+1..2+8) +
+    // DISPATCH_DIRECT(5) + EVENT_WRITE(2) ≈ 50 dwords.  Allocate 512 B
+    // for headroom.
+    uint64 pkt = alloc(512)
+    uint64 piz = 0
+    while piz < 512 { uint64 p = pkt + piz; unsafe { *(p as uint8) = 0 }; piz = piz + 1 }
+    uint64 vbuf = alloc(64)
+
+    uint64 cursor = 0
+    uint32 dw = 0
+    uint32 vz = 0
+    uint32 one = 1
+
+    // ---- (1) ACQUIRE_MEM with full cache invalidate ----
+    dw = pm4_build_acquire_mem(pkt + cursor, PM4_GCR_CNTL_FULL_INVAL)
+    cursor = cursor + dw * 4
+
+    // ---- (2) SET_SH_REG(PGM_LO, 6) — PGM_LO,HI, 0, 0, SCRATCH_LO,HI=0 ----
+    // (Same 6-reg layout as the original smoke; scratch base left 0
+    // because rmsnorm has private_segment_size=0.)
+    uint32 v0 = pgm_lo; unsafe { *((vbuf + 0)  as uint32) = v0 }
+    uint32 v1 = pgm_hi; unsafe { *((vbuf + 4)  as uint32) = v1 }
+    unsafe { *((vbuf + 8)  as uint32) = vz }
+    unsafe { *((vbuf + 12) as uint32) = vz }
+    unsafe { *((vbuf + 16) as uint32) = vz }
+    unsafe { *((vbuf + 20) as uint32) = vz }
+    dw = pm4_build_set_sh_reg(pkt + cursor, PM4_REG_COMPUTE_PGM_LO, vbuf, 6)
+    cursor = cursor + dw * 4
+
+    // ---- (3) SET_SH_REG(RSRC1, 2) — PRIV-OR'd RSRC1 + LDS-OR'd RSRC2 ----
+    unsafe { *((vbuf + 0) as uint32) = rsrc1_enc }
+    unsafe { *((vbuf + 4) as uint32) = rsrc2_enc }
+    dw = pm4_build_set_sh_reg(pkt + cursor, PM4_REG_COMPUTE_PGM_RSRC1, vbuf, 2)
+    cursor = cursor + dw * 4
+
+    // ---- (4) SET_SH_REG(USER_DATA_0, 2) — kernarg ptr lo/hi ----
+    uint32 ka_lo = karg_b & 0xFFFFFFFF
+    uint32 ka_hi = (karg_b >> 32) & 0xFFFFFFFF
+    unsafe { *((vbuf + 0) as uint32) = ka_lo }
+    unsafe { *((vbuf + 4) as uint32) = ka_hi }
+    dw = pm4_build_set_sh_reg(pkt + cursor, PM4_REG_COMPUTE_USER_DATA_0, vbuf, 2)
+    cursor = cursor + dw * 4
+
+    // ---- (5) SET_SH_REG(START_X, 8) ----
+    // START_X/Y/Z=0, NUM_THREAD_X/Y/Z=(1024,1,1), PERFCOUNT/PIPELINESTAT=0
+    unsafe { *((vbuf + 0)  as uint32) = vz }
+    unsafe { *((vbuf + 4)  as uint32) = vz }
+    unsafe { *((vbuf + 8)  as uint32) = vz }
+    uint32 num_x = 1024
+    unsafe { *((vbuf + 12) as uint32) = num_x }
+    unsafe { *((vbuf + 16) as uint32) = one }
+    unsafe { *((vbuf + 20) as uint32) = one }
+    unsafe { *((vbuf + 24) as uint32) = vz }
+    unsafe { *((vbuf + 28) as uint32) = vz }
+    dw = pm4_build_set_sh_reg(pkt + cursor, PM4_REG_COMPUTE_START_X, vbuf, 8)
+    cursor = cursor + dw * 4
+
+    // ---- (6) DISPATCH_DIRECT with force_start_at_000 (tinygrad's value) ----
+    // 0x8005 = CS_W32_EN (bit15) | FORCE_START_AT_000 (bit2) | COMPUTE_SHADER_EN (bit0).
+    uint32 init_force = 0x8005
+    uint32 grid_x = M
+    dw = pm4_build_dispatch_direct(pkt + cursor, grid_x, 1, 1, init_force)
+    cursor = cursor + dw * 4
+
+    // ---- (7) EVENT_WRITE(CS_PARTIAL_FLUSH) — drain waves ----
+    dw = pm4_build_event_write_cs_flush(pkt + cursor)
+    cursor = cursor + dw * 4
+
+    // ---- (8) RELEASE_MEM with CACHE_FLUSH_AND_INV_TS — flush GL2 and
+    // write the sentinel value to host-visible memory after end-of-
+    // pipe drain.  Without this packet, rp can advance (CP consumed
+    // the packets) before the GPU actually flushes L2 back to GTT —
+    // host reads on d_out_b see stale (zero) bytes.  pm4_build_release_mem
+    // uses CACHE_FLUSH_AND_INV_TS_EVENT(20) at end_of_pipe(5) which
+    // is the gfx11 equivalent of tinygrad's release_mem(cache_flush=True).
+    uint64 sentinel = dev_alloc_host_visible(8)
+    uint64 sentinel_host = dev_host_ptr(sentinel)
+    unsafe { *(sentinel_host as uint64) = 0 }
+    uint32 sentinel_value = 0xDEADBEEF
+    dw = pm4_build_release_mem(pkt + cursor, sentinel, sentinel_value)
+    cursor = cursor + dw * 4
+
+    uint64 total_dw = cursor / 4
+    print_str("pm4 total_dw=") ; println(total_dw)
+
+    uint64 b_wp = pm4_submit_dispatch(qb, pkt, total_dw)
+    if b_wp == 0xFFFFFFFFFFFFFFFF {
+        print_str("FAIL: Phase 2a PM4 submit back-pressure timeout\n")
+        hipkfd_teardown()
+        exit(1)
+    }
+
+    // Busy-poll the sentinel.  10 s budget — rmsnorm at M=2 is ~µs;
+    // anything longer is a wedge.  Reading at u32 granularity since
+    // RELEASE_MEM writes 32-bit data_sel.
+    uint64 timeout_ns = 10000000000
+    uint64 t0 = time_now()
+    uint32 s_val = 0
+    uint64 spin = 0
+    while 1 == 1 {
+        unsafe { *(sentinel_host as uint32) -> s_val }
+        if s_val == sentinel_value { break }
+        spin = spin + 1
+        if (spin & 0xFFFFF) == 0 {
+            uint64 dt = time_now() - t0
+            if dt > timeout_ns {
+                print_str("FAIL: Phase 2a PM4 sentinel timeout — WEDGE SIGNATURE\n")
+                uint64 rpb_host = 0; unsafe { *((qb + 0x60) as uint64) -> rpb_host }
+                uint64 wpb_host = 0; unsafe { *((qb + 0x40) as uint64) -> wpb_host }
+                uint64 rpb = 0; unsafe { *(rpb_host as uint64) -> rpb }
+                uint64 wpb = 0; unsafe { *(wpb_host as uint64) -> wpb }
+                print_str("  rp=") ; println(rpb)
+                print_str("  wp=") ; println(wpb)
+                print_str("  sentinel=") ; println(s_val)
+                hipkfd_teardown()
+                exit(1)
+            }
+        }
+    }
+    print_str("PM4 path: ok (sentinel flipped)\n")
+
+    // ---------- Verify ----------
+    // Bit-exact memcmp the two M*N*4-byte outputs.  rmsnorm_f32 is
+    // deterministic, so any divergence between AQL and PM4 indicates
+    // a dispatch-state bug — not numerical drift.
+    uint64 mismatches = 0
+    uint64 first_bad = 0xFFFFFFFFFFFFFFFF
+    uint32 first_a = 0
+    uint32 first_b = 0
+    uint64 ai = 0
+    while ai < in_bytes {
+        uint8 va = 0; unsafe { *((d_out_a_h + ai) as uint8) -> va }
+        uint8 vb = 0; unsafe { *((d_out_b_h + ai) as uint8) -> vb }
+        if va != vb {
+            if first_bad == 0xFFFFFFFFFFFFFFFF {
+                uint64 word_off = ai - (ai % 4)
+                first_bad = word_off
+                unsafe { *((d_out_a_h + word_off) as uint32) -> first_a }
+                unsafe { *((d_out_b_h + word_off) as uint32) -> first_b }
+            }
+            mismatches = mismatches + 1
+        }
+        ai = ai + 1
+    }
+    // Sanity: ensure outputs are not all-zero (kernel actually ran).
+    uint32 a0 = 0; unsafe { *(d_out_a_h as uint32) -> a0 }
+    uint32 b0 = 0; unsafe { *(d_out_b_h as uint32) -> b0 }
+    print_str("AQL out[0] bits=") ; println(a0)
+    print_str("PM4 out[0] bits=") ; println(b0)
+
+    if a0 == 0 {
+        print_str("FAIL: AQL path produced all-zero output — kernel didn't write\n")
+        hipkfd_teardown()
+        exit(1)
+    }
+    if b0 == 0 {
+        print_str("FAIL: PM4 path produced all-zero output — kernel didn't write\n")
+        hipkfd_teardown()
+        exit(1)
+    }
+    if mismatches != 0 {
+        print_str("FAIL: AQL/PM4 outputs diverge\n")
+        print_str("  first_bad_byte=") ; println(first_bad)
+        print_str("  AQL word bits=")  ; println(first_a)
+        print_str("  PM4 word bits=")  ; println(first_b)
+        print_str("  total mismatches=") ; println(mismatches)
+        hipkfd_teardown()
+        exit(1)
+    }
+
+    print_str("phase2a_pm4_rmsnorm_smoke: GREEN (PM4 == AQL bit-exact)\n")
+    hipkfd_teardown()
+    exit(0)
+}

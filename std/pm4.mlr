@@ -91,29 +91,48 @@ fn pm4_build_dispatch_direct(uint64 packet,
 }
 
 // Build a PACKET3_RELEASE_MEM that writes a 32-bit `value` to GPU VA
-// `signal_va` after end-of-pipe drain.  Body has 6 dwords; total
-// packet = 7 dwords.
+// `signal_va` AFTER end-of-pipe drain AND a full GL2/GLM/GLV/GL1
+// flush + invalidate.  This is the gfx11 equivalent of tinygrad's
+// release_mem(cache_flush=True) — required to make GPU L2 writes
+// visible to host-mapped GTT memory before the sentinel flips.
 //
-//   event_dw  = EVENT_TYPE(CACHE_FLUSH_AND_INV_TS=20) |
-//               EVENT_INDEX(end_of_pipe=5) << 8        = 0x0514
-//   memsel_dw = DATA_SEL(send_32_bit_low=1) << 29       = 0x20000000
+// Body (6 dwords):
+//   [0] event_dw  = CACHE_FLUSH_AND_INV_TS(20) | EVENT_INDEX(eop=5)<<8
+//                  | GCR cache flush bits (GLM_WB/INV, GLV/GL1/GL2_INV,
+//                                          GL2_WB, SEQ)
+//                  = 0x514 | 0x70F000  =  0x70F514
+//   [1] memsel_dw = DATA_SEL(send_32_bit_low=1)<<29
+//                  | INT_SEL(after_write_confirm=2)<<24
+//                  | DST_SEL(memory=0)<<16
+//                  = 0x20000000 | 0x02000000  =  0x22000000
+//   [2] address_lo
+//   [3] address_hi
+//   [4] data_lo  = value
+//   [5] data_hi  = 0 (32-bit write)
+//   + 1 trailing ctxid dword (0 unless tracing).
 //
-// The trailing dword is value_hi (0 for a 32-bit write).
+// Total packet = 8 dwords (header + 7 body). Cross-checked against
+// tinygrad ops_amd.py:112-130 and pm4_nv.py:313-330. Body matches
+// tinygrad's `pkt3(RELEASE_MEM, event_dw, memsel_dw, *data64_le(addr),
+// *data64_le(value), ctxid)` exactly — 7 body dwords. The trailing
+// ctxid is mandatory on gfx11; omitting it makes the CP reject the
+// IB at parse-time (rp=0 wedge signature).
 fn pm4_build_release_mem(uint64 packet, uint64 signal_va, uint32 value) -> uint32 {
-    uint32 hdr = pm4_build_header(PM4_RELEASE_MEM, 6)
-    uint32 event_dw  = 0x0514
-    uint32 memsel_dw = 0x20000000
+    uint32 hdr = pm4_build_header(PM4_RELEASE_MEM, 7)
+    uint32 event_dw  = 0x70F514
+    uint32 memsel_dw = 0x22000000
     uint32 sig_lo = signal_va & 0xFFFFFFFF
     uint32 sig_hi = (signal_va >> 32) & 0xFFFFFFFF
+    uint32 zero32 = 0
     unsafe { *((packet + 0)  as uint32) = hdr }
     unsafe { *((packet + 4)  as uint32) = event_dw }
     unsafe { *((packet + 8)  as uint32) = memsel_dw }
     unsafe { *((packet + 12) as uint32) = sig_lo }
     unsafe { *((packet + 16) as uint32) = sig_hi }
     unsafe { *((packet + 20) as uint32) = value }
-    uint32 zero32 = 0
-    unsafe { *((packet + 24) as uint32) = zero32 }
-    return 7
+    unsafe { *((packet + 24) as uint32) = zero32 }   // value_hi (32-bit write)
+    unsafe { *((packet + 28) as uint32) = zero32 }   // ctxid
+    return 8
 }
 
 // Build a PACKET3_NOP.  Useful for padding the ring up to a power-of-2
@@ -131,4 +150,101 @@ fn pm4_build_nop(uint64 packet, uint32 body_dw) -> uint32 {
         i = i + 1
     }
     return 1 + body_dw
+}
+
+// PACKET3_ACQUIRE_MEM GCR_CNTL bit positions (gfx11).  Cross-checked
+// against tinygrad/runtime/autogen/am/pm4_nv.py:351-364.  Setting all
+// of these to 1 yields the same cache_flags_dw that tinygrad's
+// AMDComputeQueue.memory_barrier() generates — i.e. full I/K/V/L1/L2
+// invalidate + writeback before the dispatch reads kernel code.
+static uint32 PM4_GCR_GLI_INV_BIT  = 0          // bits [1:0]
+static uint32 PM4_GCR_GLM_WB_BIT   = 4
+static uint32 PM4_GCR_GLM_INV_BIT  = 5
+static uint32 PM4_GCR_GLK_WB_BIT   = 6
+static uint32 PM4_GCR_GLK_INV_BIT  = 7
+static uint32 PM4_GCR_GLV_INV_BIT  = 8
+static uint32 PM4_GCR_GL1_INV_BIT  = 9
+static uint32 PM4_GCR_GL2_INV_BIT  = 14
+static uint32 PM4_GCR_GL2_WB_BIT   = 15
+
+// Full-invalidate cache_flags_dw matching tinygrad's
+// memory_barrier()'s acquire_mem() default (gli=glm=glk=glv=gl1=gl2=1).
+// Value = (1<<0) | (1<<4) | (1<<5) | (1<<6) | (1<<7) | (1<<8) | (1<<9)
+//       | (1<<14) | (1<<15)
+//       = 0xC3F1.  Hand-verified before commit.
+static uint32 PM4_GCR_CNTL_FULL_INVAL = 0xC3F1
+
+// Build a PACKET3_ACQUIRE_MEM that invalidates the cache hierarchy
+// described by `gcr_cntl` (use PM4_GCR_CNTL_FULL_INVAL for the default
+// full-cache flush before a dispatch reads kernel code).  Address=0,
+// size=(1<<64)-1 — invalidates everything regardless of VA range, same
+// as tinygrad's acquire_mem(addr=0, sz=(1<<64)-1, ...).
+//
+// Body (7 dwords):
+//   [0] CP_COHER_CNTL    = 0
+//   [1] COHER_SIZE_LO    = 0xFFFFFFFF
+//   [2] COHER_SIZE_HI    = 0xFFFFFFFF  (CP masks low 8 bits internally)
+//   [3] COHER_BASE_LO    = 0
+//   [4] COHER_BASE_HI    = 0
+//   [5] POLL_INTERVAL    = 0
+//   [6] GCR_CNTL         = gcr_cntl
+//
+// Total dwords written = 8 (header + 7 body).
+fn pm4_build_acquire_mem(uint64 packet, uint32 gcr_cntl) -> uint32 {
+    uint32 hdr = pm4_build_header(PM4_ACQUIRE_MEM, 7)
+    uint32 zero32 = 0
+    uint32 all_ones = 0xFFFFFFFF
+    unsafe { *((packet + 0)  as uint32) = hdr }
+    unsafe { *((packet + 4)  as uint32) = zero32 }       // CP_COHER_CNTL
+    unsafe { *((packet + 8)  as uint32) = all_ones }     // COHER_SIZE_LO
+    unsafe { *((packet + 12) as uint32) = all_ones }     // COHER_SIZE_HI
+    unsafe { *((packet + 16) as uint32) = zero32 }       // COHER_BASE_LO
+    unsafe { *((packet + 20) as uint32) = zero32 }       // COHER_BASE_HI
+    unsafe { *((packet + 24) as uint32) = zero32 }       // POLL_INTERVAL
+    unsafe { *((packet + 28) as uint32) = gcr_cntl }     // GCR_CNTL
+    return 8
+}
+
+// EVENT_TYPE for CS_PARTIAL_FLUSH on gfx11.  From soc_11.py:43
+// (CS_PARTIAL_FLUSH := 7).  Tinygrad emits this packet at the end of
+// every exec() (ops_amd.py:367) to ensure rp advances on dispatch
+// completion + wave drain.  Index 4 = PARTIAL_FLUSH event class.
+//
+// Body dword layout: (event_type & 0x3F) | ((event_index & 0xF) << 8)
+//                  = 7 | (4 << 8) = 0x407
+static uint32 PM4_EVENT_CS_PARTIAL_FLUSH_DW = 0x407
+
+// Build a PACKET3_EVENT_WRITE for CS_PARTIAL_FLUSH.  1 body dword,
+// 2 dwords total.  Mirrors tinygrad ops_amd.py:367.
+fn pm4_build_event_write_cs_flush(uint64 packet) -> uint32 {
+    uint32 hdr = pm4_build_header(PM4_EVENT_WRITE, 1)
+    uint32 ev  = PM4_EVENT_CS_PARTIAL_FLUSH_DW
+    unsafe { *((packet + 0) as uint32) = hdr }
+    unsafe { *((packet + 4) as uint32) = ev }
+    return 2
+}
+
+// Encode the LDS block count for COMPUTE_PGM_RSRC2 from the kernel's
+// .group_segment_fixed_size (`gss`).  Returns the bits to OR into
+// RSRC2 before writing it to SET_SH_REG.  Formula matches tinygrad
+// ops_amd.py:585:
+//     lds_size = ((gss + 511) // 512) & 0x1FF
+//     rsrc2_encoded = rsrc2 | (lds_size << 15)
+//
+// The CP firmware uses these bits to allocate LDS for the dispatch.
+// Kernels emitted via `--target=amdgpu-native` store gss in the kernel
+// descriptor's group_segment_fixed_size slot (KD+0x00) — pass that
+// value here verbatim.  Returns 0 for gss=0 (no OR needed).
+fn pm4_lds_encode_for_rsrc2(uint64 gss) -> uint32 {
+    if gss == 0 { return 0 }
+    uint64 blocks = (gss + 511) / 512
+    uint32 blocks32 = blocks & 0x1FF
+    return blocks32 << 15
+}
+
+// OR the gfx11 CWSR-workaround PRIV bit into RSRC1.  Tinygrad sets
+// this unconditionally on target[0]==11 (ops_amd.py:594).  PRIV at
+// RSRC1 bit 20 = 0x100000.
+fn pm4_rsrc1_with_priv(uint32 rsrc1) -> uint32 {
+    return rsrc1 | 0x100000
 }
