@@ -151,7 +151,10 @@ static uint64 AC_OFF_DIVMUL_R         = 100   // uint32 — divmul[1] remainder
 static uint64 AC_OFF_SHIFT            = 104   // uint32 — shift state
 static uint64 AC_OFF_IO_ATTR          = 108   // uint32 — io_attr (WS_ATTRIBUTES)
 static uint64 AC_OFF_IIO_SLOTS        = 112   // uint64 — ptr to uint16[256] iio table (0=none)
-static uint64 ATOM_CONTEXT_SIZE       = 128   // bumped from 96
+// New field (slice δ.0i): fb_window as set by setfbbase opcode.
+// Distinct from AC_OFF_FB_BASE (host scratch pointer).
+static uint64 AC_OFF_FB_WINDOW        = 120   // uint32 — SETFBBASE window value
+static uint64 ATOM_CONTEXT_SIZE       = 128   // size unchanged; bytes 120..127 were padding
 
 // =====================================================================
 // atom_exec_context (per-table-call). Size 80.
@@ -751,6 +754,169 @@ fn _atom_op_switch(uint64 ectx, uint64 ptr_ptr, uint64 arg) {
 }
 
 // =====================================================================
+// Opcode batch 3 — special ops (slice δ.0i).
+// Ports: atom_op_setport, atom_op_setregblock, atom_op_setfbbase,
+//        atom_op_setdatablock, atom_op_savereg, atom_op_restorereg,
+//        atom_op_delay, atom_op_processds, atom_op_beep,
+//        atom_op_debug, atom_op_postcard.
+// =====================================================================
+
+// atom_op_setport (atom.c:903-929)
+// arg=0 → ATI: read u16 port; if 0 → ATOM_IO_MM, else → ATOM_IO_IIO|port
+// arg=1 → PCI:   set ATOM_IO_PCI;   consume 1 byte
+// arg=2 → SYSIO: set ATOM_IO_SYSIO; consume 1 byte
+fn _atom_op_setport(uint64 ectx, uint64 ptr_ptr, uint64 arg) {
+    uint64 ctx = 0; unsafe { *((ectx + AEC_OFF_CTX) as uint64) -> ctx }
+    uint64 image = 0; unsafe { *((ctx + AC_OFF_IMAGE_BUF) as uint64) -> image }
+    uint64 ptr_val = 0; unsafe { *(ptr_ptr as uint64) -> ptr_val }
+    if arg == ATOM_PORT_ATI {
+        uint16 port_w = 0; unsafe { *((image + ptr_val) as uint16) -> port_w }
+        uint64 port = port_w
+        unsafe { *(ptr_ptr as uint64) = ptr_val + 2 }
+        if port == 0 {
+            unsafe { *((ctx + AC_OFF_IO_MODE) as uint64) = ATOM_IO_MM }
+        } else {
+            uint64 mode = ATOM_IO_IIO | port
+            unsafe { *((ctx + AC_OFF_IO_MODE) as uint64) = mode }
+        }
+    } else { if arg == ATOM_PORT_PCI {
+        unsafe { *((ctx + AC_OFF_IO_MODE) as uint64) = ATOM_IO_PCI }
+        unsafe { *(ptr_ptr as uint64) = ptr_val + 1 }
+    } else { if arg == ATOM_PORT_SYSIO {
+        unsafe { *((ctx + AC_OFF_IO_MODE) as uint64) = ATOM_IO_SYSIO }
+        unsafe { *(ptr_ptr as uint64) = ptr_val + 1 }
+    } } }
+}
+
+// atom_op_setregblock (atom.c:930-936)
+// Read u16 from bytecode → ctx->reg_block; advance ptr by 2.
+fn _atom_op_setregblock(uint64 ectx, uint64 ptr_ptr, uint64 arg) {
+    uint64 ctx = 0; unsafe { *((ectx + AEC_OFF_CTX) as uint64) -> ctx }
+    uint64 image = 0; unsafe { *((ctx + AC_OFF_IMAGE_BUF) as uint64) -> image }
+    uint64 ptr_val = 0; unsafe { *(ptr_ptr as uint64) -> ptr_val }
+    uint16 rb_w = 0; unsafe { *((image + ptr_val) as uint16) -> rb_w }
+    uint64 rb = rb_w
+    unsafe { *((ctx + AC_OFF_REG_BLOCK) as uint64) = rb }
+    unsafe { *(ptr_ptr as uint64) = ptr_val + 2 }
+}
+
+// atom_op_setfbbase (atom.c:896-902)
+// Read attr byte, then get_src value → ctx->fb_window (AC_OFF_FB_WINDOW).
+fn _atom_op_setfbbase(uint64 ectx, uint64 ptr_ptr, uint64 arg) {
+    uint64 ctx = 0; unsafe { *((ectx + AEC_OFF_CTX) as uint64) -> ctx }
+    uint64 image = 0; unsafe { *((ctx + AC_OFF_IMAGE_BUF) as uint64) -> image }
+    uint64 ptr_val = 0; unsafe { *(ptr_ptr as uint64) -> ptr_val }
+    uint8 attr_b = 0; unsafe { *((image + ptr_val) as uint8) -> attr_b }
+    uint64 attr = attr_b
+    unsafe { *(ptr_ptr as uint64) = ptr_val + 1 }
+    uint64 src = _atom_get_src(ectx, attr, ptr_ptr)
+    uint32 wv = src; unsafe { *((ctx + AC_OFF_FB_WINDOW) as uint32) = wv }
+}
+
+// atom_op_setdatablock (atom.c:882-895)
+// Read u8 idx; idx=0 → data_block=0; idx=0xFF → data_block=ectx.start;
+// else → data_block = data_table_offset_by_index(image, idx).
+fn _atom_op_setdatablock(uint64 ectx, uint64 ptr_ptr, uint64 arg) {
+    uint64 ctx = 0; unsafe { *((ectx + AEC_OFF_CTX) as uint64) -> ctx }
+    uint64 image = 0; unsafe { *((ctx + AC_OFF_IMAGE_BUF) as uint64) -> image }
+    uint64 ptr_val = 0; unsafe { *(ptr_ptr as uint64) -> ptr_val }
+    uint8 idx_b = 0; unsafe { *((image + ptr_val) as uint8) -> idx_b }
+    uint64 idx = idx_b
+    unsafe { *(ptr_ptr as uint64) = ptr_val + 1 }
+    if idx == 0 {
+        unsafe { *((ctx + AC_OFF_DATA_BLOCK) as uint64) = 0 }
+    } else { if idx == 255 {
+        uint64 start = 0; unsafe { *((ectx + AEC_OFF_START_PTR) as uint64) -> start }
+        unsafe { *((ctx + AC_OFF_DATA_BLOCK) as uint64) = start }
+    } else {
+        uint64 data_table_base = 0; unsafe { *((ctx + AC_OFF_DATA_TABLE_BASE) as uint64) -> data_table_base }
+        uint16 off_w = 0; unsafe { *((image + data_table_base + 4 + idx * 2) as uint16) -> off_w }
+        uint64 off = off_w
+        unsafe { *((ctx + AC_OFF_DATA_BLOCK) as uint64) = off }
+    } }
+}
+
+// atom_op_savereg (atom.c:877-881)
+// Unimplemented in modern amdgpu — consume 1 byte and return.
+fn _atom_op_savereg(uint64 ectx, uint64 ptr_ptr, uint64 arg) {
+    uint64 ptr_val = 0; unsafe { *(ptr_ptr as uint64) -> ptr_val }
+    unsafe { *(ptr_ptr as uint64) = ptr_val + 1 }
+}
+
+// atom_op_restorereg (atom.c:872-876)
+// Unimplemented in modern amdgpu — consume 1 byte and return.
+fn _atom_op_restorereg(uint64 ectx, uint64 ptr_ptr, uint64 arg) {
+    uint64 ptr_val = 0; unsafe { *(ptr_ptr as uint64) -> ptr_val }
+    unsafe { *(ptr_ptr as uint64) = ptr_val + 1 }
+}
+
+// atom_op_delay (atom.c:674-685)
+// Read u8 count; arg=ATOM_UNIT_MICROSEC → sleep count µs;
+//                arg=ATOM_UNIT_MILLISEC → sleep count ms.
+// Uses clock_nanosleep (syscall 35) via a stack-allocated timespec.
+fn _atom_op_delay(uint64 ectx, uint64 ptr_ptr, uint64 arg) {
+    uint64 ctx = 0; unsafe { *((ectx + AEC_OFF_CTX) as uint64) -> ctx }
+    uint64 image = 0; unsafe { *((ctx + AC_OFF_IMAGE_BUF) as uint64) -> image }
+    uint64 ptr_val = 0; unsafe { *(ptr_ptr as uint64) -> ptr_val }
+    uint8 cnt_b = 0; unsafe { *((image + ptr_val) as uint8) -> cnt_b }
+    uint64 count = cnt_b
+    unsafe { *(ptr_ptr as uint64) = ptr_val + 1 }
+    uint64 ts = alloc(16)
+    uint8 tz = 0
+    uint64 ti = 0
+    while ti < 16 {
+        unsafe { *((ts + ti) as uint8) = tz }; ti = ti + 1
+    }
+    if arg == ATOM_UNIT_MICROSEC {
+        // sleep count microseconds: sec=0, nsec=count*1000
+        unsafe { *((ts + 0) as uint64) = 0 }
+        unsafe { *((ts + 8) as uint64) = count * 1000 }
+    } else {
+        // sleep count milliseconds: sec=count/1000, nsec=(count%1000)*1000000
+        unsafe { *((ts + 0) as uint64) = count / 1000 }
+        unsafe { *((ts + 8) as uint64) = (count - (count / 1000) * 1000) * 1000000 }
+    }
+    syscall_raw(35, ts, 0, 0, 0, 0, 0)
+    dealloc(ts)
+}
+
+// atom_op_processds (atom.c:1080-1083)
+// Read u16 val; advance ptr by val + 2 (skips the DS block).
+fn _atom_op_processds(uint64 ectx, uint64 ptr_ptr, uint64 arg) {
+    uint64 ctx = 0; unsafe { *((ectx + AEC_OFF_CTX) as uint64) -> ctx }
+    uint64 image = 0; unsafe { *((ctx + AC_OFF_IMAGE_BUF) as uint64) -> image }
+    uint64 ptr_val = 0; unsafe { *(ptr_ptr as uint64) -> ptr_val }
+    uint16 val_w = 0; unsafe { *((image + ptr_val) as uint16) -> val_w }
+    uint64 val = val_w
+    unsafe { *(ptr_ptr as uint64) = ptr_val + val + 2 }
+}
+
+// atom_op_beep (atom.c:627-631)
+// Legacy HW beep — pure NOP for us; no parameter consumed.
+fn _atom_op_beep(uint64 ectx, uint64 ptr_ptr, uint64 arg) {
+}
+
+// atom_op_debug (atom.c:1074-1078)
+// Read u8 immediate and discard.
+fn _atom_op_debug(uint64 ectx, uint64 ptr_ptr, uint64 arg) {
+    uint64 ctx = 0; unsafe { *((ectx + AEC_OFF_CTX) as uint64) -> ctx }
+    uint64 image = 0; unsafe { *((ctx + AC_OFF_IMAGE_BUF) as uint64) -> image }
+    uint64 ptr_val = 0; unsafe { *(ptr_ptr as uint64) -> ptr_val }
+    uint8 _val_b = 0; unsafe { *((image + ptr_val) as uint8) -> _val_b }
+    unsafe { *(ptr_ptr as uint64) = ptr_val + 1 }
+}
+
+// atom_op_postcard (atom.c:861-866)
+// Read u8 immediate (POST code) and discard.
+fn _atom_op_postcard(uint64 ectx, uint64 ptr_ptr, uint64 arg) {
+    uint64 ctx = 0; unsafe { *((ectx + AEC_OFF_CTX) as uint64) -> ctx }
+    uint64 image = 0; unsafe { *((ctx + AC_OFF_IMAGE_BUF) as uint64) -> image }
+    uint64 ptr_val = 0; unsafe { *(ptr_ptr as uint64) -> ptr_val }
+    uint8 _val_b = 0; unsafe { *((image + ptr_val) as uint8) -> _val_b }
+    unsafe { *(ptr_ptr as uint64) = ptr_val + 1 }
+}
+
+// =====================================================================
 // Opcode arg lookup — copy of opcode_table[] from amdgpu/atom.c:1090.
 // Returns the 2nd field (`arg` value) of each entry. Slot 0 (NULL) and
 // any unknown op return 0. Slot ATOM_OP_EOT (91) returns 0.
@@ -915,6 +1081,14 @@ fn _atom_dispatch(uint64 op, uint64 ectx, uint64 ptr_ptr) {
     if op == 52 { _atom_op_sub(ectx, ptr_ptr, arg); return }
     if op == 53 { _atom_op_sub(ectx, ptr_ptr, arg); return }
     if op == 54 { _atom_op_sub(ectx, ptr_ptr, arg); return }
+    // setport (ATI/PCI/SYSIO): ops 55..57
+    if op == 55 { _atom_op_setport(ectx, ptr_ptr, arg); return }
+    if op == 56 { _atom_op_setport(ectx, ptr_ptr, arg); return }
+    if op == 57 { _atom_op_setport(ectx, ptr_ptr, arg); return }
+    // setregblock: op 58
+    if op == 58 { _atom_op_setregblock(ectx, ptr_ptr, arg); return }
+    // setfbbase: op 59
+    if op == 59 { _atom_op_setfbbase(ectx, ptr_ptr, arg); return }
     // compare: ops 60..65
     if op == 60 { _atom_op_compare(ectx, ptr_ptr, arg); return }
     if op == 61 { _atom_op_compare(ectx, ptr_ptr, arg); return }
@@ -922,6 +1096,9 @@ fn _atom_dispatch(uint64 op, uint64 ectx, uint64 ptr_ptr) {
     if op == 63 { _atom_op_compare(ectx, ptr_ptr, arg); return }
     if op == 64 { _atom_op_compare(ectx, ptr_ptr, arg); return }
     if op == 65 { _atom_op_compare(ectx, ptr_ptr, arg); return }
+    // delay (ms/µs): ops 80..81
+    if op == 80 { _atom_op_delay(ectx, ptr_ptr, arg); return }
+    if op == 81 { _atom_op_delay(ectx, ptr_ptr, arg); return }
     // test: ops 74..79
     if op == 74 { _atom_op_test(ectx, ptr_ptr, arg); return }
     if op == 75 { _atom_op_test(ectx, ptr_ptr, arg); return }
@@ -936,6 +1113,16 @@ fn _atom_dispatch(uint64 op, uint64 ectx, uint64 ptr_ptr) {
     if op == 87 { _atom_op_clear(ectx, ptr_ptr, arg); return }
     if op == 88 { _atom_op_clear(ectx, ptr_ptr, arg); return }
     if op == 89 { _atom_op_clear(ectx, ptr_ptr, arg); return }
+    // postcard: op 98
+    if op == 98 { _atom_op_postcard(ectx, ptr_ptr, arg); return }
+    // beep: op 99
+    if op == 99 { _atom_op_beep(ectx, ptr_ptr, arg); return }
+    // savereg: op 100
+    if op == 100 { _atom_op_savereg(ectx, ptr_ptr, arg); return }
+    // restorereg: op 101
+    if op == 101 { _atom_op_restorereg(ectx, ptr_ptr, arg); return }
+    // setdatablock: op 102
+    if op == 102 { _atom_op_setdatablock(ectx, ptr_ptr, arg); return }
     // mask: ops 92..97
     if op == 92 { _atom_op_mask(ectx, ptr_ptr, arg); return }
     if op == 93 { _atom_op_mask(ectx, ptr_ptr, arg); return }
@@ -964,6 +1151,10 @@ fn _atom_dispatch(uint64 op, uint64 ectx, uint64 ptr_ptr) {
     if op == 118 { _atom_op_shr(ectx, ptr_ptr, arg); return }
     if op == 119 { _atom_op_shr(ectx, ptr_ptr, arg); return }
     if op == 120 { _atom_op_shr(ectx, ptr_ptr, arg); return }
+    // debug: op 121
+    if op == 121 { _atom_op_debug(ectx, ptr_ptr, arg); return }
+    // processds: op 122
+    if op == 122 { _atom_op_processds(ectx, ptr_ptr, arg); return }
     // mul32: ops 123..124
     if op == 123 { _atom_op_mul32(ectx, ptr_ptr, arg); return }
     if op == 124 { _atom_op_mul32(ectx, ptr_ptr, arg); return }
