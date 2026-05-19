@@ -131,7 +131,7 @@ fn atom_validate_image(uint64 buf, uint64 size) -> uint64 {
 }
 
 // =====================================================================
-// atom_context (global, one per session) — byte-offset layout. Size 96.
+// atom_context (global, one per session) — byte-offset layout. Size 128.
 // =====================================================================
 static uint64 AC_OFF_IMAGE_BUF        = 0     // uint64 — base of ROM image
 static uint64 AC_OFF_IMAGE_SIZE       = 8     // uint64
@@ -145,10 +145,16 @@ static uint64 AC_OFF_IO_MODE          = 64    // uint64 — current SETPORT targ
 static uint64 AC_OFF_SCRATCH          = 72    // uint64 — scratch dword array ptr
 static uint64 AC_OFF_SCRATCH_SIZE     = 80    // uint64
 static uint64 AC_OFF_BAR5_HOST        = 88    // uint64 — host VA of mapped BAR5 (0 = no GPU)
-static uint64 ATOM_CONTEXT_SIZE       = 96
+// New fields (slice δ.0f):
+static uint64 AC_OFF_DIVMUL_Q         = 96    // uint32 — divmul[0] quotient
+static uint64 AC_OFF_DIVMUL_R         = 100   // uint32 — divmul[1] remainder
+static uint64 AC_OFF_SHIFT            = 104   // uint32 — shift state
+static uint64 AC_OFF_IO_ATTR          = 108   // uint32 — io_attr (WS_ATTRIBUTES)
+static uint64 AC_OFF_IIO_SLOTS        = 112   // uint64 — ptr to uint16[256] iio table (0=none)
+static uint64 ATOM_CONTEXT_SIZE       = 128   // bumped from 96
 
 // =====================================================================
-// atom_exec_context (per-table-call). Size 64.
+// atom_exec_context (per-table-call). Size 80.
 // =====================================================================
 static uint64 AEC_OFF_CTX             = 0     // uint64 atom_context*
 static uint64 AEC_OFF_START_PTR       = 8     // uint64 bytecode offset where table begins
@@ -158,7 +164,10 @@ static uint64 AEC_OFF_LAST_DST        = 32    // uint64 — last destination val
 static uint64 AEC_OFF_LAST_PORT       = 40    // uint64 — last SETPORT target
 static uint64 AEC_OFF_ABORT           = 48    // uint64 — 1 = halt, 0xDEAD = panic
 static uint64 AEC_OFF_PTR             = 56    // uint64 — current bytecode offset
-static uint64 ATOM_EXEC_CONTEXT_SIZE  = 64
+// New fields (slice δ.0f):
+static uint64 AEC_OFF_PS_SIZE         = 64    // uint32 — # of valid ps[] dwords
+static uint64 AEC_OFF_WS_SIZE         = 68    // uint32 — # of valid ws[] dwords
+static uint64 ATOM_EXEC_CONTEXT_SIZE  = 80    // bumped from 64
 
 // =====================================================================
 // Opcode handlers. All current handlers except _atom_op_eot are stubs.
@@ -304,11 +313,11 @@ fn atom_execute_table(uint64 ctx,
                       uint64 ps_size) -> uint64 {
     if cmd_table_offset == 0 { return 1 }
     uint64 image = 0; unsafe { *((ctx + AC_OFF_IMAGE_BUF) as uint64) -> image }
-    uint64 image_sz = 0; unsafe { *((ctx + AC_OFF_IMAGE_SIZE) as uint64) -> image_sz }
+    uint64 _image_sz = 0; unsafe { *((ctx + AC_OFF_IMAGE_SIZE) as uint64) -> _image_sz }
 
     uint16 len_w = 0; unsafe { *((image + cmd_table_offset + ATOM_CT_SIZE_PTR) as uint16) -> len_w }
     uint8  ws_b  = 0; unsafe { *((image + cmd_table_offset + ATOM_CT_WS_PTR)   as uint8)  -> ws_b }
-    uint8  ps_b  = 0; unsafe { *((image + cmd_table_offset + ATOM_CT_PS_PTR)   as uint8)  -> ps_b }
+    uint8  _ps_b = 0; unsafe { *((image + cmd_table_offset + ATOM_CT_PS_PTR)   as uint8)  -> _ps_b }
     uint64 ws_dwords = ws_b
     uint64 bytecode_start = cmd_table_offset + ATOM_CT_CODE_PTR
     uint64 bytecode_end   = cmd_table_offset + len_w
@@ -331,6 +340,8 @@ fn atom_execute_table(uint64 ctx,
     unsafe { *((ectx + AEC_OFF_PTR)       as uint64) = bytecode_start }
     unsafe { *((ectx + AEC_OFF_PS)        as uint64) = ps_ptr }
     unsafe { *((ectx + AEC_OFF_WS)        as uint64) = ws_buf }
+    unsafe { *((ectx + AEC_OFF_PS_SIZE)   as uint32) = ps_size }
+    unsafe { *((ectx + AEC_OFF_WS_SIZE)   as uint32) = ws_dwords }
 
     uint64 abort = 0
     uint64 ran_off = 0
@@ -350,4 +361,563 @@ fn atom_execute_table(uint64 ctx,
     if ran_off == 1 { return 3 }
     if abort == 0xDEAD { return 2 }
     return 0
+}
+
+// =====================================================================
+// slice δ.0f — operand decoder layer
+//
+// Ports: atom_arg_mask[], atom_arg_shift[], atom_dst_to_src[][],
+//        atom_iio_execute(), atom_get_src_int(), atom_skip_src_int(),
+//        atom_get_src(), atom_get_src_direct(), atom_get_dst(),
+//        atom_skip_dst(), atom_put_dst().
+//
+// Register / PLL / MC I/O stubs return 0 / no-op. They get wired to
+// real card_info ops in slice δ.0j.
+// =====================================================================
+
+// ---------------------------------------------------------------------
+// Lookup tables (implemented as functions — MLRift has no static arrays)
+// ---------------------------------------------------------------------
+
+// atom_arg_mask[align] — 32-bit mask for the selected sub-field.
+fn _atom_arg_mask(uint64 align) -> uint64 {
+    if align == 0 { return 0xFFFFFFFF }   // ATOM_SRC_DWORD
+    if align == 1 { return 0xFFFF }       // ATOM_SRC_WORD0
+    if align == 2 { return 0xFFFF00 }     // ATOM_SRC_WORD8
+    if align == 3 { return 0xFFFF0000 }   // ATOM_SRC_WORD16
+    if align == 4 { return 0xFF }         // ATOM_SRC_BYTE0
+    if align == 5 { return 0xFF00 }       // ATOM_SRC_BYTE8
+    if align == 6 { return 0xFF0000 }     // ATOM_SRC_BYTE16
+    if align == 7 { return 0xFF000000 }   // ATOM_SRC_BYTE24
+    return 0
+}
+
+// atom_arg_shift[align] — right-shift to extract sub-field.
+fn _atom_arg_shift(uint64 align) -> uint64 {
+    if align == 0 { return 0 }
+    if align == 1 { return 0 }
+    if align == 2 { return 8 }
+    if align == 3 { return 16 }
+    if align == 4 { return 0 }
+    if align == 5 { return 8 }
+    if align == 6 { return 16 }
+    if align == 7 { return 24 }
+    return 0
+}
+
+// atom_dst_to_src[attr_dst][idx] — translate dst-align field to src-align.
+// attr_dst = (attr >> 3) & 7;  idx = (attr >> 6) & 3.
+fn _atom_dst_to_src(uint64 attr_dst, uint64 idx) -> uint64 {
+    if attr_dst == 0 { return 0 }
+    if attr_dst == 1 {
+        if idx == 0 { return 1 } if idx == 1 { return 2 } if idx == 2 { return 3 } if idx == 3 { return 0 }
+        return 0
+    }
+    if attr_dst == 2 {
+        if idx == 0 { return 1 } if idx == 1 { return 2 } if idx == 2 { return 3 } if idx == 3 { return 0 }
+        return 0
+    }
+    if attr_dst == 3 {
+        if idx == 0 { return 1 } if idx == 1 { return 2 } if idx == 2 { return 3 } if idx == 3 { return 0 }
+        return 0
+    }
+    if attr_dst == 4 {
+        if idx == 0 { return 4 } if idx == 1 { return 5 } if idx == 2 { return 6 } if idx == 3 { return 7 }
+        return 0
+    }
+    if attr_dst == 5 {
+        if idx == 0 { return 4 } if idx == 1 { return 5 } if idx == 2 { return 6 } if idx == 3 { return 7 }
+        return 0
+    }
+    if attr_dst == 6 {
+        if idx == 0 { return 4 } if idx == 1 { return 5 } if idx == 2 { return 6 } if idx == 3 { return 7 }
+        return 0
+    }
+    if attr_dst == 7 {
+        if idx == 0 { return 4 } if idx == 1 { return 5 } if idx == 2 { return 6 } if idx == 3 { return 7 }
+        return 0
+    }
+    return 0
+}
+
+// ---------------------------------------------------------------------
+// Stubbed register I/O — wired to card_info in slice δ.0j.
+// ---------------------------------------------------------------------
+fn _atom_reg_read(uint64 ctx, uint64 idx) -> uint64 { return 0 }
+fn _atom_reg_write(uint64 ctx, uint64 idx, uint64 val) { }
+fn _atom_pll_read(uint64 ctx, uint64 idx) -> uint64 { return 0 }
+fn _atom_pll_write(uint64 ctx, uint64 idx, uint64 val) { }
+fn _atom_mc_read(uint64 ctx, uint64 idx) -> uint64 { return 0 }
+fn _atom_mc_write(uint64 ctx, uint64 idx, uint64 val) { }
+
+// ---------------------------------------------------------------------
+// atom_iio_execute — IIO sub-bytecode interpreter.
+// Ports atom.c:110-180 verbatim.
+// ctx    — atom_context*
+// base   — byte offset within image where IIO bytecode starts
+// idx    — index operand (from the caller's REG idx)
+// data   — data operand (from the caller's val)
+// Returns the final temp register value.
+// ---------------------------------------------------------------------
+fn _atom_iio_execute(uint64 ctx, uint64 base, uint64 idx, uint64 data) -> uint64 {
+    uint64 image = 0; unsafe { *((ctx + AC_OFF_IMAGE_BUF) as uint64) -> image }
+    uint64 temp = 0xCDCDCDCD
+    uint64 done = 0
+    while done == 0 {
+        uint8 opc_b = 0; unsafe { *((image + base) as uint8) -> opc_b }
+        uint64 opc = opc_b
+        if opc == ATOM_IIO_NOP {
+            base = base + 1
+        } else { if opc == ATOM_IIO_READ {
+            uint16 reg_w = 0; unsafe { *((image + base + 1) as uint16) -> reg_w }
+            uint64 reg = reg_w
+            temp = _atom_reg_read(ctx, reg)
+            base = base + 3
+        } else { if opc == ATOM_IIO_WRITE {
+            uint16 reg_w = 0; unsafe { *((image + base + 1) as uint16) -> reg_w }
+            uint64 reg = reg_w
+            _atom_reg_write(ctx, reg, temp)
+            base = base + 3
+        } else { if opc == ATOM_IIO_CLEAR {
+            uint8 cnt_b = 0; unsafe { *((image + base + 1) as uint8) -> cnt_b }
+            uint8 shft_b = 0; unsafe { *((image + base + 2) as uint8) -> shft_b }
+            uint64 cnt = cnt_b; uint64 shft = shft_b
+            uint64 mask = (0xFFFFFFFF >> (32 - cnt)) << shft
+            temp = temp & (0xFFFFFFFF - mask)
+            base = base + 3
+        } else { if opc == ATOM_IIO_SET {
+            uint8 cnt_b = 0; unsafe { *((image + base + 1) as uint8) -> cnt_b }
+            uint8 shft_b = 0; unsafe { *((image + base + 2) as uint8) -> shft_b }
+            uint64 cnt = cnt_b; uint64 shft = shft_b
+            uint64 mask = (0xFFFFFFFF >> (32 - cnt)) << shft
+            temp = temp | mask
+            base = base + 3
+        } else { if opc == ATOM_IIO_MOVE_INDEX {
+            uint8 cnt_b = 0;  unsafe { *((image + base + 1) as uint8) -> cnt_b }
+            uint8 src_b = 0;  unsafe { *((image + base + 2) as uint8) -> src_b }
+            uint8 dst_b = 0;  unsafe { *((image + base + 3) as uint8) -> dst_b }
+            uint64 cnt = cnt_b; uint64 src = src_b; uint64 dst = dst_b
+            uint64 mask = (0xFFFFFFFF >> (32 - cnt)) << dst
+            temp = temp & (0xFFFFFFFF - mask)
+            temp = temp | (((idx >> src) & (0xFFFFFFFF >> (32 - cnt))) << dst)
+            base = base + 4
+        } else { if opc == ATOM_IIO_MOVE_DATA {
+            uint8 cnt_b = 0;  unsafe { *((image + base + 1) as uint8) -> cnt_b }
+            uint8 src_b = 0;  unsafe { *((image + base + 2) as uint8) -> src_b }
+            uint8 dst_b = 0;  unsafe { *((image + base + 3) as uint8) -> dst_b }
+            uint64 cnt = cnt_b; uint64 src = src_b; uint64 dst = dst_b
+            uint64 mask = (0xFFFFFFFF >> (32 - cnt)) << dst
+            temp = temp & (0xFFFFFFFF - mask)
+            temp = temp | (((data >> src) & (0xFFFFFFFF >> (32 - cnt))) << dst)
+            base = base + 4
+        } else { if opc == ATOM_IIO_MOVE_ATTR {
+            uint8 cnt_b = 0;  unsafe { *((image + base + 1) as uint8) -> cnt_b }
+            uint8 src_b = 0;  unsafe { *((image + base + 2) as uint8) -> src_b }
+            uint8 dst_b = 0;  unsafe { *((image + base + 3) as uint8) -> dst_b }
+            uint64 cnt = cnt_b; uint64 src = src_b; uint64 dst = dst_b
+            uint64 io_attr = 0; unsafe { *((ctx + AC_OFF_IO_ATTR) as uint32) -> io_attr }
+            uint64 mask = (0xFFFFFFFF >> (32 - cnt)) << dst
+            temp = temp & (0xFFFFFFFF - mask)
+            temp = temp | (((io_attr >> src) & (0xFFFFFFFF >> (32 - cnt))) << dst)
+            base = base + 4
+        } else { if opc == ATOM_IIO_END {
+            done = 1
+        } else {
+            // Unknown IIO opcode — return 0.
+            return 0
+        } } } } } } } } }
+    }
+    return temp
+}
+
+// ---------------------------------------------------------------------
+// atom_get_src_int — ports atom.c:182-371.
+// ectx         — atom_exec_context*
+// attr         — attr byte (arg in [2:0], align in [5:3])
+// ptr_ptr      — pointer to the bytecode offset (in/out, uint64*)
+// saved_out    — if non-zero, receives the raw (pre-mask/shift) value
+// Returns the masked+shifted src value.
+// ---------------------------------------------------------------------
+fn _atom_get_src_int(uint64 ectx, uint64 attr, uint64 ptr_ptr, uint64 saved_out) -> uint64 {
+    uint64 arg   = attr & 7
+    uint64 align = (attr >> 3) & 7
+    uint64 ctx   = 0; unsafe { *((ectx + AEC_OFF_CTX) as uint64) -> ctx }
+    uint64 image = 0; unsafe { *((ctx + AC_OFF_IMAGE_BUF) as uint64) -> image }
+    uint64 cur   = 0; unsafe { *(ptr_ptr as uint64) -> cur }
+    uint64 val   = 0xCDCDCDCD
+
+    if arg == ATOM_ARG_REG {
+        uint16 reg_w = 0; unsafe { *((image + cur) as uint16) -> reg_w }
+        uint64 idx = reg_w
+        unsafe { *(ptr_ptr as uint64) = cur + 2 }
+        uint64 reg_block = 0; unsafe { *((ctx + AC_OFF_REG_BLOCK) as uint64) -> reg_block }
+        idx = idx + reg_block
+        uint64 io_mode = 0; unsafe { *((ctx + AC_OFF_IO_MODE) as uint64) -> io_mode }
+        if io_mode == ATOM_IO_MM {
+            val = _atom_reg_read(ctx, idx)
+        } else { if io_mode == ATOM_IO_PCI {
+            return 0
+        } else { if io_mode == ATOM_IO_SYSIO {
+            return 0
+        } else {
+            // indirect I/O
+            if (io_mode & 0x80) == 0 { return 0 }
+            uint64 iio_slots = 0; unsafe { *((ctx + AC_OFF_IIO_SLOTS) as uint64) -> iio_slots }
+            if iio_slots == 0 { return 0 }
+            uint64 slot = io_mode & 0x7F
+            uint16 iio_off_w = 0; unsafe { *((iio_slots + slot * 2) as uint16) -> iio_off_w }
+            uint64 iio_off = iio_off_w
+            if iio_off == 0 { return 0 }
+            val = _atom_iio_execute(ctx, iio_off, idx, 0)
+        } } }
+    } else { if arg == ATOM_ARG_PS {
+        uint8 idx_b = 0; unsafe { *((image + cur) as uint8) -> idx_b }
+        uint64 idx = idx_b
+        unsafe { *(ptr_ptr as uint64) = cur + 1 }
+        uint32 ps_size_r = 0; unsafe { *((ectx + AEC_OFF_PS_SIZE) as uint32) -> ps_size_r }
+        uint64 ps_size = ps_size_r
+        if idx < ps_size {
+            uint64 ps = 0; unsafe { *((ectx + AEC_OFF_PS) as uint64) -> ps }
+            uint32 v = 0; unsafe { *((ps + idx * 4) as uint32) -> v }
+            val = v
+        }
+        // else: val stays 0xCDCDCDCD but we still apply mask below
+    } else { if arg == ATOM_ARG_WS {
+        uint8 idx_b = 0; unsafe { *((image + cur) as uint8) -> idx_b }
+        uint64 idx = idx_b
+        unsafe { *(ptr_ptr as uint64) = cur + 1 }
+        if idx == ATOM_WS_QUOTIENT {
+            uint32 v = 0; unsafe { *((ctx + AC_OFF_DIVMUL_Q) as uint32) -> v }; val = v
+        } else { if idx == ATOM_WS_REMAINDER {
+            uint32 v = 0; unsafe { *((ctx + AC_OFF_DIVMUL_R) as uint32) -> v }; val = v
+        } else { if idx == ATOM_WS_DATAPTR {
+            uint64 v = 0; unsafe { *((ctx + AC_OFF_DATA_BLOCK) as uint64) -> v }; val = v
+        } else { if idx == ATOM_WS_SHIFT {
+            uint32 v = 0; unsafe { *((ctx + AC_OFF_SHIFT) as uint32) -> v }; val = v
+        } else { if idx == ATOM_WS_OR_MASK {
+            uint32 sh = 0; unsafe { *((ctx + AC_OFF_SHIFT) as uint32) -> sh }
+            val = 1 << sh
+        } else { if idx == ATOM_WS_AND_MASK {
+            uint32 sh = 0; unsafe { *((ctx + AC_OFF_SHIFT) as uint32) -> sh }
+            val = 0xFFFFFFFF - (1 << sh)
+        } else { if idx == ATOM_WS_FB_WINDOW {
+            uint64 v = 0; unsafe { *((ctx + AC_OFF_FB_BASE) as uint64) -> v }; val = v
+        } else { if idx == ATOM_WS_ATTRIBUTES {
+            uint32 v = 0; unsafe { *((ctx + AC_OFF_IO_ATTR) as uint32) -> v }; val = v
+        } else { if idx == ATOM_WS_REGPTR {
+            uint64 v = 0; unsafe { *((ctx + AC_OFF_REG_BLOCK) as uint64) -> v }; val = v
+        } else {
+            uint32 ws_size_r = 0; unsafe { *((ectx + AEC_OFF_WS_SIZE) as uint32) -> ws_size_r }
+            uint64 ws_size = ws_size_r
+            if idx < ws_size {
+                uint64 ws = 0; unsafe { *((ectx + AEC_OFF_WS) as uint64) -> ws }
+                uint32 v = 0; unsafe { *((ws + idx * 4) as uint32) -> v }
+                val = v
+            }
+        } } } } } } } } }
+    } else { if arg == ATOM_ARG_ID {
+        uint16 id_w = 0; unsafe { *((image + cur) as uint16) -> id_w }
+        uint64 idx = id_w
+        unsafe { *(ptr_ptr as uint64) = cur + 2 }
+        uint64 data_block = 0; unsafe { *((ctx + AC_OFF_DATA_BLOCK) as uint64) -> data_block }
+        uint32 v = 0; unsafe { *((image + idx + data_block) as uint32) -> v }
+        val = v
+    } else { if arg == ATOM_ARG_FB {
+        uint8 idx_b = 0; unsafe { *((image + cur) as uint8) -> idx_b }
+        uint64 idx = idx_b
+        unsafe { *(ptr_ptr as uint64) = cur + 1 }
+        uint64 fb_base = 0; unsafe { *((ctx + AC_OFF_FB_BASE) as uint64) -> fb_base }
+        uint64 scratch_size = 0; unsafe { *((ctx + AC_OFF_SCRATCH_SIZE) as uint64) -> scratch_size }
+        if (fb_base + idx * 4) > scratch_size {
+            val = 0
+        } else {
+            uint64 scratch = 0; unsafe { *((ctx + AC_OFF_SCRATCH) as uint64) -> scratch }
+            uint32 v = 0; unsafe { *((scratch + (fb_base / 4) * 4 + idx * 4) as uint32) -> v }
+            val = v
+        }
+    } else { if arg == ATOM_ARG_IMM {
+        // IMM — does NOT apply mask/shift; return directly.
+        if align == ATOM_SRC_DWORD {
+            uint32 v = 0; unsafe { *((image + cur) as uint32) -> v }
+            unsafe { *(ptr_ptr as uint64) = cur + 4 }
+            return v
+        } else { if align == ATOM_SRC_WORD0 {
+            uint16 v = 0; unsafe { *((image + cur) as uint16) -> v }
+            unsafe { *(ptr_ptr as uint64) = cur + 2 }
+            uint64 r = v; return r
+        } else { if align == ATOM_SRC_WORD8 {
+            uint16 v = 0; unsafe { *((image + cur) as uint16) -> v }
+            unsafe { *(ptr_ptr as uint64) = cur + 2 }
+            uint64 r = v; return r
+        } else { if align == ATOM_SRC_WORD16 {
+            uint16 v = 0; unsafe { *((image + cur) as uint16) -> v }
+            unsafe { *(ptr_ptr as uint64) = cur + 2 }
+            uint64 r = v; return r
+        } else { if align == ATOM_SRC_BYTE0 {
+            uint8 v = 0; unsafe { *((image + cur) as uint8) -> v }
+            unsafe { *(ptr_ptr as uint64) = cur + 1 }
+            uint64 r = v; return r
+        } else { if align == ATOM_SRC_BYTE8 {
+            uint8 v = 0; unsafe { *((image + cur) as uint8) -> v }
+            unsafe { *(ptr_ptr as uint64) = cur + 1 }
+            uint64 r = v; return r
+        } else { if align == ATOM_SRC_BYTE16 {
+            uint8 v = 0; unsafe { *((image + cur) as uint8) -> v }
+            unsafe { *(ptr_ptr as uint64) = cur + 1 }
+            uint64 r = v; return r
+        } else { if align == ATOM_SRC_BYTE24 {
+            uint8 v = 0; unsafe { *((image + cur) as uint8) -> v }
+            unsafe { *(ptr_ptr as uint64) = cur + 1 }
+            uint64 r = v; return r
+        } } } } } } } }
+        return 0
+    } else { if arg == ATOM_ARG_PLL {
+        uint8 idx_b = 0; unsafe { *((image + cur) as uint8) -> idx_b }
+        uint64 idx = idx_b
+        unsafe { *(ptr_ptr as uint64) = cur + 1 }
+        val = _atom_pll_read(ctx, idx)
+    } else { if arg == ATOM_ARG_MC {
+        uint8 idx_b = 0; unsafe { *((image + cur) as uint8) -> idx_b }
+        uint64 idx = idx_b
+        unsafe { *(ptr_ptr as uint64) = cur + 1 }
+        val = _atom_mc_read(ctx, idx)
+    } } } } } } } }
+
+    // Store raw value (before mask/shift) into saved_out if requested.
+    if saved_out != 0 {
+        unsafe { *(saved_out as uint64) = val }
+    }
+    // Apply alignment mask and shift.
+    val = val & _atom_arg_mask(align)
+    val = val >> _atom_arg_shift(align)
+    return val
+}
+
+// ---------------------------------------------------------------------
+// atom_skip_src_int — ports atom.c:373-406.
+// Advances ptr_ptr over the operand bytes without reading the value.
+// ---------------------------------------------------------------------
+fn _atom_skip_src_int(uint64 ectx, uint64 attr, uint64 ptr_ptr) {
+    uint64 arg   = attr & 7
+    uint64 align = (attr >> 3) & 7
+    uint64 cur   = 0; unsafe { *(ptr_ptr as uint64) -> cur }
+
+    if arg == ATOM_ARG_REG {
+        unsafe { *(ptr_ptr as uint64) = cur + 2 }
+    } else { if arg == ATOM_ARG_ID {
+        unsafe { *(ptr_ptr as uint64) = cur + 2 }
+    } else { if arg == ATOM_ARG_PLL {
+        unsafe { *(ptr_ptr as uint64) = cur + 1 }
+    } else { if arg == ATOM_ARG_MC {
+        unsafe { *(ptr_ptr as uint64) = cur + 1 }
+    } else { if arg == ATOM_ARG_PS {
+        unsafe { *(ptr_ptr as uint64) = cur + 1 }
+    } else { if arg == ATOM_ARG_WS {
+        unsafe { *(ptr_ptr as uint64) = cur + 1 }
+    } else { if arg == ATOM_ARG_FB {
+        unsafe { *(ptr_ptr as uint64) = cur + 1 }
+    } else { if arg == ATOM_ARG_IMM {
+        if align == ATOM_SRC_DWORD {
+            unsafe { *(ptr_ptr as uint64) = cur + 4 }
+        } else { if align == ATOM_SRC_WORD0 {
+            unsafe { *(ptr_ptr as uint64) = cur + 2 }
+        } else { if align == ATOM_SRC_WORD8 {
+            unsafe { *(ptr_ptr as uint64) = cur + 2 }
+        } else { if align == ATOM_SRC_WORD16 {
+            unsafe { *(ptr_ptr as uint64) = cur + 2 }
+        } else { if align == ATOM_SRC_BYTE0 {
+            unsafe { *(ptr_ptr as uint64) = cur + 1 }
+        } else { if align == ATOM_SRC_BYTE8 {
+            unsafe { *(ptr_ptr as uint64) = cur + 1 }
+        } else { if align == ATOM_SRC_BYTE16 {
+            unsafe { *(ptr_ptr as uint64) = cur + 1 }
+        } else { if align == ATOM_SRC_BYTE24 {
+            unsafe { *(ptr_ptr as uint64) = cur + 1 }
+        } } } } } } } }
+    } } } } } } } }
+}
+
+// ---------------------------------------------------------------------
+// atom_get_src — thin wrapper, ports atom.c:408-411.
+// ---------------------------------------------------------------------
+fn _atom_get_src(uint64 ectx, uint64 attr, uint64 ptr_ptr) -> uint64 {
+    return _atom_get_src_int(ectx, attr, ptr_ptr, 0)
+}
+
+// ---------------------------------------------------------------------
+// atom_get_src_direct — ports atom.c:413-437.
+// Read a raw value from the bytecode using the given alignment, without
+// any arg-type dispatch (used for immediates embedded in non-IMM ops).
+// ---------------------------------------------------------------------
+fn _atom_get_src_direct(uint64 ectx, uint64 align, uint64 ptr_ptr) -> uint64 {
+    uint64 ctx   = 0; unsafe { *((ectx + AEC_OFF_CTX) as uint64) -> ctx }
+    uint64 image = 0; unsafe { *((ctx + AC_OFF_IMAGE_BUF) as uint64) -> image }
+    uint64 cur   = 0; unsafe { *(ptr_ptr as uint64) -> cur }
+    uint64 val   = 0xCDCDCDCD
+    if align == ATOM_SRC_DWORD {
+        uint32 v = 0; unsafe { *((image + cur) as uint32) -> v }
+        val = v; unsafe { *(ptr_ptr as uint64) = cur + 4 }
+    } else { if align == ATOM_SRC_WORD0 {
+        uint16 v = 0; unsafe { *((image + cur) as uint16) -> v }
+        val = v; unsafe { *(ptr_ptr as uint64) = cur + 2 }
+    } else { if align == ATOM_SRC_WORD8 {
+        uint16 v = 0; unsafe { *((image + cur) as uint16) -> v }
+        val = v; unsafe { *(ptr_ptr as uint64) = cur + 2 }
+    } else { if align == ATOM_SRC_WORD16 {
+        uint16 v = 0; unsafe { *((image + cur) as uint16) -> v }
+        val = v; unsafe { *(ptr_ptr as uint64) = cur + 2 }
+    } else { if align == ATOM_SRC_BYTE0 {
+        uint8 v = 0; unsafe { *((image + cur) as uint8) -> v }
+        val = v; unsafe { *(ptr_ptr as uint64) = cur + 1 }
+    } else { if align == ATOM_SRC_BYTE8 {
+        uint8 v = 0; unsafe { *((image + cur) as uint8) -> v }
+        val = v; unsafe { *(ptr_ptr as uint64) = cur + 1 }
+    } else { if align == ATOM_SRC_BYTE16 {
+        uint8 v = 0; unsafe { *((image + cur) as uint8) -> v }
+        val = v; unsafe { *(ptr_ptr as uint64) = cur + 1 }
+    } else { if align == ATOM_SRC_BYTE24 {
+        uint8 v = 0; unsafe { *((image + cur) as uint8) -> v }
+        val = v; unsafe { *(ptr_ptr as uint64) = cur + 1 }
+    } } } } } } } }
+    return val
+}
+
+// ---------------------------------------------------------------------
+// atom_get_dst — thin wrapper, ports atom.c:439-446.
+// Translates the dst-alignment field to its src-alignment equivalent
+// and then calls _atom_get_src_int.
+// ---------------------------------------------------------------------
+fn _atom_get_dst(uint64 ectx, uint64 arg, uint64 attr, uint64 ptr_ptr, uint64 saved_out) -> uint64 {
+    uint64 src_align = _atom_dst_to_src((attr >> 3) & 7, (attr >> 6) & 3)
+    uint64 new_attr  = arg | (src_align << 3)
+    return _atom_get_src_int(ectx, new_attr, ptr_ptr, saved_out)
+}
+
+// ---------------------------------------------------------------------
+// atom_skip_dst — ports atom.c:448-453.
+// ---------------------------------------------------------------------
+fn _atom_skip_dst(uint64 ectx, uint64 arg, uint64 attr, uint64 ptr_ptr) {
+    uint64 src_align = _atom_dst_to_src((attr >> 3) & 7, (attr >> 6) & 3)
+    uint64 new_attr  = arg | (src_align << 3)
+    _atom_skip_src_int(ectx, new_attr, ptr_ptr)
+}
+
+// ---------------------------------------------------------------------
+// atom_put_dst — ports atom.c:455-596.
+// Writes val into the destination operand, merging with saved under
+// the alignment mask.
+// ectx      — atom_exec_context*
+// arg       — ATOM_ARG_* destination type
+// attr      — full attr byte
+// ptr_ptr   — in/out bytecode pointer
+// val       — value to write (sub-field only, before shift)
+// saved     — original word read from the destination (raw, unmasked)
+// ---------------------------------------------------------------------
+fn _atom_put_dst(uint64 ectx, uint64 arg, uint64 attr, uint64 ptr_ptr, uint64 val, uint64 saved) {
+    uint64 align = _atom_dst_to_src((attr >> 3) & 7, (attr >> 6) & 3)
+    uint64 ctx   = 0; unsafe { *((ectx + AEC_OFF_CTX) as uint64) -> ctx }
+    uint64 image = 0; unsafe { *((ctx + AC_OFF_IMAGE_BUF) as uint64) -> image }
+    uint64 cur   = 0; unsafe { *(ptr_ptr as uint64) -> cur }
+
+    // old_val = val & (mask >> shift) — track sub-field width for debug
+    // (we ignore old_val here since we don't print debug; left for symmetry)
+    // val <<= shift; val &= mask; saved &= ~mask; val |= saved
+    uint64 mask  = _atom_arg_mask(align)
+    uint64 shift = _atom_arg_shift(align)
+    val  = val << shift
+    val  = val & mask
+    saved = saved & (0xFFFFFFFF - mask)
+    val  = val | saved
+
+    if arg == ATOM_ARG_REG {
+        uint16 reg_w = 0; unsafe { *((image + cur) as uint16) -> reg_w }
+        uint64 idx = reg_w
+        unsafe { *(ptr_ptr as uint64) = cur + 2 }
+        uint64 reg_block = 0; unsafe { *((ctx + AC_OFF_REG_BLOCK) as uint64) -> reg_block }
+        idx = idx + reg_block
+        uint64 io_mode = 0; unsafe { *((ctx + AC_OFF_IO_MODE) as uint64) -> io_mode }
+        if io_mode == ATOM_IO_MM {
+            if idx == 0 {
+                _atom_reg_write(ctx, idx, val << 2)
+            } else {
+                _atom_reg_write(ctx, idx, val)
+            }
+        } else { if io_mode == ATOM_IO_PCI {
+            return
+        } else { if io_mode == ATOM_IO_SYSIO {
+            return
+        } else {
+            if (io_mode & 0x80) == 0 { return }
+            uint64 iio_slots = 0; unsafe { *((ctx + AC_OFF_IIO_SLOTS) as uint64) -> iio_slots }
+            if iio_slots == 0 { return }
+            uint64 slot = io_mode & 0xFF
+            uint16 iio_off_w = 0; unsafe { *((iio_slots + slot * 2) as uint16) -> iio_off_w }
+            uint64 iio_off = iio_off_w
+            if iio_off == 0 { return }
+            _atom_iio_execute(ctx, iio_off, idx, val)
+        } } }
+    } else { if arg == ATOM_ARG_PS {
+        uint8 idx_b = 0; unsafe { *((image + cur) as uint8) -> idx_b }
+        uint64 idx = idx_b
+        unsafe { *(ptr_ptr as uint64) = cur + 1 }
+        uint32 ps_size_r = 0; unsafe { *((ectx + AEC_OFF_PS_SIZE) as uint32) -> ps_size_r }
+        uint64 ps_size = ps_size_r
+        if idx < ps_size {
+            uint64 ps = 0; unsafe { *((ectx + AEC_OFF_PS) as uint64) -> ps }
+            uint32 wv = val; unsafe { *((ps + idx * 4) as uint32) = wv }
+        }
+    } else { if arg == ATOM_ARG_WS {
+        uint8 idx_b = 0; unsafe { *((image + cur) as uint8) -> idx_b }
+        uint64 idx = idx_b
+        unsafe { *(ptr_ptr as uint64) = cur + 1 }
+        if idx == ATOM_WS_QUOTIENT {
+            uint32 wv = val; unsafe { *((ctx + AC_OFF_DIVMUL_Q) as uint32) = wv }
+        } else { if idx == ATOM_WS_REMAINDER {
+            uint32 wv = val; unsafe { *((ctx + AC_OFF_DIVMUL_R) as uint32) = wv }
+        } else { if idx == ATOM_WS_DATAPTR {
+            unsafe { *((ctx + AC_OFF_DATA_BLOCK) as uint64) = val }
+        } else { if idx == ATOM_WS_SHIFT {
+            uint32 wv = val; unsafe { *((ctx + AC_OFF_SHIFT) as uint32) = wv }
+        } else { if idx == ATOM_WS_OR_MASK {
+            // read-only slot: no-op
+        } else { if idx == ATOM_WS_AND_MASK {
+            // read-only slot: no-op
+        } else { if idx == ATOM_WS_FB_WINDOW {
+            unsafe { *((ctx + AC_OFF_FB_BASE) as uint64) = val }
+        } else { if idx == ATOM_WS_ATTRIBUTES {
+            uint32 wv = val; unsafe { *((ctx + AC_OFF_IO_ATTR) as uint32) = wv }
+        } else { if idx == ATOM_WS_REGPTR {
+            unsafe { *((ctx + AC_OFF_REG_BLOCK) as uint64) = val }
+        } else {
+            uint32 ws_size_r = 0; unsafe { *((ectx + AEC_OFF_WS_SIZE) as uint32) -> ws_size_r }
+            uint64 ws_size = ws_size_r
+            if idx < ws_size {
+                uint64 ws = 0; unsafe { *((ectx + AEC_OFF_WS) as uint64) -> ws }
+                uint32 wv = val; unsafe { *((ws + idx * 4) as uint32) = wv }
+            }
+        } } } } } } } } }
+    } else { if arg == ATOM_ARG_FB {
+        uint8 idx_b = 0; unsafe { *((image + cur) as uint8) -> idx_b }
+        uint64 idx = idx_b
+        unsafe { *(ptr_ptr as uint64) = cur + 1 }
+        uint64 fb_base = 0; unsafe { *((ctx + AC_OFF_FB_BASE) as uint64) -> fb_base }
+        uint64 scratch_size = 0; unsafe { *((ctx + AC_OFF_SCRATCH_SIZE) as uint64) -> scratch_size }
+        if (fb_base + idx * 4) <= scratch_size {
+            uint64 scratch = 0; unsafe { *((ctx + AC_OFF_SCRATCH) as uint64) -> scratch }
+            uint32 wv = val; unsafe { *((scratch + (fb_base / 4) * 4 + idx * 4) as uint32) = wv }
+        }
+    } else { if arg == ATOM_ARG_PLL {
+        uint8 idx_b = 0; unsafe { *((image + cur) as uint8) -> idx_b }
+        uint64 idx = idx_b
+        unsafe { *(ptr_ptr as uint64) = cur + 1 }
+        _atom_pll_write(ctx, idx, val)
+    } else { if arg == ATOM_ARG_MC {
+        uint8 idx_b = 0; unsafe { *((image + cur) as uint8) -> idx_b }
+        uint64 idx = idx_b
+        unsafe { *(ptr_ptr as uint64) = cur + 1 }
+        _atom_mc_write(ctx, idx, val)
+    } } } } } }
+    // Note: the C code falls through to the debug-print switch after all arg
+    // cases except ATOM_ARG_MC (which has an early return). We have no debug
+    // output so there's nothing extra to do here.
 }
