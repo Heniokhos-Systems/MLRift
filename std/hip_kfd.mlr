@@ -112,7 +112,9 @@ static uint64 _hipkfd_phase2a_q            = 0  // PM4 queue handle
 static uint64 _hipkfd_phase2a_pkt          = 0  // 512-byte scratch packet buf
 static uint64 _hipkfd_phase2a_sentinel     = 0  // 8-byte host-visible sentinel
 static uint64 _hipkfd_phase2a_sentinel_h   = 0  // its host pointer
-static uint32 _hipkfd_phase2a_sentinel_ctr = 0  // sentinel value counter
+static uint32 _hipkfd_phase2a_sentinel_ctr = 0  // sentinel value counter (incremented per launch)
+static uint32 _hipkfd_phase2a_last_ctr     = 0  // counter value of the most recently submitted launch
+                                                // (0 ⇒ no launches in flight; sync no-ops)
 // Stored as new_wp (one past the last-written slot).  Zero ⇒ nothing
 // pending; non-zero ⇒ doorbell value to ring is `_hipkfd_chain_pending_wp - 1`.
 // Avoids the slot-0 sentinel collision on the very first deferred launch.
@@ -1103,12 +1105,32 @@ fn hipDeviceSynchronize() -> uint32 {
     // not retiring our queue).  Returning 0 lets the launcher continue
     // and exit; teardown will skip REMOVE_QUEUE.
     if kfd_wedge_seen() != 0 { return 0 }
-    // PHASE2A: each launch already busy-polls the per-launch sentinel
-    // synchronously before returning, so there is nothing left to wait
-    // on. The AQL signal (`_hipkfd_signal_h + 0x08`) is not advanced by
-    // PM4 dispatches, so without this short-circuit the AQL-style wait
-    // below would hit its 5 s wedge timeout on every sync.
-    if _hipkfd_phase2a_mode != 0 { return 0 }
+    // PHASE2A: drain in-flight async launches by polling the sentinel
+    // for the most recently submitted counter value. CP processes the
+    // PM4 ring in-order, so when sentinel == last_ctr every earlier
+    // launch's RELEASE_MEM has also fired. The AQL signal path below
+    // is intentionally skipped — it is never advanced under PHASE2A and
+    // would hit a 5 s wedge timeout instead of completing.
+    if _hipkfd_phase2a_mode != 0 {
+        if _hipkfd_phase2a_last_ctr == 0 { return 0 }
+        uint64 t0_p2as = time_now()
+        uint32 target  = _hipkfd_phase2a_last_ctr
+        uint32 s2 = 0
+        uint64 spin2 = 0
+        while 1 == 1 {
+            unsafe { *(_hipkfd_phase2a_sentinel_h as uint32) -> s2 }
+            if s2 == target { break }
+            spin2 = spin2 + 1
+            if (spin2 & 0xFFFFF) == 0 {
+                uint64 dt = time_now() - t0_p2as
+                if dt > 15000000000 {
+                    _kfd_wedge_mark("hipDeviceSynchronize PHASE2A timeout", target, s2, dt / 1000000)
+                    return 0
+                }
+            }
+        }
+        return 0
+    }
 
     // Chain mode: ring the doorbell now for the most recently queued
     // packet.  CP processes the entire batch (slots up to and including
@@ -1608,24 +1630,13 @@ fn hipModuleLaunchKernel(
             kfd_die("hipModuleLaunchKernel: pm4_submit_dispatch back-pressure timeout", 0)
         }
 
-        // Busy-poll the sentinel.  15 s budget — wedge gate catches
-        // hangs at the firmware level; non-wedge waits are < 1 ms.
-        uint64 timeout_ns_p2a = 15000000000
-        uint64 t0_p2a = time_now()
-        uint32 s_val = 0
-        uint64 spin = 0
-        while 1 == 1 {
-            unsafe { *(_hipkfd_phase2a_sentinel_h as uint32) -> s_val }
-            if s_val == sentinel_value { break }
-            spin = spin + 1
-            if (spin & 0xFFFFF) == 0 {
-                uint64 dt = time_now() - t0_p2a
-                if dt > timeout_ns_p2a {
-                    kfd_die("hipModuleLaunchKernel: phase2a sentinel timeout", sentinel_value)
-                }
-            }
-        }
-
+        // Async: record the just-submitted counter value and return.
+        // hipDeviceSynchronize will drain by polling the sentinel for
+        // this value (or any later value if subsequent launches added).
+        // CP processes packet streams in order, so sentinel writes are
+        // monotonic — waiting for the last counter implies all earlier
+        // launches have also completed.
+        _hipkfd_phase2a_last_ctr = sentinel_value
         _hipkfd_launch_count = _hipkfd_launch_count + 1
         return 0
     }
