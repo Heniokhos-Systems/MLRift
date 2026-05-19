@@ -1,0 +1,120 @@
+// Phase 3 slice γ.2 B.4 — byte-comparison against known-good zstdcat output.
+//
+// Decompresses /lib/firmware/amdgpu/gc_11_0_3_pfp.bin.zst via MLRift
+// and verifies the output matches /tmp/mlrift_fw/gc_11_0_3_pfp.bin
+// byte-for-byte. If green, MLRift's zstd implementation is correct
+// for this firmware blob.
+
+import "../std/zstd.mlr"
+import "../std/sys.mlr"
+
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn puts(uint64 s) -> uint32
+
+fn _print_dec(uint64 lab, uint64 lab_len, uint64 val) {
+    uint64 buf = alloc(64)
+    uint64 i = 0
+    while i < lab_len {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((buf + i) as uint8) = c }
+        i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((buf + lab_len) as uint8) = eq }
+    uint64 digits = 0
+    if val == 0 {
+        uint8 z = 48; unsafe { *((buf + lab_len + 1) as uint8) = z }; digits = 1
+    } else {
+        uint64 t = val
+        while t > 0 { digits = digits + 1; t = t / 10 }
+        uint64 k = digits
+        t = val
+        while k > 0 {
+            k = k - 1
+            uint64 d = t - (t / 10) * 10
+            uint8 db = d + 48
+            unsafe { *((buf + lab_len + 1 + k) as uint8) = db }
+            t = t / 10
+        }
+    }
+    uint8 nul = 0; unsafe { *((buf + lab_len + 1 + digits) as uint8) = nul }
+    puts(buf)
+    dealloc(buf)
+}
+
+fn _load_file(uint64 path, uint64 out_buf_ptr, uint64 out_size_ptr) -> uint64 {
+    uint64 fd = sys_open(path, 0, 0)
+    if fd > 0xFFFFFFFFFFFFF000 { return 1 }
+    uint64 size = syscall_raw(8, fd, 0, 2, 0, 0, 0)
+    if size > 0xFFFFFFFFFFFFF000 { sys_close(fd); return 2 }
+    syscall_raw(8, fd, 0, 0, 0, 0, 0)
+    uint64 buf = alloc(size)
+    uint64 nread = syscall_raw(0, fd, buf, size, 0, 0, 0)
+    sys_close(fd)
+    if nread != size { dealloc(buf); return 3 }
+    unsafe { *(out_buf_ptr  as uint64) = buf }
+    unsafe { *(out_size_ptr as uint64) = size }
+    return 0
+}
+
+fn main() {
+    puts("=== zstd decompress + byte-compare ===")
+
+    // Load compressed PFP
+    uint64 cb_p = alloc(8); unsafe { *(cb_p as uint64) = 0 }
+    uint64 cs_p = alloc(8); unsafe { *(cs_p as uint64) = 0 }
+    if _load_file("/lib/firmware/amdgpu/gc_11_0_3_pfp.bin.zst", cb_p, cs_p) != 0 {
+        puts("FAIL: load compressed"); exit(1)
+    }
+    uint64 cbuf = 0; unsafe { *(cb_p as uint64) -> cbuf }
+    uint64 csz  = 0; unsafe { *(cs_p as uint64) -> csz }
+    _print_dec("compressed_size", 15, csz)
+
+    // Load known-good decompressed
+    uint64 ref_p = alloc(8); unsafe { *(ref_p as uint64) = 0 }
+    uint64 rs_p  = alloc(8); unsafe { *(rs_p as uint64) = 0 }
+    if _load_file("/tmp/mlrift_fw/gc_11_0_3_pfp.bin", ref_p, rs_p) != 0 {
+        puts("FAIL: load reference"); exit(1)
+    }
+    uint64 rbuf = 0; unsafe { *(ref_p as uint64) -> rbuf }
+    uint64 rsz  = 0; unsafe { *(rs_p as uint64) -> rsz }
+    _print_dec("reference_size", 14, rsz)
+
+    // Decompress via MLRift
+    uint64 outcap = rsz + 4096
+    uint64 outbuf = alloc(outcap)
+    uint64 wp = alloc(8); unsafe { *(wp as uint64) = 0 }
+    uint64 e = zstd_decompress(cbuf, csz, outbuf, outcap, wp)
+    _print_dec("decompress_result", 17, e)
+    uint64 wrote = 0; unsafe { *(wp as uint64) -> wrote }
+    _print_dec("bytes_written",     13, wrote)
+    if e != 0 || wrote != rsz {
+        puts("FAIL: decompress error or size mismatch")
+        exit(2)
+    }
+
+    // Byte-compare
+    uint64 i = 0
+    uint64 mismatches = 0
+    uint64 first_mismatch = 0xFFFFFFFFFFFFFFFF
+    while i < rsz {
+        uint8 a = 0; unsafe { *((outbuf + i) as uint8) -> a }
+        uint8 b = 0; unsafe { *((rbuf   + i) as uint8) -> b }
+        if a != b {
+            if first_mismatch == 0xFFFFFFFFFFFFFFFF { first_mismatch = i }
+            mismatches = mismatches + 1
+        }
+        i = i + 1
+    }
+    if mismatches == 0 {
+        puts("BYTE-EXACT MATCH against zstdcat reference")
+        puts("phase3_zstd_verify_pfp: GREEN")
+    } else {
+        _print_dec("mismatches",      10, mismatches)
+        _print_dec("first_mismatch",  14, first_mismatch)
+        puts("FAIL: decompressed output diverges from reference")
+    }
+
+    dealloc(cbuf); dealloc(rbuf); dealloc(outbuf)
+    dealloc(cb_p); dealloc(cs_p); dealloc(ref_p); dealloc(rs_p); dealloc(wp)
+    exit(0)
+}

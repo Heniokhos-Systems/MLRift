@@ -1,0 +1,294 @@
+// Phase 3 slice γ.2 — unit smoke for the B.2 + B.3a primitives.
+//
+// Validates the building blocks before we wire them into the full
+// decompressor. Each subtest stands alone with hand-computed expected
+// values.
+//
+// What's tested:
+//   1. highest_set_bit on known inputs
+//   2. zstd_read_bits_le on a known byte buffer (forward LE bit reads)
+//   3. zstd_io_rewind_bits — semantics across byte boundaries
+//   4. zstd_stream_read_bits — reverse-direction with underflow handling
+//   5. zstd_huf_init_dtable — bit-lengths [1,1] → 2-symbol table
+//   6. zstd_huf_init_dtable_usingweights — weights [1,1] (=> bit-lengths [1,1])
+//   7. zstd_fse_init_dtable — explicit freqs, check table shape
+//
+// All-PASS = B.2/B.3a primitives are at least surface-correct. Bugs
+// inside the more complex flows (e.g., decompress_1stream's
+// boundary, fse_decode_header's variable-bit reads) need integration
+// tests — those come after B.3b is written.
+
+import "../std/zstd.mlr"
+
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn puts(uint64 s) -> uint32
+
+fn _print_dec(uint64 lab, uint64 lab_len, uint64 val) {
+    uint64 buf = alloc(64)
+    uint64 i = 0
+    while i < lab_len {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((buf + i) as uint8) = c }
+        i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((buf + lab_len) as uint8) = eq }
+    uint64 digits = 0
+    if val == 0 {
+        uint8 z = 48; unsafe { *((buf + lab_len + 1) as uint8) = z }; digits = 1
+    } else {
+        uint64 t = val
+        while t > 0 { digits = digits + 1; t = t / 10 }
+        uint64 k = digits
+        t = val
+        while k > 0 {
+            k = k - 1
+            uint64 d = t - (t / 10) * 10
+            uint8 db = d + 48
+            unsafe { *((buf + lab_len + 1 + k) as uint8) = db }
+            t = t / 10
+        }
+    }
+    uint8 nul = 0; unsafe { *((buf + lab_len + 1 + digits) as uint8) = nul }
+    puts(buf)
+    dealloc(buf)
+}
+
+fn _check_eq(uint64 lab, uint64 lab_len, uint64 got, uint64 want, uint64 fails_ptr) {
+    if got == want {
+        // pass silently
+    } else {
+        _print_dec(lab, lab_len, got)
+        _print_dec("  want", 6, want)
+        uint64 f = 0; unsafe { *(fails_ptr as uint64) -> f }
+        unsafe { *(fails_ptr as uint64) = f + 1 }
+    }
+}
+
+fn main() {
+    uint64 fails = alloc(8)
+    unsafe { *(fails as uint64) = 0 }
+
+    // === Subtest 1: highest_set_bit ===
+    puts("=== T1: highest_set_bit ===")
+    _check_eq("hsb(1)", 6, zstd_highest_set_bit(1), 0, fails)        // 2^0=1
+    _check_eq("hsb(2)", 6, zstd_highest_set_bit(2), 1, fails)        // 2^1=2
+    _check_eq("hsb(7)", 6, zstd_highest_set_bit(7), 2, fails)        // 2^2=4 ≤ 7
+    _check_eq("hsb(8)", 6, zstd_highest_set_bit(8), 3, fails)
+    _check_eq("hsb(255)", 8, zstd_highest_set_bit(255), 7, fails)
+    _check_eq("hsb(256)", 8, zstd_highest_set_bit(256), 8, fails)
+
+    // === Subtest 2: zstd_read_bits_le ===
+    // Bytes [0xAB, 0xCD] = LE bits ...11001101 10101011
+    // (bit 0 of byte 0 is LSB = 1; bit 7 of byte 0 is MSB = 1).
+    puts("=== T2: read_bits_le ===")
+    uint64 b = alloc(2)
+    uint8 b0 = 0xAB; unsafe { *((b + 0) as uint8) = b0 }
+    uint8 b1 = 0xCD; unsafe { *((b + 1) as uint8) = b1 }
+    // 4 bits at offset 0 → low nibble of 0xAB = 0xB
+    _check_eq("read 4 @ 0", 10, zstd_read_bits_le(b, 4, 0), 0xB, fails)
+    // 4 bits at offset 4 → high nibble of 0xAB = 0xA
+    _check_eq("read 4 @ 4", 10, zstd_read_bits_le(b, 4, 4), 0xA, fails)
+    // 8 bits at offset 0 → 0xAB
+    _check_eq("read 8 @ 0", 10, zstd_read_bits_le(b, 8, 0), 0xAB, fails)
+    // 16 bits at offset 0 → 0xCDAB (LE)
+    _check_eq("read 16 @ 0", 11, zstd_read_bits_le(b, 16, 0), 0xCDAB, fails)
+    // 4 bits at offset 8 → low nibble of 0xCD = 0xD
+    _check_eq("read 4 @ 8", 10, zstd_read_bits_le(b, 4, 8), 0xD, fails)
+    // 8 bits at offset 4 → straddle: high nibble of 0xAB + low nibble of 0xCD = 0xDA
+    _check_eq("read 8 @ 4", 10, zstd_read_bits_le(b, 8, 4), 0xDA, fails)
+    dealloc(b)
+
+    // === Subtest 3: io_rewind_bits ===
+    puts("=== T3: io_rewind_bits ===")
+    uint64 in_s = alloc(ZSTD_ISTREAM_SIZE)
+    uint64 src = alloc(8)
+    uint8 sv0 = 0xFF; unsafe { *((src + 0) as uint8) = sv0 }
+    uint8 sv1 = 0x55; unsafe { *((src + 1) as uint8) = sv1 }
+    uint64 vbuf = alloc(8)
+
+    // Read 3 bits, then 5 bits: should consume the first byte exactly.
+    zstd_istream_make(in_s, src, 8)
+    zstd_io_read_bits(in_s, 3, vbuf)
+    _check_eq("after 3-bit read, bit_off", 25, zstd_istream_bitoff(in_s), 3, fails)
+    _check_eq("after 3-bit read, len",     21, zstd_istream_len(in_s),    8, fails)
+    // Rewind 2 bits — bit_off should drop to 1, ptr/len unchanged
+    zstd_io_rewind_bits(in_s, 2)
+    _check_eq("after rewind 2, bit_off",   23, zstd_istream_bitoff(in_s), 1, fails)
+    _check_eq("after rewind 2, len",       19, zstd_istream_len(in_s),    8, fails)
+    // Rewind 4 more bits — now we cross back into previous byte.
+    // We hadn't advanced ptr (full_bytes was 0 for a 3-bit read), so
+    // rewinding 4 from bit_off=1 means: extra = 3, bytes_back = 1.
+    // This will underflow our buffer because we never went past byte 0.
+    // So this is a "doesn't apply" case for us — skip and just rewind
+    // by 1 (well within current byte).
+    zstd_io_rewind_bits(in_s, 1)
+    _check_eq("after rewind 1, bit_off",   23, zstd_istream_bitoff(in_s), 0, fails)
+
+    // === Subtest 4: zstd_stream_read_bits (reverse-direction) ===
+    puts("=== T4: stream_read_bits ===")
+    // Buffer [0x12, 0x80] — last byte's top bit is the end marker
+    // (high bit = bit 7, leaving 0 useful bits in the last byte).
+    // Stream is 1 useful byte: 0x12 = bits 00010010 LE.
+    // start_off = 8 bits (full first byte).
+    // Reading 4 bits should pull the TOP nibble of 0x12 = 0x1.
+    // (Reverse direction: first read takes the high bits.)
+    uint8 srv0 = 0x12; unsafe { *((src + 0) as uint8) = srv0 }
+    uint8 srv1 = 0x80; unsafe { *((src + 1) as uint8) = srv1 }
+    uint64 rs = alloc(ZSTD_RSTATE_SIZE)
+    // For our test, treat src as the 2-byte buffer; padding from last
+    // byte 0x80 is 8 - hsb(0x80) = 8 - 7 = 1. start_off = 16 - 1 = 15.
+    zstd_rstate_make(rs, 15)
+    // First read of 4 bits: from offset 15 down to 11 → bits at byte 1
+    // (high half) + byte 0 high bits. Byte 1 = 0x80 = 10000000, bits
+    // 14..8 = 0000000, bit 8 = 0. Hmm let me re-derive.
+    // The useful payload is the 15 bits below the end marker.
+    // Bits indexed from 0..14 = bit 0 of byte 0 through bit 6 of byte 1.
+    // Reading 4 bits "from the top": offset goes 15 → 11, we read bits
+    // 11..14 from the stream which are byte 1 bits 3..6 = bits 3..6 of
+    // 0x80 = 0000 = 0.
+    uint64 v1 = zstd_stream_read_bits(rs, src, 4)
+    _check_eq("stream read 4 #1",        16, v1, 0, fails)
+    _check_eq("offset after #1",         16, zstd_rstate_offset(rs), 11, fails)
+    // Read 4 more bits: offset 11 → 7, reads bits 7..10. Byte 1 bit 0
+    // (= LSB of 0x80 = 0) is at bit 8 of stream. Byte 0 bit 7 (= MSB
+    // of 0x12 = 0) is at bit 7 of stream. Bits 7..10 = byte 1 bits 0..2
+    // (= 000) and byte 0 bit 7 (= 0) → all zeros = 0.
+    uint64 v2 = zstd_stream_read_bits(rs, src, 4)
+    _check_eq("stream read 4 #2",        16, v2, 0, fails)
+    _check_eq("offset after #2",         16, zstd_rstate_offset(rs), 7, fails)
+    // Read 4 more: offset 7 → 3, reads byte 0 bits 3..6. 0x12 bits 3..6
+    // = bit 3 of 0x12 = 0, bit 4 = 1, bit 5 = 0, bit 6 = 0. Value = 0b0010 = 2.
+    uint64 v3 = zstd_stream_read_bits(rs, src, 4)
+    _check_eq("stream read 4 #3",        16, v3, 2, fails)
+    // Read 4 more: offset 3 → underflow. We can read 3 actual bits
+    // (byte 0 bits 0..2 = 010 = 2), then shift left by underflow=1
+    // → result = 2 << 1 = 4.
+    uint64 v4 = zstd_stream_read_bits(rs, src, 4)
+    _check_eq("stream read 4 #4 (underflow)", 28, v4, 4, fails)
+    _check_eq("underflow after #4",      20, zstd_rstate_underflow(rs), 1, fails)
+
+    dealloc(rs); dealloc(in_s); dealloc(src); dealloc(vbuf)
+
+    // === Subtest 5: huf_init_dtable with bit-lengths [1,1] ===
+    puts("=== T5: huf_init_dtable [1,1] ===")
+    uint64 t = alloc(ZSTD_HUF_DTABLE_SIZE)
+    uint64 z = 0
+    while z < ZSTD_HUF_DTABLE_SIZE { unsafe { *((t + z) as uint8) = 0 }; z = z + 1 }
+    uint64 bits2 = alloc(2)
+    uint8 b00 = 1; unsafe { *((bits2 + 0) as uint8) = b00 }
+    uint8 b01 = 1; unsafe { *((bits2 + 1) as uint8) = b01 }
+    uint64 he = zstd_huf_init_dtable(t, bits2, 2)
+    _check_eq("huf_init_dtable result",     22, he, 0, fails)
+    uint64 mb = 0; unsafe { *((t + ZSTD_HUF_DTABLE_OFF_MAXBITS) as uint64) -> mb }
+    _check_eq("max_bits",                    8, mb, 1, fails)
+    uint64 ts = 0; unsafe { *((t + ZSTD_HUF_DTABLE_OFF_TBLSIZE) as uint64) -> ts }
+    _check_eq("table_size",                 10, ts, 2, fails)
+    // symbols[0] should be 0 (first symbol with bit-length 1)
+    // symbols[1] should be 1
+    uint64 sptr = 0; unsafe { *((t + ZSTD_HUF_DTABLE_OFF_SYMBOLS) as uint64) -> sptr }
+    uint8 s0 = 0; unsafe { *((sptr + 0) as uint8) -> s0 }
+    uint8 s1 = 0; unsafe { *((sptr + 1) as uint8) -> s1 }
+    uint64 s0_u = s0
+    uint64 s1_u = s1
+    _check_eq("symbols[0]",                 10, s0_u, 0, fails)
+    _check_eq("symbols[1]",                 10, s1_u, 1, fails)
+    // num_bits[0] = num_bits[1] = 1
+    uint64 nptr = 0; unsafe { *((t + ZSTD_HUF_DTABLE_OFF_NUMBITS) as uint64) -> nptr }
+    uint8 n0 = 0; unsafe { *((nptr + 0) as uint8) -> n0 }
+    uint8 n1 = 0; unsafe { *((nptr + 1) as uint8) -> n1 }
+    uint64 n0_u = n0
+    uint64 n1_u = n1
+    _check_eq("num_bits[0]",                11, n0_u, 1, fails)
+    _check_eq("num_bits[1]",                11, n1_u, 1, fails)
+    zstd_huf_free(t)
+    dealloc(bits2)
+
+    // === Subtest 6: huf_init_dtable_usingweights ===
+    // Weights [1, 1] — both symbols have weight 1, plus an inferred
+    // last symbol. weight_sum = 2^0 + 2^0 = 2. max_bits = hsb(2) + 1 = 2.
+    // left_over = 4 - 2 = 2; last_weight = hsb(2) + 1 = 2.
+    // bit_lengths: [(2+1-1)=2, (2+1-1)=2, (2+1-2)=1] → 3 symbols.
+    puts("=== T6: huf_init_dtable_usingweights ===")
+    uint64 weights = alloc(2)
+    uint8 w0 = 1; unsafe { *((weights + 0) as uint8) = w0 }
+    uint8 w1 = 1; unsafe { *((weights + 1) as uint8) = w1 }
+    uint64 t2 = alloc(ZSTD_HUF_DTABLE_SIZE)
+    uint64 zz2 = 0
+    while zz2 < ZSTD_HUF_DTABLE_SIZE { unsafe { *((t2 + zz2) as uint8) = 0 }; zz2 = zz2 + 1 }
+    uint64 we = zstd_huf_init_dtable_usingweights(t2, weights, 2)
+    _check_eq("huf_init_usingweights result", 28, we, 0, fails)
+    uint64 mb2 = 0; unsafe { *((t2 + ZSTD_HUF_DTABLE_OFF_MAXBITS) as uint64) -> mb2 }
+    _check_eq("max_bits (weights)",          18, mb2, 2, fails)
+    zstd_huf_free(t2)
+    dealloc(weights)
+
+    // === Subtest 7.5: huf_decompress_1stream end-to-end ===
+    // Build [1,1] table, then decode a hand-crafted 1-byte stream.
+    // With max_bits=1 and num_bits[*]=1, every decoded symbol is just
+    // the next bit (state = bit). So 0xAA = 0b10101010 has end marker
+    // at bit 7 and 7 useful bits "0101010" (read from high to low) →
+    // decoded sequence [0,1,0,1,0,1,0].
+    puts("=== T7.5: huf_decompress_1stream end-to-end ===")
+    uint64 t75 = alloc(ZSTD_HUF_DTABLE_SIZE)
+    uint64 zz75 = 0
+    while zz75 < ZSTD_HUF_DTABLE_SIZE { unsafe { *((t75 + zz75) as uint8) = 0 }; zz75 = zz75 + 1 }
+    uint64 bl = alloc(2)
+    uint8 bl0 = 1; unsafe { *((bl + 0) as uint8) = bl0 }
+    uint8 bl1 = 1; unsafe { *((bl + 1) as uint8) = bl1 }
+    zstd_huf_init_dtable(t75, bl, 2)
+
+    uint64 stream = alloc(1)
+    uint8 sb = 0xAA; unsafe { *((stream + 0) as uint8) = sb }
+    uint64 out_buf = alloc(16)
+    uint64 out_str = alloc(ZSTD_OSTREAM_SIZE)
+    zstd_ostream_make(out_str, out_buf, 16)
+    uint64 nw = zstd_huf_decompress_1stream(t75, out_str, stream, 1)
+    _check_eq("huf_1stream returned",        21, nw, 7, fails)
+    // Check the 7 output bytes
+    uint64 i75 = 0
+    while i75 < 7 {
+        uint8 o = 0; unsafe { *((out_buf + i75) as uint8) -> o }
+        uint64 ou = o
+        uint64 expected = 0
+        if i75 == 0 { expected = 0 }
+        if i75 == 1 { expected = 1 }
+        if i75 == 2 { expected = 0 }
+        if i75 == 3 { expected = 1 }
+        if i75 == 4 { expected = 0 }
+        if i75 == 5 { expected = 1 }
+        if i75 == 6 { expected = 0 }
+        _check_eq("  out[i]", 8, ou, expected, fails)
+        i75 = i75 + 1
+    }
+    zstd_huf_free(t75)
+    dealloc(t75); dealloc(bl); dealloc(stream); dealloc(out_buf); dealloc(out_str)
+
+    // === Subtest 7: fse_init_dtable with predefined LL dist (subset) ===
+    puts("=== T7: fse_init_dtable ===")
+    // Use a tiny synthetic distribution: 3 symbols at accuracy_log=3
+    // (table size 8). freqs = [4, 3, 1] sums to 8.
+    uint64 freqs = alloc(3 * 8)
+    uint64 f0 = 4; unsafe { *((freqs + 0 * 8) as uint64) = f0 }
+    uint64 f1 = 3; unsafe { *((freqs + 1 * 8) as uint64) = f1 }
+    uint64 f2 = 1; unsafe { *((freqs + 2 * 8) as uint64) = f2 }
+    uint64 ft = alloc(ZSTD_FSE_DTABLE_SIZE)
+    uint64 zzz3 = 0
+    while zzz3 < ZSTD_FSE_DTABLE_SIZE { unsafe { *((ft + zzz3) as uint8) = 0 }; zzz3 = zzz3 + 1 }
+    uint64 fe = zstd_fse_init_dtable(ft, freqs, 3, 3)
+    _check_eq("fse_init_dtable result",      22, fe, 0, fails)
+    uint64 al = zstd_fse_accuracy_log(ft)
+    _check_eq("accuracy_log",                12, al, 3, fails)
+    zstd_fse_free(ft)
+    dealloc(freqs)
+
+    // === Summary ===
+    uint64 nfails = 0; unsafe { *(fails as uint64) -> nfails }
+    puts("")
+    if nfails == 0 {
+        puts("phase3_zstd_unit_smoke: ALL UNIT TESTS PASS")
+    } else {
+        _print_dec("phase3_zstd_unit_smoke FAILS", 28, nfails)
+    }
+    dealloc(fails)
+    exit(0)
+}

@@ -1,0 +1,2113 @@
+// std/zstd.mlr — zstandard decompressor in pure MLRift.
+//
+// Port of facebook/zstd's educational decoder
+// (/tmp/zstd_ref/doc/educational_decoder/zstd_decompress.c, ~2300 LOC).
+//
+// **PHASE B.1** (this commit) — substrate only:
+//   * IO streams: istream + ostream with bit-level reads
+//   * read_bits_LE, highest_set_bit primitives
+//   * Frame header parse
+//   * Block reader: handles type=0 (raw) and type=1 (RLE).
+//     Type=2 (compressed) returns ZSTD_ERR_COMPRESSED_BLOCK_NOT_IMPL.
+//
+// **PHASE B.2** (next commit) — Huffman decoder + literals section.
+// **PHASE B.3** (after that) — FSE decoder + sequences + LZ77 + glue.
+//
+// Once B.3 lands, slice γ.1's /tmp/mlrift_fw/ dependency vanishes —
+// MLRift decompresses /lib/firmware/amdgpu/*.bin.zst itself.
+//
+// Reference spec: RFC 8478 (https://datatracker.ietf.org/doc/html/rfc8478)
+// All multi-byte fields are little-endian per the spec.
+
+// =====================================================================
+// Error codes
+// =====================================================================
+static uint64 ZSTD_OK                            = 0
+static uint64 ZSTD_ERR_INVALID_BITS              = 1
+static uint64 ZSTD_ERR_INPUT_TOO_SMALL           = 2
+static uint64 ZSTD_ERR_OUTPUT_TOO_SMALL          = 3
+static uint64 ZSTD_ERR_NOT_BYTE_ALIGNED          = 4
+static uint64 ZSTD_ERR_BAD_MAGIC                 = 5
+static uint64 ZSTD_ERR_RESERVED_BIT_SET          = 6
+static uint64 ZSTD_ERR_COMPRESSED_BLOCK_NOT_IMPL = 7    // phase B.1 only
+static uint64 ZSTD_ERR_RESERVED_BLOCK            = 8
+static uint64 ZSTD_ERR_FRAME_CONTENT_TOO_BIG     = 9
+
+// =====================================================================
+// Constants from the spec
+// =====================================================================
+static uint64 ZSTD_MAGIC_NUMBER     = 0xFD2FB528
+static uint64 ZSTD_BLOCK_SIZE_MAX   = 131072    // 128 KiB
+
+// =====================================================================
+// Struct field offsets — MLRift doesn't have struct sugar, so we lay
+// these out manually in alloc'd heap buffers.
+// =====================================================================
+
+// istream_t (24 bytes):
+//   [0..7]   u64 ptr          — current byte pointer
+//   [8..15]  u64 len          — bytes remaining
+//   [16..23] u64 bit_offset   — 0..7 (bit offset within first byte)
+static uint64 ZSTD_ISTREAM_SIZE       = 24
+static uint64 ZSTD_ISTREAM_OFF_PTR    = 0
+static uint64 ZSTD_ISTREAM_OFF_LEN    = 8
+static uint64 ZSTD_ISTREAM_OFF_BITOFF = 16
+
+// ostream_t (16 bytes):
+//   [0..7]   u64 ptr
+//   [8..15]  u64 len
+static uint64 ZSTD_OSTREAM_SIZE    = 16
+static uint64 ZSTD_OSTREAM_OFF_PTR = 0
+static uint64 ZSTD_OSTREAM_OFF_LEN = 8
+
+// frame_header_t (32 bytes):
+//   [0]    u8  single_segment_flag
+//   [1]    u8  content_checksum_flag
+//   [2..7] u8  pad
+//   [8..15] u64 window_size
+//   [16..23] u64 frame_content_size
+//   [24..27] u32 dictionary_id
+//   [28..31] u32 pad
+static uint64 ZSTD_FRAME_HDR_SIZE                = 32
+static uint64 ZSTD_FRAME_HDR_OFF_SINGLE_SEG      = 0
+static uint64 ZSTD_FRAME_HDR_OFF_CONTENT_CK      = 1
+static uint64 ZSTD_FRAME_HDR_OFF_WINDOW_SIZE     = 8
+static uint64 ZSTD_FRAME_HDR_OFF_CONTENT_SIZE    = 16
+static uint64 ZSTD_FRAME_HDR_OFF_DICT_ID         = 24
+
+// =====================================================================
+// Last-error register (mirrors the istream design — error propagates
+// up the call chain via return codes, but stash the latest in a
+// global static for diagnostics).
+// =====================================================================
+static uint64 _zstd_last_error = 0
+static uint64 _zstd_dbg_step = 0
+static uint64 _zstd_num_seqs_dbg = 0
+static uint64 _zstd_seq_idx_dbg = 0
+static uint64 _zstd_dbg_last_lit_size = 0
+static uint64 _zstd_dbg_last_lit_btype = 0
+static uint64 _zstd_dbg_last_ll = 0
+static uint64 _zstd_dbg_last_ml = 0
+static uint64 _zstd_dbg_last_of = 0
+static uint64 _zstd_dbg_last_ml_c = 0
+static uint64 _zstd_dbg_last_ll_c = 0
+static uint64 _zstd_dbg_last_of_c = 0
+static uint64 _zstd_dbg_last_ml_state = 0
+static uint64 _zstd_dbg_block_count = 0
+static uint64 _zstd_dbg_block1_wrote = 0
+static uint64 _zstd_dbg_block2_wrote = 0
+
+fn zstd_last_error() -> uint64 { return _zstd_last_error }
+fn zstd_dbg_step() -> uint64 { return _zstd_dbg_step }
+fn zstd_dbg_num_seqs() -> uint64 { return _zstd_num_seqs_dbg }
+fn zstd_dbg_seq_idx() -> uint64 { return _zstd_seq_idx_dbg }
+fn zstd_dbg_last_lit_size() -> uint64 { return _zstd_dbg_last_lit_size }
+fn zstd_dbg_last_lit_btype() -> uint64 { return _zstd_dbg_last_lit_btype }
+fn zstd_dbg_last_ll() -> uint64 { return _zstd_dbg_last_ll }
+fn zstd_dbg_last_ml() -> uint64 { return _zstd_dbg_last_ml }
+fn zstd_dbg_last_of() -> uint64 { return _zstd_dbg_last_of }
+fn zstd_dbg_last_ml_c() -> uint64 { return _zstd_dbg_last_ml_c }
+fn zstd_dbg_last_ll_c() -> uint64 { return _zstd_dbg_last_ll_c }
+fn zstd_dbg_last_of_c() -> uint64 { return _zstd_dbg_last_of_c }
+fn zstd_dbg_last_ml_state() -> uint64 { return _zstd_dbg_last_ml_state }
+fn zstd_dbg_block_count() -> uint64 { return _zstd_dbg_block_count }
+fn zstd_dbg_block1_wrote() -> uint64 { return _zstd_dbg_block1_wrote }
+fn zstd_dbg_block2_wrote() -> uint64 { return _zstd_dbg_block2_wrote }
+
+fn _zstd_step(uint64 v) { _zstd_dbg_step = v }
+
+fn _zstd_fail(uint64 code) -> uint64 {
+    _zstd_last_error = code
+    return code
+}
+
+// =====================================================================
+// istream / ostream helpers
+// =====================================================================
+
+fn zstd_istream_make(uint64 s, uint64 ptr, uint64 len) {
+    unsafe { *((s + ZSTD_ISTREAM_OFF_PTR) as uint64) = ptr }
+    unsafe { *((s + ZSTD_ISTREAM_OFF_LEN) as uint64) = len }
+    uint64 zero = 0
+    unsafe { *((s + ZSTD_ISTREAM_OFF_BITOFF) as uint64) = zero }
+}
+
+fn zstd_ostream_make(uint64 s, uint64 ptr, uint64 len) {
+    unsafe { *((s + ZSTD_OSTREAM_OFF_PTR) as uint64) = ptr }
+    unsafe { *((s + ZSTD_OSTREAM_OFF_LEN) as uint64) = len }
+}
+
+fn zstd_istream_ptr(uint64 s) -> uint64 {
+    uint64 v = 0; unsafe { *((s + ZSTD_ISTREAM_OFF_PTR) as uint64) -> v }
+    return v
+}
+fn zstd_istream_len(uint64 s) -> uint64 {
+    uint64 v = 0; unsafe { *((s + ZSTD_ISTREAM_OFF_LEN) as uint64) -> v }
+    return v
+}
+fn zstd_istream_bitoff(uint64 s) -> uint64 {
+    uint64 v = 0; unsafe { *((s + ZSTD_ISTREAM_OFF_BITOFF) as uint64) -> v }
+    return v
+}
+fn zstd_istream_set_ptr(uint64 s, uint64 v) {
+    unsafe { *((s + ZSTD_ISTREAM_OFF_PTR) as uint64) = v }
+}
+fn zstd_istream_set_len(uint64 s, uint64 v) {
+    unsafe { *((s + ZSTD_ISTREAM_OFF_LEN) as uint64) = v }
+}
+fn zstd_istream_set_bitoff(uint64 s, uint64 v) {
+    unsafe { *((s + ZSTD_ISTREAM_OFF_BITOFF) as uint64) = v }
+}
+
+fn zstd_ostream_ptr(uint64 s) -> uint64 {
+    uint64 v = 0; unsafe { *((s + ZSTD_OSTREAM_OFF_PTR) as uint64) -> v }
+    return v
+}
+fn zstd_ostream_len(uint64 s) -> uint64 {
+    uint64 v = 0; unsafe { *((s + ZSTD_OSTREAM_OFF_LEN) as uint64) -> v }
+    return v
+}
+fn zstd_ostream_set_ptr(uint64 s, uint64 v) {
+    unsafe { *((s + ZSTD_OSTREAM_OFF_PTR) as uint64) = v }
+}
+fn zstd_ostream_set_len(uint64 s, uint64 v) {
+    unsafe { *((s + ZSTD_OSTREAM_OFF_LEN) as uint64) = v }
+}
+
+// =====================================================================
+// Bit reading primitives
+// =====================================================================
+
+// read_bits_LE — read up to 64 bits from `src + offset_bits` interpreted
+// as little-endian. `offset_bits` is in BITS, not bytes.
+fn zstd_read_bits_le(uint64 src, uint64 num_bits, uint64 offset_bits) -> uint64 {
+    uint64 byte_skip = offset_bits / 8
+    uint64 bit_off   = offset_bits - (byte_skip * 8)
+    uint64 cur_ptr   = src + byte_skip
+    uint64 res       = 0
+    uint64 shift     = 0
+    uint64 left      = num_bits
+    while left > 0 {
+        uint64 mask = 0xFF
+        if left < 8 {
+            uint64 one = 1
+            mask = (one << left) - 1
+        }
+        uint8 b = 0
+        unsafe { *(cur_ptr as uint8) -> b }
+        uint64 b64 = b
+        uint64 chunk = ((b64 >> bit_off) & mask) << shift
+        res = res + chunk
+        uint64 consumed = 8 - bit_off
+        shift = shift + consumed
+        if left <= consumed {
+            left = 0
+        } else {
+            left = left - consumed
+        }
+        bit_off = 0
+        cur_ptr = cur_ptr + 1
+    }
+    return res
+}
+
+// io_read_bits — read `num_bits` from the istream, advancing both
+// ptr+len AND bit_offset. Returns 0 on error (and sets _zstd_last_error).
+fn zstd_io_read_bits(uint64 in_s, uint64 num_bits, uint64 out_val_ptr) -> uint64 {
+    if num_bits == 0 { _zstd_fail(ZSTD_ERR_INVALID_BITS); return ZSTD_ERR_INVALID_BITS }
+    if num_bits > 64 { _zstd_fail(ZSTD_ERR_INVALID_BITS); return ZSTD_ERR_INVALID_BITS }
+    uint64 bit_off = zstd_istream_bitoff(in_s)
+    uint64 bytes_needed = (num_bits + bit_off + 7) / 8
+    uint64 full_bytes   = (num_bits + bit_off) / 8
+    uint64 len = zstd_istream_len(in_s)
+    if bytes_needed > len { _zstd_fail(ZSTD_ERR_INPUT_TOO_SMALL); return ZSTD_ERR_INPUT_TOO_SMALL }
+    uint64 ptr = zstd_istream_ptr(in_s)
+    uint64 val = zstd_read_bits_le(ptr, num_bits, bit_off)
+    uint64 new_bit_off = (num_bits + bit_off) - (full_bytes * 8)
+    zstd_istream_set_bitoff(in_s, new_bit_off)
+    zstd_istream_set_ptr(in_s, ptr + full_bytes)
+    zstd_istream_set_len(in_s, len - full_bytes)
+    unsafe { *(out_val_ptr as uint64) = val }
+    return ZSTD_OK
+}
+
+// Rewind the istream by `num_bits` bits. Used by decode_literals_simple
+// (size_format 0/2) and FSE_decode_header.
+fn zstd_io_rewind_bits(uint64 in_s, uint64 num_bits) {
+    if num_bits == 0 { return }
+    uint64 bit_off = zstd_istream_bitoff(in_s)
+    if num_bits <= bit_off {
+        zstd_istream_set_bitoff(in_s, bit_off - num_bits)
+        return
+    }
+    uint64 extra = num_bits - bit_off
+    uint64 bytes_back = (extra + 7) / 8
+    uint64 ptr = zstd_istream_ptr(in_s)
+    uint64 len = zstd_istream_len(in_s)
+    zstd_istream_set_ptr(in_s, ptr - bytes_back)
+    zstd_istream_set_len(in_s, len + bytes_back)
+    uint64 new_bit_off = bytes_back * 8 - extra
+    zstd_istream_set_bitoff(in_s, new_bit_off)
+}
+
+// If bit_offset != 0, advance one byte and reset bit_offset to 0.
+fn zstd_io_align_stream(uint64 in_s) -> uint64 {
+    uint64 bit_off = zstd_istream_bitoff(in_s)
+    if bit_off == 0 { return ZSTD_OK }
+    uint64 len = zstd_istream_len(in_s)
+    if len == 0 { _zstd_fail(ZSTD_ERR_INPUT_TOO_SMALL); return ZSTD_ERR_INPUT_TOO_SMALL }
+    uint64 ptr = zstd_istream_ptr(in_s)
+    zstd_istream_set_ptr(in_s, ptr + 1)
+    zstd_istream_set_len(in_s, len - 1)
+    uint64 zero = 0
+    zstd_istream_set_bitoff(in_s, zero)
+    return ZSTD_OK
+}
+
+// Get a byte-aligned read pointer and advance the stream by `n` bytes.
+// Writes the pointer-before-advance to *out_ptr.
+fn zstd_io_get_read_ptr(uint64 in_s, uint64 n, uint64 out_ptr_ptr) -> uint64 {
+    if zstd_istream_bitoff(in_s) != 0 {
+        _zstd_fail(ZSTD_ERR_NOT_BYTE_ALIGNED); return ZSTD_ERR_NOT_BYTE_ALIGNED
+    }
+    uint64 len = zstd_istream_len(in_s)
+    if n > len { _zstd_fail(ZSTD_ERR_INPUT_TOO_SMALL); return ZSTD_ERR_INPUT_TOO_SMALL }
+    uint64 ptr = zstd_istream_ptr(in_s)
+    unsafe { *(out_ptr_ptr as uint64) = ptr }
+    zstd_istream_set_ptr(in_s, ptr + n)
+    zstd_istream_set_len(in_s, len - n)
+    return ZSTD_OK
+}
+
+// Get an ostream write pointer for `n` bytes; advance ostream by n.
+fn zstd_io_get_write_ptr(uint64 out_s, uint64 n, uint64 out_ptr_ptr) -> uint64 {
+    uint64 len = zstd_ostream_len(out_s)
+    if n > len { _zstd_fail(ZSTD_ERR_OUTPUT_TOO_SMALL); return ZSTD_ERR_OUTPUT_TOO_SMALL }
+    uint64 ptr = zstd_ostream_ptr(out_s)
+    unsafe { *(out_ptr_ptr as uint64) = ptr }
+    zstd_ostream_set_ptr(out_s, ptr + n)
+    zstd_ostream_set_len(out_s, len - n)
+    return ZSTD_OK
+}
+
+// =====================================================================
+// Reverse-direction bit stream (used by HUF + FSE decoders).
+//
+// zstd's Huffman/FSE streams are read BACKWARDS from the end of the
+// payload toward the start. The C reference uses `i64 *offset` that
+// decreases below 0 — when negative, the read clamps to the start
+// and shifts the result left to fill the "off-the-end" bits with 0.
+//
+// In MLRift uint64 land we track the same idea explicitly with a
+// "rstate" struct of two fields:
+//
+//   [0..7]  uint64 offset_bits   — current bit position from START.
+//                                  Zero means we're at the front of
+//                                  the buffer; reads decrement this.
+//   [8..15] uint64 underflow     — how many bits we've consumed past
+//                                  the start (0 = normal).
+//
+// When underflow > 0, the conceptual signed offset is `-underflow`.
+// =====================================================================
+static uint64 ZSTD_RSTATE_SIZE          = 16
+static uint64 ZSTD_RSTATE_OFF_OFFSET    = 0
+static uint64 ZSTD_RSTATE_OFF_UNDERFLOW = 8
+
+fn zstd_rstate_make(uint64 rs, uint64 initial_offset_bits) {
+    unsafe { *((rs + ZSTD_RSTATE_OFF_OFFSET) as uint64) = initial_offset_bits }
+    uint64 z = 0
+    unsafe { *((rs + ZSTD_RSTATE_OFF_UNDERFLOW) as uint64) = z }
+}
+fn zstd_rstate_offset(uint64 rs) -> uint64 {
+    uint64 v = 0
+    unsafe { *((rs + ZSTD_RSTATE_OFF_OFFSET) as uint64) -> v }
+    return v
+}
+fn zstd_rstate_underflow(uint64 rs) -> uint64 {
+    uint64 v = 0
+    unsafe { *((rs + ZSTD_RSTATE_OFF_UNDERFLOW) as uint64) -> v }
+    return v
+}
+
+// Read `num_bits` from `src` in REVERSE direction (decrementing offset).
+// Returns the value with off-the-end bits filled as 0 (shifted left).
+// Updates rstate (offset_bits + underflow).
+fn zstd_stream_read_bits(uint64 rs, uint64 src, uint64 num_bits) -> uint64 {
+    uint64 underflow = zstd_rstate_underflow(rs)
+    if underflow > 0 {
+        // Already off the end — every bit read returns 0.
+        uint64 new_uf = underflow + num_bits
+        unsafe { *((rs + ZSTD_RSTATE_OFF_UNDERFLOW) as uint64) = new_uf }
+        return 0
+    }
+    uint64 cur = zstd_rstate_offset(rs)
+    if num_bits > cur {
+        // Partial read at the start of the stream.
+        uint64 actual_bits = cur
+        uint64 new_uf = num_bits - cur
+        uint64 raw = 0
+        if actual_bits > 0 {
+            raw = zstd_read_bits_le(src, actual_bits, 0)
+        }
+        uint64 result = 0
+        if new_uf < 64 {
+            result = raw << new_uf
+        }
+        uint64 z = 0
+        unsafe { *((rs + ZSTD_RSTATE_OFF_OFFSET)    as uint64) = z }
+        unsafe { *((rs + ZSTD_RSTATE_OFF_UNDERFLOW) as uint64) = new_uf }
+        return result
+    }
+    // Normal read.
+    uint64 new_off = cur - num_bits
+    uint64 v = zstd_read_bits_le(src, num_bits, new_off)
+    unsafe { *((rs + ZSTD_RSTATE_OFF_OFFSET) as uint64) = new_off }
+    return v
+}
+
+// Returns 1 iff num >= 1 << k (i.e., bit k is set or higher).
+// Used as the "highest set bit" replacement that's safe with uint64.
+fn zstd_highest_set_bit(uint64 num) -> uint64 {
+    // Returns largest k such that (1 << k) <= num. For num == 0 returns 64.
+    if num == 0 { return 64 }
+    uint64 i = 63
+    while i > 0 {
+        uint64 one = 1
+        if (one << i) <= num { return i }
+        i = i - 1
+    }
+    return 0
+}
+
+// =====================================================================
+// Byte copy + RLE fill helpers
+// =====================================================================
+fn _zstd_memcpy(uint64 dst, uint64 src, uint64 n) {
+    uint64 i = 0
+    while i < n {
+        uint8 b = 0
+        unsafe { *((src + i) as uint8) -> b }
+        unsafe { *((dst + i) as uint8) = b }
+        i = i + 1
+    }
+}
+
+fn _zstd_memset(uint64 dst, uint8 b, uint64 n) {
+    uint64 i = 0
+    while i < n {
+        unsafe { *((dst + i) as uint8) = b }
+        i = i + 1
+    }
+}
+
+// =====================================================================
+// Frame header parsing
+// =====================================================================
+
+fn zstd_parse_frame_header(uint64 in_s, uint64 hdr) -> uint64 {
+    // Zero the header buffer
+    uint64 z = 0
+    while z < ZSTD_FRAME_HDR_SIZE {
+        unsafe { *((hdr + z) as uint8) = 0 }
+        z = z + 1
+    }
+    uint64 vbuf = alloc(8)
+
+    uint64 e = zstd_io_read_bits(in_s, 8, vbuf)
+    if e != ZSTD_OK { dealloc(vbuf); return e }
+    uint64 descriptor = 0; unsafe { *(vbuf as uint64) -> descriptor }
+
+    uint64 frame_content_size_flag = descriptor >> 6
+    uint64 single_segment_flag     = (descriptor >> 5) & 1
+    uint64 reserved_bit            = (descriptor >> 3) & 1
+    uint64 content_checksum_flag   = (descriptor >> 2) & 1
+    uint64 dictionary_id_flag      = descriptor & 3
+
+    if reserved_bit != 0 {
+        dealloc(vbuf)
+        _zstd_fail(ZSTD_ERR_RESERVED_BIT_SET)
+        return ZSTD_ERR_RESERVED_BIT_SET
+    }
+
+    uint8 ssf = single_segment_flag
+    unsafe { *((hdr + ZSTD_FRAME_HDR_OFF_SINGLE_SEG) as uint8) = ssf }
+    uint8 ccf = content_checksum_flag
+    unsafe { *((hdr + ZSTD_FRAME_HDR_OFF_CONTENT_CK) as uint8) = ccf }
+
+    uint64 window_size = 0
+    if single_segment_flag == 0 {
+        e = zstd_io_read_bits(in_s, 8, vbuf)
+        if e != ZSTD_OK { dealloc(vbuf); return e }
+        uint64 wd = 0; unsafe { *(vbuf as uint64) -> wd }
+        uint64 exponent = wd >> 3
+        uint64 mantissa = wd & 7
+        uint64 one = 1
+        uint64 window_base = one << (10 + exponent)
+        uint64 window_add  = (window_base / 8) * mantissa
+        window_size = window_base + window_add
+    }
+
+    uint32 dict_id = 0
+    if dictionary_id_flag != 0 {
+        uint64 dict_bytes = 0
+        if dictionary_id_flag == 1 { dict_bytes = 1 }
+        if dictionary_id_flag == 2 { dict_bytes = 2 }
+        if dictionary_id_flag == 3 { dict_bytes = 4 }
+        e = zstd_io_read_bits(in_s, dict_bytes * 8, vbuf)
+        if e != ZSTD_OK { dealloc(vbuf); return e }
+        uint64 d = 0; unsafe { *(vbuf as uint64) -> d }
+        dict_id = d
+    }
+    unsafe { *((hdr + ZSTD_FRAME_HDR_OFF_DICT_ID) as uint32) = dict_id }
+
+    uint64 frame_content_size = 0
+    if (single_segment_flag != 0) || (frame_content_size_flag != 0) {
+        uint64 fcs_bytes = 0
+        if frame_content_size_flag == 0 { fcs_bytes = 1 }
+        if frame_content_size_flag == 1 { fcs_bytes = 2 }
+        if frame_content_size_flag == 2 { fcs_bytes = 4 }
+        if frame_content_size_flag == 3 { fcs_bytes = 8 }
+        e = zstd_io_read_bits(in_s, fcs_bytes * 8, vbuf)
+        if e != ZSTD_OK { dealloc(vbuf); return e }
+        unsafe { *(vbuf as uint64) -> frame_content_size }
+        if fcs_bytes == 2 {
+            frame_content_size = frame_content_size + 256
+        }
+    }
+    unsafe { *((hdr + ZSTD_FRAME_HDR_OFF_CONTENT_SIZE) as uint64) = frame_content_size }
+
+    if single_segment_flag != 0 {
+        window_size = frame_content_size
+    }
+    unsafe { *((hdr + ZSTD_FRAME_HDR_OFF_WINDOW_SIZE) as uint64) = window_size }
+
+    dealloc(vbuf)
+    return ZSTD_OK
+}
+
+// =====================================================================
+// Huffman decoder (PHASE B.2).
+//
+// HUF_dtable layout (32 bytes):
+//   [0..7]   uint64 symbols_ptr   — table of (1<<max_bits) u8 symbols
+//   [8..15]  uint64 num_bits_ptr  — table of (1<<max_bits) u8 bit-counts
+//   [16..23] uint64 max_bits
+//   [24..31] uint64 table_size    — convenience, = 1 << max_bits
+// =====================================================================
+static uint64 ZSTD_HUF_DTABLE_SIZE        = 32
+static uint64 ZSTD_HUF_DTABLE_OFF_SYMBOLS  = 0
+static uint64 ZSTD_HUF_DTABLE_OFF_NUMBITS  = 8
+static uint64 ZSTD_HUF_DTABLE_OFF_MAXBITS  = 16
+static uint64 ZSTD_HUF_DTABLE_OFF_TBLSIZE  = 24
+
+static uint64 ZSTD_HUF_MAX_BITS  = 16
+static uint64 ZSTD_HUF_MAX_SYMBS = 256
+
+// Allocate + zero a HUF_dtable's internal arrays for a given max_bits.
+fn zstd_huf_alloc(uint64 t, uint64 max_bits) {
+    uint64 one = 1
+    uint64 sz = one << max_bits
+    uint64 sptr = alloc(sz)
+    uint64 nptr = alloc(sz)
+    uint64 i = 0
+    while i < sz {
+        uint8 zb = 0
+        unsafe { *((sptr + i) as uint8) = zb }
+        unsafe { *((nptr + i) as uint8) = zb }
+        i = i + 1
+    }
+    unsafe { *((t + ZSTD_HUF_DTABLE_OFF_SYMBOLS) as uint64) = sptr }
+    unsafe { *((t + ZSTD_HUF_DTABLE_OFF_NUMBITS) as uint64) = nptr }
+    unsafe { *((t + ZSTD_HUF_DTABLE_OFF_MAXBITS) as uint64) = max_bits }
+    unsafe { *((t + ZSTD_HUF_DTABLE_OFF_TBLSIZE) as uint64) = sz }
+}
+
+fn zstd_huf_free(uint64 t) {
+    uint64 sptr = 0
+    unsafe { *((t + ZSTD_HUF_DTABLE_OFF_SYMBOLS) as uint64) -> sptr }
+    if sptr != 0 { dealloc(sptr) }
+    uint64 nptr = 0
+    unsafe { *((t + ZSTD_HUF_DTABLE_OFF_NUMBITS) as uint64) -> nptr }
+    if nptr != 0 { dealloc(nptr) }
+    uint64 z = 0
+    unsafe { *((t + ZSTD_HUF_DTABLE_OFF_SYMBOLS) as uint64) = z }
+    unsafe { *((t + ZSTD_HUF_DTABLE_OFF_NUMBITS) as uint64) = z }
+    unsafe { *((t + ZSTD_HUF_DTABLE_OFF_MAXBITS) as uint64) = z }
+    unsafe { *((t + ZSTD_HUF_DTABLE_OFF_TBLSIZE) as uint64) = z }
+}
+
+// Initialize a Huffman table from canonical bit-lengths.
+// bits[i] = number of bits used to encode symbol i (0 = unused).
+// num_symbs is the array length.
+fn zstd_huf_init_dtable(uint64 t, uint64 bits, uint64 num_symbs) -> uint64 {
+    if num_symbs > ZSTD_HUF_MAX_SYMBS { _zstd_fail(11); return 11 }
+    // Count symbols per bit-length and find max_bits.
+    // rank_count[0..16]
+    uint64 rank_count = alloc(17 * 8)
+    uint64 z = 0
+    while z < 17 * 8 {
+        unsafe { *((rank_count + z) as uint8) = 0 }
+        z = z + 1
+    }
+    uint64 max_bits = 0
+    uint64 i = 0
+    while i < num_symbs {
+        uint8 bi = 0
+        unsafe { *((bits + i) as uint8) -> bi }
+        uint64 bi64 = bi
+        if bi64 > ZSTD_HUF_MAX_BITS { dealloc(rank_count); _zstd_fail(12); return 12 }
+        if bi64 > max_bits { max_bits = bi64 }
+        uint64 rcp = rank_count + bi64 * 8
+        uint64 cur = 0
+        unsafe { *(rcp as uint64) -> cur }
+        cur = cur + 1
+        unsafe { *(rcp as uint64) = cur }
+        i = i + 1
+    }
+    if max_bits == 0 { dealloc(rank_count); _zstd_fail(13); return 13 }
+
+    zstd_huf_alloc(t, max_bits)
+    uint64 sptr = 0; unsafe { *((t + ZSTD_HUF_DTABLE_OFF_SYMBOLS) as uint64) -> sptr }
+    uint64 nptr = 0; unsafe { *((t + ZSTD_HUF_DTABLE_OFF_NUMBITS) as uint64) -> nptr }
+    uint64 tbl_size = 0; unsafe { *((t + ZSTD_HUF_DTABLE_OFF_TBLSIZE) as uint64) -> tbl_size }
+
+    // rank_idx[i] = starting code for bit-length i.
+    uint64 rank_idx = alloc(17 * 8)
+    uint64 zz = 0
+    while zz < 17 * 8 {
+        unsafe { *((rank_idx + zz) as uint8) = 0 }
+        zz = zz + 1
+    }
+
+    // rank_idx[max_bits] = 0
+    // For i from max_bits down to 1:
+    //   rank_idx[i-1] = rank_idx[i] + rank_count[i] * (1 << (max_bits - i))
+    //   Fill num_bits[rank_idx[i]..rank_idx[i-1]] = i
+    uint64 mb = max_bits
+    while mb >= 1 {
+        uint64 rc = 0
+        unsafe { *((rank_count + mb * 8) as uint64) -> rc }
+        uint64 cur_idx = 0
+        unsafe { *((rank_idx + mb * 8) as uint64) -> cur_idx }
+        uint64 one = 1
+        uint64 shift_amt = max_bits - mb
+        uint64 span = rc << shift_amt
+        uint64 next_idx = cur_idx + span
+        unsafe { *((rank_idx + (mb - 1) * 8) as uint64) = next_idx }
+        // memset num_bits[cur_idx .. next_idx] = mb
+        uint64 k = cur_idx
+        uint8 mb8 = mb
+        while k < next_idx {
+            unsafe { *((nptr + k) as uint8) = mb8 }
+            k = k + 1
+        }
+        if mb == 1 { mb = 0 }
+        else { mb = mb - 1 }
+    }
+    uint64 final_idx = 0
+    unsafe { *((rank_idx + 0) as uint64) -> final_idx }
+    if final_idx != tbl_size {
+        dealloc(rank_count); dealloc(rank_idx); _zstd_fail(14); return 14
+    }
+
+    // Fill symbols table: for each symbol with non-zero bit-length,
+    // allocate a contiguous range of (1 << (max_bits - bits[i])) entries.
+    uint64 ii = 0
+    while ii < num_symbs {
+        uint8 bii = 0
+        unsafe { *((bits + ii) as uint8) -> bii }
+        uint64 bii64 = bii
+        if bii64 != 0 {
+            uint64 code = 0
+            unsafe { *((rank_idx + bii64 * 8) as uint64) -> code }
+            uint64 one = 1
+            uint64 len = one << (max_bits - bii64)
+            uint64 k2 = 0
+            uint8 ii8 = ii
+            while k2 < len {
+                unsafe { *((sptr + code + k2) as uint8) = ii8 }
+                k2 = k2 + 1
+            }
+            uint64 new_code = code + len
+            unsafe { *((rank_idx + bii64 * 8) as uint64) = new_code }
+        }
+        ii = ii + 1
+    }
+
+    dealloc(rank_count); dealloc(rank_idx)
+    return ZSTD_OK
+}
+
+// Initialize Huffman table from weights (zstd's compact tree
+// description). Weights follow the spec:
+//   * weights[i] = bit-length for symbol i, where the LAST symbol's
+//     weight is derived from the sum of others to satisfy a power-of-2
+//     constraint.
+//   * bit_length = (weight == 0) ? 0 : (max_weight + 1 - weight)
+fn zstd_huf_init_dtable_usingweights(uint64 t, uint64 weights, uint64 num_symbs) -> uint64 {
+    if num_symbs + 1 > ZSTD_HUF_MAX_SYMBS { _zstd_fail(15); return 15 }
+    uint64 weight_sum = 0
+    uint64 i = 0
+    while i < num_symbs {
+        uint8 w = 0
+        unsafe { *((weights + i) as uint8) -> w }
+        uint64 w64 = w
+        if w64 > ZSTD_HUF_MAX_BITS { _zstd_fail(16); return 16 }
+        if w64 > 0 {
+            uint64 one = 1
+            weight_sum = weight_sum + (one << (w64 - 1))
+        }
+        i = i + 1
+    }
+    // The total weight must form a power-of-2 frame; we infer the
+    // last symbol's weight.
+    uint64 max_bits = zstd_highest_set_bit(weight_sum) + 1
+    uint64 one2 = 1
+    uint64 left_over = (one2 << max_bits) - weight_sum
+    if (left_over & (left_over - 1)) != 0 { _zstd_fail(17); return 17 }
+    uint64 last_weight = zstd_highest_set_bit(left_over) + 1
+
+    uint64 bits = alloc(num_symbs + 1)
+    uint64 j = 0
+    while j < num_symbs {
+        uint8 w2 = 0
+        unsafe { *((weights + j) as uint8) -> w2 }
+        uint64 w2_64 = w2
+        uint8 b = 0
+        if w2_64 > 0 {
+            uint64 bl = max_bits + 1 - w2_64
+            b = bl
+        }
+        unsafe { *((bits + j) as uint8) = b }
+        j = j + 1
+    }
+    uint8 lb = max_bits + 1 - last_weight
+    unsafe { *((bits + num_symbs) as uint8) = lb }
+    uint64 r = zstd_huf_init_dtable(t, bits, num_symbs + 1)
+    dealloc(bits)
+    return r
+}
+
+// Decode one symbol and refresh state. Returns the symbol byte.
+fn zstd_huf_decode_symbol(uint64 t, uint64 state_ptr,
+                          uint64 src, uint64 rs) -> uint8 {
+    uint64 sptr = 0; unsafe { *((t + ZSTD_HUF_DTABLE_OFF_SYMBOLS) as uint64) -> sptr }
+    uint64 nptr = 0; unsafe { *((t + ZSTD_HUF_DTABLE_OFF_NUMBITS) as uint64) -> nptr }
+    uint64 max_bits = 0; unsafe { *((t + ZSTD_HUF_DTABLE_OFF_MAXBITS) as uint64) -> max_bits }
+    uint64 state = 0; unsafe { *(state_ptr as uint64) -> state }
+    uint8 symb = 0; unsafe { *((sptr + state) as uint8) -> symb }
+    uint8 bits = 0; unsafe { *((nptr + state) as uint8) -> bits }
+    uint64 bits64 = bits
+    uint64 rest = zstd_stream_read_bits(rs, src, bits64)
+    uint64 one = 1
+    uint64 mask = (one << max_bits) - 1
+    uint64 new_state = ((state << bits64) + rest) & mask
+    unsafe { *(state_ptr as uint64) = new_state }
+    return symb
+}
+
+// Initialize the state by pulling max_bits bits.
+fn zstd_huf_init_state(uint64 t, uint64 state_ptr,
+                       uint64 src, uint64 rs) {
+    uint64 max_bits = 0; unsafe { *((t + ZSTD_HUF_DTABLE_OFF_MAXBITS) as uint64) -> max_bits }
+    uint64 v = zstd_stream_read_bits(rs, src, max_bits)
+    unsafe { *(state_ptr as uint64) = v }
+}
+
+// Decompress a single Huffman stream. Reads backward through `src`
+// (length `src_len` bytes) and writes decoded bytes to out_s.
+// Returns the number of bytes written.
+//
+// On error returns 0xFFFFFFFFFFFFFFFF and sets _zstd_last_error.
+fn zstd_huf_decompress_1stream(uint64 t, uint64 out_s,
+                                uint64 src, uint64 src_len) -> uint64 {
+    if src_len == 0 { _zstd_fail(ZSTD_ERR_INPUT_TOO_SMALL); return 0xFFFFFFFFFFFFFFFF }
+    // Padding: top set bit of last byte is the "stream end" marker.
+    uint8 last_byte = 0
+    unsafe { *((src + src_len - 1) as uint8) -> last_byte }
+    uint64 lb64 = last_byte
+    if lb64 == 0 { _zstd_fail(18); return 0xFFFFFFFFFFFFFFFF }
+    uint64 hsb = zstd_highest_set_bit(lb64)
+    uint64 padding = 8 - hsb
+    uint64 start_off = src_len * 8 - padding
+
+    uint64 rs = alloc(ZSTD_RSTATE_SIZE)
+    zstd_rstate_make(rs, start_off)
+
+    uint64 state_buf = alloc(8)
+    uint64 zinit = 0
+    unsafe { *(state_buf as uint64) = zinit }
+    zstd_huf_init_state(t, state_buf, src, rs)
+
+    uint64 max_bits = 0; unsafe { *((t + ZSTD_HUF_DTABLE_OFF_MAXBITS) as uint64) -> max_bits }
+
+    uint64 written = 0
+    uint64 vbuf = alloc(8)
+    // Loop while underflow < max_bits (equivalent to "offset > -max_bits").
+    while zstd_rstate_underflow(rs) < max_bits {
+        uint8 sym = zstd_huf_decode_symbol(t, state_buf, src, rs)
+        uint64 wp = 0
+        uint64 e = zstd_io_get_write_ptr(out_s, 1, vbuf)
+        if e != ZSTD_OK {
+            dealloc(rs); dealloc(state_buf); dealloc(vbuf)
+            return 0xFFFFFFFFFFFFFFFF
+        }
+        unsafe { *(vbuf as uint64) -> wp }
+        unsafe { *(wp as uint8) = sym }
+        written = written + 1
+    }
+    // After loop, underflow must equal max_bits exactly (stream consumed cleanly).
+    if zstd_rstate_underflow(rs) != max_bits {
+        dealloc(rs); dealloc(state_buf); dealloc(vbuf)
+        _zstd_fail(19); return 0xFFFFFFFFFFFFFFFF
+    }
+    dealloc(rs); dealloc(state_buf); dealloc(vbuf)
+    return written
+}
+
+// Decompress a 4-stream Huffman block. Layout: 3 little-endian u16
+// stream sizes, then 4 streams concatenated. The 4th stream's size is
+// the remainder.
+fn zstd_huf_decompress_4stream(uint64 t, uint64 out_s,
+                                uint64 in_s) -> uint64 {
+    uint64 vbuf = alloc(8)
+    uint64 e = zstd_io_read_bits(in_s, 16, vbuf)
+    if e != ZSTD_OK { dealloc(vbuf); return 0xFFFFFFFFFFFFFFFF }
+    uint64 c1 = 0; unsafe { *(vbuf as uint64) -> c1 }
+    e = zstd_io_read_bits(in_s, 16, vbuf)
+    if e != ZSTD_OK { dealloc(vbuf); return 0xFFFFFFFFFFFFFFFF }
+    uint64 c2 = 0; unsafe { *(vbuf as uint64) -> c2 }
+    e = zstd_io_read_bits(in_s, 16, vbuf)
+    if e != ZSTD_OK { dealloc(vbuf); return 0xFFFFFFFFFFFFFFFF }
+    uint64 c3 = 0; unsafe { *(vbuf as uint64) -> c3 }
+    // Get pointers for each stream
+    uint64 p1 = 0
+    e = zstd_io_get_read_ptr(in_s, c1, vbuf)
+    if e != ZSTD_OK { dealloc(vbuf); return 0xFFFFFFFFFFFFFFFF }
+    unsafe { *(vbuf as uint64) -> p1 }
+    uint64 p2 = 0
+    e = zstd_io_get_read_ptr(in_s, c2, vbuf)
+    if e != ZSTD_OK { dealloc(vbuf); return 0xFFFFFFFFFFFFFFFF }
+    unsafe { *(vbuf as uint64) -> p2 }
+    uint64 p3 = 0
+    e = zstd_io_get_read_ptr(in_s, c3, vbuf)
+    if e != ZSTD_OK { dealloc(vbuf); return 0xFFFFFFFFFFFFFFFF }
+    unsafe { *(vbuf as uint64) -> p3 }
+    uint64 remaining = zstd_istream_len(in_s)
+    uint64 p4 = 0
+    e = zstd_io_get_read_ptr(in_s, remaining, vbuf)
+    if e != ZSTD_OK { dealloc(vbuf); return 0xFFFFFFFFFFFFFFFF }
+    unsafe { *(vbuf as uint64) -> p4 }
+    dealloc(vbuf)
+
+    uint64 total = 0
+    uint64 w1 = zstd_huf_decompress_1stream(t, out_s, p1, c1)
+    if w1 == 0xFFFFFFFFFFFFFFFF { return 0xFFFFFFFFFFFFFFFF }
+    total = total + w1
+    uint64 w2 = zstd_huf_decompress_1stream(t, out_s, p2, c2)
+    if w2 == 0xFFFFFFFFFFFFFFFF { return 0xFFFFFFFFFFFFFFFF }
+    total = total + w2
+    uint64 w3 = zstd_huf_decompress_1stream(t, out_s, p3, c3)
+    if w3 == 0xFFFFFFFFFFFFFFFF { return 0xFFFFFFFFFFFFFFFF }
+    total = total + w3
+    uint64 w4 = zstd_huf_decompress_1stream(t, out_s, p4, remaining)
+    if w4 == 0xFFFFFFFFFFFFFFFF { return 0xFFFFFFFFFFFFFFFF }
+    total = total + w4
+    return total
+}
+
+// =====================================================================
+// FSE (Finite State Entropy) decoder (PHASE B.3a).
+//
+// FSE_dtable layout (32 bytes):
+//   [0..7]   uint64 symbols_ptr       — (1 << accuracy_log) u8 symbols
+//   [8..15]  uint64 num_bits_ptr      — (1 << accuracy_log) u8 bit-counts
+//   [16..23] uint64 new_state_base    — (1 << accuracy_log) u16 entries
+//   [24..31] uint64 accuracy_log
+//
+// Frequencies are i16 in the C reference (-1 is the "less than 1"
+// special probability). In MLRift uint64 we use 0xFFFFFFFFFFFFFFFF as
+// the -1 sentinel (matches two's-complement encoding).
+// =====================================================================
+static uint64 ZSTD_FSE_DTABLE_SIZE           = 32
+static uint64 ZSTD_FSE_DTABLE_OFF_SYMBOLS    = 0
+static uint64 ZSTD_FSE_DTABLE_OFF_NUMBITS    = 8
+static uint64 ZSTD_FSE_DTABLE_OFF_NSB        = 16
+static uint64 ZSTD_FSE_DTABLE_OFF_ACCLOG     = 24
+
+static uint64 ZSTD_FSE_MAX_ACCURACY_LOG = 15
+static uint64 ZSTD_FSE_MAX_SYMBS        = 256
+
+static uint64 ZSTD_NEG_ONE_U64 = 0xFFFFFFFFFFFFFFFF
+
+fn zstd_fse_alloc(uint64 t, uint64 accuracy_log) {
+    uint64 one = 1
+    uint64 sz = one << accuracy_log
+    uint64 sptr = alloc(sz)
+    uint64 nptr = alloc(sz)
+    uint64 nsb  = alloc(sz * 2)
+    uint64 i = 0
+    while i < sz {
+        uint8 zb = 0
+        unsafe { *((sptr + i) as uint8) = zb }
+        unsafe { *((nptr + i) as uint8) = zb }
+        uint16 zw = 0
+        unsafe { *((nsb + i * 2) as uint16) = zw }
+        i = i + 1
+    }
+    unsafe { *((t + ZSTD_FSE_DTABLE_OFF_SYMBOLS) as uint64) = sptr }
+    unsafe { *((t + ZSTD_FSE_DTABLE_OFF_NUMBITS) as uint64) = nptr }
+    unsafe { *((t + ZSTD_FSE_DTABLE_OFF_NSB)     as uint64) = nsb }
+    unsafe { *((t + ZSTD_FSE_DTABLE_OFF_ACCLOG)  as uint64) = accuracy_log }
+}
+
+fn zstd_fse_free(uint64 t) {
+    uint64 sptr = 0; unsafe { *((t + ZSTD_FSE_DTABLE_OFF_SYMBOLS) as uint64) -> sptr }
+    if sptr != 0 { dealloc(sptr) }
+    uint64 nptr = 0; unsafe { *((t + ZSTD_FSE_DTABLE_OFF_NUMBITS) as uint64) -> nptr }
+    if nptr != 0 { dealloc(nptr) }
+    uint64 nsb = 0; unsafe { *((t + ZSTD_FSE_DTABLE_OFF_NSB) as uint64) -> nsb }
+    if nsb != 0 { dealloc(nsb) }
+    uint64 z = 0
+    unsafe { *((t + ZSTD_FSE_DTABLE_OFF_SYMBOLS) as uint64) = z }
+    unsafe { *((t + ZSTD_FSE_DTABLE_OFF_NUMBITS) as uint64) = z }
+    unsafe { *((t + ZSTD_FSE_DTABLE_OFF_NSB)     as uint64) = z }
+    unsafe { *((t + ZSTD_FSE_DTABLE_OFF_ACCLOG)  as uint64) = z }
+}
+
+fn zstd_fse_accuracy_log(uint64 t) -> uint64 {
+    uint64 v = 0; unsafe { *((t + ZSTD_FSE_DTABLE_OFF_ACCLOG) as uint64) -> v }
+    return v
+}
+
+// Init from normalized frequencies (i16-valued; -1 stored as
+// 0xFFFFFFFFFFFFFFFF u64 sentinel in our `freqs` array).
+fn zstd_fse_init_dtable(uint64 t, uint64 freqs, uint64 num_symbs, uint64 accuracy_log) -> uint64 {
+    if accuracy_log > ZSTD_FSE_MAX_ACCURACY_LOG { _zstd_fail(20); return 20 }
+    if num_symbs > ZSTD_FSE_MAX_SYMBS { _zstd_fail(21); return 21 }
+    zstd_fse_alloc(t, accuracy_log)
+    uint64 sptr = 0; unsafe { *((t + ZSTD_FSE_DTABLE_OFF_SYMBOLS) as uint64) -> sptr }
+    uint64 nptr = 0; unsafe { *((t + ZSTD_FSE_DTABLE_OFF_NUMBITS) as uint64) -> nptr }
+    uint64 nsb = 0;  unsafe { *((t + ZSTD_FSE_DTABLE_OFF_NSB)     as uint64) -> nsb }
+    uint64 one = 1
+    uint64 size = one << accuracy_log
+    // state_desc[FSE_MAX_SYMBS] of u64
+    uint64 state_desc = alloc(ZSTD_FSE_MAX_SYMBS * 8)
+    uint64 z = 0
+    while z < ZSTD_FSE_MAX_SYMBS {
+        unsafe { *((state_desc + z * 8) as uint64) = 0 }
+        z = z + 1
+    }
+    // Phase 1: place "less than 1" symbols at the top of the table
+    uint64 high_threshold = size
+    uint64 s = 0
+    while s < num_symbs {
+        uint64 f = 0
+        unsafe { *((freqs + s * 8) as uint64) -> f }
+        if f == ZSTD_NEG_ONE_U64 {
+            high_threshold = high_threshold - 1
+            uint8 s8 = s
+            unsafe { *((sptr + high_threshold) as uint8) = s8 }
+            uint64 one_u = 1
+            unsafe { *((state_desc + s * 8) as uint64) = one_u }
+        }
+        s = s + 1
+    }
+    // Phase 2: spread positive-freq symbols across remaining slots
+    uint64 step = (size >> 1) + (size >> 3) + 3
+    uint64 mask = size - 1
+    uint64 pos = 0
+    uint64 ss = 0
+    while ss < num_symbs {
+        uint64 f2 = 0
+        unsafe { *((freqs + ss * 8) as uint64) -> f2 }
+        // Skip freq == 0 OR freq == -1 (the latter already placed)
+        if f2 != 0 && f2 != ZSTD_NEG_ONE_U64 {
+            unsafe { *((state_desc + ss * 8) as uint64) = f2 }
+            uint64 ii = 0
+            while ii < f2 {
+                uint8 ss8 = ss
+                unsafe { *((sptr + pos) as uint8) = ss8 }
+                // Advance pos by step, skipping high-threshold cells
+                pos = (pos + step) & mask
+                while pos >= high_threshold {
+                    pos = (pos + step) & mask
+                }
+                ii = ii + 1
+            }
+        }
+        ss = ss + 1
+    }
+    if pos != 0 {
+        dealloc(state_desc)
+        _zstd_fail(22); return 22
+    }
+    // Phase 3: fill num_bits[] and new_state_base[]
+    uint64 i = 0
+    while i < size {
+        uint8 sym8 = 0
+        unsafe { *((sptr + i) as uint8) -> sym8 }
+        uint64 sym = sym8
+        uint64 nsd = 0
+        unsafe { *((state_desc + sym * 8) as uint64) -> nsd }
+        uint64 new_nsd = nsd + 1
+        unsafe { *((state_desc + sym * 8) as uint64) = new_nsd }
+        // num_bits = accuracy_log - highest_set_bit(nsd)
+        uint64 hsb = zstd_highest_set_bit(nsd)
+        uint64 nb = accuracy_log - hsb
+        uint8 nb8 = nb
+        unsafe { *((nptr + i) as uint8) = nb8 }
+        // new_state_base = (nsd << nb) - size
+        uint64 nsbv = (nsd << nb) - size
+        uint16 nsbw = nsbv
+        unsafe { *((nsb + i * 2) as uint16) = nsbw }
+        i = i + 1
+    }
+    dealloc(state_desc)
+    return ZSTD_OK
+}
+
+// RLE-mode FSE table (single fixed symbol, accuracy_log = 0).
+fn zstd_fse_init_dtable_rle(uint64 t, uint8 sym) {
+    zstd_fse_alloc(t, 0)
+    uint64 sptr = 0; unsafe { *((t + ZSTD_FSE_DTABLE_OFF_SYMBOLS) as uint64) -> sptr }
+    uint64 nptr = 0; unsafe { *((t + ZSTD_FSE_DTABLE_OFF_NUMBITS) as uint64) -> nptr }
+    uint64 nsb = 0;  unsafe { *((t + ZSTD_FSE_DTABLE_OFF_NSB)     as uint64) -> nsb }
+    unsafe { *((sptr + 0) as uint8) = sym }
+    uint8 zb = 0
+    unsafe { *((nptr + 0) as uint8) = zb }
+    uint16 zw = 0
+    unsafe { *((nsb + 0) as uint16) = zw }
+}
+
+// Decode an FSE header from a forward-direction bitstream and populate
+// the dtable. Per spec, the header announces accuracy_log + normalized
+// frequencies; this function returns 0 on success.
+fn zstd_fse_decode_header(uint64 t, uint64 in_s, uint64 max_accuracy_log) -> uint64 {
+    if max_accuracy_log > ZSTD_FSE_MAX_ACCURACY_LOG { _zstd_fail(23); return 23 }
+    uint64 vbuf = alloc(8)
+    uint64 e = zstd_io_read_bits(in_s, 4, vbuf)
+    if e != ZSTD_OK { dealloc(vbuf); return e }
+    uint64 al4 = 0; unsafe { *(vbuf as uint64) -> al4 }
+    uint64 accuracy_log = 5 + al4
+    if accuracy_log > max_accuracy_log { dealloc(vbuf); _zstd_fail(24); return 24 }
+
+    uint64 one = 1
+    uint64 remaining = one << accuracy_log
+    uint64 freqs = alloc(ZSTD_FSE_MAX_SYMBS * 8)
+    uint64 zz = 0
+    while zz < ZSTD_FSE_MAX_SYMBS {
+        unsafe { *((freqs + zz * 8) as uint64) = 0 }
+        zz = zz + 1
+    }
+    uint64 symb = 0
+
+    while remaining > 0 && symb < ZSTD_FSE_MAX_SYMBS {
+        uint64 bits = zstd_highest_set_bit(remaining + 1) + 1
+        e = zstd_io_read_bits(in_s, bits, vbuf)
+        if e != ZSTD_OK { dealloc(vbuf); dealloc(freqs); return e }
+        uint64 val = 0; unsafe { *(vbuf as uint64) -> val }
+
+        uint64 lower_mask = (one << (bits - 1)) - 1
+        uint64 threshold  = (one << bits) - 1 - (remaining + 1)
+
+        if (val & lower_mask) < threshold {
+            zstd_io_rewind_bits(in_s, 1)
+            val = val & lower_mask
+        } else {
+            if val > lower_mask {
+                val = val - threshold
+            }
+        }
+
+        // proba = val - 1 (can be -1 when val==0)
+        uint64 proba = 0
+        uint64 abs_proba = 0
+        if val == 0 {
+            proba = ZSTD_NEG_ONE_U64
+            abs_proba = 1
+        } else {
+            proba = val - 1
+            abs_proba = proba
+        }
+        remaining = remaining - abs_proba
+
+        unsafe { *((freqs + symb * 8) as uint64) = proba }
+        symb = symb + 1
+
+        if proba == 0 {
+            e = zstd_io_read_bits(in_s, 2, vbuf)
+            if e != ZSTD_OK { dealloc(vbuf); dealloc(freqs); return e }
+            uint64 repeat = 0; unsafe { *(vbuf as uint64) -> repeat }
+            uint64 looping = 1
+            while looping != 0 {
+                uint64 j = 0
+                while j < repeat && symb < ZSTD_FSE_MAX_SYMBS {
+                    unsafe { *((freqs + symb * 8) as uint64) = 0 }
+                    symb = symb + 1
+                    j = j + 1
+                }
+                if repeat == 3 {
+                    e = zstd_io_read_bits(in_s, 2, vbuf)
+                    if e != ZSTD_OK { dealloc(vbuf); dealloc(freqs); return e }
+                    unsafe { *(vbuf as uint64) -> repeat }
+                } else {
+                    looping = 0
+                }
+            }
+        }
+    }
+    zstd_io_align_stream(in_s)
+    if remaining != 0 || symb >= ZSTD_FSE_MAX_SYMBS {
+        dealloc(vbuf); dealloc(freqs)
+        _zstd_fail(25); return 25
+    }
+    uint64 r = zstd_fse_init_dtable(t, freqs, symb, accuracy_log)
+    dealloc(vbuf); dealloc(freqs)
+    return r
+}
+
+// Decode a single FSE symbol and update state. Returns the symbol byte.
+fn zstd_fse_decode_symbol(uint64 t, uint64 state_ptr,
+                          uint64 src, uint64 rs) -> uint8 {
+    uint64 sptr = 0; unsafe { *((t + ZSTD_FSE_DTABLE_OFF_SYMBOLS) as uint64) -> sptr }
+    uint64 nptr = 0; unsafe { *((t + ZSTD_FSE_DTABLE_OFF_NUMBITS) as uint64) -> nptr }
+    uint64 nsbp = 0; unsafe { *((t + ZSTD_FSE_DTABLE_OFF_NSB)     as uint64) -> nsbp }
+    uint64 state = 0; unsafe { *(state_ptr as uint64) -> state }
+    uint8 symb = 0; unsafe { *((sptr + state) as uint8) -> symb }
+    uint8 bits = 0; unsafe { *((nptr + state) as uint8) -> bits }
+    uint16 base = 0; unsafe { *((nsbp + state * 2) as uint16) -> base }
+    uint64 bits64 = bits
+    uint64 rest = zstd_stream_read_bits(rs, src, bits64)
+    uint64 base64 = base
+    uint64 new_state = base64 + rest
+    unsafe { *(state_ptr as uint64) = new_state }
+    return symb
+}
+
+// Initialize FSE state — read accuracy_log bits from rstate.
+fn zstd_fse_init_state(uint64 t, uint64 state_ptr,
+                       uint64 src, uint64 rs) {
+    uint64 al = 0; unsafe { *((t + ZSTD_FSE_DTABLE_OFF_ACCLOG) as uint64) -> al }
+    uint64 v = zstd_stream_read_bits(rs, src, al)
+    unsafe { *(state_ptr as uint64) = v }
+}
+
+// Peek the current symbol without updating state.
+fn zstd_fse_peek_symbol(uint64 t, uint64 state) -> uint8 {
+    uint64 sptr = 0; unsafe { *((t + ZSTD_FSE_DTABLE_OFF_SYMBOLS) as uint64) -> sptr }
+    uint8 symb = 0; unsafe { *((sptr + state) as uint8) -> symb }
+    return symb
+}
+
+// Decompress two interleaved FSE streams (used by Huffman weight
+// decoder). Returns the number of symbols written.
+fn zstd_fse_decompress_interleaved2(uint64 t, uint64 out_s,
+                                     uint64 in_s) -> uint64 {
+    uint64 vbuf = alloc(8)
+    uint64 len = zstd_istream_len(in_s)
+    if len == 0 { dealloc(vbuf); _zstd_fail(ZSTD_ERR_INPUT_TOO_SMALL); return 0xFFFFFFFFFFFFFFFF }
+    uint64 src = 0
+    uint64 e = zstd_io_get_read_ptr(in_s, len, vbuf)
+    if e != ZSTD_OK { dealloc(vbuf); return 0xFFFFFFFFFFFFFFFF }
+    unsafe { *(vbuf as uint64) -> src }
+    dealloc(vbuf)
+
+    uint8 last_byte = 0
+    unsafe { *((src + len - 1) as uint8) -> last_byte }
+    uint64 lb = last_byte
+    if lb == 0 { _zstd_fail(26); return 0xFFFFFFFFFFFFFFFF }
+    uint64 padding = 8 - zstd_highest_set_bit(lb)
+    uint64 start_off = len * 8 - padding
+    uint64 rs = alloc(ZSTD_RSTATE_SIZE)
+    zstd_rstate_make(rs, start_off)
+
+    uint64 s1 = alloc(8); uint64 s2 = alloc(8)
+    unsafe { *(s1 as uint64) = 0 }
+    unsafe { *(s2 as uint64) = 0 }
+    zstd_fse_init_state(t, s1, src, rs)
+    zstd_fse_init_state(t, s2, src, rs)
+
+    uint64 written = 0
+    uint64 vbuf2 = alloc(8)
+    uint64 done = 0
+    while done == 0 {
+        // Decode symbol from state1
+        uint8 sym1 = zstd_fse_decode_symbol(t, s1, src, rs)
+        uint64 wp = 0
+        uint64 er = zstd_io_get_write_ptr(out_s, 1, vbuf2)
+        if er != ZSTD_OK { dealloc(rs); dealloc(s1); dealloc(s2); dealloc(vbuf2); return 0xFFFFFFFFFFFFFFFF }
+        unsafe { *(vbuf2 as uint64) -> wp }
+        unsafe { *(wp as uint8) = sym1 }
+        written = written + 1
+        if zstd_rstate_underflow(rs) > 0 {
+            // Last symbol from state2 (peek-only)
+            uint64 st2 = 0; unsafe { *(s2 as uint64) -> st2 }
+            uint8 sym2p = zstd_fse_peek_symbol(t, st2)
+            er = zstd_io_get_write_ptr(out_s, 1, vbuf2)
+            if er != ZSTD_OK { dealloc(rs); dealloc(s1); dealloc(s2); dealloc(vbuf2); return 0xFFFFFFFFFFFFFFFF }
+            unsafe { *(vbuf2 as uint64) -> wp }
+            unsafe { *(wp as uint8) = sym2p }
+            written = written + 1
+            done = 1
+        }
+        if done == 0 {
+            uint8 sym2 = zstd_fse_decode_symbol(t, s2, src, rs)
+            er = zstd_io_get_write_ptr(out_s, 1, vbuf2)
+            if er != ZSTD_OK { dealloc(rs); dealloc(s1); dealloc(s2); dealloc(vbuf2); return 0xFFFFFFFFFFFFFFFF }
+            unsafe { *(vbuf2 as uint64) -> wp }
+            unsafe { *(wp as uint8) = sym2 }
+            written = written + 1
+            if zstd_rstate_underflow(rs) > 0 {
+                uint64 st1 = 0; unsafe { *(s1 as uint64) -> st1 }
+                uint8 sym1p = zstd_fse_peek_symbol(t, st1)
+                er = zstd_io_get_write_ptr(out_s, 1, vbuf2)
+                if er != ZSTD_OK { dealloc(rs); dealloc(s1); dealloc(s2); dealloc(vbuf2); return 0xFFFFFFFFFFFFFFFF }
+                unsafe { *(vbuf2 as uint64) -> wp }
+                unsafe { *(wp as uint8) = sym1p }
+                written = written + 1
+                done = 1
+            }
+        }
+    }
+    dealloc(rs); dealloc(s1); dealloc(s2); dealloc(vbuf2)
+    return written
+}
+
+// =====================================================================
+// Sequence section tables (PHASE B.3b).
+//
+// MLRift doesn't have static array literal syntax (or we'd burn the
+// initializer time). These tables are accessed via per-element fn
+// lookup. They're tiny (36/29/53 entries each) so the function-call
+// overhead is irrelevant — the per-block lookup runs maybe 100 times
+// per firmware blob.
+// =====================================================================
+
+// SEQ_LITERAL_LENGTH_DEFAULT_DIST[36] (i16 with -1 sentinel)
+// Source: facebook/zstd educational decoder line 960-962.
+//   { 4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1,  1,  2,  2,
+//     2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1, 1, 1, 1, -1, -1, -1, -1 }
+fn zstd_seq_ll_default_dist(uint64 i) -> uint64 {
+    if i == 32 { return ZSTD_NEG_ONE_U64 }
+    if i == 33 { return ZSTD_NEG_ONE_U64 }
+    if i == 34 { return ZSTD_NEG_ONE_U64 }
+    if i == 35 { return ZSTD_NEG_ONE_U64 }
+    if i == 0  { return 4 }
+    if i == 1  { return 3 }
+    if i == 13 { return 1 }
+    if i == 14 { return 1 }
+    if i == 15 { return 1 }
+    if i == 25 { return 3 }
+    if i == 27 { return 1 }
+    if i == 28 { return 1 }
+    if i == 29 { return 1 }
+    if i == 30 { return 1 }
+    if i == 31 { return 1 }
+    return 2
+}
+
+// SEQ_OFFSET_DEFAULT_DIST[29]
+fn zstd_seq_of_default_dist(uint64 i) -> uint64 {
+    if i == 24 { return ZSTD_NEG_ONE_U64 }
+    if i == 25 { return ZSTD_NEG_ONE_U64 }
+    if i == 26 { return ZSTD_NEG_ONE_U64 }
+    if i == 27 { return ZSTD_NEG_ONE_U64 }
+    if i == 28 { return ZSTD_NEG_ONE_U64 }
+    if i == 6  { return 2 }
+    if i == 7  { return 2 }
+    if i == 8  { return 2 }
+    return 1
+}
+
+// SEQ_MATCH_LENGTH_DEFAULT_DIST[53]
+// Source: facebook/zstd educational decoder line 966-969:
+//   { 1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+//     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+//     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1 }
+// -1 entries are at positions 46-52 (7 entries), NOT 45-52.
+fn zstd_seq_ml_default_dist(uint64 i) -> uint64 {
+    if i == 46 { return ZSTD_NEG_ONE_U64 }
+    if i == 47 { return ZSTD_NEG_ONE_U64 }
+    if i == 48 { return ZSTD_NEG_ONE_U64 }
+    if i == 49 { return ZSTD_NEG_ONE_U64 }
+    if i == 50 { return ZSTD_NEG_ONE_U64 }
+    if i == 51 { return ZSTD_NEG_ONE_U64 }
+    if i == 52 { return ZSTD_NEG_ONE_U64 }
+    if i == 0  { return 1 }
+    if i == 1  { return 4 }
+    if i == 2  { return 3 }
+    if i == 3  { return 2 }
+    if i == 4  { return 2 }
+    if i == 5  { return 2 }
+    if i == 6  { return 2 }
+    if i == 7  { return 2 }
+    if i == 8  { return 2 }
+    return 1
+}
+
+// LL baselines + extra-bits per code (36 entries each)
+fn zstd_seq_ll_baseline(uint64 c) -> uint64 {
+    if c < 16  { return c }
+    if c == 16 { return 16 }
+    if c == 17 { return 18 }
+    if c == 18 { return 20 }
+    if c == 19 { return 22 }
+    if c == 20 { return 24 }
+    if c == 21 { return 28 }
+    if c == 22 { return 32 }
+    if c == 23 { return 40 }
+    if c == 24 { return 48 }
+    if c == 25 { return 64 }
+    if c == 26 { return 128 }
+    if c == 27 { return 256 }
+    if c == 28 { return 512 }
+    if c == 29 { return 1024 }
+    if c == 30 { return 2048 }
+    if c == 31 { return 4096 }
+    if c == 32 { return 8192 }
+    if c == 33 { return 16384 }
+    if c == 34 { return 32768 }
+    return 65536
+}
+fn zstd_seq_ll_extra_bits(uint64 c) -> uint64 {
+    if c < 16  { return 0 }
+    if c == 16 { return 1 }
+    if c == 17 { return 1 }
+    if c == 18 { return 1 }
+    if c == 19 { return 1 }
+    if c == 20 { return 2 }
+    if c == 21 { return 2 }
+    if c == 22 { return 3 }
+    if c == 23 { return 3 }
+    if c == 24 { return 4 }
+    if c == 25 { return 6 }
+    if c == 26 { return 7 }
+    if c == 27 { return 8 }
+    if c == 28 { return 9 }
+    if c == 29 { return 10 }
+    if c == 30 { return 11 }
+    if c == 31 { return 12 }
+    if c == 32 { return 13 }
+    if c == 33 { return 14 }
+    if c == 34 { return 15 }
+    return 16
+}
+
+// ML baselines + extra-bits (53 entries each)
+fn zstd_seq_ml_baseline(uint64 c) -> uint64 {
+    if c <= 31 { return c + 3 }
+    if c == 32 { return 35 }
+    if c == 33 { return 37 }
+    if c == 34 { return 39 }
+    if c == 35 { return 41 }
+    if c == 36 { return 43 }
+    if c == 37 { return 47 }
+    if c == 38 { return 51 }
+    if c == 39 { return 59 }
+    if c == 40 { return 67 }
+    if c == 41 { return 83 }
+    if c == 42 { return 99 }
+    if c == 43 { return 131 }
+    if c == 44 { return 259 }
+    if c == 45 { return 515 }
+    if c == 46 { return 1027 }
+    if c == 47 { return 2051 }
+    if c == 48 { return 4099 }
+    if c == 49 { return 8195 }
+    if c == 50 { return 16387 }
+    if c == 51 { return 32771 }
+    return 65539
+}
+fn zstd_seq_ml_extra_bits(uint64 c) -> uint64 {
+    if c <= 31 { return 0 }
+    if c == 32 { return 1 }
+    if c == 33 { return 1 }
+    if c == 34 { return 1 }
+    if c == 35 { return 1 }
+    if c == 36 { return 2 }
+    if c == 37 { return 2 }
+    if c == 38 { return 3 }
+    if c == 39 { return 3 }
+    if c == 40 { return 4 }
+    if c == 41 { return 4 }
+    if c == 42 { return 5 }
+    if c == 43 { return 7 }
+    if c == 44 { return 8 }
+    if c == 45 { return 9 }
+    if c == 46 { return 10 }
+    if c == 47 { return 11 }
+    if c == 48 { return 12 }
+    if c == 49 { return 13 }
+    if c == 50 { return 14 }
+    if c == 51 { return 15 }
+    return 16
+}
+
+// SEQ_MAX_CODES: { LL: 35, OF: 31, ML: 52 }   (OF max code = max table size - 1)
+static uint64 ZSTD_SEQ_PART_LL = 0
+static uint64 ZSTD_SEQ_PART_OF = 1
+static uint64 ZSTD_SEQ_PART_ML = 2
+
+fn zstd_seq_max_code(uint64 part) -> uint64 {
+    if part == ZSTD_SEQ_PART_LL { return 35 }
+    if part == ZSTD_SEQ_PART_OF { return 31 }
+    return 52
+}
+fn zstd_seq_default_acc(uint64 part) -> uint64 {
+    if part == ZSTD_SEQ_PART_LL { return 6 }
+    if part == ZSTD_SEQ_PART_OF { return 5 }
+    return 6
+}
+fn zstd_seq_max_acc(uint64 part) -> uint64 {
+    if part == ZSTD_SEQ_PART_LL { return 9 }
+    if part == ZSTD_SEQ_PART_OF { return 8 }
+    return 9
+}
+fn zstd_seq_default_dist_len(uint64 part) -> uint64 {
+    if part == ZSTD_SEQ_PART_LL { return 36 }
+    if part == ZSTD_SEQ_PART_OF { return 29 }
+    return 53
+}
+fn zstd_seq_default_dist_at(uint64 part, uint64 i) -> uint64 {
+    if part == ZSTD_SEQ_PART_LL { return zstd_seq_ll_default_dist(i) }
+    if part == ZSTD_SEQ_PART_OF { return zstd_seq_of_default_dist(i) }
+    return zstd_seq_ml_default_dist(i)
+}
+
+// Initialize an FSE table from a predefined distribution (no FSE
+// header parsing — distribution is hardcoded via accessor functions).
+fn zstd_fse_init_from_default(uint64 t, uint64 part) -> uint64 {
+    uint64 n = zstd_seq_default_dist_len(part)
+    uint64 al = zstd_seq_default_acc(part)
+    uint64 fbuf = alloc(n * 8)
+    uint64 i = 0
+    while i < n {
+        uint64 v = zstd_seq_default_dist_at(part, i)
+        unsafe { *((fbuf + i * 8) as uint64) = v }
+        i = i + 1
+    }
+    uint64 r = zstd_fse_init_dtable(t, fbuf, n, al)
+    dealloc(fbuf)
+    return r
+}
+
+// =====================================================================
+// Frame context — holds persistent HUF + FSE tables (for repeat mode)
+// + previous-offset history. Layout (152 bytes):
+//   [0..31]    HUF_dtable literals_dtable    (32 bytes)
+//   [32..63]   FSE_dtable ll_dtable          (32 bytes)
+//   [64..95]   FSE_dtable ml_dtable          (32 bytes)
+//   [96..127]  FSE_dtable of_dtable          (32 bytes)
+//   [128..151] u64 previous_offsets[3]       (24 bytes)
+// Plus: tracking `current_total_output` as a separate u64.
+// =====================================================================
+static uint64 ZSTD_CTX_SIZE = 152
+static uint64 ZSTD_CTX_OFF_HUF = 0
+static uint64 ZSTD_CTX_OFF_LL  = 32
+static uint64 ZSTD_CTX_OFF_ML  = 64
+static uint64 ZSTD_CTX_OFF_OF  = 96
+static uint64 ZSTD_CTX_OFF_PREV = 128
+
+fn zstd_ctx_init(uint64 ctx) {
+    uint64 z = 0
+    while z < ZSTD_CTX_SIZE {
+        unsafe { *((ctx + z) as uint8) = 0 }
+        z = z + 1
+    }
+    uint64 o1 = 1; uint64 o2 = 4; uint64 o3 = 8
+    unsafe { *((ctx + ZSTD_CTX_OFF_PREV + 0)  as uint64) = o1 }
+    unsafe { *((ctx + ZSTD_CTX_OFF_PREV + 8)  as uint64) = o2 }
+    unsafe { *((ctx + ZSTD_CTX_OFF_PREV + 16) as uint64) = o3 }
+}
+
+fn zstd_ctx_free(uint64 ctx) {
+    uint64 huf_ptr = ctx + ZSTD_CTX_OFF_HUF
+    uint64 sptr = 0; unsafe { *((huf_ptr + ZSTD_HUF_DTABLE_OFF_SYMBOLS) as uint64) -> sptr }
+    if sptr != 0 { zstd_huf_free(huf_ptr) }
+    uint64 ll_ptr = ctx + ZSTD_CTX_OFF_LL
+    uint64 lls = 0; unsafe { *((ll_ptr + ZSTD_FSE_DTABLE_OFF_SYMBOLS) as uint64) -> lls }
+    if lls != 0 { zstd_fse_free(ll_ptr) }
+    uint64 ml_ptr = ctx + ZSTD_CTX_OFF_ML
+    uint64 mls = 0; unsafe { *((ml_ptr + ZSTD_FSE_DTABLE_OFF_SYMBOLS) as uint64) -> mls }
+    if mls != 0 { zstd_fse_free(ml_ptr) }
+    uint64 of_ptr = ctx + ZSTD_CTX_OFF_OF
+    uint64 ofs = 0; unsafe { *((of_ptr + ZSTD_FSE_DTABLE_OFF_SYMBOLS) as uint64) -> ofs }
+    if ofs != 0 { zstd_fse_free(of_ptr) }
+}
+
+// =====================================================================
+// Huffman weight decoder (uses FSE for the FSE-encoded form).
+// =====================================================================
+fn zstd_decode_huf_table(uint64 t, uint64 in_s) -> uint64 {
+    uint64 vbuf = alloc(8)
+    uint64 e = zstd_io_read_bits(in_s, 8, vbuf)
+    if e != ZSTD_OK { dealloc(vbuf); return e }
+    uint64 header = 0; unsafe { *(vbuf as uint64) -> header }
+    uint64 weights = alloc(ZSTD_HUF_MAX_SYMBS)
+    uint64 zw = 0
+    while zw < ZSTD_HUF_MAX_SYMBS {
+        unsafe { *((weights + zw) as uint8) = 0 }
+        zw = zw + 1
+    }
+    uint64 num_symbs = 0
+    if header >= 128 {
+        // Direct representation — 4 bits per weight, 2 weights per byte.
+        num_symbs = header - 127
+        uint64 bytes = (num_symbs + 1) / 2
+        uint64 wp = 0
+        e = zstd_io_get_read_ptr(in_s, bytes, vbuf)
+        if e != ZSTD_OK { dealloc(vbuf); dealloc(weights); return e }
+        unsafe { *(vbuf as uint64) -> wp }
+        uint64 i = 0
+        while i < num_symbs {
+            uint8 byte_val = 0
+            unsafe { *((wp + i / 2) as uint8) -> byte_val }
+            uint64 bv = byte_val
+            uint64 weight_val = 0
+            if (i & 1) == 0 {
+                weight_val = bv >> 4
+            } else {
+                weight_val = bv & 0xF
+            }
+            uint8 ww = weight_val
+            unsafe { *((weights + i) as uint8) = ww }
+            i = i + 1
+        }
+    } else {
+        // FSE-encoded weights.
+        uint64 fse_in = alloc(ZSTD_ISTREAM_SIZE)
+        uint64 fp = 0
+        e = zstd_io_get_read_ptr(in_s, header, vbuf)
+        if e != ZSTD_OK { dealloc(vbuf); dealloc(weights); dealloc(fse_in); return e }
+        unsafe { *(vbuf as uint64) -> fp }
+        zstd_istream_make(fse_in, fp, header)
+
+        uint64 wdtable = alloc(ZSTD_FSE_DTABLE_SIZE)
+        uint64 zd = 0
+        while zd < ZSTD_FSE_DTABLE_SIZE { unsafe { *((wdtable + zd) as uint8) = 0 }; zd = zd + 1 }
+        uint64 fr = zstd_fse_decode_header(wdtable, fse_in, 7)
+        if fr != ZSTD_OK {
+            dealloc(vbuf); dealloc(weights); dealloc(fse_in); dealloc(wdtable)
+            return fr
+        }
+        uint64 w_out = alloc(ZSTD_OSTREAM_SIZE)
+        zstd_ostream_make(w_out, weights, ZSTD_HUF_MAX_SYMBS)
+        uint64 nsym = zstd_fse_decompress_interleaved2(wdtable, w_out, fse_in)
+        if nsym == 0xFFFFFFFFFFFFFFFF {
+            dealloc(vbuf); dealloc(weights); dealloc(fse_in); dealloc(wdtable); dealloc(w_out)
+            return 30
+        }
+        num_symbs = nsym
+        zstd_fse_free(wdtable)
+        dealloc(wdtable); dealloc(fse_in); dealloc(w_out)
+    }
+    dealloc(vbuf)
+    uint64 r = zstd_huf_init_dtable_usingweights(t, weights, num_symbs)
+    dealloc(weights)
+    return r
+}
+
+// =====================================================================
+// Literals section decoding.
+// Returns 0 on success and writes literals buffer pointer + size.
+// =====================================================================
+fn zstd_decode_literals(uint64 ctx, uint64 in_s,
+                        uint64 out_lit_ptr_ptr,
+                        uint64 out_lit_size_ptr) -> uint64 {
+    _zstd_step(200)
+    uint64 vbuf = alloc(8)
+    uint64 e = zstd_io_read_bits(in_s, 2, vbuf)
+    if e != ZSTD_OK { dealloc(vbuf); return e }
+    uint64 block_type = 0; unsafe { *(vbuf as uint64) -> block_type }
+    e = zstd_io_read_bits(in_s, 2, vbuf)
+    if e != ZSTD_OK { dealloc(vbuf); return e }
+    uint64 size_format = 0; unsafe { *(vbuf as uint64) -> size_format }
+
+    _zstd_dbg_last_lit_btype = block_type
+    if block_type <= 1 {
+        // Raw or RLE literals
+        uint64 size = 0
+        if size_format == 0 || size_format == 2 {
+            // 1 bit of size_format is actually the high bit of size — rewind 1.
+            zstd_io_rewind_bits(in_s, 1)
+            e = zstd_io_read_bits(in_s, 5, vbuf)
+            if e != ZSTD_OK { dealloc(vbuf); return e }
+            unsafe { *(vbuf as uint64) -> size }
+        } else if size_format == 1 {
+            e = zstd_io_read_bits(in_s, 12, vbuf)
+            if e != ZSTD_OK { dealloc(vbuf); return e }
+            unsafe { *(vbuf as uint64) -> size }
+        } else {
+            e = zstd_io_read_bits(in_s, 20, vbuf)
+            if e != ZSTD_OK { dealloc(vbuf); return e }
+            unsafe { *(vbuf as uint64) -> size }
+        }
+        _zstd_dbg_last_lit_size = size
+        if size > ZSTD_BLOCK_SIZE_MAX { dealloc(vbuf); _zstd_fail(31); return 31 }
+        uint64 lit = alloc(size)
+        if block_type == 0 {
+            uint64 rp = 0
+            e = zstd_io_get_read_ptr(in_s, size, vbuf)
+            if e != ZSTD_OK { dealloc(vbuf); dealloc(lit); return e }
+            unsafe { *(vbuf as uint64) -> rp }
+            _zstd_memcpy(lit, rp, size)
+        } else {
+            uint64 rp = 0
+            e = zstd_io_get_read_ptr(in_s, 1, vbuf)
+            if e != ZSTD_OK { dealloc(vbuf); dealloc(lit); return e }
+            unsafe { *(vbuf as uint64) -> rp }
+            uint8 rb = 0; unsafe { *(rp as uint8) -> rb }
+            _zstd_memset(lit, rb, size)
+        }
+        unsafe { *(out_lit_ptr_ptr  as uint64) = lit }
+        unsafe { *(out_lit_size_ptr as uint64) = size }
+        dealloc(vbuf)
+        return ZSTD_OK
+    }
+
+    // Huffman compressed literals (block_type 2 or 3)
+    uint64 num_streams = 4
+    uint64 regen_size = 0
+    uint64 comp_size = 0
+    if size_format == 0 {
+        num_streams = 1
+        e = zstd_io_read_bits(in_s, 10, vbuf); if e != ZSTD_OK { dealloc(vbuf); return e }
+        unsafe { *(vbuf as uint64) -> regen_size }
+        e = zstd_io_read_bits(in_s, 10, vbuf); if e != ZSTD_OK { dealloc(vbuf); return e }
+        unsafe { *(vbuf as uint64) -> comp_size }
+    } else if size_format == 1 {
+        e = zstd_io_read_bits(in_s, 10, vbuf); if e != ZSTD_OK { dealloc(vbuf); return e }
+        unsafe { *(vbuf as uint64) -> regen_size }
+        e = zstd_io_read_bits(in_s, 10, vbuf); if e != ZSTD_OK { dealloc(vbuf); return e }
+        unsafe { *(vbuf as uint64) -> comp_size }
+    } else if size_format == 2 {
+        e = zstd_io_read_bits(in_s, 14, vbuf); if e != ZSTD_OK { dealloc(vbuf); return e }
+        unsafe { *(vbuf as uint64) -> regen_size }
+        e = zstd_io_read_bits(in_s, 14, vbuf); if e != ZSTD_OK { dealloc(vbuf); return e }
+        unsafe { *(vbuf as uint64) -> comp_size }
+    } else {
+        e = zstd_io_read_bits(in_s, 18, vbuf); if e != ZSTD_OK { dealloc(vbuf); return e }
+        unsafe { *(vbuf as uint64) -> regen_size }
+        e = zstd_io_read_bits(in_s, 18, vbuf); if e != ZSTD_OK { dealloc(vbuf); return e }
+        unsafe { *(vbuf as uint64) -> comp_size }
+    }
+    if regen_size > ZSTD_BLOCK_SIZE_MAX { dealloc(vbuf); _zstd_fail(32); return 32 }
+
+    uint64 lit = alloc(regen_size)
+    uint64 lit_out = alloc(ZSTD_OSTREAM_SIZE)
+    zstd_ostream_make(lit_out, lit, regen_size)
+    uint64 huf_in = alloc(ZSTD_ISTREAM_SIZE)
+    uint64 hp = 0
+    e = zstd_io_get_read_ptr(in_s, comp_size, vbuf)
+    if e != ZSTD_OK { dealloc(vbuf); dealloc(lit); dealloc(lit_out); dealloc(huf_in); return e }
+    unsafe { *(vbuf as uint64) -> hp }
+    zstd_istream_make(huf_in, hp, comp_size)
+
+    if block_type == 2 {
+        _zstd_step(210)
+        // New Huffman table — decode it from the stream.
+        uint64 huf_ptr = ctx + ZSTD_CTX_OFF_HUF
+        uint64 old_sptr = 0
+        unsafe { *((huf_ptr + ZSTD_HUF_DTABLE_OFF_SYMBOLS) as uint64) -> old_sptr }
+        if old_sptr != 0 { zstd_huf_free(huf_ptr) }
+        uint64 dr = zstd_decode_huf_table(huf_ptr, huf_in)
+        if dr != ZSTD_OK {
+            _zstd_step(211)
+            dealloc(vbuf); dealloc(lit); dealloc(lit_out); dealloc(huf_in)
+            return dr
+        }
+        _zstd_step(212)
+    } else {
+        // Treeless — use previous block's Huffman table (must exist)
+        uint64 huf_ptr = ctx + ZSTD_CTX_OFF_HUF
+        uint64 existing_sptr = 0
+        unsafe { *((huf_ptr + ZSTD_HUF_DTABLE_OFF_SYMBOLS) as uint64) -> existing_sptr }
+        if existing_sptr == 0 {
+            dealloc(vbuf); dealloc(lit); dealloc(lit_out); dealloc(huf_in)
+            _zstd_fail(33); return 33
+        }
+    }
+
+    uint64 huf_ptr = ctx + ZSTD_CTX_OFF_HUF
+    uint64 decoded = 0
+    if num_streams == 1 {
+        _zstd_step(220)
+        // Get remaining bytes as a single stream
+        uint64 rem = zstd_istream_len(huf_in)
+        uint64 sp = 0
+        e = zstd_io_get_read_ptr(huf_in, rem, vbuf)
+        if e != ZSTD_OK { dealloc(vbuf); dealloc(lit); dealloc(lit_out); dealloc(huf_in); return e }
+        unsafe { *(vbuf as uint64) -> sp }
+        decoded = zstd_huf_decompress_1stream(huf_ptr, lit_out, sp, rem)
+    } else {
+        _zstd_step(230)
+        decoded = zstd_huf_decompress_4stream(huf_ptr, lit_out, huf_in)
+    }
+    if decoded == 0xFFFFFFFFFFFFFFFF || decoded != regen_size {
+        _zstd_step(240)
+        dealloc(vbuf); dealloc(lit); dealloc(lit_out); dealloc(huf_in)
+        _zstd_fail(34); return 34
+    }
+    _zstd_step(250)
+    dealloc(vbuf); dealloc(lit_out); dealloc(huf_in)
+    unsafe { *(out_lit_ptr_ptr  as uint64) = lit }
+    unsafe { *(out_lit_size_ptr as uint64) = regen_size }
+    return ZSTD_OK
+}
+
+// =====================================================================
+// Sequence-section table decoding (predefined / RLE / FSE / repeat).
+// =====================================================================
+fn zstd_decode_seq_table(uint64 t, uint64 in_s, uint64 part, uint64 mode) -> uint64 {
+    if mode != 3 {
+        // Free old table before overwriting (mode != repeat)
+        uint64 old_sptr = 0
+        unsafe { *((t + ZSTD_FSE_DTABLE_OFF_SYMBOLS) as uint64) -> old_sptr }
+        if old_sptr != 0 { zstd_fse_free(t) }
+    }
+    if mode == 0 {
+        return zstd_fse_init_from_default(t, part)
+    }
+    if mode == 1 {
+        // RLE — single byte read forward
+        uint64 vbuf = alloc(8)
+        uint64 rp = 0
+        uint64 e = zstd_io_get_read_ptr(in_s, 1, vbuf)
+        if e != ZSTD_OK { dealloc(vbuf); return e }
+        unsafe { *(vbuf as uint64) -> rp }
+        uint8 sym = 0; unsafe { *(rp as uint8) -> sym }
+        zstd_fse_init_dtable_rle(t, sym)
+        dealloc(vbuf)
+        return ZSTD_OK
+    }
+    if mode == 2 {
+        return zstd_fse_decode_header(t, in_s, zstd_seq_max_acc(part))
+    }
+    // mode == 3: repeat — table must already exist
+    uint64 existing = 0
+    unsafe { *((t + ZSTD_FSE_DTABLE_OFF_SYMBOLS) as uint64) -> existing }
+    if existing == 0 { _zstd_fail(35); return 35 }
+    return ZSTD_OK
+}
+
+// =====================================================================
+// Sequence decoding (single sequence + bulk loop).
+// Each sequence is a triple {literal_length, match_length, offset}.
+// We encode them into a flat array of 3*N u64s.
+// =====================================================================
+
+// Decode a single sequence command. Reads from src (reverse-direction
+// rs) and updates ll_state, of_state, ml_state via state pointers.
+// last_seq = 1 means skip the post-decode state update.
+//
+// Writes 3 u64s to out: [ll, ml, offset]
+fn _zstd_decode_one_seq(uint64 ll_t, uint64 of_t, uint64 ml_t,
+                        uint64 ll_state_ptr, uint64 of_state_ptr,
+                        uint64 ml_state_ptr,
+                        uint64 src, uint64 rs,
+                        uint64 last_seq,
+                        uint64 out_triple_ptr) -> uint64 {
+    uint64 ll_state = 0; unsafe { *(ll_state_ptr as uint64) -> ll_state }
+    uint64 of_state = 0; unsafe { *(of_state_ptr as uint64) -> of_state }
+    uint64 ml_state = 0; unsafe { *(ml_state_ptr as uint64) -> ml_state }
+    uint8 of_code = zstd_fse_peek_symbol(of_t, of_state)
+    uint8 ll_code = zstd_fse_peek_symbol(ll_t, ll_state)
+    uint8 ml_code = zstd_fse_peek_symbol(ml_t, ml_state)
+    uint64 of_c = of_code
+    uint64 ll_c = ll_code
+    uint64 ml_c = ml_code
+    _zstd_dbg_last_ml_c = ml_c
+    _zstd_dbg_last_ll_c = ll_c
+    _zstd_dbg_last_of_c = of_c
+    _zstd_dbg_last_ml_state = ml_state
+    if ll_c > zstd_seq_max_code(ZSTD_SEQ_PART_LL) { _zstd_fail(36); return 36 }
+    if ml_c > zstd_seq_max_code(ZSTD_SEQ_PART_ML) { _zstd_fail(37); return 37 }
+
+    // Read interleaved bits in order: offset, match_length, literal_length
+    uint64 one = 1
+    uint64 of_extra = zstd_stream_read_bits(rs, src, of_c)
+    uint64 offset = (one << of_c) + of_extra
+
+    uint64 ml_extra = zstd_stream_read_bits(rs, src, zstd_seq_ml_extra_bits(ml_c))
+    uint64 match_length = zstd_seq_ml_baseline(ml_c) + ml_extra
+
+    uint64 ll_extra = zstd_stream_read_bits(rs, src, zstd_seq_ll_extra_bits(ll_c))
+    uint64 literal_length = zstd_seq_ll_baseline(ll_c) + ll_extra
+
+    unsafe { *((out_triple_ptr + 0)  as uint64) = literal_length }
+    unsafe { *((out_triple_ptr + 8)  as uint64) = match_length }
+    unsafe { *((out_triple_ptr + 16) as uint64) = offset }
+
+    if last_seq == 0 {
+        // Update states: LL, ML, OF (in that order per spec)
+        uint8 sym_ll = zstd_fse_decode_symbol(ll_t, ll_state_ptr, src, rs)
+        uint8 sym_ml = zstd_fse_decode_symbol(ml_t, ml_state_ptr, src, rs)
+        uint8 sym_of = zstd_fse_decode_symbol(of_t, of_state_ptr, src, rs)
+    }
+    return ZSTD_OK
+}
+
+// =====================================================================
+// Sequence execution (LZ77 replay over decoded literals + sequences).
+// =====================================================================
+
+// Apply repeat-offset logic + advance history.
+fn _zstd_compute_offset(uint64 ctx,
+                        uint64 lit_len, uint64 raw_offset) -> uint64 {
+    uint64 prev = ctx + ZSTD_CTX_OFF_PREV
+    if raw_offset <= 3 {
+        uint64 idx = raw_offset - 1
+        if lit_len == 0 { idx = idx + 1 }
+        uint64 offset = 0
+        if idx == 0 {
+            unsafe { *((prev + 0) as uint64) -> offset }
+        } else {
+            if idx < 3 {
+                unsafe { *((prev + idx * 8) as uint64) -> offset }
+            } else {
+                uint64 p0 = 0; unsafe { *((prev + 0) as uint64) -> p0 }
+                offset = p0 - 1
+            }
+            if idx > 1 {
+                uint64 p1 = 0
+                unsafe { *((prev + 8) as uint64) -> p1 }
+                unsafe { *((prev + 16) as uint64) = p1 }
+            }
+            uint64 p0b = 0
+            unsafe { *((prev + 0) as uint64) -> p0b }
+            unsafe { *((prev + 8) as uint64) = p0b }
+            unsafe { *((prev + 0) as uint64) = offset }
+        }
+        return offset
+    }
+    uint64 offset = raw_offset - 3
+    uint64 p1 = 0; unsafe { *((prev + 8) as uint64) -> p1 }
+    unsafe { *((prev + 16) as uint64) = p1 }
+    uint64 p0 = 0; unsafe { *((prev + 0) as uint64) -> p0 }
+    unsafe { *((prev + 8) as uint64) = p0 }
+    unsafe { *((prev + 0) as uint64) = offset }
+    return offset
+}
+
+// Decompress a single compressed block. Reads literals + sequences,
+// executes them against the literals stream + output buffer.
+fn zstd_decompress_block(uint64 ctx, uint64 out_s, uint64 in_s) -> uint64 {
+    _zstd_step(100)
+    // Step 1: literals
+    uint64 lit_ptr_p = alloc(8); unsafe { *(lit_ptr_p  as uint64) = 0 }
+    uint64 lit_sz_p  = alloc(8); unsafe { *(lit_sz_p   as uint64) = 0 }
+    uint64 le = zstd_decode_literals(ctx, in_s, lit_ptr_p, lit_sz_p)
+    if le != ZSTD_OK { _zstd_step(101); dealloc(lit_ptr_p); dealloc(lit_sz_p); return le }
+    uint64 lit = 0; unsafe { *(lit_ptr_p as uint64) -> lit }
+    uint64 lit_size = 0; unsafe { *(lit_sz_p as uint64) -> lit_size }
+    dealloc(lit_ptr_p); dealloc(lit_sz_p)
+    _zstd_step(102)
+
+    // Step 2: sequences header (1-3 bytes for num_sequences)
+    uint64 vbuf = alloc(8)
+    uint64 e = zstd_io_read_bits(in_s, 8, vbuf)
+    if e != ZSTD_OK { _zstd_step(103); dealloc(vbuf); dealloc(lit); return e }
+    uint64 hdr = 0; unsafe { *(vbuf as uint64) -> hdr }
+    uint64 num_seqs = 0
+    if hdr < 128 {
+        num_seqs = hdr
+    } else if hdr < 255 {
+        e = zstd_io_read_bits(in_s, 8, vbuf)
+        if e != ZSTD_OK { _zstd_step(104); dealloc(vbuf); dealloc(lit); return e }
+        uint64 hi = 0; unsafe { *(vbuf as uint64) -> hi }
+        num_seqs = ((hdr - 128) << 8) + hi
+    } else {
+        e = zstd_io_read_bits(in_s, 16, vbuf)
+        if e != ZSTD_OK { _zstd_step(105); dealloc(vbuf); dealloc(lit); return e }
+        uint64 hi2 = 0; unsafe { *(vbuf as uint64) -> hi2 }
+        num_seqs = hi2 + 0x7F00
+    }
+    _zstd_step(110)
+    _zstd_num_seqs_dbg = num_seqs
+
+    if num_seqs == 0 {
+        // No sequences — just copy all literals to output.
+        uint64 wp_ptr = alloc(8)
+        e = zstd_io_get_write_ptr(out_s, lit_size, wp_ptr)
+        if e != ZSTD_OK { dealloc(vbuf); dealloc(lit); dealloc(wp_ptr); return e }
+        uint64 wp = 0; unsafe { *(wp_ptr as uint64) -> wp }
+        _zstd_memcpy(wp, lit, lit_size)
+        dealloc(vbuf); dealloc(lit); dealloc(wp_ptr)
+        return ZSTD_OK
+    }
+
+    // Step 3: compression-modes byte + 3 table inits
+    e = zstd_io_read_bits(in_s, 8, vbuf)
+    if e != ZSTD_OK { dealloc(vbuf); dealloc(lit); return e }
+    uint64 cmodes = 0; unsafe { *(vbuf as uint64) -> cmodes }
+    if (cmodes & 3) != 0 { dealloc(vbuf); dealloc(lit); _zstd_fail(38); return 38 }
+    uint64 ll_mode = (cmodes >> 6) & 3
+    uint64 of_mode = (cmodes >> 4) & 3
+    uint64 ml_mode = (cmodes >> 2) & 3
+
+    uint64 ll_t = ctx + ZSTD_CTX_OFF_LL
+    uint64 of_t = ctx + ZSTD_CTX_OFF_OF
+    uint64 ml_t = ctx + ZSTD_CTX_OFF_ML
+    _zstd_step(120)
+    uint64 sr = zstd_decode_seq_table(ll_t, in_s, ZSTD_SEQ_PART_LL, ll_mode)
+    if sr != ZSTD_OK { _zstd_step(121); dealloc(vbuf); dealloc(lit); return sr }
+    _zstd_step(122)
+    sr = zstd_decode_seq_table(of_t, in_s, ZSTD_SEQ_PART_OF, of_mode)
+    if sr != ZSTD_OK { _zstd_step(123); dealloc(vbuf); dealloc(lit); return sr }
+    _zstd_step(124)
+    sr = zstd_decode_seq_table(ml_t, in_s, ZSTD_SEQ_PART_ML, ml_mode)
+    if sr != ZSTD_OK { _zstd_step(125); dealloc(vbuf); dealloc(lit); return sr }
+    _zstd_step(126)
+
+    // Step 4: get the rest of the block's bytes as the FSE bitstream
+    uint64 rem = zstd_istream_len(in_s)
+    uint64 src_ptr = 0
+    e = zstd_io_get_read_ptr(in_s, rem, vbuf)
+    if e != ZSTD_OK { dealloc(vbuf); dealloc(lit); return e }
+    unsafe { *(vbuf as uint64) -> src_ptr }
+
+    uint8 last_byte = 0
+    unsafe { *((src_ptr + rem - 1) as uint8) -> last_byte }
+    uint64 lb = last_byte
+    if lb == 0 { dealloc(vbuf); dealloc(lit); _zstd_fail(39); return 39 }
+    uint64 padding = 8 - zstd_highest_set_bit(lb)
+    uint64 start_off = rem * 8 - padding
+
+    uint64 rs = alloc(ZSTD_RSTATE_SIZE)
+    zstd_rstate_make(rs, start_off)
+
+    uint64 ll_state = alloc(8); unsafe { *(ll_state as uint64) = 0 }
+    uint64 of_state = alloc(8); unsafe { *(of_state as uint64) = 0 }
+    uint64 ml_state = alloc(8); unsafe { *(ml_state as uint64) = 0 }
+    zstd_fse_init_state(ll_t, ll_state, src_ptr, rs)
+    zstd_fse_init_state(of_t, of_state, src_ptr, rs)
+    zstd_fse_init_state(ml_t, ml_state, src_ptr, rs)
+
+    // Step 5: literals stream for execute phase
+    uint64 lit_in = alloc(ZSTD_ISTREAM_SIZE)
+    zstd_istream_make(lit_in, lit, lit_size)
+
+    // Step 6: decode + execute each sequence inline
+    uint64 triple = alloc(24)
+    _zstd_step(130)
+    uint64 si = 0
+    while si < num_seqs {
+        _zstd_seq_idx_dbg = si
+        uint64 last = 0
+        if si == num_seqs - 1 { last = 1 }
+        uint64 dr = _zstd_decode_one_seq(ll_t, of_t, ml_t,
+                                          ll_state, of_state, ml_state,
+                                          src_ptr, rs, last, triple)
+        if dr != ZSTD_OK {
+            _zstd_step(131)
+            dealloc(vbuf); dealloc(lit); dealloc(rs); dealloc(triple)
+            dealloc(ll_state); dealloc(of_state); dealloc(ml_state); dealloc(lit_in)
+            return dr
+        }
+        uint64 ll_len = 0; unsafe { *((triple + 0)  as uint64) -> ll_len }
+        uint64 ml_len = 0; unsafe { *((triple + 8)  as uint64) -> ml_len }
+        uint64 raw_off = 0; unsafe { *((triple + 16) as uint64) -> raw_off }
+        _zstd_dbg_last_ll = ll_len
+        _zstd_dbg_last_ml = ml_len
+        _zstd_dbg_last_of = raw_off
+
+        // Copy literals
+        if ll_len > 0 {
+            uint64 rp = 0
+            e = zstd_io_get_read_ptr(lit_in, ll_len, vbuf)
+            if e != ZSTD_OK {
+                _zstd_step(132)
+                dealloc(vbuf); dealloc(lit); dealloc(rs); dealloc(triple)
+                dealloc(ll_state); dealloc(of_state); dealloc(ml_state); dealloc(lit_in)
+                return e
+            }
+            unsafe { *(vbuf as uint64) -> rp }
+            uint64 wp = 0
+            e = zstd_io_get_write_ptr(out_s, ll_len, vbuf)
+            if e != ZSTD_OK {
+                dealloc(vbuf); dealloc(lit); dealloc(rs); dealloc(triple)
+                dealloc(ll_state); dealloc(of_state); dealloc(ml_state); dealloc(lit_in)
+                return e
+            }
+            unsafe { *(vbuf as uint64) -> wp }
+            _zstd_memcpy(wp, rp, ll_len)
+        }
+
+        // Resolve match offset (handles repeat offsets + history update)
+        uint64 actual_offset = _zstd_compute_offset(ctx, ll_len, raw_off)
+
+        // Execute match copy from earlier in the output
+        uint64 wp2 = 0
+        e = zstd_io_get_write_ptr(out_s, ml_len, vbuf)
+        if e != ZSTD_OK {
+            dealloc(vbuf); dealloc(lit); dealloc(rs); dealloc(triple)
+            dealloc(ll_state); dealloc(of_state); dealloc(ml_state); dealloc(lit_in)
+            return e
+        }
+        unsafe { *(vbuf as uint64) -> wp2 }
+        // wp2 is the start of the new bytes; the source is wp2 - actual_offset.
+        // Byte-by-byte copy handles overlapping copies (offset < ml_len).
+        uint64 m = 0
+        while m < ml_len {
+            uint64 sptr_b = wp2 - actual_offset + m
+            uint8 sb = 0
+            unsafe { *(sptr_b as uint8) -> sb }
+            unsafe { *((wp2 + m) as uint8) = sb }
+            m = m + 1
+        }
+        si = si + 1
+    }
+
+    // Copy any leftover literals
+    uint64 lleft = zstd_istream_len(lit_in)
+    if lleft > 0 {
+        uint64 rp = 0
+        e = zstd_io_get_read_ptr(lit_in, lleft, vbuf)
+        if e != ZSTD_OK {
+            dealloc(vbuf); dealloc(lit); dealloc(rs); dealloc(triple)
+            dealloc(ll_state); dealloc(of_state); dealloc(ml_state); dealloc(lit_in)
+            return e
+        }
+        unsafe { *(vbuf as uint64) -> rp }
+        uint64 wp = 0
+        e = zstd_io_get_write_ptr(out_s, lleft, vbuf)
+        if e != ZSTD_OK {
+            dealloc(vbuf); dealloc(lit); dealloc(rs); dealloc(triple)
+            dealloc(ll_state); dealloc(of_state); dealloc(ml_state); dealloc(lit_in)
+            return e
+        }
+        unsafe { *(vbuf as uint64) -> wp }
+        _zstd_memcpy(wp, rp, lleft)
+    }
+
+    dealloc(vbuf); dealloc(lit); dealloc(rs); dealloc(triple)
+    dealloc(ll_state); dealloc(of_state); dealloc(ml_state); dealloc(lit_in)
+    return ZSTD_OK
+}
+
+// =====================================================================
+// Top-level decompressor.
+// All block types (0=Raw, 1=RLE, 2=Compressed) supported as of B.3b.
+// =====================================================================
+fn zstd_decompress(uint64 src, uint64 src_len,
+                   uint64 dst, uint64 dst_cap,
+                   uint64 out_written_ptr) -> uint64 {
+    uint64 in_s  = alloc(ZSTD_ISTREAM_SIZE)
+    uint64 out_s = alloc(ZSTD_OSTREAM_SIZE)
+    zstd_istream_make(in_s, src, src_len)
+    zstd_ostream_make(out_s, dst, dst_cap)
+
+    uint64 vbuf = alloc(8)
+
+    // Read + verify magic number (32 bits, LE)
+    uint64 e = zstd_io_read_bits(in_s, 32, vbuf)
+    if e != ZSTD_OK { dealloc(vbuf); dealloc(in_s); dealloc(out_s); return e }
+    uint64 magic = 0; unsafe { *(vbuf as uint64) -> magic }
+    if magic != ZSTD_MAGIC_NUMBER {
+        dealloc(vbuf); dealloc(in_s); dealloc(out_s)
+        _zstd_fail(ZSTD_ERR_BAD_MAGIC)
+        return ZSTD_ERR_BAD_MAGIC
+    }
+
+    // Parse frame header
+    uint64 hdr = alloc(ZSTD_FRAME_HDR_SIZE)
+    e = zstd_parse_frame_header(in_s, hdr)
+    if e != ZSTD_OK {
+        dealloc(hdr); dealloc(vbuf); dealloc(in_s); dealloc(out_s)
+        return e
+    }
+
+    // Optional: enforce frame_content_size ≤ dst_cap
+    uint64 fcs = 0
+    unsafe { *((hdr + ZSTD_FRAME_HDR_OFF_CONTENT_SIZE) as uint64) -> fcs }
+    if fcs != 0 && fcs > dst_cap {
+        dealloc(hdr); dealloc(vbuf); dealloc(in_s); dealloc(out_s)
+        _zstd_fail(ZSTD_ERR_OUTPUT_TOO_SMALL)
+        return ZSTD_ERR_OUTPUT_TOO_SMALL
+    }
+
+    // Per-frame context (HUF + 3xFSE tables + offset history)
+    uint64 ctx = alloc(ZSTD_CTX_SIZE)
+    zstd_ctx_init(ctx)
+
+    // Block loop
+    uint64 last_block = 0
+    uint64 written = 0
+    while last_block == 0 {
+        e = zstd_io_read_bits(in_s, 1, vbuf)
+        if e != ZSTD_OK { dealloc(hdr); dealloc(vbuf); dealloc(in_s); dealloc(out_s); return e }
+        unsafe { *(vbuf as uint64) -> last_block }
+        e = zstd_io_read_bits(in_s, 2, vbuf)
+        if e != ZSTD_OK { dealloc(hdr); dealloc(vbuf); dealloc(in_s); dealloc(out_s); return e }
+        uint64 block_type = 0; unsafe { *(vbuf as uint64) -> block_type }
+        e = zstd_io_read_bits(in_s, 21, vbuf)
+        if e != ZSTD_OK { dealloc(hdr); dealloc(vbuf); dealloc(in_s); dealloc(out_s); return e }
+        uint64 block_len = 0; unsafe { *(vbuf as uint64) -> block_len }
+
+        if block_type == 0 {
+            // Raw block — n bytes of raw data
+            uint64 rp = 0
+            e = zstd_io_get_read_ptr(in_s, block_len, vbuf)
+            if e != ZSTD_OK { dealloc(hdr); dealloc(vbuf); dealloc(in_s); zstd_ctx_free(ctx); dealloc(ctx); dealloc(out_s); return e }
+            unsafe { *(vbuf as uint64) -> rp }
+            uint64 wp = 0
+            e = zstd_io_get_write_ptr(out_s, block_len, vbuf)
+            if e != ZSTD_OK { dealloc(hdr); dealloc(vbuf); dealloc(in_s); zstd_ctx_free(ctx); dealloc(ctx); dealloc(out_s); return e }
+            unsafe { *(vbuf as uint64) -> wp }
+            _zstd_memcpy(wp, rp, block_len)
+            written = written + block_len
+        }
+        if block_type == 1 {
+            // RLE block — 1 byte of source, repeated block_len times
+            uint64 rp = 0
+            e = zstd_io_get_read_ptr(in_s, 1, vbuf)
+            if e != ZSTD_OK { dealloc(hdr); dealloc(vbuf); dealloc(in_s); zstd_ctx_free(ctx); dealloc(ctx); dealloc(out_s); return e }
+            unsafe { *(vbuf as uint64) -> rp }
+            uint64 wp = 0
+            e = zstd_io_get_write_ptr(out_s, block_len, vbuf)
+            if e != ZSTD_OK { dealloc(hdr); dealloc(vbuf); dealloc(in_s); zstd_ctx_free(ctx); dealloc(ctx); dealloc(out_s); return e }
+            unsafe { *(vbuf as uint64) -> wp }
+            uint8 rb = 0
+            unsafe { *(rp as uint8) -> rb }
+            _zstd_memset(wp, rb, block_len)
+            written = written + block_len
+        }
+        if block_type == 2 {
+            _zstd_dbg_block_count = _zstd_dbg_block_count + 1
+            // Compressed block — carve a sub-istream of block_len bytes
+            // and run the compressed-block decoder on it.
+            uint64 rp = 0
+            e = zstd_io_get_read_ptr(in_s, block_len, vbuf)
+            if e != ZSTD_OK { dealloc(hdr); dealloc(vbuf); dealloc(in_s); zstd_ctx_free(ctx); dealloc(ctx); dealloc(out_s); return e }
+            unsafe { *(vbuf as uint64) -> rp }
+            uint64 sub_in = alloc(ZSTD_ISTREAM_SIZE)
+            zstd_istream_make(sub_in, rp, block_len)
+            // Track output length before/after to count written bytes.
+            uint64 out_len_before = zstd_ostream_len(out_s)
+            uint64 br = zstd_decompress_block(ctx, out_s, sub_in)
+            dealloc(sub_in)
+            if br != ZSTD_OK {
+                dealloc(hdr); dealloc(vbuf); dealloc(in_s); zstd_ctx_free(ctx); dealloc(ctx); dealloc(out_s); return br
+            }
+            uint64 out_len_after = zstd_ostream_len(out_s)
+            uint64 bw = out_len_before - out_len_after
+            written = written + bw
+            if _zstd_dbg_block_count == 1 { _zstd_dbg_block1_wrote = bw }
+            if _zstd_dbg_block_count == 2 { _zstd_dbg_block2_wrote = bw }
+        }
+        if block_type == 3 {
+            dealloc(hdr); dealloc(vbuf); dealloc(in_s); zstd_ctx_free(ctx); dealloc(ctx); dealloc(out_s)
+            _zstd_fail(ZSTD_ERR_RESERVED_BLOCK)
+            return ZSTD_ERR_RESERVED_BLOCK
+        }
+    }
+
+    // Phase B.1 skips the optional 4-byte content-checksum suffix.
+    // The block loop has consumed everything we care about for now.
+
+    unsafe { *(out_written_ptr as uint64) = written }
+    zstd_ctx_free(ctx); dealloc(ctx)
+    dealloc(hdr); dealloc(vbuf); dealloc(in_s); dealloc(out_s)
+    return ZSTD_OK
+}
