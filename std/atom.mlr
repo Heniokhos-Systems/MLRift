@@ -129,3 +129,225 @@ fn atom_validate_image(uint64 buf, uint64 size) -> uint64 {
     if m3 != 77 { return 4 }   // 'M'
     return 0
 }
+
+// =====================================================================
+// atom_context (global, one per session) — byte-offset layout. Size 96.
+// =====================================================================
+static uint64 AC_OFF_IMAGE_BUF        = 0     // uint64 — base of ROM image
+static uint64 AC_OFF_IMAGE_SIZE       = 8     // uint64
+static uint64 AC_OFF_CMD_TABLE_BASE   = 16    // uint64 — byte off of cmd list
+static uint64 AC_OFF_DATA_TABLE_BASE  = 24    // uint64 — byte off of data list
+static uint64 AC_OFF_FB_BASE          = 32    // uint64 — host scratch for FB ops
+static uint64 AC_OFF_FB_SIZE          = 40    // uint64
+static uint64 AC_OFF_REG_BLOCK        = 48    // uint64 — current SET_REG_BLOCK base
+static uint64 AC_OFF_DATA_BLOCK       = 56    // uint64 — current SET_DATA_BLOCK base
+static uint64 AC_OFF_IO_MODE          = 64    // uint64 — current SETPORT target
+static uint64 AC_OFF_SCRATCH          = 72    // uint64 — scratch dword array ptr
+static uint64 AC_OFF_SCRATCH_SIZE     = 80    // uint64
+static uint64 AC_OFF_BAR5_HOST        = 88    // uint64 — host VA of mapped BAR5 (0 = no GPU)
+static uint64 ATOM_CONTEXT_SIZE       = 96
+
+// =====================================================================
+// atom_exec_context (per-table-call). Size 64.
+// =====================================================================
+static uint64 AEC_OFF_CTX             = 0     // uint64 atom_context*
+static uint64 AEC_OFF_START_PTR       = 8     // uint64 bytecode offset where table begins
+static uint64 AEC_OFF_PS              = 16    // uint64 ptr to ps[] dwords
+static uint64 AEC_OFF_WS              = 24    // uint64 ptr to ws[] dwords
+static uint64 AEC_OFF_LAST_DST        = 32    // uint64 — last destination value
+static uint64 AEC_OFF_LAST_PORT       = 40    // uint64 — last SETPORT target
+static uint64 AEC_OFF_ABORT           = 48    // uint64 — 1 = halt, 0xDEAD = panic
+static uint64 AEC_OFF_PTR             = 56    // uint64 — current bytecode offset
+static uint64 ATOM_EXEC_CONTEXT_SIZE  = 64
+
+// =====================================================================
+// Opcode handlers. All current handlers except _atom_op_eot are stubs.
+// In slices δ.0g–δ.0i these get real bodies.
+// =====================================================================
+
+// Panic — set abort to a sentinel so callers can detect.
+fn _atom_op_panic(uint64 ectx, uint64 ptr_ptr, uint64 arg) {
+    unsafe { *((ectx + AEC_OFF_ABORT) as uint64) = 0xDEAD }
+}
+
+// EOT — end of table. Halt the dispatch loop normally.
+fn _atom_op_eot(uint64 ectx, uint64 ptr_ptr, uint64 arg) {
+    unsafe { *((ectx + AEC_OFF_ABORT) as uint64) = 1 }
+}
+
+// =====================================================================
+// Opcode arg lookup — copy of opcode_table[] from amdgpu/atom.c:1090.
+// Returns the 2nd field (`arg` value) of each entry. Slot 0 (NULL) and
+// any unknown op return 0. Slot ATOM_OP_EOT (91) returns 0.
+//
+// Used by _atom_dispatch to pass arg through to each handler.
+// =====================================================================
+fn _atom_op_arg(uint64 op) -> uint64 {
+    // Move (ATOM_ARG_REG / PS / WS / FB / PLL / MC).
+    if op == 1  { return 0 }   // move REG
+    if op == 2  { return 1 }   // move PS
+    if op == 3  { return 2 }   // move WS
+    if op == 4  { return 3 }   // move FB
+    if op == 5  { return 6 }   // move PLL  (ATOM_ARG_PLL = 6)
+    if op == 6  { return 7 }   // move MC   (ATOM_ARG_MC  = 7)
+    // And.
+    if op == 7  { return 0 } if op == 8  { return 1 } if op == 9  { return 2 }
+    if op == 10 { return 3 } if op == 11 { return 6 } if op == 12 { return 7 }
+    // Or.
+    if op == 13 { return 0 } if op == 14 { return 1 } if op == 15 { return 2 }
+    if op == 16 { return 3 } if op == 17 { return 6 } if op == 18 { return 7 }
+    // shift_left.
+    if op == 19 { return 0 } if op == 20 { return 1 } if op == 21 { return 2 }
+    if op == 22 { return 3 } if op == 23 { return 6 } if op == 24 { return 7 }
+    // shift_right.
+    if op == 25 { return 0 } if op == 26 { return 1 } if op == 27 { return 2 }
+    if op == 28 { return 3 } if op == 29 { return 6 } if op == 30 { return 7 }
+    // mul.
+    if op == 31 { return 0 } if op == 32 { return 1 } if op == 33 { return 2 }
+    if op == 34 { return 3 } if op == 35 { return 6 } if op == 36 { return 7 }
+    // div.
+    if op == 37 { return 0 } if op == 38 { return 1 } if op == 39 { return 2 }
+    if op == 40 { return 3 } if op == 41 { return 6 } if op == 42 { return 7 }
+    // add.
+    if op == 43 { return 0 } if op == 44 { return 1 } if op == 45 { return 2 }
+    if op == 46 { return 3 } if op == 47 { return 6 } if op == 48 { return 7 }
+    // sub.
+    if op == 49 { return 0 } if op == 50 { return 1 } if op == 51 { return 2 }
+    if op == 52 { return 3 } if op == 53 { return 6 } if op == 54 { return 7 }
+    // setport (ATI/PCI/SYSIO).
+    if op == 55 { return 0 }   // ATOM_PORT_ATI
+    if op == 56 { return 1 }   // ATOM_PORT_PCI
+    if op == 57 { return 2 }   // ATOM_PORT_SYSIO
+    // setregblock / setfbbase — no arg.
+    if op == 58 { return 0 } if op == 59 { return 0 }
+    // compare.
+    if op == 60 { return 0 } if op == 61 { return 1 } if op == 62 { return 2 }
+    if op == 63 { return 3 } if op == 64 { return 6 } if op == 65 { return 7 }
+    // switch (no arg).
+    if op == 66 { return 0 }
+    // jump (ATOM_COND_*).
+    if op == 67 { return 2 }   // ALWAYS
+    if op == 68 { return 5 }   // EQUAL
+    if op == 69 { return 3 }   // BELOW
+    if op == 70 { return 0 }   // ABOVE
+    if op == 71 { return 4 }   // BELOWOREQUAL
+    if op == 72 { return 1 }   // ABOVEOREQUAL
+    if op == 73 { return 6 }   // NOTEQUAL
+    // test.
+    if op == 74 { return 0 } if op == 75 { return 1 } if op == 76 { return 2 }
+    if op == 77 { return 3 } if op == 78 { return 6 } if op == 79 { return 7 }
+    // delay (MILLISEC / MICROSEC).
+    if op == 80 { return 1 }   // ATOM_UNIT_MILLISEC
+    if op == 81 { return 0 }   // ATOM_UNIT_MICROSEC
+    // calltable / repeat.
+    if op == 82 { return 0 } if op == 83 { return 0 }
+    // clear.
+    if op == 84 { return 0 } if op == 85 { return 1 } if op == 86 { return 2 }
+    if op == 87 { return 3 } if op == 88 { return 6 } if op == 89 { return 7 }
+    // nop, eot.
+    if op == 90 { return 0 }
+    if op == 91 { return 0 }   // ATOM_OP_EOT
+    // mask.
+    if op == 92 { return 0 } if op == 93 { return 1 } if op == 94 { return 2 }
+    if op == 95 { return 3 } if op == 96 { return 6 } if op == 97 { return 7 }
+    // postcard, beep, savereg, restorereg, setdatablock.
+    if op == 98 { return 0 } if op == 99 { return 0 } if op == 100 { return 0 }
+    if op == 101 { return 0 } if op == 102 { return 0 }
+    // xor.
+    if op == 103 { return 0 } if op == 104 { return 1 } if op == 105 { return 2 }
+    if op == 106 { return 3 } if op == 107 { return 6 } if op == 108 { return 7 }
+    // shl.
+    if op == 109 { return 0 } if op == 110 { return 1 } if op == 111 { return 2 }
+    if op == 112 { return 3 } if op == 113 { return 6 } if op == 114 { return 7 }
+    // shr.
+    if op == 115 { return 0 } if op == 116 { return 1 } if op == 117 { return 2 }
+    if op == 118 { return 3 } if op == 119 { return 6 } if op == 120 { return 7 }
+    // debug, processds.
+    if op == 121 { return 0 } if op == 122 { return 0 }
+    // mul32 / div32 (PS, WS).
+    if op == 123 { return 1 } if op == 124 { return 2 }
+    if op == 125 { return 1 } if op == 126 { return 2 }
+    return 0
+}
+
+// =====================================================================
+// Dispatch. Currently only ATOM_OP_EOT (91) is wired. Everything else
+// flows to _atom_op_panic, which sets abort=0xDEAD so callers can
+// detect "unimplemented opcode reached".
+// =====================================================================
+fn _atom_dispatch(uint64 op, uint64 ectx, uint64 ptr_ptr) {
+    uint64 arg = _atom_op_arg(op)
+    if op == 91 { _atom_op_eot(ectx, ptr_ptr, arg); return }
+    _atom_op_panic(ectx, ptr_ptr, arg)
+}
+
+// =====================================================================
+// atom_execute_table — main bytecode loop. Mirrors
+// amdgpu_atom_execute_table_locked (atom.c:1221).
+//
+// Inputs:
+//   ctx                 — atom_context*
+//   cmd_table_offset    — byte offset within image of the cmd-table HDR
+//                         (i.e., what atom_cmd_table_offset_by_index returns)
+//   ps_ptr              — caller-provided parameter dword array (may be 0)
+//   ps_size             — # of dwords in ps[] (informational; sub-tasks check)
+//
+// Returns:
+//   0 = ran to EOT normally
+//   1 = cmd_table_offset == 0 (table not present in this VBIOS)
+//   2 = hit an unimplemented opcode (panic)
+//   3 = ran off the end of the bytecode without seeing EOT
+// =====================================================================
+fn atom_execute_table(uint64 ctx,
+                      uint64 cmd_table_offset,
+                      uint64 ps_ptr,
+                      uint64 ps_size) -> uint64 {
+    if cmd_table_offset == 0 { return 1 }
+    uint64 image = 0; unsafe { *((ctx + AC_OFF_IMAGE_BUF) as uint64) -> image }
+    uint64 image_sz = 0; unsafe { *((ctx + AC_OFF_IMAGE_SIZE) as uint64) -> image_sz }
+
+    uint16 len_w = 0; unsafe { *((image + cmd_table_offset + ATOM_CT_SIZE_PTR) as uint16) -> len_w }
+    uint8  ws_b  = 0; unsafe { *((image + cmd_table_offset + ATOM_CT_WS_PTR)   as uint8)  -> ws_b }
+    uint8  ps_b  = 0; unsafe { *((image + cmd_table_offset + ATOM_CT_PS_PTR)   as uint8)  -> ps_b }
+    uint64 ws_dwords = ws_b
+    uint64 bytecode_start = cmd_table_offset + ATOM_CT_CODE_PTR
+    uint64 bytecode_end   = cmd_table_offset + len_w
+
+    uint64 ectx = alloc(ATOM_EXEC_CONTEXT_SIZE)
+    uint64 zi = 0
+    while zi < ATOM_EXEC_CONTEXT_SIZE {
+        uint8 z = 0; unsafe { *((ectx + zi) as uint8) = z }; zi = zi + 1
+    }
+    uint64 ws_buf = 0
+    if ws_dwords > 0 {
+        ws_buf = alloc(ws_dwords * 4)
+        zi = 0
+        while zi < ws_dwords * 4 {
+            uint8 z = 0; unsafe { *((ws_buf + zi) as uint8) = z }; zi = zi + 1
+        }
+    }
+    unsafe { *((ectx + AEC_OFF_CTX)       as uint64) = ctx }
+    unsafe { *((ectx + AEC_OFF_START_PTR) as uint64) = bytecode_start }
+    unsafe { *((ectx + AEC_OFF_PTR)       as uint64) = bytecode_start }
+    unsafe { *((ectx + AEC_OFF_PS)        as uint64) = ps_ptr }
+    unsafe { *((ectx + AEC_OFF_WS)        as uint64) = ws_buf }
+
+    uint64 abort = 0
+    uint64 ran_off = 0
+    while abort == 0 {
+        uint64 ptr = 0; unsafe { *((ectx + AEC_OFF_PTR) as uint64) -> ptr }
+        if ptr >= bytecode_end { ran_off = 1; abort = 0xBEEF }
+        else {
+            uint8 op_b = 0; unsafe { *((image + ptr) as uint8) -> op_b }
+            uint64 op = op_b
+            unsafe { *((ectx + AEC_OFF_PTR) as uint64) = ptr + 1 }
+            _atom_dispatch(op, ectx, ectx + AEC_OFF_PTR)
+            unsafe { *((ectx + AEC_OFF_ABORT) as uint64) -> abort }
+        }
+    }
+    if ws_buf != 0 { dealloc(ws_buf) }
+    dealloc(ectx)
+    if ran_off == 1 { return 3 }
+    if abort == 0xDEAD { return 2 }
+    return 0
+}

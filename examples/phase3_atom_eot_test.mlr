@@ -1,0 +1,115 @@
+// Phase 3 slice δ.0e — synthetic ATOM dispatch + EOT test.
+//
+// Constructs a minimal in-memory ATOM image with a single 1-byte
+// command table containing just ATOM_OP_EOT (91), then calls
+// atom_execute_table. Confirms the interpreter loop halts with rc=0
+// and that an unimplemented opcode produces rc=2.
+//
+// No file I/O. No GPU MMIO. Pure validation of the bytecode loop +
+// dispatch table arity.
+
+import "../std/atom.mlr"
+import "../std/atom_constants.mlr"
+import "../std/sys.mlr"
+
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn puts(uint64 s) -> uint32
+
+fn _print_dec(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(64)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint64 digits = 0
+    if v == 0 {
+        uint8 z = 48; unsafe { *((b + ll + 1) as uint8) = z }; digits = 1
+    } else {
+        uint64 t = v
+        while t > 0 { digits = digits + 1; t = t / 10 }
+        uint64 k = digits
+        t = v
+        while k > 0 {
+            k = k - 1
+            uint64 d = t - (t / 10) * 10
+            uint8 db = d + 48
+            unsafe { *((b + ll + 1 + k) as uint8) = db }
+            t = t / 10
+        }
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 1 + digits) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+fn main() {
+    puts("phase3_atom_eot_test")
+
+    // Build a synthetic 64-byte ATOM image. Layout:
+    //   [0x00..0x07]: padding (mlrift unsafe writes don't need AA55 magic
+    //                 since atom_execute_table doesn't call atom_validate_image)
+    //   [0x08]: cmd-table HEADER starts here.
+    //           [0..1] uint16 size = 7 (header 6 bytes + 1 bytecode byte)
+    //           [2]    fmt_rev = 0
+    //           [3]    content_rev = 0
+    //           [4]    ws_dwords = 0
+    //           [5]    ps_dwords = 0
+    //           [6]    bytecode[0] = 91 (ATOM_OP_EOT)
+    //   The cmd_table_offset we pass to atom_execute_table is 0x08.
+
+    uint64 image_size = 64
+    uint64 image = alloc(image_size)
+    uint64 i = 0
+    while i < image_size { uint8 z = 0; unsafe { *((image + i) as uint8) = z }; i = i + 1 }
+
+    uint64 ct = 8
+    uint16 ct_size = 7
+    unsafe { *((image + ct + 0) as uint16) = ct_size }
+    uint8 ws = 0; unsafe { *((image + ct + 4) as uint8) = ws }
+    uint8 ps = 0; unsafe { *((image + ct + 5) as uint8) = ps }
+    uint8 eot = 91; unsafe { *((image + ct + 6) as uint8) = eot }
+
+    // Allocate + populate atom_context.
+    uint64 ctx = alloc(ATOM_CONTEXT_SIZE)
+    i = 0
+    while i < ATOM_CONTEXT_SIZE { uint8 z = 0; unsafe { *((ctx + i) as uint8) = z }; i = i + 1 }
+    unsafe { *((ctx + AC_OFF_IMAGE_BUF)  as uint64) = image }
+    unsafe { *((ctx + AC_OFF_IMAGE_SIZE) as uint64) = image_size }
+
+    // Run the EOT-only program.
+    uint64 rc = atom_execute_table(ctx, ct, 0, 0)
+    _print_dec("rc_eot", 6, rc)
+    if rc != 0 {
+        puts("FAIL: EOT-only program did not return 0")
+        dealloc(ctx); dealloc(image); exit(1)
+    }
+
+    // Sanity: replace the EOT byte with an unimplemented opcode (1 = move REG)
+    // and confirm rc=2 (panic detected).
+    uint8 mv = 1; unsafe { *((image + ct + 6) as uint8) = mv }
+    // Bump ct_size to 32 so the bytecode loop doesn't ran-off-end before
+    // the panic actually fires (since op 1 reads several operand bytes
+    // we'd otherwise stop at bytecode_end). After panic is set, the
+    // outer loop exits immediately.
+    uint16 big = 32
+    unsafe { *((image + ct + 0) as uint16) = big }
+    uint64 rc2 = atom_execute_table(ctx, ct, 0, 0)
+    _print_dec("rc_unimpl", 9, rc2)
+    if rc2 != 2 {
+        puts("FAIL: unimplemented opcode did not produce rc=2")
+        dealloc(ctx); dealloc(image); exit(2)
+    }
+
+    // Sanity: cmd_table_offset == 0 should produce rc=1.
+    uint64 rc3 = atom_execute_table(ctx, 0, 0, 0)
+    _print_dec("rc_null", 7, rc3)
+    if rc3 != 1 {
+        puts("FAIL: null cmd_table_offset did not produce rc=1")
+        dealloc(ctx); dealloc(image); exit(3)
+    }
+
+    dealloc(ctx); dealloc(image)
+    puts("phase3_atom_eot_test: GREEN")
+    exit(0)
+}
