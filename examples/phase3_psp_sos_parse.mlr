@@ -1,0 +1,240 @@
+// Phase 3 slice δ.0 — parse psp_13_0_10_sos.bin v2 firmware header.
+//
+// Pure file parsing, NO GPU touches. Lists every sub-blob (kdb,
+// sys_drv, soc_drv, sos, etc.) with its file-offset + size + version.
+// Slice δ.2+ will DMA the relevant sub-blobs into VRAM and command
+// PSP to load them.
+//
+// Reads from /tmp/mlrift_fw/psp_13_0_10_sos.bin (decompressed during
+// γ.2 verify; if missing, run phase3_zstd_verify_all first to populate
+// the cache).
+
+import "../std/amdgpu_firmware.mlr"
+import "../std/sys.mlr"
+
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn puts(uint64 s) -> uint32
+
+fn _print_label_dec(uint64 label, uint64 lab_len, uint64 val) {
+    uint64 buf = alloc(64)
+    uint64 i = 0
+    while i < lab_len {
+        uint8 c = 0; unsafe { *((label + i) as uint8) -> c }
+        unsafe { *((buf + i) as uint8) = c }
+        i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((buf + lab_len) as uint8) = eq }
+    uint64 digits = 0
+    if val == 0 {
+        uint8 z = 48; unsafe { *((buf + lab_len + 1) as uint8) = z }
+        digits = 1
+    } else {
+        uint64 t = val
+        while t > 0 { digits = digits + 1; t = t / 10 }
+        uint64 k = digits
+        t = val
+        while k > 0 {
+            k = k - 1
+            uint64 d = t - (t / 10) * 10
+            uint8 db = d + 48
+            unsafe { *((buf + lab_len + 1 + k) as uint8) = db }
+            t = t / 10
+        }
+    }
+    uint8 nul = 0; unsafe { *((buf + lab_len + 1 + digits) as uint8) = nul }
+    puts(buf)
+    dealloc(buf)
+}
+
+fn _print_label_hex32(uint64 label, uint64 lab_len, uint64 val) {
+    uint64 buf = alloc(64)
+    uint64 i = 0
+    while i < lab_len {
+        uint8 c = 0; unsafe { *((label + i) as uint8) -> c }
+        unsafe { *((buf + i) as uint8) = c }
+        i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((buf + lab_len) as uint8) = eq }
+    uint8 zx = 48; unsafe { *((buf + lab_len + 1) as uint8) = zx }
+    uint8 xc = 120; unsafe { *((buf + lab_len + 2) as uint8) = xc }
+    uint64 j = 0
+    while j < 8 {
+        uint64 sh = (7 - j) * 4
+        uint64 nyb = (val >> sh) & 0xF
+        uint8 ch = nyb + 48
+        if nyb >= 10 { ch = nyb + 87 }
+        unsafe { *((buf + lab_len + 3 + j) as uint8) = ch }
+        j = j + 1
+    }
+    uint8 nul = 0; unsafe { *((buf + lab_len + 11) as uint8) = nul }
+    puts(buf)
+    dealloc(buf)
+}
+
+fn _fw_type_name(uint64 t) -> uint64 {
+    if t == 0  { return "UNKNOWN" }
+    if t == 1  { return "SOS" }
+    if t == 2  { return "SYS_DRV" }
+    if t == 3  { return "KDB" }
+    if t == 4  { return "TOC" }
+    if t == 5  { return "KEYDB" }
+    if t == 6  { return "SPL" }
+    if t == 7  { return "RL" }
+    if t == 8  { return "SOC_DRV" }
+    if t == 9  { return "INTF_DRV" }
+    if t == 10 { return "DBG_DRV" }
+    if t == 11 { return "RAS_DRV" }
+    return "?"
+}
+
+fn main() {
+    puts("phase3_psp_sos_parse: psp_13_0_10_sos.bin v2 header walk")
+
+    uint64 path = "/tmp/mlrift_fw/psp_13_0_10_sos.bin"
+    uint64 bp = alloc(8); unsafe { *(bp as uint64) = 0 }
+    uint64 sp = alloc(8); unsafe { *(sp as uint64) = 0 }
+    uint64 le = fw_load_file(path, bp, sp)
+    if le != 0 {
+        _print_label_dec("FAIL fw_load_file errno", 23, le)
+        exit(1)
+    }
+    uint64 buf = 0; unsafe { *(bp as uint64) -> buf }
+    uint64 sz  = 0; unsafe { *(sp as uint64) -> sz }
+    dealloc(bp); dealloc(sp)
+
+    _print_label_dec("file_size_bytes", 15, sz)
+
+    // Common header validation.
+    uint64 ve = fw_validate_common_header(buf, sz)
+    if ve != 0 {
+        _print_label_dec("FAIL fw_validate_common_header", 30, ve)
+        dealloc(buf)
+        exit(2)
+    }
+
+    uint64 hmaj = fw_header_version_major(buf)
+    uint64 hmin = fw_header_version_minor(buf)
+    _print_label_dec("header_version_major", 20, hmaj)
+    _print_label_dec("header_version_minor", 20, hmin)
+    if hmaj != 2 {
+        puts("FAIL: not a v2.x PSP firmware header")
+        dealloc(buf)
+        exit(3)
+    }
+
+    uint64 hsz = fw_header_size_bytes(buf)
+    _print_label_dec("header_size_bytes", 17, hsz)
+    _print_label_hex32("ucode_version", 13, fw_ucode_version(buf))
+
+    uint64 cnt = psp_v2_bin_count(buf)
+    _print_label_dec("psp_fw_bin_count", 16, cnt)
+    uint64 tbl_off = psp_v2_desc_table_offset(buf)
+    _print_label_dec("desc_table_offset", 17, tbl_off)
+
+    if tbl_off == 0 {
+        puts("FAIL: unsupported v2 minor")
+        dealloc(buf)
+        exit(4)
+    }
+
+    // Per amdgpu_psp.c::parse_sos_bin_descriptor, each desc->offset_bytes
+    // is RELATIVE to header.ucode_array_offset_bytes. File offset =
+    // ucode_array_offset_bytes + desc->offset_bytes.
+    uint64 uaob = fw_ucode_array_offset_bytes(buf)
+    _print_label_dec("ucode_array_offset_bytes", 24, uaob)
+
+    puts("--- sub-blob descriptors ---")
+    uint64 dp = alloc(32)
+    uint64 i = 0
+    while i < cnt {
+        unsafe { *((dp + 0)  as uint64) = 0 }
+        unsafe { *((dp + 8)  as uint64) = 0 }
+        unsafe { *((dp + 16) as uint64) = 0 }
+        unsafe { *((dp + 24) as uint64) = 0 }
+        uint64 r = psp_v2_get_desc(buf, sz, i, dp + 0, dp + 8, dp + 16, dp + 24)
+        if r != 0 {
+            _print_label_dec("FAIL get_desc errno", 19, r)
+            _print_label_dec("  at idx", 8, i)
+            dealloc(dp)
+            dealloc(buf)
+            exit(5)
+        }
+        uint64 t  = 0; unsafe { *((dp + 0)  as uint64) -> t }
+        uint64 vr = 0; unsafe { *((dp + 8)  as uint64) -> vr }
+        uint64 of = 0; unsafe { *((dp + 16) as uint64) -> of }
+        uint64 sb = 0; unsafe { *((dp + 24) as uint64) -> sb }
+        _print_label_dec("idx", 3, i)
+        uint64 nm = _fw_type_name(t)
+        puts(nm)
+        _print_label_dec("  type_num", 10, t)
+        _print_label_hex32("  fw_version", 12, vr)
+        _print_label_hex32("  rel_offset", 12, of)
+        uint64 file_off = uaob + of
+        _print_label_hex32("  file_offset", 13, file_off)
+        _print_label_dec("  size_bytes", 12, sb)
+        if file_off + sb > sz {
+            puts("  FAIL: sub-blob extends past EOF")
+            dealloc(dp); dealloc(buf)
+            exit(6)
+        }
+        if file_off < hsz {
+            puts("  FAIL: sub-blob file-offset lands inside header area")
+            dealloc(dp); dealloc(buf)
+            exit(7)
+        }
+        i = i + 1
+    }
+    dealloc(dp)
+
+    // Quick lookup test for the sub-blobs slice δ needs.
+    puts("--- lookup test ---")
+    uint64 lp = alloc(16)
+    unsafe { *((lp + 0) as uint64) = 0 }
+    unsafe { *((lp + 8) as uint64) = 0 }
+    uint64 lr_sys = psp_v2_find(buf, sz, PSP_FW_TYPE_SYS_DRV, lp + 0, lp + 8)
+    _print_label_dec("find_SYS_DRV_rc", 15, lr_sys)
+    if lr_sys == 0 {
+        uint64 of_sys = 0; unsafe { *((lp + 0) as uint64) -> of_sys }
+        uint64 sz_sys = 0; unsafe { *((lp + 8) as uint64) -> sz_sys }
+        _print_label_hex32("  SYS_DRV_offset", 16, of_sys)
+        _print_label_dec("  SYS_DRV_size",   14, sz_sys)
+    }
+
+    unsafe { *((lp + 0) as uint64) = 0 }
+    unsafe { *((lp + 8) as uint64) = 0 }
+    uint64 lr_sos = psp_v2_find(buf, sz, PSP_FW_TYPE_SOS, lp + 0, lp + 8)
+    _print_label_dec("find_SOS_rc", 11, lr_sos)
+    if lr_sos == 0 {
+        uint64 of_sos = 0; unsafe { *((lp + 0) as uint64) -> of_sos }
+        uint64 sz_sos = 0; unsafe { *((lp + 8) as uint64) -> sz_sos }
+        _print_label_hex32("  SOS_offset", 12, of_sos)
+        _print_label_dec("  SOS_size",   10, sz_sos)
+    }
+
+    unsafe { *((lp + 0) as uint64) = 0 }
+    unsafe { *((lp + 8) as uint64) = 0 }
+    uint64 lr_kdb = psp_v2_find(buf, sz, PSP_FW_TYPE_KDB, lp + 0, lp + 8)
+    _print_label_dec("find_KDB_rc", 11, lr_kdb)
+    if lr_kdb == 0 {
+        uint64 of_kdb = 0; unsafe { *((lp + 0) as uint64) -> of_kdb }
+        uint64 sz_kdb = 0; unsafe { *((lp + 8) as uint64) -> sz_kdb }
+        _print_label_hex32("  KDB_offset", 12, of_kdb)
+        _print_label_dec("  KDB_size",   10, sz_kdb)
+    }
+
+    unsafe { *((lp + 0) as uint64) = 0 }
+    unsafe { *((lp + 8) as uint64) = 0 }
+    uint64 lr_soc = psp_v2_find(buf, sz, PSP_FW_TYPE_SOC_DRV, lp + 0, lp + 8)
+    _print_label_dec("find_SOC_DRV_rc", 15, lr_soc)
+    if lr_soc == 0 {
+        uint64 of_soc = 0; unsafe { *((lp + 0) as uint64) -> of_soc }
+        uint64 sz_soc = 0; unsafe { *((lp + 8) as uint64) -> sz_soc }
+        _print_label_hex32("  SOC_DRV_offset", 16, of_soc)
+        _print_label_dec("  SOC_DRV_size",   14, sz_soc)
+    }
+
+    dealloc(lp)
+    dealloc(buf)
+    puts("phase3_psp_sos_parse: GREEN")
+    exit(0)
+}

@@ -153,6 +153,131 @@ fn fw_ucode_data_ptr(uint64 buf) -> uint64 {
     return buf + off
 }
 
+// =====================================================================
+// PSP firmware header v2 — used by psp_13_0_10_sos.bin (and TA).
+//
+// Layout (drivers/gpu/drm/amd/include/amdgpu_ucode.h):
+//   struct psp_firmware_header_v2_0 {
+//       struct common_firmware_header header;   // 32 bytes
+//       uint32_t psp_fw_bin_count;              // offset 32
+//       struct psp_fw_bin_desc psp_fw_bin[];    // offset 36 (v2.0)
+//   };
+//   struct psp_firmware_header_v2_1 {
+//       struct common_firmware_header header;   // 32 bytes
+//       uint32_t psp_fw_bin_count;              // offset 32
+//       uint32_t psp_aux_fw_bin_index;          // offset 36
+//       uint32_t evbin_fw_bin_index;            // offset 40
+//       struct psp_fw_bin_desc psp_fw_bin[];    // offset 44 (v2.1)
+//   };
+//   struct psp_fw_bin_desc {
+//       uint32_t fw_type;
+//       uint32_t fw_version;
+//       uint32_t offset_bytes;
+//       uint32_t size_bytes;
+//   };
+//
+// fw_type enum (amdgpu_psp.h enum psp_fw_type):
+static uint64 PSP_FW_TYPE_UNKNOWN   = 0
+static uint64 PSP_FW_TYPE_SOS       = 1
+static uint64 PSP_FW_TYPE_SYS_DRV   = 2
+static uint64 PSP_FW_TYPE_KDB       = 3
+static uint64 PSP_FW_TYPE_TOC       = 4
+static uint64 PSP_FW_TYPE_KEYDB     = 5
+static uint64 PSP_FW_TYPE_SPL       = 6
+static uint64 PSP_FW_TYPE_RL        = 7
+static uint64 PSP_FW_TYPE_SOC_DRV   = 8
+static uint64 PSP_FW_TYPE_INTF_DRV  = 9
+static uint64 PSP_FW_TYPE_DBG_DRV   = 10
+static uint64 PSP_FW_TYPE_RAS_DRV   = 11
+
+static uint64 PSP_FW_BIN_DESC_SIZE  = 16
+
+// Byte offset (within the file) at which the descriptor array begins.
+// Caller must pre-validate the common header. Returns 0 if the header
+// version is not v2.0 / v2.1.
+fn psp_v2_desc_table_offset(uint64 buf) -> uint64 {
+    uint64 maj = fw_header_version_major(buf)
+    uint64 minr = fw_header_version_minor(buf)
+    if maj != 2 { return 0 }
+    if minr == 0 { return 36 }
+    if minr == 1 { return 44 }
+    return 0
+}
+
+// Number of psp_fw_bin descriptors in this blob. Lives at file
+// offset 32 regardless of v2.x minor.
+fn psp_v2_bin_count(uint64 buf) -> uint32 {
+    uint32 v = 0
+    unsafe { *((buf + 32) as uint32) -> v }
+    return v
+}
+
+// Read descriptor field by 4-tuple (fw_type, fw_version, offset_bytes,
+// size_bytes). idx in [0, psp_v2_bin_count). Writes through out_*
+// pointers. Returns 0 on success, non-zero if idx out of range or
+// header version unsupported.
+fn psp_v2_get_desc(uint64 buf,
+                   uint64 file_size,
+                   uint64 idx,
+                   uint64 out_fw_type,
+                   uint64 out_fw_version,
+                   uint64 out_offset_bytes,
+                   uint64 out_size_bytes) -> uint64 {
+    uint64 tbl_off = psp_v2_desc_table_offset(buf)
+    if tbl_off == 0 { return 1 }
+    uint64 cnt = psp_v2_bin_count(buf)
+    if idx >= cnt { return 2 }
+    uint64 d_off = tbl_off + idx * PSP_FW_BIN_DESC_SIZE
+    if d_off + PSP_FW_BIN_DESC_SIZE > file_size { return 3 }
+    uint32 t  = 0; unsafe { *((buf + d_off + 0)  as uint32) -> t }
+    uint32 vr = 0; unsafe { *((buf + d_off + 4)  as uint32) -> vr }
+    uint32 of = 0; unsafe { *((buf + d_off + 8)  as uint32) -> of }
+    uint32 sz = 0; unsafe { *((buf + d_off + 12) as uint32) -> sz }
+    uint64 t64  = t
+    uint64 vr64 = vr
+    uint64 of64 = of
+    uint64 sz64 = sz
+    unsafe { *(out_fw_type      as uint64) = t64 }
+    unsafe { *(out_fw_version   as uint64) = vr64 }
+    unsafe { *(out_offset_bytes as uint64) = of64 }
+    unsafe { *(out_size_bytes   as uint64) = sz64 }
+    return 0
+}
+
+// Look up the descriptor for a given fw_type. Writes (offset_bytes,
+// size_bytes) into the out pointers. Returns 0 on hit, 1 if not found.
+fn psp_v2_find(uint64 buf,
+               uint64 file_size,
+               uint64 fw_type,
+               uint64 out_offset_bytes,
+               uint64 out_size_bytes) -> uint64 {
+    uint64 cnt = psp_v2_bin_count(buf)
+    uint64 i = 0
+    uint64 sp = alloc(32)
+    while i < cnt {
+        unsafe { *((sp + 0)  as uint64) = 0 }
+        unsafe { *((sp + 8)  as uint64) = 0 }
+        unsafe { *((sp + 16) as uint64) = 0 }
+        unsafe { *((sp + 24) as uint64) = 0 }
+        uint64 r = psp_v2_get_desc(buf, file_size, i,
+                                   sp + 0, sp + 8, sp + 16, sp + 24)
+        if r == 0 {
+            uint64 t = 0; unsafe { *((sp + 0)  as uint64) -> t }
+            if t == fw_type {
+                uint64 of = 0; unsafe { *((sp + 16) as uint64) -> of }
+                uint64 sz = 0; unsafe { *((sp + 24) as uint64) -> sz }
+                unsafe { *(out_offset_bytes as uint64) = of }
+                unsafe { *(out_size_bytes   as uint64) = sz }
+                dealloc(sp)
+                return 0
+            }
+        }
+        i = i + 1
+    }
+    dealloc(sp)
+    return 1
+}
+
 // Sanity check — reject the blob if header_size_bytes is implausible.
 // Returns 0 if header looks valid, non-zero otherwise.
 //
