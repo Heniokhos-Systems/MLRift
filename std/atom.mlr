@@ -601,6 +601,156 @@ fn _atom_op_compare(uint64 ectx, uint64 ptr_ptr, uint64 arg) {
 }
 
 // =====================================================================
+// Opcode batch 2 — control flow (slice δ.0h).
+// Ports: atom_op_jump, atom_op_calltable, atom_op_switch,
+//        atom_op_repeat, atom_op_nop.
+// =====================================================================
+
+// atom_op_nop (atom.c:842-845) — literally nothing.
+fn _atom_op_nop(uint64 ectx, uint64 ptr_ptr, uint64 arg) {
+}
+
+// atom_op_repeat (atom.c:867-870)
+// The kernel marks this "unimplemented!" and the body is a no-op.
+// We skip 2 bytes for the u16 count field (matching what a real implementation
+// would consume) then return without looping — same as kernel behaviour.
+fn _atom_op_repeat(uint64 ectx, uint64 ptr_ptr, uint64 arg) {
+    uint64 ptr_val = 0; unsafe { *(ptr_ptr as uint64) -> ptr_val }
+    unsafe { *(ptr_ptr as uint64) = ptr_val + 2 }
+}
+
+// atom_op_jump (atom.c:729-781)
+// Reads a uint16 target offset (from bytecode_start), evaluates the
+// condition against last_dst (set by the most recent compare/test),
+// and jumps if the condition is met.
+//
+// Condition flag derivation (unsigned, matching kernel's uint32_t compare):
+//   last_dst = dst - src  (computed by _atom_op_compare)
+//   cs_equal   = (last_dst == 0)               — equal
+//   cs_above   = (last_dst != 0) && (hi32 == 0) — unsigned dst > src (no borrow)
+//   cs_aboveq  = (hi32 == 0)                   — unsigned dst >= src (no borrow)
+//
+// arg = ATOM_COND_* (0=ABOVE 1=ABOVEOREQUAL 2=ALWAYS 3=BELOW
+//                    4=BELOWOREQUAL 5=EQUAL 6=NOTEQUAL)
+fn _atom_op_jump(uint64 ectx, uint64 ptr_ptr, uint64 arg) {
+    uint64 ctx = 0; unsafe { *((ectx + AEC_OFF_CTX) as uint64) -> ctx }
+    uint64 image = 0; unsafe { *((ctx + AC_OFF_IMAGE_BUF) as uint64) -> image }
+
+    // Read uint16 target; advance ptr by 2.
+    uint64 ptr_val = 0; unsafe { *(ptr_ptr as uint64) -> ptr_val }
+    uint16 tgt_w = 0; unsafe { *((image + ptr_val) as uint16) -> tgt_w }
+    uint64 target = tgt_w
+    unsafe { *(ptr_ptr as uint64) = ptr_val + 2 }
+
+    // Derive condition flags from last_dst.
+    uint64 last_dst = 0; unsafe { *((ectx + AEC_OFF_LAST_DST) as uint64) -> last_dst }
+    uint64 hi32 = (last_dst >> 32) & 0xFFFFFFFF
+    uint64 cs_equal = 0; if last_dst == 0 { cs_equal = 1 }
+    uint64 cs_aboveq = 0; if hi32 == 0 { cs_aboveq = 1 }       // no borrow → dst >= src
+    uint64 cs_above = 0; if cs_equal == 0 && cs_aboveq == 1 { cs_above = 1 }  // dst > src
+
+    uint64 execute = 0
+    if arg == ATOM_COND_ABOVE        { if cs_above  == 1 { execute = 1 } }
+    if arg == ATOM_COND_ABOVEOREQUAL { if cs_aboveq == 1 { execute = 1 } }
+    if arg == ATOM_COND_ALWAYS       { execute = 1 }
+    if arg == ATOM_COND_BELOW        { if cs_aboveq == 0 { execute = 1 } }   // !cs_above && !cs_equal
+    if arg == ATOM_COND_BELOWOREQUAL { if cs_above  == 0 { execute = 1 } }   // !cs_above
+    if arg == ATOM_COND_EQUAL        { if cs_equal  == 1 { execute = 1 } }
+    if arg == ATOM_COND_NOTEQUAL     { if cs_equal  == 0 { execute = 1 } }
+
+    if execute == 1 {
+        uint64 start_ptr = 0; unsafe { *((ectx + AEC_OFF_START_PTR) as uint64) -> start_ptr }
+        unsafe { *(ptr_ptr as uint64) = start_ptr + target }
+    }
+}
+
+// atom_op_calltable (atom.c:632-646)
+// Reads a u8 sub-table index, resolves it via the cmd-table list in the
+// image, then recursively calls atom_execute_table with the caller's ps.
+fn _atom_op_calltable(uint64 ectx, uint64 ptr_ptr, uint64 arg) {
+    uint64 ctx = 0; unsafe { *((ectx + AEC_OFF_CTX) as uint64) -> ctx }
+    uint64 image = 0; unsafe { *((ctx + AC_OFF_IMAGE_BUF) as uint64) -> image }
+
+    // Read u8 index; advance ptr by 1.
+    uint64 ptr_val = 0; unsafe { *(ptr_ptr as uint64) -> ptr_val }
+    uint8 idx_b = 0; unsafe { *((image + ptr_val) as uint8) -> idx_b }
+    uint64 idx = idx_b
+    unsafe { *(ptr_ptr as uint64) = ptr_val + 1 }
+
+    // Resolve sub-table offset via cmd-table list:
+    //   image[cmd_table_list_base + 4 + 2*idx]  (uint16)
+    uint64 cmd_list_base = 0; unsafe { *((ctx + AC_OFF_CMD_TABLE_BASE) as uint64) -> cmd_list_base }
+    uint16 sub_off_w = 0; unsafe { *((image + cmd_list_base + 4 + idx * 2) as uint16) -> sub_off_w }
+    uint64 sub_off = sub_off_w
+    if sub_off == 0 { return }   // table not present — silent skip (kernel omits call)
+
+    // Pass caller's ps through.
+    uint64 ps_ptr = 0; unsafe { *((ectx + AEC_OFF_PS) as uint64) -> ps_ptr }
+    uint32 ps_size_r = 0; unsafe { *((ectx + AEC_OFF_PS_SIZE) as uint32) -> ps_size_r }
+    uint64 ps_size = ps_size_r
+
+    uint64 r = atom_execute_table(ctx, sub_off, ps_ptr, ps_size)
+    if r != 0 {
+        unsafe { *((ectx + AEC_OFF_ABORT) as uint64) = 0xDEAD }
+    }
+}
+
+// atom_op_switch (atom.c:1021-1046)
+// Reads attr, reads src via get_src, then scans (case-magic, val, target)
+// pairs until ATOM_CASE_END (0x5A5A). On match: jump to start+target.
+fn _atom_op_switch(uint64 ectx, uint64 ptr_ptr, uint64 arg) {
+    uint64 ctx = 0; unsafe { *((ectx + AEC_OFF_CTX) as uint64) -> ctx }
+    uint64 image = 0; unsafe { *((ctx + AC_OFF_IMAGE_BUF) as uint64) -> image }
+
+    // Read attr byte; advance ptr by 1.
+    uint64 ptr_val = 0; unsafe { *(ptr_ptr as uint64) -> ptr_val }
+    uint8 attr_b = 0; unsafe { *((image + ptr_val) as uint8) -> attr_b }
+    uint64 attr = attr_b
+    unsafe { *(ptr_ptr as uint64) = ptr_val + 1 }
+
+    uint64 src = _atom_get_src(ectx, attr, ptr_ptr)
+
+    // Scan case list.
+    uint64 done = 0
+    while done == 0 {
+        uint64 cur = 0; unsafe { *(ptr_ptr as uint64) -> cur }
+        // Peek uint16 — is it ATOM_CASE_END?
+        uint16 peek_w = 0; unsafe { *((image + cur) as uint16) -> peek_w }
+        uint64 peek = peek_w
+        if peek == ATOM_CASE_END {
+            // Skip the end marker and exit.
+            unsafe { *(ptr_ptr as uint64) = cur + 2 }
+            done = 1
+        } else {
+            // Check low byte for ATOM_CASE_MAGIC (0x63).
+            uint8 lo_b = 0; unsafe { *((image + cur) as uint8) -> lo_b }
+            uint64 lo = lo_b
+            if lo == ATOM_CASE_MAGIC {
+                unsafe { *(ptr_ptr as uint64) = cur + 1 }   // skip magic byte
+                // Read IMM val using (attr & 0x38) | ATOM_ARG_IMM.
+                uint64 imm_attr = (attr & 0x38) | ATOM_ARG_IMM
+                uint64 val = _atom_get_src(ectx, imm_attr, ptr_ptr)
+                // Read target uint16.
+                uint64 cur2 = 0; unsafe { *(ptr_ptr as uint64) -> cur2 }
+                uint16 tgt_w = 0; unsafe { *((image + cur2) as uint16) -> tgt_w }
+                uint64 tgt = tgt_w
+                if val == src {
+                    uint64 start_ptr = 0; unsafe { *((ectx + AEC_OFF_START_PTR) as uint64) -> start_ptr }
+                    unsafe { *(ptr_ptr as uint64) = start_ptr + tgt }
+                    done = 1
+                } else {
+                    unsafe { *(ptr_ptr as uint64) = cur2 + 2 }  // skip target
+                }
+            } else {
+                // Bad case — abort.
+                unsafe { *((ectx + AEC_OFF_ABORT) as uint64) = 0xDEAD }
+                done = 1
+            }
+        }
+    }
+}
+
+// =====================================================================
 // Opcode arg lookup — copy of opcode_table[] from amdgpu/atom.c:1090.
 // Returns the 2nd field (`arg` value) of each entry. Slot 0 (NULL) and
 // any unknown op return 0. Slot ATOM_OP_EOT (91) returns 0.
@@ -820,6 +970,22 @@ fn _atom_dispatch(uint64 op, uint64 ectx, uint64 ptr_ptr) {
     // div32: ops 125..126
     if op == 125 { _atom_op_div32(ectx, ptr_ptr, arg); return }
     if op == 126 { _atom_op_div32(ectx, ptr_ptr, arg); return }
+    // switch: op 66
+    if op == 66 { _atom_op_switch(ectx, ptr_ptr, arg); return }
+    // jump (7 condition variants): ops 67..73
+    if op == 67 { _atom_op_jump(ectx, ptr_ptr, arg); return }
+    if op == 68 { _atom_op_jump(ectx, ptr_ptr, arg); return }
+    if op == 69 { _atom_op_jump(ectx, ptr_ptr, arg); return }
+    if op == 70 { _atom_op_jump(ectx, ptr_ptr, arg); return }
+    if op == 71 { _atom_op_jump(ectx, ptr_ptr, arg); return }
+    if op == 72 { _atom_op_jump(ectx, ptr_ptr, arg); return }
+    if op == 73 { _atom_op_jump(ectx, ptr_ptr, arg); return }
+    // calltable: op 82
+    if op == 82 { _atom_op_calltable(ectx, ptr_ptr, arg); return }
+    // repeat: op 83
+    if op == 83 { _atom_op_repeat(ectx, ptr_ptr, arg); return }
+    // nop: op 90
+    if op == 90 { _atom_op_nop(ectx, ptr_ptr, arg); return }
     _atom_op_panic(ectx, ptr_ptr, arg)
 }
 
