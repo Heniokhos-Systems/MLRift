@@ -178,7 +178,53 @@ static uint64 ATOM_EXEC_CONTEXT_SIZE  = 80    // bumped from 64
 // =====================================================================
 
 // Panic — set abort to a sentinel so callers can detect.
+static uint64 _atom_last_panic_op  = 0xFFFFFFFFFFFFFFFF
+static uint64 _atom_last_panic_ptr = 0
+fn atom_last_panic_op() -> uint64 { return _atom_last_panic_op }
+fn atom_last_panic_ptr() -> uint64 { return _atom_last_panic_ptr }
+
+// Dispatch trace ring buffer — last 64 (ptr_before, op) pairs.
+// _atom_trace_idx is monotonically increasing; modulo 64 gives the slot.
+static uint64 _atom_trace_idx     = 0
+static uint64 _atom_trace_ptrs    = 0   // allocated to 64 * 8 bytes on first dispatch
+static uint64 _atom_trace_ops     = 0
+fn _atom_trace_init() {
+    if _atom_trace_ptrs == 0 {
+        _atom_trace_ptrs = alloc(64 * 8)
+        _atom_trace_ops  = alloc(64 * 8)
+        uint64 i = 0
+        while i < 64 * 8 {
+            uint8 z = 0
+            unsafe { *((_atom_trace_ptrs + i) as uint8) = z }
+            unsafe { *((_atom_trace_ops  + i) as uint8) = z }
+            i = i + 1
+        }
+    }
+}
+fn _atom_trace_record(uint64 ptr_before, uint64 op) {
+    if _atom_trace_ptrs == 0 { _atom_trace_init() }
+    uint64 slot = (_atom_trace_idx & 63) * 8
+    unsafe { *((_atom_trace_ptrs + slot) as uint64) = ptr_before }
+    unsafe { *((_atom_trace_ops  + slot) as uint64) = op }
+    _atom_trace_idx = _atom_trace_idx + 1
+}
+fn atom_trace_count() -> uint64 { return _atom_trace_idx }
+fn atom_trace_ptr_at(uint64 i) -> uint64 {
+    if _atom_trace_ptrs == 0 { return 0 }
+    uint64 slot = (i & 63) * 8
+    uint64 v = 0; unsafe { *((_atom_trace_ptrs + slot) as uint64) -> v }
+    return v
+}
+fn atom_trace_op_at(uint64 i) -> uint64 {
+    if _atom_trace_ops == 0 { return 0 }
+    uint64 slot = (i & 63) * 8
+    uint64 v = 0; unsafe { *((_atom_trace_ops + slot) as uint64) -> v }
+    return v
+}
+
 fn _atom_op_panic(uint64 ectx, uint64 ptr_ptr, uint64 arg) {
+    uint64 cur = 0; unsafe { *(ptr_ptr as uint64) -> cur }
+    _atom_last_panic_ptr = cur
     unsafe { *((ectx + AEC_OFF_ABORT) as uint64) = 0xDEAD }
 }
 
@@ -1017,6 +1063,7 @@ fn _atom_op_arg(uint64 op) -> uint64 {
 // =====================================================================
 fn _atom_dispatch(uint64 op, uint64 ectx, uint64 ptr_ptr) {
     uint64 arg = _atom_op_arg(op)
+    _atom_last_panic_op = op   // record (overwritten on next dispatch; final write before EOT/panic is what we'll see)
     if op == 91 { _atom_op_eot(ectx, ptr_ptr, arg); return }
     // move: ops 1..6
     if op == 1 { _atom_op_move(ectx, ptr_ptr, arg); return }
@@ -1226,7 +1273,11 @@ fn atom_execute_table(uint64 ctx,
         }
     }
     unsafe { *((ectx + AEC_OFF_CTX)       as uint64) = ctx }
-    unsafe { *((ectx + AEC_OFF_START_PTR) as uint64) = bytecode_start }
+    // ectx.start = cmd_table_offset (header start), NOT bytecode body
+    // start. Jump targets are u16 offsets RELATIVE TO THE HEADER —
+    // mirrors amdgpu_atom_execute_table_locked which sets ectx.start=base
+    // where base is the cmd-table header offset.
+    unsafe { *((ectx + AEC_OFF_START_PTR) as uint64) = cmd_table_offset }
     unsafe { *((ectx + AEC_OFF_PTR)       as uint64) = bytecode_start }
     unsafe { *((ectx + AEC_OFF_PS)        as uint64) = ps_ptr }
     unsafe { *((ectx + AEC_OFF_WS)        as uint64) = ws_buf }
@@ -1241,6 +1292,7 @@ fn atom_execute_table(uint64 ctx,
         else {
             uint8 op_b = 0; unsafe { *((image + ptr) as uint8) -> op_b }
             uint64 op = op_b
+            _atom_trace_record(ptr, op)
             unsafe { *((ectx + AEC_OFF_PTR) as uint64) = ptr + 1 }
             _atom_dispatch(op, ectx, ectx + AEC_OFF_PTR)
             unsafe { *((ectx + AEC_OFF_ABORT) as uint64) -> abort }

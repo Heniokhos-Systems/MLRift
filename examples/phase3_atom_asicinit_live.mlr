@@ -1,0 +1,314 @@
+// Phase 3 slice δ.N — FIRST LIVE GPU run via ATOM interpreter.
+//
+// Executes AsicInit (ATOM command-table index 0) on the actual dGPU
+// through VFIO, using the MLRift ATOM bytecode interpreter wired to
+// the real BAR5 host VA.
+//
+// Expected GREEN shape:
+//   pre.RCC_CONFIG_MEMSIZE  = 0x00000000   (VRAM not yet trained)
+//   pre.C2PMSG_35           = 0x80000000   (PSP bootloader ready)
+//   pre.C2PMSG_81           = 0x00000000   (SOS not yet loaded)
+//   AsicInit returned rc=0
+//   post.RCC_CONFIG_MEMSIZE = <non-zero>   (VRAM trained → GREEN)
+//
+// Failure modes:
+//   rc != 0 → AsicInit hit unimplemented opcode or panicked.
+//   RCC_CONFIG_MEMSIZE unchanged → init ran but MC didn't train.
+//   GPU wedge → subsequent BAR5 reads return 0xFF / hang.
+//
+// Recovery: kernel driver re-FLRs on rebind; worst case = full reboot.
+//
+// DO NOT run without sudo + VFIO group ownership for 0000:03:00.0.
+// The controller orchestrates the live run and commit.
+
+import "../std/pcidev.mlr"
+import "../std/amdgpu_ip_discovery.mlr"
+import "../std/atom.mlr"
+import "../std/sys.mlr"
+
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn puts(uint64 s) -> uint32
+
+// _hex32: print "label=0xXXXXXXXX\n"
+fn _hex32(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(64)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint8 zx = 48; unsafe { *((b + ll + 1) as uint8) = zx }
+    uint8 xc = 120; unsafe { *((b + ll + 2) as uint8) = xc }
+    uint64 j = 0
+    while j < 8 {
+        uint64 sh = (7 - j) * 4
+        uint64 nyb = (v >> sh) & 0xF
+        uint8 ch = nyb + 48
+        if nyb >= 10 { ch = nyb + 87 }
+        unsafe { *((b + ll + 3 + j) as uint8) = ch }
+        j = j + 1
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 11) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+// _dec: print "label=N\n"
+fn _dec(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(64)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint64 digits = 0
+    if v == 0 {
+        uint8 z = 48; unsafe { *((b + ll + 1) as uint8) = z }; digits = 1
+    } else {
+        uint64 t = v
+        while t > 0 { digits = digits + 1; t = t / 10 }
+        uint64 k = digits
+        t = v
+        while k > 0 {
+            k = k - 1
+            uint64 d = t - (t / 10) * 10
+            uint8 db = d + 48
+            unsafe { *((b + ll + 1 + k) as uint8) = db }
+            t = t / 10
+        }
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 1 + digits) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+// _bar5_read32: direct dword read from a BAR5 byte offset.
+fn _bar5_read32(uint64 bar5, uint64 byte_off) -> uint64 {
+    uint32 v = 0
+    unsafe { *((bar5 + byte_off) as uint32) -> v }
+    uint64 ret = v
+    return ret
+}
+
+fn main() {
+    puts("phase3_atom_asicinit_live (FIRST LIVE GPU AsicInit)")
+
+    // ------------------------------------------------------------------
+    // 1) Load /tmp/mlrift_vbios.rom into a heap buffer.
+    // ------------------------------------------------------------------
+    uint64 bp = alloc(8); unsafe { *(bp as uint64) = 0 }
+    uint64 sp = alloc(8); unsafe { *(sp as uint64) = 0 }
+    uint64 le = atom_load_image("/tmp/mlrift_vbios.rom", bp, sp)
+    if le != 0 {
+        _dec("FAIL atom_load_image", 20, le)
+        dealloc(bp); dealloc(sp); exit(1)
+    }
+    uint64 image_buf  = 0; unsafe { *(bp as uint64) -> image_buf }
+    uint64 image_size = 0; unsafe { *(sp as uint64) -> image_size }
+    dealloc(bp); dealloc(sp)
+    _dec("vbios_size_bytes", 16, image_size)
+
+    // ------------------------------------------------------------------
+    // 2) Validate the image (AA55 magic + ATOM signature).
+    // ------------------------------------------------------------------
+    uint64 ve = atom_validate_image(image_buf, image_size)
+    if ve != 0 {
+        _dec("FAIL atom_validate_image", 24, ve)
+        dealloc(image_buf); exit(2)
+    }
+    puts("vbios: ATOM signature OK")
+
+    // ------------------------------------------------------------------
+    // 3) Open VFIO device 0000:03:00.0 (VFIO group 14).
+    // ------------------------------------------------------------------
+    uint64 oe = pci_open("0000:03:00.0", 14)
+    if oe != 0 {
+        _dec("FAIL pci_open", 13, oe)
+        dealloc(image_buf); exit(3)
+    }
+
+    // ------------------------------------------------------------------
+    // 4) Load hardcoded IP bases for Navi32 (gfx11 / RX 7800 XT).
+    // ------------------------------------------------------------------
+    amdgpu_load_navi32_bases()
+
+    // ------------------------------------------------------------------
+    // 5) Map BAR5 (MMIO aperture, ~16 MiB on gfx11).
+    // ------------------------------------------------------------------
+    uint64 bar5 = pci_map_bar(PCI_BAR5_REGION_INDEX)
+    if bar5 == PCI_MAP_FAILED_SENTINEL {
+        puts("FAIL: BAR5 mmap")
+        pci_close(); dealloc(image_buf); exit(4)
+    }
+    _hex32("bar5_host_va", 12, bar5)
+
+    // ------------------------------------------------------------------
+    // 6) Enable Bus Master (PSP DMA + ATOM register writes need this).
+    // ------------------------------------------------------------------
+    uint64 bme = pci_set_bus_master()
+    if bme != 0 {
+        _dec("FAIL pci_set_bus_master", 23, bme)
+        sys_munmap(bar5, 0x100000)
+        pci_close(); dealloc(image_buf); exit(5)
+    }
+    _hex32("pci_cmd_after_bm", 16, pci_read_config32(0x04))
+
+    // ------------------------------------------------------------------
+    // 7) Pre-snapshot — read key registers before AsicInit.
+    //
+    //   RCC_CONFIG_MEMSIZE     : BAR5[0x37CC] — VRAM size in MB.
+    //                            Expect 0 before POST.
+    //   DOORBELL_APER_EN       : (nbif_base_2 + 0xC0) * 4 = 0x3780.
+    //                            Context register.
+    //   C2PMSG_35              : PSP bootloader ready (expect 0x80000000).
+    //   C2PMSG_81              : SOS sign-of-life (expect 0x00000000).
+    // ------------------------------------------------------------------
+    puts("--- pre-snapshot ---")
+
+    // RCC_CONFIG_MEMSIZE is at a fixed BAR5 byte offset 0x37CC on
+    // gfx11/gfx1100 (mmRCC_CONFIG_MEMSIZE, dword 0xDF3 = byte 0x37CC).
+    uint64 rcc_memsize_off    = 0x37CC
+    // NBIF DOORBELL_APER_EN: (amdgpu_ip_nbif_base_2 + 0xC0) * 4
+    //   = (0xD20 + 0xC0) * 4 = 0xDE0 * 4 = 0x3780
+    uint64 doorbell_aper_off  = 0x3780
+    // PSP C2PMSG_35: (amdgpu_ip_mp0_base_0 + PSP_REG_C2PMSG_35) * 4
+    //   = (0x16000 + 0x63) * 4 = 0x5818C
+    uint64 c2pmsg35_off       = 0x5818C
+    // PSP C2PMSG_81: (amdgpu_ip_mp0_base_0 + PSP_REG_C2PMSG_81) * 4
+    //   = (0x16000 + 0x91) * 4 = 0x58244
+    uint64 c2pmsg81_off       = 0x58244
+
+    uint64 pre_memsize    = _bar5_read32(bar5, rcc_memsize_off)
+    uint64 pre_doorbell   = _bar5_read32(bar5, doorbell_aper_off)
+    uint64 pre_c2pmsg35   = _bar5_read32(bar5, c2pmsg35_off)
+    uint64 pre_c2pmsg81   = _bar5_read32(bar5, c2pmsg81_off)
+
+    _hex32("pre_RCC_CONFIG_MEMSIZE", 22, pre_memsize)
+    _hex32("pre_DOORBELL_APER_EN",   20, pre_doorbell)
+    _hex32("pre_C2PMSG_35",          13, pre_c2pmsg35)
+    _hex32("pre_C2PMSG_81",          13, pre_c2pmsg81)
+
+    // Sanity check: PSP bootloader should be ready.
+    if pre_c2pmsg35 != 0x80000000 {
+        puts("WARN: C2PMSG_35 != 0x80000000 — bootloader may not be in fresh state")
+    }
+    if pre_c2pmsg81 != 0 {
+        puts("WARN: C2PMSG_81 != 0x00000000 — SOS may already be alive")
+    }
+
+    // ------------------------------------------------------------------
+    // 8) Initialize ATOM context with the REAL bar5 host VA.
+    //    atom_context_init wires all register reads/writes through BAR5.
+    // ------------------------------------------------------------------
+    uint64 ctx = atom_context_init(image_buf, image_size, bar5)
+    if ctx == 0 {
+        puts("FAIL: atom_context_init returned NULL")
+        sys_munmap(bar5, 0x100000)
+        pci_close(); dealloc(image_buf); exit(6)
+    }
+    puts("atom_context_init: OK")
+
+    // ------------------------------------------------------------------
+    // 9) Allocate 64-byte zero-filled AsicInit parameter block.
+    //    AsicInit (ATOM_CMD_INIT=0) on modern VBIOS reads defaults from
+    //    data_block; zero-filling the PS dwords is safe.
+    // ------------------------------------------------------------------
+    uint64 params     = alloc(64)
+    uint64 params_idx = 0
+    while params_idx < 64 {
+        uint8 z = 0; unsafe { *((params + params_idx) as uint8) = z }
+        params_idx = params_idx + 1
+    }
+
+    // ------------------------------------------------------------------
+    // 10) Last warning before execution.
+    // ------------------------------------------------------------------
+    puts("ABOUT TO INVOKE AsicInit (ATOM cmd index 0) — GPU may POST")
+
+    // ------------------------------------------------------------------
+    // 11) Execute AsicInit (cmd index 0, ps_size = 16 dwords).
+    //     atom_execute_table_by_index(ctx, idx, ps_ptr, ps_size)
+    //       idx     = 0  (ATOM_CMD_INIT = AsicInit)
+    //       ps_ptr  = params
+    //       ps_size = 16 (dword count for the PS block)
+    // ------------------------------------------------------------------
+    uint64 rc = atom_execute_table_by_index(ctx, 0, params, 16)
+
+    // ------------------------------------------------------------------
+    // 12) Print rc immediately so it's visible even if a crash follows.
+    // ------------------------------------------------------------------
+    _dec("AsicInit_rc", 11, rc)
+
+    // ------------------------------------------------------------------
+    // 13) Post-snapshot — same registers regardless of rc.
+    // ------------------------------------------------------------------
+    puts("--- post-snapshot ---")
+
+    uint64 post_memsize  = _bar5_read32(bar5, rcc_memsize_off)
+    uint64 post_doorbell = _bar5_read32(bar5, doorbell_aper_off)
+    uint64 post_c2pmsg35 = _bar5_read32(bar5, c2pmsg35_off)
+    uint64 post_c2pmsg81 = _bar5_read32(bar5, c2pmsg81_off)
+
+    _hex32("post_RCC_CONFIG_MEMSIZE", 23, post_memsize)
+    _hex32("post_DOORBELL_APER_EN",   21, post_doorbell)
+    _hex32("post_C2PMSG_35",          14, post_c2pmsg35)
+    _hex32("post_C2PMSG_81",          14, post_c2pmsg81)
+
+    puts("--- side-by-side ---")
+    _hex32("pre_memsize",  11, pre_memsize)
+    _hex32("post_memsize", 12, post_memsize)
+    _dec("memsize_delta", 13, post_memsize - pre_memsize)
+
+    // ------------------------------------------------------------------
+    // 14) Verdict.
+    // ------------------------------------------------------------------
+    uint64 verdict = 0
+    if rc != 0 {
+        puts("AsicInit returned non-zero — check for WARN/FAIL lines above")
+        _dec("AsicInit_rc_nonzero", 19, rc)
+        // rc=2 means panic was hit; print the last opcode + bytecode position.
+        if rc == 2 {
+            _dec("last_panic_op",  13, atom_last_panic_op())
+            _hex32("last_panic_ptr", 14, atom_last_panic_ptr())
+            // Dump the last 32 dispatched (ptr, op) pairs.
+            puts("--- trace (last 32 dispatches) ---")
+            uint64 total = atom_trace_count()
+            uint64 start = 0
+            if total > 32 { start = total - 32 }
+            uint64 i = start
+            while i < total {
+                uint64 p = atom_trace_ptr_at(i)
+                uint64 o = atom_trace_op_at(i)
+                _hex32("  ptr", 5, p)
+                _dec("  op",   4, o)
+                i = i + 1
+            }
+        }
+        verdict = 1
+    }
+    if post_memsize == pre_memsize {
+        if post_memsize == 0 {
+            puts("RCC_CONFIG_MEMSIZE still 0 — VRAM did not train")
+            verdict = 1
+        }
+    }
+    if verdict == 0 {
+        puts("phase3_atom_asicinit_live: GREEN — VRAM trained")
+    }
+
+    // ------------------------------------------------------------------
+    // 15) Cleanup — always executed (even on failure path above, since
+    //     we fall through rather than exit early).
+    // ------------------------------------------------------------------
+    atom_context_free(ctx)
+    dealloc(image_buf)
+    dealloc(params)
+    sys_munmap(bar5, 0x100000)
+    pci_close()
+
+    if verdict != 0 {
+        puts("phase3_atom_asicinit_live: FAIL")
+        exit(1)
+    }
+    exit(0)
+}
