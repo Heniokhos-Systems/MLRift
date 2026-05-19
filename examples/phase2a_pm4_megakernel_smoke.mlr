@@ -1,0 +1,329 @@
+// 5b-compute Phase 2a — PM4 dispatch of the Llama-1B layer mega-kernel
+// at max_phase=0 (phase-1 rmsnorm + first cross-WG barrier only).
+//
+// This is the wedge-probe that the five-attempt ladder before commit
+// e23d94c could not get past.  With the recipe proven on rmsnorm_f32_1024
+// (ACQUIRE_MEM full-invalidate + RSRC1|=PRIV + RSRC2|=LDS_SIZE +
+// initiator=0x8005 + EVENT_WRITE(CS_PARTIAL_FLUSH) + properly-formed
+// RELEASE_MEM with ctxid), this smoke escalates to the actual Llama-1B
+// mega-kernel — same 8 KB image, 512-WG grid, cross-WG barrier — that
+// the attempt ladder was originally chasing.
+//
+// max_phase=0 returns after WG-0's rmsnorm + the first mega_barrier
+// across 512 WGs.  We compare b_x_norm_g (the rmsnorm output) byte-by-
+// byte between Phase 1 AQL and Phase 2a PM4 dispatches.
+//
+// Wedge risk: HIGH.  If PM4 dispatch wedges here despite the recipe,
+// the GPU MEC may need a full reboot to recover.
+
+import "../std/kfd.mlr"
+import "../std/aql.mlr"
+import "../std/kfd_phase1.mlr"
+import "../std/kfd_pm4.mlr"
+import "../std/pm4.mlr"
+import "../std/hip_kfd.mlr"
+
+fn main() {
+    kfd_init()
+
+    // ---------- Module load ----------
+    uint64 mod = kernel_load("/tmp/llama_layer_megakernel_v2.co")
+    uint64 kn  = "llama_layer_megakernel"
+    uint64 kd  = kernel_get_function(mod, kn)
+    if kd == 0 {
+        print_str("FAIL: llama_layer_megakernel kernel not found\n")
+        hipkfd_teardown()
+        exit(1)
+    }
+
+    uint64 image_base_va   = 0; unsafe { *((mod + 0x10) as uint64) -> image_base_va }
+    uint64 image_base_host = 0; unsafe { *((mod + 0x20) as uint64) -> image_base_host }
+    uint64 kd_host = image_base_host + (kd - image_base_va)
+
+    uint32 gss32 = 0; unsafe { *((kd_host + 0x00) as uint32) -> gss32 }
+    uint64 gss   = gss32
+    uint64 entry_off = 0; unsafe { *((kd_host + 0x10) as uint64) -> entry_off }
+    uint32 rsrc1_kd = 0; unsafe { *((kd_host + 0x30) as uint32) -> rsrc1_kd }
+    uint32 rsrc2_kd = 0; unsafe { *((kd_host + 0x34) as uint32) -> rsrc2_kd }
+
+    uint64 kobj_va = kd + entry_off
+    uint64 kobj_shifted = kobj_va >> 8
+    uint32 pgm_lo = kobj_shifted & 0xFFFFFFFF
+    uint32 pgm_hi = (kobj_shifted >> 32) & 0xFF
+
+    uint32 rsrc1_enc = pm4_rsrc1_with_priv(rsrc1_kd)
+    uint32 lds_bits  = pm4_lds_encode_for_rsrc2(gss)
+    uint32 rsrc2_enc = rsrc2_kd | lds_bits
+
+    print_str("kobj_va=")    ; println(kobj_va)
+    print_str("entry_off=")  ; println(entry_off)
+    print_str("gss=")        ; println(gss)
+    print_str("rsrc1_enc=")  ; println(rsrc1_enc)
+    print_str("rsrc2_enc=")  ; println(rsrc2_enc)
+
+    // ---------- Buffers (one per arg — 16 KiB each, well above the
+    // 2048 f32 working-set the rmsnorm phase needs) ----------
+    // 23 device pointers + 1 by_value (pos) + 1 by_value (max_phase).
+    // Pre-alloc as a single 23 × 16 KiB block + carve into args.
+    uint64 buf_sz = 16384
+    uint64 n_ptr = 23
+    uint64 block_a = dev_alloc_host_visible(n_ptr * buf_sz)
+    uint64 block_a_h = dev_host_ptr(block_a)
+    uint64 block_b = dev_alloc_host_visible(n_ptr * buf_sz)
+    uint64 block_b_h = dev_host_ptr(block_b)
+
+    // Zero both blocks first so unused regions return 0.
+    uint64 zi = 0
+    while zi < n_ptr * buf_sz {
+        uint64 pa = block_a_h + zi; unsafe { *(pa as uint8) = 0 }
+        uint64 pb = block_b_h + zi; unsafe { *(pb as uint8) = 0 }
+        zi = zi + 1
+    }
+
+    // Seed in_residual (arg 0) with a non-zero ramp and in_norm_g
+    // (arg 6) with a constant ≠ 1.  All-zero inputs make rmsnorm
+    // produce 0 trivially, which would pass the bit-comparison
+    // without exercising the kernel — defeating the test.  With a
+    // ramp + non-trivial gamma the rmsnorm output spreads non-zero
+    // values across all 2048 elements and any divergence between
+    // AQL and PM4 dispatch surfaces.
+    uint64 hidden = 2048
+    uint64 in_off  = 0 * buf_sz
+    uint64 nrm_off = 6 * buf_sz
+    uint64 ii = 0
+    while ii < hidden {
+        f64 v_in  = int_to_f64(ii) * 0.001 + 0.1   // ramp 0.1..2.148
+        f64 v_nrm = 0.5 + int_to_f64(ii) / int_to_f64(hidden)
+        f32 vi = f64_to_f32(v_in)
+        f32 vn = f64_to_f32(v_nrm)
+        uint64 pa_i = block_a_h + in_off  + ii * 4
+        uint64 pb_i = block_b_h + in_off  + ii * 4
+        uint64 pa_n = block_a_h + nrm_off + ii * 4
+        uint64 pb_n = block_b_h + nrm_off + ii * 4
+        unsafe { *(pa_i as f32) = vi }
+        unsafe { *(pb_i as f32) = vi }
+        unsafe { *(pa_n as f32) = vn }
+        unsafe { *(pb_n as f32) = vn }
+        ii = ii + 1
+    }
+
+    // Build the 23-arg device-VA table for each path.  arg i lives at
+    // block + i * buf_sz.
+    uint64 vas_a = alloc(n_ptr * 8)
+    uint64 vas_b = alloc(n_ptr * 8)
+    uint64 ai_i = 0
+    while ai_i < n_ptr {
+        uint64 va_a = block_a + ai_i * buf_sz
+        uint64 va_b = block_b + ai_i * buf_sz
+        unsafe { *((vas_a + ai_i * 8) as uint64) = va_a }
+        unsafe { *((vas_b + ai_i * 8) as uint64) = va_b }
+        ai_i = ai_i + 1
+    }
+
+    // Kernarg blob = 24 × u64 = 192 bytes.  Same struct for AQL and PM4
+    // except the device pointers differ between block_a / block_b.
+    uint64 karg_a = dev_alloc_host_visible(192)
+    uint64 karg_a_h = dev_host_ptr(karg_a)
+    uint64 karg_b = dev_alloc_host_visible(192)
+    uint64 karg_b_h = dev_host_ptr(karg_b)
+    uint64 ki = 0
+    while ki < n_ptr {
+        uint64 va_a = 0; unsafe { *((vas_a + ki * 8) as uint64) -> va_a }
+        uint64 va_b = 0; unsafe { *((vas_b + ki * 8) as uint64) -> va_b }
+        unsafe { *((karg_a_h + ki * 8) as uint64) = va_a }
+        unsafe { *((karg_b_h + ki * 8) as uint64) = va_b }
+        ki = ki + 1
+    }
+    // pos (arg 14, byte 112) — by_value; 0 is valid for "first token"
+    uint64 pos_v = 0
+    unsafe { *((karg_a_h + 14 * 8) as uint64) = pos_v }
+    unsafe { *((karg_b_h + 14 * 8) as uint64) = pos_v }
+    // max_phase (arg 23, byte 184) — by_value; 0 ⇒ return after phase 1
+    uint64 mp = 0
+    unsafe { *((karg_a_h + 23 * 8) as uint64) = mp }
+    unsafe { *((karg_b_h + 23 * 8) as uint64) = mp }
+
+    print_str("buffers ready\n")
+
+    // ---------- Path A: Phase 1 AQL reference ----------
+    uint64 qa  = kfd_create_queue(KFD_WAIT_BUSY_POLL)
+    uint64 sig = kfd_signal_alloc()
+
+    kfd_signal_reset(sig)
+    uint64 abuf = alloc(64)
+    uint64 azi = 0
+    while azi < 64 { uint64 p = abuf + azi; unsafe { *(p as uint8) = 0 }; azi = azi + 1 }
+    // Grid = (512, 1, 1) workgroups × 32 thread/WG = matches existing
+    // gpu_llama_layer_megakernel_to_dev launcher.
+    uint32 ahs = aql_build_kernel_dispatch(abuf,
+                                            512, 1, 1,    // grid (WG count)
+                                            32, 1, 1,     // block (WG size)
+                                            0, gss,
+                                            kd, karg_a, sig)
+    uint64 a_wp = phase1_submit_packet(qa, abuf, ahs)
+    if a_wp == 0xFFFFFFFFFFFFFFFF {
+        print_str("FAIL: AQL submit back-pressure\n")
+        hipkfd_teardown(); exit(1)
+    }
+    uint64 a_ok = phase1_wait_signal(sig, 0, 5000000000)
+    if a_ok == 0 {
+        print_str("FAIL: AQL completion timeout\n")
+        hipkfd_teardown(); exit(1)
+    }
+    print_str("AQL path: ok\n")
+
+    // ---------- Path B: Phase 2a PM4 dispatch ----------
+    uint64 qb = pm4_create_queue()
+
+    uint64 pkt = alloc(512)
+    uint64 piz = 0
+    while piz < 512 { uint64 p = pkt + piz; unsafe { *(p as uint8) = 0 }; piz = piz + 1 }
+    uint64 vbuf = alloc(64)
+
+    uint64 cursor = 0
+    uint32 dw = 0
+    uint32 vz = 0
+    uint32 one = 1
+
+    // (1) ACQUIRE_MEM with full cache invalidate.
+    dw = pm4_build_acquire_mem(pkt + cursor, PM4_GCR_CNTL_FULL_INVAL)
+    cursor = cursor + dw * 4
+
+    // (2) SET_SH_REG(PGM_LO, 6) — PGM_LO,HI, 0, 0, SCRATCH_LO,HI=0.
+    uint32 v0 = pgm_lo; unsafe { *((vbuf + 0) as uint32) = v0 }
+    uint32 v1 = pgm_hi; unsafe { *((vbuf + 4) as uint32) = v1 }
+    unsafe { *((vbuf + 8)  as uint32) = vz }
+    unsafe { *((vbuf + 12) as uint32) = vz }
+    unsafe { *((vbuf + 16) as uint32) = vz }
+    unsafe { *((vbuf + 20) as uint32) = vz }
+    dw = pm4_build_set_sh_reg(pkt + cursor, PM4_REG_COMPUTE_PGM_LO, vbuf, 6)
+    cursor = cursor + dw * 4
+
+    // (3) SET_SH_REG(RSRC1, 2) — PRIV-OR'd RSRC1 + LDS-OR'd RSRC2.
+    unsafe { *((vbuf + 0) as uint32) = rsrc1_enc }
+    unsafe { *((vbuf + 4) as uint32) = rsrc2_enc }
+    dw = pm4_build_set_sh_reg(pkt + cursor, PM4_REG_COMPUTE_PGM_RSRC1, vbuf, 2)
+    cursor = cursor + dw * 4
+
+    // (4) SET_SH_REG(USER_DATA_0, 2) — kernarg ptr lo/hi.
+    uint32 ka_lo = karg_b & 0xFFFFFFFF
+    uint32 ka_hi = (karg_b >> 32) & 0xFFFFFFFF
+    unsafe { *((vbuf + 0) as uint32) = ka_lo }
+    unsafe { *((vbuf + 4) as uint32) = ka_hi }
+    dw = pm4_build_set_sh_reg(pkt + cursor, PM4_REG_COMPUTE_USER_DATA_0, vbuf, 2)
+    cursor = cursor + dw * 4
+
+    // (5) SET_SH_REG(START_X, 8) — START=0, NUM_THREAD=(32,1,1).
+    unsafe { *((vbuf + 0)  as uint32) = vz }
+    unsafe { *((vbuf + 4)  as uint32) = vz }
+    unsafe { *((vbuf + 8)  as uint32) = vz }
+    uint32 num_x = 32
+    unsafe { *((vbuf + 12) as uint32) = num_x }
+    unsafe { *((vbuf + 16) as uint32) = one }
+    unsafe { *((vbuf + 20) as uint32) = one }
+    unsafe { *((vbuf + 24) as uint32) = vz }
+    unsafe { *((vbuf + 28) as uint32) = vz }
+    dw = pm4_build_set_sh_reg(pkt + cursor, PM4_REG_COMPUTE_START_X, vbuf, 8)
+    cursor = cursor + dw * 4
+
+    // (6) DISPATCH_DIRECT(512, 1, 1, 0x8005).
+    uint32 init_force = 0x8005
+    dw = pm4_build_dispatch_direct(pkt + cursor, 512, 1, 1, init_force)
+    cursor = cursor + dw * 4
+
+    // (7) EVENT_WRITE(CS_PARTIAL_FLUSH).
+    dw = pm4_build_event_write_cs_flush(pkt + cursor)
+    cursor = cursor + dw * 4
+
+    // (8) RELEASE_MEM completion fence with cache flush + sentinel.
+    uint64 sentinel = dev_alloc_host_visible(8)
+    uint64 sentinel_host = dev_host_ptr(sentinel)
+    unsafe { *(sentinel_host as uint64) = 0 }
+    uint32 sentinel_value = 0xDEADBEEF
+    dw = pm4_build_release_mem(pkt + cursor, sentinel, sentinel_value)
+    cursor = cursor + dw * 4
+
+    uint64 total_dw = cursor / 4
+    print_str("pm4 total_dw=") ; println(total_dw)
+
+    uint64 b_wp = pm4_submit_dispatch(qb, pkt, total_dw)
+    if b_wp == 0xFFFFFFFFFFFFFFFF {
+        print_str("FAIL: PM4 submit back-pressure\n")
+        hipkfd_teardown(); exit(1)
+    }
+
+    // 15 s budget — mega-kernel phase-1 + barrier should be sub-ms,
+    // but if waves hang waiting for a barrier that never releases
+    // (e.g., grid<512 by accident) the timeout will catch it.
+    uint64 timeout_ns = 15000000000
+    uint64 t0 = time_now()
+    uint32 s_val = 0
+    uint64 spin = 0
+    while 1 == 1 {
+        unsafe { *(sentinel_host as uint32) -> s_val }
+        if s_val == sentinel_value { break }
+        spin = spin + 1
+        if (spin & 0xFFFFF) == 0 {
+            uint64 dt = time_now() - t0
+            if dt > timeout_ns {
+                print_str("FAIL: PM4 sentinel timeout — WEDGE\n")
+                uint64 rpb_host = 0; unsafe { *((qb + 0x60) as uint64) -> rpb_host }
+                uint64 wpb_host = 0; unsafe { *((qb + 0x40) as uint64) -> wpb_host }
+                uint64 rpb = 0; unsafe { *(rpb_host as uint64) -> rpb }
+                uint64 wpb = 0; unsafe { *(wpb_host as uint64) -> wpb }
+                print_str("  rp=") ; println(rpb)
+                print_str("  wp=") ; println(wpb)
+                print_str("  sentinel=") ; println(s_val)
+                hipkfd_teardown(); exit(1)
+            }
+        }
+    }
+    print_str("PM4 path: ok (sentinel flipped)\n")
+
+    // ---------- Verify ----------
+    // Compare b_x_norm_g (arg 17) between the two paths, byte-by-byte.
+    // arg 17 lives at block + 17 * buf_sz.  All 2048 f32 written by
+    // WG-0's rmsnorm — same bytes in both paths if PM4 substrate is
+    // functionally equivalent.
+    uint64 b_x_a = block_a_h + 17 * buf_sz
+    uint64 b_x_b = block_b_h + 17 * buf_sz
+    uint64 compare_bytes = 2048 * 4    // 2048 f32 = hidden dim for Llama-1B
+
+    uint64 mismatches = 0
+    uint64 first_bad = 0xFFFFFFFFFFFFFFFF
+    uint32 first_a_word = 0
+    uint32 first_b_word = 0
+    uint64 mi = 0
+    while mi < compare_bytes {
+        uint8 va = 0; unsafe { *((b_x_a + mi) as uint8) -> va }
+        uint8 vb = 0; unsafe { *((b_x_b + mi) as uint8) -> vb }
+        if va != vb {
+            if first_bad == 0xFFFFFFFFFFFFFFFF {
+                uint64 wo = mi - (mi % 4)
+                first_bad = wo
+                unsafe { *((b_x_a + wo) as uint32) -> first_a_word }
+                unsafe { *((b_x_b + wo) as uint32) -> first_b_word }
+            }
+            mismatches = mismatches + 1
+        }
+        mi = mi + 1
+    }
+
+    uint32 a0 = 0; unsafe { *(b_x_a as uint32) -> a0 }
+    uint32 b0 = 0; unsafe { *(b_x_b as uint32) -> b0 }
+    print_str("AQL b_x_norm_g[0] bits=") ; println(a0)
+    print_str("PM4 b_x_norm_g[0] bits=") ; println(b0)
+
+    if mismatches != 0 {
+        print_str("FAIL: AQL/PM4 b_x_norm_g diverge\n")
+        print_str("  first_bad_byte=") ; println(first_bad)
+        print_str("  AQL word=")  ; println(first_a_word)
+        print_str("  PM4 word=")  ; println(first_b_word)
+        print_str("  total mismatches=") ; println(mismatches)
+        hipkfd_teardown(); exit(1)
+    }
+
+    print_str("phase2a_pm4_megakernel_smoke: GREEN (PM4 == AQL bit-exact at max_phase=0)\n")
+    hipkfd_teardown()
+    exit(0)
+}
