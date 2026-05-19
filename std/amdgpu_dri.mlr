@@ -1,0 +1,300 @@
+// AMDGPU DRI ioctl wrappers — direct /dev/dri/renderD128 access.
+//
+// Phase 2b substrate: replaces KFD's ALLOC_MEMORY_OF_GPU +
+// CREATE_QUEUE with raw amdgpu GEM allocations + AMDGPU_CS
+// submission of PM4 IBs.  Reuses the DRM context fd that
+// std/kfd.mlr's kfd_init() already opened (kfd_drm_fd()) — opening
+// a second fd on renderD128 triggers amdgpu's "double DRM file
+// binding" guard, which kfd_process_init rejects.
+//
+// Numbers + struct sizes verified against the installed kernel
+// (Linux 6.17 amdgpu_drm.h) via /tmp/check_amdgpu_abi.c:
+//
+//   DRM_IOCTL_AMDGPU_GEM_CREATE  = 0xC0206440 (union, 32B)
+//   DRM_IOCTL_AMDGPU_GEM_MMAP    = 0xC0086441 (union, 8B)
+//   DRM_IOCTL_AMDGPU_CTX         = 0xC0106442 (union, 16B)
+//   DRM_IOCTL_AMDGPU_BO_LIST     = 0xC0186443 (union, 24B)
+//   DRM_IOCTL_AMDGPU_CS          = 0xC0186444 (union, 24B)
+//   DRM_IOCTL_AMDGPU_INFO        = 0x40206445 (struct, 32B; _IOW)
+//   DRM_IOCTL_AMDGPU_GEM_VA      = 0x40286448 (struct, 40B; _IOW)
+//   DRM_IOCTL_AMDGPU_WAIT_CS     = 0xC0206449 (union, 32B)
+//   DRM_IOCTL_GEM_CLOSE          = 0x40086409 (generic DRM, 8B)
+//
+// GEM_VA is the historical wart: it's _IOW (write-only), so
+// returning errno-via-ioctl-retval is the only signal — no
+// readback fields.
+
+import "sys.mlr"
+import "kfd.mlr"
+
+// --- ioctl numbers ---
+static uint64 DRM_IOCTL_AMDGPU_GEM_CREATE = 0xC0206440
+static uint64 DRM_IOCTL_AMDGPU_GEM_MMAP   = 0xC0086441
+static uint64 DRM_IOCTL_AMDGPU_BO_LIST    = 0xC0186443
+static uint64 DRM_IOCTL_AMDGPU_CS         = 0xC0186444
+static uint64 DRM_IOCTL_AMDGPU_GEM_VA     = 0x40286448
+static uint64 DRM_IOCTL_AMDGPU_WAIT_CS    = 0xC0206449
+static uint64 DRM_IOCTL_GEM_CLOSE         = 0x40086409
+
+// --- gem_create domain bits ---
+static uint32 AMDGPU_GEM_DOMAIN_GTT       = 0x2
+static uint32 AMDGPU_GEM_DOMAIN_VRAM      = 0x4
+
+// --- gem_create domain_flags ---
+static uint32 AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED = 0x01
+static uint32 AMDGPU_GEM_CREATE_NO_CPU_ACCESS       = 0x02
+static uint32 AMDGPU_GEM_CREATE_CPU_GTT_USWC        = 0x04
+static uint32 AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS     = 0x20
+
+// --- gem_va operations + flags ---
+static uint32 AMDGPU_VA_OP_MAP            = 1
+static uint32 AMDGPU_VA_OP_UNMAP          = 2
+static uint32 AMDGPU_VM_PAGE_READABLE     = 0x2
+static uint32 AMDGPU_VM_PAGE_WRITEABLE    = 0x4
+static uint32 AMDGPU_VM_PAGE_EXECUTABLE   = 0x8
+
+// --- CS chunk IDs + IP types ---
+static uint32 AMDGPU_CHUNK_ID_IB              = 0x01
+static uint32 AMDGPU_CHUNK_ID_FENCE           = 0x03
+static uint32 AMDGPU_CHUNK_ID_BO_LIST_HANDLES = 0x05
+static uint32 AMDGPU_HW_IP_GFX                = 0
+static uint32 AMDGPU_HW_IP_COMPUTE            = 1
+static uint32 AMDGPU_HW_IP_DMA                = 2
+
+// ---------------------------------------------------------------------
+// Allocate a GEM BO.  Returns the kernel handle (>0 on success, 0 on
+// failure — the kernel never returns handle=0 so this is unambiguous).
+//
+// `domains`       bitmask: VRAM=0x4, GTT=0x2 (typically only one bit)
+// `domain_flags`  bitmask: CPU_ACCESS_REQUIRED=0x1, NO_CPU_ACCESS=0x2,
+//                          CPU_GTT_USWC=0x4, VRAM_CONTIGUOUS=0x20
+//
+// Struct layout (32B union):
+//   [0x00] in.bo_size      u64
+//   [0x08] in.alignment    u64
+//   [0x10] in.domains      u64
+//   [0x18] in.domain_flags u64
+//   [0x00] out.handle      u32  (overlapping)
+fn amdgpu_gem_create(uint64 bo_size, uint64 alignment, uint32 domains, uint32 domain_flags) -> uint32 {
+    uint64 args = alloc(32)
+    uint64 zi = 0
+    while zi < 32 { uint64 p = args + zi; unsafe { *(p as uint8) = 0 }; zi = zi + 1 }
+    unsafe { *((args + 0x00) as uint64) = bo_size }
+    unsafe { *((args + 0x08) as uint64) = alignment }
+    uint64 dom64 = domains
+    uint64 df64  = domain_flags
+    unsafe { *((args + 0x10) as uint64) = dom64 }
+    unsafe { *((args + 0x18) as uint64) = df64 }
+    uint64 r64 = sys_ioctl(kfd_drm_fd(), DRM_IOCTL_AMDGPU_GEM_CREATE, args)
+    if r64 != 0 { return 0 }
+    uint32 handle = 0
+    unsafe { *((args + 0x00) as uint32) -> handle }
+    return handle
+}
+
+// Get the mmap offset for a GEM BO.  Caller does the actual sys_mmap
+// against the DRI fd using the returned offset.  Two-step protocol —
+// no way to do it in one ioctl.
+fn amdgpu_gem_mmap_offset(uint32 handle) -> uint64 {
+    uint64 args = alloc(8)
+    uint64 zi = 0
+    while zi < 8 { uint64 p = args + zi; unsafe { *(p as uint8) = 0 }; zi = zi + 1 }
+    unsafe { *((args + 0x00) as uint32) = handle }
+    uint64 r64 = sys_ioctl(kfd_drm_fd(), DRM_IOCTL_AMDGPU_GEM_MMAP, args)
+    if r64 != 0 { return 0xFFFFFFFFFFFFFFFF }
+    uint64 off = 0
+    unsafe { *((args + 0x00) as uint64) -> off }
+    return off
+}
+
+// Map (or unmap) a GEM BO into the DRI context's VM at GPU VA
+// `va_address` with size `map_size`.  Use `AMDGPU_VA_OP_MAP` for map
+// and AMDGPU_VA_OP_UNMAP to tear down.  `vm_flags` is the bitmask
+// READABLE | WRITEABLE | EXECUTABLE (executable required for shader
+// code BOs).
+//
+// Note: GEM_VA's ioctl is _IOW (write-only) — the kernel returns the
+// errno via the ioctl return value but writes nothing back.  Struct
+// is 40B; bytes 40..63 in tinygrad's autogen are timeline-syncobj
+// fields added in a newer kernel.  Our installed kernel uses the
+// 40B variant.
+fn amdgpu_gem_va_op(uint32 handle, uint32 operation, uint64 va_address,
+                    uint64 offset_in_bo, uint64 map_size, uint32 vm_flags) -> uint32 {
+    uint64 args = alloc(40)
+    uint64 zi = 0
+    while zi < 40 { uint64 p = args + zi; unsafe { *(p as uint8) = 0 }; zi = zi + 1 }
+    unsafe { *((args + 0x00) as uint32) = handle }
+    unsafe { *((args + 0x08) as uint32) = operation }
+    unsafe { *((args + 0x0C) as uint32) = vm_flags }
+    unsafe { *((args + 0x10) as uint64) = va_address }
+    unsafe { *((args + 0x18) as uint64) = offset_in_bo }
+    unsafe { *((args + 0x20) as uint64) = map_size }
+    uint64 r64 = sys_ioctl(kfd_drm_fd(), DRM_IOCTL_AMDGPU_GEM_VA, args)
+    return r64 & 0xFFFFFFFF
+}
+
+// Convenience: map a BO for read/write/execute.
+fn amdgpu_gem_va_map_rwx(uint32 handle, uint64 va, uint64 size) -> uint32 {
+    uint32 flags = AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE | AMDGPU_VM_PAGE_EXECUTABLE
+    return amdgpu_gem_va_op(handle, AMDGPU_VA_OP_MAP, va, 0, size, flags)
+}
+
+// Free a GEM BO via the generic DRM_IOCTL_GEM_CLOSE.  Note this is
+// NOT amdgpu-specific — it's the generic DRM gem-close ioctl living
+// at command 0x09.  Struct is 8B (handle u32 + pad u32).
+fn amdgpu_gem_close(uint32 handle) -> uint32 {
+    uint64 args = alloc(8)
+    uint64 zi = 0
+    while zi < 8 { uint64 p = args + zi; unsafe { *(p as uint8) = 0 }; zi = zi + 1 }
+    unsafe { *((args + 0x00) as uint32) = handle }
+    uint64 r64 = sys_ioctl(kfd_drm_fd(), DRM_IOCTL_GEM_CLOSE, args)
+    return r64 & 0xFFFFFFFF
+}
+
+// Create a BO list naming each BO that an AMDGPU_CS may touch.
+//
+// `entries` points to an array of (u32 handle, u32 priority) tuples
+// = 8 bytes each.  `n_entries` is the count.  Returns the list handle
+// (>0 on success; 0 on failure).  The kernel verifies
+// `bo_info_size == sizeof(bo_list_entry) = 8` and rejects otherwise.
+//
+// Struct layout (24B in / 8B out):
+//   [0x00] in.operation     u32 (1 = create, 2 = destroy, 3 = update)
+//   [0x04] in.list_handle   u32 (input for destroy/update; 0 for create)
+//   [0x08] in.bo_number     u32
+//   [0x0C] in.bo_info_size  u32 (must == 8)
+//   [0x10] in.bo_info_ptr   u64
+//   [0x00] out.list_handle  u32
+static uint32 AMDGPU_BO_LIST_OP_CREATE = 0
+static uint32 AMDGPU_BO_LIST_OP_DESTROY = 1
+static uint32 AMDGPU_BO_LIST_OP_UPDATE = 2
+fn amdgpu_bo_list_create(uint64 entries, uint32 n_entries) -> uint32 {
+    uint64 args = alloc(24)
+    uint64 zi = 0
+    while zi < 24 { uint64 p = args + zi; unsafe { *(p as uint8) = 0 }; zi = zi + 1 }
+    uint32 op = AMDGPU_BO_LIST_OP_CREATE
+    unsafe { *((args + 0x00) as uint32) = op }
+    unsafe { *((args + 0x08) as uint32) = n_entries }
+    uint32 esize = 8
+    unsafe { *((args + 0x0C) as uint32) = esize }
+    unsafe { *((args + 0x10) as uint64) = entries }
+    uint64 r64 = sys_ioctl(kfd_drm_fd(), DRM_IOCTL_AMDGPU_BO_LIST, args)
+    if r64 != 0 { return 0 }
+    uint32 list_handle = 0
+    unsafe { *((args + 0x00) as uint32) -> list_handle }
+    return list_handle
+}
+
+// Destroy a previously-created BO list.
+fn amdgpu_bo_list_destroy(uint32 list_handle) -> uint32 {
+    uint64 args = alloc(24)
+    uint64 zi = 0
+    while zi < 24 { uint64 p = args + zi; unsafe { *(p as uint8) = 0 }; zi = zi + 1 }
+    uint32 op = AMDGPU_BO_LIST_OP_DESTROY
+    unsafe { *((args + 0x00) as uint32) = op }
+    unsafe { *((args + 0x04) as uint32) = list_handle }
+    uint64 r64 = sys_ioctl(kfd_drm_fd(), DRM_IOCTL_AMDGPU_BO_LIST, args)
+    return r64 & 0xFFFFFFFF
+}
+
+// Submit a single PM4 IB on the compute IP.
+//
+// `ctx_id` from raw_drm_ctx_alloc (std/kfd_raw.mlr).
+// `bo_list` from amdgpu_bo_list_create.
+// `ib_va` is the GPU VA of the IB BO.  `ib_dwords` is its length in
+// dwords (must be > 0 and aligned to 1).
+// Returns the fence seq_no (u64) via `out_fence_slot`; ioctl return
+// value is 0 on success.
+//
+// Layout: cs_in is 24B (ctx_id, bo_list_handle, num_chunks, _pad,
+// chunks_ptr). cs.out is 8B (fence handle u64). chunks_ptr points to
+// an array of `__u64` chunk-pointers; each chunk-pointer points to a
+// `drm_amdgpu_cs_chunk` (16B) which references the actual chunk_data
+// (an IB or fence struct via its `chunk_data` u64 field).  Double-
+// indirection — easy to misread; see project_phase2_aql_finding.
+fn amdgpu_cs_submit_pm4(uint32 ctx_id, uint32 bo_list,
+                         uint64 ib_va, uint32 ib_dwords,
+                         uint64 out_fence_slot) -> uint32 {
+    return amdgpu_cs_submit_pm4_ip(ctx_id, bo_list, ib_va, ib_dwords, AMDGPU_HW_IP_COMPUTE, out_fence_slot)
+}
+
+// Same as amdgpu_cs_submit_pm4 but lets the caller pick the HW IP.
+// Used during bring-up to diagnose whether COMPUTE-vs-GFX matters.
+fn amdgpu_cs_submit_pm4_ip(uint32 ctx_id, uint32 bo_list,
+                            uint64 ib_va, uint32 ib_dwords,
+                            uint32 ip_type,
+                            uint64 out_fence_slot) -> uint32 {
+    // Build cs_chunk_ib (32B).
+    uint64 ib_chunk_data = alloc(32)
+    uint64 zi = 0
+    while zi < 32 { uint64 p = ib_chunk_data + zi; unsafe { *(p as uint8) = 0 }; zi = zi + 1 }
+    // _pad u32 at 0, flags u32 at 4 (leave 0), va_start u64 at 8,
+    // ib_bytes u32 at 16, ip_type u32 at 20, ip_instance u32 at 24,
+    // ring u32 at 28.
+    unsafe { *((ib_chunk_data + 0x08) as uint64) = ib_va }
+    uint32 ib_bytes = ib_dwords * 4
+    unsafe { *((ib_chunk_data + 0x10) as uint32) = ib_bytes }
+    unsafe { *((ib_chunk_data + 0x14) as uint32) = ip_type }
+    uint32 ring0 = 0
+    unsafe { *((ib_chunk_data + 0x1C) as uint32) = ring0 }
+
+    // Build drm_amdgpu_cs_chunk (16B).
+    uint64 chunk = alloc(16)
+    uint64 zk = 0
+    while zk < 16 { uint64 p = chunk + zk; unsafe { *(p as uint8) = 0 }; zk = zk + 1 }
+    unsafe { *((chunk + 0x00) as uint32) = AMDGPU_CHUNK_ID_IB }
+    uint32 chunk_len_dw = 8                          // sizeof(cs_chunk_ib)/4 = 32/4 = 8
+    unsafe { *((chunk + 0x04) as uint32) = chunk_len_dw }
+    unsafe { *((chunk + 0x08) as uint64) = ib_chunk_data }
+
+    // Array of chunk pointers (1 entry for single IB).
+    uint64 chunk_ptrs = alloc(8)
+    unsafe { *(chunk_ptrs as uint64) = chunk }
+
+    // Build cs_in (24B).
+    uint64 cs_args = alloc(24)
+    uint64 zc = 0
+    while zc < 24 { uint64 p = cs_args + zc; unsafe { *(p as uint8) = 0 }; zc = zc + 1 }
+    unsafe { *((cs_args + 0x00) as uint32) = ctx_id }
+    unsafe { *((cs_args + 0x04) as uint32) = bo_list }
+    uint32 nchunks = 1
+    unsafe { *((cs_args + 0x08) as uint32) = nchunks }
+    unsafe { *((cs_args + 0x10) as uint64) = chunk_ptrs }
+
+    uint64 r64 = sys_ioctl(kfd_drm_fd(), DRM_IOCTL_AMDGPU_CS, cs_args)
+    if r64 != 0 { return r64 & 0xFFFFFFFF }
+
+    // out.handle (u64) overlaps with cs_in.ctx_id at offset 0.
+    uint64 fence = 0
+    unsafe { *((cs_args + 0x00) as uint64) -> fence }
+    unsafe { *(out_fence_slot as uint64) = fence }
+    return 0
+}
+
+// Block until the CS fence retires or `timeout_ns` elapses.
+// Returns 0 on success (fence done), 1 on timeout, errno otherwise.
+//
+// Layout: wait_cs_in is 32B (handle u64, timeout u64, ip_type u32,
+// ip_instance u32, ring u32, ctx_id u32).  out is u32 status (0=done,
+// 1=timeout) — overlaps the union with the input fields.
+fn amdgpu_wait_cs(uint32 ctx_id, uint64 fence_handle, uint64 timeout_ns) -> uint32 {
+    return amdgpu_wait_cs_ip(ctx_id, fence_handle, timeout_ns, AMDGPU_HW_IP_COMPUTE)
+}
+
+fn amdgpu_wait_cs_ip(uint32 ctx_id, uint64 fence_handle, uint64 timeout_ns, uint32 ip_type) -> uint32 {
+    uint64 args = alloc(32)
+    uint64 zi = 0
+    while zi < 32 { uint64 p = args + zi; unsafe { *(p as uint8) = 0 }; zi = zi + 1 }
+    unsafe { *((args + 0x00) as uint64) = fence_handle }
+    unsafe { *((args + 0x08) as uint64) = timeout_ns }
+    unsafe { *((args + 0x10) as uint32) = ip_type }
+    uint32 ring0 = 0
+    unsafe { *((args + 0x14) as uint32) = ring0 }    // ip_instance
+    unsafe { *((args + 0x18) as uint32) = ring0 }    // ring
+    unsafe { *((args + 0x1C) as uint32) = ctx_id }
+    uint64 r64 = sys_ioctl(kfd_drm_fd(), DRM_IOCTL_AMDGPU_WAIT_CS, args)
+    if r64 != 0 { return r64 & 0xFFFFFFFF }
+    uint32 status = 0
+    unsafe { *((args + 0x00) as uint32) -> status }
+    return status                                    // 0 = done, 1 = timeout
+}

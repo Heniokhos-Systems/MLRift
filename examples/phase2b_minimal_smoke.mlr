@@ -1,0 +1,178 @@
+// 5b-compute Phase 2b — DEAD END as of 2026-05-19.
+//
+// This smoke attempted to submit a single PM4 NOP IB via
+// DRM_IOCTL_AMDGPU_CS on a gfx11 RX 7800 XT and wait for retirement.
+// All variants timed out (GFX IP, COMPUTE IP, with/without KFD bound,
+// with/without a BO list, ib_va in the documented amdgpu VA range).
+//
+// Diagnosis (cross-verified with a pure-C reproducer that did the
+// same ioctls — same result):
+//
+//   * DRM_IOCTL_AMDGPU_CS accepts the submission and returns a valid
+//     fence handle (cs.out.handle != 0).
+//   * AMDGPU_CTX_OP_QUERY_STATE shows the context healthy:
+//     flags=0, hangs=0, reset_status=0 — the GPU isn't faulting.
+//   * DRM_IOCTL_AMDGPU_WAIT_CS times out indefinitely. The job is
+//     queued in amdgpu's scheduler but never dispatched to a real
+//     hardware ring.
+//   * AMDGPU_INFO_HW_IP_INFO shows COMPUTE has 4 rings (avail=0xf),
+//     GFX has 1 ring (avail=0x1) — both gfx11. So rings exist.
+//   * RADV/Vulkan works fine on the same fd — graphics paths are
+//     alive. But RADV uses engine-specific PM4 init + syncobj fences,
+//     not bare-NOP submissions.
+//
+// Hypothesis: on gfx11 consumer cards with KFD-MES enabled, the
+// AMDGPU_CS API accepts compute IB submissions but the kernel
+// scheduler doesn't route them to a hardware ring without the same
+// initialization patterns RADV emits. Going further requires
+// reverse-engineering RADV's PM4 init sequence and engine binding —
+// substantial work beyond a parity smoke.
+//
+// Decision: Phase 2a (PM4 dispatch on KFD-created COMPUTE queue with
+// doorbell) remains the practical end of the Phase 2 bypass arc on
+// this hardware. The next real bypass (Phase 3) is full AM-driver
+// style: VFIO-unbind amdgpu, take MMIO directly, run MES from
+// userspace. tinygrad's PCIIface is the reference.
+//
+// This smoke is preserved as a research artifact + sanity check for
+// the std/amdgpu_dri.mlr ioctl wrappers (all 7 ioctls return success
+// for valid inputs — just the scheduling step fails).
+
+import "../std/kfd.mlr"
+import "../std/kfd_raw.mlr"
+import "../std/amdgpu_dri.mlr"
+import "../std/pm4.mlr"
+import "../std/hip_kfd.mlr"
+
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn puts(uint64 s) -> uint32
+
+fn print_label_u64(uint64 label, uint64 lab_len, uint64 val) {
+    uint64 buf = alloc(128)
+    uint64 i = 0
+    while i < lab_len {
+        uint64 sp = label + i; uint64 c = 0
+        unsafe { *(sp as uint8) -> c }
+        uint64 dp = buf + i; uint8 cb = c
+        unsafe { *(dp as uint8) = cb }
+        i = i + 1
+    }
+    uint64 cp = buf + lab_len; uint8 col = 58; unsafe { *(cp as uint8) = col }
+    uint64 sp2 = buf + lab_len + 1; uint8 space = 32; unsafe { *(sp2 as uint8) = space }
+    uint64 nb = buf + lab_len + 2
+    // u64 to decimal inline
+    uint64 n = 0; uint64 t = val
+    if val == 0 { uint8 z = 48; unsafe { *(nb as uint8) = z }; n = 1 }
+    else {
+        while t > 0 { n = n + 1; t = t / 10 }
+        uint64 idx = n; t = val
+        while idx > 0 {
+            idx = idx - 1
+            uint64 d = t - (t / 10) * 10
+            uint64 p = nb + idx; uint8 c = d + 48
+            unsafe { *(p as uint8) = c }
+            t = t / 10
+        }
+    }
+    uint64 np = nb + n
+    uint8 nul = 0; unsafe { *(np as uint8) = nul }
+    puts(buf)
+}
+
+fn main() {
+    kfd_init()
+
+    // 1) Allocate a DRI context (raw_drm_ctx_alloc lives in kfd_raw.mlr).
+    uint64 ctx_slot = alloc(4)
+    uint32 cz = 0; unsafe { *(ctx_slot as uint32) = cz }
+    uint32 cr = raw_drm_ctx_alloc(kfd_drm_fd(), ctx_slot)
+    if cr != 0 { print_label_u64("ctx_alloc errno", 15, cr); exit(1) }
+    uint32 ctx_id = 0; unsafe { *(ctx_slot as uint32) -> ctx_id }
+    print_label_u64("ctx_id", 6, ctx_id)
+
+    // 2) Allocate a 4 KiB IB BO in GTT with CPU access so the host
+    //    can write PM4 packets directly into it.
+    uint64 ib_size = 4096
+    uint32 ib_handle = amdgpu_gem_create(ib_size, 4096,
+                                          AMDGPU_GEM_DOMAIN_GTT,
+                                          AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED)
+    if ib_handle == 0 { puts("gem_create failed"); exit(1) }
+    print_label_u64("ib_handle", 9, ib_handle)
+
+    // 3) Reserve a GPU VA in MLRift's existing reservation pool —
+    //    same allocator KFD uses, so the amdgpu CS path sees the
+    //    same unified VM mapping.
+    uint64 ib_va = _kfd_reserve_va(ib_size)
+    print_label_u64("ib_va", 5, ib_va)
+
+    // 4) Map the IB BO into the DRI context VM at ib_va (R+W+X).
+    //    EXECUTABLE is required because the CP fetches packets via
+    //    its own DMA path which honours VM permission bits on gfx11.
+    uint32 mr = amdgpu_gem_va_map_rwx(ib_handle, ib_va, ib_size)
+    if mr != 0 { print_label_u64("gem_va_map errno", 16, mr); exit(1) }
+
+    // 5) Get mmap offset, then mmap into the host process.
+    uint64 mm_off = amdgpu_gem_mmap_offset(ib_handle)
+    if mm_off == 0xFFFFFFFFFFFFFFFF { puts("gem_mmap_offset failed"); exit(1) }
+    uint64 prot = 3                              // PROT_READ|PROT_WRITE
+    uint64 flags = 1                             // MAP_SHARED
+    uint64 ib_host = sys_mmap(0, ib_size, prot, flags, kfd_drm_fd(), mm_off)
+    if ib_host > 0xFFFFFFFFFFFFF000 {
+        print_label_u64("mmap errno", 10, 0xFFFFFFFFFFFFFFFF - ib_host + 1)
+        exit(1)
+    }
+    print_label_u64("ib_host", 7, ib_host)
+
+    // 6) Write a single PM4 NOP packet (body=31 dwords).  The CP
+    //    accepts arbitrary NOP payloads — total IB = 32 dwords.  We
+    //    intentionally make it >1 dword so we can also exercise the
+    //    chunk's `length_dw` field with a non-trivial size.
+    uint64 zi = 0
+    while zi < ib_size { uint64 p = ib_host + zi; unsafe { *(p as uint8) = 0 }; zi = zi + 1 }
+    uint32 nop_body_dw = 31
+    uint32 unused_dw = pm4_build_nop(ib_host, nop_body_dw)    // returns 1 + body_dw
+    uint32 total_dw = 32
+
+    // 7) Build BO list naming the IB.  Single entry struct: u32 handle,
+    //    u32 priority. Priority is hint-only; 0 is fine.
+    uint64 bo_entries = alloc(8)
+    unsafe { *((bo_entries + 0) as uint32) = ib_handle }
+    uint32 pr0 = 0; unsafe { *((bo_entries + 4) as uint32) = pr0 }
+    uint32 n_entries = 1
+    uint32 bo_list = amdgpu_bo_list_create(bo_entries, n_entries)
+    if bo_list == 0 { puts("bo_list_create failed"); exit(1) }
+    print_label_u64("bo_list", 7, bo_list)
+
+    // 8) Submit the IB on GFX IP first as a diagnostic — GFX rings
+    //    are owned by amdgpu itself (not shared with KFD's MEC pipes)
+    //    so they're a clean test of whether the CS-substrate works
+    //    independent of KFD-amdgpu contention.  COMPUTE IP retest
+    //    comes after we know GFX retires.
+    uint64 fence_slot = alloc(8)
+    uint64 fz = 0; unsafe { *(fence_slot as uint64) = fz }
+    uint32 ip_under_test = AMDGPU_HW_IP_GFX
+    uint32 sr = amdgpu_cs_submit_pm4_ip(ctx_id, bo_list, ib_va, total_dw, ip_under_test, fence_slot)
+    if sr != 0 { print_label_u64("cs_submit errno", 15, sr); exit(1) }
+    uint64 fence = 0; unsafe { *(fence_slot as uint64) -> fence }
+    print_label_u64("fence", 5, fence)
+
+    // 9) Wait up to 5 s for retirement.
+    uint64 timeout_ns = 5000000000
+    uint32 wr = amdgpu_wait_cs_ip(ctx_id, fence, timeout_ns, ip_under_test)
+    if wr != 0 { print_label_u64("wait_cs errno_or_timeout", 24, wr); exit(1) }
+    puts("phase2b_minimal_smoke: GREEN (PM4 NOP retired via AMDGPU_CS on GFX)")
+
+    // Cleanup.
+    uint32 dr1 = amdgpu_bo_list_destroy(bo_list)
+    uint32 dr2 = amdgpu_gem_va_op(ib_handle, AMDGPU_VA_OP_UNMAP, ib_va, 0, ib_size, 0)
+    uint32 dr3 = amdgpu_gem_close(ib_handle)
+    uint32 dr4 = raw_drm_ctx_free(kfd_drm_fd(), ctx_id)
+    // Don't fail the smoke on cleanup errors — substrate validity is
+    // already proven by reaching this point. Just print them.
+    if dr1 != 0 { print_label_u64("bo_list_destroy errno", 21, dr1) }
+    if dr2 != 0 { print_label_u64("gem_va_unmap errno",     19, dr2) }
+    if dr3 != 0 { print_label_u64("gem_close errno",        15, dr3) }
+    if dr4 != 0 { print_label_u64("ctx_free errno",         14, dr4) }
+
+    exit(0)
+}
