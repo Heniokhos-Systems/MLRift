@@ -1,0 +1,397 @@
+// Phase 3 slice δ.4-b — PSP load_sos via VRAM-backed msg1 buffer.
+//
+// Hypothesis (per research): SOS partial-init hang in δ.4 is because
+// SOS expects its msg1 buffer to be in VRAM (FB aperture), not in
+// sysmem (system aperture). Tinygrad's AM driver does this — maps BAR0
+// (VRAM window), copies firmware into it, hands the VRAM MC address
+// to C2PMSG_36. amdgpu uses GTT but relies on the GART PT walker which
+// we already proved is non-functional cold (ε.0b).
+//
+// This smoke:
+//   1. Maps BAR5 (MMIO) + BAR0 (VRAM window).
+//   2. Reads FB_LOCATION_BASE/TOP/OFFSET from MMHUB to discover the
+//      VRAM aperture configured by SBIOS POST / amdgpu's prior init.
+//   3. If FB_LOCATION_BASE == 0 → bail with diagnostic (FLR cleared
+//      VRAM state — would need amdgpu-side restore first).
+//   4. Otherwise, lay out the PSP msg1 buffer at vram_mc_base + 1 MiB,
+//      run the full 7-cmd PSP bootloader chain through that VRAM buffer,
+//      and poll C2PMSG_81 for SOS sign-of-life.
+
+import "../std/pcidev.mlr"
+import "../std/amdgpu_ip_discovery.mlr"
+import "../std/amdgpu_firmware.mlr"
+import "../std/gmc.mlr"
+import "../std/gmc_constants.mlr"
+import "../std/psp.mlr"
+import "../std/sys.mlr"
+
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn puts(uint64 s) -> uint32
+
+fn _hex32(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(64)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint8 zx = 48; unsafe { *((b + ll + 1) as uint8) = zx }
+    uint8 xc = 120; unsafe { *((b + ll + 2) as uint8) = xc }
+    uint64 j = 0
+    while j < 8 {
+        uint64 sh = (7 - j) * 4
+        uint64 nyb = (v >> sh) & 0xF
+        uint8 ch = nyb + 48
+        if nyb >= 10 { ch = nyb + 87 }
+        unsafe { *((b + ll + 3 + j) as uint8) = ch }
+        j = j + 1
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 11) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+fn _dec(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(64)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint64 digits = 0
+    if v == 0 {
+        uint8 z = 48; unsafe { *((b + ll + 1) as uint8) = z }; digits = 1
+    } else {
+        uint64 t = v
+        while t > 0 { digits = digits + 1; t = t / 10 }
+        uint64 k = digits
+        t = v
+        while k > 0 {
+            k = k - 1
+            uint64 d = t - (t / 10) * 10
+            uint8 db = d + 48
+            unsafe { *((b + ll + 1 + k) as uint8) = db }
+            t = t / 10
+        }
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 1 + digits) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+// Read a 32-bit MMHUB register via BAR5 mapping. (Local copy of the
+// _mmhub_read32 logic since gmc.mlr's is private.)
+fn _mmhub_r32(uint64 bar5_host, uint64 reg_dw) -> uint64 {
+    uint64 byte_off = (amdgpu_ip_mmhub_base_0 + reg_dw) * 4
+    uint32 v = 0
+    unsafe { *((bar5_host + byte_off) as uint32) -> v }
+    uint64 ret = v
+    return ret
+}
+
+// Copy `n` bytes from `src` (host VA) to `dst` (BAR0 MMIO VA), byte-wise.
+fn _mmio_copy(uint64 dst, uint64 src, uint64 n) {
+    uint64 i = 0
+    while i < n {
+        uint8 b = 0; unsafe { *((src + i) as uint8) -> b }
+        unsafe { *((dst + i) as uint8) = b }
+        i = i + 1
+    }
+}
+
+// Issue one bootloader cmd backed by VRAM buffer at bar0_host+offset.
+// Returns 0 on success, 1 on timeout.
+fn _send_bl_cmd_vram(uint64 bar5,
+                     uint64 bar0_host,
+                     uint64 vram_offset,
+                     uint64 msg1_mc_addr,
+                     uint64 blob_ptr,
+                     uint64 blob_size,
+                     uint64 cmd_word) -> uint64 {
+    // Copy firmware to BAR0 (VRAM). Skip zeroing the rest — PSP only
+    // reads `blob_size` bytes.
+    _mmio_copy(bar0_host + vram_offset, blob_ptr, blob_size)
+    psp_write32(bar5, PSP_REG_C2PMSG_36, msg1_mc_addr >> 20)
+    psp_write32(bar5, PSP_REG_C2PMSG_35, cmd_word)
+    uint64 pi = 0
+    uint64 plast = 0
+    uint64 rc = 1
+    while pi < 30000 {
+        plast = psp_read32(bar5, PSP_REG_C2PMSG_35)
+        if plast == 0x80000000 {
+            rc = 0
+            pi = 30001
+        }
+        if pi != 30001 {
+            if (pi & 0x7FF) == 0 {
+                _hex32("poll_C2PMSG_35", 14, plast)
+                _dec("poll_iter",        9, pi)
+            }
+            uint64 ts = alloc(16)
+            unsafe { *((ts + 0) as uint64) = 0 }
+            unsafe { *((ts + 8) as uint64) = 1000000 }
+            syscall_raw(35, ts, 0, 0, 0, 0, 0)
+            dealloc(ts)
+            pi = pi + 1
+        }
+    }
+    _hex32("final_C2PMSG_35", 15, plast)
+    return rc
+}
+
+// Optional load: skip if sub-blob not in firmware.
+fn _try_load_vram(uint64 bar5,
+                  uint64 bar0_host,
+                  uint64 vram_offset,
+                  uint64 msg1_mc_addr,
+                  uint64 fw_buf,
+                  uint64 fw_sz,
+                  uint64 uaob,
+                  uint64 fw_type,
+                  uint64 cmd_word) -> uint64 {
+    uint64 lp = alloc(16)
+    unsafe { *((lp + 0) as uint64) = 0 }
+    unsafe { *((lp + 8) as uint64) = 0 }
+    uint64 fr = psp_v2_find(fw_buf, fw_sz, fw_type, lp + 0, lp + 8)
+    if fr != 0 { dealloc(lp); return 1 }
+    uint64 rel_off = 0; unsafe { *((lp + 0) as uint64) -> rel_off }
+    uint64 sub_size = 0; unsafe { *((lp + 8) as uint64) -> sub_size }
+    dealloc(lp)
+    uint64 sub_ptr = fw_buf + uaob + rel_off
+    _dec("sub_size", 8, sub_size)
+    uint64 rc = _send_bl_cmd_vram(bar5, bar0_host, vram_offset, msg1_mc_addr,
+                                  sub_ptr, sub_size, cmd_word)
+    if rc != 0 { return 2 }
+    uint64 errb = psp_read32(bar5, PSP_REG_C2PMSG_35) & 0xFF
+    if errb != 0 { _hex32("err_byte", 8, errb); return 3 }
+    return 0
+}
+
+// Wait for SOS sign of life — C2PMSG_81 != 0. 30s budget after 20 ms
+// initial settle (matches kernel mdelay(20)).
+fn _wait_sos_alive(uint64 bar5) -> uint64 {
+    uint64 ts0 = alloc(16)
+    unsafe { *((ts0 + 0) as uint64) = 0 }
+    unsafe { *((ts0 + 8) as uint64) = 20000000 }
+    syscall_raw(35, ts0, 0, 0, 0, 0, 0)
+    dealloc(ts0)
+    uint64 i = 0
+    uint64 last = 0
+    while i < 30000 {
+        last = psp_read32(bar5, PSP_REG_C2PMSG_81)
+        if last != 0 {
+            _hex32("sos_C2PMSG_81", 13, last)
+            _dec("sos_alive_iter", 14, i)
+            return 0
+        }
+        if (i & 0x3FF) == 0 {
+            _hex32("wait_C2PMSG_81", 14, last)
+            _hex32("wait_C2PMSG_58", 14, psp_read32(bar5, PSP_REG_C2PMSG_58))
+            _hex32("wait_C2PMSG_35", 14, psp_read32(bar5, PSP_REG_C2PMSG_35))
+            _dec("wait_iter",        9, i)
+        }
+        uint64 ts = alloc(16)
+        unsafe { *((ts + 0) as uint64) = 0 }
+        unsafe { *((ts + 8) as uint64) = 1000000 }
+        syscall_raw(35, ts, 0, 0, 0, 0, 0)
+        dealloc(ts)
+        i = i + 1
+    }
+    return 1
+}
+
+fn main() {
+    puts("phase3_psp_load_sos_vram (δ.4-b)")
+
+    // 1) Load PSP firmware blob.
+    uint64 bp = alloc(8); unsafe { *(bp as uint64) = 0 }
+    uint64 sp = alloc(8); unsafe { *(sp as uint64) = 0 }
+    uint64 le = fw_load_file("/tmp/mlrift_fw/psp_13_0_10_sos.bin", bp, sp)
+    if le != 0 { _dec("FAIL fw_load_file", 17, le); exit(1) }
+    uint64 fw_buf = 0; unsafe { *(bp as uint64) -> fw_buf }
+    uint64 fw_sz  = 0; unsafe { *(sp as uint64) -> fw_sz }
+    dealloc(bp); dealloc(sp)
+    uint64 uaob = fw_ucode_array_offset_bytes(fw_buf)
+
+    // 2) Open device + BAR5 + BAR0 + bus master.
+    uint64 oe = pci_open("0000:03:00.0", 14)
+    if oe != 0 { _dec("FAIL pci_open", 13, oe); dealloc(fw_buf); exit(2) }
+    amdgpu_load_navi32_bases()
+    uint64 bar5 = pci_map_bar(PCI_BAR5_REGION_INDEX)
+    if bar5 == PCI_MAP_FAILED_SENTINEL {
+        puts("FAIL: BAR5 mmap")
+        pci_close(); dealloc(fw_buf); exit(3)
+    }
+    uint64 bar0 = pci_map_bar(PCI_BAR0_REGION_INDEX)
+    if bar0 == PCI_MAP_FAILED_SENTINEL {
+        puts("FAIL: BAR0 mmap (VRAM window)")
+        pci_close(); dealloc(fw_buf); exit(4)
+    }
+    uint64 bme = pci_set_bus_master()
+    if bme != 0 {
+        _dec("FAIL pci_set_bus_master", 23, bme)
+        pci_close(); dealloc(fw_buf); exit(5)
+    }
+    _hex32("bar5_host_lo", 12, bar5 & 0xFFFFFFFF)
+    _hex32("bar0_host_lo", 12, bar0 & 0xFFFFFFFF)
+
+    // 3) Read FB_LOCATION_* — discover the VRAM aperture configured
+    //    by SBIOS POST (or whatever was left after FLR).
+    uint64 fb_base_raw = _mmhub_r32(bar5, regMMMC_VM_FB_LOCATION_BASE)
+    uint64 fb_top_raw  = _mmhub_r32(bar5, regMMMC_VM_FB_LOCATION_TOP)
+    uint64 fb_off_raw  = _mmhub_r32(bar5, regMMMC_VM_FB_OFFSET)
+    _hex32("FB_LOCATION_BASE", 16, fb_base_raw)
+    _hex32("FB_LOCATION_TOP",  15, fb_top_raw)
+    _hex32("FB_OFFSET",         9, fb_off_raw)
+    // FB_LOCATION units: MC VA >> 24 (16 MiB chunks).
+    uint64 vram_mc_base = fb_base_raw << 24
+    uint64 vram_mc_top  = (fb_top_raw << 24) | 0xFFFFFF
+    _hex32("vram_mc_base_lo",  15, vram_mc_base & 0xFFFFFFFF)
+    _hex32("vram_mc_base_hi",  15, vram_mc_base >> 32)
+
+    if fb_base_raw == 0 {
+        if fb_top_raw == 0 {
+            puts("FAIL: FB_LOCATION_BASE/TOP both zero — VRAM aperture not")
+            puts("      configured. FLR likely cleared GMC state; amdgpu")
+            puts("      must restore VRAM mapping before this path works.")
+            pci_close(); dealloc(fw_buf); exit(6)
+        }
+    }
+
+    // 4) Plan: msg1 buffer lives 1 MiB into VRAM (safe past PSP TMR
+    //    conventional location). Bar 0 maps to the BOTTOM of VRAM,
+    //    so we write at bar0 + msg1_offset.
+    uint64 msg1_offset = 0x100000
+    uint64 msg1_mc_addr = vram_mc_base + msg1_offset
+    _hex32("msg1_offset",     11, msg1_offset)
+    _hex32("msg1_mc_addr_lo", 15, msg1_mc_addr & 0xFFFFFFFF)
+    _hex32("msg1_mc_addr_hi", 15, msg1_mc_addr >> 32)
+    _hex32("C2PMSG_36 word",  14, msg1_mc_addr >> 20)
+
+    // 5) Pre-PSP state.
+    puts("--- pre-PSP state ---")
+    _hex32("pre_C2PMSG_35", 13, psp_bootloader_status_raw(bar5))
+    _hex32("pre_C2PMSG_81", 13, psp_read32(bar5, PSP_REG_C2PMSG_81))
+    _hex32("pre_C2PMSG_58", 13, psp_read32(bar5, PSP_REG_C2PMSG_58))
+    if psp_is_bootloader_ready(bar5) == 0 {
+        puts("FAIL: bootloader not ready")
+        pci_close(); dealloc(fw_buf); exit(7)
+    }
+    if psp_is_sos_alive(bar5) != 0 {
+        puts("WARN: SOS already alive — bailing")
+        pci_close(); dealloc(fw_buf); exit(8)
+    }
+
+    // 6) Chain: KDB → SPL → SYS_DRV → SOC_DRV → INTF_DRV → DBG_DRV → SOS.
+    //    All via VRAM-backed buffer at msg1_mc_addr.
+    puts("=== Cmd: KDB (VRAM-backed) ===")
+    uint64 r_kdb = _try_load_vram(bar5, bar0, msg1_offset, msg1_mc_addr,
+                                   fw_buf, fw_sz, uaob,
+                                   PSP_FW_TYPE_KDB, PSP_BL_LOAD_KEY_DATABASE)
+    _dec("kdb_rc", 6, r_kdb)
+    if r_kdb != 0 {
+        puts("FAIL: KDB via VRAM did not complete")
+        pci_close(); dealloc(fw_buf); exit(10)
+    }
+
+    puts("=== Cmd: SPL (optional) ===")
+    uint64 r_spl = _try_load_vram(bar5, bar0, msg1_offset, msg1_mc_addr,
+                                   fw_buf, fw_sz, uaob,
+                                   PSP_FW_TYPE_SPL, PSP_BL_LOAD_TOS_SPL_TABLE)
+    _dec("spl_rc", 6, r_spl)
+    if r_spl == 1 { puts("  (skipped)") }
+    if r_spl > 1 {
+        puts("FAIL: SPL cmd error")
+        pci_close(); dealloc(fw_buf); exit(11)
+    }
+
+    puts("=== Cmd: SYS_DRV ===")
+    uint64 r_sys = _try_load_vram(bar5, bar0, msg1_offset, msg1_mc_addr,
+                                   fw_buf, fw_sz, uaob,
+                                   PSP_FW_TYPE_SYS_DRV, PSP_BL_LOAD_SYSDRV)
+    _dec("sys_drv_rc", 10, r_sys)
+    if r_sys != 0 {
+        puts("FAIL: SYS_DRV cmd error")
+        pci_close(); dealloc(fw_buf); exit(12)
+    }
+
+    puts("=== Cmd: SOC_DRV (optional) ===")
+    uint64 r_soc = _try_load_vram(bar5, bar0, msg1_offset, msg1_mc_addr,
+                                   fw_buf, fw_sz, uaob,
+                                   PSP_FW_TYPE_SOC_DRV, PSP_BL_LOAD_SOCDRV)
+    _dec("soc_drv_rc", 10, r_soc)
+    if r_soc == 1 { puts("  (skipped)") }
+    if r_soc > 1 {
+        puts("FAIL: SOC_DRV cmd error")
+        pci_close(); dealloc(fw_buf); exit(13)
+    }
+
+    puts("=== Cmd: INTF_DRV (optional) ===")
+    uint64 r_intf = _try_load_vram(bar5, bar0, msg1_offset, msg1_mc_addr,
+                                    fw_buf, fw_sz, uaob,
+                                    PSP_FW_TYPE_INTF_DRV, PSP_BL_LOAD_INTFDRV)
+    _dec("intf_drv_rc", 11, r_intf)
+    if r_intf == 1 { puts("  (skipped)") }
+    if r_intf > 1 {
+        puts("FAIL: INTF_DRV cmd error")
+        pci_close(); dealloc(fw_buf); exit(14)
+    }
+
+    puts("=== Cmd: DBG_DRV (optional) ===")
+    uint64 r_dbg = _try_load_vram(bar5, bar0, msg1_offset, msg1_mc_addr,
+                                   fw_buf, fw_sz, uaob,
+                                   PSP_FW_TYPE_DBG_DRV, PSP_BL_LOAD_DBGDRV)
+    _dec("dbg_drv_rc", 10, r_dbg)
+    if r_dbg == 1 { puts("  (skipped)") }
+    if r_dbg > 1 {
+        puts("FAIL: DBG_DRV cmd error")
+        pci_close(); dealloc(fw_buf); exit(15)
+    }
+
+    // 7) Final cmd — SOS_DRV. Waits for C2PMSG_81 (not BL ready).
+    puts("=== Cmd: SOS_DRV (VRAM-backed, poll C2PMSG_81) ===")
+    uint64 lp_sos = alloc(16)
+    unsafe { *((lp_sos + 0) as uint64) = 0 }
+    unsafe { *((lp_sos + 8) as uint64) = 0 }
+    uint64 fr_sos = psp_v2_find(fw_buf, fw_sz, PSP_FW_TYPE_SOS, lp_sos + 0, lp_sos + 8)
+    if fr_sos != 0 {
+        puts("FAIL: SOS not in firmware blob")
+        dealloc(lp_sos); pci_close(); dealloc(fw_buf); exit(16)
+    }
+    uint64 sos_rel_off = 0; unsafe { *((lp_sos + 0) as uint64) -> sos_rel_off }
+    uint64 sos_size    = 0; unsafe { *((lp_sos + 8) as uint64) -> sos_size }
+    dealloc(lp_sos)
+    uint64 sos_ptr = fw_buf + uaob + sos_rel_off
+    _dec("sos_blob_size", 13, sos_size)
+
+    _mmio_copy(bar0 + msg1_offset, sos_ptr, sos_size)
+    psp_write32(bar5, PSP_REG_C2PMSG_36, msg1_mc_addr >> 20)
+    psp_write32(bar5, PSP_REG_C2PMSG_35, PSP_BL_LOAD_SOSDRV)
+    puts("--- SOS cmd written; polling C2PMSG_81 ---")
+    uint64 r_alive = _wait_sos_alive(bar5)
+    _dec("sos_alive_rc", 12, r_alive)
+
+    puts("--- post-SOS state ---")
+    _hex32("post_C2PMSG_35", 14, psp_bootloader_status_raw(bar5))
+    _hex32("post_C2PMSG_81", 14, psp_read32(bar5, PSP_REG_C2PMSG_81))
+    _hex32("post_C2PMSG_58", 14, psp_read32(bar5, PSP_REG_C2PMSG_58))
+    _dec("post_bl_ready",   13, psp_is_bootloader_ready(bar5))
+    _dec("post_sos_alive",  14, psp_is_sos_alive(bar5))
+    if psp_is_sos_alive(bar5) != 0 {
+        _hex32("sos_fw_version", 14, psp_sos_fw_version(bar5))
+    }
+
+    pci_close()
+    dealloc(fw_buf)
+
+    if r_alive != 0 {
+        puts("verdict: SOS_DRV via VRAM did not sign on")
+        puts("  → C2PMSG_81 still 0; same as sysmem path")
+        puts("  → VRAM hypothesis falsified; ceiling is deeper than buffer location")
+        puts("phase3_psp_load_sos_vram: FAIL")
+        exit(17)
+    }
+    puts("verdict: SOS ALIVE via VRAM-backed buffer ✓")
+    puts("phase3_psp_load_sos_vram: GREEN")
+    exit(0)
+}
