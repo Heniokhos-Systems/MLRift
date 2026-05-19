@@ -1,0 +1,128 @@
+// Phase 3 slice ε.0a-3 — Layer 1 offline PTE encoding test.
+//
+// Pure CPU, no GPU MMIO, no sudo. Allocates a fake pt_ctx (PD0 + PT
+// as plain heap pages, NOT IOMMU-mapped — gmc_map only writes to the
+// host VAs, doesn't issue any DMA). Calls gmc_map with hardcoded
+// mc_va_base=0x100000, buf_gpu_iova=0x200000200000, size=0x100000.
+// Reads PT and PD entries back and asserts the encoding matches the
+// spec exactly.
+
+import "../std/gmc.mlr"
+import "../std/gmc_constants.mlr"
+import "../std/sys.mlr"
+
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn puts(uint64 s) -> uint32
+
+fn _hex64(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(64)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint8 zx = 48; unsafe { *((b + ll + 1) as uint8) = zx }
+    uint8 xc = 120; unsafe { *((b + ll + 2) as uint8) = xc }
+    uint64 j = 0
+    while j < 16 {
+        uint64 sh = (15 - j) * 4
+        uint64 nyb = (v >> sh) & 0xF
+        uint8 ch = nyb + 48
+        if nyb >= 10 { ch = nyb + 87 }
+        unsafe { *((b + ll + 3 + j) as uint8) = ch }
+        j = j + 1
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 19) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+fn _read_q(uint64 base, uint64 idx) -> uint64 {
+    uint64 v = 0
+    unsafe { *((base + idx * 8) as uint64) -> v }
+    return v
+}
+
+fn main() {
+    puts("phase3_gmc_pte_encode_test")
+
+    // Build a fake pt_ctx using plain heap pages (no IOMMU).
+    uint64 pd_host = alloc(4096)
+    uint64 pt_host = alloc(4096)
+    uint64 pd_iova = 0x300000010000   // fake — only used as PDE target
+    uint64 pt_iova = 0x300000020000   // fake — what gmc_map writes into PDE
+    uint64 i = 0
+    while i < 4096 {
+        uint8 z = 0
+        unsafe { *((pd_host + i) as uint8) = z }
+        unsafe { *((pt_host + i) as uint8) = z }
+        i = i + 1
+    }
+    uint64 pt_ctx = alloc(GMC_PT_CTX_SIZE)
+    unsafe { *((pt_ctx + GMC_PT_OFF_PD_HOST) as uint64) = pd_host }
+    unsafe { *((pt_ctx + GMC_PT_OFF_PD_IOVA) as uint64) = pd_iova }
+    unsafe { *((pt_ctx + GMC_PT_OFF_PT_HOST) as uint64) = pt_host }
+    unsafe { *((pt_ctx + GMC_PT_OFF_PT_IOVA) as uint64) = pt_iova }
+
+    uint64 mc_va_base   = 0x100000
+    uint64 buf_gpu_iova = 0x200000200000
+    uint64 size         = 0x100000   // 1 MiB
+
+    uint64 rc = gmc_map(pt_ctx, mc_va_base, buf_gpu_iova, size)
+    if rc != 0 {
+        _hex64("FAIL gmc_map rc", 14, rc)
+        exit(1)
+    }
+
+    // PDE check: PDE[0] (since mc_va_base >> 21 = 0) should = pt_iova | VALID.
+    uint64 pde0 = _read_q(pd_host, 0)
+    uint64 want_pde0 = (pt_iova & 0xFFFFFFFFFFFFF000) | AMDGPU_PTE_VALID
+    _hex64("PDE0_got",  8, pde0)
+    _hex64("PDE0_want", 9, want_pde0)
+    if pde0 != want_pde0 { puts("FAIL PDE[0]"); exit(2) }
+
+    // PDE[1..511] should be 0.
+    uint64 pde1 = _read_q(pd_host, 1)
+    if pde1 != 0 { puts("FAIL PDE[1] non-zero"); exit(3) }
+
+    // PT entries: pt_start_idx = (0x100000 >> 12) & 0x1FF = 0x100 = 256.
+    // PT[256] should encode iova 0x200000200000.
+    // PT[511] should encode iova 0x2000002FF000.
+    uint64 want_flags = AMDGPU_PTE_VALID | AMDGPU_PTE_SYSTEM | AMDGPU_PTE_SNOOPED | AMDGPU_PTE_READABLE | AMDGPU_PTE_WRITEABLE | AMDGPU_PTE_EXECUTABLE
+
+    uint64 pt256 = _read_q(pt_host, 256)
+    uint64 want256 = 0x200000200000 | want_flags
+    _hex64("PT256_got",  9, pt256)
+    _hex64("PT256_want", 10, want256)
+    if pt256 != want256 { puts("FAIL PT[256]"); exit(4) }
+
+    uint64 pt257 = _read_q(pt_host, 257)
+    uint64 want257 = 0x200000201000 | want_flags
+    if pt257 != want257 { puts("FAIL PT[257]"); exit(5) }
+
+    uint64 pt511 = _read_q(pt_host, 511)
+    uint64 want511 = 0x2000002FF000 | want_flags
+    _hex64("PT511_got",  9, pt511)
+    _hex64("PT511_want", 10, want511)
+    if pt511 != want511 { puts("FAIL PT[511]"); exit(6) }
+
+    // PT[255] (below our region) should be 0.
+    uint64 pt255 = _read_q(pt_host, 255)
+    if pt255 != 0 { puts("FAIL PT[255] should be 0"); exit(7) }
+
+    // Constraint checks: each error code from gmc_map.
+    uint64 rc_bad_align_mc = gmc_map(pt_ctx, 0x100001, buf_gpu_iova, size)
+    if rc_bad_align_mc != 1 { puts("FAIL unaligned mc_va_base did not return 1"); exit(8) }
+    uint64 rc_zero_size = gmc_map(pt_ctx, 0x100000, buf_gpu_iova, 0)
+    if rc_zero_size != 2 { puts("FAIL zero size did not return 2"); exit(9) }
+    uint64 rc_bad_align_sz = gmc_map(pt_ctx, 0x100000, buf_gpu_iova, 0x1001)
+    if rc_bad_align_sz != 2 { puts("FAIL unaligned size did not return 2"); exit(10) }
+    // Range crossing 2-MiB boundary: mc_va_base=0x1F0000, size=0x20000 spans
+    // [0x1F0000..0x20FFFF] which crosses the 0x200000 boundary.
+    uint64 rc_cross = gmc_map(pt_ctx, 0x1F0000, buf_gpu_iova, 0x20000)
+    if rc_cross != 3 { puts("FAIL cross-2MiB did not return 3"); exit(11) }
+
+    dealloc(pt_ctx); dealloc(pt_host); dealloc(pd_host)
+    puts("phase3_gmc_pte_encode_test: GREEN")
+    exit(0)
+}
