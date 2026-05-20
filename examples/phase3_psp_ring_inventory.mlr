@@ -1,0 +1,85 @@
+// Phase 3 ζ.10-prep — read-only inventory of PSP SOS ring state.
+//
+// After ζ.8/ζ.9 confirmed the remaining wall is MEC firmware-internal
+// scheduler state, we need to issue a PSP command to reload MEC firmware
+// (cleaning DMEM). PSP SOS-mode commands go through a ring buffer set up
+// by amdgpu. This smoke reads (without writing) all relevant PSP ring
+// registers so we know what we're working with.
+//
+// Read:
+//   C2PMSG_58  — SOS firmware version
+//   C2PMSG_64  — kernel cmd (last command word)
+//   C2PMSG_67  — ring wptr (kernel side)
+//   C2PMSG_69  — ring base lo
+//   C2PMSG_70  — ring base hi
+//   C2PMSG_71  — ring size
+//   C2PMSG_81  — SOS sign-of-life
+//   C2PMSG_103 — SR-IOV ring hi (probably 0 on bare metal)
+//   C2PMSG_115 — TOS state
+//
+// Read-only. Safe.
+
+import "../std/pcidev.mlr"
+import "../std/amdgpu_ip_discovery.mlr"
+import "../std/psp.mlr"
+import "../std/sys.mlr"
+
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn puts(uint64 s) -> uint32
+
+fn _hex32(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(80)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint8 zx = 48; unsafe { *((b + ll + 1) as uint8) = zx }
+    uint8 xc = 120; unsafe { *((b + ll + 2) as uint8) = xc }
+    uint64 j = 0
+    while j < 8 {
+        uint64 sh = (7 - j) * 4
+        uint64 nyb = (v >> sh) & 0xF
+        uint8 ch = nyb + 48
+        if nyb >= 10 { ch = nyb + 87 }
+        unsafe { *((b + ll + 3 + j) as uint8) = ch }
+        j = j + 1
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 11) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+fn main() {
+    puts("phase3_psp_ring_inventory (ζ.10-prep)")
+    uint64 oe = pci_open("0000:03:00.0", 14)
+    if oe != 0 { puts("FAIL pci_open"); exit(1) }
+    amdgpu_load_navi32_bases()
+    uint64 bar5 = pci_map_bar(PCI_BAR5_REGION_INDEX)
+    if bar5 == PCI_MAP_FAILED_SENTINEL { puts("FAIL BAR5"); pci_close(); exit(2) }
+
+    uint64 sol = psp_read32(bar5, PSP_REG_C2PMSG_81)
+    _hex32("C2PMSG_81 (sign-of-life)", 24, sol)
+    if sol == 0 {
+        puts("FAIL: SOS not alive")
+        pci_close(); exit(3)
+    }
+
+    puts("--- PSP SOS ring state ---")
+    _hex32("C2PMSG_58 (sos_fw_ver)",   22, psp_read32(bar5, PSP_REG_C2PMSG_58))
+    _hex32("C2PMSG_64 (kernel cmd)",   22, psp_read32(bar5, PSP_REG_C2PMSG_64))
+    _hex32("C2PMSG_67 (ring wptr)",    21, psp_read32(bar5, PSP_REG_C2PMSG_67))
+    _hex32("C2PMSG_69 (ring base lo)", 24, psp_read32(bar5, PSP_REG_C2PMSG_69))
+    _hex32("C2PMSG_70 (ring base hi)", 24, psp_read32(bar5, PSP_REG_C2PMSG_70))
+    _hex32("C2PMSG_71 (ring size)",    21, psp_read32(bar5, PSP_REG_C2PMSG_71))
+    _hex32("C2PMSG_103 (sriov ring)",  23, psp_read32(bar5, PSP_REG_C2PMSG_103))
+    _hex32("C2PMSG_115 (TOS state)",   22, psp_read32(bar5, PSP_REG_C2PMSG_115))
+
+    // C2PMSG_35 too — bootloader state (should be quiescent in SOS mode)
+    _hex32("C2PMSG_35 (BL state)", 20, psp_read32(bar5, PSP_REG_C2PMSG_35))
+    _hex32("C2PMSG_36 (BL bufptr)", 21, psp_read32(bar5, PSP_REG_C2PMSG_36))
+
+    pci_close()
+    puts("ζ.10-prep GREEN — inventory complete")
+    exit(0)
+}
