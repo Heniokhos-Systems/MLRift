@@ -1,0 +1,376 @@
+// Phase 3 slice ζ.11 — PSP AUTOLOAD_RLC w/o touching GMC aperture.
+//
+// ζ.10 wedged PSP by overwriting SYSTEM_APERTURE_LOW/HIGH — broke PSP's
+// access to its in-flight ring contents in amdgpu's GTT. PSP returned
+// error 0x115 on subsequent ring-create.
+//
+// ζ.11 keeps amdgpu's aperture intact and allocates sysmem at an IOVA
+// WITHIN amdgpu's existing aperture range. This way PSP can read our
+// new ring without breaking access to its existing state.
+//
+// Steps:
+//   1. Read SYSTEM_APERTURE_LOW/HIGH to learn amdgpu's range.
+//   2. Pick an IOVA in the upper portion of that range (unused gap,
+//      above amdgpu's PSP ring at 0x83_FE7A_2000).
+//   3. Allocate sysmem at that IOVA via pci_alloc_sysmem_at_iova.
+//   4. Submit ring-create + AUTOLOAD_RLC.
+//
+// === ζ.10 original notes below for reference ===
+//
+// (Original ζ.10:)
+//
+// Goal: force PSP to trigger RLC backdoor autoload, which re-loads MEC
+// firmware. This clears MEC's firmware-internal scheduler table (DMEM)
+// — the remaining wall from ζ.9. If PSP retained TOC parse state from
+// amdgpu's prior init, AUTOLOAD_RLC alone (without a fresh LOAD_TOC +
+// LOAD_IP_FW chain) should be sufficient. If not, status returns
+// PSP_ERR_UNKNOWN_COMMAND (0x100) and we'll know step 3 is needed.
+//
+// Strategy:
+//   1. Allocate sysmem for our own GPCOM ring (4 KB), cmd buffer (1 KB),
+//      fence dword. Use bus addresses as MC addresses (PSP reads via
+//      system aperture or PCIe DMA).
+//   2. Re-init the PSP GPCOM ring at our buffers — write C2PMSG_69/70/71
+//      with our ring base/size, then C2PMSG_64 = 0x00020000 (RING_TYPE_KM
+//      << 16). Poll C2PMSG_64 for bit 31 set + low 16 bits = 0.
+//   3. Build AUTOLOAD_RLC cmd: zero 1024 B, set cmd_id=0x21 at offset +8.
+//   4. Build psp_gfx_rb_frame at ring[0] (64 B):
+//        +0  cmd_buf_addr_lo
+//        +4  cmd_buf_addr_hi
+//        +8  cmd_buf_size = 1024
+//        +12 fence_addr_lo
+//        +16 fence_addr_hi
+//        +20 fence_value = 1
+//        +24..+63 zero
+//   5. Write C2PMSG_67 = 16 (wptr advance — frame consumed 16 dwords).
+//   6. Poll fence value (sysmem) for == 1, with timeout.
+//   7. Read response status at cmd_buf + 864 (0 = success, 0x100 = unknown).
+//   8. If status==0, re-attempt the dispatch from ζ.9 — MEC DMEM should
+//      now be fresh.
+//
+// PRESERVES: SOS (per agent — AUTOLOAD_RLC runs inside SOS, doesn't
+//            touch BL-loaded SOS firmware family).
+// RISK:      C2PMSG_64 = 0x00020000 may be rejected if PSP considers
+//            ring already created. We have a fallback diagnostic if so.
+
+import "../std/pcidev.mlr"
+import "../std/amdgpu_ip_discovery.mlr"
+import "../std/gmc_constants.mlr"
+import "../std/gmc.mlr"
+import "../std/psp.mlr"
+import "../std/sys.mlr"
+
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn puts(uint64 s) -> uint32
+
+static uint64 PSP_RING_CREATE_KM_CMD = 0x00020000   // RING_TYPE__KM << 16
+static uint64 PSP_GFX_CMD_AUTOLOAD_RLC = 0x21
+static uint64 PSP_GPCOM_CMD_BUF_SIZE = 1024
+static uint64 PSP_GPCOM_RING_SIZE = 0x1000   // 4 KiB (matches amdgpu)
+static uint64 PSP_GPCOM_FRAME_SIZE = 64
+static uint64 PSP_GPCOM_RESP_OFFSET = 864
+
+fn _hex32(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(96)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint8 zx = 48; unsafe { *((b + ll + 1) as uint8) = zx }
+    uint8 xc = 120; unsafe { *((b + ll + 2) as uint8) = xc }
+    uint64 j = 0
+    while j < 8 {
+        uint64 sh = (7 - j) * 4
+        uint64 nyb = (v >> sh) & 0xF
+        uint8 ch = nyb + 48
+        if nyb >= 10 { ch = nyb + 87 }
+        unsafe { *((b + ll + 3 + j) as uint8) = ch }
+        j = j + 1
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 11) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+fn _dec(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(80)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint64 digits = 0
+    if v == 0 {
+        uint8 z = 48; unsafe { *((b + ll + 1) as uint8) = z }; digits = 1
+    } else {
+        uint64 t = v
+        while t > 0 { digits = digits + 1; t = t / 10 }
+        uint64 k = digits
+        t = v
+        while k > 0 {
+            k = k - 1
+            uint64 d = t - (t / 10) * 10
+            uint8 db = d + 48
+            unsafe { *((b + ll + 1 + k) as uint8) = db }
+            t = t / 10
+        }
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 1 + digits) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+// Zero a sysmem region byte-by-byte (slow but obviously correct).
+fn _zero_region(uint64 host_va, uint64 size) {
+    uint64 i = 0
+    while i < size {
+        unsafe { *((host_va + i) as uint8) = 0 }
+        i = i + 1
+    }
+}
+
+fn _msleep_ms(uint64 ms) {
+    uint64 ts = alloc(16)
+    unsafe { *((ts + 0) as uint64) = ms / 1000 }
+    unsafe { *((ts + 8) as uint64) = (ms - (ms / 1000) * 1000) * 1000000 }
+    syscall_raw(35, ts, 0, 0, 0, 0, 0)
+    dealloc(ts)
+}
+
+fn main() {
+    puts("phase3_psp_autoload_rlc_v2 (ζ.11)")
+    uint64 oe = pci_open("0000:03:00.0", 14)
+    if oe != 0 { puts("FAIL pci_open"); exit(1) }
+    amdgpu_load_navi32_bases()
+    uint64 bar5 = pci_map_bar(PCI_BAR5_REGION_INDEX)
+    if bar5 == PCI_MAP_FAILED_SENTINEL { puts("FAIL BAR5"); pci_close(); exit(2) }
+    uint64 bme = pci_set_bus_master()
+    if bme != 0 { puts("FAIL set_bus_master"); pci_close(); exit(3) }
+
+    uint64 sol = psp_read32(bar5, PSP_REG_C2PMSG_81)
+    _hex32("C2PMSG_81 (sol)", 15, sol)
+    if sol == 0 { puts("FAIL: SOS not alive"); pci_close(); exit(4) }
+
+    // Step 1: Read amdgpu's existing SYSTEM_APERTURE_LOW/HIGH to learn
+    // the MC range PSP can already access. We'll allocate sysmem within
+    // that range — avoiding any aperture modification (which wedged ζ.10).
+    puts("--- Reading amdgpu's existing SYSTEM_APERTURE ---")
+    uint64 apert_lo_byte = (amdgpu_ip_mmhub_base_0 + regMMMC_VM_SYSTEM_APERTURE_LOW_ADDR) * 4
+    uint64 apert_hi_byte = (amdgpu_ip_mmhub_base_0 + regMMMC_VM_SYSTEM_APERTURE_HIGH_ADDR) * 4
+    uint32 apert_lo_w = 0; unsafe { *((bar5 + apert_lo_byte) as uint32) -> apert_lo_w }
+    uint32 apert_hi_w = 0; unsafe { *((bar5 + apert_hi_byte) as uint32) -> apert_hi_w }
+    uint64 apert_lo_reg = apert_lo_w
+    uint64 apert_hi_reg = apert_hi_w
+    _hex32("APERT_LOW_ADDR reg",  18, apert_lo_reg)
+    _hex32("APERT_HIGH_ADDR reg", 19, apert_hi_reg)
+    // Register values are MC address >> 18.
+    uint64 apert_mc_low  = apert_lo_reg << 18
+    uint64 apert_mc_high = apert_hi_reg << 18
+    _hex32("apert_mc_low_lo",  15, apert_mc_low & 0xFFFFFFFF)
+    _hex32("apert_mc_low_hi",  15, apert_mc_low >> 32)
+    _hex32("apert_mc_high_lo", 16, apert_mc_high & 0xFFFFFFFF)
+    _hex32("apert_mc_high_hi", 16, apert_mc_high >> 32)
+
+    // Pick an IOVA inside the aperture. Observed range on Navi 32 with
+    // amdgpu-primed setup: [0x80_00000000, 0x83_FEFC0000). amdgpu's PSP
+    // ring sits at 0x83_FE7A_2000 + 0x1000. Pick 0x83_FE800000 — 376 KB
+    // above amdgpu's ring, ~7.75 MB below aperture top. Should be a free
+    // gap (amdgpu's allocator typically grows from low end).
+    uint64 ring_iova    = 0x83FE800000
+    uint64 cmd_iova     = 0x83FE804000
+    uint64 fence_iova   = 0x83FE808000
+    uint64 _scratch_iova_unused = 0   // no aperture mod, no scratch needed
+
+    if ring_iova < apert_mc_low {
+        puts("WARN: ring_iova below aperture LOW — PSP may not reach it")
+    }
+    if ring_iova >= apert_mc_high {
+        puts("WARN: ring_iova above aperture HIGH — PSP may not reach it")
+    }
+
+    puts("--- Allocating sysmem at IOVAs inside amdgpu aperture ---")
+    uint64 rhp = alloc(8); unsafe { *(rhp as uint64) = 0 }
+    uint64 e1 = pci_alloc_sysmem_at_iova(PSP_GPCOM_RING_SIZE, ring_iova, rhp)
+    if e1 != 0 {
+        _dec("FAIL alloc ring", 15, e1); dealloc(rhp); pci_close(); exit(5)
+    }
+    uint64 ring_hva = 0; unsafe { *(rhp as uint64) -> ring_hva }
+    dealloc(rhp)
+    uint64 ring_gpa = ring_iova
+
+    uint64 chp = alloc(8); unsafe { *(chp as uint64) = 0 }
+    uint64 e2 = pci_alloc_sysmem_at_iova(4096, cmd_iova, chp)
+    if e2 != 0 {
+        _dec("FAIL alloc cmd", 14, e2)
+        pci_free_sysmem(ring_hva, ring_iova, PSP_GPCOM_RING_SIZE)
+        dealloc(chp); pci_close(); exit(6)
+    }
+    uint64 cmd_hva = 0; unsafe { *(chp as uint64) -> cmd_hva }
+    dealloc(chp)
+    uint64 cmd_gpa = cmd_iova
+
+    uint64 fhp = alloc(8); unsafe { *(fhp as uint64) = 0 }
+    uint64 e3 = pci_alloc_sysmem_at_iova(4096, fence_iova, fhp)
+    if e3 != 0 {
+        _dec("FAIL alloc fence", 16, e3)
+        pci_free_sysmem(ring_hva, ring_iova, PSP_GPCOM_RING_SIZE)
+        pci_free_sysmem(cmd_hva, cmd_iova, 4096)
+        dealloc(fhp); pci_close(); exit(7)
+    }
+    uint64 fence_hva = 0; unsafe { *(fhp as uint64) -> fence_hva }
+    dealloc(fhp)
+    uint64 fence_gpa = fence_iova
+
+    // No scratch_iova alloc needed — no aperture modification.
+
+    _hex32("ring_gpa_lo",  11, ring_gpa & 0xFFFFFFFF)
+    _hex32("ring_gpa_hi",  11, ring_gpa >> 32)
+    _hex32("cmd_gpa_lo",   10, cmd_gpa & 0xFFFFFFFF)
+    _hex32("fence_gpa_lo", 12, fence_gpa & 0xFFFFFFFF)
+
+    _zero_region(ring_hva, PSP_GPCOM_RING_SIZE)
+    _zero_region(cmd_hva,  PSP_GPCOM_CMD_BUF_SIZE)
+    _zero_region(fence_hva, 4096)
+
+    // Step 2: Re-init the GPCOM ring at our buffer.
+    // Check C2PMSG_64 first — should have bit 31 set (PSP ready for cmds).
+    puts("--- Pre-init PSP state ---")
+    _hex32("C2PMSG_64 pre-init", 18, psp_read32(bar5, PSP_REG_C2PMSG_64))
+    _hex32("C2PMSG_67 pre-init", 18, psp_read32(bar5, PSP_REG_C2PMSG_67))
+
+    puts("--- Submitting ring create (KM) ---")
+    psp_write32(bar5, PSP_REG_C2PMSG_69, ring_gpa & 0xFFFFFFFF)
+    psp_write32(bar5, PSP_REG_C2PMSG_70, ring_gpa >> 32)
+    psp_write32(bar5, PSP_REG_C2PMSG_71, PSP_GPCOM_RING_SIZE)
+    psp_write32(bar5, PSP_REG_C2PMSG_64, PSP_RING_CREATE_KM_CMD)
+
+    // Per agent: 20 ms delay then poll C2PMSG_64 for (val & 0x80000000) set + low 16 bits = 0.
+    _msleep_ms(20)
+    uint64 ri = 0
+    uint64 ring_create_val = 0
+    while ri < 200 {
+        ring_create_val = psp_read32(bar5, PSP_REG_C2PMSG_64)
+        if (ring_create_val & 0x80000000) != 0 {
+            ri = 200
+        }
+        if ri < 200 {
+            _msleep_ms(5)
+            ri = ri + 1
+        }
+    }
+    _hex32("C2PMSG_64 post-init", 19, ring_create_val)
+    uint64 err_bits = ring_create_val & 0xFFFF
+    if (ring_create_val & 0x80000000) == 0 {
+        puts("FAIL: ring create never completed (no bit 31)")
+        pci_close(); exit(8)
+    }
+    if err_bits != 0 {
+        _hex32("ring create error bits", 22, err_bits)
+        puts("FAIL: PSP rejected ring re-init")
+        pci_close(); exit(9)
+    }
+    puts("Ring create OK")
+
+    // Step 3: Build AUTOLOAD_RLC command at cmd buffer.
+    // Layout per psp_gfx_cmd_resp (1024 B):
+    //   +0  buf_size
+    //   +4  buf_version
+    //   +8  cmd_id              ← 0x21 for AUTOLOAD_RLC
+    //   +12 resp_buf_addr_lo
+    //   +16 resp_buf_addr_hi
+    //   +20 resp_offset
+    //   +24 resp_buf_size
+    //   +28 union psp_gfx_commands cmd  (zero for AUTOLOAD_RLC)
+    //   +864 struct psp_gfx_resp resp   (PSP writes status here)
+    puts("--- Building AUTOLOAD_RLC command ---")
+    unsafe { *((cmd_hva + 8) as uint32) = PSP_GFX_CMD_AUTOLOAD_RLC }
+
+    // Step 4: Build psp_gfx_rb_frame at ring[0] (64 B = 16 dwords).
+    puts("--- Building ring frame ---")
+    unsafe { *((ring_hva + 0)  as uint32) = cmd_gpa & 0xFFFFFFFF }
+    unsafe { *((ring_hva + 4)  as uint32) = cmd_gpa >> 32 }
+    unsafe { *((ring_hva + 8)  as uint32) = PSP_GPCOM_CMD_BUF_SIZE }
+    unsafe { *((ring_hva + 12) as uint32) = fence_gpa & 0xFFFFFFFF }
+    unsafe { *((ring_hva + 16) as uint32) = fence_gpa >> 32 }
+    unsafe { *((ring_hva + 20) as uint32) = 1 }   // fence_value
+    // sid_lo/hi, vmid, frame_type, reserved — all zero (zero'd by region init)
+
+    // Sanity: re-read what we wrote.
+    uint32 rb0 = 0; unsafe { *((ring_hva + 0) as uint32) -> rb0 }
+    uint32 rb1 = 0; unsafe { *((ring_hva + 12) as uint32) -> rb1 }
+    uint64 rb0_u = rb0; uint64 rb1_u = rb1
+    _hex32("frame.cmd_buf_lo", 16, rb0_u)
+    _hex32("frame.fence_lo",   14, rb1_u)
+
+    // Step 5: Doorbell — write wptr advance to C2PMSG_67.
+    // wptr is in dwords; one frame = 16 dwords.
+    puts("--- Doorbell C2PMSG_67 = 16 ---")
+    psp_write32(bar5, PSP_REG_C2PMSG_67, 16)
+
+    // Step 6: Poll fence dword for == 1.
+    puts("--- Polling fence ---")
+    uint64 fi = 0
+    uint64 fence_val = 0
+    while fi < 2000 {
+        uint32 fv = 0; unsafe { *((fence_hva) as uint32) -> fv }
+        fence_val = fv
+        if fence_val == 1 {
+            fi = 2000
+        }
+        if fi < 2000 {
+            if (fi & 0xFF) == 0 {
+                _dec("poll", 4, fi)
+                _hex32("  fence", 7, fence_val)
+                _hex32("  C2PMSG_67", 12, psp_read32(bar5, PSP_REG_C2PMSG_67))
+            }
+            _msleep_ms(1)
+            fi = fi + 1
+        }
+    }
+
+    if fence_val != 1 {
+        _hex32("final fence", 11, fence_val)
+        // Read response status anyway — might have partial info.
+        uint32 rs = 0; unsafe { *((cmd_hva + PSP_GPCOM_RESP_OFFSET) as uint32) -> rs }
+        uint64 rs_u = rs
+        _hex32("final status", 12, rs_u)
+        puts("FAIL: fence never reached 1 — PSP didn't complete cmd")
+        pci_free_sysmem(ring_hva, ring_iova, PSP_GPCOM_RING_SIZE)
+        pci_free_sysmem(cmd_hva, cmd_iova, 4096)
+        pci_free_sysmem(fence_hva, fence_iova, 4096)
+        pci_close(); exit(10)
+    }
+
+    // Step 7: Read response status.
+    uint32 status_w = 0
+    unsafe { *((cmd_hva + PSP_GPCOM_RESP_OFFSET) as uint32) -> status_w }
+    uint64 status_u = status_w
+    _hex32("response status", 15, status_u)
+
+    // Decode status:
+    //   0      = success
+    //   0x100  = PSP_ERR_UNKNOWN_COMMAND (need LOAD_TOC + LOAD_IP_FW first)
+    //   other  = various errors
+    if status_u == 0 {
+        puts("AUTOLOAD_RLC GREEN — MEC firmware reloaded, DMEM cleared")
+    } else {
+        if status_u == 0x100 {
+            puts("AUTOLOAD_RLC returned UNKNOWN_COMMAND")
+            puts("→ PSP needs LOAD_TOC + LOAD_IP_FW chain first (step 3)")
+        } else {
+            puts("AUTOLOAD_RLC failed with non-zero status")
+        }
+    }
+
+    // Verify SOS still alive.
+    uint64 sol_post = psp_read32(bar5, PSP_REG_C2PMSG_81)
+    _hex32("C2PMSG_81 post", 14, sol_post)
+
+    pci_free_sysmem(ring_hva, ring_iova, PSP_GPCOM_RING_SIZE)
+    pci_free_sysmem(cmd_hva, cmd_iova, 4096)
+    pci_free_sysmem(fence_hva, fence_iova, 4096)
+    pci_close()
+    puts("ζ.11 complete")
+    exit(0)
+}
