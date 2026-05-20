@@ -1,0 +1,214 @@
+// Phase 3 slice δ.4-snapshot — dump MMIO state of the device via
+// sysfs BAR5. Works regardless of which driver (amdgpu / vfio-pci)
+// currently owns the device — sysfs resource5 is just a memory-mapped
+// view of the BAR. Linux allows root mmap on it whether or not a
+// driver is bound.
+//
+// Use case: run with amdgpu owning the device → capture "good state".
+// Compare against a run with vfio owning the device (post-FLR) →
+// reveals which registers amdgpu sets up that we lose to FLR.
+//
+// USAGE:
+//   sudo /tmp/phase3_mmio_dump        # prints registers to stdout
+//
+// Pipe to a file (in /tmp) to compare runs:
+//   sudo /tmp/phase3_mmio_dump > /tmp/state_amdgpu.txt
+//   # rebind to vfio
+//   sudo /tmp/phase3_mmio_dump > /tmp/state_vfio.txt
+//   diff /tmp/state_amdgpu.txt /tmp/state_vfio.txt
+
+import "../std/sys.mlr"
+import "../std/amdgpu_ip_discovery.mlr"
+import "../std/gmc_constants.mlr"
+import "../std/psp.mlr"
+import "../std/nbio.mlr"
+
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn puts(uint64 s) -> uint32
+
+// Linux constants we need (not in sys.mlr).
+static uint64 O_RDWR     = 2
+static uint64 PROT_READ  = 1
+static uint64 PROT_WRITE = 2
+static uint64 MAP_SHARED = 1
+static uint64 NR_write   = 1     // syscall number for write(2)
+
+// Path: /sys/bus/pci/devices/0000:03:00.0/resource5
+static uint64 SYSFS_RESOURCE5_PATH_LEN = 49
+
+// =====================================================================
+// Hex print helpers (label = value)
+// =====================================================================
+fn _hex32(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(80)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }
+        i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint8 zx = 48; unsafe { *((b + ll + 1) as uint8) = zx }
+    uint8 xc = 120; unsafe { *((b + ll + 2) as uint8) = xc }
+    uint64 j = 0
+    while j < 8 {
+        uint64 sh = (7 - j) * 4
+        uint64 nyb = (v >> sh) & 0xF
+        uint8 ch = nyb + 48
+        if nyb >= 10 { ch = nyb + 87 }
+        unsafe { *((b + ll + 3 + j) as uint8) = ch }
+        j = j + 1
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 11) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+// =====================================================================
+// MMIO accessors against the sysfs-mapped BAR5.
+// =====================================================================
+fn _bar5_r32(uint64 bar5, uint64 byte_off) -> uint64 {
+    uint32 v = 0
+    unsafe { *((bar5 + byte_off) as uint32) -> v }
+    uint64 r = v
+    return r
+}
+
+fn _mmhub_dw(uint64 reg_dw) -> uint64 {
+    return (amdgpu_ip_mmhub_base_0 + reg_dw) * 4
+}
+
+fn _mp0_dw(uint64 reg_dw) -> uint64 {
+    return (amdgpu_ip_mp0_base_0 + reg_dw) * 4
+}
+
+fn _mp1_dw(uint64 reg_dw) -> uint64 {
+    return (amdgpu_ip_mp1_base_0 + reg_dw) * 4
+}
+
+fn _nbif_dw(uint64 reg_dw) -> uint64 {
+    return (amdgpu_ip_nbif_base_2 + reg_dw) * 4
+}
+
+// =====================================================================
+// Dump groups
+// =====================================================================
+fn _dump_mmhub(uint64 bar5) {
+    puts("--- MMHUB (FB+AGP+SYS apertures, TLB, L2, CONTEXT0) ---")
+    _hex32("FB_LOCATION_BASE",  16, _bar5_r32(bar5, _mmhub_dw(regMMMC_VM_FB_LOCATION_BASE)))
+    _hex32("FB_LOCATION_TOP",   15, _bar5_r32(bar5, _mmhub_dw(regMMMC_VM_FB_LOCATION_TOP)))
+    _hex32("FB_OFFSET",          9, _bar5_r32(bar5, _mmhub_dw(regMMMC_VM_FB_OFFSET)))
+    _hex32("AGP_BASE",           8, _bar5_r32(bar5, _mmhub_dw(regMMMC_VM_AGP_BASE)))
+    _hex32("AGP_BOT",            7, _bar5_r32(bar5, _mmhub_dw(regMMMC_VM_AGP_BOT)))
+    _hex32("AGP_TOP",            7, _bar5_r32(bar5, _mmhub_dw(regMMMC_VM_AGP_TOP)))
+    _hex32("SYS_APERT_LO",      12, _bar5_r32(bar5, _mmhub_dw(regMMMC_VM_SYSTEM_APERTURE_LOW_ADDR)))
+    _hex32("SYS_APERT_HI",      12, _bar5_r32(bar5, _mmhub_dw(regMMMC_VM_SYSTEM_APERTURE_HIGH_ADDR)))
+    _hex32("SYS_APERT_DEF_LSB", 17, _bar5_r32(bar5, _mmhub_dw(regMMMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_LSB)))
+    _hex32("SYS_APERT_DEF_MSB", 17, _bar5_r32(bar5, _mmhub_dw(regMMMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_MSB)))
+    _hex32("MX_L1_TLB_CNTL",    14, _bar5_r32(bar5, _mmhub_dw(regMMMC_VM_MX_L1_TLB_CNTL)))
+    _hex32("L2_CNTL",            7, _bar5_r32(bar5, _mmhub_dw(regMMVM_L2_CNTL)))
+    _hex32("L2_CNTL2",           8, _bar5_r32(bar5, _mmhub_dw(regMMVM_L2_CNTL2)))
+    _hex32("L2_CNTL3",           8, _bar5_r32(bar5, _mmhub_dw(regMMVM_L2_CNTL3)))
+    _hex32("L2_CNTL4",           8, _bar5_r32(bar5, _mmhub_dw(regMMVM_L2_CNTL4)))
+    _hex32("L2_CNTL5",           8, _bar5_r32(bar5, _mmhub_dw(regMMVM_L2_CNTL5)))
+    _hex32("L2_PFC_CNTL",       11, _bar5_r32(bar5, _mmhub_dw(regMMVM_L2_PROTECTION_FAULT_CNTL)))
+    _hex32("L2_PFC_CNTL2",      12, _bar5_r32(bar5, _mmhub_dw(regMMVM_L2_PROTECTION_FAULT_CNTL2)))
+    _hex32("L2_PFC_STATUS",     13, _bar5_r32(bar5, _mmhub_dw(regMMVM_L2_PROTECTION_FAULT_STATUS)))
+    _hex32("L2_PFC_ADDR_LO",    14, _bar5_r32(bar5, _mmhub_dw(regMMVM_L2_PROTECTION_FAULT_ADDR_LO32)))
+    _hex32("L2_PFC_ADDR_HI",    14, _bar5_r32(bar5, _mmhub_dw(regMMVM_L2_PROTECTION_FAULT_ADDR_HI32)))
+    _hex32("L2_PFC_DFLT_LO",    14, _bar5_r32(bar5, _mmhub_dw(regMMVM_L2_PROTECTION_FAULT_DEFAULT_ADDR_LO32)))
+    _hex32("L2_PFC_DFLT_HI",    14, _bar5_r32(bar5, _mmhub_dw(regMMVM_L2_PROTECTION_FAULT_DEFAULT_ADDR_HI32)))
+    _hex32("CTX0_CNTL",          9, _bar5_r32(bar5, _mmhub_dw(regMMVM_CONTEXT0_CNTL)))
+    _hex32("CTX0_PT_BASE_LO",   15, _bar5_r32(bar5, _mmhub_dw(regMMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32)))
+    _hex32("CTX0_PT_BASE_HI",   15, _bar5_r32(bar5, _mmhub_dw(regMMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_HI32)))
+    _hex32("CTX0_PT_START_LO",  16, _bar5_r32(bar5, _mmhub_dw(regMMVM_CONTEXT0_PAGE_TABLE_START_ADDR_LO32)))
+    _hex32("CTX0_PT_START_HI",  16, _bar5_r32(bar5, _mmhub_dw(regMMVM_CONTEXT0_PAGE_TABLE_START_ADDR_HI32)))
+    _hex32("CTX0_PT_END_LO",    14, _bar5_r32(bar5, _mmhub_dw(regMMVM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32)))
+    _hex32("CTX0_PT_END_HI",    14, _bar5_r32(bar5, _mmhub_dw(regMMVM_CONTEXT0_PAGE_TABLE_END_ADDR_HI32)))
+}
+
+fn _dump_mp0(uint64 bar5) {
+    puts("--- MP0 (PSP) C2PMSG state ---")
+    _hex32("C2PMSG_33",  9, _bar5_r32(bar5, _mp0_dw(PSP_REG_C2PMSG_33)))
+    _hex32("C2PMSG_35",  9, _bar5_r32(bar5, _mp0_dw(PSP_REG_C2PMSG_35)))
+    _hex32("C2PMSG_36",  9, _bar5_r32(bar5, _mp0_dw(PSP_REG_C2PMSG_36)))
+    _hex32("C2PMSG_58",  9, _bar5_r32(bar5, _mp0_dw(PSP_REG_C2PMSG_58)))
+    _hex32("C2PMSG_64",  9, _bar5_r32(bar5, _mp0_dw(PSP_REG_C2PMSG_64)))
+    _hex32("C2PMSG_67",  9, _bar5_r32(bar5, _mp0_dw(PSP_REG_C2PMSG_67)))
+    _hex32("C2PMSG_69",  9, _bar5_r32(bar5, _mp0_dw(PSP_REG_C2PMSG_69)))
+    _hex32("C2PMSG_70",  9, _bar5_r32(bar5, _mp0_dw(PSP_REG_C2PMSG_70)))
+    _hex32("C2PMSG_71",  9, _bar5_r32(bar5, _mp0_dw(PSP_REG_C2PMSG_71)))
+    _hex32("C2PMSG_81",  9, _bar5_r32(bar5, _mp0_dw(PSP_REG_C2PMSG_81)))
+    _hex32("C2PMSG_103", 10, _bar5_r32(bar5, _mp0_dw(PSP_REG_C2PMSG_103)))
+    _hex32("C2PMSG_115", 10, _bar5_r32(bar5, _mp0_dw(PSP_REG_C2PMSG_115)))
+}
+
+// MP1 (SMU) C2PMSG offsets — follow the same pattern as MP0:
+//   PSP_REG_C2PMSG_N = N + 0x40 (dword offset within the IP base)
+// We don't have explicit constants for MP1, so compute inline.
+fn _dump_mp1(uint64 bar5) {
+    puts("--- MP1 (SMU) C2PMSG state ---")
+    uint64 c2_base = 0x40
+    _hex32("MP1_C2PMSG_33",  13, _bar5_r32(bar5, _mp1_dw(c2_base + 33)))
+    _hex32("MP1_C2PMSG_35",  13, _bar5_r32(bar5, _mp1_dw(c2_base + 35)))
+    _hex32("MP1_C2PMSG_66",  13, _bar5_r32(bar5, _mp1_dw(c2_base + 66)))
+    _hex32("MP1_C2PMSG_67",  13, _bar5_r32(bar5, _mp1_dw(c2_base + 67)))
+    _hex32("MP1_C2PMSG_75",  13, _bar5_r32(bar5, _mp1_dw(c2_base + 75)))
+    _hex32("MP1_C2PMSG_82",  13, _bar5_r32(bar5, _mp1_dw(c2_base + 82)))
+    _hex32("MP1_C2PMSG_90",  13, _bar5_r32(bar5, _mp1_dw(c2_base + 90)))
+    _hex32("MP1_C2PMSG_93",  13, _bar5_r32(bar5, _mp1_dw(c2_base + 93)))
+    _hex32("MP1_C2PMSG_103", 14, _bar5_r32(bar5, _mp1_dw(c2_base + 103)))
+}
+
+fn _dump_nbio(uint64 bar5) {
+    puts("--- NBIO/BIF state ---")
+    _hex32("BIF_FB_EN",          9, _bar5_r32(bar5, _nbif_dw(regBIF_BX0_BIF_FB_EN)))
+    _hex32("REMAP_HDP_MEM",     13, _bar5_r32(bar5, _nbif_dw(regBIF_BX0_REMAP_HDP_MEM_FLUSH_CNTL)))
+    _hex32("REMAP_HDP_REG",     13, _bar5_r32(bar5, _nbif_dw(regBIF_BX0_REMAP_HDP_REG_FLUSH_CNTL)))
+    _hex32("DOORBELL_APER_EN",  16, _bar5_r32(bar5, _nbif_dw(regRCC_DEV0_EPF0_RCC_DOORBELL_APER_EN)))
+    _hex32("DOORBELL_BASE_LO",  16, _bar5_r32(bar5, _nbif_dw(regBIF_BX_PF0_DOORBELL_SELFRING_GPA_APER_BASE_LOW)))
+    _hex32("DOORBELL_BASE_HI",  16, _bar5_r32(bar5, _nbif_dw(regBIF_BX_PF0_DOORBELL_SELFRING_GPA_APER_BASE_HIGH)))
+    _hex32("DOORBELL_CNTL",     13, _bar5_r32(bar5, _nbif_dw(regBIF_BX_PF0_DOORBELL_SELFRING_GPA_APER_CNTL)))
+}
+
+fn main() {
+    puts("phase3_mmio_dump")
+    amdgpu_load_navi32_bases()
+
+    // Build the sysfs path on the heap.
+    uint64 path = alloc(64)
+    uint64 src = "/sys/bus/pci/devices/0000:03:00.0/resource5"
+    uint64 i = 0
+    while i < SYSFS_RESOURCE5_PATH_LEN {
+        uint8 c = 0; unsafe { *((src + i) as uint8) -> c }
+        unsafe { *((path + i) as uint8) = c }
+        i = i + 1
+    }
+    uint8 nul = 0; unsafe { *((path + SYSFS_RESOURCE5_PATH_LEN) as uint8) = nul }
+
+    uint64 fd = sys_open(path, O_RDWR, 0)
+    if fd > 0xFFFFFFFFFFFFFF00 {
+        puts("FAIL: sys_open resource5")
+        dealloc(path); exit(1)
+    }
+    dealloc(path)
+
+    // BAR5 is typically 1 MiB on Navi 32.
+    uint64 bar5 = sys_mmap(0, 0x100000, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)
+    if bar5 > 0xFFFFFFFFFFFFFF00 {
+        puts("FAIL: sys_mmap resource5")
+        sys_close(fd); exit(2)
+    }
+
+    _hex32("BAR5_host_lo", 12, bar5 & 0xFFFFFFFF)
+    _hex32("BAR5_host_hi", 12, bar5 >> 32)
+
+    _dump_mmhub(bar5)
+    _dump_mp0(bar5)
+    _dump_mp1(bar5)
+    _dump_nbio(bar5)
+
+    sys_munmap(bar5, 0x100000)
+    sys_close(fd)
+    puts("phase3_mmio_dump: DONE")
+    exit(0)
+}
