@@ -1,0 +1,310 @@
+// Phase 3 slice ζ.1 — first PM4 NOP dispatch via manual MEC HQD setup.
+//
+// ζ.0 showed all 8 MEC HQDs cleared by vfio FLR — full manual setup
+// needed. This smoke does the tinygrad-AM-style direct HQD programming:
+//
+//   1. Allocate ring + RPTR_REPORT + WPTR_POLL + EOP buffers in VRAM
+//      (via BAR0). Just pick offsets 8/9/10/11 MiB into VRAM.
+//   2. Construct PM4 NOP packet at ring[0].
+//   3. Set up MEC0 / PIPE=0 / QUEUE=2 HQD via GRBM_GFX_CNTL selector.
+//   4. CP_HQD_ACTIVE = 1 (final activation write).
+//   5. Doorbell write at BAR2[doorbell_index * 4].
+//   6. Poll RPTR_REPORT for advancement → completion proven.
+//
+// Risk: malformed HQD config can wedge MEC. Reboot recovers; we have
+// budget. Conservative defaults; KMD-queue/private-state per amdgpu's
+// gfx_v11_0_kcq_init_register pattern.
+
+import "../std/pcidev.mlr"
+import "../std/amdgpu_ip_discovery.mlr"
+import "../std/gmc_constants.mlr"
+import "../std/psp.mlr"
+import "../std/sys.mlr"
+
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn puts(uint64 s) -> uint32
+
+// GC v11.0.0 register offsets (BASE_IDX=0).
+static uint64 regGRBM_GFX_CNTL                        = 0x0900
+static uint64 regCP_HQD_ACTIVE                        = 0x1fab
+static uint64 regCP_HQD_VMID                          = 0x1fac
+static uint64 regCP_HQD_PERSISTENT_STATE              = 0x1fad
+static uint64 regCP_HQD_PIPE_PRIORITY                 = 0x1fae
+static uint64 regCP_HQD_QUEUE_PRIORITY                = 0x1faf
+static uint64 regCP_HQD_QUANTUM                       = 0x1fb0
+static uint64 regCP_HQD_PQ_BASE                       = 0x1fb1
+static uint64 regCP_HQD_PQ_BASE_HI                    = 0x1fb2
+static uint64 regCP_HQD_PQ_RPTR                       = 0x1fb3
+static uint64 regCP_HQD_PQ_RPTR_REPORT_ADDR           = 0x1fb4
+static uint64 regCP_HQD_PQ_RPTR_REPORT_ADDR_HI        = 0x1fb5
+static uint64 regCP_HQD_PQ_WPTR_POLL_ADDR             = 0x1fb6
+static uint64 regCP_HQD_PQ_WPTR_POLL_ADDR_HI          = 0x1fb7
+static uint64 regCP_HQD_PQ_DOORBELL_CONTROL           = 0x1fb8
+static uint64 regCP_HQD_PQ_CONTROL                    = 0x1fba
+static uint64 regCP_HQD_IB_CONTROL                    = 0x1fbe
+static uint64 regCP_HQD_EOP_BASE_ADDR                 = 0x1fce
+static uint64 regCP_HQD_EOP_BASE_ADDR_HI              = 0x1fcf
+static uint64 regCP_HQD_EOP_CONTROL                   = 0x1fd0
+static uint64 regCP_HQD_PQ_WPTR_LO                    = 0x1fdf
+static uint64 regCP_HQD_PQ_WPTR_HI                    = 0x1fe0
+
+fn _hex32(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(80)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint8 zx = 48; unsafe { *((b + ll + 1) as uint8) = zx }
+    uint8 xc = 120; unsafe { *((b + ll + 2) as uint8) = xc }
+    uint64 j = 0
+    while j < 8 {
+        uint64 sh = (7 - j) * 4
+        uint64 nyb = (v >> sh) & 0xF
+        uint8 ch = nyb + 48
+        if nyb >= 10 { ch = nyb + 87 }
+        unsafe { *((b + ll + 3 + j) as uint8) = ch }
+        j = j + 1
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 11) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+fn _dec(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(80)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint64 digits = 0
+    if v == 0 {
+        uint8 z = 48; unsafe { *((b + ll + 1) as uint8) = z }; digits = 1
+    } else {
+        uint64 t = v
+        while t > 0 { digits = digits + 1; t = t / 10 }
+        uint64 k = digits
+        t = v
+        while k > 0 {
+            k = k - 1
+            uint64 d = t - (t / 10) * 10
+            uint8 db = d + 48
+            unsafe { *((b + ll + 1 + k) as uint8) = db }
+            t = t / 10
+        }
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 1 + digits) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+fn _gc_r32(uint64 bar5, uint64 reg_dw) -> uint64 {
+    uint64 byte_off = (amdgpu_ip_gc_base_0 + reg_dw) * 4
+    uint32 v = 0
+    unsafe { *((bar5 + byte_off) as uint32) -> v }
+    uint64 ret = v
+    return ret
+}
+
+fn _gc_w32(uint64 bar5, uint64 reg_dw, uint64 val) {
+    uint64 byte_off = (amdgpu_ip_gc_base_0 + reg_dw) * 4
+    uint32 v = val
+    unsafe { *((bar5 + byte_off) as uint32) = v }
+}
+
+fn _mmhub_w32(uint64 bar5, uint64 reg_dw, uint64 val) {
+    uint64 byte_off = (amdgpu_ip_mmhub_base_0 + reg_dw) * 4
+    uint32 v = val
+    unsafe { *((bar5 + byte_off) as uint32) = v }
+}
+
+// GRBM_GFX_CNTL selector on gfx11 (verified from gc_11_0_0_sh_mask.h):
+//   PIPEID  : bit 0
+//   MEID    : bit 2
+//   VMID    : bit 4
+//   QUEUEID : bit 8
+// Earlier gfx versions had MEID at bit 24; gfx11 packs more tightly.
+fn _select_hqd(uint64 bar5, uint64 me, uint64 pipe, uint64 q, uint64 vmid) {
+    uint64 sel = (pipe << 0) | (me << 2) | (vmid << 4) | (q << 8)
+    _gc_w32(bar5, regGRBM_GFX_CNTL, sel)
+    uint64 _rb = _gc_r32(bar5, regGRBM_GFX_CNTL)   // fence
+}
+
+fn main() {
+    puts("phase3_pm4_nop_dispatch (ζ.1)")
+    uint64 oe = pci_open("0000:03:00.0", 14)
+    if oe != 0 { puts("FAIL pci_open"); exit(1) }
+    amdgpu_load_navi32_bases()
+    uint64 bar5 = pci_map_bar(PCI_BAR5_REGION_INDEX)
+    if bar5 == PCI_MAP_FAILED_SENTINEL { puts("FAIL BAR5"); pci_close(); exit(2) }
+    uint64 bar0 = pci_map_bar(PCI_BAR0_REGION_INDEX)
+    if bar0 == PCI_MAP_FAILED_SENTINEL { puts("FAIL BAR0"); pci_close(); exit(3) }
+    uint64 bar2 = pci_map_bar(2)
+    if bar2 == PCI_MAP_FAILED_SENTINEL { puts("FAIL BAR2"); pci_close(); exit(4) }
+    uint64 bme = pci_set_bus_master()
+    if bme != 0 { puts("FAIL set_bus_master"); pci_close(); exit(5) }
+
+    // Precondition: SOS alive.
+    uint64 sol = psp_read32(bar5, PSP_REG_C2PMSG_81)
+    if sol == 0 {
+        puts("FAIL: SOS not alive. Need amdgpu prime → vfio rebind.")
+        pci_close(); exit(6)
+    }
+    _hex32("sos_C2PMSG_81", 13, sol)
+
+    // Re-enable CTX0_CNTL so GMC walker is armed against amdgpu's
+    // preserved GART (ε.1 finding).
+    _mmhub_w32(bar5, regMMVM_CONTEXT0_CNTL, 0x01fffe01)
+    puts("CTX0_CNTL re-armed")
+
+    // VRAM layout (offsets relative to vram_mc_base = FB_LOC_BASE<<24):
+    //   ring      @ 0x800000 (8 MiB),  size 0x1000 (4 KiB = 1024 dwords)
+    //   rptr_rep  @ 0x801000           size 0x1000
+    //   wptr_poll @ 0x802000           size 0x1000
+    //   eop       @ 0x803000           size 0x1000
+    uint64 ring_off = 0x800000
+    uint64 rptr_off = 0x801000
+    uint64 wptr_off = 0x802000
+    uint64 eop_off  = 0x803000
+    uint64 ring_size = 0x1000
+
+    // vram_mc_base = FB_LOCATION_BASE << 24 (read from MMHUB).
+    uint64 fb_base_byte = (amdgpu_ip_mmhub_base_0 + regMMMC_VM_FB_LOCATION_BASE) * 4
+    uint32 fb_base_w = 0; unsafe { *((bar5 + fb_base_byte) as uint32) -> fb_base_w }
+    uint64 fb_base_64 = fb_base_w
+    uint64 vram_mc_base = fb_base_64 << 24
+    uint64 ring_mc = vram_mc_base + ring_off
+    uint64 rptr_mc = vram_mc_base + rptr_off
+    uint64 wptr_mc = vram_mc_base + wptr_off
+    uint64 eop_mc  = vram_mc_base + eop_off
+    _hex32("ring_mc_lo", 10, ring_mc & 0xFFFFFFFF)
+    _hex32("ring_mc_hi", 10, ring_mc >> 32)
+
+    // Zero the buffers via BAR0.
+    uint64 zi = 0
+    while zi < ring_size {
+        unsafe { *((bar0 + ring_off + zi)  as uint32) = 0 }
+        unsafe { *((bar0 + rptr_off + zi)  as uint32) = 0 }
+        unsafe { *((bar0 + wptr_off + zi)  as uint32) = 0 }
+        unsafe { *((bar0 + eop_off + zi)   as uint32) = 0 }
+        zi = zi + 4
+    }
+
+    // Write PM4 NOP at ring[0]: type-3 packet, opcode 0x10 (NOP),
+    // count_minus_one = 0 (1-dword packet).
+    // header = (3 << 30) | (0x10 << 8) = 0xC0001000.
+    uint32 pm4_nop = 0xC0001000
+    unsafe { *((bar0 + ring_off) as uint32) = pm4_nop }
+
+    // Pick a doorbell index in the MEC range [0, 0x450] (from ζ.0).
+    // Use index 0x10 — well within range, away from index 0 (KIQ).
+    uint64 doorbell_idx = 0x10
+    uint64 doorbell_byte_offset = doorbell_idx * 8   // each doorbell = 8 bytes (qword)
+
+    // Select MEC0 (me=1), pipe=0, queue=2, vmid=0.
+    _select_hqd(bar5, 1, 0, 2, 0)
+    puts("HQD selector: ME=1, PIPE=0, QUEUE=2, VMID=0")
+
+    // Program HQD. Field encoding per gfx_v11_0.c::gfx_v11_0_kcq_init_register.
+    _gc_w32(bar5, regCP_HQD_VMID, 0)
+    _gc_w32(bar5, regCP_HQD_PQ_BASE,       (ring_mc >> 8) & 0xFFFFFFFF)
+    _gc_w32(bar5, regCP_HQD_PQ_BASE_HI,    (ring_mc >> 8) >> 32)
+    _gc_w32(bar5, regCP_HQD_PQ_RPTR_REPORT_ADDR,    rptr_mc & 0xFFFFFFFF)
+    _gc_w32(bar5, regCP_HQD_PQ_RPTR_REPORT_ADDR_HI, rptr_mc >> 32)
+    _gc_w32(bar5, regCP_HQD_PQ_WPTR_POLL_ADDR,    wptr_mc & 0xFFFFFFFF)
+    _gc_w32(bar5, regCP_HQD_PQ_WPTR_POLL_ADDR_HI, wptr_mc >> 32)
+    _gc_w32(bar5, regCP_HQD_EOP_BASE_ADDR,    (eop_mc >> 8) & 0xFFFFFFFF)
+    _gc_w32(bar5, regCP_HQD_EOP_BASE_ADDR_HI, (eop_mc >> 8) >> 32)
+
+    // CP_HQD_EOP_CONTROL: EOP_SIZE = log2(eop_size_dwords) - 1.
+    //   eop_size = 4096 bytes = 1024 dwords; log2 = 10; -1 = 9.
+    uint64 eop_size_field = 9
+    _gc_w32(bar5, regCP_HQD_EOP_CONTROL, eop_size_field)
+
+    // CP_HQD_PQ_CONTROL: QUEUE_SIZE(b0)=9, RPTR_BLOCK_SIZE(b8)=5,
+    //   UNORD_DISPATCH(b28)=0, PRIV_STATE(b30)=1, KMD_QUEUE(b31)=1.
+    //   = 0x9 | (5 << 8) | (1 << 30) | (1 << 31) = 0xC0000509.
+    uint64 pq_control = 0xC0000509
+    _gc_w32(bar5, regCP_HQD_PQ_CONTROL, pq_control)
+
+    // CP_HQD_PQ_DOORBELL_CONTROL: DOORBELL_OFFSET(b2)=idx, EN(b30)=1.
+    //   = (idx << 2) | (1 << 30).
+    uint64 doorbell_cntl = (doorbell_idx << 2) | (1 << 30)
+    _gc_w32(bar5, regCP_HQD_PQ_DOORBELL_CONTROL, doorbell_cntl)
+
+    // CP_HQD_PERSISTENT_STATE: PRELOAD_REQ(b0)=1, PRELOAD_SIZE(b8)=0x55.
+    //   = 0x1 | (0x55 << 8) = 0x5501.
+    _gc_w32(bar5, regCP_HQD_PERSISTENT_STATE, 0x5501)
+
+    // Default priorities and quantum.
+    _gc_w32(bar5, regCP_HQD_PIPE_PRIORITY,  2)
+    _gc_w32(bar5, regCP_HQD_QUEUE_PRIORITY, 15)
+    _gc_w32(bar5, regCP_HQD_QUANTUM,        0x111)  // enable + duration 0x11
+    _gc_w32(bar5, regCP_HQD_IB_CONTROL,     0)
+
+    // WPTR registers (also reflected in the WPTR_POLL VRAM page).
+    _gc_w32(bar5, regCP_HQD_PQ_WPTR_LO, 0)
+    _gc_w32(bar5, regCP_HQD_PQ_WPTR_HI, 0)
+
+    // Activate.
+    _gc_w32(bar5, regCP_HQD_ACTIVE, 1)
+    uint64 active_rb = _gc_r32(bar5, regCP_HQD_ACTIVE)
+    _hex32("CP_HQD_ACTIVE post-activate", 27, active_rb)
+    if (active_rb & 0x1) == 0 {
+        puts("FAIL: HQD did not activate. Dumping current HQD state:")
+        _hex32("  CP_HQD_PQ_BASE",          17, _gc_r32(bar5, regCP_HQD_PQ_BASE))
+        _hex32("  CP_HQD_PQ_BASE_HI",       19, _gc_r32(bar5, regCP_HQD_PQ_BASE_HI))
+        _hex32("  CP_HQD_PQ_CONTROL",       19, _gc_r32(bar5, regCP_HQD_PQ_CONTROL))
+        _hex32("  CP_HQD_PQ_DOORBELL_CTL",  24, _gc_r32(bar5, regCP_HQD_PQ_DOORBELL_CONTROL))
+        pci_close(); exit(10)
+    }
+
+    // Write WPTR=1 (one dword written to ring) via the WPTR_POLL page.
+    unsafe { *((bar0 + wptr_off) as uint32) = 1 }
+    _gc_w32(bar5, regCP_HQD_PQ_WPTR_LO, 1)
+
+    // Ring the doorbell — write WPTR to BAR2[doorbell_byte_offset].
+    unsafe { *((bar2 + doorbell_byte_offset) as uint32) = 1 }
+    puts("Doorbell rung")
+
+    // Poll RPTR_REPORT (in VRAM via BAR0) for advancement to 1.
+    uint64 poll_iter = 0
+    uint64 rptr_val = 0
+    uint64 max_iters = 5000   // ~5 seconds at 1ms per iter
+    uint64 done = 0
+    while poll_iter < max_iters {
+        uint32 rptr_w = 0
+        unsafe { *((bar0 + rptr_off) as uint32) -> rptr_w }
+        rptr_val = rptr_w
+        if rptr_val == 1 {
+            done = 1
+            poll_iter = max_iters
+        }
+        if done == 0 {
+            if (poll_iter & 0xFF) == 0 {
+                _dec("poll_iter", 9, poll_iter)
+                _hex32("  rptr_report", 13, rptr_val)
+                _hex32("  HQD_RPTR",    10, _gc_r32(bar5, regCP_HQD_PQ_RPTR))
+            }
+            uint64 ts = alloc(16)
+            unsafe { *((ts + 0) as uint64) = 0 }
+            unsafe { *((ts + 8) as uint64) = 1000000 }
+            syscall_raw(35, ts, 0, 0, 0, 0, 0)
+            dealloc(ts)
+            poll_iter = poll_iter + 1
+        }
+    }
+    pci_close()
+
+    if done == 0 {
+        _hex32("final_rptr_report", 17, rptr_val)
+        _hex32("final_HQD_RPTR",    14, _gc_r32(bar5, regCP_HQD_PQ_RPTR))
+        puts("FAIL: RPTR_REPORT never advanced to 1 — queue not executing")
+        exit(11)
+    }
+    puts("=============================================================")
+    puts("ζ.1 GREEN — PM4 NOP dispatched via direct MEC HQD + vfio")
+    puts("=============================================================")
+    exit(0)
+}
