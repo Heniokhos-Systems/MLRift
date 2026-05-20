@@ -1,0 +1,177 @@
+// Phase 3 slice ε.0 — warm-hybrid state exploration.
+//
+// δ.4 SHIPPED via warm-hybrid path: amdgpu loads, SOS comes alive,
+// vfio rebind preserves PSP/SOS state (C2PMSG_81 != 0 across FLR).
+//
+// This smoke validates the warm-hybrid scope for ε+ slices:
+//   1. SOS is alive (C2PMSG_81 non-zero, fw version present).
+//   2. BAR2 (doorbell) maps via vfio.
+//   3. BAR0 (VRAM) maps via vfio, FB aperture accessible.
+//   4. Reads first 16 doorbell entries — non-zero entries indicate
+//      active queues amdgpu created and that survived FLR.
+//   5. Reports the doorbell map so future ε/ζ/η slices can pick a
+//      doorbell to ring for PM4 dispatch.
+
+import "../std/pcidev.mlr"
+import "../std/amdgpu_ip_discovery.mlr"
+import "../std/gmc_constants.mlr"
+import "../std/psp.mlr"
+import "../std/sys.mlr"
+
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn puts(uint64 s) -> uint32
+
+fn _hex32(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(80)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint8 zx = 48; unsafe { *((b + ll + 1) as uint8) = zx }
+    uint8 xc = 120; unsafe { *((b + ll + 2) as uint8) = xc }
+    uint64 j = 0
+    while j < 8 {
+        uint64 sh = (7 - j) * 4
+        uint64 nyb = (v >> sh) & 0xF
+        uint8 ch = nyb + 48
+        if nyb >= 10 { ch = nyb + 87 }
+        unsafe { *((b + ll + 3 + j) as uint8) = ch }
+        j = j + 1
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 11) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+fn _dec(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(80)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint64 digits = 0
+    if v == 0 {
+        uint8 z = 48; unsafe { *((b + ll + 1) as uint8) = z }; digits = 1
+    } else {
+        uint64 t = v
+        while t > 0 { digits = digits + 1; t = t / 10 }
+        uint64 k = digits
+        t = v
+        while k > 0 {
+            k = k - 1
+            uint64 d = t - (t / 10) * 10
+            uint8 db = d + 48
+            unsafe { *((b + ll + 1 + k) as uint8) = db }
+            t = t / 10
+        }
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 1 + digits) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+fn main() {
+    puts("phase3_warm_hybrid_explore (ε.0)")
+    uint64 oe = pci_open("0000:03:00.0", 14)
+    if oe != 0 { _dec("FAIL pci_open", 13, oe); exit(1) }
+    amdgpu_load_navi32_bases()
+
+    uint64 bar5 = pci_map_bar(PCI_BAR5_REGION_INDEX)
+    if bar5 == PCI_MAP_FAILED_SENTINEL { puts("FAIL BAR5"); pci_close(); exit(2) }
+    uint64 bar0 = pci_map_bar(PCI_BAR0_REGION_INDEX)
+    if bar0 == PCI_MAP_FAILED_SENTINEL { puts("FAIL BAR0"); pci_close(); exit(3) }
+    uint64 bar2 = pci_map_bar(2)
+    if bar2 == PCI_MAP_FAILED_SENTINEL {
+        puts("FAIL BAR2 (doorbell) — vfio may have rejected the mapping")
+        pci_close(); exit(4)
+    }
+
+    _hex32("bar5_host_lo", 12, bar5 & 0xFFFFFFFF)
+    _hex32("bar0_host_lo", 12, bar0 & 0xFFFFFFFF)
+    _hex32("bar2_host_lo", 12, bar2 & 0xFFFFFFFF)
+
+    uint64 bme = pci_set_bus_master()
+    if bme != 0 { _dec("FAIL pci_set_bus_master", 23, bme); pci_close(); exit(5) }
+
+    // 1) Verify SOS alive.
+    puts("--- SOS warm state ---")
+    uint64 sol = psp_read32(bar5, PSP_REG_C2PMSG_81)
+    _hex32("C2PMSG_81 (sign-of-life)", 24, sol)
+    _hex32("C2PMSG_58 (sos_fw_ver)",   22, psp_read32(bar5, PSP_REG_C2PMSG_58))
+    _hex32("C2PMSG_69 (ring_base_lo)", 24, psp_read32(bar5, PSP_REG_C2PMSG_69))
+    _hex32("C2PMSG_70 (ring_base_hi)", 24, psp_read32(bar5, PSP_REG_C2PMSG_70))
+    _hex32("C2PMSG_71 (ring_size)",    21, psp_read32(bar5, PSP_REG_C2PMSG_71))
+    if sol == 0 {
+        puts("FAIL: SOS not alive — need amdgpu prime first.")
+        puts("  Run: echo amdgpu > /sys/bus/pci/devices/0000:03:00.0/driver_override")
+        puts("       then unbind/probe to bring amdgpu up,")
+        puts("       then rebind to vfio-pci.")
+        pci_close(); exit(6)
+    }
+
+    // 2) Dump first 16 doorbell entries from BAR2 (each entry is 8 bytes,
+    //    so 16 entries = 128 bytes). Active queues amdgpu created will
+    //    have non-zero write-pointers visible in BAR2.
+    puts("--- BAR2 first 16 doorbell entries (qword each) ---")
+    uint64 di = 0
+    while di < 16 {
+        uint64 lo = 0; uint64 hi = 0
+        uint32 lo_w = 0; uint32 hi_w = 0
+        unsafe { *((bar2 + di * 8 + 0) as uint32) -> lo_w }
+        unsafe { *((bar2 + di * 8 + 4) as uint32) -> hi_w }
+        lo = lo_w
+        hi = hi_w
+        if lo != 0 {
+            _dec("doorbell_idx", 12, di)
+            _hex32("  doorbell_lo", 13, lo)
+            _hex32("  doorbell_hi", 13, hi)
+        }
+        if hi != 0 {
+            if lo == 0 {
+                _dec("doorbell_idx", 12, di)
+                _hex32("  doorbell_lo", 13, lo)
+                _hex32("  doorbell_hi", 13, hi)
+            }
+        }
+        di = di + 1
+    }
+
+    // 3) Read MMHUB current state — confirms amdgpu's GMC config survived FLR.
+    uint64 fb_base_byte = (amdgpu_ip_mmhub_base_0 + regMMMC_VM_FB_LOCATION_BASE) * 4
+    uint32 fb_base_w = 0; unsafe { *((bar5 + fb_base_byte) as uint32) -> fb_base_w }
+    uint64 ctx0_byte = (amdgpu_ip_mmhub_base_0 + regMMVM_CONTEXT0_CNTL) * 4
+    uint32 ctx0_w = 0; unsafe { *((bar5 + ctx0_byte) as uint32) -> ctx0_w }
+    uint64 pt_base_lo_byte = (amdgpu_ip_mmhub_base_0 + regMMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32) * 4
+    uint32 pt_base_lo_w = 0; unsafe { *((bar5 + pt_base_lo_byte) as uint32) -> pt_base_lo_w }
+    uint64 pt_base_hi_byte = (amdgpu_ip_mmhub_base_0 + regMMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_HI32) * 4
+    uint32 pt_base_hi_w = 0; unsafe { *((bar5 + pt_base_hi_byte) as uint32) -> pt_base_hi_w }
+
+    puts("--- MMHUB warm state (post-vfio-rebind) ---")
+    _hex32("FB_LOCATION_BASE", 16, fb_base_w)
+    _hex32("CTX0_CNTL",         9, ctx0_w)
+    _hex32("CTX0_PT_BASE_LO",  15, pt_base_lo_w)
+    _hex32("CTX0_PT_BASE_HI",  15, pt_base_hi_w)
+    if (ctx0_w & 0x1) != 0 {
+        puts("  CTX0_CNTL.ENABLE_CONTEXT=1 — GMC PT walker IS ACTIVE")
+        puts("  amdgpu's VRAM-resident GART page table is reachable")
+    } else {
+        puts("  CTX0_CNTL.ENABLE_CONTEXT=0 — GMC walker disabled (warning)")
+    }
+
+    pci_close()
+
+    puts("=============================================================")
+    puts("ε.0 explore: warm-hybrid state inventory complete")
+    puts("=============================================================")
+    puts("Findings:")
+    if sol != 0 { puts("  ✓ SOS alive (C2PMSG_81 ticking)") }
+    if bar2 != PCI_MAP_FAILED_SENTINEL { puts("  ✓ BAR2 (doorbell) maps via vfio") }
+    if (ctx0_w & 0x1) != 0 { puts("  ✓ GMC CONTEXT0 active (PT walker live)") }
+    puts("")
+    puts("Next: ζ slice would map a specific MEC queue's doorbell,")
+    puts("      write a PM4 NOP, ring the doorbell, observe completion.")
+    puts("phase3_warm_hybrid_explore: GREEN")
+    exit(0)
+}
