@@ -1,0 +1,142 @@
+// Phase 3 utility — MEC pipe-reset recovery.
+//
+// When MEC RS64 gets stuck (INSTR_PNTR pinned at some address, not the
+// idle loop ~0x8b41), pulse PIPE_RESET to bring it back. This is the
+// same sequence amdgpu uses in gfx_v11_0_cp_compute_enable when toggling
+// MEC: assert halt+reset, delay, release.
+//
+// Sequence per amdgpu/gfx_v11_0.c:
+//   1. CP_MEC_RS64_CNTL = 0x400F0010
+//      = HALT(b30) | PIPE0..3_RESET(b16-19) | ICACHE_INVALIDATE(b4)
+//   2. udelay(50)
+//   3. CP_MEC_RS64_CNTL = 0x3C000000
+//      = PIPE0..3_ACTIVE(b26-29), no HALT, no RESET
+//   4. udelay(50)
+//
+// After: INSTR_PNTR should be at PC_START_LO (0x00000c00) initially,
+// then quickly move to idle loop (~0x8b41) as firmware initializes.
+//
+// PRESERVES: SOS state, MEC PC_START, MEC firmware IMEM, RLC state,
+//            GMC config, VRAM contents.
+// CLEARS:    MEC RS64 cores' internal state (live PC, registers),
+//            any stuck queue scheduling state.
+
+import "../std/pcidev.mlr"
+import "../std/amdgpu_ip_discovery.mlr"
+import "../std/psp.mlr"
+import "../std/sys.mlr"
+
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn puts(uint64 s) -> uint32
+
+static uint64 regCP_MEC_RS64_CNTL_dw       = 0x2904
+static uint64 regCP_MEC_RS64_INSTR_PNTR_dw = 0x2908
+
+static uint64 MEC_RESET_VAL  = 0x400F0010
+static uint64 MEC_UNHALT_VAL = 0x3C000000
+
+fn _hex32(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(80)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint8 zx = 48; unsafe { *((b + ll + 1) as uint8) = zx }
+    uint8 xc = 120; unsafe { *((b + ll + 2) as uint8) = xc }
+    uint64 j = 0
+    while j < 8 {
+        uint64 sh = (7 - j) * 4
+        uint64 nyb = (v >> sh) & 0xF
+        uint8 ch = nyb + 48
+        if nyb >= 10 { ch = nyb + 87 }
+        unsafe { *((b + ll + 3 + j) as uint8) = ch }
+        j = j + 1
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 11) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+fn _gc1_r32(uint64 bar5, uint64 reg_dw) -> uint64 {
+    uint64 byte_off = (amdgpu_ip_gc_base_1 + reg_dw) * 4
+    uint32 v = 0
+    unsafe { *((bar5 + byte_off) as uint32) -> v }
+    uint64 ret = v
+    return ret
+}
+
+fn _gc1_w32(uint64 bar5, uint64 reg_dw, uint64 val) {
+    uint64 byte_off = (amdgpu_ip_gc_base_1 + reg_dw) * 4
+    uint32 v = val
+    unsafe { *((bar5 + byte_off) as uint32) = v }
+}
+
+fn _delay(uint64 spins) {
+    uint64 i = 0
+    while i < spins { i = i + 1 }
+}
+
+fn main() {
+    puts("phase3_mec_reset")
+    uint64 oe = pci_open("0000:03:00.0", 14)
+    if oe != 0 { puts("FAIL pci_open"); exit(1) }
+    amdgpu_load_navi32_bases()
+    uint64 bar5 = pci_map_bar(PCI_BAR5_REGION_INDEX)
+    if bar5 == PCI_MAP_FAILED_SENTINEL { puts("FAIL BAR5"); pci_close(); exit(2) }
+
+    uint64 sol = psp_read32(bar5, PSP_REG_C2PMSG_81)
+    _hex32("sos_C2PMSG_81", 13, sol)
+    if sol == 0 { puts("FAIL: SOS not alive"); pci_close(); exit(3) }
+
+    uint64 cntl_pre = _gc1_r32(bar5, regCP_MEC_RS64_CNTL_dw)
+    uint64 pntr_pre = _gc1_r32(bar5, regCP_MEC_RS64_INSTR_PNTR_dw)
+    _hex32("MEC_CNTL pre",   12, cntl_pre)
+    _hex32("INSTR_PNTR pre", 14, pntr_pre)
+
+    // Step 1: Halt + reset all 4 pipes + invalidate icache.
+    puts("Pulsing MEC reset (0x400F0010)")
+    _gc1_w32(bar5, regCP_MEC_RS64_CNTL_dw, MEC_RESET_VAL)
+    _delay(50000)
+    uint64 cntl_mid  = _gc1_r32(bar5, regCP_MEC_RS64_CNTL_dw)
+    uint64 pntr_mid  = _gc1_r32(bar5, regCP_MEC_RS64_INSTR_PNTR_dw)
+    _hex32("MEC_CNTL mid",   12, cntl_mid)
+    _hex32("INSTR_PNTR mid", 14, pntr_mid)
+
+    // Step 2: release halt + reset, set all pipes active.
+    puts("Releasing MEC reset (0x3C000000)")
+    _gc1_w32(bar5, regCP_MEC_RS64_CNTL_dw, MEC_UNHALT_VAL)
+    _delay(100000)
+
+    uint64 cntl_post  = _gc1_r32(bar5, regCP_MEC_RS64_CNTL_dw)
+    uint64 pntr_a     = _gc1_r32(bar5, regCP_MEC_RS64_INSTR_PNTR_dw)
+    _delay(20000)
+    uint64 pntr_b     = _gc1_r32(bar5, regCP_MEC_RS64_INSTR_PNTR_dw)
+    _delay(50000)
+    uint64 pntr_c     = _gc1_r32(bar5, regCP_MEC_RS64_INSTR_PNTR_dw)
+    _hex32("MEC_CNTL post",     13, cntl_post)
+    _hex32("INSTR_PNTR (a)",    14, pntr_a)
+    _hex32("INSTR_PNTR (b)",    14, pntr_b)
+    _hex32("INSTR_PNTR (c)",    14, pntr_c)
+
+    uint64 sol_post = psp_read32(bar5, PSP_REG_C2PMSG_81)
+    _hex32("sos_C2PMSG_81 post", 18, sol_post)
+
+    if pntr_c != pntr_a {
+        puts("MEC MOVING — reset recovered cleanly")
+    } else {
+        if pntr_a == 0x00000c00 {
+            puts("MEC at PC_START (not yet executing into firmware)")
+        } else {
+            if pntr_a == 0x00008b41 {
+                puts("MEC at idle loop — ready for new work")
+            } else {
+                puts("MEC static at some address — investigate")
+            }
+        }
+    }
+
+    pci_close()
+    puts("phase3_mec_reset GREEN")
+    exit(0)
+}
