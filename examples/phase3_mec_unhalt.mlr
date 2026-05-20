@@ -1,0 +1,222 @@
+// Phase 3 slice ζ.2b — unhalt MEC RS64 cores after vfio FLR.
+//
+// ζ.2a inventory established:
+//   CP_MEC_RS64_CNTL = 0x400f0000
+//     bit 30 (MEC_HALT)             = 1
+//     bits 19..16 (MEC_PIPEn_RESET) = 1111 (all four pipes in reset)
+//     bits 29..26 (MEC_PIPEn_ACTIVE)= 0
+//   PC_START preserved = 0x0001c000_00000c00  (firmware entry intact)
+//   INSTR_PNTR static = 0x00000c00 (= PC_START_LO; cores idle at entry)
+//   RLC_CNTL bit 0    = 1 (RLC running)
+//
+// gfx_v11_0_cp_compute_enable(adev, true) writes a single CNTL value that
+//   clears MEC_HALT, MEC_PIPEn_RESET, MEC_INVALIDATE_ICACHE
+//   sets   MEC_PIPEn_ACTIVE (bits 26..29)
+// From the post-FLR state above, that target value evaluates to
+// **0x3C000000** (= 0x04000000 | 0x08000000 | 0x10000000 | 0x20000000).
+//
+// After the write, MEC RS64 cores resume executing from PC_START. We
+// confirm by reading INSTR_PNTR twice — if it differs between reads (or
+// is non-static at a different value than PC_START_LO), cores are alive.
+//
+// Risk: low. MEC reads HQD context via GRBM_GFX_CNTL selector; current
+// GRBM = 0 selects me=0/pipe=0/q=0, which has PQ_BASE=0. MEC will scan
+// empty queues and idle. No DMA, no faults, no doorbells rung.
+//
+// Reversibility: writing CP_MEC_RS64_CNTL back to 0x400f0000 re-halts.
+
+import "../std/pcidev.mlr"
+import "../std/amdgpu_ip_discovery.mlr"
+import "../std/psp.mlr"
+import "../std/sys.mlr"
+
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn puts(uint64 s) -> uint32
+
+// BASE_IDX=0
+static uint64 regCP_STAT_dw            = 0x0F40
+static uint64 regGRBM_STATUS_dw        = 0x0DA4
+static uint64 regGRBM_STATUS2_dw       = 0x0DA2
+
+// BASE_IDX=1
+static uint64 regCP_MEC_RS64_PRGRM_CNTR_START_dw    = 0x2900
+static uint64 regCP_MEC_RS64_CNTL_dw                = 0x2904
+static uint64 regCP_MEC_RS64_INSTR_PNTR_dw          = 0x2908
+static uint64 regCP_MEC_RS64_PRGRM_CNTR_START_HI_dw = 0x2938
+
+static uint64 MEC_UNHALT_VAL = 0x3C000000
+
+fn _hex32(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(96)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint8 zx = 48; unsafe { *((b + ll + 1) as uint8) = zx }
+    uint8 xc = 120; unsafe { *((b + ll + 2) as uint8) = xc }
+    uint64 j = 0
+    while j < 8 {
+        uint64 sh = (7 - j) * 4
+        uint64 nyb = (v >> sh) & 0xF
+        uint8 ch = nyb + 48
+        if nyb >= 10 { ch = nyb + 87 }
+        unsafe { *((b + ll + 3 + j) as uint8) = ch }
+        j = j + 1
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 11) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+fn _gc0_r32(uint64 bar5, uint64 reg_dw) -> uint64 {
+    uint64 byte_off = (amdgpu_ip_gc_base_0 + reg_dw) * 4
+    uint32 v = 0
+    unsafe { *((bar5 + byte_off) as uint32) -> v }
+    uint64 ret = v
+    return ret
+}
+
+fn _gc1_r32(uint64 bar5, uint64 reg_dw) -> uint64 {
+    uint64 byte_off = (amdgpu_ip_gc_base_1 + reg_dw) * 4
+    uint32 v = 0
+    unsafe { *((bar5 + byte_off) as uint32) -> v }
+    uint64 ret = v
+    return ret
+}
+
+fn _gc1_w32(uint64 bar5, uint64 reg_dw, uint64 val) {
+    uint64 byte_off = (amdgpu_ip_gc_base_1 + reg_dw) * 4
+    uint32 v = val
+    unsafe { *((bar5 + byte_off) as uint32) = v }
+}
+
+fn _delay(uint64 spins) {
+    uint64 i = 0
+    while i < spins { i = i + 1 }
+}
+
+fn main() {
+    puts("phase3_mec_unhalt (ζ.2b)")
+    uint64 oe = pci_open("0000:03:00.0", 14)
+    if oe != 0 { puts("FAIL pci_open"); exit(1) }
+    amdgpu_load_navi32_bases()
+    uint64 bar5 = pci_map_bar(PCI_BAR5_REGION_INDEX)
+    if bar5 == PCI_MAP_FAILED_SENTINEL { puts("FAIL BAR5"); pci_close(); exit(2) }
+
+    // Precondition: SOS alive
+    uint64 sol = psp_read32(bar5, PSP_REG_C2PMSG_81)
+    _hex32("sos_C2PMSG_81", 13, sol)
+    if sol == 0 {
+        puts("FAIL: SOS not alive — need amdgpu prime → vfio rebind first.")
+        pci_close(); exit(3)
+    }
+
+    // Snapshot pre-unhalt state.
+    puts("")
+    puts("--- Pre-unhalt MEC state ---")
+    uint64 cntl_pre   = _gc1_r32(bar5, regCP_MEC_RS64_CNTL_dw)
+    uint64 pc_lo_pre  = _gc1_r32(bar5, regCP_MEC_RS64_PRGRM_CNTR_START_dw)
+    uint64 pc_hi_pre  = _gc1_r32(bar5, regCP_MEC_RS64_PRGRM_CNTR_START_HI_dw)
+    uint64 pntr_pre   = _gc1_r32(bar5, regCP_MEC_RS64_INSTR_PNTR_dw)
+    uint64 cp_stat_pre   = _gc0_r32(bar5, regCP_STAT_dw)
+    uint64 grbm_stat_pre = _gc0_r32(bar5, regGRBM_STATUS_dw)
+    uint64 grbm_st2_pre  = _gc0_r32(bar5, regGRBM_STATUS2_dw)
+    _hex32("CP_MEC_RS64_CNTL pre",     20, cntl_pre)
+    _hex32("PC_START_LO",              11, pc_lo_pre)
+    _hex32("PC_START_HI",              11, pc_hi_pre)
+    _hex32("INSTR_PNTR pre",           14, pntr_pre)
+    _hex32("CP_STAT pre",              11, cp_stat_pre)
+    _hex32("GRBM_STATUS pre",          15, grbm_stat_pre)
+    _hex32("GRBM_STATUS2 pre",         16, grbm_st2_pre)
+
+    if pc_lo_pre == 0 {
+        if pc_hi_pre == 0 {
+            puts("FAIL: PC_START wiped — would need MEC fw header restore.")
+            puts("      ζ.2c (PC_START restore + MDBASE re-prime) needed.")
+            pci_close(); exit(4)
+        }
+    }
+    if (cntl_pre & 0x40000000) == 0 {
+        puts("WARN: MEC_HALT already clear — unhalt would be a no-op.")
+    }
+
+    // The single magic write.
+    puts("")
+    puts("--- Writing CP_MEC_RS64_CNTL = 0x3C000000 (unhalt all 4 pipes) ---")
+    _gc1_w32(bar5, regCP_MEC_RS64_CNTL_dw, MEC_UNHALT_VAL)
+
+    // udelay(50) equivalent — small busy loop.
+    _delay(50000)
+
+    // Readback.
+    uint64 cntl_post = _gc1_r32(bar5, regCP_MEC_RS64_CNTL_dw)
+    _hex32("CP_MEC_RS64_CNTL post",    21, cntl_post)
+
+    // Liveness check: read INSTR_PNTR several times with delays.
+    uint64 pntr_a = _gc1_r32(bar5, regCP_MEC_RS64_INSTR_PNTR_dw)
+    _delay(10000)
+    uint64 pntr_b = _gc1_r32(bar5, regCP_MEC_RS64_INSTR_PNTR_dw)
+    _delay(50000)
+    uint64 pntr_c = _gc1_r32(bar5, regCP_MEC_RS64_INSTR_PNTR_dw)
+    _delay(100000)
+    uint64 pntr_d = _gc1_r32(bar5, regCP_MEC_RS64_INSTR_PNTR_dw)
+
+    _hex32("INSTR_PNTR (a)",           14, pntr_a)
+    _hex32("INSTR_PNTR (b)",           14, pntr_b)
+    _hex32("INSTR_PNTR (c)",           14, pntr_c)
+    _hex32("INSTR_PNTR (d)",           14, pntr_d)
+
+    // Verify SOS still alive.
+    uint64 sol_post = psp_read32(bar5, PSP_REG_C2PMSG_81)
+    _hex32("sos_C2PMSG_81 post",       18, sol_post)
+    if sol_post == 0 {
+        puts("WARN: SOS died after MEC unhalt — unexpected interaction.")
+    }
+
+    uint64 cp_stat_post = _gc0_r32(bar5, regCP_STAT_dw)
+    uint64 grbm_st2_post = _gc0_r32(bar5, regGRBM_STATUS2_dw)
+    _hex32("CP_STAT post",             12, cp_stat_post)
+    _hex32("GRBM_STATUS2 post",        17, grbm_st2_post)
+
+    // Decode post-state.
+    puts("")
+    puts("--- Post-unhalt decode ---")
+    if (cntl_post & 0x40000000) != 0 {
+        puts("  MEC_HALT still=1 — write did NOT take effect (HW rejected)")
+    } else {
+        puts("  MEC_HALT cleared ✓")
+    }
+    if (cntl_post & 0x000F0000) != 0 {
+        _hex32("  PIPE_RESET still set bits", 25, (cntl_post >> 16) & 0xF)
+    } else {
+        puts("  All PIPE_RESET cleared ✓")
+    }
+    uint64 active_bits = (cntl_post >> 26) & 0xF
+    if active_bits == 0xF {
+        puts("  All 4 PIPE_ACTIVE set ✓")
+    } else {
+        _hex32("  PIPE_ACTIVE bits", 17, active_bits)
+    }
+
+    puts("")
+    puts("--- Liveness verdict ---")
+    if pntr_d != pntr_a {
+        puts("  INSTR_PNTR MOVED across reads — MEC IS ALIVE.")
+    } else {
+        if pntr_a != pc_lo_pre {
+            puts("  INSTR_PNTR moved past PC_START then stuck — MEC executed briefly")
+            puts("  then halted on a fault. Check IH ring (η slice).")
+        } else {
+            puts("  INSTR_PNTR static at PC_START — MEC did NOT start executing.")
+            puts("  Possibilities: MDBASE not primed; ICACHE empty (firmware not in IMEM)")
+        }
+    }
+
+    pci_close()
+    puts("")
+    puts("=============================================================")
+    puts("ζ.2b complete — see verdict above")
+    puts("=============================================================")
+    exit(0)
+}
