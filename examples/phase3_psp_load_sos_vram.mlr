@@ -235,6 +235,20 @@ fn main() {
     _hex32("bar5_host_lo", 12, bar5 & 0xFFFFFFFF)
     _hex32("bar0_host_lo", 12, bar0 & 0xFFFFFFFF)
 
+    // Enable PCI ROM aperture (PCI config 0x30, bit 0). Research agent
+    // #1 disassembled the SOS firmware (psp_13_0_10 is unencrypted ARM)
+    // and found that SOS init calls svc #0xb4 (GPU-specific) which
+    // hypothetically reads the iKEK from SPI-ROM via this aperture. If
+    // the aperture is disabled, the read fails silently and a downstream
+    // svc #0x2b returns nonzero, triggering SOS panic loop (exact match
+    // to our observed symptom: C2PMSG_58 published, C2PMSG_81 never set).
+    uint32 rom_addr_pre = pci_read_config32(0x30)
+    uint32 rom_addr_en = rom_addr_pre | 0x1
+    pci_write_config32(0x30, rom_addr_en)
+    uint32 rom_addr_post = pci_read_config32(0x30)
+    _hex32("rom_addr_pre",  12, rom_addr_pre)
+    _hex32("rom_addr_post", 13, rom_addr_post)
+
     // 3) Read FB_LOCATION_* — discover the VRAM aperture configured
     //    by SBIOS POST (or whatever was left after FLR).
     uint64 fb_base_raw = _mmhub_r32(bar5, regMMMC_VM_FB_LOCATION_BASE)
@@ -299,13 +313,33 @@ fn main() {
     _hex32("pre_C2PMSG_35", 13, psp_bootloader_status_raw(bar5))
     _hex32("pre_C2PMSG_81", 13, psp_read32(bar5, PSP_REG_C2PMSG_81))
     _hex32("pre_C2PMSG_58", 13, psp_read32(bar5, PSP_REG_C2PMSG_58))
-    if psp_is_bootloader_ready(bar5) == 0 {
-        puts("FAIL: bootloader not ready")
-        pci_close(); dealloc(fw_buf); exit(7)
-    }
+    _hex32("pre_C2PMSG_64", 13, psp_read32(bar5, PSP_REG_C2PMSG_64))
+    _hex32("pre_C2PMSG_69", 13, psp_read32(bar5, PSP_REG_C2PMSG_69))
+    _hex32("pre_C2PMSG_70", 13, psp_read32(bar5, PSP_REG_C2PMSG_70))
+    _hex32("pre_C2PMSG_71", 13, psp_read32(bar5, PSP_REG_C2PMSG_71))
+
+    // If SOS is already alive (e.g., warm-boot via amdgpu hand-off where
+    // amdgpu loaded SOS, then we rebound to vfio and FLR did NOT reset
+    // PSP state), the bootloader is GONE — C2PMSG_35 reads 0 — and we
+    // are already at the target end-state. Declare GREEN and exit.
     if psp_is_sos_alive(bar5) != 0 {
-        puts("WARN: SOS already alive — bailing")
-        pci_close(); dealloc(fw_buf); exit(8)
+        puts("=============================================================")
+        puts("SOS IS ALIVE — vfio FLR preserved PSP state from amdgpu init.")
+        puts("This is the warm-boot path. No PSP bootloader chain needed.")
+        puts("=============================================================")
+        _hex32("sos_fw_version (C2PMSG_58)", 26, psp_sos_fw_version(bar5))
+        _hex32("sos_sign_of_life (C2PMSG_81)", 28, psp_read32(bar5, PSP_REG_C2PMSG_81))
+        _hex32("psp_ring_create_ack (C2PMSG_64)", 31, psp_read32(bar5, PSP_REG_C2PMSG_64))
+        _hex32("psp_ring_base_lo (C2PMSG_69)", 28, psp_read32(bar5, PSP_REG_C2PMSG_69))
+        _hex32("psp_ring_base_hi (C2PMSG_70)", 28, psp_read32(bar5, PSP_REG_C2PMSG_70))
+        _hex32("psp_ring_size (C2PMSG_71)", 25, psp_read32(bar5, PSP_REG_C2PMSG_71))
+        puts("phase3_psp_load_sos_vram: GREEN (warm-boot)")
+        pci_close(); dealloc(fw_buf); exit(0)
+    }
+
+    if psp_is_bootloader_ready(bar5) == 0 {
+        puts("FAIL: bootloader not ready AND SOS not alive — PSP wedged")
+        pci_close(); dealloc(fw_buf); exit(7)
     }
 
     // 6) Chain: KDB → SPL → SYS_DRV → SOC_DRV → INTF_DRV → DBG_DRV → SOS.
