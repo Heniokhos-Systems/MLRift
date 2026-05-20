@@ -1,0 +1,101 @@
+// Phase 3 slice η.3b — read RCC_CONFIG_MEMSIZE to determine whether
+// VRAM has been trained.
+//
+// η.3 result: SOS started (C2PMSG_58 set) but never asserted SoL
+// (C2PMSG_81 stayed 0). One strong hypothesis: SOS tries to access VRAM
+// during its init and stalls when VRAM isn't trained.
+//
+// RCC_CONFIG_MEMSIZE (BAR5 byte 0x37CC) is the NBIO register that
+// reports trained VRAM size in MiB. amdgpu reads this post-VBIOS-POST.
+//
+//   0x00000000 → VRAM not trained → AsicInit (VBIOS POST) is the missing piece
+//   non-zero   → VRAM trained → AsicInit is NOT the cause; look elsewhere
+//
+// Read-only. Zero writes. Safe.
+
+import "../std/pcidev.mlr"
+import "../std/sys.mlr"
+
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn puts(uint64 s) -> uint32
+
+fn _hex32(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(80)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint8 zx = 48; unsafe { *((b + ll + 1) as uint8) = zx }
+    uint8 xc = 120; unsafe { *((b + ll + 2) as uint8) = xc }
+    uint64 j = 0
+    while j < 8 {
+        uint64 sh = (7 - j) * 4
+        uint64 nyb = (v >> sh) & 0xF
+        uint8 ch = nyb + 48
+        if nyb >= 10 { ch = nyb + 87 }
+        unsafe { *((b + ll + 3 + j) as uint8) = ch }
+        j = j + 1
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 11) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+fn _dec(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(80)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint64 digits = 0
+    if v == 0 {
+        uint8 z = 48; unsafe { *((b + ll + 1) as uint8) = z }; digits = 1
+    } else {
+        uint64 t = v
+        while t > 0 { digits = digits + 1; t = t / 10 }
+        uint64 k = digits
+        t = v
+        while k > 0 {
+            k = k - 1
+            uint64 d = t - (t / 10) * 10
+            uint8 db = d + 48
+            unsafe { *((b + ll + 1 + k) as uint8) = db }
+            t = t / 10
+        }
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 1 + digits) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+fn main() {
+    puts("phase3_eta3b_vram_trained (η.3b — READ-ONLY)")
+
+    uint64 oe = pci_open("0000:03:00.0", 14)
+    if oe != 0 { _dec("FAIL pci_open", 13, oe); exit(1) }
+    uint64 bar5 = pci_map_bar(PCI_BAR5_REGION_INDEX)
+    if bar5 == PCI_MAP_FAILED_SENTINEL { puts("FAIL BAR5"); pci_close(); exit(2) }
+
+    // mmRCC_CONFIG_MEMSIZE at BAR5 byte 0x37CC (dword 0xDF3) on gfx11.
+    uint32 v_memsize = 0
+    unsafe { *((bar5 + 0x37CC) as uint32) -> v_memsize }
+    uint64 memsize = v_memsize
+    _hex32("RCC_CONFIG_MEMSIZE", 18, memsize)
+    _dec("VRAM_MiB",            8, memsize)
+
+    if memsize == 0 {
+        puts("VERDICT: VRAM NOT TRAINED")
+        puts("        → AsicInit (VBIOS POST) is the missing piece before LOAD_SOS")
+        puts("        → next: cold cycle, then chain AsicInit + BL + SOS")
+    }
+    if memsize != 0 {
+        puts("VERDICT: VRAM TRAINED")
+        puts("        → AsicInit is NOT the cause of SOS stall")
+        puts("        → look at IH ring, MMHUB clients, or NBIO state")
+    }
+
+    pci_close()
+    exit(0)
+}

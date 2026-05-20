@@ -1,0 +1,250 @@
+// Phase 3 slice η.3a — VBIOS command-table inventory.
+//
+// η.3 found AsicInit (cmd table index 0) ran clean but didn't train
+// VRAM. On Navi+ GPUs, memory training is done by a different command
+// table (likely MemoryDeviceInit, DynamicMemorySettings, or similar).
+//
+// This smoke loads the VBIOS ROM, walks the master command-table list,
+// and prints index/offset/header-size/bytecode-size/first-opcode for
+// every present table. We then cross-reference against amdgpu's
+// _ATOM_MASTER_LIST_OF_COMMAND_FUNCTIONS_V2_x to identify candidates
+// for memory training.
+//
+// Per-cmd-table header (atom.h, _ATOM_COMMAND_TABLE):
+//   uint16 size_bytes        // total table size including header
+//   uint8  work_size          // # of ws[] dwords
+//   uint8  param_size         // # of ps[] dwords
+//   uint16 content_pointer    // unused on modern VBIOS
+//   bytecode starts at offset 6
+//
+// Read-only. No GPU touch. Safe.
+
+import "../std/atom.mlr"
+import "../std/sys.mlr"
+
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn puts(uint64 s) -> uint32
+
+fn _hex32(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(96)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint8 zx = 48; unsafe { *((b + ll + 1) as uint8) = zx }
+    uint8 xc = 120; unsafe { *((b + ll + 2) as uint8) = xc }
+    uint64 j = 0
+    while j < 8 {
+        uint64 sh = (7 - j) * 4
+        uint64 nyb = (v >> sh) & 0xF
+        uint8 ch = nyb + 48
+        if nyb >= 10 { ch = nyb + 87 }
+        unsafe { *((b + ll + 3 + j) as uint8) = ch }
+        j = j + 1
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 11) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+fn _dec(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(96)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint64 digits = 0
+    if v == 0 {
+        uint8 z = 48; unsafe { *((b + ll + 1) as uint8) = z }; digits = 1
+    } else {
+        uint64 t = v
+        while t > 0 { digits = digits + 1; t = t / 10 }
+        uint64 k = digits
+        t = v
+        while k > 0 {
+            k = k - 1
+            uint64 d = t - (t / 10) * 10
+            uint8 db = d + 48
+            unsafe { *((b + ll + 1 + k) as uint8) = db }
+            t = t / 10
+        }
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 1 + digits) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+// Print "idx=NN off=0xXXXX hdr_size=DDDD ws=NN ps=NN first_op=0xXX".
+// Six fields on one line; keeps output compact.
+fn _print_entry(uint64 idx,
+                uint64 cmd_off,
+                uint64 hdr_size,
+                uint64 ws,
+                uint64 ps,
+                uint64 first_op) {
+    uint64 b = alloc(128)
+    // "idx=NNN " (4 digits + space)
+    uint64 dd = 0
+    if idx < 10 { dd = 1 }
+    if idx < 100 { if idx >= 10 { dd = 2 } }
+    if idx >= 100 { dd = 3 }
+    unsafe { *((b + 0) as uint8) = 105 }  // i
+    unsafe { *((b + 1) as uint8) = 100 }  // d
+    unsafe { *((b + 2) as uint8) = 120 }  // x
+    unsafe { *((b + 3) as uint8) = 61 }   // =
+    uint64 t = idx
+    uint64 k = dd
+    while k > 0 {
+        k = k - 1
+        uint64 d = t - (t / 10) * 10
+        uint8 db = d + 48
+        unsafe { *((b + 4 + k) as uint8) = db }
+        t = t / 10
+    }
+    uint64 p = 4 + dd
+    unsafe { *((b + p) as uint8) = 32 }; p = p + 1   // space
+
+    // "off=0xXXXX "
+    unsafe { *((b + p + 0) as uint8) = 111 }  // o
+    unsafe { *((b + p + 1) as uint8) = 102 }  // f
+    unsafe { *((b + p + 2) as uint8) = 102 }  // f
+    unsafe { *((b + p + 3) as uint8) = 61 }   // =
+    unsafe { *((b + p + 4) as uint8) = 48 }   // 0
+    unsafe { *((b + p + 5) as uint8) = 120 }  // x
+    uint64 j = 0
+    while j < 4 {
+        uint64 sh = (3 - j) * 4
+        uint64 nyb = (cmd_off >> sh) & 0xF
+        uint8 ch = nyb + 48
+        if nyb >= 10 { ch = nyb + 87 }
+        unsafe { *((b + p + 6 + j) as uint8) = ch }
+        j = j + 1
+    }
+    p = p + 10
+    unsafe { *((b + p) as uint8) = 32 }; p = p + 1   // space
+
+    // "sz=DDDDD "
+    unsafe { *((b + p + 0) as uint8) = 115 }  // s
+    unsafe { *((b + p + 1) as uint8) = 122 }  // z
+    unsafe { *((b + p + 2) as uint8) = 61 }   // =
+    // count digits of hdr_size (up to 5)
+    uint64 sd = 1
+    uint64 tt = hdr_size
+    while tt >= 10 { sd = sd + 1; tt = tt / 10 }
+    if hdr_size == 0 { sd = 1 }
+    uint64 kk = sd
+    tt = hdr_size
+    while kk > 0 {
+        kk = kk - 1
+        uint64 d = tt - (tt / 10) * 10
+        uint8 db = d + 48
+        unsafe { *((b + p + 3 + kk) as uint8) = db }
+        tt = tt / 10
+    }
+    p = p + 3 + sd
+    unsafe { *((b + p) as uint8) = 32 }; p = p + 1
+
+    // "ws=NN ps=NN op=0xXX"
+    unsafe { *((b + p + 0) as uint8) = 119 }  // w
+    unsafe { *((b + p + 1) as uint8) = 115 }  // s
+    unsafe { *((b + p + 2) as uint8) = 61 }
+    if ws < 10 {
+        unsafe { *((b + p + 3) as uint8) = ws + 48 }
+        p = p + 4
+    } else {
+        unsafe { *((b + p + 3) as uint8) = (ws / 10) + 48 }
+        unsafe { *((b + p + 4) as uint8) = (ws - (ws / 10) * 10) + 48 }
+        p = p + 5
+    }
+    unsafe { *((b + p) as uint8) = 32 }; p = p + 1
+
+    unsafe { *((b + p + 0) as uint8) = 112 }  // p
+    unsafe { *((b + p + 1) as uint8) = 115 }  // s
+    unsafe { *((b + p + 2) as uint8) = 61 }
+    if ps < 10 {
+        unsafe { *((b + p + 3) as uint8) = ps + 48 }
+        p = p + 4
+    } else {
+        unsafe { *((b + p + 3) as uint8) = (ps / 10) + 48 }
+        unsafe { *((b + p + 4) as uint8) = (ps - (ps / 10) * 10) + 48 }
+        p = p + 5
+    }
+    unsafe { *((b + p) as uint8) = 32 }; p = p + 1
+
+    unsafe { *((b + p + 0) as uint8) = 111 }  // o
+    unsafe { *((b + p + 1) as uint8) = 112 }  // p
+    unsafe { *((b + p + 2) as uint8) = 61 }
+    unsafe { *((b + p + 3) as uint8) = 48 }
+    unsafe { *((b + p + 4) as uint8) = 120 }
+    uint64 jj = 0
+    while jj < 2 {
+        uint64 sh = (1 - jj) * 4
+        uint64 nyb = (first_op >> sh) & 0xF
+        uint8 ch = nyb + 48
+        if nyb >= 10 { ch = nyb + 87 }
+        unsafe { *((b + p + 5 + jj) as uint8) = ch }
+        jj = jj + 1
+    }
+    p = p + 7
+    unsafe { *((b + p) as uint8) = 0 }
+    puts(b); dealloc(b)
+}
+
+fn main() {
+    puts("phase3_eta3a_atom_cmd_inventory (READ-ONLY)")
+
+    uint64 bp = alloc(8); unsafe { *(bp as uint64) = 0 }
+    uint64 sp = alloc(8); unsafe { *(sp as uint64) = 0 }
+    uint64 le = atom_load_image("/tmp/mlrift_vbios.rom", bp, sp)
+    if le != 0 { _dec("FAIL atom_load_image", 20, le); exit(1) }
+    uint64 buf = 0; unsafe { *(bp as uint64) -> buf }
+    uint64 sz  = 0; unsafe { *(sp as uint64) -> sz }
+    dealloc(bp); dealloc(sp)
+
+    uint64 ve = atom_validate_image(buf, sz)
+    if ve != 0 { _dec("FAIL atom_validate", 18, ve); dealloc(buf); exit(2) }
+
+    _dec("vbios_size", 10, sz)
+
+    uint64 cmd_base = atom_get_cmd_table_list_base(buf)
+    _hex32("cmd_table_list_base", 19, cmd_base)
+
+    // The master cmd table starts with a 6-byte header (size, ws, ps,
+    // content_ptr), then a uint16[] of per-table offsets. Read the size
+    // field to get total — number of entries = (size - 4) / 2.
+    uint16 list_size = 0
+    unsafe { *((buf + cmd_base) as uint16) -> list_size }
+    uint64 lsz = list_size
+    uint64 n_entries = (lsz - 4) / 2
+    _dec("master_list_size_bytes", 22, lsz)
+    _dec("n_cmd_tables",            12, n_entries)
+
+    // Walk each entry. Offset 0 means "not present".
+    puts("--- per-cmd-table inventory ---")
+    uint64 i = 0
+    uint64 n_present = 0
+    while i < n_entries {
+        uint64 off = atom_cmd_table_offset_by_index(buf, i)
+        if off != 0 {
+            n_present = n_present + 1
+            // Per-cmd-table header: u16 size, u8 ws, u8 ps, u16 content_ptr.
+            uint16 hsz = 0
+            unsafe { *((buf + off + 0) as uint16) -> hsz }
+            uint8 ws = 0; unsafe { *((buf + off + 2) as uint8) -> ws }
+            uint8 ps = 0; unsafe { *((buf + off + 3) as uint8) -> ps }
+            uint8 first_op = 0; unsafe { *((buf + off + 6) as uint8) -> first_op }
+            uint64 hsz_u = hsz; uint64 ws_u = ws; uint64 ps_u = ps; uint64 op_u = first_op
+            _print_entry(i, off, hsz_u, ws_u, ps_u, op_u)
+        }
+        i = i + 1
+    }
+
+    _dec("present_count", 13, n_present)
+    _dec("absent_count",  12, n_entries - n_present)
+
+    dealloc(buf)
+    puts("phase3_eta3a_atom_cmd_inventory: GREEN")
+    exit(0)
+}
