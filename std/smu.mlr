@@ -1,0 +1,188 @@
+// std/smu.mlr — Navi 32 (smu_v13_0_10) MP1 mailbox primitives.
+//
+// Slice η.3e-4 deliverable: foundation for SMU PMFW load. We need PMFW
+// running BEFORE LOAD_SOSDRV because SOS expects memory training (UMC
+// PHY clocks) to be set up, and the UMC clocks come from PMFW.
+//
+// Tinygrad's AM_SMU.init_hw writes MP1 mailbox BEFORE PSP runs — proving
+// the SMU ROM accepts early messages WITHOUT PSP having loaded PMFW yet.
+// Order:
+//   1. (ours, future) Load smu_13_0_10.bin into sysmem buffer at known iova.
+//   2. SMU_MSG_SetDriverDramAddrHigh(addr_hi32)
+//   3. SMU_MSG_SetDriverDramAddrLow(addr_lo32)
+//   4. SMU_MSG_AppRunMicrocode (or whatever message_id transfers FW from
+//      sysmem to SMU SRAM and starts PMFW execution).
+//   5. Poll MP1_FIRMWARE_FLAGS.INTERRUPTS_ENABLED for PMFW-alive.
+//   6. Now LOAD_SOSDRV should succeed.
+//
+// This file implements only the read+write+send-msg primitives. The
+// specific FW-load message dance is η.3e-5 (next slice; needs message IDs
+// from smu_v13_0_10_ppsmc.h).
+//
+// MP1 register dword offsets (BASE_IDX=0). Source: mp_13_0_*_offset.h.
+//   mmMP1_SMN_C2PMSG_66 = 0x0282    // Message
+//   mmMP1_SMN_C2PMSG_82 = 0x0292    // Argument / parameter
+//   mmMP1_SMN_C2PMSG_90 = 0x029A    // Response (0 = idle/in-flight)
+//
+// Register access model (BAR5):
+//   byte_off = (amdgpu_ip_mp1_base_0 + reg_dw) * 4
+// where amdgpu_ip_mp1_base_0 = 0x00016000 on Navi 32 (same aperture as
+// MP0 — they share base_0 on this chip).
+
+import "pcidev.mlr"
+import "amdgpu_ip_discovery.mlr"
+import "sys.mlr"
+
+// =====================================================================
+// MP1 mailbox dword offsets (BASE_IDX=0).
+// =====================================================================
+static uint64 SMU_REG_C2PMSG_66 = 0x0282   // msg id
+static uint64 SMU_REG_C2PMSG_82 = 0x0292   // argument
+static uint64 SMU_REG_C2PMSG_90 = 0x029A   // response
+
+// =====================================================================
+// SMU response codes (from PPSMC / smu_v13_0_2_ppsmc.h convention).
+// =====================================================================
+static uint64 SMU_RESP_OK            = 1
+static uint64 SMU_RESP_FAILED        = 0xFF
+static uint64 SMU_RESP_UNKNOWN_CMD   = 0xFE
+static uint64 SMU_RESP_CMD_REJECTED  = 0xFD
+
+// =====================================================================
+// Poll budget for SMU response (units: 1-µs iterations of the spin loop
+// with a brief sched_yield via nanosleep). 100000 ≈ ~100 ms wall — well
+// under amdgpu's 1 second default in smu_v13_0_wait_for_response.
+// =====================================================================
+static uint64 SMU_RESP_POLL_BUDGET = 100000
+
+// =====================================================================
+// Low-level read/write.
+// =====================================================================
+fn smu_read32(uint64 bar5_host, uint64 reg_dw) -> uint64 {
+    uint64 byte_off = (amdgpu_ip_mp1_base_0 + reg_dw) * 4
+    uint32 v = 0
+    unsafe { *((bar5_host + byte_off) as uint32) -> v }
+    uint64 ret = v
+    return ret
+}
+
+fn smu_write32(uint64 bar5_host, uint64 reg_dw, uint64 val) {
+    uint64 byte_off = (amdgpu_ip_mp1_base_0 + reg_dw) * 4
+    uint32 v = val
+    unsafe { *((bar5_host + byte_off) as uint32) = v }
+}
+
+// =====================================================================
+// smu_msg_state — peek the three mailbox regs without writing.
+// Writes through three out-pointers. Safe to call at any time.
+// =====================================================================
+fn smu_msg_state(uint64 bar5_host,
+                 uint64 out_msg, uint64 out_arg, uint64 out_resp) {
+    uint64 m = smu_read32(bar5_host, SMU_REG_C2PMSG_66)
+    uint64 a = smu_read32(bar5_host, SMU_REG_C2PMSG_82)
+    uint64 r = smu_read32(bar5_host, SMU_REG_C2PMSG_90)
+    unsafe { *(out_msg  as uint64) = m }
+    unsafe { *(out_arg  as uint64) = a }
+    unsafe { *(out_resp as uint64) = r }
+}
+
+// =====================================================================
+// smu_wait_response — poll C2PMSG_90 for a non-zero response. Sleeps
+// 1 µs between polls (nanosleep 1000ns).
+//
+// Returns:
+//   0  response arrived (writes raw code through out_resp_ptr).
+//   1  timeout (out_resp_ptr written with last read value).
+// =====================================================================
+fn smu_wait_response(uint64 bar5_host, uint64 out_resp_ptr) -> uint64 {
+    uint64 i = 0
+    uint64 last = 0
+    while i < SMU_RESP_POLL_BUDGET {
+        last = smu_read32(bar5_host, SMU_REG_C2PMSG_90)
+        if last != 0 {
+            unsafe { *(out_resp_ptr as uint64) = last }
+            return 0
+        }
+        uint64 ts = alloc(16)
+        unsafe { *((ts + 0) as uint64) = 0 }
+        unsafe { *((ts + 8) as uint64) = 1000 }
+        syscall_raw(35, ts, 0, 0, 0, 0, 0)
+        dealloc(ts)
+        i = i + 1
+    }
+    unsafe { *(out_resp_ptr as uint64) = last }
+    return 1
+}
+
+// =====================================================================
+// smu_send_msg — full mailbox handshake. Per amdgpu
+// smu_v13_0_send_msg_with_param + tinygrad AM_SMU._send_msg:
+//
+//   1. Clear response register (C2PMSG_90 = 0).
+//   2. Write argument (C2PMSG_82 = arg).
+//   3. Write message ID (C2PMSG_66 = msg_id) — this kicks SMU.
+//   4. Poll C2PMSG_90 for non-zero.
+//
+// Inputs:
+//   bar5_host    Host VA of BAR5 mmap.
+//   msg_id       PPSMC_MSG_* numeric ID.
+//   arg          Argument / parameter (uint32).
+//   out_resp     Destination for the raw response code. Always written.
+//
+// Returns:
+//   0  response == SMU_RESP_OK (1).
+//   1  timeout (no response within SMU_RESP_POLL_BUDGET).
+//   2  SMU returned a non-OK code (caller can inspect *out_resp for
+//      detail — e.g. SMU_RESP_UNKNOWN_CMD = unsupported message ID).
+// =====================================================================
+fn smu_send_msg(uint64 bar5_host, uint64 msg_id, uint64 arg,
+                uint64 out_resp_ptr) -> uint64 {
+    smu_write32(bar5_host, SMU_REG_C2PMSG_90, 0)
+    smu_write32(bar5_host, SMU_REG_C2PMSG_82, arg)
+    smu_write32(bar5_host, SMU_REG_C2PMSG_66, msg_id)
+    uint64 wr = smu_wait_response(bar5_host, out_resp_ptr)
+    if wr != 0 { return 1 }
+    uint64 resp = 0
+    unsafe { *(out_resp_ptr as uint64) -> resp }
+    if resp == SMU_RESP_OK { return 0 }
+    return 2
+}
+
+// =====================================================================
+// Diagnostic printer. Pure reads — safe to call at any time.
+// =====================================================================
+@dynamic extern fn puts(uint64 s) -> uint32
+
+fn _smu_print_hex32(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(64)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint8 zx = 48; unsafe { *((b + ll + 1) as uint8) = zx }
+    uint8 xc = 120; unsafe { *((b + ll + 2) as uint8) = xc }
+    uint64 j = 0
+    while j < 8 {
+        uint64 sh = (7 - j) * 4
+        uint64 nyb = (v >> sh) & 0xF
+        uint8 ch = nyb + 48
+        if nyb >= 10 { ch = nyb + 87 }
+        unsafe { *((b + ll + 3 + j) as uint8) = ch }
+        j = j + 1
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 11) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+// Read+dump the three mailbox regs. Useful between phases to see SMU
+// inflight state without disturbing anything.
+fn smu_dump_mailbox(uint64 bar5_host) {
+    uint64 m = smu_read32(bar5_host, SMU_REG_C2PMSG_66)
+    uint64 a = smu_read32(bar5_host, SMU_REG_C2PMSG_82)
+    uint64 r = smu_read32(bar5_host, SMU_REG_C2PMSG_90)
+    _smu_print_hex32("MP1_C2PMSG_66_msg",  17, m)
+    _smu_print_hex32("MP1_C2PMSG_82_arg",  17, a)
+    _smu_print_hex32("MP1_C2PMSG_90_resp", 18, r)
+}
