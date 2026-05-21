@@ -1,0 +1,204 @@
+// Phase 3 slice η.3d-ii — AsicInit WITH VRAM training flags set.
+//
+// η.3d-i confirmed RCC_CONFIG_MEMSIZE=0 from cold boot. Investigation
+// of amdgpu source shows AsicInit on Navi/atomfirmware DOES train
+// memory — but only when called with specific umc_config flags in
+// the ps[] parameter block:
+//
+//   struct asic_init_param_v2_1 {
+//       uint32_t engineclock;     // ps[0]  — VBIOS default OK if 0
+//       uint32_t memclock;        // ps[1]  — VBIOS default OK if 0
+//       uint32_t umc_config;      // ps[2]  — TRAINING FLAGS
+//       uint32_t umc_config1;     // ps[3]  — 0
+//   };
+//
+//   #define UMC_CONFIG__ENABLE_VRAM_TRAINING_FLAG  0x00000001
+//   #define UMC_CONFIG__ENABLE_FB_RESET_FLAG       0x00000002
+//   #define UMC_CONFIG__ENABLE_AUTO_TRAINING_FLAG  0x00000004
+//
+// Our earlier `phase3_atom_asicinit_live` passed all-zero ps[] →
+// umc_config=0 → AsicInit skipped memory training. This smoke sets
+// umc_config = 0x05 (VRAM_TRAINING | AUTO_TRAINING). engineclock and
+// memclock left at 0 (VBIOS default behavior).
+//
+// WEDGE-CAPABLE: if memory training fails mid-flight, GPU may hang.
+// On wedge, cold cycle required.
+
+import "../std/pcidev.mlr"
+import "../std/amdgpu_ip_discovery.mlr"
+import "../std/atom.mlr"
+import "../std/sys.mlr"
+
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn puts(uint64 s) -> uint32
+
+fn _hex32(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(80)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint8 zx = 48; unsafe { *((b + ll + 1) as uint8) = zx }
+    uint8 xc = 120; unsafe { *((b + ll + 2) as uint8) = xc }
+    uint64 j = 0
+    while j < 8 {
+        uint64 sh = (7 - j) * 4
+        uint64 nyb = (v >> sh) & 0xF
+        uint8 ch = nyb + 48
+        if nyb >= 10 { ch = nyb + 87 }
+        unsafe { *((b + ll + 3 + j) as uint8) = ch }
+        j = j + 1
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 11) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+fn _dec(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(80)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint64 digits = 0
+    if v == 0 {
+        uint8 z = 48; unsafe { *((b + ll + 1) as uint8) = z }; digits = 1
+    } else {
+        uint64 t = v
+        while t > 0 { digits = digits + 1; t = t / 10 }
+        uint64 k = digits
+        t = v
+        while k > 0 {
+            k = k - 1
+            uint64 d = t - (t / 10) * 10
+            uint8 db = d + 48
+            unsafe { *((b + ll + 1 + k) as uint8) = db }
+            t = t / 10
+        }
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 1 + digits) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+fn _bar5_read32(uint64 bar5, uint64 byte_off) -> uint64 {
+    uint32 v = 0
+    unsafe { *((bar5 + byte_off) as uint32) -> v }
+    uint64 ret = v
+    return ret
+}
+
+fn main() {
+    puts("phase3_eta3d2_asicinit_train (η.3d-ii, WEDGE-CAPABLE)")
+
+    // Load VBIOS image
+    uint64 bp = alloc(8); unsafe { *(bp as uint64) = 0 }
+    uint64 sp = alloc(8); unsafe { *(sp as uint64) = 0 }
+    uint64 le = atom_load_image("/tmp/mlrift_vbios.rom", bp, sp)
+    if le != 0 { _dec("FAIL atom_load_image", 20, le); exit(1) }
+    uint64 image_buf  = 0; unsafe { *(bp as uint64) -> image_buf }
+    uint64 image_size = 0; unsafe { *(sp as uint64) -> image_size }
+    dealloc(bp); dealloc(sp)
+    _dec("vbios_size_bytes", 16, image_size)
+    uint64 ve = atom_validate_image(image_buf, image_size)
+    if ve != 0 { _dec("FAIL atom_validate", 18, ve); dealloc(image_buf); exit(2) }
+
+    // Open vfio + map BAR5 + BME
+    uint64 oe = pci_open("0000:03:00.0", 14)
+    if oe != 0 { _dec("FAIL pci_open", 13, oe); dealloc(image_buf); exit(3) }
+    amdgpu_load_navi32_bases()
+    uint64 bar5 = pci_map_bar(PCI_BAR5_REGION_INDEX)
+    if bar5 == PCI_MAP_FAILED_SENTINEL { puts("FAIL BAR5"); pci_close(); dealloc(image_buf); exit(4) }
+    uint64 bme = pci_set_bus_master()
+    if bme != 0 { _dec("FAIL set_bus_master", 20, bme); pci_close(); dealloc(image_buf); exit(5) }
+
+    // Pre-snapshot
+    uint64 rcc_memsize_off = 0x37CC
+    uint64 c2pmsg35_off = (amdgpu_ip_mp0_base_0 + 0x0063) * 4
+    uint64 c2pmsg81_off = (amdgpu_ip_mp0_base_0 + 0x0091) * 4
+
+    puts("--- pre-snapshot ---")
+    uint64 pre_memsize  = _bar5_read32(bar5, rcc_memsize_off)
+    uint64 pre_c2pmsg35 = _bar5_read32(bar5, c2pmsg35_off)
+    uint64 pre_c2pmsg81 = _bar5_read32(bar5, c2pmsg81_off)
+    _hex32("pre_RCC_CONFIG_MEMSIZE", 22, pre_memsize)
+    _hex32("pre_C2PMSG_35",          13, pre_c2pmsg35)
+    _hex32("pre_C2PMSG_81",          13, pre_c2pmsg81)
+
+    if pre_memsize != 0 {
+        puts("NOTE: RCC_CONFIG_MEMSIZE already non-zero — VRAM may already be trained.")
+        puts("      Continuing anyway to test re-train idempotency.")
+    }
+
+    // Init ATOM context
+    uint64 ctx = atom_context_init(image_buf, image_size, bar5)
+    if ctx == 0 { puts("FAIL atom_context_init"); pci_close(); dealloc(image_buf); exit(6) }
+    puts("atom_context_init: OK")
+
+    // Build ps[] with VRAM training flags
+    //   ps[0] = engineclock = 0  (VBIOS default)
+    //   ps[1] = memclock    = 0  (VBIOS default)
+    //   ps[2] = umc_config  = 0x05  (VRAM_TRAINING | AUTO_TRAINING)
+    //   ps[3] = umc_config1 = 0
+    //   ps[4..15] zero-filled
+    uint64 params = alloc(64)
+    uint64 pi = 0
+    while pi < 64 {
+        uint8 z = 0; unsafe { *((params + pi) as uint8) = z }
+        pi = pi + 1
+    }
+    uint32 umc_cfg = 0x00000005   // bit0 VRAM_TRAINING + bit2 AUTO_TRAINING
+    unsafe { *((params + 8) as uint32) = umc_cfg }
+    _hex32("ps[2]_umc_config", 16, 0x05)
+
+    puts("ABOUT TO INVOKE AsicInit with umc_config=0x05 (training enabled)")
+    uint64 rc = atom_execute_table_by_index(ctx, 0, params, 16)
+    _dec("AsicInit_rc", 11, rc)
+
+    // Post-snapshot (multi-point — give memory training time)
+    puts("--- post-snapshot T+0ms ---")
+    uint64 m0 = _bar5_read32(bar5, rcc_memsize_off)
+    _hex32("RCC_CONFIG_MEMSIZE", 18, m0)
+    _dec("VRAM_MiB",             8, m0)
+
+    // Sleep 100ms in case training continues async
+    uint64 ts = alloc(16)
+    unsafe { *((ts + 0) as uint64) = 0 }
+    unsafe { *((ts + 8) as uint64) = 100000000 }
+    syscall_raw(35, ts, 0, 0, 0, 0, 0)
+    dealloc(ts)
+
+    puts("--- post-snapshot T+100ms ---")
+    uint64 m1 = _bar5_read32(bar5, rcc_memsize_off)
+    uint64 p35 = _bar5_read32(bar5, c2pmsg35_off)
+    uint64 p81 = _bar5_read32(bar5, c2pmsg81_off)
+    _hex32("RCC_CONFIG_MEMSIZE", 18, m1)
+    _dec("VRAM_MiB",             8, m1)
+    _hex32("post_C2PMSG_35",     14, p35)
+    _hex32("post_C2PMSG_81",     14, p81)
+
+    puts("--- verdict ---")
+    if m1 != 0 {
+        puts("GREEN: VRAM IS TRAINED. RCC_CONFIG_MEMSIZE non-zero.")
+        puts("       Cold-boot path unblocked. Next: BL chain + LOAD_SOSDRV.")
+    }
+    if m1 == 0 {
+        if rc != 0 {
+            _dec("AsicInit returned non-zero rc", 30, rc)
+            puts("ATOM interpreter hit an issue (panic / unimpl opcode).")
+        }
+        if rc == 0 {
+            puts("AsicInit returned OK but VRAM still untrained.")
+            puts("Possibilities:")
+            puts("  - engineclock/memclock=0 not accepted — need real defaults from VBIOS firmwareinfo")
+            puts("  - Some OTHER prereq state (SMU init, NBIO scratch, ...)")
+            puts("  - Training happens in PSP after LOAD_SOSDRV (then SOS stalls are a different bug)")
+        }
+    }
+
+    pci_close()
+    dealloc(image_buf)
+    exit(0)
+}

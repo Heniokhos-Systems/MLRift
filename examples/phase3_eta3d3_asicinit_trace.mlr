@@ -1,0 +1,231 @@
+// Phase 3 slice η.3d-iii — AsicInit with trace dump.
+//
+// η.3d-ii: AsicInit rc=0 but VRAM untrained. Need to know if the
+// AsicInit table is doing real work or just a stub. std/atom.mlr's
+// 64-entry trace ring records the TOTAL op count via _atom_trace_idx.
+//
+// Verdict by trace count:
+//   <20 ops    → AsicInit on Navi 32 is essentially a stub. Memory
+//                 training happens elsewhere (probably PSP/SOS).
+//   20..64 ops → moderate work, possibly setport+reg-clear init.
+//   >64 ops    → significant work attempted. Last 64 ops printed
+//                 show what was executing at the end.
+//
+// Also dumps the last N (ptr, op) pairs to see what got executed.
+
+import "../std/pcidev.mlr"
+import "../std/amdgpu_ip_discovery.mlr"
+import "../std/atom.mlr"
+import "../std/sys.mlr"
+
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn puts(uint64 s) -> uint32
+
+fn _hex32(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(96)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint8 zx = 48; unsafe { *((b + ll + 1) as uint8) = zx }
+    uint8 xc = 120; unsafe { *((b + ll + 2) as uint8) = xc }
+    uint64 j = 0
+    while j < 8 {
+        uint64 sh = (7 - j) * 4
+        uint64 nyb = (v >> sh) & 0xF
+        uint8 ch = nyb + 48
+        if nyb >= 10 { ch = nyb + 87 }
+        unsafe { *((b + ll + 3 + j) as uint8) = ch }
+        j = j + 1
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 11) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+fn _dec(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(96)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint64 digits = 0
+    if v == 0 {
+        uint8 z = 48; unsafe { *((b + ll + 1) as uint8) = z }; digits = 1
+    } else {
+        uint64 t = v
+        while t > 0 { digits = digits + 1; t = t / 10 }
+        uint64 k = digits
+        t = v
+        while k > 0 {
+            k = k - 1
+            uint64 d = t - (t / 10) * 10
+            uint8 db = d + 48
+            unsafe { *((b + ll + 1 + k) as uint8) = db }
+            t = t / 10
+        }
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 1 + digits) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+// Print one trace entry: "[i] ptr=0xXXXX op=DDD"
+fn _print_entry(uint64 i, uint64 ptr, uint64 op) {
+    uint64 b = alloc(64)
+    unsafe { *((b + 0) as uint8) = 91 }    // [
+    // i (up to 3 digits)
+    uint64 dd = 1
+    if i >= 10 { dd = 2 }
+    if i >= 100 { dd = 3 }
+    if i == 0 { dd = 1 }
+    uint64 t = i
+    uint64 k = dd
+    while k > 0 {
+        k = k - 1
+        uint64 d = t - (t / 10) * 10
+        uint8 db = d + 48
+        unsafe { *((b + 1 + k) as uint8) = db }
+        t = t / 10
+    }
+    uint64 p = 1 + dd
+    unsafe { *((b + p) as uint8) = 93 }   // ]
+    unsafe { *((b + p + 1) as uint8) = 32 }  // space
+    p = p + 2
+
+    // ptr=0xXXXX (4 hex digits)
+    unsafe { *((b + p + 0) as uint8) = 112 }  // p
+    unsafe { *((b + p + 1) as uint8) = 116 }  // t
+    unsafe { *((b + p + 2) as uint8) = 114 }  // r
+    unsafe { *((b + p + 3) as uint8) = 61 }
+    unsafe { *((b + p + 4) as uint8) = 48 }
+    unsafe { *((b + p + 5) as uint8) = 120 }
+    uint64 j = 0
+    while j < 4 {
+        uint64 sh = (3 - j) * 4
+        uint64 nyb = (ptr >> sh) & 0xF
+        uint8 ch = nyb + 48
+        if nyb >= 10 { ch = nyb + 87 }
+        unsafe { *((b + p + 6 + j) as uint8) = ch }
+        j = j + 1
+    }
+    p = p + 10
+    unsafe { *((b + p) as uint8) = 32 }; p = p + 1
+
+    // op=DDD (decimal up to 3 digits)
+    unsafe { *((b + p + 0) as uint8) = 111 }  // o
+    unsafe { *((b + p + 1) as uint8) = 112 }  // p
+    unsafe { *((b + p + 2) as uint8) = 61 }
+    uint64 od = 1
+    if op >= 10 { od = 2 }
+    if op >= 100 { od = 3 }
+    if op == 0 { od = 1 }
+    uint64 ot = op
+    uint64 ok = od
+    while ok > 0 {
+        ok = ok - 1
+        uint64 d = ot - (ot / 10) * 10
+        uint8 db = d + 48
+        unsafe { *((b + p + 3 + ok) as uint8) = db }
+        ot = ot / 10
+    }
+    p = p + 3 + od
+    unsafe { *((b + p) as uint8) = 0 }
+    puts(b); dealloc(b)
+}
+
+fn main() {
+    puts("phase3_eta3d3_asicinit_trace (η.3d-iii, WEDGE-CAPABLE)")
+
+    uint64 bp = alloc(8); unsafe { *(bp as uint64) = 0 }
+    uint64 sp = alloc(8); unsafe { *(sp as uint64) = 0 }
+    uint64 le = atom_load_image("/tmp/mlrift_vbios.rom", bp, sp)
+    if le != 0 { _dec("FAIL atom_load_image", 20, le); exit(1) }
+    uint64 image_buf  = 0; unsafe { *(bp as uint64) -> image_buf }
+    uint64 image_size = 0; unsafe { *(sp as uint64) -> image_size }
+    dealloc(bp); dealloc(sp)
+
+    uint64 ve = atom_validate_image(image_buf, image_size)
+    if ve != 0 { _dec("FAIL atom_validate", 18, ve); dealloc(image_buf); exit(2) }
+
+    uint64 oe = pci_open("0000:03:00.0", 14)
+    if oe != 0 { _dec("FAIL pci_open", 13, oe); dealloc(image_buf); exit(3) }
+    amdgpu_load_navi32_bases()
+    uint64 bar5 = pci_map_bar(PCI_BAR5_REGION_INDEX)
+    if bar5 == PCI_MAP_FAILED_SENTINEL { puts("FAIL BAR5"); pci_close(); dealloc(image_buf); exit(4) }
+    uint64 bme = pci_set_bus_master()
+    if bme != 0 { _dec("FAIL set_bus_master", 20, bme); pci_close(); dealloc(image_buf); exit(5) }
+
+    uint64 ctx = atom_context_init(image_buf, image_size, bar5)
+    if ctx == 0 { puts("FAIL atom_context_init"); pci_close(); dealloc(image_buf); exit(6) }
+
+    // ps[] with VRAM training flags + reasonable clocks.
+    // engineclock & memclock in 10kHz units; try 500MHz / 1GHz default boot.
+    uint64 params = alloc(64)
+    uint64 pi = 0
+    while pi < 64 {
+        uint8 z = 0; unsafe { *((params + pi) as uint8) = z }
+        pi = pi + 1
+    }
+    uint32 eng = 50000        // 500 MHz in 10kHz units
+    uint32 mem = 100000       // 1000 MHz in 10kHz units
+    uint32 umc_cfg = 0x00000005   // VRAM_TRAINING | AUTO_TRAINING
+    unsafe { *((params + 0) as uint32) = eng }
+    unsafe { *((params + 4) as uint32) = mem }
+    unsafe { *((params + 8) as uint32) = umc_cfg }
+
+    _hex32("ps[0]_engineclock_10kHz", 22, 50000)
+    _hex32("ps[1]_memclock_10kHz",    20, 100000)
+    _hex32("ps[2]_umc_config",        16, umc_cfg)
+
+    puts("ABOUT TO INVOKE AsicInit (with training flags + nonzero clocks)")
+    uint64 rc = atom_execute_table_by_index(ctx, 0, params, 16)
+    _dec("AsicInit_rc", 11, rc)
+
+    uint64 tc = atom_trace_count()
+    _dec("total_op_count", 14, tc)
+
+    // Print last N entries (up to min(tc, 64))
+    puts("--- last ops executed (most recent first reverse-walk; up to 64) ---")
+    uint64 n_show = tc
+    if n_show > 64 { n_show = 64 }
+    uint64 first_idx = 0
+    if tc > 64 { first_idx = tc - 64 }
+    uint64 ii = first_idx
+    while ii < tc {
+        uint64 p = atom_trace_ptr_at(ii)
+        uint64 op = atom_trace_op_at(ii)
+        _print_entry(ii, p, op)
+        ii = ii + 1
+    }
+
+    puts("--- post-state ---")
+    uint64 m1 = 0
+    unsafe { *((bar5 + 0x37CC) as uint32) -> m1 }
+    _hex32("RCC_CONFIG_MEMSIZE", 18, m1)
+
+    puts("--- verdict ---")
+    if tc < 20 {
+        puts("STUB: AsicInit table on Navi 32 is essentially empty.")
+        puts("      Memory training is NOT done by AsicInit on this chip.")
+        puts("      Must be done by PSP/SOS or external (UEFI POST).")
+    }
+    if tc >= 20 {
+        if tc < 100 {
+            puts("MODERATE work — AsicInit ran ~moderate-size init sequence.")
+        }
+        if tc >= 100 {
+            puts("SIGNIFICANT work — AsicInit ran complex sequence.")
+        }
+        if m1 == 0 {
+            puts("but RCC_CONFIG_MEMSIZE still 0 — training attempted but failed,")
+            puts("or training is a separate command table entirely.")
+        }
+    }
+
+    pci_close()
+    dealloc(image_buf)
+    exit(0)
+}
