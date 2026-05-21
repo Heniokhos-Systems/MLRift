@@ -1,0 +1,393 @@
+// Phase 3 slice η.3h — replay amdgpu's pre-PSP MMIO sequence verbatim,
+// then drive LOAD_SOSDRV on our own buffer.
+//
+// Background: mmiotrace of amdgpu binding to dGPU captured 5047 W
+// events (full PSP/SOS/SMU/MEC init). η.3g/parse_amdgpu_trace.py
+// extracted the 335 essential pre-LOAD_KDB writes (filtered out 2560
+// SMN-INDEX read-setup writes) to /tmp/amdgpu_replay.bin.
+//
+// This smoke replays those 335 writes verbatim, then runs OUR BL chain
+// using OUR sysmem-backed staging buffer (the only practical staging
+// path without VRAM trained). Skips during replay:
+//   - offset in [0x4480, 0x44cf]: IH ring config. amdgpu's values point
+//     at VRAM addresses we can't reach. We don't init IH here (η.3e-3
+//     proved IH ring isn't on the SOS-stall path).
+//   - offset == 0x58190: amdgpu's C2PMSG_36 (buf addr) write. We set
+//     our own.
+//
+// Binary format /tmp/amdgpu_replay.bin:
+//   uint32 N
+//   N × { uint32 offset_in_bar5, uint32 value }
+
+import "../std/pcidev.mlr"
+import "../std/amdgpu_ip_discovery.mlr"
+import "../std/amdgpu_firmware.mlr"
+import "../std/gmc.mlr"
+import "../std/nbio.mlr"
+import "../std/psp.mlr"
+import "../std/sys.mlr"
+
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn puts(uint64 s) -> uint32
+
+fn _hex32(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(96)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint8 zx = 48; unsafe { *((b + ll + 1) as uint8) = zx }
+    uint8 xc = 120; unsafe { *((b + ll + 2) as uint8) = xc }
+    uint64 j = 0
+    while j < 8 {
+        uint64 sh = (7 - j) * 4
+        uint64 nyb = (v >> sh) & 0xF
+        uint8 ch = nyb + 48
+        if nyb >= 10 { ch = nyb + 87 }
+        unsafe { *((b + ll + 3 + j) as uint8) = ch }
+        j = j + 1
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 11) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+fn _dec(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(96)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint64 digits = 0
+    if v == 0 {
+        uint8 z = 48; unsafe { *((b + ll + 1) as uint8) = z }; digits = 1
+    } else {
+        uint64 t = v
+        while t > 0 { digits = digits + 1; t = t / 10 }
+        uint64 k = digits
+        t = v
+        while k > 0 {
+            k = k - 1
+            uint64 d = t - (t / 10) * 10
+            uint8 db = d + 48
+            unsafe { *((b + ll + 1 + k) as uint8) = db }
+            t = t / 10
+        }
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 1 + digits) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+// Decide whether a (offset, value) write should be skipped during
+// replay. Returns 1 to skip, 0 to apply.
+//
+// η.3h-bisect-1: previous attempt replayed all 335 (minus IH/C2PMSG_36)
+// and PSP stalled mid-LOAD_KDB (rc=3, C2PMSG_35=0). Hypothesis: MMHUB
+// writes broke PSP DMA. Skip MMHUB this run to test that.
+fn _replay_should_skip(uint64 offset) -> uint64 {
+    if offset >= 0x4480 {
+        if offset <= 0x44cf {
+            return 1   // IH ring config — VRAM addrs, would fault
+        }
+    }
+    if offset == 0x58190 { return 1 }   // C2PMSG_36 (amdgpu's buf addr)
+    if offset == 0x5818c { return 1 }   // C2PMSG_35 (defensive — shouldn't be in blob anyway)
+
+    // BISECT EXCLUSION: full MMHUB region.
+    // 228 writes here; amdgpu sets up multi-VMID with VRAM-PT for
+    // contexts we never override. Skip wholesale to see if it's the
+    // culprit. If GREEN → MMHUB writes are the issue.
+    if offset >= 0x68000 {
+        if offset < 0x70000 {
+            return 1
+        }
+    }
+    return 0
+}
+
+// Replay all writes from the blob, skipping unsafe ones.
+// Returns (applied_count, skipped_count) via out pointers.
+fn _replay_apply(uint64 bar5, uint64 blob_buf, uint64 blob_size,
+                 uint64 out_applied, uint64 out_skipped) {
+    if blob_size < 4 {
+        unsafe { *(out_applied as uint64) = 0 }
+        unsafe { *(out_skipped as uint64) = 0 }
+        return
+    }
+    uint32 n_raw = 0
+    unsafe { *(blob_buf as uint32) -> n_raw }
+    uint64 n = n_raw
+
+    uint64 applied = 0
+    uint64 skipped = 0
+    uint64 i = 0
+    while i < n {
+        uint64 ent_off = 4 + i * 8
+        if ent_off + 8 > blob_size { return }
+        uint32 raw_off = 0
+        uint32 raw_val = 0
+        unsafe { *((blob_buf + ent_off + 0) as uint32) -> raw_off }
+        unsafe { *((blob_buf + ent_off + 4) as uint32) -> raw_val }
+        uint64 offset = raw_off
+        uint64 value  = raw_val
+
+        if _replay_should_skip(offset) == 1 {
+            skipped = skipped + 1
+        } else {
+            uint32 v32 = value
+            unsafe { *((bar5 + offset) as uint32) = v32 }
+            applied = applied + 1
+        }
+        i = i + 1
+    }
+    unsafe { *(out_applied as uint64) = applied }
+    unsafe { *(out_skipped as uint64) = skipped }
+}
+
+fn _load_one(uint64 step_label,
+             uint64 fw_buf, uint64 fw_sz, uint64 fw_type,
+             uint64 cmd_word,
+             uint64 bar5, uint64 buf_host, uint64 buf_iova) -> uint64 {
+    puts(step_label)
+    uint64 lp = alloc(16)
+    unsafe { *((lp + 0) as uint64) = 0 }
+    unsafe { *((lp + 8) as uint64) = 0 }
+    uint64 fr = psp_v2_find(fw_buf, fw_sz, fw_type, lp + 0, lp + 8)
+    if fr != 0 {
+        _dec("  psp_v2_find_rc", 16, fr)
+        dealloc(lp); return 99
+    }
+    uint64 rel_off = 0; unsafe { *((lp + 0) as uint64) -> rel_off }
+    uint64 sub_sz  = 0; unsafe { *((lp + 8) as uint64) -> sub_sz }
+    dealloc(lp)
+    uint64 uaob = fw_ucode_array_offset_bytes(fw_buf)
+    uint64 sub_ptr = fw_buf + uaob + rel_off
+    _dec("  sub_blob_size", 15, sub_sz)
+
+    uint64 errp = alloc(8); unsafe { *(errp as uint64) = 0 }
+    uint64 rc = psp_load_component(bar5, buf_host, buf_iova,
+                                   sub_ptr, sub_sz, cmd_word, errp)
+    uint64 err = 0; unsafe { *(errp as uint64) -> err }
+    dealloc(errp)
+    uint64 post = psp_bootloader_status_raw(bar5)
+    _dec("  rc",       4, rc)
+    _hex32("  err",    5, err)
+    _hex32("  C2PMSG_35", 11, post)
+    return rc
+}
+
+fn _wait_sol(uint64 bar5) -> uint64 {
+    uint64 ts0 = alloc(16)
+    unsafe { *((ts0 + 0) as uint64) = 0 }
+    unsafe { *((ts0 + 8) as uint64) = 20000000 }
+    syscall_raw(35, ts0, 0, 0, 0, 0, 0)
+    dealloc(ts0)
+
+    uint64 i = 0
+    uint64 last = 0
+    while i < 60000 {
+        last = psp_read32(bar5, PSP_REG_C2PMSG_81)
+        if last != 0 {
+            _hex32("SoL_C2PMSG_81", 13, last)
+            _dec("sol_iter_ms",    11, i)
+            return 0
+        }
+        if (i & 0x1FF) == 0 {
+            _hex32("wait_C2PMSG_81", 14, last)
+            _hex32("wait_C2PMSG_58", 14, psp_read32(bar5, PSP_REG_C2PMSG_58))
+            _hex32("wait_C2PMSG_35", 14, psp_read32(bar5, PSP_REG_C2PMSG_35))
+            _dec("wait_iter_ms",    12, i)
+        }
+        uint64 ts = alloc(16)
+        unsafe { *((ts + 0) as uint64) = 0 }
+        unsafe { *((ts + 8) as uint64) = 1000000 }
+        syscall_raw(35, ts, 0, 0, 0, 0, 0)
+        dealloc(ts)
+        i = i + 1
+    }
+    return 1
+}
+
+fn main() {
+    puts("phase3_eta3h_trace_replay (η.3h, WEDGE-CAPABLE)")
+
+    // ---------------- load replay blob ----------------
+    uint64 bp = alloc(8); unsafe { *(bp as uint64) = 0 }
+    uint64 sp = alloc(8); unsafe { *(sp as uint64) = 0 }
+    uint64 le = fw_load_file("/tmp/amdgpu_replay.bin", bp, sp)
+    if le != 0 { _dec("FAIL fw_load_file (replay blob)", 31, le); exit(1) }
+    uint64 blob_buf = 0; unsafe { *(bp as uint64) -> blob_buf }
+    uint64 blob_sz  = 0; unsafe { *(sp as uint64) -> blob_sz }
+    dealloc(bp); dealloc(sp)
+    _dec("replay_blob_size", 16, blob_sz)
+    uint32 nraw = 0
+    unsafe { *(blob_buf as uint32) -> nraw }
+    uint64 n_entries = nraw
+    _dec("replay_entries",    14, n_entries)
+
+    // ---------------- load SOS firmware ----------------
+    uint64 fbp = alloc(8); unsafe { *(fbp as uint64) = 0 }
+    uint64 fsp = alloc(8); unsafe { *(fsp as uint64) = 0 }
+    uint64 fle = fw_load_file("/tmp/mlrift_fw/psp_13_0_10_sos.bin", fbp, fsp)
+    if fle != 0 { _dec("FAIL fw_load_file (SOS)", 23, fle); dealloc(blob_buf); exit(2) }
+    uint64 fw_buf = 0; unsafe { *(fbp as uint64) -> fw_buf }
+    uint64 fw_sz  = 0; unsafe { *(fsp as uint64) -> fw_sz }
+    dealloc(fbp); dealloc(fsp)
+
+    // ---------------- open device ----------------
+    uint64 oe = pci_open("0000:03:00.0", 14)
+    if oe != 0 { _dec("FAIL pci_open", 13, oe); exit(3) }
+    amdgpu_load_navi32_bases()
+    uint64 bar5 = pci_map_bar(PCI_BAR5_REGION_INDEX)
+    if bar5 == PCI_MAP_FAILED_SENTINEL { puts("FAIL BAR5"); pci_close(); exit(4) }
+    uint64 bme = pci_set_bus_master()
+    if bme != 0 { _dec("FAIL set_bus_master", 20, bme); pci_close(); exit(5) }
+
+    // ---------------- allocate OUR PSP staging buffer ----------------
+    uint64 buf_iova = 0x40000000
+    uint64 buf_size = 0x400000
+    uint64 hp = alloc(8); unsafe { *(hp as uint64) = 0 }
+    uint64 ae = pci_alloc_sysmem_at_iova(buf_size, buf_iova, hp)
+    if ae != 0 { _dec("FAIL pci_alloc PSP buf", 22, ae); dealloc(hp); pci_close(); exit(6) }
+    uint64 buf_host = 0; unsafe { *(hp as uint64) -> buf_host }
+    dealloc(hp)
+
+    // ---------------- scratch for aperture default ----------------
+    uint64 sph = alloc(8); unsafe { *(sph as uint64) = 0 }
+    uint64 spg = alloc(8); unsafe { *(spg as uint64) = 0 }
+    uint64 sae = pci_alloc_sysmem_aligned(4096, 4096, sph, spg)
+    if sae != 0 { _dec("FAIL scratch alloc", 18, sae); pci_close(); exit(7) }
+    uint64 scratch_iova = 0; unsafe { *(spg as uint64) -> scratch_iova }
+    dealloc(sph); dealloc(spg)
+
+    // ---------------- pre-state ----------------
+    puts("--- pre-replay state ---")
+    _hex32("pre_C2PMSG_35", 13, psp_bootloader_status_raw(bar5))
+    _hex32("pre_C2PMSG_81", 13, psp_read32(bar5, PSP_REG_C2PMSG_81))
+    if psp_is_bootloader_ready(bar5) == 0 {
+        puts("FAIL: BL not ready at start — cold cycle needed")
+        exit(8)
+    }
+    if psp_is_sos_alive(bar5) != 0 {
+        puts("WARN: SOS already alive — would not be a cold test")
+    }
+
+    // ---------------- REPLAY ----------------
+    puts("--- replaying amdgpu pre-PSP MMIO writes ---")
+    uint64 ap = alloc(8); unsafe { *(ap as uint64) = 0 }
+    uint64 skp = alloc(8); unsafe { *(skp as uint64) = 0 }
+    _replay_apply(bar5, blob_buf, blob_sz, ap, skp)
+    uint64 applied = 0; unsafe { *(ap as uint64) -> applied }
+    uint64 skipped = 0; unsafe { *(skp as uint64) -> skipped }
+    dealloc(ap); dealloc(skp)
+    _dec("replay_applied", 14, applied)
+    _dec("replay_skipped", 14, skipped)
+
+    // ---------------- override: our GMC aperture identity ----------------
+    // Need our CONTEXT0 + system aperture to cover [0x40000000, 0x40400000).
+    // Replay set CONTEXT0 to amdgpu's VRAM-backed PT — overwrite it.
+    puts("--- overriding GMC with our aperture identity ---")
+    uint64 ge = gmc_init_aperture_identity(bar5, 0x1000, 0x100F, scratch_iova)
+    _dec("gmc_init_rc", 11, ge)
+    if ge != 0 {
+        puts("BAIL: gmc_init failed")
+        exit(9)
+    }
+
+    // ---------------- NBIO BIF FB gate (idempotent — amdgpu may have done it) ----------------
+    puts("--- NBIO BIF FB gate ---")
+    nbio_mc_access_enable(bar5)
+    nbio_readback_diagnostic(bar5)
+
+    // ---------------- BL chain ----------------
+    puts("--- BL chain on top of replayed state ---")
+    uint64 step_rc = 0
+    step_rc = _load_one("=== Step 1: LOAD_KDB ===",
+                        fw_buf, fw_sz, PSP_FW_TYPE_KDB,
+                        PSP_BL_LOAD_KEY_DATABASE,
+                        bar5, buf_host, buf_iova)
+    if step_rc != 0 { puts("STEP 1 FAILED"); exit(20) }
+
+    step_rc = _load_one("=== Step 2: LOAD_SYSDRV ===",
+                        fw_buf, fw_sz, PSP_FW_TYPE_SYS_DRV,
+                        PSP_BL_LOAD_SYSDRV,
+                        bar5, buf_host, buf_iova)
+    if step_rc != 0 { puts("STEP 2 FAILED"); exit(21) }
+
+    step_rc = _load_one("=== Step 3: LOAD_SOCDRV ===",
+                        fw_buf, fw_sz, PSP_FW_TYPE_SOC_DRV,
+                        PSP_BL_LOAD_SOCDRV,
+                        bar5, buf_host, buf_iova)
+    if step_rc != 0 { puts("STEP 3 FAILED"); exit(22) }
+
+    step_rc = _load_one("=== Step 4: LOAD_INTFDRV ===",
+                        fw_buf, fw_sz, PSP_FW_TYPE_INTF_DRV,
+                        PSP_BL_LOAD_INTFDRV,
+                        bar5, buf_host, buf_iova)
+    if step_rc != 0 { puts("STEP 4 FAILED"); exit(23) }
+
+    step_rc = _load_one("=== Step 5: LOAD_DBGDRV ===",
+                        fw_buf, fw_sz, PSP_FW_TYPE_DBG_DRV,
+                        PSP_BL_LOAD_DBGDRV,
+                        bar5, buf_host, buf_iova)
+    if step_rc != 0 { puts("STEP 5 FAILED"); exit(24) }
+
+    puts("--- BL chain GREEN; LOAD_SOSDRV ---")
+
+    // ---------------- LOAD_SOSDRV ----------------
+    uint64 lp = alloc(16)
+    unsafe { *((lp + 0) as uint64) = 0 }
+    unsafe { *((lp + 8) as uint64) = 0 }
+    uint64 fr = psp_v2_find(fw_buf, fw_sz, PSP_FW_TYPE_SOS, lp + 0, lp + 8)
+    if fr != 0 { _dec("FAIL psp_v2_find SOS", 20, fr); exit(30) }
+    uint64 sos_off = 0; unsafe { *((lp + 0) as uint64) -> sos_off }
+    uint64 sos_sz  = 0; unsafe { *((lp + 8) as uint64) -> sos_sz }
+    dealloc(lp)
+    uint64 uaob = fw_ucode_array_offset_bytes(fw_buf)
+    uint64 sos_ptr = fw_buf + uaob + sos_off
+    _dec("sos_sub_blob_size", 17, sos_sz)
+
+    psp_zero_buf(buf_host, PSP_FW_BUF_SIZE)
+    psp_copy_blob(buf_host, sos_ptr, sos_sz)
+    uint64 addr_word = buf_iova >> 20
+    psp_write32(bar5, PSP_REG_C2PMSG_36, addr_word)
+    psp_write32(bar5, PSP_REG_C2PMSG_35, PSP_BL_LOAD_SOSDRV)
+    puts("LOAD_SOSDRV cmd written; polling C2PMSG_81 up to 60s")
+
+    uint64 we = _wait_sol(bar5)
+
+    // ---------------- post-state ----------------
+    puts("--- post-LOAD_SOSDRV state ---")
+    _hex32("post_C2PMSG_35", 14, psp_bootloader_status_raw(bar5))
+    _hex32("post_C2PMSG_81", 14, psp_read32(bar5, PSP_REG_C2PMSG_81))
+    _hex32("post_C2PMSG_58", 14, psp_read32(bar5, PSP_REG_C2PMSG_58))
+
+    uint32 v_memsize = 0
+    unsafe { *((bar5 + 0x37CC) as uint32) -> v_memsize }
+    uint64 memsize = v_memsize
+    _hex32("RCC_CONFIG_MEMSIZE", 18, memsize)
+    _dec("VRAM_MiB",             8, memsize)
+
+    if we == 0 {
+        puts("VERDICT: GREEN — SOS alive on trace-replay. COLD-BOOT UNBLOCKED.")
+        if memsize != 0 {
+            puts("VERDICT++: VRAM TRAINED too.")
+        }
+    }
+    if we != 0 {
+        puts("VERDICT: AMBER — replay didn't unblock SOS.")
+        if memsize != 0 {
+            puts("  but MEMSIZE non-zero — partial progress")
+        }
+    }
+
+    pci_free_sysmem(0, scratch_iova, 4096)
+    pci_free_sysmem(buf_host, buf_iova, buf_size)
+    pci_close()
+    dealloc(fw_buf)
+    dealloc(blob_buf)
+    exit(0)
+}
