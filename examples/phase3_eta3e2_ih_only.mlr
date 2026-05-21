@@ -1,0 +1,188 @@
+// Phase 3 slice η.3e-2 — IH ring init STANDALONE (no PSP).
+//
+// Tests std/ih.mlr against the live GPU before chaining it under
+// LOAD_SOSDRV. Acceptance criteria:
+//   - ih_init_rings returns 0 (no readback wedge).
+//   - IH_RB_CNTL readback ≈ 0xA0130121 (clear of the WPTR_OVERFLOW_CLEAR
+//     side-effect bit per AMD HW).
+//   - IH_RB_BASE readback == ring0_iova >> 8.
+//   - PSP bootloader is still alive afterwards (C2PMSG_35 == 0x80000000)
+//     — proves we didn't accidentally wedge MP0.
+//
+// Layout (caller-supplied IOVAs, all covered by GMC aperture identity):
+//   ring0   @ 0x60000000  (256 KiB)
+//   ring1   @ 0x60040000  (256 KiB)
+//   rwptr   @ 0x60080000  (4 KiB)
+//   scratch @ bump-allocated (aperture default-fault target)
+//
+// Aperture range: [0x60000000, 0x60100000) — apert_lo=0x1800,
+// apert_hi=0x1803.
+//
+// Safe-ish: writes only IH regs (OSSSYS aperture) plus the MMHUB
+// GMC regs gmc_init_aperture_identity touches. Does NOT touch MP0
+// command path. If this wedges, MMHUB/GMC misconfig is suspect.
+
+import "../std/pcidev.mlr"
+import "../std/amdgpu_ip_discovery.mlr"
+import "../std/gmc.mlr"
+import "../std/ih.mlr"
+import "../std/psp.mlr"
+import "../std/sys.mlr"
+
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn puts(uint64 s) -> uint32
+
+fn _hex32(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(80)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint8 zx = 48; unsafe { *((b + ll + 1) as uint8) = zx }
+    uint8 xc = 120; unsafe { *((b + ll + 2) as uint8) = xc }
+    uint64 j = 0
+    while j < 8 {
+        uint64 sh = (7 - j) * 4
+        uint64 nyb = (v >> sh) & 0xF
+        uint8 ch = nyb + 48
+        if nyb >= 10 { ch = nyb + 87 }
+        unsafe { *((b + ll + 3 + j) as uint8) = ch }
+        j = j + 1
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 11) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+fn _dec(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(80)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint64 digits = 0
+    if v == 0 {
+        uint8 z = 48; unsafe { *((b + ll + 1) as uint8) = z }; digits = 1
+    } else {
+        uint64 t = v
+        while t > 0 { digits = digits + 1; t = t / 10 }
+        uint64 k = digits
+        t = v
+        while k > 0 {
+            k = k - 1
+            uint64 d = t - (t / 10) * 10
+            uint8 db = d + 48
+            unsafe { *((b + ll + 1 + k) as uint8) = db }
+            t = t / 10
+        }
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 1 + digits) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+fn main() {
+    puts("phase3_eta3e2_ih_only (η.3e-2 — IH STANDALONE)")
+
+    // ---------------- open device ----------------
+    uint64 oe = pci_open("0000:03:00.0", 14)
+    if oe != 0 { _dec("FAIL pci_open", 13, oe); exit(1) }
+    amdgpu_load_navi32_bases()
+    uint64 bar5 = pci_map_bar(PCI_BAR5_REGION_INDEX)
+    if bar5 == PCI_MAP_FAILED_SENTINEL { puts("FAIL BAR5"); pci_close(); exit(2) }
+    uint64 bme = pci_set_bus_master()
+    if bme != 0 { _dec("FAIL set_bus_master", 20, bme); pci_close(); exit(3) }
+
+    // ---------------- pre-state ----------------
+    puts("--- pre-init PSP state ---")
+    _hex32("pre_C2PMSG_35", 13, psp_bootloader_status_raw(bar5))
+    _hex32("pre_C2PMSG_81", 13, psp_read32(bar5, PSP_REG_C2PMSG_81))
+    if psp_is_sos_alive(bar5) != 0 {
+        puts("FAIL: SOS already alive — cold cycle required (see η.0)")
+        pci_close(); exit(4)
+    }
+    if psp_is_bootloader_ready(bar5) == 0 {
+        puts("WARN: BL not ready, but proceeding (IH init touches no MP0)")
+    }
+
+    // ---------------- alloc IH rings + scratch ----------------
+    uint64 ring0_iova = 0x60000000
+    uint64 ring1_iova = 0x60040000
+    uint64 rwptr_iova = 0x60080000
+
+    uint64 ctxp = alloc(8); unsafe { *(ctxp as uint64) = 0 }
+    uint64 ae = ih_alloc_rings(ring0_iova, ring1_iova, rwptr_iova, ctxp)
+    if ae != 0 {
+        _dec("FAIL ih_alloc_rings", 19, ae)
+        dealloc(ctxp); pci_close(); exit(5)
+    }
+    uint64 ih_ctx = 0; unsafe { *(ctxp as uint64) -> ih_ctx }
+    dealloc(ctxp)
+    puts("ih_alloc_rings: OK (ring0/ring1/rwptr mapped via IOMMU)")
+
+    // Scratch page for aperture default-fault target.
+    uint64 sph = alloc(8); unsafe { *(sph as uint64) = 0 }
+    uint64 spg = alloc(8); unsafe { *(spg as uint64) = 0 }
+    uint64 sae = pci_alloc_sysmem_aligned(4096, 4096, sph, spg)
+    if sae != 0 { _dec("FAIL scratch alloc", 18, sae); ih_free_rings(ih_ctx); pci_close(); exit(6) }
+    uint64 scratch_iova = 0; unsafe { *(spg as uint64) -> scratch_iova }
+    dealloc(sph); dealloc(spg)
+
+    // ---------------- GMC aperture identity covering IH iovas ----------------
+    puts("ABOUT TO WRITE MMHUB APERTURE-IDENTITY (covering 0x60000000+1MiB)")
+    uint64 ge = gmc_init_aperture_identity(bar5, 0x1800, 0x1803, scratch_iova)
+    _dec("gmc_init_aperture_identity_rc", 29, ge)
+    if ge != 0 {
+        puts("BAIL: gmc_init failed")
+        pci_free_sysmem(0, scratch_iova, 4096)
+        ih_free_rings(ih_ctx)
+        pci_close(); exit(7)
+    }
+
+    // ---------------- IH init ----------------
+    puts("ABOUT TO WRITE IH RING REGISTERS")
+    uint64 ie = ih_init_rings(bar5, ih_ctx)
+    _dec("ih_init_rings_rc", 16, ie)
+    if ie != 0 {
+        puts("BAIL: ih_init_rings failed")
+        ih_disable(bar5)
+        pci_free_sysmem(0, scratch_iova, 4096)
+        ih_free_rings(ih_ctx)
+        pci_close(); exit(8)
+    }
+
+    // ---------------- readback ----------------
+    puts("--- IH register state post-init ---")
+    ih_dump_state(bar5)
+
+    // Specifically verify IH_RB_BASE == ring0_iova >> 8
+    uint64 rb_base = 0
+    uint32 vb = 0
+    unsafe { *((bar5 + (amdgpu_ip_oss_base_0 + IH_REG_RB_BASE) * 4) as uint32) -> vb }
+    rb_base = vb
+    uint64 expected = (ring0_iova >> 8) & 0xFFFFFFFF
+    _hex32("expected_RB_BASE", 16, expected)
+    if rb_base != expected {
+        puts("FAIL: RB_BASE readback mismatch — HW dropped the write?")
+    }
+    if rb_base == expected {
+        puts("OK: RB_BASE matches ring0_iova >> 8")
+    }
+
+    // ---------------- post-state ----------------
+    puts("--- post-init PSP state (sanity: MP0 untouched) ---")
+    _hex32("post_C2PMSG_35", 14, psp_bootloader_status_raw(bar5))
+    _hex32("post_C2PMSG_81", 14, psp_read32(bar5, PSP_REG_C2PMSG_81))
+    _dec("post_bl_ready",   13, psp_is_bootloader_ready(bar5))
+
+    // ---------------- teardown ----------------
+    ih_disable(bar5)
+    pci_free_sysmem(0, scratch_iova, 4096)
+    ih_free_rings(ih_ctx)
+    pci_close()
+
+    puts("phase3_eta3e2_ih_only: COMPLETE")
+    exit(0)
+}
