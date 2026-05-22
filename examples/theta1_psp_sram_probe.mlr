@@ -1,0 +1,279 @@
+// Slice θ.1 — warm-boot PSP SRAM scrape probe (READ-ONLY).
+//
+// Goal: locate any externally-accessible memory region in the dGPU
+// register space (BAR5) that contains the DECRYPTED SOS image.
+//
+// Approach:
+//   1. Confirm warm SOS state (BOOT_STEADY=0xBA at C2PMSG_92).
+//   2. Sweep BAR5 in chunks looking for the SOS exception-vector
+//      byte pattern at the start of SOS body:
+//        +0x00 200000ea  ; b 0xd110088 (Reset)
+//        +0x04 7b0000ea  ; b 0xd1101f8 (Undef)
+//        +0x08 860000ea  ; b 0xd110228 (SVC)
+//        +0x0c a60000ea  ; b 0xd1102ac (Pref Abort)
+//        +0x10 b60000ea  ; b 0xd1102f0 (Data Abort)
+//        +0x14 feffffea  ; b 0xd110014 (Reserved)
+//        +0x18 c90000ea  ; b 0xd110344 (IRQ)
+//        +0x1c 0000a0e1  ; mov r0, r0  (FIQ nop)
+//   3. Independently dump MP0 dwords 0x100..0x3FF (the "private"
+//      MP0 area beyond C2PMSG_127) — looking for varying / non-zero
+//      data that might be a PSP debug aperture.
+//
+// READ-ONLY: no MMIO writes, no Bus Master Enable, no PSP commands.
+//
+// Prerequisites for warm boot path:
+//   a. Cold-boot the system (PSU off > 15s).
+//   b. Let amdgpu load normally and bring SOS to BOOT_STEADY=0xBA.
+//   c. `echo 0000:03:00.0 > /sys/bus/pci/drivers/amdgpu/unbind` then
+//      `echo 0000:03:00.0 > /sys/bus/pci/drivers/vfio-pci/bind`.
+//      PSP aux power survives software resets (per memory) so SOS
+//      stays alive.
+//   d. Run this smoke. If C2PMSG_92 != 0xBA at start, abort.
+//
+// If we find the 8-dword exception vector pattern in BAR5, that's
+// the smoking gun: SOS is memory-mapped externally and option 1A
+// is open. If we don't, option 1A is closed and the cold-boot wall
+// remains in encrypted-firmware territory.
+
+import "../std/pcidev.mlr"
+import "../std/amdgpu_ip_discovery.mlr"
+import "../std/psp.mlr"
+import "../std/sys.mlr"
+
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn puts(uint64 s) -> uint32
+
+fn _hex32(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(96)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint8 zx = 48; unsafe { *((b + ll + 1) as uint8) = zx }
+    uint8 xc = 120; unsafe { *((b + ll + 2) as uint8) = xc }
+    uint64 j = 0
+    while j < 8 {
+        uint64 sh = (7 - j) * 4
+        uint64 nyb = (v >> sh) & 0xF
+        uint8 ch = nyb + 48
+        if nyb >= 10 { ch = nyb + 87 }
+        unsafe { *((b + ll + 3 + j) as uint8) = ch }
+        j = j + 1
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 11) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+fn _dec(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(96)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint64 digits = 0
+    if v == 0 {
+        uint8 z = 48; unsafe { *((b + ll + 1) as uint8) = z }; digits = 1
+    } else {
+        uint64 t = v
+        while t > 0 { digits = digits + 1; t = t / 10 }
+        uint64 k = digits
+        t = v
+        while k > 0 {
+            k = k - 1
+            uint64 d = t - (t / 10) * 10
+            uint8 db = d + 48
+            unsafe { *((b + ll + 1 + k) as uint8) = db }
+            t = t / 10
+        }
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 1 + digits) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+// Print a single hex match site: "match @ 0xXXXXXXXX"
+fn _hit(uint64 lab, uint64 ll, uint64 byte_off) {
+    uint64 b = alloc(96)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 c1
+    c1 = 32; unsafe { *((b + ll) as uint8) = c1 }
+    c1 = 64; unsafe { *((b + ll + 1) as uint8) = c1 }
+    c1 = 48; unsafe { *((b + ll + 2) as uint8) = c1 }
+    c1 = 120; unsafe { *((b + ll + 3) as uint8) = c1 }
+    uint64 j = 0
+    while j < 8 {
+        uint64 sh = (7 - j) * 4
+        uint64 nyb = (byte_off >> sh) & 0xF
+        uint8 ch = nyb + 48
+        if nyb >= 10 { ch = nyb + 87 }
+        unsafe { *((b + ll + 4 + j) as uint8) = ch }
+        j = j + 1
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 12) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+fn main() {
+    puts("theta1_psp_sram_probe (READ-ONLY)")
+
+    uint64 oe = pci_open("0000:03:00.0", 14)
+    if oe != 0 { _dec("FAIL pci_open", 13, oe); exit(3) }
+    amdgpu_load_navi32_bases()
+    uint64 bar5 = pci_map_bar(PCI_BAR5_REGION_INDEX)
+    if bar5 == PCI_MAP_FAILED_SENTINEL { puts("FAIL BAR5"); pci_close(); exit(4) }
+
+    // Confirm warm state: read SOS state markers
+    puts("--- SOS state markers ---")
+    uint64 c2_35 = psp_read32(bar5, PSP_REG_C2PMSG_35)
+    uint64 c2_58 = psp_read32(bar5, PSP_REG_C2PMSG_58)
+    uint64 c2_81 = psp_read32(bar5, PSP_REG_C2PMSG_81)
+    uint64 c2_92 = psp_read32(bar5, 0x009C)
+    _hex32("C2PMSG_35 (BL)", 14, c2_35)
+    _hex32("C2PMSG_58 (SOS ver)", 19, c2_58)
+    _hex32("C2PMSG_81 (SoL)", 15, c2_81)
+    _hex32("C2PMSG_92 (BOOT_STATUS)", 23, c2_92)
+    if c2_92 != 0xBA {
+        puts("WARN: BOOT_STATUS != 0xBA — SOS not warm-steady.")
+        puts("  Smoke proceeds anyway but pattern match may be invalid.")
+    } else {
+        puts("OK: SOS is in BOOT_STEADY (0xBA). Warm state confirmed.")
+    }
+
+    // ============================================================
+    // Phase 1: search BAR5 for SOS exception vector pattern.
+    // The pattern is 8 little-endian dwords at the start of SOS body
+    // (file 0x100 = virt 0x0d110000):
+    //   0xea000020  (b 0xd110088 = Reset handler)
+    //   0xea00007b  (b 0xd1101f8 = Undef)
+    //   ... etc.
+    // We scan BAR5 dword-aligned looking for this exact sequence.
+    // BAR5 is large; we scan a bounded range.
+    // ============================================================
+    puts("--- Phase 1: BAR5 sweep for SOS vector pattern ---")
+
+    // BAR5 layout (Navi 32, gc_11_0_3):
+    //   0x00000000 - 0x00400000 — register space (~4 MB)
+    // We sweep dwords 0x00000000..0x00300000 (= 0..3 MB).
+    // That's 768K dword reads. At ~1us each, ~0.8s total.
+
+    // Pattern (8 dwords, little-endian):
+    uint64 p0 = 0xea000020   // b Reset
+    uint64 p1 = 0xea00007b   // b Undef
+    uint64 p2 = 0xea000086   // b SVC
+    uint64 p3 = 0xea0000a6   // b PrefAbort
+    uint64 p4 = 0xea0000b6   // b DataAbort
+    uint64 p5_32 = 0xeafffffe  // b Reserved (self-loop)
+    uint64 p6 = 0xea0000c9   // b IRQ
+    uint64 p7 = 0xe1a00000   // mov r0, r0 (FIQ nop)
+
+    uint64 SCAN_END = 0x00300000   // 3 MB
+    uint64 STEP = 4
+    uint64 hits_count = 0
+    uint64 nonzero_count = 0
+    uint64 last_seen_nonzero_off = 0
+    uint64 off = 0
+    while off < SCAN_END {
+        uint32 v0_32 = 0
+        unsafe { *((bar5 + off) as uint32) -> v0_32 }
+        uint64 v0 = v0_32
+
+        if v0 != 0 {
+            nonzero_count = nonzero_count + 1
+            last_seen_nonzero_off = off
+        }
+
+        if v0 == p0 {
+            // Check the next 7 dwords
+            uint32 v32 = 0
+            uint64 ok = 1
+            unsafe { *((bar5 + off + 4) as uint32) -> v32 }
+            uint64 v1 = v32; if v1 != p1 { ok = 0 }
+            if ok == 1 {
+                unsafe { *((bar5 + off + 8) as uint32) -> v32 }
+                uint64 v2 = v32; if v2 != p2 { ok = 0 }
+            }
+            if ok == 1 {
+                unsafe { *((bar5 + off + 12) as uint32) -> v32 }
+                uint64 v3 = v32; if v3 != p3 { ok = 0 }
+            }
+            if ok == 1 {
+                unsafe { *((bar5 + off + 16) as uint32) -> v32 }
+                uint64 v4 = v32; if v4 != p4 { ok = 0 }
+            }
+            if ok == 1 {
+                unsafe { *((bar5 + off + 20) as uint32) -> v32 }
+                uint64 v5 = v32; if v5 != p5_32 { ok = 0 }
+            }
+            if ok == 1 {
+                unsafe { *((bar5 + off + 24) as uint32) -> v32 }
+                uint64 v6 = v32; if v6 != p6 { ok = 0 }
+            }
+            if ok == 1 {
+                unsafe { *((bar5 + off + 28) as uint32) -> v32 }
+                uint64 v7 = v32; if v7 != p7 { ok = 0 }
+            }
+            if ok == 1 {
+                _hit("HIT: SOS vec @bar5", 18, off)
+                hits_count = hits_count + 1
+            }
+        }
+        off = off + STEP
+    }
+
+    _dec("scan_bytes_total", 16, SCAN_END)
+    _dec("nonzero_dwords",   15, nonzero_count)
+    _dec("vector_hits",      11, hits_count)
+    _hex32("last_nonzero_off", 16, last_seen_nonzero_off)
+
+    // ============================================================
+    // Phase 2: dump MP0 private register range (dwords 0x100..0x3FF).
+    // ============================================================
+    puts("--- Phase 2: MP0 dwords 0x100..0x3FF non-zero scan ---")
+    uint64 base_byte = amdgpu_ip_mp0_base_0 * 4
+    uint64 nz_priv = 0
+    uint64 d = 0x100
+    while d < 0x400 {
+        uint32 v32 = 0
+        unsafe { *((bar5 + base_byte + d * 4) as uint32) -> v32 }
+        uint64 v = v32
+        if v != 0 {
+            // print "dw[0xNNN] = 0xVVVVVVVV"
+            uint64 lab = alloc(32)
+            uint64 li = 0
+            uint8 c
+            c = 100; unsafe { *((lab + li) as uint8) = c }; li = li + 1  // d
+            c = 119; unsafe { *((lab + li) as uint8) = c }; li = li + 1  // w
+            c =  91; unsafe { *((lab + li) as uint8) = c }; li = li + 1  // [
+            c =  48; unsafe { *((lab + li) as uint8) = c }; li = li + 1  // 0
+            c = 120; unsafe { *((lab + li) as uint8) = c }; li = li + 1  // x
+            uint64 j = 0
+            while j < 3 {
+                uint64 sh = (2 - j) * 4
+                uint64 nyb = (d >> sh) & 0xF
+                uint8 ch = nyb + 48
+                if nyb >= 10 { ch = nyb + 87 }
+                unsafe { *((lab + li + j) as uint8) = ch }
+                j = j + 1
+            }
+            li = li + 3
+            c =  93; unsafe { *((lab + li) as uint8) = c }; li = li + 1  // ]
+            uint8 nul = 0; unsafe { *((lab + li) as uint8) = nul }
+            _hex32(lab, li, v)
+            dealloc(lab)
+            nz_priv = nz_priv + 1
+        }
+        d = d + 1
+    }
+    _dec("nz_priv_count", 13, nz_priv)
+
+    puts("--- theta1 done ---")
+    pci_close()
+    exit(0)
+}
