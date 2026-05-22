@@ -1,5 +1,9 @@
 // std/nbio.mlr — Navi 32 NBIO (Northbridge I/O) bring-up helpers.
 //
+// Phase A.0: ported from `dev` to `dev` handle. MMIO goes through
+// gpu_reg_r32/w32(dev, GPU_IP_NBIO, ...). The amdgpu_ip_discovery import
+// is gone — NBIO's BASE_IDX=2 nbif offset lives in the gpu handle.
+//
 // amdgpu's soc21_common_hw_init writes a set of NBIO/BIF registers
 // BEFORE any other IP block initializes. PSP's mailbox and FB-traffic
 // path live behind these — without them, PSP can publish MP0 mailbox
@@ -9,12 +13,8 @@
 // Reference: drivers/gpu/drm/amd/amdgpu/nbio_v4_3.c (kernel master).
 // Register offsets from
 // drivers/gpu/drm/amd/include/asic_reg/nbio/nbio_4_3_0_offset.h.
-// All NBIO regs we touch use BASE_IDX=2 → amdgpu_ip_nbif_base_2.
-// Navi 32 nbif_base_2 = 0x00000D20, so MMIO byte offset is
-//   (0xD20 + reg_dw) * 4.
 
-import "pcidev.mlr"
-import "amdgpu_ip_discovery.mlr"
+import "gpudev.mlr"
 
 // NBIO 4.3.0 register dword offsets (BASE_IDX=2).
 static uint64 regBIF_BX0_BIF_FB_EN                              = 0x0100
@@ -32,16 +32,13 @@ static uint64 BIF_FB_EN_FB_WRITE_EN = 0x2
 // =====================================================================
 // MMIO helpers for NBIO registers (BASE_IDX=2).
 // =====================================================================
-fn _nbio_write32(uint64 bar5_host, uint64 reg_dw, uint64 val) {
-    uint64 byte_off = (amdgpu_ip_nbif_base_2 + reg_dw) * 4
+fn _nbio_write32(uint64 dev, uint64 reg_dw, uint64 val) {
     uint32 v = val
-    unsafe { *((bar5_host + byte_off) as uint32) = v }
+    gpu_reg_w32(dev, GPU_IP_NBIO, reg_dw, v)
 }
 
-fn _nbio_read32(uint64 bar5_host, uint64 reg_dw) -> uint64 {
-    uint64 byte_off = (amdgpu_ip_nbif_base_2 + reg_dw) * 4
-    uint32 v = 0
-    unsafe { *((bar5_host + byte_off) as uint32) -> v }
+fn _nbio_read32(uint64 dev, uint64 reg_dw) -> uint64 {
+    uint32 v = gpu_reg_r32(dev, GPU_IP_NBIO, reg_dw)
     uint64 ret = v
     return ret
 }
@@ -58,9 +55,9 @@ fn _nbio_read32(uint64 bar5_host, uint64 reg_dw) -> uint64 {
 // C2PMSG_58 in milliseconds, then locks because it cannot reach
 // its VRAM working set.
 // =====================================================================
-fn nbio_mc_access_enable(uint64 bar5_host) {
+fn nbio_mc_access_enable(uint64 dev) {
     uint64 v = BIF_FB_EN_FB_READ_EN | BIF_FB_EN_FB_WRITE_EN
-    _nbio_write32(bar5_host, regBIF_BX0_BIF_FB_EN, v)
+    _nbio_write32(dev, regBIF_BX0_BIF_FB_EN, v)
 }
 
 // =====================================================================
@@ -92,8 +89,8 @@ fn _nbio_print_hex32(uint64 lab, uint64 ll, uint64 v) {
     puts(b); dealloc(b)
 }
 
-fn nbio_readback_diagnostic(uint64 bar5_host) {
-    uint64 fb_en = _nbio_read32(bar5_host, regBIF_BX0_BIF_FB_EN)
+fn nbio_readback_diagnostic(uint64 dev) {
+    uint64 fb_en = _nbio_read32(dev, regBIF_BX0_BIF_FB_EN)
     _nbio_print_hex32("BIF_FB_EN", 9, fb_en)
 }
 
@@ -116,14 +113,14 @@ fn nbio_readback_diagnostic(uint64 bar5_host) {
 //                       the 12-bit limit and sets high bits, which is
 //                       hw-accepted behavior).
 // =====================================================================
-fn nbio_init_doorbell_selfring(uint64 bar5_host,
+fn nbio_init_doorbell_selfring(uint64 dev,
                                 uint64 doorbell_phys_base,
                                 uint64 doorbell_size_bytes) {
     // Base low/high.
-    _nbio_write32(bar5_host,
+    _nbio_write32(dev,
                   regBIF_BX_PF0_DOORBELL_SELFRING_GPA_APER_BASE_LOW,
                   doorbell_phys_base & 0xFFFFFFFF)
-    _nbio_write32(bar5_host,
+    _nbio_write32(dev,
                   regBIF_BX_PF0_DOORBELL_SELFRING_GPA_APER_BASE_HIGH,
                   doorbell_phys_base >> 32)
 
@@ -131,19 +128,19 @@ fn nbio_init_doorbell_selfring(uint64 bar5_host,
     // shifted into bits 8.. amdgpu-style.
     uint64 size_field = (doorbell_size_bytes << 8) & 0xFFFFFF00
     uint64 cntl = size_field | 0x1
-    _nbio_write32(bar5_host,
+    _nbio_write32(dev,
                   regBIF_BX_PF0_DOORBELL_SELFRING_GPA_APER_CNTL, cntl)
 
     // Per-EPF doorbell aperture enable (RCC). bit 0 = BIF_DOORBELL_APER_EN.
-    _nbio_write32(bar5_host,
+    _nbio_write32(dev,
                   regRCC_DEV0_EPF0_RCC_DOORBELL_APER_EN, 0x1)
 }
 
-fn nbio_readback_doorbell_diagnostic(uint64 bar5_host) {
-    uint64 lo = _nbio_read32(bar5_host, regBIF_BX_PF0_DOORBELL_SELFRING_GPA_APER_BASE_LOW)
-    uint64 hi = _nbio_read32(bar5_host, regBIF_BX_PF0_DOORBELL_SELFRING_GPA_APER_BASE_HIGH)
-    uint64 cn = _nbio_read32(bar5_host, regBIF_BX_PF0_DOORBELL_SELFRING_GPA_APER_CNTL)
-    uint64 en = _nbio_read32(bar5_host, regRCC_DEV0_EPF0_RCC_DOORBELL_APER_EN)
+fn nbio_readback_doorbell_diagnostic(uint64 dev) {
+    uint64 lo = _nbio_read32(dev, regBIF_BX_PF0_DOORBELL_SELFRING_GPA_APER_BASE_LOW)
+    uint64 hi = _nbio_read32(dev, regBIF_BX_PF0_DOORBELL_SELFRING_GPA_APER_BASE_HIGH)
+    uint64 cn = _nbio_read32(dev, regBIF_BX_PF0_DOORBELL_SELFRING_GPA_APER_CNTL)
+    uint64 en = _nbio_read32(dev, regRCC_DEV0_EPF0_RCC_DOORBELL_APER_EN)
     _nbio_print_hex32("DOORBELL_BASE_LO", 16, lo)
     _nbio_print_hex32("DOORBELL_BASE_HI", 16, hi)
     _nbio_print_hex32("DOORBELL_CNTL",    13, cn)

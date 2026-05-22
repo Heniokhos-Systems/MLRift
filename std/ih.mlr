@@ -1,5 +1,10 @@
 // std/ih.mlr — Navi 32 (gc_11_0_3) OSSSYS Interrupt Handler v6.0 bring-up.
 //
+// Phase A.0: ported from `dev` to `dev` handle. MMIO goes through
+// gpu_reg_r32/w32(dev, GPU_IP_OSS, ...). Allocations go through
+// gpu_dma_alloc_at / gpu_dma_free. The amdgpu_ip_discovery import is
+// gone — IH's BASE_IDX=0 OSS offset lives in the gpu handle.
+//
 // Slice η.3e-2 deliverable. Discovered in η.3d research: amdgpu's IP-block
 // order brings up SOC -> GMC -> IH BEFORE psp_hw_init. We had MMHUB up
 // (std/gmc.mlr::gmc_init_aperture_identity) but no IH. Hypothesis: PSP
@@ -11,18 +16,13 @@
 //   - tinygrad runtime/support/am/ip.py::AM_IH.init_hw
 //   - osssys_6_0_0_offset.h / osssys_6_0_0_sh_mask.h
 //
-// Register access model (BAR5 mmio):
-//   byte_off = (amdgpu_ip_oss_base_0 + reg_dw) * 4
-//   amdgpu_ip_oss_base_0 = 0x000010A0 on Navi 32.
-//
 // Buffer placement: all ring buffers + the rwptr write-back page must
 // live at IOMMU iovas that are covered by the GMC system-aperture
 // identity range set up via gmc_init_aperture_identity. The caller picks
 // the iovas and is responsible for aperture coverage. 256 KiB per ring
 // (matches amdgpu IH_RING_SIZE), 4 KiB for the rwptr page.
 
-import "pcidev.mlr"
-import "amdgpu_ip_discovery.mlr"
+import "gpudev.mlr"
 import "sys.mlr"
 
 // =====================================================================
@@ -114,30 +114,27 @@ static uint64 IH_CTX_SIZE           = 48
 // =====================================================================
 // Low-level read/write.
 // =====================================================================
-fn _ih_write32(uint64 bar5_host, uint64 reg_dw, uint64 val) {
-    uint64 byte_off = (amdgpu_ip_oss_base_0 + reg_dw) * 4
+fn _ih_write32(uint64 dev, uint64 reg_dw, uint64 val) {
     uint32 v = val
-    unsafe { *((bar5_host + byte_off) as uint32) = v }
+    gpu_reg_w32(dev, GPU_IP_OSS, reg_dw, v)
 }
 
-fn _ih_read32(uint64 bar5_host, uint64 reg_dw) -> uint64 {
-    uint64 byte_off = (amdgpu_ip_oss_base_0 + reg_dw) * 4
-    uint32 v = 0
-    unsafe { *((bar5_host + byte_off) as uint32) -> v }
+fn _ih_read32(uint64 dev, uint64 reg_dw) -> uint64 {
+    uint32 v = gpu_reg_r32(dev, GPU_IP_OSS, reg_dw)
     uint64 ret = v
     return ret
 }
 
 // =====================================================================
 // ih_alloc_rings — allocate ring0 (256 KiB), ring1 (256 KiB), and
-// rwptr scratch (4 KiB) via pci_alloc_sysmem_at_iova at caller-supplied
-// iovas. Caller MUST cover all three iovas with the GMC system-aperture
+// rwptr scratch (4 KiB) via gpu_dma_alloc_at at caller-supplied iovas.
+// Caller MUST cover all three iovas with the GMC system-aperture
 // identity range (otherwise the GPU will fault when writing the rwptr).
 //
 // All three iovas must be 4 KiB-aligned. Ring iovas must be 256-KiB-
 // aligned (matches amdgpu allocation pattern; not strictly enforced
 // hardware-side but defensive). Iovas must not overlap any prior
-// pci_alloc_sysmem allocation.
+// gpu_dma_alloc allocation.
 //
 // Writes a freshly-allocated 48-byte context pointer through out_ctx_ptr.
 // Pages are zero-filled.
@@ -147,30 +144,34 @@ fn _ih_read32(uint64 bar5_host, uint64 reg_dw) -> uint64 {
 //   1 ring0 iova not 256-KiB-aligned (low 18 bits set).
 //   2 ring1 iova not 256-KiB-aligned.
 //   3 rwptr iova not 4-KiB-aligned.
-//   4 ring0 alloc failed (return code from pci_alloc_sysmem_at_iova).
+//   4 ring0 alloc failed (return code from gpu_dma_alloc_at).
 //   5 ring1 alloc failed.
 //   6 rwptr alloc failed.
 // =====================================================================
-fn ih_alloc_rings(uint64 ring0_iova, uint64 ring1_iova, uint64 rwptr_iova,
+fn ih_alloc_rings(uint64 dev,
+                  uint64 ring0_iova, uint64 ring1_iova, uint64 rwptr_iova,
                   uint64 out_ctx_ptr) -> uint64 {
     if (ring0_iova & 0x3FFFF) != 0 { return 1 }
     if (ring1_iova & 0x3FFFF) != 0 { return 2 }
     if (rwptr_iova & 0xFFF)   != 0 { return 3 }
 
     uint64 hp0 = alloc(8); unsafe { *(hp0 as uint64) = 0 }
-    uint64 e0 = pci_alloc_sysmem_at_iova(IH_RING_SIZE_BYTES, ring0_iova, hp0)
+    uint64 e0 = gpu_dma_alloc_at(dev, IH_RING_SIZE_BYTES, ring0_iova,
+                                  GPU_DMA_UNCACHED, hp0)
     if e0 != 0 { dealloc(hp0); return 4 }
     uint64 ring0_host = 0; unsafe { *(hp0 as uint64) -> ring0_host }
     dealloc(hp0)
 
     uint64 hp1 = alloc(8); unsafe { *(hp1 as uint64) = 0 }
-    uint64 e1 = pci_alloc_sysmem_at_iova(IH_RING_SIZE_BYTES, ring1_iova, hp1)
+    uint64 e1 = gpu_dma_alloc_at(dev, IH_RING_SIZE_BYTES, ring1_iova,
+                                  GPU_DMA_UNCACHED, hp1)
     if e1 != 0 { dealloc(hp1); return 5 }
     uint64 ring1_host = 0; unsafe { *(hp1 as uint64) -> ring1_host }
     dealloc(hp1)
 
     uint64 hpw = alloc(8); unsafe { *(hpw as uint64) = 0 }
-    uint64 ew = pci_alloc_sysmem_at_iova(IH_RWPTR_PAGE_BYTES, rwptr_iova, hpw)
+    uint64 ew = gpu_dma_alloc_at(dev, IH_RWPTR_PAGE_BYTES, rwptr_iova,
+                                  GPU_DMA_UNCACHED, hpw)
     if ew != 0 { dealloc(hpw); return 6 }
     uint64 rwptr_host = 0; unsafe { *(hpw as uint64) -> rwptr_host }
     dealloc(hpw)
@@ -217,38 +218,38 @@ fn ih_alloc_rings(uint64 ring0_iova, uint64 ring1_iova, uint64 rwptr_iova,
 //   1 IH_RB_CNTL readback after enable != written value (wedge / wrong base).
 //   2 readback returned 0xFFFFFFFF (suspected total wedge).
 // =====================================================================
-fn ih_init_rings(uint64 bar5_host, uint64 ih_ctx) -> uint64 {
+fn ih_init_rings(uint64 dev, uint64 ih_ctx) -> uint64 {
     uint64 ring0_iova = 0; unsafe { *((ih_ctx + IH_CTX_OFF_RING0_IOVA) as uint64) -> ring0_iova }
     uint64 ring1_iova = 0; unsafe { *((ih_ctx + IH_CTX_OFF_RING1_IOVA) as uint64) -> ring1_iova }
     uint64 rwptr_iova = 0; unsafe { *((ih_ctx + IH_CTX_OFF_RWPTR_IOVA) as uint64) -> rwptr_iova }
 
     // CNTL2: clear (no client-debug). Matches tinygrad init pre-step.
-    _ih_write32(bar5_host, IH_REG_CNTL2, 0)
+    _ih_write32(dev, IH_REG_CNTL2, 0)
 
     // ---- Ring 0 ----
     // IH_RB_BASE holds paddr[39:8]. IH_RB_BASE_HI holds paddr[47:40].
     uint64 base0_lo = (ring0_iova >> 8) & 0xFFFFFFFF
     uint64 base0_hi = (ring0_iova >> 40) & 0xFF
-    _ih_write32(bar5_host, IH_REG_RB_BASE,    base0_lo)
-    _ih_write32(bar5_host, IH_REG_RB_BASE_HI, base0_hi)
+    _ih_write32(dev, IH_REG_RB_BASE,    base0_lo)
+    _ih_write32(dev, IH_REG_RB_BASE_HI, base0_hi)
 
     // wptr writeback: IH writes the wptr dword to this paddr periodically.
     // Software can poll *rwptr_host[0] to detect entries without MMIO read.
     uint64 rwptr_lo = rwptr_iova & 0xFFFFFFFF
     uint64 rwptr_hi = (rwptr_iova >> 32) & 0xFFFFFFFF
-    _ih_write32(bar5_host, IH_REG_RB_WPTR_ADDR_LO, rwptr_lo)
-    _ih_write32(bar5_host, IH_REG_RB_WPTR_ADDR_HI, rwptr_hi)
+    _ih_write32(dev, IH_REG_RB_WPTR_ADDR_LO, rwptr_lo)
+    _ih_write32(dev, IH_REG_RB_WPTR_ADDR_HI, rwptr_hi)
 
-    _ih_write32(bar5_host, IH_REG_RB_RPTR, 0)
-    _ih_write32(bar5_host, IH_REG_RB_WPTR, 0)
+    _ih_write32(dev, IH_REG_RB_RPTR, 0)
+    _ih_write32(dev, IH_REG_RB_WPTR, 0)
 
     // No doorbell — disable.
-    _ih_write32(bar5_host, IH_REG_DOORBELL_RPTR, 0)
+    _ih_write32(dev, IH_REG_DOORBELL_RPTR, 0)
 
-    _ih_write32(bar5_host, IH_REG_RB_CNTL, IH_RB_CNTL_VAL_RING0)
+    _ih_write32(dev, IH_REG_RB_CNTL, IH_RB_CNTL_VAL_RING0)
 
     // Readback fence on ring0 CNTL — confirms HW accepted the value.
-    uint64 rb0 = _ih_read32(bar5_host, IH_REG_RB_CNTL)
+    uint64 rb0 = _ih_read32(dev, IH_REG_RB_CNTL)
     if rb0 == 0xFFFFFFFF { return 2 }
     // Mask out WPTR_OVERFLOW_CLEAR — HW may clear it after the write.
     uint64 mask = 0xFFFFFFFF
@@ -258,18 +259,18 @@ fn ih_init_rings(uint64 bar5_host, uint64 ih_ctx) -> uint64 {
     // ---- Ring 1 ----
     uint64 base1_lo = (ring1_iova >> 8) & 0xFFFFFFFF
     uint64 base1_hi = (ring1_iova >> 40) & 0xFF
-    _ih_write32(bar5_host, IH_REG_RB_BASE_RING1,    base1_lo)
-    _ih_write32(bar5_host, IH_REG_RB_BASE_HI_RING1, base1_hi)
-    _ih_write32(bar5_host, IH_REG_RB_RPTR_RING1, 0)
-    _ih_write32(bar5_host, IH_REG_RB_WPTR_RING1, 0)
-    _ih_write32(bar5_host, IH_REG_DOORBELL_RPTR_RING1, 0)
-    _ih_write32(bar5_host, IH_REG_RB_CNTL_RING1, IH_RB_CNTL_VAL_RING1)
+    _ih_write32(dev, IH_REG_RB_BASE_RING1,    base1_lo)
+    _ih_write32(dev, IH_REG_RB_BASE_HI_RING1, base1_hi)
+    _ih_write32(dev, IH_REG_RB_RPTR_RING1, 0)
+    _ih_write32(dev, IH_REG_RB_WPTR_RING1, 0)
+    _ih_write32(dev, IH_REG_DOORBELL_RPTR_RING1, 0)
+    _ih_write32(dev, IH_REG_RB_CNTL_RING1, IH_RB_CNTL_VAL_RING1)
 
     // ---- Globals ----
-    _ih_write32(bar5_host, IH_REG_CNTL, IH_CNTL_VAL)
-    _ih_write32(bar5_host, IH_REG_STORM_CLIENT_LIST_CNTL, IH_STORM_CLIENT_LIST_CNTL_VAL)
-    _ih_write32(bar5_host, IH_REG_INT_FLOOD_CNTL, IH_INT_FLOOD_CNTL_VAL)
-    _ih_write32(bar5_host, IH_REG_MSI_STORM_CTRL, IH_MSI_STORM_CTRL_VAL)
+    _ih_write32(dev, IH_REG_CNTL, IH_CNTL_VAL)
+    _ih_write32(dev, IH_REG_STORM_CLIENT_LIST_CNTL, IH_STORM_CLIENT_LIST_CNTL_VAL)
+    _ih_write32(dev, IH_REG_INT_FLOOD_CNTL, IH_INT_FLOOD_CNTL_VAL)
+    _ih_write32(dev, IH_REG_MSI_STORM_CTRL, IH_MSI_STORM_CTRL_VAL)
 
     return 0
 }
@@ -279,16 +280,16 @@ fn ih_init_rings(uint64 bar5_host, uint64 ih_ctx) -> uint64 {
 // (via ih_disable) before calling — pages still mapped to live ring
 // pointers will fault on subsequent IH writes.
 // =====================================================================
-fn ih_free_rings(uint64 ih_ctx) {
+fn ih_free_rings(uint64 dev, uint64 ih_ctx) {
     uint64 ring0_host = 0; unsafe { *((ih_ctx + IH_CTX_OFF_RING0_HOST) as uint64) -> ring0_host }
     uint64 ring0_iova = 0; unsafe { *((ih_ctx + IH_CTX_OFF_RING0_IOVA) as uint64) -> ring0_iova }
     uint64 ring1_host = 0; unsafe { *((ih_ctx + IH_CTX_OFF_RING1_HOST) as uint64) -> ring1_host }
     uint64 ring1_iova = 0; unsafe { *((ih_ctx + IH_CTX_OFF_RING1_IOVA) as uint64) -> ring1_iova }
     uint64 rwptr_host = 0; unsafe { *((ih_ctx + IH_CTX_OFF_RWPTR_HOST) as uint64) -> rwptr_host }
     uint64 rwptr_iova = 0; unsafe { *((ih_ctx + IH_CTX_OFF_RWPTR_IOVA) as uint64) -> rwptr_iova }
-    pci_free_sysmem(rwptr_host, rwptr_iova, IH_RWPTR_PAGE_BYTES)
-    pci_free_sysmem(ring1_host, ring1_iova, IH_RING_SIZE_BYTES)
-    pci_free_sysmem(ring0_host, ring0_iova, IH_RING_SIZE_BYTES)
+    gpu_dma_free(dev, rwptr_host, rwptr_iova, IH_RWPTR_PAGE_BYTES)
+    gpu_dma_free(dev, ring1_host, ring1_iova, IH_RING_SIZE_BYTES)
+    gpu_dma_free(dev, ring0_host, ring0_iova, IH_RING_SIZE_BYTES)
     dealloc(ih_ctx)
 }
 
@@ -297,10 +298,10 @@ fn ih_free_rings(uint64 ih_ctx) {
 // ring buffers, or to quiesce IH after SoS becomes alive (PSP/SOS
 // typically wants to take over IH itself once it's running).
 // =====================================================================
-fn ih_disable(uint64 bar5_host) {
+fn ih_disable(uint64 dev) {
     // Clear RB_ENABLE (bit 0) on both rings.
-    _ih_write32(bar5_host, IH_REG_RB_CNTL, 0)
-    _ih_write32(bar5_host, IH_REG_RB_CNTL_RING1, 0)
+    _ih_write32(dev, IH_REG_RB_CNTL, 0)
+    _ih_write32(dev, IH_REG_RB_CNTL_RING1, 0)
 }
 
 // =====================================================================
@@ -333,16 +334,16 @@ fn _ih_print_hex32(uint64 lab, uint64 ll, uint64 v) {
     puts(b); dealloc(b)
 }
 
-fn ih_dump_state(uint64 bar5_host) {
-    uint64 cntl0 = _ih_read32(bar5_host, IH_REG_RB_CNTL)
-    uint64 base0 = _ih_read32(bar5_host, IH_REG_RB_BASE)
-    uint64 bhi0  = _ih_read32(bar5_host, IH_REG_RB_BASE_HI)
-    uint64 rptr0 = _ih_read32(bar5_host, IH_REG_RB_RPTR)
-    uint64 wptr0 = _ih_read32(bar5_host, IH_REG_RB_WPTR)
-    uint64 cntl1 = _ih_read32(bar5_host, IH_REG_RB_CNTL_RING1)
-    uint64 ihcn  = _ih_read32(bar5_host, IH_REG_CNTL)
-    uint64 strm  = _ih_read32(bar5_host, IH_REG_STORM_CLIENT_LIST_CNTL)
-    uint64 flood = _ih_read32(bar5_host, IH_REG_INT_FLOOD_CNTL)
+fn ih_dump_state(uint64 dev) {
+    uint64 cntl0 = _ih_read32(dev, IH_REG_RB_CNTL)
+    uint64 base0 = _ih_read32(dev, IH_REG_RB_BASE)
+    uint64 bhi0  = _ih_read32(dev, IH_REG_RB_BASE_HI)
+    uint64 rptr0 = _ih_read32(dev, IH_REG_RB_RPTR)
+    uint64 wptr0 = _ih_read32(dev, IH_REG_RB_WPTR)
+    uint64 cntl1 = _ih_read32(dev, IH_REG_RB_CNTL_RING1)
+    uint64 ihcn  = _ih_read32(dev, IH_REG_CNTL)
+    uint64 strm  = _ih_read32(dev, IH_REG_STORM_CLIENT_LIST_CNTL)
+    uint64 flood = _ih_read32(dev, IH_REG_INT_FLOOD_CNTL)
     _ih_print_hex32("IH_RB_CNTL",          10, cntl0)
     _ih_print_hex32("IH_RB_BASE",          10, base0)
     _ih_print_hex32("IH_RB_BASE_HI",       13, bhi0)

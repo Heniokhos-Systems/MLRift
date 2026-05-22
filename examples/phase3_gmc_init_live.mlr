@@ -5,7 +5,7 @@
 // sudo run + commit based on the actual outcome.
 //
 // Sequence:
-//   1. pci_open + map BAR5 + bus master.
+//   1. gpu_open + map BAR5 + bus master.
 //   2. Allocate GART pages (PD0 + PT) via gmc_alloc_page_table.
 //   3. Allocate the PSP staging buffer (1 MiB, 1-MiB aligned) via
 //      psp_alloc_fw_buf — this is what we'll point GART at.
@@ -15,7 +15,7 @@
 //   7. gmc_readback_sanity for visibility.
 //   8. Cleanup.
 
-import "../std/pcidev.mlr"
+import "../std/gpudev.mlr"
 import "../std/amdgpu_ip_discovery.mlr"
 import "../std/gmc.mlr"
 import "../std/psp.mlr"
@@ -79,21 +79,27 @@ fn main() {
     puts("phase3_gmc_init_live (LIVE GMC GART)")
 
     // 1) Open device, map BAR5, enable Bus Master, load IP bases.
-    uint64 oe = pci_open("0000:03:00.0", 14)
-    if oe != 0 { _dec("FAIL pci_open", 13, oe); exit(1) }
+    uint64 dev = gpu_open("0000:03:00.0")
+    if dev == GPU_HANDLE_INVALID { _dec("FAIL gpu_open", 13, 1); exit(1) }
     amdgpu_load_navi32_bases()
-    uint64 bar5 = pci_map_bar(PCI_BAR5_REGION_INDEX)
-    if bar5 == PCI_MAP_FAILED_SENTINEL { puts("FAIL BAR5 mmap"); pci_close(); exit(2) }
-    uint64 bme = pci_set_bus_master()
-    if bme != 0 { _dec("FAIL set_bus_master", 19, bme); pci_close(); exit(3) }
+    gpu_load_ip_bases_explicit(dev,
+        amdgpu_ip_gc_base_0, amdgpu_ip_gc_base_1,
+        amdgpu_ip_mmhub_base_0, amdgpu_ip_mp0_base_0,
+        amdgpu_ip_mp1_base_0, amdgpu_ip_oss_base_0,
+        amdgpu_ip_nbio_base_0, amdgpu_ip_hdp_base_0)
+
+    uint64 bar5 = gpu_map_bar(dev, GPU_BAR_REGISTERS)
+    if bar5 == GPU_VA_INVALID { puts("FAIL BAR5 mmap"); gpu_close(dev); exit(2) }
+    uint64 bme = gpu_bus_master_enable(dev)
+    if bme != 0 { _dec("FAIL bus_master_enable", 22, bme); gpu_close(dev); exit(3) }
     _hex32("bar5_host_lo", 12, bar5 & 0xFFFFFFFF)
 
     // 2) Allocate the 2-page GART (PD0 + PT).
     uint64 pp = alloc(8); unsafe { *(pp as uint64) = 0 }
-    uint64 pe = gmc_alloc_page_table(pp)
+    uint64 pe = gmc_alloc_page_table(dev, pp)
     if pe != 0 {
         _dec("FAIL gmc_alloc_page_table", 24, pe)
-        dealloc(pp); pci_close(); exit(4)
+        dealloc(pp); gpu_close(dev); exit(4)
     }
     uint64 pt_ctx = 0; unsafe { *(pp as uint64) -> pt_ctx }
     dealloc(pp)
@@ -105,11 +111,11 @@ fn main() {
     // 3) Allocate the PSP 1 MiB buffer.
     uint64 hp = alloc(8); unsafe { *(hp as uint64) = 0 }
     uint64 gp = alloc(8); unsafe { *(gp as uint64) = 0 }
-    uint64 pae = psp_alloc_fw_buf(hp, gp)
+    uint64 pae = psp_alloc_fw_buf(dev, hp, gp)
     if pae != 0 {
         _dec("FAIL psp_alloc_fw_buf", 21, pae)
-        gmc_page_table_free(pt_ctx)
-        dealloc(hp); dealloc(gp); pci_close(); exit(5)
+        gmc_page_table_free(dev, pt_ctx)
+        dealloc(hp); dealloc(gp); gpu_close(dev); exit(5)
     }
     uint64 buf_iova = 0; unsafe { *(gp as uint64) -> buf_iova }
     uint64 buf_host = 0; unsafe { *(hp as uint64) -> buf_host }
@@ -119,13 +125,14 @@ fn main() {
     // 4) Allocate a 4 KiB scratch page for SYSTEM_APERTURE_DEFAULT_ADDR.
     uint64 sp = alloc(8); unsafe { *(sp as uint64) = 0 }
     uint64 sg = alloc(8); unsafe { *(sg as uint64) = 0 }
-    uint64 sae = pci_alloc_sysmem_aligned(4096, 4096, sp, sg)
+    uint64 sae = gpu_dma_alloc_aligned(dev, 4096, 4096, GPU_DMA_CACHED, sp, sg)
     if sae != 0 {
         _dec("FAIL scratch alloc", 18, sae)
-        psp_free_fw_buf(buf_host, buf_iova)
-        gmc_page_table_free(pt_ctx)
-        dealloc(sp); dealloc(sg); pci_close(); exit(6)
+        psp_free_fw_buf(dev, buf_host, buf_iova)
+        gmc_page_table_free(dev, pt_ctx)
+        dealloc(sp); dealloc(sg); gpu_close(dev); exit(6)
     }
+    uint64 scratch_host = 0; unsafe { *(sp as uint64) -> scratch_host }
     uint64 scratch_iova = 0; unsafe { *(sg as uint64) -> scratch_iova }
     dealloc(sp); dealloc(sg)
 
@@ -133,10 +140,10 @@ fn main() {
     uint64 me = gmc_map(pt_ctx, 0x100000, buf_iova, 0x100000)
     if me != 0 {
         _dec("FAIL gmc_map", 12, me)
-        pci_free_sysmem(0, scratch_iova, 4096)
-        psp_free_fw_buf(buf_host, buf_iova)
-        gmc_page_table_free(pt_ctx)
-        pci_close(); exit(7)
+        gpu_dma_free(dev, scratch_host, scratch_iova, 4096)
+        psp_free_fw_buf(dev, buf_host, buf_iova)
+        gmc_page_table_free(dev, pt_ctx)
+        gpu_close(dev); exit(7)
     }
     _hex32("mc_va_base",   10, 0x100000)
     _hex32("mc_va_size",   10, 0x100000)
@@ -144,13 +151,13 @@ fn main() {
 
     // 6) Run the live MMHUB init.
     puts("ABOUT TO WRITE MMHUB GART REGISTERS")
-    uint64 ie = gmc_init_mmhub(bar5, pt_ctx, 0x100000, 0x100000,
+    uint64 ie = gmc_init_mmhub(dev, pt_ctx, 0x100000, 0x100000,
                                 0, 0xFFFF, scratch_iova)
     _dec("gmc_init_mmhub_rc", 17, ie)
 
     // 7) Diagnostic readback regardless of rc.
     puts("--- readback ---")
-    uint64 re = gmc_readback_sanity(bar5)
+    uint64 re = gmc_readback_sanity(dev)
     _dec("readback_rc", 11, re)
 
     // Verdict.
@@ -164,10 +171,10 @@ fn main() {
     }
 
     // 8) Cleanup.
-    pci_free_sysmem(0, scratch_iova, 4096)
-    psp_free_fw_buf(buf_host, buf_iova)
-    gmc_page_table_free(pt_ctx)
-    pci_close()
+    gpu_dma_free(dev, scratch_host, scratch_iova, 4096)
+    psp_free_fw_buf(dev, buf_host, buf_iova)
+    gmc_page_table_free(dev, pt_ctx)
+    gpu_close(dev)
 
     if verdict != 0 { exit(8) }
     exit(0)

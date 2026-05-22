@@ -12,7 +12,7 @@
 //   5. Reports the doorbell map so future ε/ζ/η slices can pick a
 //      doorbell to ring for PM4 dispatch.
 
-import "../std/pcidev.mlr"
+import "../std/gpudev.mlr"
 import "../std/amdgpu_ip_discovery.mlr"
 import "../std/gmc_constants.mlr"
 import "../std/psp.mlr"
@@ -74,41 +74,46 @@ fn _dec(uint64 lab, uint64 ll, uint64 v) {
 
 fn main() {
     puts("phase3_warm_hybrid_explore (ε.0)")
-    uint64 oe = pci_open("0000:03:00.0", 14)
-    if oe != 0 { _dec("FAIL pci_open", 13, oe); exit(1) }
+    uint64 dev = gpu_open("0000:03:00.0")
+    if dev == GPU_HANDLE_INVALID { _dec("FAIL gpu_open", 13, 1); exit(1) }
     amdgpu_load_navi32_bases()
+    gpu_load_ip_bases_explicit(dev,
+        amdgpu_ip_gc_base_0, amdgpu_ip_gc_base_1,
+        amdgpu_ip_mmhub_base_0, amdgpu_ip_mp0_base_0,
+        amdgpu_ip_mp1_base_0, amdgpu_ip_oss_base_0,
+        amdgpu_ip_nbio_base_0, amdgpu_ip_hdp_base_0)
 
-    uint64 bar5 = pci_map_bar(PCI_BAR5_REGION_INDEX)
-    if bar5 == PCI_MAP_FAILED_SENTINEL { puts("FAIL BAR5"); pci_close(); exit(2) }
-    uint64 bar0 = pci_map_bar(PCI_BAR0_REGION_INDEX)
-    if bar0 == PCI_MAP_FAILED_SENTINEL { puts("FAIL BAR0"); pci_close(); exit(3) }
-    uint64 bar2 = pci_map_bar(2)
-    if bar2 == PCI_MAP_FAILED_SENTINEL {
+    uint64 bar5 = gpu_map_bar(dev, GPU_BAR_REGISTERS)
+    if bar5 == GPU_VA_INVALID { puts("FAIL BAR5"); gpu_close(dev); exit(2) }
+    uint64 bar0 = gpu_map_bar(dev, GPU_BAR_VRAM)
+    if bar0 == GPU_VA_INVALID { puts("FAIL BAR0"); gpu_close(dev); exit(3) }
+    uint64 bar2 = gpu_map_bar(dev, GPU_BAR_DOORBELL)
+    if bar2 == GPU_VA_INVALID {
         puts("FAIL BAR2 (doorbell) — vfio may have rejected the mapping")
-        pci_close(); exit(4)
+        gpu_close(dev); exit(4)
     }
 
     _hex32("bar5_host_lo", 12, bar5 & 0xFFFFFFFF)
     _hex32("bar0_host_lo", 12, bar0 & 0xFFFFFFFF)
     _hex32("bar2_host_lo", 12, bar2 & 0xFFFFFFFF)
 
-    uint64 bme = pci_set_bus_master()
-    if bme != 0 { _dec("FAIL pci_set_bus_master", 23, bme); pci_close(); exit(5) }
+    uint64 bme = gpu_bus_master_enable(dev)
+    if bme != 0 { _dec("FAIL gpu_bus_master_enable", 26, bme); gpu_close(dev); exit(5) }
 
     // 1) Verify SOS alive.
     puts("--- SOS warm state ---")
-    uint64 sol = psp_read32(bar5, PSP_REG_C2PMSG_81)
+    uint64 sol = psp_read32(dev, PSP_REG_C2PMSG_81)
     _hex32("C2PMSG_81 (sign-of-life)", 24, sol)
-    _hex32("C2PMSG_58 (sos_fw_ver)",   22, psp_read32(bar5, PSP_REG_C2PMSG_58))
-    _hex32("C2PMSG_69 (ring_base_lo)", 24, psp_read32(bar5, PSP_REG_C2PMSG_69))
-    _hex32("C2PMSG_70 (ring_base_hi)", 24, psp_read32(bar5, PSP_REG_C2PMSG_70))
-    _hex32("C2PMSG_71 (ring_size)",    21, psp_read32(bar5, PSP_REG_C2PMSG_71))
+    _hex32("C2PMSG_58 (sos_fw_ver)",   22, psp_read32(dev, PSP_REG_C2PMSG_58))
+    _hex32("C2PMSG_69 (ring_base_lo)", 24, psp_read32(dev, PSP_REG_C2PMSG_69))
+    _hex32("C2PMSG_70 (ring_base_hi)", 24, psp_read32(dev, PSP_REG_C2PMSG_70))
+    _hex32("C2PMSG_71 (ring_size)",    21, psp_read32(dev, PSP_REG_C2PMSG_71))
     if sol == 0 {
         puts("FAIL: SOS not alive — need amdgpu prime first.")
         puts("  Run: echo amdgpu > /sys/bus/pci/devices/0000:03:00.0/driver_override")
         puts("       then unbind/probe to bring amdgpu up,")
         puts("       then rebind to vfio-pci.")
-        pci_close(); exit(6)
+        gpu_close(dev); exit(6)
     }
 
     // 2) Dump first 16 doorbell entries from BAR2 (each entry is 8 bytes,
@@ -139,14 +144,10 @@ fn main() {
     }
 
     // 3) Read MMHUB current state — confirms amdgpu's GMC config survived FLR.
-    uint64 fb_base_byte = (amdgpu_ip_mmhub_base_0 + regMMMC_VM_FB_LOCATION_BASE) * 4
-    uint32 fb_base_w = 0; unsafe { *((bar5 + fb_base_byte) as uint32) -> fb_base_w }
-    uint64 ctx0_byte = (amdgpu_ip_mmhub_base_0 + regMMVM_CONTEXT0_CNTL) * 4
-    uint32 ctx0_w = 0; unsafe { *((bar5 + ctx0_byte) as uint32) -> ctx0_w }
-    uint64 pt_base_lo_byte = (amdgpu_ip_mmhub_base_0 + regMMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32) * 4
-    uint32 pt_base_lo_w = 0; unsafe { *((bar5 + pt_base_lo_byte) as uint32) -> pt_base_lo_w }
-    uint64 pt_base_hi_byte = (amdgpu_ip_mmhub_base_0 + regMMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_HI32) * 4
-    uint32 pt_base_hi_w = 0; unsafe { *((bar5 + pt_base_hi_byte) as uint32) -> pt_base_hi_w }
+    uint32 fb_base_w = gpu_reg_r32(dev, GPU_IP_MMHUB, regMMMC_VM_FB_LOCATION_BASE)
+    uint32 ctx0_w = gpu_reg_r32(dev, GPU_IP_MMHUB, regMMVM_CONTEXT0_CNTL)
+    uint32 pt_base_lo_w = gpu_reg_r32(dev, GPU_IP_MMHUB, regMMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32)
+    uint32 pt_base_hi_w = gpu_reg_r32(dev, GPU_IP_MMHUB, regMMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_HI32)
 
     puts("--- MMHUB warm state (post-vfio-rebind) ---")
     _hex32("FB_LOCATION_BASE", 16, fb_base_w)
@@ -160,14 +161,14 @@ fn main() {
         puts("  CTX0_CNTL.ENABLE_CONTEXT=0 — GMC walker disabled (warning)")
     }
 
-    pci_close()
+    gpu_close(dev)
 
     puts("=============================================================")
     puts("ε.0 explore: warm-hybrid state inventory complete")
     puts("=============================================================")
     puts("Findings:")
     if sol != 0 { puts("  ✓ SOS alive (C2PMSG_81 ticking)") }
-    if bar2 != PCI_MAP_FAILED_SENTINEL { puts("  ✓ BAR2 (doorbell) maps via vfio") }
+    if bar2 != GPU_VA_INVALID { puts("  ✓ BAR2 (doorbell) maps via vfio") }
     if (ctx0_w & 0x1) != 0 { puts("  ✓ GMC CONTEXT0 active (PT walker live)") }
     puts("")
     puts("Next: ζ slice would map a specific MEC queue's doorbell,")

@@ -1,13 +1,13 @@
 // std/psp.mlr — PSP v13 (gc_11_0_3 / Navi 32) bootloader handshake.
 //
-// Slice δ.1 publishes the read-only and helper surface; the live
-// load_kdb / load_sys_drv / load_sos commands land in δ.2 / δ.3 / δ.4.
+// Phase A.0: ported from raw `bar5_host` to `dev` handle. All MMIO now
+// goes through gpu_reg_r32/w32(dev, GPU_IP_PSP, ...). Allocator uses
+// gpu_dma_alloc_aligned. amdgpu_ip_discovery import removed — the IP
+// base lives in the gpu handle.
 //
 // Register access model (all via BAR5):
-//   byte_off = (amdgpu_ip_mp0_base_0 + reg_dw) * 4
-// where reg_dw is the dword offset published in mp_13_0_*_offset.h.
-// Both mp_13_0_2 (Navi 31) and mp_13_0_6 (MI300) agree on the C2PMSG
-// dword offsets, so we use them for mp_13_0_10 (Navi 32) too.
+//   The PSP base offset is cached in the gpu handle by
+//   gpu_load_ip_bases_*. This module no longer hardcodes it.
 //
 // Critical handshake facts (cross-checked with amdgpu's psp_v13_0.c):
 //   * Bootloader-ready signal:  C2PMSG_35 reads exactly 0x80000000
@@ -22,8 +22,7 @@
 //     (typically 0 → non-zero) after a successful SOSDRV load.
 //   * SOS firmware version after SOS-alive: read C2PMSG_58.
 
-import "pcidev.mlr"
-import "amdgpu_ip_discovery.mlr"
+import "gpudev.mlr"
 import "sys.mlr"
 
 // =====================================================================
@@ -68,20 +67,19 @@ static uint64 PSP_FW_BUF_SIZE            = 0x100000   // 1 MiB
 static uint64 PSP_POLL_BUDGET            = 200000
 
 // =====================================================================
-// Low-level register read/write.
+// Low-level register read/write. Return type stays uint64 (high bits
+// zero) for caller compatibility — every existing caller already
+// upcasts the 32-bit value.
 // =====================================================================
-fn psp_read32(uint64 bar5_host, uint64 reg_dw) -> uint64 {
-    uint64 byte_off = (amdgpu_ip_mp0_base_0 + reg_dw) * 4
-    uint32 v = 0
-    unsafe { *((bar5_host + byte_off) as uint32) -> v }
+fn psp_read32(uint64 dev, uint64 reg_dw) -> uint64 {
+    uint32 v = gpu_reg_r32(dev, GPU_IP_PSP, reg_dw)
     uint64 ret = v
     return ret
 }
 
-fn psp_write32(uint64 bar5_host, uint64 reg_dw, uint64 val) {
-    uint64 byte_off = (amdgpu_ip_mp0_base_0 + reg_dw) * 4
+fn psp_write32(uint64 dev, uint64 reg_dw, uint64 val) {
     uint32 v = val
-    unsafe { *((bar5_host + byte_off) as uint32) = v }
+    gpu_reg_w32(dev, GPU_IP_PSP, reg_dw, v)
 }
 
 // =====================================================================
@@ -90,30 +88,30 @@ fn psp_write32(uint64 bar5_host, uint64 reg_dw, uint64 val) {
 
 // Returns 1 if the bootloader is idle and ready for a command
 // (C2PMSG_35 == 0x80000000 exactly). Returns 0 if busy or in error.
-fn psp_is_bootloader_ready(uint64 bar5_host) -> uint64 {
-    uint64 v = psp_read32(bar5_host, PSP_REG_C2PMSG_35)
+fn psp_is_bootloader_ready(uint64 dev) -> uint64 {
+    uint64 v = psp_read32(dev, PSP_REG_C2PMSG_35)
     if v == PSP_BL_READY { return 1 }
     return 0
 }
 
 // Returns the raw C2PMSG_35 value — useful for error-code inspection
 // (bits [7:0] are non-zero on PSP-side command failure).
-fn psp_bootloader_status_raw(uint64 bar5_host) -> uint64 {
-    return psp_read32(bar5_host, PSP_REG_C2PMSG_35)
+fn psp_bootloader_status_raw(uint64 dev) -> uint64 {
+    return psp_read32(dev, PSP_REG_C2PMSG_35)
 }
 
 // Returns 1 if SOS is up (C2PMSG_81 != 0). Mirrors
 // psp_v13_0_is_sos_alive() from the kernel driver.
-fn psp_is_sos_alive(uint64 bar5_host) -> uint64 {
-    uint64 v = psp_read32(bar5_host, PSP_REG_C2PMSG_81)
+fn psp_is_sos_alive(uint64 dev) -> uint64 {
+    uint64 v = psp_read32(dev, PSP_REG_C2PMSG_81)
     if v != 0 { return 1 }
     return 0
 }
 
 // Returns the SOS firmware version (valid only after psp_is_sos_alive
 // returns 1).
-fn psp_sos_fw_version(uint64 bar5_host) -> uint64 {
-    return psp_read32(bar5_host, PSP_REG_C2PMSG_58)
+fn psp_sos_fw_version(uint64 dev) -> uint64 {
+    return psp_read32(dev, PSP_REG_C2PMSG_58)
 }
 
 // =====================================================================
@@ -135,11 +133,11 @@ fn _psp_msleep(uint64 ms) {
 // Wait for C2PMSG_35 to settle on PSP_BL_READY. Returns 0 on success,
 // 1 on timeout. The bits [7:0] of the LAST read are placed in
 // *out_err_bits if non-NULL (caller can pass 0 to ignore).
-fn psp_wait_for_bootloader(uint64 bar5_host, uint64 out_err_bits) -> uint64 {
+fn psp_wait_for_bootloader(uint64 dev, uint64 out_err_bits) -> uint64 {
     uint64 i = 0
     uint64 last = 0
     while i < PSP_POLL_BUDGET {
-        last = psp_read32(bar5_host, PSP_REG_C2PMSG_35)
+        last = psp_read32(dev, PSP_REG_C2PMSG_35)
         if last == PSP_BL_READY {
             if out_err_bits != 0 { unsafe { *(out_err_bits as uint64) = 0 } }
             return 0
@@ -156,10 +154,10 @@ fn psp_wait_for_bootloader(uint64 bar5_host, uint64 out_err_bits) -> uint64 {
 
 // Wait until C2PMSG_81 changes from `snapshot`. Used after the
 // load_sos cmd. Returns 0 on success, 1 on timeout.
-fn psp_wait_for_sos_alive(uint64 bar5_host, uint64 snapshot) -> uint64 {
+fn psp_wait_for_sos_alive(uint64 dev, uint64 snapshot) -> uint64 {
     uint64 i = 0
     while i < PSP_POLL_BUDGET {
-        uint64 v = psp_read32(bar5_host, PSP_REG_C2PMSG_81)
+        uint64 v = psp_read32(dev, PSP_REG_C2PMSG_81)
         if v != snapshot { return 0 }
         _psp_msleep(1)
         i = i + 1
@@ -168,20 +166,22 @@ fn psp_wait_for_sos_alive(uint64 bar5_host, uint64 snapshot) -> uint64 {
 }
 
 // =====================================================================
-// DMA buffer management.
+// DMA buffer management. Now goes through the gpudev allocator.
 // =====================================================================
 
 // Allocate the 1 MiB PSP firmware staging buffer. 1 MiB aligned at the
 // GPU bus address as required by C2PMSG_36's (>> 20) encoding. Writes
 // (host_va, gpu_va) through the output pointers. Returns the same
-// error codes as pci_alloc_sysmem.
-fn psp_alloc_fw_buf(uint64 out_host_va_ptr, uint64 out_gpu_va_ptr) -> uint64 {
-    return pci_alloc_sysmem_aligned(PSP_FW_BUF_SIZE, PSP_FW_BUF_SIZE,
-                                    out_host_va_ptr, out_gpu_va_ptr)
+// error codes as gpu_dma_alloc_aligned.
+fn psp_alloc_fw_buf(uint64 dev,
+                    uint64 out_host_va_ptr, uint64 out_gpu_va_ptr) -> uint64 {
+    return gpu_dma_alloc_aligned(dev, PSP_FW_BUF_SIZE, PSP_FW_BUF_SIZE,
+                                 GPU_DMA_CACHED,
+                                 out_host_va_ptr, out_gpu_va_ptr)
 }
 
-fn psp_free_fw_buf(uint64 host_va, uint64 gpu_va) {
-    pci_free_sysmem(host_va, gpu_va, PSP_FW_BUF_SIZE)
+fn psp_free_fw_buf(uint64 dev, uint64 host_va, uint64 gpu_va) -> uint64 {
+    return gpu_dma_free(dev, host_va, gpu_va, PSP_FW_BUF_SIZE)
 }
 
 // memset a buffer to zero, byte-by-byte (slow but obviously correct).
@@ -233,7 +233,7 @@ fn psp_copy_blob(uint64 host_buf, uint64 src, uint64 size) {
 //   4 = sub_blob_size exceeds PSP_FW_BUF_SIZE — caller bug.
 //
 // out_err_byte may be 0 to skip writing the error byte.
-fn psp_load_component(uint64 bar5_host,
+fn psp_load_component(uint64 dev,
                       uint64 fw_buf_host_va,
                       uint64 fw_buf_gpu_va,
                       uint64 sub_blob_ptr,
@@ -241,15 +241,15 @@ fn psp_load_component(uint64 bar5_host,
                       uint64 cmd_word,
                       uint64 out_err_byte) -> uint64 {
     if sub_blob_size > PSP_FW_BUF_SIZE { return 4 }
-    if psp_is_sos_alive(bar5_host) != 0 { return 1 }
-    uint64 r1 = psp_wait_for_bootloader(bar5_host, out_err_byte)
+    if psp_is_sos_alive(dev) != 0 { return 1 }
+    uint64 r1 = psp_wait_for_bootloader(dev, out_err_byte)
     if r1 != 0 { return 2 }
     psp_zero_buf(fw_buf_host_va, PSP_FW_BUF_SIZE)
     psp_copy_blob(fw_buf_host_va, sub_blob_ptr, sub_blob_size)
     uint64 addr_word = fw_buf_gpu_va >> 20
-    psp_write32(bar5_host, PSP_REG_C2PMSG_36, addr_word)
-    psp_write32(bar5_host, PSP_REG_C2PMSG_35, cmd_word)
-    uint64 r2 = psp_wait_for_bootloader(bar5_host, out_err_byte)
+    psp_write32(dev, PSP_REG_C2PMSG_36, addr_word)
+    psp_write32(dev, PSP_REG_C2PMSG_35, cmd_word)
+    uint64 r2 = psp_wait_for_bootloader(dev, out_err_byte)
     if r2 != 0 { return 3 }
     return 0
 }

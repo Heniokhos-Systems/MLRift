@@ -1,21 +1,22 @@
 // Phase 3 slice α — VFIO substrate smoke.
 //
 // Replicates /tmp/vfio_probe.c (which is in C) but written entirely in
-// MLRift via std/pcidev.mlr. Proof that the HAL works end-to-end:
+// MLRift via std/gpudev.mlr. Proof that the HAL works end-to-end:
 //
-//   1. Open the VFIO container + group 14 + device 0000:03:00.0.
+//   1. Open the GPU at 0000:03:00.0 (IOMMU group auto-discovered).
 //   2. Walk regions 0-6 and print sizes + flags.
 //   3. mmap BAR5 (MMIO regs) and print the first 16 dwords.
-//   4. pci_alloc_sysmem a 4 KiB buffer (proves IOMMU MAP_DMA works).
+//   4. gpu_dma_alloc a 4 KiB buffer (proves IOMMU MAP_DMA works).
 //   5. Close.
 //
 // Expected output mirrors /tmp/vfio_probe — BAR0=16 GiB, BAR2=256 MiB,
 // BAR5=1 MiB, BAR5[0]=0xfec07ffc with the same structured-data pattern.
 //
-// Requires: sudo (only root can open /dev/vfio/14).
+// Requires: sudo (only root can open /dev/vfio/<group>).
 // Requires: dGPU bound to vfio-pci (see /etc/modprobe.d/vfio-dgpu.conf).
 
 import "../std/pcidev.mlr"
+import "../std/gpudev.mlr"
 import "../std/sys.mlr"
 
 @dynamic extern fn exit(uint64 code)
@@ -87,20 +88,23 @@ fn _print_u64_dec(uint64 label, uint64 lab_len, uint64 val) {
 }
 
 fn main() {
-    // 1) Open the device.
+    // 1) Open the device. BDF only — IOMMU group auto-discovered.
     uint64 bdf = "0000:03:00.0"
-    uint64 e = pci_open(bdf, 14)
-    if e != 0 {
-        uint64 lab1 = "pci_open errno"
-        _print_u64_dec(lab1, 14, e)
+    uint64 dev = gpu_open(bdf)
+    if dev == GPU_HANDLE_INVALID {
+        uint64 lab1 = "gpu_open"
+        _print_u64_dec(lab1, 8, 1)
         uint64 lab2 = "sys_errno"
         _print_u64_dec(lab2, 9, sys_errno_get())
         exit(1)
     }
-    puts("pci_open: OK")
+    puts("gpu_open: OK")
     _print_u64_dec("device_fd", 9, pci_device_fd())
 
-    // 2) Walk regions 0-6 (the BAR + ROM range).
+    // 2) Walk regions 0-6 (the BAR + ROM range). gpu_bar_info doesn't
+    //    expose the mmap offset, so fall back to pci_bar_info for the
+    //    diagnostic dump — this is a legacy module we're allowed to
+    //    keep around for tooling.
     uint64 idx = 0
     while idx < 7 {
         uint64 sb = alloc(24)
@@ -141,10 +145,10 @@ fn main() {
 
     // 3) mmap BAR5 and read first 16 dwords. The C probe showed
     //    BAR5[0]=0xfec07ffc with structured data — we should match.
-    uint64 mmio = pci_map_bar(PCI_BAR5_REGION_INDEX)
-    if mmio == PCI_MAP_FAILED_SENTINEL {
+    uint64 mmio = gpu_map_bar(dev, GPU_BAR_REGISTERS)
+    if mmio == GPU_VA_INVALID {
         puts("FAIL: BAR5 mmap failed")
-        pci_close()
+        gpu_close(dev)
         exit(2)
     }
     _print_u64_hex("BAR5_host", 9, mmio)
@@ -203,12 +207,12 @@ fn main() {
     uint64 gva_ptr = alloc(8)
     unsafe { *(hva_ptr as uint64) = 0 }
     unsafe { *(gva_ptr as uint64) = 0 }
-    uint64 ae = pci_alloc_sysmem(4096, hva_ptr, gva_ptr)
+    uint64 ae = gpu_dma_alloc(dev, 4096, GPU_DMA_CACHED, hva_ptr, gva_ptr)
     if ae != 0 {
-        _print_u64_dec("FAIL pci_alloc_sysmem errno", 27, ae)
+        _print_u64_dec("FAIL gpu_dma_alloc errno", 24, ae)
         _print_u64_dec("  sys_errno", 11, sys_errno_get())
         dealloc(hva_ptr); dealloc(gva_ptr)
-        pci_close()
+        gpu_close(dev)
         exit(3)
     }
     uint64 hva = 0; unsafe { *(hva_ptr as uint64) -> hva }
@@ -225,10 +229,9 @@ fn main() {
     unsafe { *(hva as uint32) -> read_back }
     _print_u64_hex("sysmem sentinel readback", 24, read_back)
 
-    // Cleanup.
-    pci_free_sysmem(hva, gva, 4096)
-    sys_munmap(mmio, 0x100000)
-    pci_close()
+    // Cleanup. gpu_close handles BAR unmaps automatically.
+    gpu_dma_free(dev, hva, gva, 4096)
+    gpu_close(dev)
     puts("phase3_vfio_substrate_smoke: GREEN")
     exit(0)
 }

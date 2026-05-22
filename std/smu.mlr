@@ -24,13 +24,12 @@
 //   mmMP1_SMN_C2PMSG_82 = 0x0292    // Argument / parameter
 //   mmMP1_SMN_C2PMSG_90 = 0x029A    // Response (0 = idle/in-flight)
 //
-// Register access model (BAR5):
-//   byte_off = (amdgpu_ip_mp1_base_0 + reg_dw) * 4
-// where amdgpu_ip_mp1_base_0 = 0x00016000 on Navi 32 (same aperture as
-// MP0 — they share base_0 on this chip).
+// Register access goes through gpu_reg_r32/w32(dev, GPU_IP_SMU, ...).
+// The MP1 base offset is cached in the gpu handle.
+//
+// Phase A.0: ported from `dev` to `dev` handle.
 
-import "pcidev.mlr"
-import "amdgpu_ip_discovery.mlr"
+import "gpudev.mlr"
 import "sys.mlr"
 
 // =====================================================================
@@ -58,29 +57,26 @@ static uint64 SMU_RESP_POLL_BUDGET = 100000
 // =====================================================================
 // Low-level read/write.
 // =====================================================================
-fn smu_read32(uint64 bar5_host, uint64 reg_dw) -> uint64 {
-    uint64 byte_off = (amdgpu_ip_mp1_base_0 + reg_dw) * 4
-    uint32 v = 0
-    unsafe { *((bar5_host + byte_off) as uint32) -> v }
+fn smu_read32(uint64 dev, uint64 reg_dw) -> uint64 {
+    uint32 v = gpu_reg_r32(dev, GPU_IP_SMU, reg_dw)
     uint64 ret = v
     return ret
 }
 
-fn smu_write32(uint64 bar5_host, uint64 reg_dw, uint64 val) {
-    uint64 byte_off = (amdgpu_ip_mp1_base_0 + reg_dw) * 4
+fn smu_write32(uint64 dev, uint64 reg_dw, uint64 val) {
     uint32 v = val
-    unsafe { *((bar5_host + byte_off) as uint32) = v }
+    gpu_reg_w32(dev, GPU_IP_SMU, reg_dw, v)
 }
 
 // =====================================================================
 // smu_msg_state — peek the three mailbox regs without writing.
 // Writes through three out-pointers. Safe to call at any time.
 // =====================================================================
-fn smu_msg_state(uint64 bar5_host,
+fn smu_msg_state(uint64 dev,
                  uint64 out_msg, uint64 out_arg, uint64 out_resp) {
-    uint64 m = smu_read32(bar5_host, SMU_REG_C2PMSG_66)
-    uint64 a = smu_read32(bar5_host, SMU_REG_C2PMSG_82)
-    uint64 r = smu_read32(bar5_host, SMU_REG_C2PMSG_90)
+    uint64 m = smu_read32(dev, SMU_REG_C2PMSG_66)
+    uint64 a = smu_read32(dev, SMU_REG_C2PMSG_82)
+    uint64 r = smu_read32(dev, SMU_REG_C2PMSG_90)
     unsafe { *(out_msg  as uint64) = m }
     unsafe { *(out_arg  as uint64) = a }
     unsafe { *(out_resp as uint64) = r }
@@ -94,11 +90,11 @@ fn smu_msg_state(uint64 bar5_host,
 //   0  response arrived (writes raw code through out_resp_ptr).
 //   1  timeout (out_resp_ptr written with last read value).
 // =====================================================================
-fn smu_wait_response(uint64 bar5_host, uint64 out_resp_ptr) -> uint64 {
+fn smu_wait_response(uint64 dev, uint64 out_resp_ptr) -> uint64 {
     uint64 i = 0
     uint64 last = 0
     while i < SMU_RESP_POLL_BUDGET {
-        last = smu_read32(bar5_host, SMU_REG_C2PMSG_90)
+        last = smu_read32(dev, SMU_REG_C2PMSG_90)
         if last != 0 {
             unsafe { *(out_resp_ptr as uint64) = last }
             return 0
@@ -124,7 +120,7 @@ fn smu_wait_response(uint64 bar5_host, uint64 out_resp_ptr) -> uint64 {
 //   4. Poll C2PMSG_90 for non-zero.
 //
 // Inputs:
-//   bar5_host    Host VA of BAR5 mmap.
+//   dev    Host VA of BAR5 mmap.
 //   msg_id       PPSMC_MSG_* numeric ID.
 //   arg          Argument / parameter (uint32).
 //   out_resp     Destination for the raw response code. Always written.
@@ -135,12 +131,12 @@ fn smu_wait_response(uint64 bar5_host, uint64 out_resp_ptr) -> uint64 {
 //   2  SMU returned a non-OK code (caller can inspect *out_resp for
 //      detail — e.g. SMU_RESP_UNKNOWN_CMD = unsupported message ID).
 // =====================================================================
-fn smu_send_msg(uint64 bar5_host, uint64 msg_id, uint64 arg,
+fn smu_send_msg(uint64 dev, uint64 msg_id, uint64 arg,
                 uint64 out_resp_ptr) -> uint64 {
-    smu_write32(bar5_host, SMU_REG_C2PMSG_90, 0)
-    smu_write32(bar5_host, SMU_REG_C2PMSG_82, arg)
-    smu_write32(bar5_host, SMU_REG_C2PMSG_66, msg_id)
-    uint64 wr = smu_wait_response(bar5_host, out_resp_ptr)
+    smu_write32(dev, SMU_REG_C2PMSG_90, 0)
+    smu_write32(dev, SMU_REG_C2PMSG_82, arg)
+    smu_write32(dev, SMU_REG_C2PMSG_66, msg_id)
+    uint64 wr = smu_wait_response(dev, out_resp_ptr)
     if wr != 0 { return 1 }
     uint64 resp = 0
     unsafe { *(out_resp_ptr as uint64) -> resp }
@@ -178,10 +174,10 @@ fn _smu_print_hex32(uint64 lab, uint64 ll, uint64 v) {
 
 // Read+dump the three mailbox regs. Useful between phases to see SMU
 // inflight state without disturbing anything.
-fn smu_dump_mailbox(uint64 bar5_host) {
-    uint64 m = smu_read32(bar5_host, SMU_REG_C2PMSG_66)
-    uint64 a = smu_read32(bar5_host, SMU_REG_C2PMSG_82)
-    uint64 r = smu_read32(bar5_host, SMU_REG_C2PMSG_90)
+fn smu_dump_mailbox(uint64 dev) {
+    uint64 m = smu_read32(dev, SMU_REG_C2PMSG_66)
+    uint64 a = smu_read32(dev, SMU_REG_C2PMSG_82)
+    uint64 r = smu_read32(dev, SMU_REG_C2PMSG_90)
     _smu_print_hex32("MP1_C2PMSG_66_msg",  17, m)
     _smu_print_hex32("MP1_C2PMSG_82_arg",  17, a)
     _smu_print_hex32("MP1_C2PMSG_90_resp", 18, r)
