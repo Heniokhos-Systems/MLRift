@@ -1,0 +1,492 @@
+// Phase 3 slice κ.1 — DRAM_LONG_TRAIN with CORRECT C2PMSG_36 buffer offset.
+//
+// Lead from η.3j-RE-3 + amdgpu psp_v13_0.c source audit (2026-05-21):
+//   amdgpu_psp.c:psp_sw_init() unconditionally calls
+//     psp_mem_training(psp, PSP_MEM_TRAIN_COLD_BOOT)
+//   which writes PSP_BL__DRAM_LONG_TRAIN (= 0x100000) to MP0_C2PMSG_35
+//   and polls for bit 31 set (3 second timeout). This runs BEFORE the
+//   BL chain (LOAD_KDB, ..., LOAD_SOSDRV) in psp_hw_init.
+//
+//   Our previous BL chain (KDB → SOC_DRV → INTF_DRV → DBG_DRV → SOSDRV)
+//   has never issued DRAM_LONG_TRAIN. Matches our η.3d-i finding that
+//   RCC_CONFIG_MEMSIZE = 0 after the BL chain — the PSP never trained
+//   DRAM because we never asked it to. This is the missing handshake.
+//
+// Strategy: clone η.3i (full MMHUB replay + BL chain GREEN), then after
+//   step 5 (LOAD_DBGDRV) but BEFORE LOAD_SOSDRV, issue DRAM_LONG_TRAIN:
+//     1. Wait C2PMSG_35 == 0x80000000 (BL idle).
+//     2. Write c2p_train_data_offset>>20 to C2PMSG_36 (training buffer
+//        location in VRAM; required for BOTH long/short per psp_v13_0.c).
+//        For 16 GiB VRAM with ~32 MiB reserve: 0x3FE000000>>20 = 0x3FE0.
+//     3. Write 0x100000 to C2PMSG_35 (PSP_BL__DRAM_LONG_TRAIN).
+//     4. Poll C2PMSG_35 for bit 31 set for up to 3 seconds (the
+//        MEM_TRAIN_SEND_MSG_TIMEOUT_US from kernel driver).
+//     5. Read RCC_CONFIG_MEMSIZE — expect non-zero post-train.
+//
+// THEN proceed with LOAD_SOSDRV as normal.
+//
+// Risk: PSP may try to dereference the training context at addr 0 and
+//   wedge (cold cycle required). If we get rc != 0 or no ack within 3s,
+//   bail out and report — we'll then build a sysmem training-context
+//   buffer in η.3k-2.
+//
+// WEDGE-CAPABLE.
+
+import "../std/pcidev.mlr"
+import "../std/amdgpu_ip_discovery.mlr"
+import "../std/amdgpu_firmware.mlr"
+import "../std/gmc.mlr"
+import "../std/gmc_constants.mlr"
+import "../std/nbio.mlr"
+import "../std/psp.mlr"
+import "../std/sys.mlr"
+
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn puts(uint64 s) -> uint32
+
+// PSP_BL__DRAM_LONG_TRAIN — from amdgpu_psp.h:80
+static uint64 PSP_BL_DRAM_LONG_TRAIN  = 0x00100000
+static uint64 PSP_BL_DRAM_SHORT_TRAIN = 0x00200000
+// MBOX_READY_MASK in amdgpu psp_v13_0.c — bit 31 set = BL ack.
+static uint64 MBOX_READY_MASK         = 0x80000000
+
+fn _hex32(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(96)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint8 zx = 48; unsafe { *((b + ll + 1) as uint8) = zx }
+    uint8 xc = 120; unsafe { *((b + ll + 2) as uint8) = xc }
+    uint64 j = 0
+    while j < 8 {
+        uint64 sh = (7 - j) * 4
+        uint64 nyb = (v >> sh) & 0xF
+        uint8 ch = nyb + 48
+        if nyb >= 10 { ch = nyb + 87 }
+        unsafe { *((b + ll + 3 + j) as uint8) = ch }
+        j = j + 1
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 11) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+fn _dec(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(96)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint64 digits = 0
+    if v == 0 {
+        uint8 z = 48; unsafe { *((b + ll + 1) as uint8) = z }; digits = 1
+    } else {
+        uint64 t = v
+        while t > 0 { digits = digits + 1; t = t / 10 }
+        uint64 k = digits
+        t = v
+        while k > 0 {
+            k = k - 1
+            uint64 d = t - (t / 10) * 10
+            uint8 db = d + 48
+            unsafe { *((b + ll + 1 + k) as uint8) = db }
+            t = t / 10
+        }
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 1 + digits) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+// In η.3k-1 we KEEP amdgpu's MMHUB setup (same as η.3i).
+fn _replay_should_skip(uint64 offset) -> uint64 {
+    if offset >= 0x4480 { if offset <= 0x44cf { return 1 } }
+    if offset == 0x58190 { return 1 }
+    if offset == 0x5818c { return 1 }
+    if offset == 0x6A3C4 { return 1 }
+    if offset == 0x6A360 { return 1 }
+    if offset == 0x6A364 { return 1 }
+    return 0
+}
+
+fn _replay_apply(uint64 bar5, uint64 blob_buf, uint64 blob_size,
+                 uint64 out_applied, uint64 out_skipped) {
+    if blob_size < 4 {
+        unsafe { *(out_applied as uint64) = 0 }
+        unsafe { *(out_skipped as uint64) = 0 }
+        return
+    }
+    uint32 n_raw = 0
+    unsafe { *(blob_buf as uint32) -> n_raw }
+    uint64 n = n_raw
+    uint64 applied = 0
+    uint64 skipped = 0
+    uint64 i = 0
+    while i < n {
+        uint64 ent_off = 4 + i * 8
+        if ent_off + 8 > blob_size { return }
+        uint32 raw_off = 0
+        uint32 raw_val = 0
+        unsafe { *((blob_buf + ent_off + 0) as uint32) -> raw_off }
+        unsafe { *((blob_buf + ent_off + 4) as uint32) -> raw_val }
+        uint64 offset = raw_off
+        uint64 value  = raw_val
+        if _replay_should_skip(offset) == 1 {
+            skipped = skipped + 1
+        } else {
+            uint32 v32 = value
+            unsafe { *((bar5 + offset) as uint32) = v32 }
+            applied = applied + 1
+        }
+        i = i + 1
+    }
+    unsafe { *(out_applied as uint64) = applied }
+    unsafe { *(out_skipped as uint64) = skipped }
+}
+
+fn _load_one(uint64 step_label,
+             uint64 fw_buf, uint64 fw_sz, uint64 fw_type,
+             uint64 cmd_word,
+             uint64 bar5, uint64 buf_host, uint64 buf_iova) -> uint64 {
+    puts(step_label)
+    uint64 lp = alloc(16)
+    unsafe { *((lp + 0) as uint64) = 0 }
+    unsafe { *((lp + 8) as uint64) = 0 }
+    uint64 fr = psp_v2_find(fw_buf, fw_sz, fw_type, lp + 0, lp + 8)
+    if fr != 0 {
+        _dec("  psp_v2_find_rc", 16, fr)
+        dealloc(lp); return 99
+    }
+    uint64 rel_off = 0; unsafe { *((lp + 0) as uint64) -> rel_off }
+    uint64 sub_sz  = 0; unsafe { *((lp + 8) as uint64) -> sub_sz }
+    dealloc(lp)
+    uint64 uaob = fw_ucode_array_offset_bytes(fw_buf)
+    uint64 sub_ptr = fw_buf + uaob + rel_off
+    _dec("  sub_blob_size", 15, sub_sz)
+
+    uint64 errp = alloc(8); unsafe { *(errp as uint64) = 0 }
+    uint64 rc = psp_load_component(bar5, buf_host, buf_iova,
+                                   sub_ptr, sub_sz, cmd_word, errp)
+    uint64 err = 0; unsafe { *(errp as uint64) -> err }
+    dealloc(errp)
+    uint64 post = psp_bootloader_status_raw(bar5)
+    _dec("  rc",       4, rc)
+    _hex32("  err",    5, err)
+    _hex32("  C2PMSG_35", 11, post)
+    return rc
+}
+
+fn _read_memsize(uint64 bar5) -> uint64 {
+    uint32 v = 0
+    unsafe { *((bar5 + 0x37CC) as uint32) -> v }
+    uint64 memsize = v
+    return memsize
+}
+
+// =====================================================================
+// _dram_long_train — issue PSP_BL__DRAM_LONG_TRAIN and wait up to 3s.
+// =====================================================================
+// Returns:
+//   0 on success (C2PMSG_35 bit 31 set within 3s)
+//   1 on timeout
+//   2 if BL not in ready state before we send
+fn _dram_long_train(uint64 bar5) -> uint64 {
+    puts("=== DRAM_LONG_TRAIN (PSP_BL__DRAM_LONG_TRAIN=0x100000) ===")
+
+    // Pre-train state
+    uint64 pre_c35  = psp_read32(bar5, PSP_REG_C2PMSG_35)
+    uint64 pre_mems = _read_memsize(bar5)
+    _hex32("  pre_C2PMSG_35", 15, pre_c35)
+    _hex32("  pre_MEMSIZE",   13, pre_mems)
+
+    if pre_c35 != MBOX_READY_MASK {
+        puts("  ABORT: BL not idle (C2PMSG_35 != 0x80000000)")
+        return 2
+    }
+
+    // Write training-context offset (LONG path ignores this; SHORT uses it).
+    psp_write32(bar5, PSP_REG_C2PMSG_36, 0x3FE0)
+
+    // Issue DRAM_LONG_TRAIN.
+    psp_write32(bar5, PSP_REG_C2PMSG_35, PSP_BL_DRAM_LONG_TRAIN)
+    puts("  DRAM_LONG_TRAIN cmd written; polling C2PMSG_35 bit 31 for up to 3 s")
+
+    // Poll up to 3 seconds (3000 iterations of 1 ms).
+    uint64 i = 0
+    uint64 last = 0
+    while i < 3000 {
+        last = psp_read32(bar5, PSP_REG_C2PMSG_35)
+        if (last & MBOX_READY_MASK) != 0 {
+            _hex32("  ACK_C2PMSG_35", 15, last)
+            _dec("  ack_ms",         8, i)
+            uint64 mid_mems = _read_memsize(bar5)
+            _hex32("  post_MEMSIZE", 14, mid_mems)
+            if mid_mems != 0 {
+                puts("  RESULT: DRAM_LONG_TRAIN GREEN — VRAM TRAINED")
+            }
+            if mid_mems == 0 {
+                puts("  RESULT: ack received but MEMSIZE still 0 (cmd accepted, training may have failed silently)")
+            }
+            // Low-byte error bits.
+            uint64 err_bits = last & 0xFF
+            if err_bits != 0 {
+                _hex32("  ERR_BITS", 10, err_bits)
+                puts("  WARN: low-byte error bits set — training reported failure")
+                return 3
+            }
+            return 0
+        }
+        if (i & 0xFF) == 0 {
+            _hex32("  poll_C2PMSG_35", 16, last)
+            _dec("  poll_ms",          9, i)
+        }
+        uint64 ts = alloc(16)
+        unsafe { *((ts + 0) as uint64) = 0 }
+        unsafe { *((ts + 8) as uint64) = 1000000 }   // 1 ms
+        syscall_raw(35, ts, 0, 0, 0, 0, 0)
+        dealloc(ts)
+        i = i + 1
+    }
+    _hex32("  timeout_C2PMSG_35", 18, last)
+    puts("  RESULT: TIMEOUT — PSP didn't ack DRAM_LONG_TRAIN within 3 s")
+    return 1
+}
+
+fn _wait_sol(uint64 bar5) -> uint64 {
+    uint64 ts0 = alloc(16)
+    unsafe { *((ts0 + 0) as uint64) = 0 }
+    unsafe { *((ts0 + 8) as uint64) = 20000000 }
+    syscall_raw(35, ts0, 0, 0, 0, 0, 0)
+    dealloc(ts0)
+
+    uint64 i = 0
+    uint64 last = 0
+    while i < 60000 {
+        last = psp_read32(bar5, PSP_REG_C2PMSG_81)
+        if last != 0 {
+            _hex32("SoL_C2PMSG_81", 13, last)
+            _dec("sol_iter_ms",    11, i)
+            return 0
+        }
+        if (i & 0x1FF) == 0 {
+            _hex32("wait_C2PMSG_81", 14, last)
+            _hex32("wait_C2PMSG_58", 14, psp_read32(bar5, PSP_REG_C2PMSG_58))
+            _hex32("wait_C2PMSG_35", 14, psp_read32(bar5, PSP_REG_C2PMSG_35))
+            _dec("wait_iter_ms",    12, i)
+        }
+        uint64 ts = alloc(16)
+        unsafe { *((ts + 0) as uint64) = 0 }
+        unsafe { *((ts + 8) as uint64) = 1000000 }
+        syscall_raw(35, ts, 0, 0, 0, 0, 0)
+        dealloc(ts)
+        i = i + 1
+    }
+    return 1
+}
+
+fn _eta3k_mmhub_write32(uint64 bar5_host, uint64 reg_dw, uint64 val) {
+    uint64 byte_off = (amdgpu_ip_mmhub_base_0 + reg_dw) * 4
+    uint32 v = val
+    unsafe { *((bar5_host + byte_off) as uint32) = v }
+}
+
+fn main() {
+    puts("phase3_kappa1_dram_long_train_with_buf (κ.1, WEDGE-CAPABLE)")
+
+    // ---------------- load replay blob ----------------
+    uint64 bp = alloc(8); unsafe { *(bp as uint64) = 0 }
+    uint64 sp = alloc(8); unsafe { *(sp as uint64) = 0 }
+    uint64 le = fw_load_file("/tmp/amdgpu_replay.bin", bp, sp)
+    if le != 0 { _dec("FAIL replay blob load", 21, le); exit(1) }
+    uint64 blob_buf = 0; unsafe { *(bp as uint64) -> blob_buf }
+    uint64 blob_sz  = 0; unsafe { *(sp as uint64) -> blob_sz }
+    dealloc(bp); dealloc(sp)
+    _dec("replay_blob_size", 16, blob_sz)
+
+    // ---------------- load SOS firmware ----------------
+    uint64 fbp = alloc(8); unsafe { *(fbp as uint64) = 0 }
+    uint64 fsp = alloc(8); unsafe { *(fsp as uint64) = 0 }
+    uint64 fle = fw_load_file("/tmp/mlrift_fw/psp_13_0_10_sos.bin", fbp, fsp)
+    if fle != 0 { _dec("FAIL SOS fw load", 16, fle); exit(2) }
+    uint64 fw_buf = 0; unsafe { *(fbp as uint64) -> fw_buf }
+    uint64 fw_sz  = 0; unsafe { *(fsp as uint64) -> fw_sz }
+    dealloc(fbp); dealloc(fsp)
+
+    // ---------------- open device ----------------
+    uint64 oe = pci_open("0000:03:00.0", 14)
+    if oe != 0 { _dec("FAIL pci_open", 13, oe); exit(3) }
+    amdgpu_load_navi32_bases()
+    uint64 bar5 = pci_map_bar(PCI_BAR5_REGION_INDEX)
+    if bar5 == PCI_MAP_FAILED_SENTINEL { puts("FAIL BAR5"); pci_close(); exit(4) }
+    uint64 bme = pci_set_bus_master()
+    if bme != 0 { _dec("FAIL set_bus_master", 20, bme); pci_close(); exit(5) }
+
+    // ---------------- PSP staging buffer @ iova 0x40000000 ----------------
+    uint64 buf_iova = 0x40000000
+    uint64 buf_size = 0x400000
+    uint64 hp = alloc(8); unsafe { *(hp as uint64) = 0 }
+    uint64 ae = pci_alloc_sysmem_at_iova(buf_size, buf_iova, hp)
+    if ae != 0 { _dec("FAIL pci_alloc PSP buf", 22, ae); exit(6) }
+    uint64 buf_host = 0; unsafe { *(hp as uint64) -> buf_host }
+    dealloc(hp)
+
+    // ---------------- scratch for system aperture DEFAULT_ADDR ----------------
+    uint64 sph = alloc(8); unsafe { *(sph as uint64) = 0 }
+    uint64 spg = alloc(8); unsafe { *(spg as uint64) = 0 }
+    uint64 sae = pci_alloc_sysmem_aligned(4096, 4096, sph, spg)
+    if sae != 0 { _dec("FAIL scratch alloc", 18, sae); exit(7) }
+    uint64 scratch_iova = 0; unsafe { *(spg as uint64) -> scratch_iova }
+    dealloc(sph); dealloc(spg)
+
+    // ---------------- pre-state ----------------
+    puts("--- pre-replay state ---")
+    _hex32("pre_C2PMSG_35",  13, psp_bootloader_status_raw(bar5))
+    _hex32("pre_RCC_MEMSIZE", 16, _read_memsize(bar5))
+    if psp_is_bootloader_ready(bar5) == 0 {
+        puts("FAIL: BL not ready"); exit(8)
+    }
+    if psp_is_sos_alive(bar5) != 0 {
+        puts("WARN: SOS already alive (warm boot — training will be skipped by PSP)")
+    }
+
+    // ---------------- REPLAY MMHUB ----------------
+    puts("--- replaying amdgpu pre-PSP MMIO writes (KEEPING MMHUB) ---")
+    uint64 ap = alloc(8); unsafe { *(ap as uint64) = 0 }
+    uint64 skp = alloc(8); unsafe { *(skp as uint64) = 0 }
+    _replay_apply(bar5, blob_buf, blob_sz, ap, skp)
+    uint64 applied = 0; unsafe { *(ap as uint64) -> applied }
+    uint64 skipped = 0; unsafe { *(skp as uint64) -> skipped }
+    dealloc(ap); dealloc(skp)
+    _dec("replay_applied", 14, applied)
+    _dec("replay_skipped", 14, skipped)
+
+    // ---------------- MMHUB overrides ----------------
+    puts("--- MMHUB overrides for our buf access ---")
+    _eta3k_mmhub_write32(bar5, regMMMC_VM_SYSTEM_APERTURE_LOW_ADDR, 0x1000)
+    _eta3k_mmhub_write32(bar5, regMMMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_LSB, scratch_iova >> 12)
+    _eta3k_mmhub_write32(bar5, regMMMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_MSB, (scratch_iova >> 12) >> 32)
+
+    // ---------------- NBIO ----------------
+    puts("--- NBIO BIF FB gate ---")
+    nbio_mc_access_enable(bar5)
+    nbio_readback_diagnostic(bar5)
+
+    // ---------------- BL chain ----------------
+    puts("--- BL chain ---")
+    uint64 step_rc = 0
+    step_rc = _load_one("=== Step 1: LOAD_KDB ===",
+                        fw_buf, fw_sz, PSP_FW_TYPE_KDB,
+                        PSP_BL_LOAD_KEY_DATABASE,
+                        bar5, buf_host, buf_iova)
+    if step_rc != 0 { puts("STEP 1 FAILED"); exit(20) }
+
+    step_rc = _load_one("=== Step 2: LOAD_SYSDRV ===",
+                        fw_buf, fw_sz, PSP_FW_TYPE_SYS_DRV,
+                        PSP_BL_LOAD_SYSDRV,
+                        bar5, buf_host, buf_iova)
+    if step_rc != 0 { puts("STEP 2 FAILED"); exit(21) }
+
+    step_rc = _load_one("=== Step 3: LOAD_SOCDRV ===",
+                        fw_buf, fw_sz, PSP_FW_TYPE_SOC_DRV,
+                        PSP_BL_LOAD_SOCDRV,
+                        bar5, buf_host, buf_iova)
+    if step_rc != 0 { puts("STEP 3 FAILED"); exit(22) }
+
+    step_rc = _load_one("=== Step 4: LOAD_INTFDRV ===",
+                        fw_buf, fw_sz, PSP_FW_TYPE_INTF_DRV,
+                        PSP_BL_LOAD_INTFDRV,
+                        bar5, buf_host, buf_iova)
+    if step_rc != 0 { puts("STEP 4 FAILED"); exit(23) }
+
+    step_rc = _load_one("=== Step 5: LOAD_DBGDRV ===",
+                        fw_buf, fw_sz, PSP_FW_TYPE_DBG_DRV,
+                        PSP_BL_LOAD_DBGDRV,
+                        bar5, buf_host, buf_iova)
+    if step_rc != 0 { puts("STEP 5 FAILED"); exit(24) }
+
+    puts("--- BL chain GREEN; pre-LOAD_SOSDRV state ---")
+    _hex32("between_C2PMSG_35", 17, psp_bootloader_status_raw(bar5))
+    _hex32("between_MEMSIZE",   15, _read_memsize(bar5))
+
+    // ==============================================================
+    // THE NEW STEP — DRAM_LONG_TRAIN before LOAD_SOSDRV
+    // ==============================================================
+    uint64 dt_rc = _dram_long_train(bar5)
+    _dec("dram_long_train_rc", 18, dt_rc)
+    uint64 post_train_mems = _read_memsize(bar5)
+    _hex32("post_train_MEMSIZE", 18, post_train_mems)
+
+    // We proceed with LOAD_SOSDRV REGARDLESS of training rc — if training
+    // failed we still want the C2PMSG_81 telemetry for diagnosis. (If PSP
+    // wedged, _load_one will fail loudly.)
+
+    // ---------------- LOAD_SOSDRV ----------------
+    puts("--- LOAD_SOSDRV ---")
+    uint64 lp = alloc(16)
+    unsafe { *((lp + 0) as uint64) = 0 }
+    unsafe { *((lp + 8) as uint64) = 0 }
+    uint64 fr = psp_v2_find(fw_buf, fw_sz, PSP_FW_TYPE_SOS, lp + 0, lp + 8)
+    if fr != 0 { _dec("FAIL psp_v2_find SOS", 20, fr); exit(30) }
+    uint64 sos_off = 0; unsafe { *((lp + 0) as uint64) -> sos_off }
+    uint64 sos_sz  = 0; unsafe { *((lp + 8) as uint64) -> sos_sz }
+    dealloc(lp)
+    uint64 uaob = fw_ucode_array_offset_bytes(fw_buf)
+    uint64 sos_ptr = fw_buf + uaob + sos_off
+    _dec("sos_sub_blob_size", 17, sos_sz)
+
+    psp_zero_buf(buf_host, PSP_FW_BUF_SIZE)
+    psp_copy_blob(buf_host, sos_ptr, sos_sz)
+    uint64 addr_word = buf_iova >> 20
+    psp_write32(bar5, PSP_REG_C2PMSG_36, addr_word)
+    psp_write32(bar5, PSP_REG_C2PMSG_35, PSP_BL_LOAD_SOSDRV)
+    puts("LOAD_SOSDRV cmd written; polling C2PMSG_81 up to 60 s")
+    uint64 we = _wait_sol(bar5)
+
+    // ---------------- post-state ----------------
+    puts("--- post-LOAD_SOSDRV state ---")
+    _hex32("post_C2PMSG_35", 14, psp_bootloader_status_raw(bar5))
+    _hex32("post_C2PMSG_81", 14, psp_read32(bar5, PSP_REG_C2PMSG_81))
+    _hex32("post_C2PMSG_58", 14, psp_read32(bar5, PSP_REG_C2PMSG_58))
+    uint64 final_mems = _read_memsize(bar5)
+    _hex32("final_MEMSIZE",  13, final_mems)
+    _dec("VRAM_MiB",          8, final_mems)
+
+    // ---------------- verdict ----------------
+    if we == 0 {
+        puts("VERDICT: SOS REACHED SOL.")
+        if final_mems != 0 {
+            puts("VERDICT++: VRAM TRAINED. COLD-BOOT WALL BROKEN.")
+        }
+        if final_mems == 0 {
+            puts("VERDICT+: SoL but MEMSIZE=0 — training reported ok but no VRAM. Need η.3k-2 sysmem context buf.")
+        }
+    }
+    if we != 0 {
+        puts("VERDICT: SOS STILL STALLED.")
+        if dt_rc == 0 {
+            puts("  but DRAM_LONG_TRAIN acked — training was accepted, SoL gate elsewhere")
+        }
+        if dt_rc == 1 {
+            puts("  DRAM_LONG_TRAIN timed out — PSP didn't process the training cmd")
+        }
+        if dt_rc == 2 {
+            puts("  BL was not idle before training cmd — chain state corrupted")
+        }
+        if dt_rc == 3 {
+            puts("  DRAM_LONG_TRAIN error bits set — PSP rejected training (likely needs context buf)")
+        }
+        if final_mems != 0 {
+            puts("  MEMSIZE non-zero — partial training progress")
+        }
+    }
+
+    pci_free_sysmem(0, scratch_iova, 4096)
+    pci_free_sysmem(buf_host, buf_iova, buf_size)
+    pci_close()
+    dealloc(fw_buf)
+    dealloc(blob_buf)
+    exit(0)
+}
