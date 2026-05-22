@@ -1,0 +1,359 @@
+// Phase 3 slice η.3o — give SOS something at IOVA 0x83f00f80.
+//
+// η.3k-2/η.3l/η.3m/η.3n all observed SOS crashes at PSP-virt 0x83f00f80
+// with type=4 (Data Abort), PC=0x0d1102f4. The address falls inside our
+// system aperture range [0x40000000, 0x83FEFC0000] but we have no IOMMU
+// mapping at IOVA 0x83f00f80 — only at 0x40000000 (PSP staging buf).
+//
+// Hypothesis: SOS's CPU-side virt 0x83f00f80 lands on physical sysmem
+// via MMHUB identity routing, and SOS faults because the IOMMU has no
+// mapping there. amdgpu's kernel-side IOMMU domain DOES have sysmem
+// mapped widely; ours doesn't.
+//
+// This smoke allocates a 4 MiB sysmem buffer at IOVA 0x83f00000
+// (covers 0x83f00000..0x84300000 → 4 MiB around the fault address),
+// then runs the standard AsicInit+BL-chain+LOAD_SOSDRV flow.
+//
+// Decisive outcomes:
+//   - SOS reaches SoL → IOMMU mapping was the wall (full breakthrough)
+//   - SOS crashes at a DIFFERENT address (C2PMSG_61 != 0x83f00f80)
+//     → we progressed past the first fault; new fault tells us what
+//     SOS reaches for next (we then map THAT region too)
+//   - SOS crashes at same 0x83f00f80 → MMHUB isn't actually routing
+//     this PSP-virt through our IOMMU as expected; the address must
+//     come from a different mechanism (PSP-internal mapping)
+//   - PSP wedges → cold cycle required
+//
+// WEDGE-CAPABLE. Cold cycle before running.
+
+import "../std/pcidev.mlr"
+import "../std/amdgpu_ip_discovery.mlr"
+import "../std/amdgpu_firmware.mlr"
+import "../std/atom.mlr"
+import "../std/gmc.mlr"
+import "../std/gmc_constants.mlr"
+import "../std/psp.mlr"
+import "../std/sys.mlr"
+
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn puts(uint64 s) -> uint32
+
+static uint64 FW_INFO_TABLE_IDX        = 4
+static uint64 ASIC_INIT_CMD_IDX        = 0
+static uint64 ENGINE_FLAG_NORMAL_INIT  = 0x00
+static uint64 MEM_FLAG_FB_RESET_COLD   = 0x00
+static uint64 FI_OFF_BOOTUP_SCLK       = 0x08
+static uint64 FI_OFF_BOOTUP_MCLK       = 0x0C
+static uint64 AMDGPU_RAS_BOOT_STEADY_STATUS = 0xBA
+
+// The fault address we want to feed SOS. Aligned-down to 4 KiB page.
+static uint64 FAULT_PAGE_IOVA          = 0x83f00000
+static uint64 FAULT_BUF_SIZE           = 0x400000   // 4 MiB
+static uint64 FAULT_BYTE_OFFSET        = 0xf80      // within the page
+
+fn _hex32(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(96)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint8 zx = 48; unsafe { *((b + ll + 1) as uint8) = zx }
+    uint8 xc = 120; unsafe { *((b + ll + 2) as uint8) = xc }
+    uint64 j = 0
+    while j < 8 {
+        uint64 sh = (7 - j) * 4
+        uint64 nyb = (v >> sh) & 0xF
+        uint8 ch = nyb + 48
+        if nyb >= 10 { ch = nyb + 87 }
+        unsafe { *((b + ll + 3 + j) as uint8) = ch }
+        j = j + 1
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 11) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+fn _dec(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(96)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint64 digits = 0
+    if v == 0 {
+        uint8 z = 48; unsafe { *((b + ll + 1) as uint8) = z }; digits = 1
+    } else {
+        uint64 t = v
+        while t > 0 { digits = digits + 1; t = t / 10 }
+        uint64 k = digits
+        t = v
+        while k > 0 {
+            k = k - 1
+            uint64 d = t - (t / 10) * 10
+            uint8 db = d + 48
+            unsafe { *((b + ll + 1 + k) as uint8) = db }
+            t = t / 10
+        }
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 1 + digits) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+fn _memsize(uint64 bar5) -> uint64 {
+    uint32 v = 0
+    unsafe { *((bar5 + 0x37CC) as uint32) -> v }
+    uint64 r = v
+    return r
+}
+
+fn _read_boot_status(uint64 bar5) -> uint64 {
+    return psp_read32(bar5, 0x009C)
+}
+
+fn _load(uint64 step_label,
+         uint64 fw_buf, uint64 fw_sz, uint64 fw_type,
+         uint64 cmd_word,
+         uint64 bar5, uint64 buf_host, uint64 buf_iova) -> uint64 {
+    puts(step_label)
+    uint64 lp = alloc(16)
+    unsafe { *((lp + 0) as uint64) = 0 }
+    unsafe { *((lp + 8) as uint64) = 0 }
+    uint64 fr = psp_v2_find(fw_buf, fw_sz, fw_type, lp + 0, lp + 8)
+    if fr != 0 { _dec("  v2_find_rc", 12, fr); dealloc(lp); return 99 }
+    uint64 rel_off = 0; unsafe { *((lp + 0) as uint64) -> rel_off }
+    uint64 sub_sz  = 0; unsafe { *((lp + 8) as uint64) -> sub_sz }
+    dealloc(lp)
+    uint64 uaob = fw_ucode_array_offset_bytes(fw_buf)
+    uint64 sub_ptr = fw_buf + uaob + rel_off
+
+    uint64 errp = alloc(8); unsafe { *(errp as uint64) = 0 }
+    uint64 rc = psp_load_component(bar5, buf_host, buf_iova,
+                                   sub_ptr, sub_sz, cmd_word, errp)
+    uint64 err = 0; unsafe { *(errp as uint64) -> err }
+    dealloc(errp)
+    _dec("  rc",  4, rc)
+    _hex32("  err",     5, err)
+    _hex32("  MEMSIZE",  9, _memsize(bar5))
+    return rc
+}
+
+fn _asic_init(uint64 ctx, uint64 vbios_buf,
+              uint64 engineflag, uint64 memflag) -> uint64 {
+    puts("=== ATOM_CMD_INIT (η.3o: with fault-addr buf mapped) ===")
+    uint64 fi_off = atom_data_table_offset_by_index(vbios_buf, FW_INFO_TABLE_IDX)
+    if fi_off == 0 { puts("  FAIL: firmware_info data table not present"); return 1 }
+    uint32 sclk32 = 0; unsafe { *((vbios_buf + fi_off + FI_OFF_BOOTUP_SCLK) as uint32) -> sclk32 }
+    uint32 mclk32 = 0; unsafe { *((vbios_buf + fi_off + FI_OFF_BOOTUP_MCLK) as uint32) -> mclk32 }
+    uint64 sclk = sclk32
+    uint64 mclk = mclk32
+    uint64 ps_size = 18 * 4
+    uint64 params = alloc(ps_size)
+    uint64 zi = 0
+    while zi < ps_size { uint8 z = 0; unsafe { *((params + zi) as uint8) = z }; zi = zi + 1 }
+    uint32 ps0 = (engineflag << 24) | (sclk & 0xFFFFFF)
+    uint32 ps1 = (memflag << 24)    | (mclk & 0xFFFFFF)
+    unsafe { *((params + 0) as uint32) = ps0 }
+    unsafe { *((params + 4) as uint32) = ps1 }
+    uint64 rc = atom_execute_table_by_index(ctx, ASIC_INIT_CMD_IDX, params, ps_size)
+    _dec("  AsicInit_rc", 13, rc)
+    dealloc(params)
+    return rc
+}
+
+fn main() {
+    puts("phase3_eta3o_sysmem_at_fault_addr (η.3o, WEDGE-CAPABLE)")
+
+    uint64 bp = alloc(8); unsafe { *(bp as uint64) = 0 }
+    uint64 sp = alloc(8); unsafe { *(sp as uint64) = 0 }
+    uint64 le = atom_load_image("/tmp/mlrift_vbios.rom", bp, sp)
+    if le != 0 { _dec("FAIL atom_load_image", 20, le); exit(1) }
+    uint64 vbios_buf = 0; unsafe { *(bp as uint64) -> vbios_buf }
+    uint64 vbios_sz  = 0; unsafe { *(sp as uint64) -> vbios_sz }
+    dealloc(bp); dealloc(sp)
+
+    uint64 fbp = alloc(8); unsafe { *(fbp as uint64) = 0 }
+    uint64 fsp = alloc(8); unsafe { *(fsp as uint64) = 0 }
+    uint64 fl = fw_load_file("/tmp/mlrift_fw/psp_13_0_10_sos.bin", fbp, fsp)
+    if fl != 0 { _dec("FAIL fw_load", 12, fl); exit(3) }
+    uint64 fw_buf = 0; unsafe { *(fbp as uint64) -> fw_buf }
+    uint64 fw_sz  = 0; unsafe { *(fsp as uint64) -> fw_sz }
+    dealloc(fbp); dealloc(fsp)
+
+    uint64 oe = pci_open("0000:03:00.0", 14)
+    if oe != 0 { _dec("FAIL pci_open", 13, oe); exit(4) }
+    amdgpu_load_navi32_bases()
+    uint64 bar5 = pci_map_bar(PCI_BAR5_REGION_INDEX)
+    if bar5 == PCI_MAP_FAILED_SENTINEL { puts("FAIL BAR5"); pci_close(); exit(5) }
+    uint64 bme = pci_set_bus_master()
+    if bme != 0 { _dec("FAIL BME", 8, bme); pci_close(); exit(6) }
+
+    // PSP staging buf @ IOVA 0x40000000
+    uint64 hp = alloc(8); unsafe { *(hp as uint64) = 0 }
+    uint64 buf_iova = 0x40000000
+    uint64 ae = pci_alloc_sysmem_at_iova(0x100000, buf_iova, hp)
+    if ae != 0 { _dec("FAIL alloc PSP buf", 18, ae); pci_close(); exit(7) }
+    uint64 buf_host = 0; unsafe { *(hp as uint64) -> buf_host }
+    dealloc(hp)
+
+    // Scratch page (for system aperture DEFAULT_ADDR)
+    uint64 sph = alloc(8); unsafe { *(sph as uint64) = 0 }
+    uint64 spg = alloc(8); unsafe { *(spg as uint64) = 0 }
+    uint64 sae = pci_alloc_sysmem_aligned(4096, 4096, sph, spg)
+    if sae != 0 { _dec("FAIL scratch", 12, sae); pci_close(); exit(8) }
+    uint64 scratch_iova = 0; unsafe { *(spg as uint64) -> scratch_iova }
+    dealloc(sph); dealloc(spg)
+
+    // === NEW: sysmem buf at the SOS fault address ===
+    puts("--- allocating 4 MiB sysmem at IOVA 0x83f00000 (covers fault 0x83f00f80) ---")
+    uint64 fhp = alloc(8); unsafe { *(fhp as uint64) = 0 }
+    uint64 fae = pci_alloc_sysmem_at_iova(FAULT_BUF_SIZE, FAULT_PAGE_IOVA, fhp)
+    if fae != 0 {
+        _dec("FAIL alloc fault buf (rc)", 25, fae)
+        _hex32("  attempted_iova", 16, FAULT_PAGE_IOVA)
+        _hex32("  attempted_size", 16, FAULT_BUF_SIZE)
+        pci_close(); exit(9)
+    }
+    uint64 fault_buf_host = 0; unsafe { *(fhp as uint64) -> fault_buf_host }
+    dealloc(fhp)
+    _hex32("  fault_buf_host", 15, fault_buf_host)
+    _hex32("  fault_buf_iova", 15, FAULT_PAGE_IOVA)
+    _hex32("  fault_buf_size", 15, FAULT_BUF_SIZE)
+
+    // Zero the fault buf so SOS reads zeros (not random heap bytes)
+    uint64 zi = 0
+    while zi < FAULT_BUF_SIZE {
+        uint8 z = 0; unsafe { *((fault_buf_host + zi) as uint8) = z }
+        zi = zi + 1
+    }
+    puts("  fault buf zeroed")
+
+    // System aperture LOW override so the buf range stays inside the aperture
+    // (LOW=0x1000 = byte 0x40000000; HIGH already covers up to 0x83FEFC0000)
+    uint64 mmhub_aper_low_byte = (amdgpu_ip_mmhub_base_0 + regMMMC_VM_SYSTEM_APERTURE_LOW_ADDR) * 4
+    uint32 aper_low_val = 0x1000
+    unsafe { *((bar5 + mmhub_aper_low_byte) as uint32) = aper_low_val }
+    uint64 mmhub_def_lo_byte = (amdgpu_ip_mmhub_base_0 + regMMMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_LSB) * 4
+    uint64 mmhub_def_hi_byte = (amdgpu_ip_mmhub_base_0 + regMMMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_MSB) * 4
+    uint32 def_lo = scratch_iova >> 12
+    uint32 def_hi = (scratch_iova >> 12) >> 32
+    unsafe { *((bar5 + mmhub_def_lo_byte) as uint32) = def_lo }
+    unsafe { *((bar5 + mmhub_def_hi_byte) as uint32) = def_hi }
+
+    puts("--- pre-AsicInit ---")
+    _hex32("MEMSIZE",     7, _memsize(bar5))
+    _hex32("C2PMSG_35",   9, psp_bootloader_status_raw(bar5))
+    _hex32("BOOT_STATUS", 11, _read_boot_status(bar5))
+    if psp_is_bootloader_ready(bar5) == 0 { puts("FAIL: BL not ready"); pci_close(); exit(10) }
+
+    uint64 ctx = atom_context_init(vbios_buf, vbios_sz, bar5)
+    if ctx == 0 { puts("FAIL atom_context_init"); pci_close(); exit(11) }
+
+    _asic_init(ctx, vbios_buf, ENGINE_FLAG_NORMAL_INIT, MEM_FLAG_FB_RESET_COLD)
+
+    if _load("=== KDB ===",      fw_buf, fw_sz, PSP_FW_TYPE_KDB,
+              PSP_BL_LOAD_KEY_DATABASE, bar5, buf_host, buf_iova) != 0 { exit(20) }
+    if _load("=== SYS_DRV ===",  fw_buf, fw_sz, PSP_FW_TYPE_SYS_DRV,
+              PSP_BL_LOAD_SYSDRV,       bar5, buf_host, buf_iova) != 0 { exit(21) }
+    if _load("=== SOC_DRV ===",  fw_buf, fw_sz, PSP_FW_TYPE_SOC_DRV,
+              PSP_BL_LOAD_SOCDRV,       bar5, buf_host, buf_iova) != 0 { exit(22) }
+    if _load("=== INTF_DRV ===", fw_buf, fw_sz, PSP_FW_TYPE_INTF_DRV,
+              PSP_BL_LOAD_INTFDRV,      bar5, buf_host, buf_iova) != 0 { exit(23) }
+    if _load("=== DBG_DRV ===",  fw_buf, fw_sz, PSP_FW_TYPE_DBG_DRV,
+              PSP_BL_LOAD_DBGDRV,       bar5, buf_host, buf_iova) != 0 { exit(24) }
+
+    puts("=== LOAD_SOSDRV ===")
+    uint64 lp_sos = alloc(16)
+    unsafe { *((lp_sos + 0) as uint64) = 0 }
+    unsafe { *((lp_sos + 8) as uint64) = 0 }
+    uint64 fr = psp_v2_find(fw_buf, fw_sz, PSP_FW_TYPE_SOS, lp_sos + 0, lp_sos + 8)
+    if fr != 0 { puts("FAIL SOS not in fw"); exit(30) }
+    uint64 sos_rel = 0; unsafe { *((lp_sos + 0) as uint64) -> sos_rel }
+    uint64 sos_sz  = 0; unsafe { *((lp_sos + 8) as uint64) -> sos_sz }
+    dealloc(lp_sos)
+    uint64 uaob_sos = fw_ucode_array_offset_bytes(fw_buf)
+    uint64 sos_ptr  = fw_buf + uaob_sos + sos_rel
+
+    psp_zero_buf(buf_host, 0x100000)
+    psp_copy_blob(buf_host, sos_ptr, sos_sz)
+    psp_write32(bar5, PSP_REG_C2PMSG_36, buf_iova >> 20)
+    psp_write32(bar5, PSP_REG_C2PMSG_35, PSP_BL_LOAD_SOSDRV)
+    puts("--- SOSDRV written, polling SoL + exception triplet for up to 60s ---")
+
+    uint64 ts0 = alloc(16)
+    unsafe { *((ts0 + 0) as uint64) = 0 }
+    unsafe { *((ts0 + 8) as uint64) = 20000000 }
+    syscall_raw(35, ts0, 0, 0, 0, 0, 0)
+    dealloc(ts0)
+
+    uint64 it = 0
+    uint64 last_addr = 0
+    while it < 60 {
+        uint64 sol  = psp_read32(bar5, PSP_REG_C2PMSG_81)
+        uint64 mem  = _memsize(bar5)
+        uint64 bst  = _read_boot_status(bar5)
+        uint64 fault_addr = psp_read32(bar5, 0x007D)
+        if (it & 7) == 0 {
+            _dec("iter", 4, it)
+            _hex32("  SOL",          5, sol)
+            _hex32("  MEM",          5, mem)
+            _hex32("  BOOT_STATUS",  13, bst)
+            _hex32("  FAULT_ADDR",   13, fault_addr)
+        }
+        if fault_addr != last_addr {
+            if fault_addr != 0 {
+                if last_addr != 0 {
+                    puts("==>>> FAULT_ADDR CHANGED — SOS made progress! <<<==")
+                    _hex32("  old_addr", 10, last_addr)
+                    _hex32("  new_addr", 10, fault_addr)
+                }
+            }
+            last_addr = fault_addr
+        }
+        if sol != 0 {
+            puts("==>>> SOS REACHED SOL — COLD-BOOT WALL BROKEN <<<==")
+            it = 9999
+        }
+        if (bst & 0xFF) == AMDGPU_RAS_BOOT_STEADY_STATUS {
+            puts("==>>> BOOT_STATUS=0xBA STEADY <<<==")
+        }
+        if it != 9999 {
+            uint64 ts = alloc(16)
+            unsafe { *((ts + 0) as uint64) = 1 }
+            unsafe { *((ts + 8) as uint64) = 0 }
+            syscall_raw(35, ts, 0, 0, 0, 0, 0)
+            dealloc(ts)
+            it = it + 1
+        }
+    }
+
+    puts("--- final ---")
+    _hex32("final_C2PMSG_81",   15, psp_read32(bar5, PSP_REG_C2PMSG_81))
+    _hex32("final_C2PMSG_58",   15, psp_read32(bar5, PSP_REG_C2PMSG_58))
+    _hex32("final_BOOT_STATUS", 17, _read_boot_status(bar5))
+    _hex32("final_MEMSIZE",     13, _memsize(bar5))
+    _hex32("final_C2PMSG_60_type", 20, psp_read32(bar5, 0x007C))
+    _hex32("final_C2PMSG_61_addr", 20, psp_read32(bar5, 0x007D))
+    _hex32("final_C2PMSG_62_pc",   18, psp_read32(bar5, 0x007E))
+
+    // Check if our fault buf got touched
+    puts("--- fault buf inspection (first 64 bytes) ---")
+    uint64 fbi = 0
+    while fbi < 64 {
+        uint32 v = 0; unsafe { *((fault_buf_host + fbi) as uint32) -> v }
+        uint64 val = v
+        if val != 0 {
+            _hex32("  offset", 8, fbi)
+            _hex32("  value",  7, val)
+        }
+        fbi = fbi + 4
+    }
+
+    pci_free_sysmem(fault_buf_host, FAULT_PAGE_IOVA, FAULT_BUF_SIZE)
+    pci_close()
+    dealloc(fw_buf)
+    dealloc(vbios_buf)
+    exit(0)
+}

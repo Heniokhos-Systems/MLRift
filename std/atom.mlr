@@ -222,6 +222,163 @@ fn atom_trace_op_at(uint64 i) -> uint64 {
     return v
 }
 
+// =====================================================================
+// η.3m opcode/MMIO instrumentation — runtime-toggleable, static-buffered.
+// All hooks no-op when atom_trace_enabled == 0, so existing smokes are
+// unaffected. Lazy-alloc buffers on first enable.
+// =====================================================================
+static uint64 atom_trace_enabled    = 0
+
+// Per-opcode counter: 128 entries × 8 bytes
+static uint64 _atom_op_counts       = 0
+
+// MMIO write ring: 1024 entries × 16 bytes (pc:u32 | reg:u32 | val:u32 | flags:u32)
+static uint64 _atom_mmio_ring       = 0
+static uint64 _atom_mmio_idx        = 0
+static uint64 _atom_mmio_wrap       = 0
+
+// Sub-table call ring: 256 entries × 16 bytes (caller_pc:u64 | callee_idx:u64)
+static uint64 _atom_call_ring       = 0
+static uint64 _atom_call_idx        = 0
+
+// Termination single record
+static uint64 _atom_term_pc         = 0
+static uint64 _atom_term_op         = 0
+static uint64 _atom_term_reason     = 0
+static uint64 _atom_term_bytes      = 0
+
+fn _atom_inst_init() {
+    if _atom_op_counts == 0 {
+        _atom_op_counts = alloc(128 * 8)
+        uint64 i = 0
+        while i < 128 * 8 { uint8 z = 0; unsafe { *((_atom_op_counts + i) as uint8) = z }; i = i + 1 }
+    }
+    if _atom_mmio_ring == 0 {
+        _atom_mmio_ring = alloc(1024 * 16)
+        uint64 i = 0
+        while i < 1024 * 16 { uint8 z = 0; unsafe { *((_atom_mmio_ring + i) as uint8) = z }; i = i + 1 }
+    }
+    if _atom_call_ring == 0 {
+        _atom_call_ring = alloc(256 * 16)
+        uint64 i = 0
+        while i < 256 * 16 { uint8 z = 0; unsafe { *((_atom_call_ring + i) as uint8) = z }; i = i + 1 }
+    }
+}
+
+fn atom_trace_enable()  { _atom_inst_init(); atom_trace_enabled = 1 }
+fn atom_trace_disable() { atom_trace_enabled = 0 }
+
+fn atom_trace_reset() {
+    _atom_inst_init()
+    uint64 i = 0
+    while i < 128 * 8  { uint8 z = 0; unsafe { *((_atom_op_counts + i) as uint8) = z }; i = i + 1 }
+    i = 0
+    while i < 1024 * 16 { uint8 z = 0; unsafe { *((_atom_mmio_ring + i) as uint8) = z }; i = i + 1 }
+    i = 0
+    while i < 256 * 16  { uint8 z = 0; unsafe { *((_atom_call_ring + i) as uint8) = z }; i = i + 1 }
+    _atom_mmio_idx  = 0
+    _atom_mmio_wrap = 0
+    _atom_call_idx  = 0
+    _atom_term_pc     = 0
+    _atom_term_op     = 0
+    _atom_term_reason = 0
+    _atom_term_bytes  = 0
+}
+
+fn _atom_inst_count_op(uint64 op) {
+    if atom_trace_enabled == 0 { return }
+    if op >= 128 { return }
+    uint64 slot = op * 8
+    uint64 cur = 0; unsafe { *((_atom_op_counts + slot) as uint64) -> cur }
+    cur = cur + 1
+    unsafe { *((_atom_op_counts + slot) as uint64) = cur }
+}
+
+fn _atom_inst_log_mmio(uint64 pc, uint64 reg_off, uint64 val, uint64 flags) {
+    if atom_trace_enabled == 0 { return }
+    if _atom_mmio_ring == 0 { return }
+    uint64 slot = (_atom_mmio_idx & 1023) * 16
+    uint32 p = pc;      unsafe { *((_atom_mmio_ring + slot      ) as uint32) = p }
+    uint32 r = reg_off; unsafe { *((_atom_mmio_ring + slot +  4 ) as uint32) = r }
+    uint32 v = val;     unsafe { *((_atom_mmio_ring + slot +  8 ) as uint32) = v }
+    uint32 f = flags;   unsafe { *((_atom_mmio_ring + slot + 12 ) as uint32) = f }
+    _atom_mmio_idx = _atom_mmio_idx + 1
+    if (_atom_mmio_idx & 1023) == 0 { _atom_mmio_wrap = _atom_mmio_wrap + 1 }
+}
+
+fn _atom_inst_log_call(uint64 caller_pc, uint64 callee_idx) {
+    if atom_trace_enabled == 0 { return }
+    if _atom_call_ring == 0 { return }
+    uint64 slot = (_atom_call_idx & 255) * 16
+    unsafe { *((_atom_call_ring + slot     ) as uint64) = caller_pc }
+    unsafe { *((_atom_call_ring + slot + 8 ) as uint64) = callee_idx }
+    _atom_call_idx = _atom_call_idx + 1
+}
+
+fn _atom_inst_set_term(uint64 pc, uint64 op, uint64 reason, uint64 bytes) {
+    if atom_trace_enabled == 0 { return }
+    _atom_term_pc     = pc
+    _atom_term_op     = op
+    _atom_term_reason = reason
+    _atom_term_bytes  = bytes
+}
+
+// Public accessors.
+fn atom_trace_get_opcode_counts(uint64 out_buf) -> uint64 {
+    if _atom_op_counts == 0 { return 0 }
+    uint64 i = 0
+    while i < 128 {
+        uint64 v = 0; unsafe { *((_atom_op_counts + i * 8) as uint64) -> v }
+        unsafe { *((out_buf + i * 8) as uint64) = v }
+        i = i + 1
+    }
+    return 128
+}
+
+fn atom_trace_get_mmio_count() -> uint64 { return _atom_mmio_idx }
+fn atom_trace_get_mmio_wrap()  -> uint64 { return _atom_mmio_wrap }
+
+fn atom_trace_get_mmio_writes(uint64 out_buf, uint64 max) -> uint64 {
+    if _atom_mmio_ring == 0 { return 0 }
+    uint64 total = _atom_mmio_idx
+    uint64 start = 0
+    uint64 n     = total
+    if _atom_mmio_wrap > 0 { start = _atom_mmio_idx; n = 1024 }
+    if n > max { start = start + (n - max); n = max }
+    uint64 i = 0
+    while i < n {
+        uint64 slot = ((start + i) & 1023) * 16
+        uint32 p = 0; unsafe { *((_atom_mmio_ring + slot     ) as uint32) -> p }
+        uint32 r = 0; unsafe { *((_atom_mmio_ring + slot +  4) as uint32) -> r }
+        uint32 v = 0; unsafe { *((_atom_mmio_ring + slot +  8) as uint32) -> v }
+        uint32 f = 0; unsafe { *((_atom_mmio_ring + slot + 12) as uint32) -> f }
+        unsafe { *((out_buf + i * 16     ) as uint32) = p }
+        unsafe { *((out_buf + i * 16 +  4) as uint32) = r }
+        unsafe { *((out_buf + i * 16 +  8) as uint32) = v }
+        unsafe { *((out_buf + i * 16 + 12) as uint32) = f }
+        i = i + 1
+    }
+    return n
+}
+
+fn atom_trace_get_call_count() -> uint64 { return _atom_call_idx }
+fn atom_trace_get_call_at(uint64 i, uint64 out_pc_ptr, uint64 out_idx_ptr) {
+    if _atom_call_ring == 0 { return }
+    uint64 slot = (i & 255) * 16
+    uint64 pc = 0; unsafe { *((_atom_call_ring + slot    ) as uint64) -> pc }
+    uint64 ix = 0; unsafe { *((_atom_call_ring + slot + 8) as uint64) -> ix }
+    unsafe { *(out_pc_ptr  as uint64) = pc }
+    unsafe { *(out_idx_ptr as uint64) = ix }
+}
+
+// out_struct layout: pc:u64 | op:u64 | reason:u64 | bytes:u64
+fn atom_trace_get_termination(uint64 out_struct) {
+    unsafe { *((out_struct      ) as uint64) = _atom_term_pc }
+    unsafe { *((out_struct +  8 ) as uint64) = _atom_term_op }
+    unsafe { *((out_struct + 16 ) as uint64) = _atom_term_reason }
+    unsafe { *((out_struct + 24 ) as uint64) = _atom_term_bytes }
+}
+
 fn _atom_op_panic(uint64 ectx, uint64 ptr_ptr, uint64 arg) {
     uint64 cur = 0; unsafe { *(ptr_ptr as uint64) -> cur }
     _atom_last_panic_ptr = cur
@@ -738,6 +895,7 @@ fn _atom_op_calltable(uint64 ectx, uint64 ptr_ptr, uint64 arg) {
     uint32 ps_size_r = 0; unsafe { *((ectx + AEC_OFF_PS_SIZE) as uint32) -> ps_size_r }
     uint64 ps_size = ps_size_r
 
+    _atom_inst_log_call(ptr_val, idx)
     uint64 r = atom_execute_table(ctx, sub_off, ps_ptr, ps_size)
     if r != 0 {
         unsafe { *((ectx + AEC_OFF_ABORT) as uint64) = 0xDEAD }
@@ -1286,6 +1444,8 @@ fn atom_execute_table(uint64 ctx,
 
     uint64 abort = 0
     uint64 ran_off = 0
+    uint64 last_pc = bytecode_start
+    uint64 last_op = 0
     while abort == 0 {
         uint64 ptr = 0; unsafe { *((ectx + AEC_OFF_PTR) as uint64) -> ptr }
         if ptr >= bytecode_end { ran_off = 1; abort = 0xBEEF }
@@ -1293,6 +1453,10 @@ fn atom_execute_table(uint64 ctx,
             uint8 op_b = 0; unsafe { *((image + ptr) as uint8) -> op_b }
             uint64 op = op_b
             _atom_trace_record(ptr, op)
+            _atom_inst_count_op(op)
+            _atom_last_panic_ptr = ptr
+            last_pc = ptr
+            last_op = op
             unsafe { *((ectx + AEC_OFF_PTR) as uint64) = ptr + 1 }
             _atom_dispatch(op, ectx, ectx + AEC_OFF_PTR)
             unsafe { *((ectx + AEC_OFF_ABORT) as uint64) -> abort }
@@ -1300,6 +1464,10 @@ fn atom_execute_table(uint64 ctx,
     }
     if ws_buf != 0 { dealloc(ws_buf) }
     dealloc(ectx)
+    uint64 reason = 0
+    if ran_off == 1 { reason = 1 }
+    if abort  == 0xDEAD { reason = 2 }
+    _atom_inst_set_term(last_pc, last_op, reason, last_pc - bytecode_start)
     if ran_off == 1 { return 3 }
     if abort == 0xDEAD { return 2 }
     return 0
@@ -1410,8 +1578,9 @@ fn _atom_reg_read(uint64 ctx, uint64 idx) -> uint64 {
 fn _atom_reg_write(uint64 ctx, uint64 idx, uint64 val) {
     uint64 bar5 = 0
     unsafe { *((ctx + AC_OFF_BAR5_HOST) as uint64) -> bar5 }
-    if bar5 == 0 { return }
     uint64 byte_off = idx * 4
+    _atom_inst_log_mmio(_atom_last_panic_ptr, byte_off, val, 0)
+    if bar5 == 0 { return }
     uint32 v = val
     unsafe { *((bar5 + byte_off) as uint32) = v }
 }
@@ -1921,16 +2090,73 @@ fn _atom_put_dst(uint64 ectx, uint64 arg, uint64 attr, uint64 ptr_ptr, uint64 va
 }
 
 // =====================================================================
+// IIO sub-program length table — port of amdgpu atom.c atom_iio_len[].
+// Indexed by ATOM_IIO_* opcode. END is consumed by caller via "cur += 3".
+fn _atom_iio_op_len(uint64 op) -> uint64 {
+    if op == ATOM_IIO_NOP        { return 1 }
+    if op == ATOM_IIO_START      { return 2 }
+    if op == ATOM_IIO_READ       { return 3 }
+    if op == ATOM_IIO_WRITE      { return 3 }
+    if op == ATOM_IIO_CLEAR      { return 3 }
+    if op == ATOM_IIO_SET        { return 3 }
+    if op == ATOM_IIO_MOVE_INDEX { return 4 }
+    if op == ATOM_IIO_MOVE_ATTR  { return 4 }
+    if op == ATOM_IIO_MOVE_DATA  { return 4 }
+    if op == ATOM_IIO_END        { return 3 }
+    return 1
+}
+
+// Port of amdgpu atom.c:atom_index_iio. `base` is the byte offset of the
+// FIRST IIO_START in the VBIOS image (i.e. iio_data_table_offset + 4 to
+// skip atom_common_table_header). Walks each [START][slot][...][END][pad][pad]
+// sub-program and stores the BODY byte offset (post-slot) in slots[slot_id].
+// Returns the slots-table pointer (0 on alloc fail).
+fn _atom_index_iio(uint64 image, uint64 base) -> uint64 {
+    uint64 tbl = alloc(ATOM_IIO_SLOT_BYTES)
+    if tbl == 0 { return 0 }
+    uint64 zi = 0
+    while zi < ATOM_IIO_SLOT_BYTES {
+        uint8 z = 0; unsafe { *((tbl + zi) as uint8) = z }; zi = zi + 1
+    }
+    uint64 cur  = base
+    uint64 done = 0
+    while done == 0 {
+        uint8 hdr = 0; unsafe { *((image + cur) as uint8) -> hdr }
+        if hdr != ATOM_IIO_START {
+            done = 1
+        }
+        if done == 0 {
+            uint8 slot_b = 0; unsafe { *((image + cur + 1) as uint8) -> slot_b }
+            uint64 slot = slot_b
+            uint64 body_off = cur + 2
+            uint16 body_off_w = body_off
+            unsafe { *((tbl + slot * 2) as uint16) = body_off_w }
+            cur = cur + 2
+            uint8 opc = 0; unsafe { *((image + cur) as uint8) -> opc }
+            while opc != ATOM_IIO_END {
+                cur = cur + _atom_iio_op_len(opc)
+                unsafe { *((image + cur) as uint8) -> opc }
+            }
+            cur = cur + 3   // skip [END][pad][pad]
+        }
+    }
+    return tbl
+}
+
+// =====================================================================
 // slice δ.0k — context builder + image bind
 //
 // atom_context_init(image_buf, image_size, bar5_host) → ctx or 0
 //   Allocates and zeroes an atom_context (ATOM_CONTEXT_SIZE bytes),
 //   wires the image fields, resolves the command/data table-of-contents
-//   base offsets, and allocates a 64 KiB host scratch backing store for
-//   ATOM_ARG_FB ops. Pass bar5_host = 0 for synthetic / CPU-only mode.
+//   base offsets, allocates a 64 KiB host scratch backing store for
+//   ATOM_ARG_FB ops, and (NEW) builds the IIO slot table from data-table
+//   23 (indirectioaccess) so SET_PORT_IIO REG accesses can resolve to
+//   real MMIO writes. Pass bar5_host = 0 for synthetic / CPU-only mode.
 //
 // atom_context_free(ctx)
-//   Frees the scratch buffer then the ctx block. Caller frees image_buf.
+//   Frees the IIO slot table, scratch buffer, then the ctx block. Caller
+//   frees image_buf.
 //
 // atom_execute_table_by_index(ctx, idx, ps_ptr, ps_size) → rc
 //   Convenience: resolves cmd-table index → byte offset and delegates
@@ -1973,11 +2199,23 @@ fn atom_context_init(uint64 image_buf, uint64 image_size, uint64 bar5_host) -> u
     unsafe { *((ctx + AC_OFF_IO_MODE)         as uint64) = ATOM_IO_MM }
     unsafe { *((ctx + AC_OFF_BAR5_HOST)       as uint64) = bar5_host  }
 
+    // η.3m fix — populate iio slot table from indirectioaccess (idx 23).
+    // Without this, every SET_PORT_IIO REG access silently no-ops,
+    // breaking ATOM_CMD_INIT's memory-training writes.
+    uint64 iio_tbl_off = atom_data_table_offset_by_index(image_buf, ATOM_DATA_IIO_IDX)
+    uint64 iio_slots = 0
+    if iio_tbl_off != 0 {
+        iio_slots = _atom_index_iio(image_buf, iio_tbl_off + ATOM_CT_HEADER_SIZE)
+    }
+    unsafe { *((ctx + AC_OFF_IIO_SLOTS) as uint64) = iio_slots }
+
     return ctx
 }
 
 fn atom_context_free(uint64 ctx) {
     if ctx == 0 { return }
+    uint64 iio = 0; unsafe { *((ctx + AC_OFF_IIO_SLOTS) as uint64) -> iio }
+    if iio != 0 { dealloc(iio) }
     uint64 scratch = 0; unsafe { *((ctx + AC_OFF_SCRATCH) as uint64) -> scratch }
     if scratch != 0 { dealloc(scratch) }
     dealloc(ctx)

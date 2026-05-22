@@ -1,0 +1,188 @@
+// Phase 3 slice η.3n — READ-ONLY probe of BIOS_SCRATCH[0..7].
+//
+// Question this answers: did UEFI POST run ATOM_CMD_INIT on this dGPU?
+//
+// amdgpu's gate (amdgpu_atombios.c:amdgpu_atombios_scratch_need_asic_init):
+//
+//     u32 tmp = RREG32(adev->bios_scratch_reg_offset + 7);
+//     if (tmp & ATOM_S7_ASIC_INIT_COMPLETE_MASK)   // 0x00000200, bit 9
+//         return false;   // skip asic_init (UEFI already did it)
+//     else
+//         return true;    // run asic_init ourselves
+//
+// `bios_scratch_reg_offset` comes from VBIOS firmware_info_v3_1 field
+// `bios_scratch_reg_startaddr` at byte offset 0x18 within that table.
+// The value is an ABSOLUTE SMN dword address; in our BAR5 view we
+// access via `bar5 + addr * 4`.
+//
+// Outcomes:
+//   - bit 9 SET in our cold-state read   = UEFI POSTed the dGPU
+//     fully (including memory training), and amdgpu's "skip path"
+//     is the reason it appears to "just work"; we need a different
+//     entry point.
+//   - bit 9 CLEAR                         = UEFI did NOT mark asic_init
+//     complete; whatever amdgpu does next IS what trains DRAM. (Bug
+//     in either our theory or our run.)
+//
+// READ-ONLY. No writes. No BME. No PSP touch. Safe to run any time.
+
+import "../std/pcidev.mlr"
+import "../std/amdgpu_ip_discovery.mlr"
+import "../std/atom.mlr"
+import "../std/psp.mlr"
+import "../std/sys.mlr"
+
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn puts(uint64 s) -> uint32
+
+static uint64 FW_INFO_TABLE_IDX   = 4
+static uint64 FI_OFF_BIOS_SCRATCH_REG_STARTADDR = 0x18
+static uint64 ATOM_S7_ASIC_INIT_COMPLETE_MASK   = 0x00000200
+
+fn _hex32(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(96)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint8 zx = 48; unsafe { *((b + ll + 1) as uint8) = zx }
+    uint8 xc = 120; unsafe { *((b + ll + 2) as uint8) = xc }
+    uint64 j = 0
+    while j < 8 {
+        uint64 sh = (7 - j) * 4
+        uint64 nyb = (v >> sh) & 0xF
+        uint8 ch = nyb + 48
+        if nyb >= 10 { ch = nyb + 87 }
+        unsafe { *((b + ll + 3 + j) as uint8) = ch }
+        j = j + 1
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 11) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+fn _dec(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(96)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint64 digits = 0
+    if v == 0 {
+        uint8 z = 48; unsafe { *((b + ll + 1) as uint8) = z }; digits = 1
+    } else {
+        uint64 t = v
+        while t > 0 { digits = digits + 1; t = t / 10 }
+        uint64 k = digits
+        t = v
+        while k > 0 {
+            k = k - 1
+            uint64 d = t - (t / 10) * 10
+            uint8 db = d + 48
+            unsafe { *((b + ll + 1 + k) as uint8) = db }
+            t = t / 10
+        }
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 1 + digits) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+fn main() {
+    puts("phase3_eta3n_bios_scratch_probe (η.3n, READ-ONLY)")
+
+    // ---- load VBIOS (file-only, no GPU MMIO yet) ----
+    uint64 bp = alloc(8); unsafe { *(bp as uint64) = 0 }
+    uint64 sp = alloc(8); unsafe { *(sp as uint64) = 0 }
+    uint64 le = atom_load_image("/tmp/mlrift_vbios.rom", bp, sp)
+    if le != 0 { _dec("FAIL atom_load_image", 20, le); exit(1) }
+    uint64 vbios_buf = 0; unsafe { *(bp as uint64) -> vbios_buf }
+    uint64 vbios_sz  = 0; unsafe { *(sp as uint64) -> vbios_sz }
+    dealloc(bp); dealloc(sp)
+    _dec("vbios_sz", 8, vbios_sz)
+
+    // ---- find firmware_info data table, read bios_scratch_reg_startaddr ----
+    uint64 fi_off = atom_data_table_offset_by_index(vbios_buf, FW_INFO_TABLE_IDX)
+    if fi_off == 0 { puts("FAIL: firmware_info data table not present"); exit(2) }
+    _hex32("firmware_info_off", 18, fi_off)
+
+    uint32 bsr32 = 0
+    unsafe { *((vbios_buf + fi_off + FI_OFF_BIOS_SCRATCH_REG_STARTADDR) as uint32) -> bsr32 }
+    uint64 bios_scratch_reg_addr = bsr32
+    _hex32("bios_scratch_reg_addr", 21, bios_scratch_reg_addr)
+
+    if bios_scratch_reg_addr == 0 {
+        puts("WARN: bios_scratch_reg_startaddr == 0 (VBIOS doesn't expose it)")
+    }
+
+    // ---- vfio + BAR5 (READ-ONLY — no BME, no writes) ----
+    uint64 oe = pci_open("0000:03:00.0", 14)
+    if oe != 0 { _dec("FAIL pci_open", 13, oe); exit(3) }
+    amdgpu_load_navi32_bases()
+    uint64 bar5 = pci_map_bar(PCI_BAR5_REGION_INDEX)
+    if bar5 == PCI_MAP_FAILED_SENTINEL { puts("FAIL BAR5"); pci_close(); exit(4) }
+
+    // Sanity: confirm PSP-side state (does NOT touch BIOS_SCRATCH).
+    _hex32("PSP_C2PMSG_35", 13, psp_bootloader_status_raw(bar5))
+    _hex32("PSP_C2PMSG_58", 13, psp_read32(bar5, PSP_REG_C2PMSG_58))
+    _hex32("PSP_C2PMSG_81", 13, psp_read32(bar5, PSP_REG_C2PMSG_81))
+
+    // ---- read BIOS_SCRATCH[0..7] dwords ----
+    puts("--- BIOS_SCRATCH[0..7] (dword absolute SMN addrs from firmware_info) ---")
+    uint64 i = 0
+    uint64 s7 = 0
+    while i < 8 {
+        uint64 byte_off = (bios_scratch_reg_addr + i) * 4
+        uint32 v32 = 0
+        unsafe { *((bar5 + byte_off) as uint32) -> v32 }
+        uint64 v = v32
+        // Print as "SCRATCH_N=0xVVVVVVVV"
+        uint64 lab = alloc(16)
+        uint64 li = 0
+        uint8 c
+        c =  83; unsafe { *((lab + li) as uint8) = c }; li = li + 1   // S
+        c =  67; unsafe { *((lab + li) as uint8) = c }; li = li + 1   // C
+        c =  82; unsafe { *((lab + li) as uint8) = c }; li = li + 1   // R
+        c =  65; unsafe { *((lab + li) as uint8) = c }; li = li + 1   // A
+        c =  84; unsafe { *((lab + li) as uint8) = c }; li = li + 1   // T
+        c =  67; unsafe { *((lab + li) as uint8) = c }; li = li + 1   // C
+        c =  72; unsafe { *((lab + li) as uint8) = c }; li = li + 1   // H
+        c =  95; unsafe { *((lab + li) as uint8) = c }; li = li + 1   // _
+        uint8 dch = i + 48
+        unsafe { *((lab + li) as uint8) = dch }; li = li + 1
+        uint8 nul = 0; unsafe { *((lab + li) as uint8) = nul }
+        _hex32(lab, li, v)
+        dealloc(lab)
+        if i == 7 { s7 = v }
+        i = i + 1
+    }
+
+    // ---- verdict on ATOM_S7_ASIC_INIT_COMPLETE_MASK ----
+    puts("--- VERDICT ---")
+    _hex32("BIOS_SCRATCH_7_raw",      18, s7)
+    _hex32("ASIC_INIT_COMPLETE_mask", 23, ATOM_S7_ASIC_INIT_COMPLETE_MASK)
+    uint64 masked = s7 & ATOM_S7_ASIC_INIT_COMPLETE_MASK
+    _hex32("masked_bit9",             11, masked)
+
+    if masked != 0 {
+        puts("==>>> ATOM_S7_ASIC_INIT_COMPLETE bit SET <<<==")
+        puts("UEFI POSTed the dGPU including AsicInit.")
+        puts("amdgpu's 'need_post' returns FALSE — it SKIPS asic_init.")
+        puts("This means amdgpu's success path depends on UEFI having done DRAM training.")
+        puts("Our cold-boot wall = UEFI is not running asic_init when iGPU is primary.")
+    }
+    if masked == 0 {
+        puts("==>>> ATOM_S7_ASIC_INIT_COMPLETE bit CLEAR <<<==")
+        puts("UEFI did NOT mark asic_init complete.")
+        puts("On a real boot amdgpu would RUN asic_init now via its atom interpreter.")
+        puts("But η.3m proved asic_init is a 256-byte stub on this VBIOS — so amdgpu")
+        puts("can't be training DRAM that way either. Cold-boot mechanism remains")
+        puts("genuinely unknown.")
+    }
+
+    pci_close()
+    dealloc(vbios_buf)
+    exit(0)
+}

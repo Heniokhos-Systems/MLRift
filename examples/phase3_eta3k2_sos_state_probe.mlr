@@ -1,0 +1,250 @@
+// Phase 3 slice η.3k-2 — read-only SOS state probe.
+//
+// η.3k-1 (DRAM_LONG_TRAIN) proved DRAM_LONG_TRAIN is a no-op stub on
+// psp_13_0_10 (1 ms ack with no error bits but MEMSIZE=0). 10 hypotheses
+// ruled out. Cold-boot wall is NOT a missing PSP_BL command.
+//
+// This smoke does NOT touch the PSP — purely READ-ONLY. It captures the
+// post-η.3k-1 SOS-stalled state: SOS started (C2PMSG_58=0x00320d17) but
+// SoL (C2PMSG_81) is 0. Question: is SOS still RUNNING (making
+// observable progress), or is it WEDGED (no register changes)?
+//
+// We sample the entire MP0 register block (dwords 0x00..0x100, i.e.
+// BAR5 byte offsets 0x58000..0x58400) at ~200ms intervals for ~10s
+// (50 samples). For each register we report:
+//   - non-zero values at sample 0
+//   - any register that CHANGES between samples (with first/last value)
+//
+// Special interest:
+//   - Dword 0x36 (= PSP-view SMN 0x032000d8 under 1:1 mapping): the
+//     SOS debug status register we found in η.3j-RE-3 helper 0x1d50.
+//     If SOS is making progress, this should tick.
+//   - C2PMSG_58 (dword 0x7a): SOS version, sanity check stays
+//     0x00320d17.
+//   - C2PMSG_81 (dword 0x91): SoL — should remain 0 in current state.
+//   - C2PMSG_35 (dword 0x63): BL state, expect 0 (BL has handed off).
+//
+// READ-ONLY. No writes to any MMIO. No PSP reset. Safe to run in the
+// current PSP-stalled state — no cold cycle consumed.
+
+import "../std/pcidev.mlr"
+import "../std/amdgpu_ip_discovery.mlr"
+import "../std/psp.mlr"
+import "../std/sys.mlr"
+
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn puts(uint64 s) -> uint32
+
+fn _hex32(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(96)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint8 zx = 48; unsafe { *((b + ll + 1) as uint8) = zx }
+    uint8 xc = 120; unsafe { *((b + ll + 2) as uint8) = xc }
+    uint64 j = 0
+    while j < 8 {
+        uint64 sh = (7 - j) * 4
+        uint64 nyb = (v >> sh) & 0xF
+        uint8 ch = nyb + 48
+        if nyb >= 10 { ch = nyb + 87 }
+        unsafe { *((b + ll + 3 + j) as uint8) = ch }
+        j = j + 1
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 11) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+fn _dec(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(96)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint64 digits = 0
+    if v == 0 {
+        uint8 z = 48; unsafe { *((b + ll + 1) as uint8) = z }; digits = 1
+    } else {
+        uint64 t = v
+        while t > 0 { digits = digits + 1; t = t / 10 }
+        uint64 k = digits
+        t = v
+        while k > 0 {
+            k = k - 1
+            uint64 d = t - (t / 10) * 10
+            uint8 db = d + 48
+            unsafe { *((b + ll + 1 + k) as uint8) = db }
+            t = t / 10
+        }
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 1 + digits) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+// Print "reg[dword=0xXXX] = 0xVVVVVVVV  (C2PMSG_NN if applicable)"
+fn _print_reg(uint64 dw, uint64 val) {
+    // label: "reg[dword=0x__ ]"
+    uint64 lab = alloc(32)
+    uint64 li = 0
+    // "reg[dw=0x" — 9 chars
+    uint8 c
+    c = 114; unsafe { *((lab + li) as uint8) = c }; li = li + 1   // r
+    c = 101; unsafe { *((lab + li) as uint8) = c }; li = li + 1   // e
+    c = 103; unsafe { *((lab + li) as uint8) = c }; li = li + 1   // g
+    c =  91; unsafe { *((lab + li) as uint8) = c }; li = li + 1   // [
+    c = 100; unsafe { *((lab + li) as uint8) = c }; li = li + 1   // d
+    c = 119; unsafe { *((lab + li) as uint8) = c }; li = li + 1   // w
+    c =  61; unsafe { *((lab + li) as uint8) = c }; li = li + 1   // =
+    c =  48; unsafe { *((lab + li) as uint8) = c }; li = li + 1   // 0
+    c = 120; unsafe { *((lab + li) as uint8) = c }; li = li + 1   // x
+    // hex of dw (3 digits)
+    uint64 j = 0
+    while j < 3 {
+        uint64 sh = (2 - j) * 4
+        uint64 nyb = (dw >> sh) & 0xF
+        uint8 ch = nyb + 48
+        if nyb >= 10 { ch = nyb + 87 }
+        unsafe { *((lab + li + j) as uint8) = ch }
+        j = j + 1
+    }
+    li = li + 3
+    c = 93; unsafe { *((lab + li) as uint8) = c }; li = li + 1    // ]
+    uint8 nul = 0; unsafe { *((lab + li) as uint8) = nul }
+    _hex32(lab, li, val)
+    dealloc(lab)
+}
+
+fn _msleep(uint64 ms) {
+    uint64 ts = alloc(16)
+    unsafe { *((ts + 0) as uint64) = ms / 1000 }
+    unsafe { *((ts + 8) as uint64) = (ms - (ms / 1000) * 1000) * 1000000 }
+    syscall_raw(35, ts, 0, 0, 0, 0, 0)
+    dealloc(ts)
+}
+
+fn main() {
+    puts("phase3_eta3k2_sos_state_probe (η.3k-2, READ-ONLY)")
+
+    uint64 oe = pci_open("0000:03:00.0", 14)
+    if oe != 0 { _dec("FAIL pci_open", 13, oe); exit(3) }
+    amdgpu_load_navi32_bases()
+    uint64 bar5 = pci_map_bar(PCI_BAR5_REGION_INDEX)
+    if bar5 == PCI_MAP_FAILED_SENTINEL { puts("FAIL BAR5"); pci_close(); exit(4) }
+
+    // We do NOT set bus master — read-only. NOT touch the PSP.
+
+    puts("--- baseline state (sanity) ---")
+    _hex32("C2PMSG_35", 9, psp_read32(bar5, PSP_REG_C2PMSG_35))
+    _hex32("C2PMSG_58", 9, psp_read32(bar5, PSP_REG_C2PMSG_58))
+    _hex32("C2PMSG_81", 9, psp_read32(bar5, PSP_REG_C2PMSG_81))
+
+    // Scan range: dword index 0x00..0x100 inside the MP0 SOC15 base.
+    // Byte address = bar5 + (amdgpu_ip_mp0_base_0 + dw) * 4
+    //              = bar5 + (0x16000 + dw) * 4
+    uint64 N = 0x100
+    uint64 base_byte = amdgpu_ip_mp0_base_0 * 4
+    // base_byte = 0x58000
+
+    // Sample 0: read all N dwords into baseline buffer.
+    uint64 baseline = alloc(N * 4)
+    uint64 i = 0
+    while i < N {
+        uint32 v32 = 0
+        unsafe { *((bar5 + base_byte + i * 4) as uint32) -> v32 }
+        uint64 v = v32
+        unsafe { *((baseline + i * 8) as uint64) = v }
+        i = i + 1
+    }
+
+    puts("--- sample 0 (non-zero regs in MP0 dword 0x00..0x100) ---")
+    uint64 nz0 = 0
+    i = 0
+    while i < N {
+        uint64 v = 0; unsafe { *((baseline + i * 8) as uint64) -> v }
+        if v != 0 {
+            _print_reg(i, v)
+            nz0 = nz0 + 1
+        }
+        i = i + 1
+    }
+    _dec("nonzero_count_sample0", 21, nz0)
+
+    // Now sample S more times at ~200ms intervals; track per-register
+    // max-seen and any change. To stay tight on memory, we keep a
+    // "last_seen" buffer plus a "changed_mask" buffer.
+    uint64 S = 50
+    uint64 last_seen = alloc(N * 8)
+    uint64 changed   = alloc(N * 8)
+    uint64 distinct_count = alloc(N * 8)
+    i = 0
+    while i < N {
+        uint64 v = 0; unsafe { *((baseline + i * 8) as uint64) -> v }
+        unsafe { *((last_seen + i * 8) as uint64) = v }
+        unsafe { *((changed   + i * 8) as uint64) = 0 }
+        unsafe { *((distinct_count + i * 8) as uint64) = 1 }
+        i = i + 1
+    }
+
+    puts("--- sampling MP0 dword 0x00..0x100 50x over ~10s ---")
+    uint64 s = 1
+    while s < S {
+        _msleep(200)
+        i = 0
+        while i < N {
+            uint32 v32 = 0
+            unsafe { *((bar5 + base_byte + i * 4) as uint32) -> v32 }
+            uint64 v = v32
+            uint64 prev = 0; unsafe { *((last_seen + i * 8) as uint64) -> prev }
+            if v != prev {
+                uint64 cnt = 0; unsafe { *((changed + i * 8) as uint64) -> cnt }
+                unsafe { *((changed + i * 8) as uint64) = cnt + 1 }
+                uint64 dc = 0; unsafe { *((distinct_count + i * 8) as uint64) -> dc }
+                unsafe { *((distinct_count + i * 8) as uint64) = dc + 1 }
+                unsafe { *((last_seen + i * 8) as uint64) = v }
+            }
+            i = i + 1
+        }
+        s = s + 1
+    }
+
+    puts("--- changed registers (delta between sample 0 and sample 49) ---")
+    uint64 changed_count = 0
+    i = 0
+    while i < N {
+        uint64 ch = 0; unsafe { *((changed + i * 8) as uint64) -> ch }
+        if ch != 0 {
+            uint64 first = 0; unsafe { *((baseline + i * 8) as uint64) -> first }
+            uint64 last  = 0; unsafe { *((last_seen + i * 8) as uint64) -> last  }
+            uint64 dc    = 0; unsafe { *((distinct_count + i * 8) as uint64) -> dc }
+            // print as: "reg[dw=0xXXX] first=0xV last=0xV changes=N distinct=N"
+            _print_reg(i, first)
+            _hex32("    last",      8, last)
+            _dec("    n_transitions", 17, ch)
+            _dec("    distinct_vals", 17, dc)
+            changed_count = changed_count + 1
+        }
+        i = i + 1
+    }
+    _dec("changed_reg_count", 17, changed_count)
+
+    if changed_count == 0 {
+        puts("VERDICT: NO MP0 REGISTER CHANGED over 10s — SOS is WEDGED in TIGHT LOOP or HALTED.")
+        puts("  Static state for at least 10s suggests SOS is not making observable progress")
+        puts("  through C2PMSG-visible state machine.")
+    }
+    if changed_count != 0 {
+        puts("VERDICT: SOS IS LIVE — some MP0 register(s) tick. Investigate the changed regs above.")
+    }
+
+    dealloc(baseline)
+    dealloc(last_seen)
+    dealloc(changed)
+    dealloc(distinct_count)
+    pci_close()
+    exit(0)
+}
