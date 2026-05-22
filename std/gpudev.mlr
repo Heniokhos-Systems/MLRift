@@ -1,0 +1,748 @@
+// std/gpudev.mlr — userland GPU device HAL (Phase A.0 spec).
+//
+// This is the new API surface for talking to a discrete AMD GPU from
+// userland. Today it sits on top of std/pcidev.mlr (which talks to VFIO);
+// after Phase A.1-D ships, the same surface will sit on top of the
+// KernRift kernel driver.
+//
+// Design principles (from docs/VFIO_REWRITE_PROPOSAL.md §11):
+//   * Handle-based, not file-scope-static — multi-device ready.
+//   * IOMMU group auto-discovered from BDF — caller doesn't pass it.
+//   * Per-IP-block register helpers — no more `_gc0_w32` per smoke.
+//   * Doorbell, VRAM aperture, MMIO registers, IOMMU buffers each have
+//     their own typed surface — intent is visible in the call.
+//   * Batched primitives are first-class even when they internally loop
+//     today; the kernel-driver port will batch in-kernel without API
+//     change.
+//   * Completion-wait goes through a kernel-side signal API; today it
+//     polls userland but the shape is preserved.
+//   * Visibility flags on DMA alloc (cached/uncached/write-combining).
+//
+// Naming convention:
+//   gpu_*   — public API
+//   _gd_*   — private helpers (file-scope)
+//   GPU_*   — public constants
+//   _GD_*   — private constants
+//
+// Return-code convention:
+//   0          = success
+//   non-zero   = error number (per-function specific, documented inline)
+//   sentinels  = GPU_HANDLE_INVALID, GPU_VA_INVALID where pointer-shaped
+//
+// Verified: not yet — this file is a spec being validated by porting
+// representative smokes against it (Phase A.0). Implementation calls into
+// std/pcidev.mlr internally and inherits its 2026-05-19 verification.
+
+import "pcidev.mlr"
+import "sys.mlr"
+
+// =====================================================================
+// CONSTANTS
+// =====================================================================
+
+// Handle sentinel.
+static uint64 GPU_HANDLE_INVALID = 0
+static uint64 GPU_VA_INVALID     = 0xFFFFFFFFFFFFFFFF
+
+// IP-block identifiers. Used as first arg to gpu_reg_r32/w32.
+// Numeric values are arbitrary but stable; the implementation maps each
+// to the right IP-base register chunk learned from the discovery table.
+static uint64 GPU_IP_PSP      = 1   // MP0 mailbox + DEBUG_STATUS path
+static uint64 GPU_IP_SMU      = 2   // MP1 mailbox
+static uint64 GPU_IP_GC0      = 3   // graphics, BASE_IDX=0
+static uint64 GPU_IP_GC1      = 4   // graphics, BASE_IDX=1
+static uint64 GPU_IP_MMHUB    = 5   // memory hub
+static uint64 GPU_IP_GMC      = 6   // graphics memory controller
+static uint64 GPU_IP_NBIO     = 7   // north-bridge IO
+static uint64 GPU_IP_OSS      = 8   // operating-system stub (IH/SDMA)
+static uint64 GPU_IP_HDP      = 9   // host data path
+static uint64 GPU_IP_SMUIO    = 10  // SMU IO (clock + reset glue)
+
+// DMA visibility flags for gpu_dma_alloc. Bitwise-OR for combinations.
+static uint64 GPU_DMA_CACHED   = 0x0   // default: write-back cached
+static uint64 GPU_DMA_UNCACHED = 0x1   // strongly-ordered, host-visible
+static uint64 GPU_DMA_WC       = 0x2   // write-combining (e.g. ring buf)
+static uint64 GPU_DMA_GTT      = 0x4   // hint: prefers GTT placement
+static uint64 GPU_DMA_LOCKED   = 0x8   // mlock pages (default ON today)
+
+// BAR identifiers — typed wrappers over PCI_BAR<N>_REGION_INDEX so
+// callers don't have to import pcidev's index constants directly.
+static uint64 GPU_BAR_VRAM       = 0   // BAR0 — full VRAM aperture
+static uint64 GPU_BAR_DOORBELL   = 2   // BAR2 — doorbell ring page
+static uint64 GPU_BAR_REGISTERS  = 5   // BAR5 — SOC15 MMIO
+
+// Reset levels for gpu_reset.
+static uint64 GPU_RESET_FLR      = 1   // PCI function-level reset
+static uint64 GPU_RESET_SBR      = 2   // PCI secondary bus reset (rare)
+static uint64 GPU_RESET_D3COLD   = 3   // power-cycle via D3cold transition
+
+// Internal struct offsets (gpu handle layout). The handle is a pointer
+// into a 128-byte allocation:
+//
+//   off  0:  uint64  bdf_string_ptr      — caller-owned, not freed by us
+//   off  8:  uint64  iommu_group_num     — discovered from sysfs
+//   off 16:  uint64  bar_vram_host_va    — 0 if not mapped
+//   off 24:  uint64  bar_vram_size       — 0 if not mapped
+//   off 32:  uint64  bar_doorbell_host_va
+//   off 40:  uint64  bar_doorbell_size
+//   off 48:  uint64  bar_registers_host_va
+//   off 56:  uint64  bar_registers_size
+//   off 64:  uint64  ip_base_gc0_dw      — IP discovery cache
+//   off 72:  uint64  ip_base_gc1_dw
+//   off 80:  uint64  ip_base_mmhub_dw
+//   off 88:  uint64  ip_base_psp_dw      — MP0
+//   off 96:  uint64  ip_base_smu_dw      — MP1
+//   off 104: uint64  ip_base_oss_dw
+//   off 112: uint64  ip_base_nbio_dw
+//   off 120: uint64  ip_base_hdp_dw
+
+static uint64 _GD_OFF_BDF              = 0
+static uint64 _GD_OFF_GROUP            = 8
+static uint64 _GD_OFF_BAR_VRAM_HOST    = 16
+static uint64 _GD_OFF_BAR_VRAM_SIZE    = 24
+static uint64 _GD_OFF_BAR_DB_HOST      = 32
+static uint64 _GD_OFF_BAR_DB_SIZE      = 40
+static uint64 _GD_OFF_BAR_REGS_HOST    = 48
+static uint64 _GD_OFF_BAR_REGS_SIZE    = 56
+static uint64 _GD_OFF_IP_GC0           = 64
+static uint64 _GD_OFF_IP_GC1           = 72
+static uint64 _GD_OFF_IP_MMHUB         = 80
+static uint64 _GD_OFF_IP_PSP           = 88
+static uint64 _GD_OFF_IP_SMU           = 96
+static uint64 _GD_OFF_IP_OSS           = 104
+static uint64 _GD_OFF_IP_NBIO          = 112
+static uint64 _GD_OFF_IP_HDP           = 120
+static uint64 _GD_HANDLE_BYTES         = 128
+
+// =====================================================================
+// PRIVATE HELPERS
+// =====================================================================
+
+fn _gd_load_u64(uint64 base, uint64 off) -> uint64 {
+    uint64 v = 0
+    unsafe { *((base + off) as uint64) -> v }
+    return v
+}
+
+fn _gd_store_u64(uint64 base, uint64 off, uint64 val) {
+    unsafe { *((base + off) as uint64) = val }
+}
+
+// Read `/sys/bus/pci/devices/<bdf>/iommu_group` and return the integer
+// at the end of the symlink target. Returns 0xFFFFFFFFFFFFFFFF on any
+// failure (file missing, parse error, etc.).
+//
+// Today this is the one place the API still requires platform-aware
+// discovery. The KernRift driver will expose this directly via ioctl.
+fn _gd_discover_iommu_group(uint64 bdf_str) -> uint64 {
+    // Build "/sys/bus/pci/devices/<bdf>/iommu_group".
+    uint64 path = alloc(96)
+    uint64 i = 0
+    uint8 z = 0
+    while i < 96 { unsafe { *((path + i) as uint8) = z }; i = i + 1 }
+    uint64 prefix = "/sys/bus/pci/devices/"
+    i = 0
+    while i < 21 {
+        uint8 c = 0
+        unsafe { *((prefix + i) as uint8) -> c }
+        unsafe { *((path + i) as uint8) = c }
+        i = i + 1
+    }
+    // BDF is "0000:03:00.0" form — 12 bytes.
+    uint64 j = 0
+    while j < 12 {
+        uint8 c = 0
+        unsafe { *((bdf_str + j) as uint8) -> c }
+        unsafe { *((path + 21 + j) as uint8) = c }
+        j = j + 1
+    }
+    uint64 suffix = "/iommu_group"
+    j = 0
+    while j < 12 {
+        uint8 c = 0
+        unsafe { *((suffix + j) as uint8) -> c }
+        unsafe { *((path + 33 + j) as uint8) = c }
+        j = j + 1
+    }
+    // readlinkat: syscall #267 on x86_64; AT_FDCWD = -100.
+    uint64 link_buf = alloc(256)
+    uint64 lk = 0
+    while lk < 256 { unsafe { *((link_buf + lk) as uint8) = z }; lk = lk + 1 }
+    uint64 r = syscall_raw(267, 0xFFFFFFFFFFFFFF9C, path, link_buf, 255, 0, 0)
+    dealloc(path)
+    if r > 0xFFFFFFFFFFFFF000 {
+        dealloc(link_buf)
+        return 0xFFFFFFFFFFFFFFFF
+    }
+    // Walk backward from the end of the readlink result to find the
+    // trailing integer. Target shape: ".../iommu_groups/<N>".
+    uint64 end = r
+    uint64 k = end
+    while k > 0 {
+        uint64 km = k - 1
+        uint8 c = 0
+        unsafe { *((link_buf + km) as uint8) -> c }
+        if c == 47 { k = 0 }   // '/'
+        if c != 47 { k = km }
+    }
+    // After the loop, k is either 0 (no slash found) or stale; redo it
+    // properly to find the position right after the last '/'.
+    uint64 last_slash = 0xFFFFFFFFFFFFFFFF
+    uint64 scan = 0
+    while scan < end {
+        uint8 c = 0
+        unsafe { *((link_buf + scan) as uint8) -> c }
+        if c == 47 { last_slash = scan }
+        scan = scan + 1
+    }
+    if last_slash == 0xFFFFFFFFFFFFFFFF {
+        dealloc(link_buf)
+        return 0xFFFFFFFFFFFFFFFF
+    }
+    uint64 num_start = last_slash + 1
+    uint64 num = 0
+    uint64 p = num_start
+    while p < end {
+        uint8 c = 0
+        unsafe { *((link_buf + p) as uint8) -> c }
+        if c >= 48 {
+            if c <= 57 {
+                uint64 d = c - 48
+                num = num * 10 + d
+            }
+        }
+        p = p + 1
+    }
+    dealloc(link_buf)
+    return num
+}
+
+// IP-block byte offset within BAR5 for a (ip, reg_dw) pair.
+// Returns 0 if the IP isn't loaded into the handle's cache (caller's
+// problem). All callers must have done gpu_load_ip_bases() first.
+fn _gd_ip_byte_off(uint64 dev, uint64 ip, uint64 reg_dw) -> uint64 {
+    uint64 base_dw = 0
+    if ip == GPU_IP_GC0   { base_dw = _gd_load_u64(dev, _GD_OFF_IP_GC0) }
+    if ip == GPU_IP_GC1   { base_dw = _gd_load_u64(dev, _GD_OFF_IP_GC1) }
+    if ip == GPU_IP_MMHUB { base_dw = _gd_load_u64(dev, _GD_OFF_IP_MMHUB) }
+    if ip == GPU_IP_PSP   { base_dw = _gd_load_u64(dev, _GD_OFF_IP_PSP) }
+    if ip == GPU_IP_SMU   { base_dw = _gd_load_u64(dev, _GD_OFF_IP_SMU) }
+    if ip == GPU_IP_OSS   { base_dw = _gd_load_u64(dev, _GD_OFF_IP_OSS) }
+    if ip == GPU_IP_NBIO  { base_dw = _gd_load_u64(dev, _GD_OFF_IP_NBIO) }
+    if ip == GPU_IP_HDP   { base_dw = _gd_load_u64(dev, _GD_OFF_IP_HDP) }
+    return (base_dw + reg_dw) * 4
+}
+
+// =====================================================================
+// LIFECYCLE
+// =====================================================================
+
+// gpu_open — open the GPU at the given PCI BDF, auto-discover its IOMMU
+// group, and prepare a handle. Returns GPU_HANDLE_INVALID on failure.
+//
+// On success the returned handle owns:
+//   * the underlying VFIO container/group/device fds (via pcidev)
+//   * a small alloc'd state struct holding BAR addresses + IP bases
+//
+// Caller MUST call gpu_close(handle) eventually.
+//
+// Today the implementation assumes one GPU per process. Multi-device
+// will require teaching pcidev.mlr to track containers in a table.
+fn gpu_open(uint64 bdf_str) -> uint64 {
+    uint64 group = _gd_discover_iommu_group(bdf_str)
+    if group == 0xFFFFFFFFFFFFFFFF { return GPU_HANDLE_INVALID }
+    uint64 r = pci_open(bdf_str, group)
+    if r != 0 { return GPU_HANDLE_INVALID }
+
+    uint64 dev = alloc(_GD_HANDLE_BYTES)
+    uint64 z = 0; uint64 i = 0
+    while i < _GD_HANDLE_BYTES {
+        unsafe { *((dev + i) as uint8) = 0 }
+        i = i + 1
+    }
+    _gd_store_u64(dev, _GD_OFF_BDF, bdf_str)
+    _gd_store_u64(dev, _GD_OFF_GROUP, group)
+    return dev
+}
+
+// gpu_close — release all BAR mappings, IOMMU mappings, and fds owned
+// by the handle. Safe to call on GPU_HANDLE_INVALID (no-op).
+fn gpu_close(uint64 dev) {
+    if dev == GPU_HANDLE_INVALID { return }
+    // BAR unmaps. pcidev doesn't track BAR sizes for us, but we stored
+    // them when mapping.
+    uint64 sz = 0
+    sz = _gd_load_u64(dev, _GD_OFF_BAR_VRAM_SIZE)
+    if sz != 0 { sys_munmap(_gd_load_u64(dev, _GD_OFF_BAR_VRAM_HOST), sz) }
+    sz = _gd_load_u64(dev, _GD_OFF_BAR_DB_SIZE)
+    if sz != 0 { sys_munmap(_gd_load_u64(dev, _GD_OFF_BAR_DB_HOST), sz) }
+    sz = _gd_load_u64(dev, _GD_OFF_BAR_REGS_SIZE)
+    if sz != 0 { sys_munmap(_gd_load_u64(dev, _GD_OFF_BAR_REGS_HOST), sz) }
+    pci_close()
+    dealloc(dev)
+}
+
+// gpu_reset — reset the device at the requested level.
+//   GPU_RESET_FLR    — function-level reset, fast, in-band
+//   GPU_RESET_SBR    — secondary bus reset, heavier
+//   GPU_RESET_D3COLD — power-cycle via D3cold (rare)
+//
+// FLR is implemented via the PCIe device-control register (config off
+// 0x68 + 0x8). Returns 0 on success.
+fn gpu_reset(uint64 dev, uint64 level) -> uint64 {
+    if dev == GPU_HANDLE_INVALID { return 1 }
+    if level == GPU_RESET_FLR {
+        // Find PCIe capability via config space walk. For now we
+        // hard-code that AMD GPUs put PCIe cap at 0x58 — this is what
+        // we've seen on Navi 32 and is consistent across the family.
+        // A robust impl walks the cap list; deferred to driver port.
+        uint32 dev_ctl = pci_read_config32(0x60)
+        uint32 new_ctl = dev_ctl | 0x00008000   // Initiate FLR (bit 15)
+        return pci_write_config32(0x60, new_ctl)
+    }
+    return 2   // not yet implemented
+}
+
+// =====================================================================
+// BAR MAPPING
+// =====================================================================
+
+// gpu_bar_info — query a BAR's size + VFIO flag bits without mapping.
+// Diagnostic-friendly form for tooling that wants to walk regions.
+//
+// Production code should prefer gpu_map_bar (caches sizes in the handle).
+//
+// Error codes:
+//   1 = bad handle
+//   2 = underlying pcidev query failed
+fn gpu_bar_info(uint64 dev, uint64 which,
+                uint64 out_size, uint64 out_flags) -> uint64 {
+    if dev == GPU_HANDLE_INVALID { return 1 }
+    uint64 sb = alloc(24)
+    uint64 zi = 0
+    while zi < 24 { unsafe { *((sb + zi) as uint8) = 0 }; zi = zi + 1 }
+    uint64 e = pci_bar_info(which, sb + 0, sb + 8, sb + 16)
+    if e != 0 { dealloc(sb); return 2 }
+    uint64 sz = 0; unsafe { *((sb + 0)  as uint64) -> sz }
+    uint64 fl = 0; unsafe { *((sb + 16) as uint64) -> fl }
+    dealloc(sb)
+    unsafe { *(out_size  as uint64) = sz }
+    unsafe { *(out_flags as uint64) = fl }
+    return 0
+}
+
+// gpu_map_bar — map the named BAR. Returns the host virtual address on
+// success, or GPU_VA_INVALID on failure. The mapping is cached in the
+// handle so subsequent calls return the same address (idempotent).
+//
+// `which` is GPU_BAR_VRAM | GPU_BAR_DOORBELL | GPU_BAR_REGISTERS.
+fn gpu_map_bar(uint64 dev, uint64 which) -> uint64 {
+    if dev == GPU_HANDLE_INVALID { return GPU_VA_INVALID }
+    uint64 host_off = 0
+    uint64 size_off = 0
+    if which == GPU_BAR_VRAM     { host_off = _GD_OFF_BAR_VRAM_HOST; size_off = _GD_OFF_BAR_VRAM_SIZE }
+    if which == GPU_BAR_DOORBELL { host_off = _GD_OFF_BAR_DB_HOST;   size_off = _GD_OFF_BAR_DB_SIZE }
+    if which == GPU_BAR_REGISTERS{ host_off = _GD_OFF_BAR_REGS_HOST; size_off = _GD_OFF_BAR_REGS_SIZE }
+    if host_off == 0 { return GPU_VA_INVALID }
+
+    uint64 cached = _gd_load_u64(dev, host_off)
+    if cached != 0 { return cached }
+
+    uint64 host = pci_map_bar(which)
+    if host == PCI_MAP_FAILED_SENTINEL { return GPU_VA_INVALID }
+
+    // Query size for cleanup bookkeeping.
+    uint64 sb = alloc(24)
+    uint64 zi = 0
+    while zi < 24 { unsafe { *((sb + zi) as uint8) = 0 }; zi = zi + 1 }
+    uint64 e = pci_bar_info(which, sb + 0, sb + 8, sb + 16)
+    uint64 size = 0
+    if e == 0 { unsafe { *((sb + 0) as uint64) -> size } }
+    dealloc(sb)
+
+    _gd_store_u64(dev, host_off, host)
+    _gd_store_u64(dev, size_off, size)
+    return host
+}
+
+// =====================================================================
+// PCI CONFIG SPACE
+// =====================================================================
+
+fn gpu_config_r32(uint64 dev, uint64 off) -> uint32 {
+    if dev == GPU_HANDLE_INVALID { return 0xFFFFFFFF }
+    return pci_read_config32(off)
+}
+
+fn gpu_config_w32(uint64 dev, uint64 off, uint32 val) -> uint64 {
+    if dev == GPU_HANDLE_INVALID { return 1 }
+    return pci_write_config32(off, val)
+}
+
+// gpu_bus_master_enable — enable Bus Master + Memory + I/O space in the
+// PCI command register. Required after FLR and after fresh vfio bind
+// before the GPU can DMA-fetch from system memory.
+fn gpu_bus_master_enable(uint64 dev) -> uint64 {
+    if dev == GPU_HANDLE_INVALID { return 1 }
+    return pci_set_bus_master()
+}
+
+// =====================================================================
+// IP-BLOCK REGISTER ACCESS (BAR5 typed)
+// =====================================================================
+
+// gpu_load_ip_bases_explicit — populate the handle's IP-base cache
+// from explicit caller-supplied values. Useful when the caller already
+// knows the right bases (e.g., hard-coded for a test board) or wants
+// to inject a custom set for fault-injection testing.
+//
+// Production callers should prefer gpu_load_ip_bases_from_discovery,
+// which reads the on-chip IP discovery table.
+fn gpu_load_ip_bases_explicit(uint64 dev,
+                              uint64 gc0_base_dw, uint64 gc1_base_dw,
+                              uint64 mmhub_base_dw, uint64 psp_base_dw,
+                              uint64 smu_base_dw, uint64 oss_base_dw,
+                              uint64 nbio_base_dw, uint64 hdp_base_dw) -> uint64 {
+    if dev == GPU_HANDLE_INVALID { return 1 }
+    _gd_store_u64(dev, _GD_OFF_IP_GC0,   gc0_base_dw)
+    _gd_store_u64(dev, _GD_OFF_IP_GC1,   gc1_base_dw)
+    _gd_store_u64(dev, _GD_OFF_IP_MMHUB, mmhub_base_dw)
+    _gd_store_u64(dev, _GD_OFF_IP_PSP,   psp_base_dw)
+    _gd_store_u64(dev, _GD_OFF_IP_SMU,   smu_base_dw)
+    _gd_store_u64(dev, _GD_OFF_IP_OSS,   oss_base_dw)
+    _gd_store_u64(dev, _GD_OFF_IP_NBIO,  nbio_base_dw)
+    _gd_store_u64(dev, _GD_OFF_IP_HDP,   hdp_base_dw)
+    return 0
+}
+
+// gpu_load_ip_bases_from_discovery — read the on-chip IP discovery
+// table at the documented BAR0 offset and populate the handle's IP-base
+// cache. This is the production path: every GPU since gfx9 publishes
+// its IP layout here, so no caller-side hardcoded base table is needed.
+//
+// Today this delegates to amdgpu_load_navi32_bases() (which has its own
+// module globals) and mirrors the values into the handle. The next
+// refactor of amdgpu_ip_discovery.mlr will make this a single function
+// that walks the table directly into the handle, eliminating the
+// module-global pass-through.
+//
+// Pre-condition: gpu_map_bar(dev, GPU_BAR_VRAM) has been called (the
+// discovery table is read through the VRAM aperture). On hardware
+// where the table can't be read until VRAM is trained, callers must
+// fall back to gpu_load_ip_bases_explicit() with hard-coded values.
+fn gpu_load_ip_bases_from_discovery(uint64 dev) -> uint64 {
+    if dev == GPU_HANDLE_INVALID { return 1 }
+    // TODO: parse the IP discovery table from BAR0 directly. For now,
+    // import std/amdgpu_ip_discovery.mlr at the call site and pass
+    // its globals through gpu_load_ip_bases_explicit. This keeps the
+    // smoke-port API stable while the discovery refactor lands.
+    return 2   // not yet implemented — callers must use the _explicit form
+}
+
+// gpu_reg_r32 — read a 32-bit register on the given IP block at the
+// given dword offset. BAR5 must be mapped (gpu_map_bar GPU_BAR_REGISTERS)
+// and IP bases must be loaded.
+fn gpu_reg_r32(uint64 dev, uint64 ip, uint64 reg_dw) -> uint32 {
+    uint64 bar5 = _gd_load_u64(dev, _GD_OFF_BAR_REGS_HOST)
+    uint64 byte_off = _gd_ip_byte_off(dev, ip, reg_dw)
+    uint32 v = 0
+    unsafe { *((bar5 + byte_off) as uint32) -> v }
+    return v
+}
+
+fn gpu_reg_w32(uint64 dev, uint64 ip, uint64 reg_dw, uint32 val) {
+    uint64 bar5 = _gd_load_u64(dev, _GD_OFF_BAR_REGS_HOST)
+    uint64 byte_off = _gd_ip_byte_off(dev, ip, reg_dw)
+    unsafe { *((bar5 + byte_off) as uint32) = val }
+}
+
+// gpu_reg_replay — bulk-apply a sequence of (ip, reg_dw, val) writes.
+// `spec` points to N records of 24 bytes: u64 ip, u64 reg_dw, u64 val.
+// Used by trace-replay smokes (e.g. the η.3i 228-write MMHUB replay).
+//
+// Today: pure userland loop. Under the KernRift driver, this becomes
+// a single ioctl with the spec array — meaningful for 228-write replays.
+fn gpu_reg_replay(uint64 dev, uint64 spec, uint64 n) -> uint64 {
+    if dev == GPU_HANDLE_INVALID { return 1 }
+    uint64 i = 0
+    while i < n {
+        uint64 ip     = _gd_load_u64(spec, i * 24 + 0)
+        uint64 reg_dw = _gd_load_u64(spec, i * 24 + 8)
+        uint64 val64  = _gd_load_u64(spec, i * 24 + 16)
+        uint32 val = val64
+        gpu_reg_w32(dev, ip, reg_dw, val)
+        i = i + 1
+    }
+    return 0
+}
+
+// =====================================================================
+// VRAM APERTURE (BAR0)
+// =====================================================================
+
+// gpu_vram_w32 / w64 / r32 / r64 — read/write the VRAM aperture at a
+// byte offset into BAR0. Used for ring/EOP/RPTR buffer scribbling.
+//
+// Pre-condition: gpu_map_bar(dev, GPU_BAR_VRAM) returned non-invalid.
+fn gpu_vram_w32(uint64 dev, uint64 off, uint32 val) {
+    uint64 bar0 = _gd_load_u64(dev, _GD_OFF_BAR_VRAM_HOST)
+    unsafe { *((bar0 + off) as uint32) = val }
+}
+
+fn gpu_vram_w64(uint64 dev, uint64 off, uint64 val) {
+    uint64 bar0 = _gd_load_u64(dev, _GD_OFF_BAR_VRAM_HOST)
+    unsafe { *((bar0 + off) as uint64) = val }
+}
+
+fn gpu_vram_r32(uint64 dev, uint64 off) -> uint32 {
+    uint64 bar0 = _gd_load_u64(dev, _GD_OFF_BAR_VRAM_HOST)
+    uint32 v = 0
+    unsafe { *((bar0 + off) as uint32) -> v }
+    return v
+}
+
+fn gpu_vram_r64(uint64 dev, uint64 off) -> uint64 {
+    uint64 bar0 = _gd_load_u64(dev, _GD_OFF_BAR_VRAM_HOST)
+    uint64 v = 0
+    unsafe { *((bar0 + off) as uint64) -> v }
+    return v
+}
+
+// gpu_vram_zero — zero `n` bytes of VRAM at byte offset `off`. Common
+// preamble before ring/EOP setup. Uses 32-bit stores.
+fn gpu_vram_zero(uint64 dev, uint64 off, uint64 n) {
+    uint64 bar0 = _gd_load_u64(dev, _GD_OFF_BAR_VRAM_HOST)
+    uint64 i = 0
+    while i < n {
+        unsafe { *((bar0 + off + i) as uint32) = 0 }
+        i = i + 4
+    }
+}
+
+// =====================================================================
+// DOORBELLS (BAR2)
+// =====================================================================
+
+// gpu_doorbell_ring32/64 — write to the doorbell aperture at the given
+// dword offset. (Hardware expects byte offset = dword_off * 4.)
+// 64-bit form for queues that need atomic WPTR delivery.
+fn gpu_doorbell_ring32(uint64 dev, uint64 dword_off, uint32 val) {
+    uint64 bar2 = _gd_load_u64(dev, _GD_OFF_BAR_DB_HOST)
+    unsafe { *((bar2 + dword_off * 4) as uint32) = val }
+}
+
+fn gpu_doorbell_ring64(uint64 dev, uint64 dword_off, uint64 val) {
+    uint64 bar2 = _gd_load_u64(dev, _GD_OFF_BAR_DB_HOST)
+    unsafe { *((bar2 + dword_off * 4) as uint64) = val }
+}
+
+// =====================================================================
+// IOMMU / DMA
+// =====================================================================
+
+// gpu_dma_alloc — allocate page-aligned host memory and IOMMU-map it.
+// Writes the host-side VA into *out_host_va and the GPU-side IOVA into
+// *out_gpu_iova. `flags` is a bitwise-OR of GPU_DMA_* constants.
+//
+// On the VFIO substrate, GPU_DMA_CACHED is honored (default) and other
+// flags are silently ignored — Linux VFIO doesn't expose caching attrs
+// from userland. The flags are a forward commitment for the KernRift
+// driver, where MTRR/PAT control will be in our hands.
+//
+// Error codes:
+//   1 = bad handle
+//   2 = bump allocator exhausted
+//   3 = host mmap failed
+//   4 = IOMMU MAP failed
+fn gpu_dma_alloc(uint64 dev, uint64 size, uint64 flags,
+                 uint64 out_host_va, uint64 out_gpu_iova) -> uint64 {
+    if dev == GPU_HANDLE_INVALID { return 1 }
+    return pci_alloc_sysmem(size, out_host_va, out_gpu_iova)
+}
+
+// gpu_dma_alloc_aligned — alloc with caller-specified IOVA alignment
+// (and size alignment). `alignment` must be a power of two ≥ 4096.
+// Required by PSP staging buffer (1 MiB alignment).
+fn gpu_dma_alloc_aligned(uint64 dev, uint64 size, uint64 alignment,
+                         uint64 flags,
+                         uint64 out_host_va, uint64 out_gpu_iova) -> uint64 {
+    if dev == GPU_HANDLE_INVALID { return 1 }
+    return pci_alloc_sysmem_aligned(size, alignment, out_host_va, out_gpu_iova)
+}
+
+// gpu_dma_alloc_at — alloc with caller-specified IOVA. Required for
+// GMC system-aperture identity mapping (MC VA must equal bus IOVA).
+//
+// `iova` MUST be page-aligned and MUST NOT overlap any existing
+// mapping. Error 5 = iova mis-aligned.
+fn gpu_dma_alloc_at(uint64 dev, uint64 size, uint64 iova, uint64 flags,
+                    uint64 out_host_va) -> uint64 {
+    if dev == GPU_HANDLE_INVALID { return 1 }
+    return pci_alloc_sysmem_at_iova(size, iova, out_host_va)
+}
+
+// gpu_dma_alloc_many — batched allocation. `specs` points to N records
+// of 32 bytes: u64 size, u64 alignment (0 = none), u64 flags, u64 iova
+// (0 = auto-pick). Outputs go to `out_host_vas` and `out_gpu_iovas`
+// arrays of N u64s each.
+//
+// Today: pure userland loop. Under the KernRift driver, this becomes
+// a single ioctl that programs the IOMMU page table in one walk — the
+// real perf win is avoiding N round-trips when N is large.
+fn gpu_dma_alloc_many(uint64 dev, uint64 specs, uint64 n,
+                      uint64 out_host_vas, uint64 out_gpu_iovas) -> uint64 {
+    if dev == GPU_HANDLE_INVALID { return 1 }
+    uint64 i = 0
+    while i < n {
+        uint64 sz    = _gd_load_u64(specs, i * 32 + 0)
+        uint64 align = _gd_load_u64(specs, i * 32 + 8)
+        uint64 fl    = _gd_load_u64(specs, i * 32 + 16)
+        uint64 iova  = _gd_load_u64(specs, i * 32 + 24)
+        uint64 hva_slot = out_host_vas + i * 8
+        uint64 gva_slot = out_gpu_iovas + i * 8
+        uint64 e = 0
+        if iova != 0 {
+            e = gpu_dma_alloc_at(dev, sz, iova, fl, hva_slot)
+            if e == 0 { _gd_store_u64(out_gpu_iovas, i * 8, iova) }
+        }
+        if iova == 0 {
+            if align != 0 {
+                e = gpu_dma_alloc_aligned(dev, sz, align, fl, hva_slot, gva_slot)
+            }
+            if align == 0 {
+                e = gpu_dma_alloc(dev, sz, fl, hva_slot, gva_slot)
+            }
+        }
+        if e != 0 { return e }
+        i = i + 1
+    }
+    return 0
+}
+
+// gpu_dma_free — undo a single DMA alloc.
+fn gpu_dma_free(uint64 dev, uint64 host_va, uint64 gpu_iova, uint64 size) -> uint64 {
+    if dev == GPU_HANDLE_INVALID { return 1 }
+    return pci_free_sysmem(host_va, gpu_iova, size)
+}
+
+// =====================================================================
+// COMPLETION SIGNALS
+// =====================================================================
+
+// A completion signal is a pinned 64-bit slot in IOMMU-mapped sysmem.
+// The GPU writes the slot when a job finishes; userland polls or waits.
+//
+// Today: userland polling. Under the KernRift driver, gpu_signal_wait
+// becomes a kernel-side sleep on an MSI-X interrupt that wakes when
+// the signal slot is touched — no userland CPU spin.
+//
+// Signal handle layout (32 bytes):
+//   off  0: uint64  host_va of the slot (userland reads here)
+//   off  8: uint64  gpu_iova of the slot (GPU writes here)
+//   off 16: uint64  size (always 64 today; future: longer signal arrays)
+//   off 24: uint64  reserved
+
+static uint64 GPU_SIG_OFF_HOST   = 0
+static uint64 GPU_SIG_OFF_GPU    = 8
+static uint64 GPU_SIG_OFF_SIZE   = 16
+static uint64 _GD_SIG_BYTES      = 32
+
+fn gpu_signal_alloc(uint64 dev) -> uint64 {
+    if dev == GPU_HANDLE_INVALID { return GPU_HANDLE_INVALID }
+    uint64 hp = alloc(8); unsafe { *(hp as uint64) = 0 }
+    uint64 gp = alloc(8); unsafe { *(gp as uint64) = 0 }
+    // 4 KiB minimum — IOMMU page size on x86_64. We only use the first 8 bytes.
+    uint64 e = gpu_dma_alloc(dev, 4096, GPU_DMA_UNCACHED, hp, gp)
+    if e != 0 {
+        dealloc(hp); dealloc(gp)
+        return GPU_HANDLE_INVALID
+    }
+    uint64 host = 0; unsafe { *(hp as uint64) -> host }
+    uint64 gpu  = 0; unsafe { *(gp as uint64) -> gpu }
+    dealloc(hp); dealloc(gp)
+    unsafe { *(host as uint64) = 0 }   // zero the slot
+
+    uint64 sig = alloc(_GD_SIG_BYTES)
+    _gd_store_u64(sig, GPU_SIG_OFF_HOST, host)
+    _gd_store_u64(sig, GPU_SIG_OFF_GPU,  gpu)
+    _gd_store_u64(sig, GPU_SIG_OFF_SIZE, 4096)
+    return sig
+}
+
+// gpu_signal_gpu_iova — get the GPU-side IOVA to put in a packet that
+// the GPU will write upon completion.
+fn gpu_signal_gpu_iova(uint64 sig) -> uint64 {
+    if sig == GPU_HANDLE_INVALID { return GPU_VA_INVALID }
+    return _gd_load_u64(sig, GPU_SIG_OFF_GPU)
+}
+
+// gpu_signal_value — observe the current host-side value (no waiting).
+fn gpu_signal_value(uint64 sig) -> uint64 {
+    if sig == GPU_HANDLE_INVALID { return 0 }
+    uint64 host = _gd_load_u64(sig, GPU_SIG_OFF_HOST)
+    uint64 v = 0
+    unsafe { *(host as uint64) -> v }
+    return v
+}
+
+// gpu_signal_wait — wait until the signal slot equals `expected`, or
+// until `timeout_us` elapses. Returns 0 on match, 1 on timeout, 2 on
+// bad args.
+//
+// Today: userland poll with nanosleep between checks. Under the
+// KernRift driver, the kernel sleeps on an MSI-X completion interrupt.
+fn gpu_signal_wait(uint64 sig, uint64 expected, uint64 timeout_us) -> uint64 {
+    if sig == GPU_HANDLE_INVALID { return 2 }
+    uint64 host = _gd_load_u64(sig, GPU_SIG_OFF_HOST)
+    uint64 step_ns = 1000   // 1 µs poll
+    uint64 elapsed_us = 0
+    while elapsed_us < timeout_us {
+        uint64 v = 0
+        unsafe { *(host as uint64) -> v }
+        if v == expected { return 0 }
+        uint64 ts = alloc(16)
+        unsafe { *((ts + 0) as uint64) = 0 }
+        unsafe { *((ts + 8) as uint64) = step_ns }
+        syscall_raw(35, ts, 0, 0, 0, 0, 0)
+        dealloc(ts)
+        elapsed_us = elapsed_us + 1
+    }
+    return 1
+}
+
+// gpu_vram_poll — poll a VRAM-resident slot for an expected value with
+// a timeout. Used for ring/RPTR completion checks where the slot lives
+// in VRAM aperture, not in IOMMU-mapped sysmem (gpu_signal_wait covers
+// the sysmem case).
+//
+// `width` is 4 (uint32) or 8 (uint64). Returns 0 on match, 1 on
+// timeout, 2 on bad args.
+fn gpu_vram_poll(uint64 dev, uint64 off, uint64 width,
+                 uint64 expected, uint64 timeout_us) -> uint64 {
+    if dev == GPU_HANDLE_INVALID { return 2 }
+    if width != 4 { if width != 8 { return 2 } }
+    uint64 step_ns = 1000
+    uint64 elapsed_us = 0
+    while elapsed_us < timeout_us {
+        uint64 v = 0
+        if width == 4 { uint32 v32 = gpu_vram_r32(dev, off); v = v32 }
+        if width == 8 { v = gpu_vram_r64(dev, off) }
+        if v == expected { return 0 }
+        uint64 ts = alloc(16)
+        unsafe { *((ts + 0) as uint64) = 0 }
+        unsafe { *((ts + 8) as uint64) = step_ns }
+        syscall_raw(35, ts, 0, 0, 0, 0, 0)
+        dealloc(ts)
+        elapsed_us = elapsed_us + 1
+    }
+    return 1
+}
+
+fn gpu_signal_free(uint64 dev, uint64 sig) {
+    if sig == GPU_HANDLE_INVALID { return }
+    uint64 host = _gd_load_u64(sig, GPU_SIG_OFF_HOST)
+    uint64 gpu  = _gd_load_u64(sig, GPU_SIG_OFF_GPU)
+    uint64 size = _gd_load_u64(sig, GPU_SIG_OFF_SIZE)
+    gpu_dma_free(dev, host, gpu, size)
+    dealloc(sig)
+}
