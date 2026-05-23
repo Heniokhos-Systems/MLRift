@@ -175,25 +175,87 @@ fn main() {
         puts("  CTX0_CNTL.ENABLE_CONTEXT=0 — GMC walker disabled (warning)")
     }
 
-    // 5) VRAM aperture: map a 4 KiB window of BAR0 (NOT the 16 GiB whole BAR).
-    puts("--- VRAM aperture (BAR0 window) ---")
-    uint64 vwin = gpu_map_bar_window(dev, GPU_BAR_VRAM, 0, 4096)
-    if vwin == GPU_VA_INVALID {
-        puts("  FAIL: gpu_map_bar_window(BAR0) failed")
-    } else {
-        uint32 rd = 0; unsafe { *((vwin + 0) as uint32) -> rd }
-        _hex32("vram[0]", 7, rd)
-        if rd == 0xFFFFFFFF { puts("  WARN: vram[0]=all-1s (untrained/unposted)") }
-        else { puts("  vram[0] returns real data (trained)") }
-        // save -> write test pattern -> readback -> restore @ offset 0x100
-        uint32 orig = 0; unsafe { *((vwin + 0x100) as uint32) -> orig }
-        unsafe { *((vwin + 0x100) as uint32) = 0xCAFEF00D }
-        uint32 back = 0; unsafe { *((vwin + 0x100) as uint32) -> back }
-        unsafe { *((vwin + 0x100) as uint32) = orig }      // restore — no permanent change
-        if back == 0xCAFEF00D { puts("  VRAM writable (write/readback/restore ok)") }
-        else { _hex32("  FAIL vram write readback", 26, back) }
-        sys_munmap(vwin, 4096)
+    // 5) VRAM TRAINING test: write a distinct pattern at deep offsets, then
+    //    read them all back (two passes -> also proves persistence across
+    //    unmap/remap). A correct readback GiB-deep into GDDR6 is conclusive:
+    //    you cannot reliably store/retrieve at GiB offsets in untrained DRAM.
+    //    Each dword is saved before and restored after (no permanent change).
+    puts("--- VRAM training test (deep multi-offset write/verify) ---")
+    uint64 noff = 4
+    uint64 offs = alloc(32)
+    unsafe { *((offs + 0)  as uint64) = 0 }            // 0
+    unsafe { *((offs + 8)  as uint64) = 0x10000000 }   // 256 MiB (past non-ReBAR mirror)
+    unsafe { *((offs + 16) as uint64) = 0x40000000 }   // 1 GiB
+    unsafe { *((offs + 24) as uint64) = 0x80000000 }   // 2 GiB (deepest; well within 16 GiB BAR)
+    uint64 savd = alloc(16)   // 4 saved uint32 originals
+    uint64 mapok = 1
+    uint64 ok = 0
+    uint64 i = 0
+    uint64 off = 0
+    uint64 oa = 0
+    uint64 w = 0
+    uint32 o = 0
+    uint64 pat = 0
+    uint64 want = 0
+    uint32 back = 0
+    uint64 omib = 0
+
+    // Pass A: save original + write distinct pattern at window offset 0x200.
+    i = 0
+    while i < noff {
+        oa = offs + i * 8
+        unsafe { *((oa) as uint64) -> off }
+        w = gpu_map_bar_window(dev, GPU_BAR_VRAM, off, 4096)
+        if w == GPU_VA_INVALID {
+            omib = off >> 20
+            _dec("  FAIL map @MiB", 15, omib)
+            mapok = 0
+        } else {
+            unsafe { *((w + 0x200) as uint32) -> o }
+            unsafe { *((savd + i * 4) as uint32) = o }
+            pat = 0xABCD0000 | ((off >> 20) & 0xFFFF)
+            unsafe { *((w + 0x200) as uint32) = pat }
+            sys_munmap(w, 4096)
+        }
+        i = i + 1
     }
+
+    // Pass B: re-map, read back, compare to expected, restore original.
+    i = 0
+    while i < noff {
+        oa = offs + i * 8
+        unsafe { *((oa) as uint64) -> off }
+        omib = off >> 20
+        w = gpu_map_bar_window(dev, GPU_BAR_VRAM, off, 4096)
+        if w != GPU_VA_INVALID {
+            unsafe { *((w + 0x200) as uint32) -> back }
+            want = 0xABCD0000 | ((off >> 20) & 0xFFFF)
+            if back == want {
+                _dec("  OK MiB", 8, omib)
+                ok = ok + 1
+            } else {
+                _dec("  BAD MiB", 9, omib)
+                _hex32("    got", 7, back)
+            }
+            unsafe { *((savd + i * 4) as uint32) -> o }
+            unsafe { *((w + 0x200) as uint32) = o }
+            sys_munmap(w, 4096)
+        }
+        i = i + 1
+    }
+
+    if mapok == 0 {
+        puts("  INCONCLUSIVE: a BAR0 window failed to map")
+    } else {
+        if ok == noff {
+            puts("  VRAM TRAINED: all deep offsets store/retrieve distinct patterns")
+        } else {
+            puts("  VRAM NOT TRAINED (a deep offset failed write/verify)")
+            _dec("  offsets passing", 17, ok)
+        }
+    }
+    dealloc(offs)
+    dealloc(savd)
 
     // 6) DMA round-trip (LAST — our IOMMU domain attach replaces the device's
     //    domain). Map a sysmem buffer + verify it resolves, then re-read the
