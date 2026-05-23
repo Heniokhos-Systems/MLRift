@@ -1,0 +1,64 @@
+// examples/mlriftdev_smoke.mlr — standalone smoke for std/mlriftdev.mlr,
+// the /dev/mlrift_pci substrate (VFIO replacement). Mirrors the DMA part
+// of phase3_vfio_substrate_smoke.mlr but over our own driver.
+//
+//   1. mlr_open the GPU at 0000:03:00.0.
+//   2. mlr_alloc_sysmem two buffers (4 KiB, 16 KiB) — IOMMU-mapped at
+//      auto-picked IOVAs in the 0x2000_0000_0000 window.
+//   3. Write a pattern through the returned host VA (proves real memory).
+//   4. mlr_alloc_sysmem_at_iova a buffer at a fixed IOVA.
+//   5. Free all + close.
+//
+// PREREQUISITE: dGPU unbound from vfio-pci + /dev/mlrift_pci present
+// (sudo insmod the KernRift-built mlrift_pci.ko). Run as root.
+// Build: build/mlrc --arch=x86_64 --target=linux --emit=elfexe examples/mlriftdev_smoke.mlr -o /tmp/mlriftdev_smoke
+
+import "../std/mlriftdev.mlr"
+import "../std/sys.mlr"
+
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn puts(uint64 s) -> uint32
+
+fn main() -> int64 {
+    uint64 bdf = "0000:03:00.0"
+    uint64 e = mlr_open(bdf)
+    if e != 0 { puts("FAIL: mlr_open"); exit(10) }
+    puts("mlr_open ok (slot 0, /dev/mlrift_pci)")
+
+    // outs: [0]=host0 [8]=iova0 [16]=host1 [24]=iova1 [32]=host2
+    uint64 outs = alloc(64)
+
+    uint64 e1 = mlr_alloc_sysmem(4096, outs + 0, outs + 8)
+    if e1 != 0 { mlr_close(); puts("FAIL: alloc 4K"); exit(20) }
+    uint64 e2 = mlr_alloc_sysmem(16384, outs + 16, outs + 24)
+    if e2 != 0 { mlr_close(); puts("FAIL: alloc 16K"); exit(21) }
+    puts("alloc_sysmem x2 ok (IOMMU-mapped)")
+
+    // Prove the host VAs are real, writable memory.
+    uint64 h0 = 0; unsafe { *((outs + 0) as uint64) -> h0 }
+    uint64 h1 = 0; unsafe { *((outs + 16) as uint64) -> h1 }
+    unsafe { *((h0) as uint64) = 0xDEADBEEFCAFEBABE }
+    unsafe { *((h1) as uint64) = 0x0123456789ABCDEF }
+    uint64 v0 = 0; unsafe { *((h0) as uint64) -> v0 }
+    uint64 v1 = 0; unsafe { *((h1) as uint64) -> v1 }
+    if v0 != 0xDEADBEEFCAFEBABE { mlr_close(); puts("FAIL: host0 readback"); exit(30) }
+    if v1 != 0x0123456789ABCDEF { mlr_close(); puts("FAIL: host1 readback"); exit(31) }
+    puts("host VA write/readback ok")
+
+    // Fixed-IOVA alloc (the gpu_dma_alloc_at path).
+    uint64 e3 = mlr_alloc_sysmem_at_iova(8192, 0x400000000, outs + 32)
+    if e3 != 0 { mlr_close(); puts("FAIL: alloc_at_iova"); exit(40) }
+    puts("alloc_sysmem_at_iova(0x400000000) ok")
+
+    // Free everything.
+    uint64 iova0 = 0; unsafe { *((outs + 8)  as uint64) -> iova0 }
+    uint64 iova1 = 0; unsafe { *((outs + 24) as uint64) -> iova1 }
+    uint64 h2 = 0;    unsafe { *((outs + 32) as uint64) -> h2 }
+    mlr_free_sysmem(h0, iova0, 4096)
+    mlr_free_sysmem(h1, iova1, 16384)
+    mlr_free_sysmem(h2, 0x400000000, 8192)
+    mlr_close()
+
+    puts("PASS")
+    return 0
+}

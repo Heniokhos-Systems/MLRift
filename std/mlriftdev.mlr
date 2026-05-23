@@ -1,0 +1,171 @@
+// std/mlriftdev.mlr — userland substrate over the KernRift-built
+// /dev/mlrift_pci driver (the VFIO replacement). Mirrors the pci_*
+// surface of std/pcidev.mlr but talks to our own misc-device + IOMMU
+// paging domain instead of /dev/vfio. This is the "B.3 → gpudev" path:
+// std/gpudev.mlr can sit on EITHER pcidev (VFIO) or this module.
+//
+// Driver side: examples/mlrift_pci.kr in the KernRift repo. The target
+// device must be unbound from vfio-pci first (our driver attaches its
+// own unmanaged IOMMU paging domain on the first sysmem alloc).
+//
+// Scope (this increment): device open/close + IOMMU-mapped sysmem
+// (alloc/alloc_at_iova/alloc_aligned/free). BAR mmap (mlr_map_bar) needs
+// a BAR-size source (a BAR_INFO ioctl or /sys parsing) — a follow-up.
+//
+// All returns from the driver come back through sys_ioctl as a raw long:
+// success is a small non-negative value, failure is a negative errno
+// (which, read unsigned, is > MLR_ERR_SENTINEL).
+
+// ---- ioctl numbers (must match examples/mlrift_pci.kr) ----
+//   MLRIFT_OPEN_PCI    = _IOW('M',1,char[13]) = 0x400D4D01
+//   MLRIFT_CLOSE_PCI   = _IO('M',2)           = 0x00004D02
+//   MLRIFT_IOMMU_MAP   = _IOW('M',4,char[24]) = 0x40184D04
+//   MLRIFT_IOMMU_UNMAP = _IOW('M',5,char[16]) = 0x40104D05
+static uint64 MLR_OPEN_PCI    = 0x400D4D01
+static uint64 MLR_CLOSE_PCI   = 0x00004D02
+static uint64 MLR_IOMMU_MAP   = 0x40184D04
+static uint64 MLR_IOMMU_UNMAP = 0x40104D05
+
+// mmap prot/flags (SysV/Linux x86_64) — same values pcidev.mlr uses.
+static uint64 MLR_PROT_RW     = 3          // PROT_READ|PROT_WRITE
+static uint64 MLR_MAP_PRIVATE = 0x2
+static uint64 MLR_MAP_ANON    = 0x20
+static uint64 MLR_MAP_LOCKED  = 0x2000
+static uint64 MLR_NO_FD       = 0xFFFFFFFFFFFFFFFF
+// mmap() returns -errno in [-4095,-1]; as unsigned that's > this.
+static uint64 MLR_ERR_SENTINEL = 0xFFFFFFFFFFFFF000
+
+// GPU-side IOVA bump allocator. Our paging domain is unmanaged, so we
+// own the whole input-address space; mirror pcidev's 0x2000_0000_0000
+// window (2^45, within the GPU MM-hub aperture and the IOMMU's width)
+// so gpudev's IOVA-placement assumptions carry over unchanged.
+static uint64 MLR_IOVA_BASE   = 0x200000000000
+static uint64 MLR_IOVA_LIMIT  = 0x300000000000
+static uint64 _mlr_iova_cursor = 0x200000000000
+
+// Driver fd ("/dev/mlrift_pci"), 0xFFFF... when closed.
+static uint64 _mlr_fd = 0xFFFFFFFFFFFFFFFF
+
+// Round n up to a 4 KiB page.
+fn _mlr_page_up(uint64 n) -> uint64 {
+    return (n + 4095) & 0xFFFFFFFFFFFFF000
+}
+
+// Zero n bytes at p.
+fn _mlr_zero(uint64 p, uint64 n) {
+    uint64 i = 0
+    while i < n { unsafe { *((p + i) as uint8) = 0 }; i = i + 1 }
+}
+
+// mlr_open — open /dev/mlrift_pci and resolve the BDF to slot 0.
+// bdf_str must be a NUL-terminated "DDDD:BB:SS.F" (12 chars + NUL).
+// Returns 0 on success, else:
+//   1 = open("/dev/mlrift_pci") failed
+//   2 = MLRIFT_OPEN_PCI ioctl failed (device absent / not unbound)
+fn mlr_open(uint64 bdf_str) -> uint64 {
+    uint64 path = "/dev/mlrift_pci"
+    uint64 fd = sys_open(path, 2, 0)            // O_RDWR=2
+    if fd > MLR_ERR_SENTINEL { return 1 }
+    uint64 r = sys_ioctl(fd, MLR_OPEN_PCI, bdf_str)
+    if r > MLR_ERR_SENTINEL { sys_close(fd); return 2 }
+    _mlr_fd = fd
+    return 0
+}
+
+// mlr_close — release slot 0 (which also tears down the IOMMU domain in
+// the driver) and close the fd.
+fn mlr_close() {
+    if _mlr_fd == MLR_ERR_SENTINEL { return }
+    sys_ioctl(_mlr_fd, MLR_CLOSE_PCI, 0)        // arg = slot 0
+    sys_close(_mlr_fd)
+    _mlr_fd = 0xFFFFFFFFFFFFFFFF
+}
+
+// mlr_device_fd — raw fd for callers that need to mmap a BAR directly.
+fn mlr_device_fd() -> uint64 { return _mlr_fd }
+
+// _mlr_map_dma — internal: mmap `sz` bytes of anon locked host memory
+// and IOMMU-map it at `iova`. Writes the host VA to out_host_va_ptr.
+// Returns 0 on success, 3 = host mmap failed, 4 = IOMMU_MAP ioctl failed
+// (host mmap rolled back).
+fn _mlr_map_dma(uint64 sz, uint64 iova, uint64 out_host_va_ptr) -> uint64 {
+    uint64 host = sys_mmap(0, sz, MLR_PROT_RW,
+                           MLR_MAP_PRIVATE | MLR_MAP_ANON | MLR_MAP_LOCKED,
+                           MLR_NO_FD, 0)
+    if host > MLR_ERR_SENTINEL { return 3 }
+
+    uint64 req = alloc(24)
+    unsafe { *((req + 0)  as uint64) = host }
+    unsafe { *((req + 8)  as uint64) = iova }
+    unsafe { *((req + 16) as uint64) = sz }
+    uint64 r = sys_ioctl(_mlr_fd, MLR_IOMMU_MAP, req)
+    dealloc(req)
+    if r > MLR_ERR_SENTINEL {
+        sys_munmap(host, sz)
+        return 4
+    }
+    unsafe { *(out_host_va_ptr as uint64) = host }
+    return 0
+}
+
+// mlr_alloc_sysmem — allocate page-aligned host memory and IOMMU-map it
+// for GPU access at an auto-picked IOVA (bump allocator). Writes host VA
+// to *out_host_va_ptr and the GPU IOVA to *out_gpu_iova_ptr.
+// Errors: 1 = not open, 2 = IOVA space exhausted, 3/4 from _mlr_map_dma.
+fn mlr_alloc_sysmem(uint64 size,
+                    uint64 out_host_va_ptr,
+                    uint64 out_gpu_iova_ptr) -> uint64 {
+    if _mlr_fd == MLR_ERR_SENTINEL { return 1 }
+    uint64 sz = _mlr_page_up(size)
+    if _mlr_iova_cursor + sz > MLR_IOVA_LIMIT { return 2 }
+    uint64 iova = _mlr_iova_cursor
+    uint64 e = _mlr_map_dma(sz, iova, out_host_va_ptr)
+    if e != 0 { return e }
+    _mlr_iova_cursor = _mlr_iova_cursor + sz
+    unsafe { *(out_gpu_iova_ptr as uint64) = iova }
+    return 0
+}
+
+// mlr_alloc_sysmem_aligned — align the IOVA cursor + size up to
+// `alignment` (power of two, >= 4096) before allocating. Used by PSP
+// (1 MiB alignment). Same outputs/errors as mlr_alloc_sysmem.
+fn mlr_alloc_sysmem_aligned(uint64 size,
+                            uint64 alignment,
+                            uint64 out_host_va_ptr,
+                            uint64 out_gpu_iova_ptr) -> uint64 {
+    if _mlr_fd == MLR_ERR_SENTINEL { return 1 }
+    uint64 amask = alignment - 1
+    uint64 cur = _mlr_iova_cursor
+    _mlr_iova_cursor = (cur + amask) & (0xFFFFFFFFFFFFFFFF - amask)
+    uint64 sz_aligned = (size + amask) & (0xFFFFFFFFFFFFFFFF - amask)
+    return mlr_alloc_sysmem(sz_aligned, out_host_va_ptr, out_gpu_iova_ptr)
+}
+
+// mlr_alloc_sysmem_at_iova — IOMMU-map at a CALLER-SPECIFIED iova (e.g.
+// GMC system-aperture identity path). desired_iova must be 4 KiB-aligned
+// and not overlap an existing mapping (caller's responsibility).
+// Errors: 1 = not open, 5 = iova misaligned, 3/4 from _mlr_map_dma.
+fn mlr_alloc_sysmem_at_iova(uint64 size,
+                            uint64 desired_iova,
+                            uint64 out_host_va_ptr) -> uint64 {
+    if _mlr_fd == MLR_ERR_SENTINEL { return 1 }
+    if (desired_iova & 0xFFF) != 0 { return 5 }
+    uint64 sz = _mlr_page_up(size)
+    return _mlr_map_dma(sz, desired_iova, out_host_va_ptr)
+}
+
+// mlr_free_sysmem — undo an alloc: IOMMU-unmap then munmap. The IOVA is
+// not returned to the bump allocator (no coalescing) — fine for the
+// alloc-once-free-at-teardown cold-init use case. Returns 0, or 1 if the
+// unmap ioctl failed (munmap still attempted).
+fn mlr_free_sysmem(uint64 host_va, uint64 gpu_iova, uint64 size) -> uint64 {
+    uint64 sz = _mlr_page_up(size)
+    uint64 req = alloc(16)
+    unsafe { *((req + 0) as uint64) = gpu_iova }
+    unsafe { *((req + 8) as uint64) = sz }
+    uint64 r = sys_ioctl(_mlr_fd, MLR_IOMMU_UNMAP, req)
+    dealloc(req)
+    sys_munmap(host_va, sz)
+    if r > MLR_ERR_SENTINEL { return 1 }
+    return 0
+}
