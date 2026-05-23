@@ -25,13 +25,16 @@ static uint64 MLR_OPEN_PCI    = 0x400D4D01
 static uint64 MLR_CLOSE_PCI   = 0x00004D02
 static uint64 MLR_IOMMU_MAP   = 0x40184D04
 static uint64 MLR_IOMMU_UNMAP = 0x40104D05
+static uint64 MLR_BAR_INFO    = 0xC0104D06   // _IOWR('M',6,char[16])
 
 // mmap prot/flags (SysV/Linux x86_64) — same values pcidev.mlr uses.
 static uint64 MLR_PROT_RW     = 3          // PROT_READ|PROT_WRITE
+static uint64 MLR_MAP_SHARED  = 0x1
 static uint64 MLR_MAP_PRIVATE = 0x2
 static uint64 MLR_MAP_ANON    = 0x20
 static uint64 MLR_MAP_LOCKED  = 0x2000
 static uint64 MLR_NO_FD       = 0xFFFFFFFFFFFFFFFF
+static uint64 MLR_MAP_FAILED  = 0xFFFFFFFFFFFFFFFF
 // mmap() returns -errno in [-4095,-1]; as unsigned that's > this.
 static uint64 MLR_ERR_SENTINEL = 0xFFFFFFFFFFFFF000
 
@@ -83,6 +86,41 @@ fn mlr_close() {
 
 // mlr_device_fd — raw fd for callers that need to mmap a BAR directly.
 fn mlr_device_fd() -> uint64 { return _mlr_fd }
+
+// mlr_bar_info — query a BAR's byte size (and, internally, phys base)
+// via the BAR_INFO ioctl. Writes the size to *out_size_ptr (0 = BAR not
+// present). Returns 0 on success, 1 = not open, 2 = ioctl failed.
+fn mlr_bar_info(uint64 bar_index, uint64 out_size_ptr) -> uint64 {
+    if _mlr_fd == MLR_ERR_SENTINEL { return 1 }
+    uint64 req = alloc(16)
+    _mlr_zero(req, 16)
+    uint32 bi = bar_index
+    unsafe { *((req + 0) as uint32) = bi }
+    uint64 r = sys_ioctl(_mlr_fd, MLR_BAR_INFO, req)
+    if r > MLR_ERR_SENTINEL { dealloc(req); return 2 }
+    uint64 size = 0; unsafe { *((req + 0) as uint64) -> size }
+    dealloc(req)
+    unsafe { *(out_size_ptr as uint64) = size }
+    return 0
+}
+
+// mlr_map_bar — mmap a whole BAR into this process as uncached MMIO. The
+// driver's mmap handler reads vm_pgoff to pick the BAR (offset =
+// bar_index<<40) and forces UC-. Returns the host VA, or MLR_MAP_FAILED.
+fn mlr_map_bar(uint64 bar_index) -> uint64 {
+    if _mlr_fd == MLR_ERR_SENTINEL { return MLR_MAP_FAILED }
+    uint64 sizep = alloc(8)
+    unsafe { *(sizep as uint64) = 0 }
+    uint64 e = mlr_bar_info(bar_index, sizep)
+    uint64 size = 0; unsafe { *(sizep as uint64) -> size }
+    dealloc(sizep)
+    if e != 0 { return MLR_MAP_FAILED }
+    if size == 0 { return MLR_MAP_FAILED }                 // BAR not present
+    uint64 offset = bar_index << 40                        // driver: bar = pgoff>>28
+    uint64 host = sys_mmap(0, size, MLR_PROT_RW, MLR_MAP_SHARED, _mlr_fd, offset)
+    if host > MLR_ERR_SENTINEL { return MLR_MAP_FAILED }
+    return host
+}
 
 // _mlr_map_dma — internal: mmap `sz` bytes of anon locked host memory
 // and IOMMU-map it at `iova`. Writes the host VA to out_host_va_ptr.
