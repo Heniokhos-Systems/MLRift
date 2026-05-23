@@ -1,0 +1,56 @@
+// examples/gpudev_smoke.mlr — exercise the gpudev HAL through the
+// backend switch. With /dev/mlrift_pci loaded, gpu_open auto-selects the
+// mlrift_pci backend; otherwise it falls back to VFIO. Same source runs
+// on either substrate — that's the whole point of the migration.
+//
+//   gpu_open -> gpu_dma_alloc + host readback -> gpu_map_bar(REGISTERS)
+//   -> gpu_bar_info(VRAM) -> gpu_dma_free -> gpu_close.
+//
+// PREREQUISITE for the mlrift path: dGPU off vfio-pci + mlrift_pci.ko
+// loaded. Run as root (MAP_LOCKED). Build:
+//   build/mlrc --arch=x86_64 --target=linux --emit=elfexe \
+//     examples/gpudev_smoke.mlr -o /tmp/gpudev_smoke
+
+import "../std/gpudev.mlr"
+import "../std/sys.mlr"
+
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn puts(uint64 s) -> uint32
+
+fn main() -> int64 {
+    uint64 bdf = "0000:03:00.0"
+    uint64 dev = gpu_open(bdf)
+    if dev == 0 { puts("FAIL: gpu_open"); exit(10) }
+    puts("gpu_open ok (backend auto-selected)")
+
+    // DMA alloc via the HAL.
+    uint64 outs = alloc(32)
+    uint64 e = gpu_dma_alloc(dev, 16384, 0, outs + 0, outs + 8)
+    if e != 0 { gpu_close(dev); puts("FAIL: gpu_dma_alloc"); exit(20) }
+    uint64 h = 0; unsafe { *((outs + 0) as uint64) -> h }
+    unsafe { *((h) as uint64) = 0xCAFEF00DD00DFEED }
+    uint64 v = 0; unsafe { *((h) as uint64) -> v }
+    if v != 0xCAFEF00DD00DFEED { gpu_close(dev); puts("FAIL: host readback"); exit(21) }
+    puts("gpu_dma_alloc + host readback ok")
+
+    // Map the register BAR (uncached). Do NOT read it.
+    uint64 regs = gpu_map_bar(dev, GPU_BAR_REGISTERS)
+    if regs == 0xFFFFFFFFFFFFFFFF { gpu_close(dev); puts("FAIL: gpu_map_bar(REGISTERS)"); exit(30) }
+    puts("gpu_map_bar(REGISTERS) ok (uncached; not read)")
+
+    // BAR info for the VRAM aperture.
+    uint64 bi = alloc(16)
+    uint64 be = gpu_bar_info(dev, GPU_BAR_VRAM, bi + 0, bi + 8)
+    uint64 vsz = 0; unsafe { *((bi + 0) as uint64) -> vsz }
+    dealloc(bi)
+    if be != 0 { gpu_close(dev); puts("FAIL: gpu_bar_info(VRAM)"); exit(40) }
+    if vsz == 0 { gpu_close(dev); puts("FAIL: VRAM BAR size 0"); exit(41) }
+    puts("gpu_bar_info(VRAM) ok (nonzero size)")
+
+    // Free + close.
+    uint64 iova = 0; unsafe { *((outs + 8) as uint64) -> iova }
+    gpu_dma_free(dev, h, iova, 16384)
+    gpu_close(dev)
+    puts("PASS")
+    return 0
+}

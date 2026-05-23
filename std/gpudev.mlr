@@ -34,6 +34,7 @@
 // std/pcidev.mlr internally and inherits its 2026-05-19 verification.
 
 import "pcidev.mlr"
+import "mlriftdev.mlr"
 import "sys.mlr"
 
 // =====================================================================
@@ -43,6 +44,11 @@ import "sys.mlr"
 // Handle sentinel.
 static uint64 GPU_HANDLE_INVALID = 0
 static uint64 GPU_VA_INVALID     = 0xFFFFFFFFFFFFFFFF
+
+// Active substrate backend, chosen in gpu_open: 0 = VFIO (std/pcidev.mlr,
+// the cold-boot default), 1 = mlrift_pci (std/mlriftdev.mlr, our own
+// driver). Single-device-per-process, so a file-scope static suffices.
+static uint64 _gd_backend = 0
 
 // IP-block identifiers. Used as first arg to gpu_reg_r32/w32.
 // Numeric values are arbitrary but stable; the implementation maps each
@@ -249,10 +255,22 @@ fn _gd_ip_byte_off(uint64 dev, uint64 ip, uint64 reg_dw) -> uint64 {
 // Today the implementation assumes one GPU per process. Multi-device
 // will require teaching pcidev.mlr to track containers in a table.
 fn gpu_open(uint64 bdf_str) -> uint64 {
-    uint64 group = _gd_discover_iommu_group(bdf_str)
-    if group == 0xFFFFFFFFFFFFFFFF { return GPU_HANDLE_INVALID }
-    uint64 r = pci_open(bdf_str, group)
-    if r != 0 { return GPU_HANDLE_INVALID }
+    // Prefer the mlrift_pci driver. /dev/mlrift_pci only exists when our
+    // kernel module is loaded — which the user does only to use it (the
+    // device unbound from vfio-pci). mlr_open succeeding is that signal.
+    // If it fails (module absent), fall back to the VFIO substrate so the
+    // existing cold-boot workflow is unchanged.
+    uint64 group = 0
+    uint64 r = mlr_open(bdf_str)
+    if r == 0 {
+        _gd_backend = 1
+    } else {
+        _gd_backend = 0
+        group = _gd_discover_iommu_group(bdf_str)
+        if group == 0xFFFFFFFFFFFFFFFF { return GPU_HANDLE_INVALID }
+        uint64 rv = pci_open(bdf_str, group)
+        if rv != 0 { return GPU_HANDLE_INVALID }
+    }
 
     uint64 dev = alloc(_GD_HANDLE_BYTES)
     uint64 z = 0; uint64 i = 0
@@ -278,7 +296,7 @@ fn gpu_close(uint64 dev) {
     if sz != 0 { sys_munmap(_gd_load_u64(dev, _GD_OFF_BAR_DB_HOST), sz) }
     sz = _gd_load_u64(dev, _GD_OFF_BAR_REGS_SIZE)
     if sz != 0 { sys_munmap(_gd_load_u64(dev, _GD_OFF_BAR_REGS_HOST), sz) }
-    pci_close()
+    if _gd_backend == 1 { mlr_close() } else { pci_close() }
     dealloc(dev)
 }
 
@@ -318,6 +336,21 @@ fn gpu_reset(uint64 dev, uint64 level) -> uint64 {
 fn gpu_bar_info(uint64 dev, uint64 which,
                 uint64 out_size, uint64 out_flags) -> uint64 {
     if dev == GPU_HANDLE_INVALID { return 1 }
+    if _gd_backend == 1 {
+        // mlrift backend: BAR_INFO gives size only; synthesize the flag
+        // bits (READ|WRITE|MMAP = 7) for a present BAR.
+        uint64 szp = alloc(8)
+        unsafe { *(szp as uint64) = 0 }
+        uint64 me = mlr_bar_info(which, szp)
+        uint64 msz = 0; unsafe { *(szp as uint64) -> msz }
+        dealloc(szp)
+        if me != 0 { return 2 }
+        uint64 mfl = 0
+        if msz != 0 { mfl = 7 }
+        unsafe { *(out_size  as uint64) = msz }
+        unsafe { *(out_flags as uint64) = mfl }
+        return 0
+    }
     uint64 sb = alloc(24)
     uint64 zi = 0
     while zi < 24 { unsafe { *((sb + zi) as uint8) = 0 }; zi = zi + 1 }
@@ -348,17 +381,27 @@ fn gpu_map_bar(uint64 dev, uint64 which) -> uint64 {
     uint64 cached = _gd_load_u64(dev, host_off)
     if cached != 0 { return cached }
 
-    uint64 host = pci_map_bar(which)
-    if host == PCI_MAP_FAILED_SENTINEL { return GPU_VA_INVALID }
-
-    // Query size for cleanup bookkeeping.
-    uint64 sb = alloc(24)
-    uint64 zi = 0
-    while zi < 24 { unsafe { *((sb + zi) as uint8) = 0 }; zi = zi + 1 }
-    uint64 e = pci_bar_info(which, sb + 0, sb + 8, sb + 16)
+    uint64 host = 0
     uint64 size = 0
-    if e == 0 { unsafe { *((sb + 0) as uint64) -> size } }
-    dealloc(sb)
+    if _gd_backend == 1 {
+        host = mlr_map_bar(which)
+        if host == GPU_VA_INVALID { return GPU_VA_INVALID }   // MLR_MAP_FAILED == GPU_VA_INVALID
+        uint64 szp = alloc(8)
+        unsafe { *(szp as uint64) = 0 }
+        mlr_bar_info(which, szp)
+        unsafe { *(szp as uint64) -> size }
+        dealloc(szp)
+    } else {
+        host = pci_map_bar(which)
+        if host == PCI_MAP_FAILED_SENTINEL { return GPU_VA_INVALID }
+        // Query size for cleanup bookkeeping.
+        uint64 sb = alloc(24)
+        uint64 zi = 0
+        while zi < 24 { unsafe { *((sb + zi) as uint8) = 0 }; zi = zi + 1 }
+        uint64 e = pci_bar_info(which, sb + 0, sb + 8, sb + 16)
+        if e == 0 { unsafe { *((sb + 0) as uint64) -> size } }
+        dealloc(sb)
+    }
 
     _gd_store_u64(dev, host_off, host)
     _gd_store_u64(dev, size_off, size)
@@ -557,6 +600,7 @@ fn gpu_doorbell_ring64(uint64 dev, uint64 dword_off, uint64 val) {
 fn gpu_dma_alloc(uint64 dev, uint64 size, uint64 flags,
                  uint64 out_host_va, uint64 out_gpu_iova) -> uint64 {
     if dev == GPU_HANDLE_INVALID { return 1 }
+    if _gd_backend == 1 { return mlr_alloc_sysmem(size, out_host_va, out_gpu_iova) }
     return pci_alloc_sysmem(size, out_host_va, out_gpu_iova)
 }
 
@@ -567,6 +611,7 @@ fn gpu_dma_alloc_aligned(uint64 dev, uint64 size, uint64 alignment,
                          uint64 flags,
                          uint64 out_host_va, uint64 out_gpu_iova) -> uint64 {
     if dev == GPU_HANDLE_INVALID { return 1 }
+    if _gd_backend == 1 { return mlr_alloc_sysmem_aligned(size, alignment, out_host_va, out_gpu_iova) }
     return pci_alloc_sysmem_aligned(size, alignment, out_host_va, out_gpu_iova)
 }
 
@@ -578,6 +623,7 @@ fn gpu_dma_alloc_aligned(uint64 dev, uint64 size, uint64 alignment,
 fn gpu_dma_alloc_at(uint64 dev, uint64 size, uint64 iova, uint64 flags,
                     uint64 out_host_va) -> uint64 {
     if dev == GPU_HANDLE_INVALID { return 1 }
+    if _gd_backend == 1 { return mlr_alloc_sysmem_at_iova(size, iova, out_host_va) }
     return pci_alloc_sysmem_at_iova(size, iova, out_host_va)
 }
 
@@ -622,6 +668,7 @@ fn gpu_dma_alloc_many(uint64 dev, uint64 specs, uint64 n,
 // gpu_dma_free — undo a single DMA alloc.
 fn gpu_dma_free(uint64 dev, uint64 host_va, uint64 gpu_iova, uint64 size) -> uint64 {
     if dev == GPU_HANDLE_INVALID { return 1 }
+    if _gd_backend == 1 { return mlr_free_sysmem(host_va, gpu_iova, size) }
     return pci_free_sysmem(host_va, gpu_iova, size)
 }
 
