@@ -7,13 +7,14 @@
 //        Assert CTX0 enabled (bit 0 of regMMVM_CONTEXT0_CNTL).
 //   3. NBIO doorbell selfring init from BAR2 physical address.
 //   4. MEC reset/unhalt + MES unhalt.
-//   5. KIQ HQD (ME=3/PIPE=1/QUEUE=0): MQD+ring+rptr+eop in VRAM,
-//        DOORBELL_OFFSET=0x00 EN, HQD_ACTIVE=1.
-//   6. Write one PM4 NOP (0xFFFF1000) to ring, WPTR=1.
-//   7. Ring doorbell: *(bar2+0 as uint64)=1.
+//   5. KIQ HQD (ME=3/PIPE=1/QUEUE=0): MQD+ring+rptr+wptr+eop in VRAM,
+//        CP_HQD_PQ_CONTROL=0xd8308011, DOORBELL_CONTROL=0x40000060 (offset=0x18/byte=0x60),
+//        WPTR via GTT poll addr, MEC doorbell range LOWER=0/UPPER=0x450.
+//   6. Write one PM4 NOP (0xC0001000) to ring, WPTR via GTT wptr slot.
+//   7. Ring doorbell: *(bar2+0x60 as uint64)=1.
 //   8. Delay, read DOORBELL_HIT bit31 + HQD_RPTR.
 //   9. Verdict "KIQ CONSUMED NOP" if rptr>0;
-//        else fall back to 9-offset sweep to find the right byte offset.
+//        else fall back to 10-offset sweep to find the right byte offset.
 //
 // Run only with mlrift_pci bound (warm-handoff, VRAM trained).
 // Procedure: stop sddm, unbind amdgpu, bind mlrift_pci, run from TTY.
@@ -38,6 +39,8 @@ static uint64 regCP_HQD_PQ_BASE_HI                    = 0x1fb2
 static uint64 regCP_HQD_PQ_RPTR                       = 0x1fb3
 static uint64 regCP_HQD_PQ_RPTR_REPORT_ADDR           = 0x1fb4
 static uint64 regCP_HQD_PQ_RPTR_REPORT_ADDR_HI        = 0x1fb5
+static uint64 regCP_HQD_PQ_WPTR_POLL_ADDR_LO          = 0x1fb6
+static uint64 regCP_HQD_PQ_WPTR_POLL_ADDR_HI          = 0x1fb7
 static uint64 regCP_HQD_PQ_DOORBELL_CONTROL           = 0x1fb8
 static uint64 regCP_HQD_PQ_CONTROL                    = 0x1fba
 static uint64 regCP_HQD_DEQUEUE_REQUEST               = 0x1fc1
@@ -47,13 +50,13 @@ static uint64 regCP_MQD_CONTROL                       = 0x1fcb
 static uint64 regCP_HQD_EOP_BASE_ADDR                 = 0x1fce
 static uint64 regCP_HQD_EOP_BASE_ADDR_HI              = 0x1fcf
 static uint64 regCP_HQD_EOP_CONTROL                   = 0x1fd0
-static uint64 regCP_HQD_PQ_WPTR_LO                    = 0x1fdf
-static uint64 regCP_HQD_PQ_WPTR_HI                    = 0x1fe0
-
 // CP registers BASE_IDX=1
 static uint64 regGRBM_GFX_CNTL                        = 0x0900
 static uint64 regCP_MEC_RS64_CNTL_dw                  = 0x2904
 static uint64 regCP_MES_CNTL_dw                       = 0x2807
+// MEC doorbell range — GC1 (ME-engine aperture); range 0 drops all doorbells.
+static uint64 regCP_MEC_DOORBELL_RANGE_LOWER           = 0x1dfc
+static uint64 regCP_MEC_DOORBELL_RANGE_UPPER           = 0x1dfd
 
 static uint64 MEC_RESET_VAL  = 0x400F0010
 static uint64 MEC_UNHALT_VAL = 0x3C000000
@@ -260,6 +263,7 @@ fn main() {
     uint64 mqd_mc  = vram_mc_base + mqd_off
     uint64 ring_mc = vram_mc_base + ring_off
     uint64 rptr_mc = vram_mc_base + rptr_off
+    uint64 wptr_mc = vram_mc_base + wptr_off
     uint64 eop_mc  = vram_mc_base + eop_off
     _hex32("vram_mc_base", 12, vram_mc_base)
     _hex32("ring_mc",       7, ring_mc)
@@ -326,34 +330,39 @@ fn main() {
     gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_EOP_BASE_ADDR_HI, eop_hi)
     gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_EOP_CONTROL, 9)
 
-    gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_CONTROL,       0xC0000509)
+    // WPTR via GTT: point poll-addr to wptr_off slot; MEC reads wptr from memory.
+    uint32 wptr_mc_lo = wptr_mc & 0xFFFFFFFF
+    uint32 wptr_mc_hi = wptr_mc >> 32
+    gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_WPTR_POLL_ADDR_LO, wptr_mc_lo)
+    gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_WPTR_POLL_ADDR_HI, wptr_mc_hi)
+    gpu_vram_w32(dev, wptr_off, 0)
+
+    gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_CONTROL,       0xd8308011)
     gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PERSISTENT_STATE, 0x0BE05501)
     gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_RPTR,           0)
-    gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_WPTR_LO,        0)
-    gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_WPTR_HI,        0)
 
-    // DOORBELL_OFFSET=0x00 (dword 0), EN=1 (bit 30).
-    uint64 db_dword_off = 0x00
-    uint64 db_cntl_init = (db_dword_off << 2) | (1 << 30)
-    uint32 db_cntl_w = db_cntl_init
-    gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_DOORBELL_CONTROL, db_cntl_w)
+    // DOORBELL_CONTROL = 0x40000060: EN (bit30)=1, DOORBELL_OFFSET=0x18 (byte 0x60).
+    gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_DOORBELL_CONTROL, 0x40000060)
+
+    // MEC doorbell range: open the ME-engine aperture so doorbells are not dropped.
+    gpu_reg_w32(dev, GPU_IP_GC1, regCP_MEC_DOORBELL_RANGE_LOWER, 0x00000000)
+    gpu_reg_w32(dev, GPU_IP_GC1, regCP_MEC_DOORBELL_RANGE_UPPER, 0x00000450)
 
     // Activate.
     gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_ACTIVE, 1)
     puts("KIQ HQD activated")
 
     // -------------------------------------------------------
-    // 6+7) Write NOP to ring, advance WPTR, ring doorbell at offset 0.
+    // 6+7) Write NOP to ring, advance WPTR via GTT, ring doorbell at byte 0x60.
     // -------------------------------------------------------
     puts("")
-    puts("=== Ring doorbell (offset=0x00) ===")
+    puts("=== Ring doorbell (offset=0x60) ===")
 
-    // NOP already at ring[0]; advance WPTR to 1.
-    gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_WPTR_LO, 1)
-    gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_WPTR_HI, 0)
+    // NOP already at ring[0]; advance WPTR to 1 via GTT memory (not reg).
+    gpu_vram_w32(dev, wptr_off, 1)
 
-    // Ring: raw uint64 write to BAR2+0.
-    unsafe { *((bar2 + 0) as uint64) = 1 }
+    // Ring: raw uint64 write to BAR2+0x60.
+    unsafe { *((bar2 + 0x60) as uint64) = 1 }
     _delay(200000)
 
     // -------------------------------------------------------
@@ -385,25 +394,26 @@ fn main() {
         gpu_close(dev)
         exit(0)
     }
-    puts("rptr=0 at offset 0x00 — running 9-offset sweep as fallback")
+    puts("rptr=0 at offset 0x60 — running 10-offset sweep as fallback")
 
     // Reset HQD state before sweep.
     gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_DEQUEUE_REQUEST, 1)
     _delay(10000)
     gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_DEQUEUE_REQUEST, 0)
 
-    // Candidate byte offsets.
-    uint64 cands_count = 9
+    // Candidate byte offsets (0x60 = amdgpu-derived primary candidate).
+    uint64 cands_count = 10
     uint64 cands = alloc(cands_count * 8)
     unsafe { *((cands + 0 * 8) as uint64) = 0x000 }
     unsafe { *((cands + 1 * 8) as uint64) = 0x008 }
     unsafe { *((cands + 2 * 8) as uint64) = 0x010 }
     unsafe { *((cands + 3 * 8) as uint64) = 0x020 }
     unsafe { *((cands + 4 * 8) as uint64) = 0x040 }
-    unsafe { *((cands + 5 * 8) as uint64) = 0x080 }
-    unsafe { *((cands + 6 * 8) as uint64) = 0x100 }
-    unsafe { *((cands + 7 * 8) as uint64) = 0x200 }
-    unsafe { *((cands + 8 * 8) as uint64) = 0x400 }
+    unsafe { *((cands + 5 * 8) as uint64) = 0x060 }
+    unsafe { *((cands + 6 * 8) as uint64) = 0x080 }
+    unsafe { *((cands + 7 * 8) as uint64) = 0x100 }
+    unsafe { *((cands + 8 * 8) as uint64) = 0x200 }
+    unsafe { *((cands + 9 * 8) as uint64) = 0x400 }
 
     uint64 ci = 0
     uint64 found_hit = 0
@@ -418,13 +428,11 @@ fn main() {
         uint32 dbcntl_w = dbcntl
         gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_DOORBELL_CONTROL, dbcntl_w)
         gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_RPTR,   0)
-        gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_WPTR_LO, 0)
-        gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_WPTR_HI, 0)
+        gpu_vram_w32(dev, wptr_off, 0)
         gpu_vram_w32(dev, ring_off, 0xC0001000)
         gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_ACTIVE, 1)
 
-        gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_WPTR_LO, 1)
-        gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_WPTR_HI, 0)
+        gpu_vram_w32(dev, wptr_off, 1)
         unsafe { *((bar2 + byte_off) as uint64) = 1 }
         _delay(50000)
 
