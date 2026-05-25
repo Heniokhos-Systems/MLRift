@@ -1,0 +1,187 @@
+// gmc_walker_bringup — Task 1 of GMC VM-walker bring-up (drive-compute SP1).
+//
+// Re-enables the GMC page-table walker (kernel context-0) on the warm AMD
+// dGPU via mlrift_pci, then verifies the walker is live.
+//
+// Sequence:
+//   1. gpu_open + map BAR5 + bus master + load IP bases.
+//   2. Allocate GART pages (PD0 + PT) via gmc_alloc_page_table.
+//   3. Allocate a 4 KiB sysmem DMA buffer — used as both the mapped target
+//      and the SYSTEM_APERTURE_DEFAULT_ADDR scratch page.
+//   4. gmc_map: mc_va=0x1000000 → buf iova, size=4096.
+//   5. gmc_init_mmhub (system-aperture span 0..0xFFFF, scratch=buf iova).
+//   6. gmc_readback_sanity — diagnostic register dump.
+//   7. Read regMMVM_CONTEXT0_CNTL directly + check bit 0 (walker enabled).
+//   8. gmc_dump_fault_status — latch status for post-run inspection.
+//   9. Final verdict.
+//
+// DO NOT run this binary while amdgpu or any other driver owns the device.
+// Procedure: stop sddm, unbind amdgpu, bind mlrift_pci, then run from TTY.
+
+import "../std/gpudev.mlr"
+import "../std/amdgpu_ip_discovery.mlr"
+import "../std/gmc.mlr"
+import "../std/sys.mlr"
+
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn puts(uint64 s) -> uint32
+
+fn _hex32(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(80)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint8 zx = 48; unsafe { *((b + ll + 1) as uint8) = zx }
+    uint8 xc = 120; unsafe { *((b + ll + 2) as uint8) = xc }
+    uint64 j = 0
+    while j < 8 {
+        uint64 sh = (7 - j) * 4
+        uint64 nyb = (v >> sh) & 0xF
+        uint8 ch = nyb + 48
+        if nyb >= 10 { ch = nyb + 87 }
+        unsafe { *((b + ll + 3 + j) as uint8) = ch }
+        j = j + 1
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 11) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+fn _dec(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(80)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint64 digits = 0
+    if v == 0 {
+        uint8 z = 48; unsafe { *((b + ll + 1) as uint8) = z }; digits = 1
+    } else {
+        uint64 t = v
+        while t > 0 { digits = digits + 1; t = t / 10 }
+        uint64 k = digits
+        t = v
+        while k > 0 {
+            k = k - 1
+            uint64 d = t - (t / 10) * 10
+            uint8 db = d + 48
+            unsafe { *((b + ll + 1 + k) as uint8) = db }
+            t = t / 10
+        }
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 1 + digits) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+fn main() {
+    puts("gmc_walker_bringup (Task 1 — GMC VM walker re-enable)")
+
+    // 1) Open device, map BAR5, enable Bus Master, load IP bases.
+    uint64 dev = gpu_open("0000:03:00.0")
+    if dev == GPU_HANDLE_INVALID { _dec("FAIL gpu_open", 13, 1); exit(1) }
+    amdgpu_load_navi32_bases()
+    gpu_load_ip_bases_explicit(dev,
+        amdgpu_ip_gc_base_0, amdgpu_ip_gc_base_1,
+        amdgpu_ip_mmhub_base_0, amdgpu_ip_mp0_base_0,
+        amdgpu_ip_mp1_base_0, amdgpu_ip_oss_base_0,
+        amdgpu_ip_nbif_base_0, amdgpu_ip_hdp_base_0)
+
+    uint64 bar5 = gpu_map_bar(dev, GPU_BAR_REGISTERS)
+    if bar5 == GPU_VA_INVALID { puts("FAIL BAR5 mmap"); gpu_close(dev); exit(2) }
+    uint64 bme = gpu_bus_master_enable(dev)
+    if bme != 0 { _dec("FAIL bus_master_enable", 22, bme); gpu_close(dev); exit(3) }
+    _hex32("bar5_host_lo", 12, bar5 & 0xFFFFFFFF)
+
+    // 2) Allocate the 2-page GART (PD0 + PT).
+    uint64 pp = alloc(8); unsafe { *(pp as uint64) = 0 }
+    uint64 pe = gmc_alloc_page_table(dev, pp)
+    if pe != 0 {
+        _dec("FAIL gmc_alloc_page_table", 25, pe)
+        dealloc(pp); gpu_close(dev); exit(4)
+    }
+    uint64 pt_ctx = 0; unsafe { *(pp as uint64) -> pt_ctx }
+    dealloc(pp)
+    uint64 pd_iova = 0; unsafe { *((pt_ctx + GMC_PT_OFF_PD_IOVA) as uint64) -> pd_iova }
+    uint64 pt_iova = 0; unsafe { *((pt_ctx + GMC_PT_OFF_PT_IOVA) as uint64) -> pt_iova }
+    _hex32("PD0_iova_lo", 11, pd_iova & 0xFFFFFFFF)
+    _hex32("PT_iova_lo",  10, pt_iova & 0xFFFFFFFF)
+
+    // 3) Allocate a 4 KiB sysmem buffer — mapped target + DEFAULT_ADDR scratch.
+    uint64 outs = alloc(16)
+    uint64 dae = gpu_dma_alloc(dev, 4096, 0, outs + 0, outs + 8)
+    if dae != 0 {
+        _dec("FAIL gpu_dma_alloc", 18, dae)
+        gmc_page_table_free(dev, pt_ctx)
+        dealloc(outs); gpu_close(dev); exit(5)
+    }
+    uint64 buf_host = 0; unsafe { *((outs + 0) as uint64) -> buf_host }
+    uint64 buf_iova = 0; unsafe { *((outs + 8) as uint64) -> buf_iova }
+    dealloc(outs)
+    _hex32("buf_iova_lo", 11, buf_iova & 0xFFFFFFFF)
+
+    // 4) Map buf at MC VA 0x1000000 (16 MiB), size 0x200000 (2 MiB).
+    uint64 me = gmc_map(pt_ctx, 0x1000000, buf_iova, 0x200000)
+    if me != 0 {
+        _dec("FAIL gmc_map", 12, me)
+        gpu_dma_free(dev, buf_host, buf_iova, 4096)
+        gmc_page_table_free(dev, pt_ctx)
+        gpu_close(dev); exit(6)
+    }
+    _hex32("mc_va_base", 10, 0x1000000)
+    _hex32("mc_va_size", 10, 0x200000)
+
+    // 5) Run MMHUB init: system aperture spans full range (lo=0, hi=0xFFFF),
+    //    default_addr = buf_iova (scratch page for faulting accesses).
+    puts("ABOUT TO WRITE MMHUB GART REGISTERS")
+    uint64 ie = gmc_init_mmhub(dev, pt_ctx, 0x1000000, 0x200000,
+                                0, 0xFFFF, buf_iova)
+    _dec("gmc_init_mmhub_rc", 17, ie)
+    if ie != 0 {
+        puts("FAIL gmc_init_mmhub — aborting")
+        gpu_dma_free(dev, buf_host, buf_iova, 4096)
+        gmc_page_table_free(dev, pt_ctx)
+        gpu_close(dev); exit(7)
+    }
+
+    // 6) Diagnostic readback.
+    puts("--- readback ---")
+    uint64 re = gmc_readback_sanity(dev)
+    _dec("readback_rc", 11, re)
+
+    // 7) Direct check of regMMVM_CONTEXT0_CNTL bit 0.
+    uint32 ctx0_raw = gpu_reg_r32(dev, GPU_IP_MMHUB, regMMVM_CONTEXT0_CNTL)
+    uint64 ctx0_val = ctx0_raw
+    _hex32("CTX0_CNTL", 9, ctx0_val)
+    if (ctx0_val & 0x1) != 0 {
+        puts("CTX0 walker ENABLED")
+    } else {
+        puts("WALKER OFF")
+    }
+
+    // 8) Fault status latch — useful for post-run analysis.
+    puts("--- fault status ---")
+    gmc_dump_fault_status(dev)
+
+    // 9) Final verdict.
+    uint64 verdict = 0
+    if ie != 0 { verdict = 1 }
+    if re != 0 { verdict = 1 }
+    if (ctx0_val & 0x1) == 0 { verdict = 1 }
+    if verdict == 0 {
+        puts("gmc_walker_bringup: GREEN — GMC VM walker LIVE")
+    } else {
+        puts("gmc_walker_bringup: FAIL")
+    }
+
+    // Cleanup.
+    gpu_dma_free(dev, buf_host, buf_iova, 4096)
+    gmc_page_table_free(dev, pt_ctx)
+    gpu_close(dev)
+
+    if verdict != 0 { exit(8) }
+    exit(0)
+}
