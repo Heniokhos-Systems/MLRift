@@ -1,0 +1,471 @@
+// kiq_doorbell_bringup — SP2 Task 1: GMC walker + KIQ bring-up.
+//
+// Sequence:
+//   1. gpu_open + IP bases + bus master + map BAR5/BAR2/BAR0.
+//   2. GMC walker bring-up:
+//        gmc_alloc_page_table → gmc_map(0x200000) → gmc_init_mmhub.
+//        Assert CTX0 enabled (bit 0 of regMMVM_CONTEXT0_CNTL).
+//   3. NBIO doorbell selfring init from BAR2 physical address.
+//   4. MEC reset/unhalt + MES unhalt.
+//   5. KIQ HQD (ME=3/PIPE=1/QUEUE=0): MQD+ring+rptr+eop in VRAM,
+//        DOORBELL_OFFSET=0x00 EN, HQD_ACTIVE=1.
+//   6. Write one PM4 NOP (0xFFFF1000) to ring, WPTR=1.
+//   7. Ring doorbell: *(bar2+0 as uint64)=1.
+//   8. Delay, read DOORBELL_HIT bit31 + HQD_RPTR.
+//   9. Verdict "KIQ CONSUMED NOP" if rptr>0;
+//        else fall back to 9-offset sweep to find the right byte offset.
+//
+// Run only with mlrift_pci bound (warm-handoff, VRAM trained).
+// Procedure: stop sddm, unbind amdgpu, bind mlrift_pci, run from TTY.
+
+import "../std/gpudev.mlr"
+import "../std/amdgpu_ip_discovery.mlr"
+import "../std/gmc.mlr"
+import "../std/gmc_constants.mlr"
+import "../std/nbio.mlr"
+import "../std/psp.mlr"
+import "../std/sys.mlr"
+
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn puts(uint64 s) -> uint32
+
+// CP registers BASE_IDX=0
+static uint64 regCP_HQD_ACTIVE                        = 0x1fab
+static uint64 regCP_HQD_VMID                          = 0x1fac
+static uint64 regCP_HQD_PERSISTENT_STATE              = 0x1fad
+static uint64 regCP_HQD_PQ_BASE                       = 0x1fb1
+static uint64 regCP_HQD_PQ_BASE_HI                    = 0x1fb2
+static uint64 regCP_HQD_PQ_RPTR                       = 0x1fb3
+static uint64 regCP_HQD_PQ_RPTR_REPORT_ADDR           = 0x1fb4
+static uint64 regCP_HQD_PQ_RPTR_REPORT_ADDR_HI        = 0x1fb5
+static uint64 regCP_HQD_PQ_DOORBELL_CONTROL           = 0x1fb8
+static uint64 regCP_HQD_PQ_CONTROL                    = 0x1fba
+static uint64 regCP_HQD_DEQUEUE_REQUEST               = 0x1fc1
+static uint64 regCP_MQD_BASE_ADDR                     = 0x1fa9
+static uint64 regCP_MQD_BASE_ADDR_HI                  = 0x1faa
+static uint64 regCP_MQD_CONTROL                       = 0x1fcb
+static uint64 regCP_HQD_EOP_BASE_ADDR                 = 0x1fce
+static uint64 regCP_HQD_EOP_BASE_ADDR_HI              = 0x1fcf
+static uint64 regCP_HQD_EOP_CONTROL                   = 0x1fd0
+static uint64 regCP_HQD_PQ_WPTR_LO                    = 0x1fdf
+static uint64 regCP_HQD_PQ_WPTR_HI                    = 0x1fe0
+
+// CP registers BASE_IDX=1
+static uint64 regGRBM_GFX_CNTL                        = 0x0900
+static uint64 regCP_MEC_RS64_CNTL_dw                  = 0x2904
+static uint64 regCP_MES_CNTL_dw                       = 0x2807
+
+static uint64 MEC_RESET_VAL  = 0x400F0010
+static uint64 MEC_UNHALT_VAL = 0x3C000000
+static uint64 MES_UNHALT_VAL = 0x0C000000
+
+fn _hex32(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(96)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint8 zx = 48; unsafe { *((b + ll + 1) as uint8) = zx }
+    uint8 xc = 120; unsafe { *((b + ll + 2) as uint8) = xc }
+    uint64 j = 0
+    while j < 8 {
+        uint64 sh = (7 - j) * 4
+        uint64 nyb = (v >> sh) & 0xF
+        uint8 ch = nyb + 48
+        if nyb >= 10 { ch = nyb + 87 }
+        unsafe { *((b + ll + 3 + j) as uint8) = ch }
+        j = j + 1
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 11) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+fn _dec(uint64 lab, uint64 ll, uint64 v) {
+    uint64 b = alloc(80)
+    uint64 i = 0
+    while i < ll {
+        uint8 c = 0; unsafe { *((lab + i) as uint8) -> c }
+        unsafe { *((b + i) as uint8) = c }; i = i + 1
+    }
+    uint8 eq = 61; unsafe { *((b + ll) as uint8) = eq }
+    uint64 digits = 0
+    if v == 0 {
+        uint8 z = 48; unsafe { *((b + ll + 1) as uint8) = z }; digits = 1
+    } else {
+        uint64 t = v
+        while t > 0 { digits = digits + 1; t = t / 10 }
+        uint64 k = digits
+        t = v
+        while k > 0 {
+            k = k - 1
+            uint64 d = t - (t / 10) * 10
+            uint8 db = d + 48
+            unsafe { *((b + ll + 1 + k) as uint8) = db }
+            t = t / 10
+        }
+    }
+    uint8 nul = 0; unsafe { *((b + ll + 1 + digits) as uint8) = nul }
+    puts(b); dealloc(b)
+}
+
+fn _select_hqd(uint64 dev, uint64 me, uint64 pipe, uint64 q, uint64 vmid) {
+    uint64 sel = (pipe << 0) | (me << 2) | (vmid << 4) | (q << 8)
+    uint32 sel32 = sel
+    gpu_reg_w32(dev, GPU_IP_GC1, regGRBM_GFX_CNTL, sel32)
+    uint32 _rb = gpu_reg_r32(dev, GPU_IP_GC1, regGRBM_GFX_CNTL)
+}
+
+fn _delay(uint64 spins) {
+    uint64 i = 0
+    while i < spins { i = i + 1 }
+}
+
+fn main() {
+    puts("kiq_doorbell_bringup (SP2 Task 1)")
+
+    // 1) Open device, map BARs, enable Bus Master, load IP bases.
+    uint64 dev = gpu_open("0000:03:00.0")
+    if dev == GPU_HANDLE_INVALID { puts("FAIL gpu_open"); exit(1) }
+    amdgpu_load_navi32_bases()
+    gpu_load_ip_bases_explicit(dev,
+        amdgpu_ip_gc_base_0, amdgpu_ip_gc_base_1,
+        amdgpu_ip_mmhub_base_0, amdgpu_ip_mp0_base_0,
+        amdgpu_ip_mp1_base_0, amdgpu_ip_oss_base_0,
+        amdgpu_ip_nbif_base_0, amdgpu_ip_hdp_base_0)
+
+    uint64 bar5 = gpu_map_bar(dev, GPU_BAR_REGISTERS)
+    if bar5 == GPU_VA_INVALID { puts("FAIL BAR5"); gpu_close(dev); exit(2) }
+    uint64 bar0 = gpu_map_bar(dev, GPU_BAR_VRAM)
+    if bar0 == GPU_VA_INVALID { puts("FAIL BAR0"); gpu_close(dev); exit(3) }
+    uint64 bar2 = gpu_map_bar(dev, GPU_BAR_DOORBELL)
+    if bar2 == GPU_VA_INVALID { puts("FAIL BAR2"); gpu_close(dev); exit(4) }
+    uint64 bme = gpu_bus_master_enable(dev)
+    if bme != 0 { puts("FAIL bus_master_enable"); gpu_close(dev); exit(5) }
+
+    // Confirm SOS alive.
+    uint64 sol = psp_read32(dev, PSP_REG_C2PMSG_81)
+    _hex32("sos_C2PMSG_81", 13, sol)
+    if sol == 0 { puts("FAIL: SOS not alive"); gpu_close(dev); exit(6) }
+
+    // -------------------------------------------------------
+    // 2) GMC walker bring-up.
+    // -------------------------------------------------------
+    puts("")
+    puts("=== GMC walker bring-up ===")
+
+    uint64 pp = alloc(8); unsafe { *(pp as uint64) = 0 }
+    uint64 pe = gmc_alloc_page_table(dev, pp)
+    if pe != 0 {
+        _dec("FAIL gmc_alloc_page_table", 25, pe)
+        dealloc(pp); gpu_close(dev); exit(7)
+    }
+    uint64 pt_ctx = 0; unsafe { *(pp as uint64) -> pt_ctx }
+    dealloc(pp)
+
+    uint64 outs = alloc(16)
+    uint64 dae = gpu_dma_alloc(dev, 4096, 0, outs + 0, outs + 8)
+    if dae != 0 {
+        _dec("FAIL gpu_dma_alloc", 18, dae)
+        gmc_page_table_free(dev, pt_ctx)
+        dealloc(outs); gpu_close(dev); exit(8)
+    }
+    uint64 buf_host = 0; unsafe { *((outs + 0) as uint64) -> buf_host }
+    uint64 buf_iova = 0; unsafe { *((outs + 8) as uint64) -> buf_iova }
+    dealloc(outs)
+    _hex32("buf_iova_lo", 11, buf_iova & 0xFFFFFFFF)
+
+    uint64 me = gmc_map(pt_ctx, 0x1000000, buf_iova, 0x200000)
+    if me != 0 {
+        _dec("FAIL gmc_map", 12, me)
+        gpu_dma_free(dev, buf_host, buf_iova, 4096)
+        gmc_page_table_free(dev, pt_ctx)
+        gpu_close(dev); exit(9)
+    }
+
+    uint64 ie = gmc_init_mmhub(dev, pt_ctx, 0x1000000, 0x200000,
+                                0, 0xFFFF, buf_iova)
+    _dec("gmc_init_mmhub_rc", 17, ie)
+    if ie != 0 {
+        puts("FAIL gmc_init_mmhub")
+        gpu_dma_free(dev, buf_host, buf_iova, 4096)
+        gmc_page_table_free(dev, pt_ctx)
+        gpu_close(dev); exit(10)
+    }
+
+    // Assert CTX0 walker is enabled.
+    uint32 ctx0_raw = gpu_reg_r32(dev, GPU_IP_MMHUB, regMMVM_CONTEXT0_CNTL)
+    uint64 ctx0_val = ctx0_raw
+    _hex32("CTX0_CNTL", 9, ctx0_val)
+    if (ctx0_val & 0x1) == 0 {
+        puts("FAIL: CTX0 walker not enabled")
+        gpu_dma_free(dev, buf_host, buf_iova, 4096)
+        gmc_page_table_free(dev, pt_ctx)
+        gpu_close(dev); exit(11)
+    }
+    puts("CTX0 walker ENABLED")
+
+    // -------------------------------------------------------
+    // 3) NBIO doorbell selfring init.
+    //    Read BAR2 physical address from PCI config 0x18/0x1C.
+    // -------------------------------------------------------
+    puts("")
+    puts("=== NBIO doorbell selfring init ===")
+    uint64 bar2_lo_raw = pci_read_config32(0x18)
+    uint64 bar2_hi_raw = pci_read_config32(0x1C)
+    uint64 bar2_phys = (bar2_lo_raw & 0xFFFFFFF0) | (bar2_hi_raw << 32)
+    _hex32("bar2_phys_lo", 12, bar2_phys & 0xFFFFFFFF)
+    _hex32("bar2_phys_hi", 12, bar2_phys >> 32)
+    // Size from BAR info.
+    uint64 sb = alloc(24)
+    uint64 zi = 0
+    while zi < 24 { unsafe { *((sb + zi) as uint8) = 0 }; zi = zi + 1 }
+    uint64 br2 = pci_bar_info(2, sb + 0, sb + 8, sb + 16)
+    uint64 bar2_size = 0x2000
+    if br2 == 0 { unsafe { *((sb + 0) as uint64) -> bar2_size } } else { puts("WARN: pci_bar_info failed, bar2_size default") }
+    dealloc(sb)
+    _hex32("bar2_size", 9, bar2_size)
+    nbio_init_doorbell_selfring(dev, bar2_phys, bar2_size)
+    puts("NBIO doorbell selfring configured")
+
+    // -------------------------------------------------------
+    // 4) MEC reset/unhalt + MES unhalt.
+    // -------------------------------------------------------
+    puts("")
+    puts("=== MEC reset/unhalt + MES unhalt ===")
+    uint32 mec_reset_v  = MEC_RESET_VAL
+    uint32 mec_unhalt_v = MEC_UNHALT_VAL
+    uint32 mes_unhalt_v = MES_UNHALT_VAL
+    gpu_reg_w32(dev, GPU_IP_GC1, regCP_MEC_RS64_CNTL_dw, mec_reset_v)
+    _delay(50000)
+    gpu_reg_w32(dev, GPU_IP_GC1, regCP_MEC_RS64_CNTL_dw, mec_unhalt_v)
+    _delay(100000)
+    gpu_reg_w32(dev, GPU_IP_GC1, regCP_MES_CNTL_dw, mes_unhalt_v)
+    _delay(100000)
+    puts("MEC/MES unhalted")
+
+    // -------------------------------------------------------
+    // 5) KIQ HQD bring-up (ME=3, PIPE=1, QUEUE=0).
+    //    Allocate MQD/ring/rptr/eop in VRAM.
+    // -------------------------------------------------------
+    puts("")
+    puts("=== KIQ HQD bring-up (ME=3/P1/Q0) ===")
+
+    uint64 mqd_off  = 0xB00000
+    uint64 ring_off = 0xB01000
+    uint64 rptr_off = 0xB02000
+    uint64 wptr_off = 0xB03000
+    uint64 eop_off  = 0xB04000
+
+    uint32 fb_base_w = gpu_reg_r32(dev, GPU_IP_MMHUB, regMMMC_VM_FB_LOCATION_BASE)
+    uint64 fb_base_64 = fb_base_w
+    uint64 vram_mc_base = fb_base_64 << 24
+    uint64 mqd_mc  = vram_mc_base + mqd_off
+    uint64 ring_mc = vram_mc_base + ring_off
+    uint64 rptr_mc = vram_mc_base + rptr_off
+    uint64 eop_mc  = vram_mc_base + eop_off
+    _hex32("vram_mc_base", 12, vram_mc_base)
+    _hex32("ring_mc",       7, ring_mc)
+
+    // Zero MQD + ring + rptr + wptr.
+    uint64 zi2 = 0
+    while zi2 < 0x1000 {
+        gpu_vram_w32(dev, mqd_off  + zi2, 0)
+        gpu_vram_w32(dev, ring_off + zi2, 0)
+        gpu_vram_w32(dev, rptr_off + zi2, 0)
+        gpu_vram_w32(dev, wptr_off + zi2, 0)
+        zi2 = zi2 + 4
+    }
+
+    // Minimal MQD.
+    uint64 mqd_self_lo = mqd_mc & 0xFFFFFFFC
+    uint64 mqd_self_hi = mqd_mc >> 32
+    gpu_vram_w32(dev, mqd_off + 0  * 4, 0xC0310800)
+    gpu_vram_w32(dev, mqd_off + 11 * 4, 1)
+    gpu_vram_w32(dev, mqd_off + 23 * 4, 0xFFFFFFFF)
+    gpu_vram_w32(dev, mqd_off + 24 * 4, 0xFFFFFFFF)
+    gpu_vram_w32(dev, mqd_off + 26 * 4, 0xFFFFFFFF)
+    gpu_vram_w32(dev, mqd_off + 27 * 4, 0xFFFFFFFF)
+    gpu_vram_w32(dev, mqd_off + 32 * 4, 7)
+    gpu_vram_w32(dev, mqd_off + 44 * 4, 0xFFFFFFFF)
+    gpu_vram_w32(dev, mqd_off + 45 * 4, 0xFFFFFFFF)
+    gpu_vram_w32(dev, mqd_off + 46 * 4, 0xFFFFFFFF)
+    gpu_vram_w32(dev, mqd_off + 47 * 4, 0xFFFFFFFF)
+    uint32 sl = mqd_self_lo; uint32 sh = mqd_self_hi
+    gpu_vram_w32(dev, mqd_off + 128 * 4, sl)
+    gpu_vram_w32(dev, mqd_off + 129 * 4, sh)
+    gpu_vram_w32(dev, mqd_off + 130 * 4, 1)
+    gpu_vram_w32(dev, mqd_off + 160 * 4, 0x20004000)
+
+    // PM4 NOP at ring[0]: 0xC0001000 (single-dword NOP).
+    gpu_vram_w32(dev, ring_off, 0xC0001000)
+
+    // Select KIQ slot (ME=3, PIPE=1, QUEUE=0, VMID=0).
+    _select_hqd(dev, 3, 1, 0, 0)
+    gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_DEQUEUE_REQUEST, 1)
+    _delay(50000)
+    gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_DEQUEUE_REQUEST, 0)
+
+    uint32 mqd_lo32 = mqd_self_lo
+    uint32 mqd_hi32 = mqd_self_hi
+    gpu_reg_w32(dev, GPU_IP_GC0, regCP_MQD_BASE_ADDR,    mqd_lo32)
+    gpu_reg_w32(dev, GPU_IP_GC0, regCP_MQD_BASE_ADDR_HI, mqd_hi32)
+    gpu_reg_w32(dev, GPU_IP_GC0, regCP_MQD_CONTROL, 0)
+    gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_VMID, 0)
+
+    uint32 pq_base_lo = (ring_mc >> 8) & 0xFFFFFFFF
+    uint32 pq_base_hi = (ring_mc >> 8) >> 32
+    gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_BASE,    pq_base_lo)
+    gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_BASE_HI, pq_base_hi)
+
+    uint32 rptr_lo = rptr_mc & 0xFFFFFFFF
+    uint32 rptr_hi = rptr_mc >> 32
+    gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_RPTR_REPORT_ADDR,    rptr_lo)
+    gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_RPTR_REPORT_ADDR_HI, rptr_hi)
+
+    uint32 eop_lo = (eop_mc >> 8) & 0xFFFFFFFF
+    uint32 eop_hi = (eop_mc >> 8) >> 32
+    gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_EOP_BASE_ADDR,    eop_lo)
+    gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_EOP_BASE_ADDR_HI, eop_hi)
+    gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_EOP_CONTROL, 9)
+
+    gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_CONTROL,       0xC0000509)
+    gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PERSISTENT_STATE, 0x0BE05501)
+    gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_RPTR,           0)
+    gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_WPTR_LO,        0)
+    gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_WPTR_HI,        0)
+
+    // DOORBELL_OFFSET=0x00 (dword 0), EN=1 (bit 30).
+    uint64 db_dword_off = 0x00
+    uint64 db_cntl_init = (db_dword_off << 2) | (1 << 30)
+    uint32 db_cntl_w = db_cntl_init
+    gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_DOORBELL_CONTROL, db_cntl_w)
+
+    // Activate.
+    gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_ACTIVE, 1)
+    puts("KIQ HQD activated")
+
+    // -------------------------------------------------------
+    // 6+7) Write NOP to ring, advance WPTR, ring doorbell at offset 0.
+    // -------------------------------------------------------
+    puts("")
+    puts("=== Ring doorbell (offset=0x00) ===")
+
+    // NOP already at ring[0]; advance WPTR to 1.
+    gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_WPTR_LO, 1)
+    gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_WPTR_HI, 0)
+
+    // Ring: raw uint64 write to BAR2+0.
+    unsafe { *((bar2 + 0) as uint64) = 1 }
+    _delay(200000)
+
+    // -------------------------------------------------------
+    // 8) Check DOORBELL_HIT bit31 + HQD_RPTR.
+    // -------------------------------------------------------
+    _select_hqd(dev, 3, 1, 0, 0)
+    uint32 db_post_w = gpu_reg_r32(dev, GPU_IP_GC0, regCP_HQD_PQ_DOORBELL_CONTROL)
+    uint32 rptr_post_w = gpu_reg_r32(dev, GPU_IP_GC0, regCP_HQD_PQ_RPTR)
+    uint64 db_post = db_post_w
+    uint64 rptr_post = rptr_post_w
+    _hex32("DBELL_CTL_post", 14, db_post)
+    _hex32("HQD_RPTR_post",  13, rptr_post)
+
+    uint64 hit = (db_post >> 31) & 0x1
+    _dec("DOORBELL_HIT", 12, hit)
+    _dec("HQD_RPTR",      8, rptr_post)
+
+    // -------------------------------------------------------
+    // 9) Verdict / fallback sweep.
+    // -------------------------------------------------------
+    puts("")
+    puts("===========================================")
+    puts("Verdict")
+    puts("===========================================")
+    if rptr_post > 0 {
+        puts("KIQ CONSUMED NOP — doorbell delivery GREEN")
+        gpu_dma_free(dev, buf_host, buf_iova, 4096)
+        gmc_page_table_free(dev, pt_ctx)
+        gpu_close(dev)
+        exit(0)
+    }
+    puts("rptr=0 at offset 0x00 — running 9-offset sweep as fallback")
+
+    // Reset HQD state before sweep.
+    gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_DEQUEUE_REQUEST, 1)
+    _delay(10000)
+    gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_DEQUEUE_REQUEST, 0)
+
+    // Candidate byte offsets.
+    uint64 cands_count = 9
+    uint64 cands = alloc(cands_count * 8)
+    unsafe { *((cands + 0 * 8) as uint64) = 0x000 }
+    unsafe { *((cands + 1 * 8) as uint64) = 0x008 }
+    unsafe { *((cands + 2 * 8) as uint64) = 0x010 }
+    unsafe { *((cands + 3 * 8) as uint64) = 0x020 }
+    unsafe { *((cands + 4 * 8) as uint64) = 0x040 }
+    unsafe { *((cands + 5 * 8) as uint64) = 0x080 }
+    unsafe { *((cands + 6 * 8) as uint64) = 0x100 }
+    unsafe { *((cands + 7 * 8) as uint64) = 0x200 }
+    unsafe { *((cands + 8 * 8) as uint64) = 0x400 }
+
+    uint64 ci = 0
+    uint64 found_hit = 0
+    uint64 hit_offset = 0
+    while ci < cands_count {
+        uint64 byte_off = 0
+        unsafe { *((cands + ci * 8) as uint64) -> byte_off }
+        uint64 dword_off = byte_off / 4
+
+        _select_hqd(dev, 3, 1, 0, 0)
+        uint64 dbcntl = (dword_off << 2) | (1 << 30)
+        uint32 dbcntl_w = dbcntl
+        gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_DOORBELL_CONTROL, dbcntl_w)
+        gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_RPTR,   0)
+        gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_WPTR_LO, 0)
+        gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_WPTR_HI, 0)
+        gpu_vram_w32(dev, ring_off, 0xC0001000)
+        gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_ACTIVE, 1)
+
+        gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_WPTR_LO, 1)
+        gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_WPTR_HI, 0)
+        unsafe { *((bar2 + byte_off) as uint64) = 1 }
+        _delay(50000)
+
+        _select_hqd(dev, 3, 1, 0, 0)
+        uint32 db_sw = gpu_reg_r32(dev, GPU_IP_GC0, regCP_HQD_PQ_DOORBELL_CONTROL)
+        uint32 rptr_sw = gpu_reg_r32(dev, GPU_IP_GC0, regCP_HQD_PQ_RPTR)
+        uint64 db_sv = db_sw
+        uint64 rptr_sv = rptr_sw
+
+        _hex32("byte_off",    8,  byte_off)
+        _hex32("  DBELL_CTL", 11, db_sv)
+        _hex32("  HQD_RPTR",  10, rptr_sv)
+        if (db_sv & 0x80000000) != 0 {
+            puts("  *** DOORBELL_HIT SET ***")
+            if found_hit == 0 {
+                found_hit = 1
+                hit_offset = byte_off
+            }
+        }
+        gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_DEQUEUE_REQUEST, 1)
+        _delay(10000)
+        ci = ci + 1
+    }
+    dealloc(cands)
+
+    puts("")
+    if found_hit != 0 {
+        _hex32("HIT at byte_off", 15, hit_offset)
+        puts("  Use this offset for dispatch")
+    } else {
+        puts("NO HIT in sweep — doorbell delivery broken")
+    }
+
+    gpu_dma_free(dev, buf_host, buf_iova, 4096)
+    gmc_page_table_free(dev, pt_ctx)
+    gpu_close(dev)
+    puts("kiq_doorbell_bringup complete")
+    if found_hit != 0 { exit(0) }
+    exit(1)
+}
