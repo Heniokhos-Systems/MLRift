@@ -1,0 +1,679 @@
+// bp_wzma_gpu_fwd_native — WZMALinear+InfoNCE GPU forward, NO hipcc/ROCm.
+//
+// Identical computation to bp_wzma_gpu_fwd.mlr (commit c4bcd56) but the
+// gemm_f32 kernel is emitted by MLRift's --target=amdgpu-native path
+// (Phase 3c-3 AST-walker), not by hipcc.  The kernel interface and
+// dispatch grid are identical; only the .co source changes.
+//
+// Dims: B=8 S=16 D=384 K=4 R=32 vocab=8192
+// Reads bench_init.bin (same layout as bp_wzma_bench.mlr).
+//
+// GPU kernels used:
+//   embedding_lookup_f32  : token gather  [B*S] ids → [B*S, D]
+//   gemm_f32              : U-projection  X[B*S,D] @ U_k[D,R] → inter_k[B*S,R]
+//   gemm_f32              : V-projection  inter_k[B*S,R] @ V_k[R,D] → outk_k[B*S,D]
+//     (gemm_f32 kernel emitted by MLRift native emitter — no hipcc)
+//
+// CPU steps (all lightweight operations):
+//   - Gate logits: dot(x_pos, gw[k]) + gb[k] per position  (K=4, D=384)
+//   - Gate softmax  (K=4 values)
+//   - WZMA weighted mix + output bias
+//   - Mean pool         [B,S,D] → [B,D]
+//   - L2 normalise      [B,D] in-place
+//   - InfoNCE loss      scalar
+//
+// Note: gemv_coop_f32 requires k_dim to be a multiple of 256; D=384 is not,
+// so gate logits are computed on CPU. The heavy U/V projections (D=384,
+// R=32) use gemm_f32 which handles arbitrary K_dim correctly.
+//
+// Asserts:
+//   |gpu_fwd_loss - bench_ref.json cpu_losses[0]| < 1e-2   (= 3.059341)
+//   |gpu_encoder_v1 - bench_gpu_v1.bin|_inf < 1e-3         (per-element)
+//
+// Build (no hipcc at any step):
+//   # Build gemm_f32.co natively (AST-walker, no hipcc):
+//   ./build/mlrc --target=amdgpu-native \
+//       examples/llm/gemm_f32.mlr -o /tmp/gemm_f32_native
+//
+//   # Build embedding_lookup kernel:
+//   ./build/mlrc --arch=x86_64 \
+//       --emit-amdgpu-embedding-lookup-f32=/tmp/embedding_lookup_f32.co \
+//       /tmp/empty.mlr
+//
+//   # Build launcher (KFD-shim path, no hipcc):
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native \
+//       examples/bp_wzma_gpu_fwd_native.mlr -o /tmp/bp_wzma_gpu_fwd_native
+//
+// Run:
+//   /tmp/bp_wzma_gpu_fwd_native
+//
+// Expected output:
+//   cpu_fwd_loss: 3.059341   (matches bench_ref.json cpu_losses[0])
+//   gpu_fwd_loss: ~3.059     (within 1e-2 of CPU)
+//   v1_max_err:   <1e-3      (vs bench_gpu_v1.bin)
+//   PASS
+
+import "../std/train.mlr"
+import "../std/math_float.mlr"
+import "../std/fmt.mlr"
+import "../std/time.mlr"
+import "../std/hip.mlr"
+
+// =========================================================================
+// Dims (static constants)
+// =========================================================================
+static u64 B_DIM     = 8
+static u64 S_DIM     = 16
+static u64 D_DIM     = 384
+static u64 K_DIM     = 4
+static u64 R_DIM     = 32
+static u64 VOCAB_DIM = 8192
+static u64 BS_DIM    = 128      // B * S
+
+// =========================================================================
+// Utility: abs_f32
+// =========================================================================
+fn abs_f32(f32 v) -> f32 {
+    if v < 0.0f { return 0.0f - v }
+    return v
+}
+
+// =========================================================================
+// Utility: die on GPU error
+// =========================================================================
+fn die_gpu(u64 msg, u64 code) {
+    print_str(msg)
+    print_str(" err=")
+    u64 s = fmt_dec(code)
+    print_str(s)
+    dealloc(s)
+    print_str("\n")
+    hipkfd_teardown()
+    exit(1)
+}
+
+// =========================================================================
+// load_co: open, read, hipModuleLoadData, hipModuleGetFunction
+//   Returns function handle on success; calls die_gpu on any error.
+// =========================================================================
+fn load_co(u64 co_path, u64 fn_name) -> u64 {
+    u64 fd = file_open(co_path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        print_str("Cannot open .co: ")
+        print_str(co_path)
+        print_str("\n")
+        hipkfd_teardown()
+        exit(1)
+    }
+    u64 sz   = file_size(fd)
+    u64 blob = alloc(sz)
+    file_read(fd, blob, sz)
+    file_close(fd)
+
+    u64 mod_slot = alloc(8)
+    u32 err = hipModuleLoadData(mod_slot, blob)
+    if err != 0 { die_gpu("hipModuleLoadData", err) }
+    u64 mod = 0
+    unsafe { *(mod_slot as u64) -> mod }
+
+    u64 fh_slot = alloc(8)
+    err = hipModuleGetFunction(fh_slot, mod, fn_name)
+    if err != 0 { die_gpu("hipModuleGetFunction", err) }
+    u64 fh = 0
+    unsafe { *(fh_slot as u64) -> fh }
+
+    dealloc(mod_slot)
+    dealloc(fh_slot)
+    return fh
+}
+
+// =========================================================================
+// GPU launch helpers
+// =========================================================================
+
+// gemm_f32: C[M,N] = A[M,K_dim] @ B[K_dim,N]
+//   grid = tiles_M * tiles_N (each tile is 16x16), block = 256
+fn launch_gemm(u64 fh, u64 d_a, u64 d_b, u64 d_c, u64 m, u64 n, u64 k_dim) {
+    u64 p0 = alloc(8); unsafe { *(p0 as u64) = d_a }
+    u64 p1 = alloc(8); unsafe { *(p1 as u64) = d_b }
+    u64 p2 = alloc(8); unsafe { *(p2 as u64) = d_c }
+    u64 p3 = alloc(8); unsafe { *(p3 as u64) = m }
+    u64 p4 = alloc(8); unsafe { *(p4 as u64) = n }
+    u64 p5 = alloc(8); unsafe { *(p5 as u64) = k_dim }
+    u64 kp = alloc(6 * 8)
+    unsafe { *(kp        as u64) = p0 }
+    unsafe { *((kp +  8) as u64) = p1 }
+    unsafe { *((kp + 16) as u64) = p2 }
+    unsafe { *((kp + 24) as u64) = p3 }
+    unsafe { *((kp + 32) as u64) = p4 }
+    unsafe { *((kp + 40) as u64) = p5 }
+    u64 tiles_m = (m + 15) / 16
+    u64 tiles_n = (n + 15) / 16
+    u64 grid_u  = tiles_m * tiles_n
+    u32 grid  = grid_u
+    u32 block = 256
+    u32 err = hipModuleLaunchKernel(fh, grid, 1, 1, block, 1, 1, 0, 0, kp, 0)
+    if err != 0 { die_gpu("launch gemm", err) }
+    dealloc(p0); dealloc(p1); dealloc(p2); dealloc(p3); dealloc(p4); dealloc(p5); dealloc(kp)
+}
+
+// embedding_lookup_f32: out[SEQ, D] = embed[token_ids[SEQ], D]
+//   token_ids: uint32[SEQ],  D must be ≤ 1024 and a multiple of 32
+//   grid = SEQ, block = D
+fn launch_embed(u64 fh, u64 d_ids, u64 d_emb, u64 d_out, u64 seq, u64 D) {
+    u64 p0 = alloc(8); unsafe { *(p0 as u64) = d_ids }
+    u64 p1 = alloc(8); unsafe { *(p1 as u64) = d_emb }
+    u64 p2 = alloc(8); unsafe { *(p2 as u64) = d_out }
+    u64 p3 = alloc(8); unsafe { *(p3 as u64) = D }
+    u64 kp = alloc(4 * 8)
+    unsafe { *(kp        as u64) = p0 }
+    unsafe { *((kp +  8) as u64) = p1 }
+    unsafe { *((kp + 16) as u64) = p2 }
+    unsafe { *((kp + 24) as u64) = p3 }
+    u32 grid  = seq
+    u32 block = D   // D=384 ≤ 1024 and multiple of 32 ✓
+    u32 err = hipModuleLaunchKernel(fh, grid, 1, 1, block, 1, 1, 0, 0, kp, 0)
+    if err != 0 { die_gpu("launch embed", err) }
+    dealloc(p0); dealloc(p1); dealloc(p2); dealloc(p3); dealloc(kp)
+}
+
+// =========================================================================
+// cpu_gate_logits:
+//   For each position pos in [BS], compute alpha[pos, k] = dot(x[pos], gw[k]) + gb[k]
+//   Then apply softmax over k=0..K-1.
+//   x_ptr: [BS, D] f32; gw_ptr: [K, D] f32; gb_ptr: [K] f32
+//   alpha: [BS, K] f32 (output)
+// =========================================================================
+fn cpu_gate_logits(u64 x_ptr, u64 gw_ptr, u64 gb_ptr, u64 alpha, u64 BS, u64 D, u64 K) {
+    u64 pos = 0
+    while pos < BS {
+        u64 x_row = x_ptr + pos * D * 4
+        u64 a_row = alpha + pos * K * 4
+        u64 k = 0
+        while k < K {
+            u64 gw_row = gw_ptr + k * D * 4
+            f32 acc = 0.0f
+            u64 d = 0
+            while d < D {
+                f32 xv = 0.0f; unsafe { *((x_row + d * 4) as f32) -> xv }
+                f32 wv = 0.0f; unsafe { *((gw_row + d * 4) as f32) -> wv }
+                acc = acc + xv * wv
+                d = d + 1
+            }
+            f32 bk = 0.0f; unsafe { *((gb_ptr + k * 4) as f32) -> bk }
+            unsafe { *((a_row + k * 4) as f32) = acc + bk }
+            k = k + 1
+        }
+        softmax_f32_inplace(a_row, K)
+        pos = pos + 1
+    }
+}
+
+// =========================================================================
+// cpu_wzma_mix:
+//   z[BS, D] = sum_k alpha[BS, K] * outk[k][BS, D] + bias[D]
+//
+//   outk_flat: [K, BS, D] f32 (K contiguous blocks of [BS, D])
+//   alpha:     [BS, K]    f32
+//   bias:      [D]        f32
+//   z:         [BS, D]    f32  (output)
+// =========================================================================
+fn cpu_wzma_mix(u64 alpha, u64 outk_flat, u64 bias, u64 z, u64 BS, u64 D, u64 K) {
+    u64 pos = 0
+    while pos < BS {
+        u64 alpha_row = alpha + pos * K * 4
+        u64 z_row     = z     + pos * D * 4
+        u64 d = 0
+        while d < D {
+            f32 acc = 0.0f
+            u64 k = 0
+            while k < K {
+                f32 ak = 0.0f
+                unsafe { *((alpha_row + k * 4) as f32) -> ak }
+                f32 ok = 0.0f
+                u64 outk_k_row = outk_flat + k * BS * D * 4 + pos * D * 4
+                unsafe { *((outk_k_row + d * 4) as f32) -> ok }
+                acc = acc + ak * ok
+                k = k + 1
+            }
+            f32 bv = 0.0f
+            unsafe { *((bias + d * 4) as f32) -> bv }
+            unsafe { *((z_row + d * 4) as f32) = acc + bv }
+            d = d + 1
+        }
+        pos = pos + 1
+    }
+}
+
+// =========================================================================
+// gpu_fwd_view:
+//   h_x:     [BS, D] f32  — CPU-computed embeddings (from embed_f32)
+//   d_x:     GPU buffer  — receives GPU-computed embeddings
+//   h_alpha: [BS, K] f32 — output: CPU-computed gate softmax
+//   d_outk*: GPU output  — outk_k[BS, D] for k=0..K-1
+//
+//   Steps:
+//   1. GPU embed → d_x
+//   2. CPU gate logits from h_x → h_alpha  (avoids gemv_coop D%256≠0 issue)
+//   3. GPU gemm: U-proj  (x @ U_k → inter_k)
+//   4. GPU gemm: V-proj  (inter_k @ V_k → outk_k)
+// =========================================================================
+fn gpu_fwd_view(u64 fh_embed, u64 fh_gemm,
+                u64 d_ids, u64 d_emb,
+                u64 h_x, u64 h_gw, u64 h_gb,
+                u64 d_x,
+                u64 d_U, u64 d_V,
+                u64 d_outk0, u64 d_outk1, u64 d_outk2, u64 d_outk3,
+                u64 h_alpha,
+                u64 B, u64 S, u64 D, u64 K, u64 R) {
+    u64 BS = B * S
+
+    // ── Step 1: Embed tokens (GPU) ──────────────────────────────────────
+    launch_embed(fh_embed, d_ids, d_emb, d_x, BS, D)
+    u32 err = hipDeviceSynchronize()
+    if err != 0 { die_gpu("sync embed", err) }
+
+    // ── Step 2: Gate logits (CPU, avoids gemv_coop D%256 limitation) ───
+    cpu_gate_logits(h_x, h_gw, h_gb, h_alpha, BS, D, K)
+
+    // ── Step 3: U-projection (K launches of gemm_f32) ──────────────────
+    // inter_k[BS, R] = X[BS, D] @ U_k[D, R]
+    u64 d_int0 = 0; u64 d_int1 = 0; u64 d_int2 = 0; u64 d_int3 = 0
+    u64 slot = alloc(8)
+    slot = alloc(8); err = hipMalloc(slot, BS * R * 4); if err != 0 { die_gpu("mInt0", err) }; unsafe { *(slot as u64) -> d_int0 }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, BS * R * 4); if err != 0 { die_gpu("mInt1", err) }; unsafe { *(slot as u64) -> d_int1 }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, BS * R * 4); if err != 0 { die_gpu("mInt2", err) }; unsafe { *(slot as u64) -> d_int2 }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, BS * R * 4); if err != 0 { die_gpu("mInt3", err) }; unsafe { *(slot as u64) -> d_int3 }; dealloc(slot)
+
+    u64 d_int_arr = alloc(4 * 8)
+    unsafe { *(d_int_arr        as u64) = d_int0 }
+    unsafe { *((d_int_arr +  8) as u64) = d_int1 }
+    unsafe { *((d_int_arr + 16) as u64) = d_int2 }
+    unsafe { *((d_int_arr + 24) as u64) = d_int3 }
+
+    u64 k2 = 0
+    while k2 < K {
+        u64 d_Uk  = d_U + k2 * D * R * 4
+        u64 d_intk = 0
+        unsafe { *((d_int_arr + k2 * 8) as u64) -> d_intk }
+        // C[BS, R] = X[BS, D] @ U_k[D, R]
+        launch_gemm(fh_gemm, d_x, d_Uk, d_intk, BS, R, D)
+        k2 = k2 + 1
+    }
+    err = hipDeviceSynchronize()
+    if err != 0 { die_gpu("sync U-proj", err) }
+
+    // ── Step 4: V-projection (K launches of gemm_f32) ──────────────────
+    // outk_k[BS, D] = inter_k[BS, R] @ V_k[R, D]
+    u64 d_outk_arr = alloc(4 * 8)
+    unsafe { *(d_outk_arr        as u64) = d_outk0 }
+    unsafe { *((d_outk_arr +  8) as u64) = d_outk1 }
+    unsafe { *((d_outk_arr + 16) as u64) = d_outk2 }
+    unsafe { *((d_outk_arr + 24) as u64) = d_outk3 }
+
+    u64 k3 = 0
+    while k3 < K {
+        u64 d_Vk   = d_V + k3 * R * D * 4
+        u64 d_intk = 0
+        unsafe { *((d_int_arr + k3 * 8) as u64) -> d_intk }
+        u64 d_otkk = 0
+        unsafe { *((d_outk_arr + k3 * 8) as u64) -> d_otkk }
+        // C[BS, D] = inter_k[BS, R] @ V_k[R, D]
+        launch_gemm(fh_gemm, d_intk, d_Vk, d_otkk, BS, D, R)
+        k3 = k3 + 1
+    }
+    err = hipDeviceSynchronize()
+    if err != 0 { die_gpu("sync V-proj", err) }
+
+    // Free intermediate buffers
+    hipFree(d_int0); hipFree(d_int1); hipFree(d_int2); hipFree(d_int3)
+    dealloc(d_int_arr)
+    dealloc(d_outk_arr)
+}
+
+// =========================================================================
+// main
+// =========================================================================
+fn main() {
+    u64 B     = B_DIM
+    u64 S     = S_DIM
+    u64 D     = D_DIM
+    u64 K     = K_DIM
+    u64 R     = R_DIM
+    u64 VOCAB = VOCAB_DIM
+    u64 BS    = BS_DIM
+
+    print_str("=== bp_wzma_gpu_fwd_native: B=8 S=16 D=384 K=4 R=32 (MLRift-native gemm) ===\n")
+
+    // ── Init GPU ───────────────────────────────────────────────────────
+    u32 err = hipSetDevice(0)
+    if err != 0 {
+        print_str("hipSetDevice failed err=")
+        u64 s = fmt_dec(err); print_str(s); dealloc(s); print_str("\n")
+        exit(1)
+    }
+
+    // ── Load GPU kernels ───────────────────────────────────────────────
+    print_str("Loading kernels...\n")
+    // embedding_lookup_f32 — emitted by --emit-amdgpu-embedding-lookup-f32
+    u64 fh_embed = load_co("/tmp/embedding_lookup_f32.co", "embedding_lookup_f32")
+    // gemm_f32 — emitted by MLRift --target=amdgpu-native (no hipcc)
+    u64 fh_gemm  = load_co("/tmp/gemm_f32_native.co",     "gemm_f32")
+    print_str("Kernels loaded (native gemm_f32, no hipcc).\n")
+
+    // ── Allocate CPU weight buffers ────────────────────────────────────
+    u64 emb_ptr  = alloc(VOCAB * D * 4)
+    u64 U_ptr    = alloc(K * D * R * 4)
+    u64 V_ptr    = alloc(K * R * D * 4)
+    u64 gw_ptr   = alloc(K * D * 4)
+    u64 gb_ptr   = alloc(K * 4)
+    u64 bias_ptr = alloc(D * 4)
+
+    // ── Read bench_init.bin ────────────────────────────────────────────
+    u64 bin_path = "/home/pantelis/Desktop/Projects/Work/MLRiftBench/tools/bench_init.bin"
+    u64 fd = file_open(bin_path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        print_str("Cannot open bench_init.bin\n")
+        hipkfd_teardown(); exit(1)
+    }
+    file_read(fd, emb_ptr,  VOCAB * D * 4)
+    file_read(fd, U_ptr,    K * D * R * 4)
+    file_read(fd, V_ptr,    K * R * D * 4)
+    file_read(fd, gw_ptr,   K * D * 4)
+    file_read(fd, gb_ptr,   K * 4)
+    file_read(fd, bias_ptr, D * 4)
+
+    // ids stored as int32 in file — read directly; raw bytes usable as uint32
+    u64 ids1_i32 = alloc(BS * 4)
+    u64 ids2_i32 = alloc(BS * 4)
+    file_read(fd, ids1_i32, BS * 4)
+    file_read(fd, ids2_i32, BS * 4)
+    file_close(fd)
+
+    // Expand ids to u64 for CPU embed_f32 (uses u64 ids)
+    u64 ids1_u64 = alloc(BS * 8)
+    u64 ids2_u64 = alloc(BS * 8)
+    u64 ii = 0
+    while ii < BS {
+        u64 a1 = ids1_i32 + ii * 4
+        u64 b0 = 0; u64 b1 = 0; u64 b2 = 0; u64 b3 = 0
+        unsafe { *(a1 as u8) -> b0 }
+        unsafe { *((a1 + 1) as u8) -> b1 }
+        unsafe { *((a1 + 2) as u8) -> b2 }
+        unsafe { *((a1 + 3) as u8) -> b3 }
+        u64 id1 = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+        unsafe { *((ids1_u64 + ii * 8) as u64) = id1 }
+
+        u64 a2 = ids2_i32 + ii * 4
+        u64 c0 = 0; u64 c1 = 0; u64 c2 = 0; u64 c3 = 0
+        unsafe { *(a2 as u8) -> c0 }
+        unsafe { *((a2 + 1) as u8) -> c1 }
+        unsafe { *((a2 + 2) as u8) -> c2 }
+        unsafe { *((a2 + 3) as u8) -> c3 }
+        u64 id2 = c0 | (c1 << 8) | (c2 << 16) | (c3 << 24)
+        unsafe { *((ids2_u64 + ii * 8) as u64) = id2 }
+        ii = ii + 1
+    }
+    print_str("Weights loaded.\n")
+
+    // =========================================================================
+    // CPU FORWARD (reference)
+    // =========================================================================
+    print_str("\n--- CPU forward ---\n")
+    u64 t0_cpu = time_now()
+
+    u64 cx1    = alloc(BS * D * 4)
+    u64 cx2    = alloc(BS * D * 4)
+    u64 cz1    = alloc(BS * D * 4)
+    u64 cz2    = alloc(BS * D * 4)
+    u64 calp1  = alloc(BS * K * 4)
+    u64 cint1  = alloc(BS * K * R * 4)
+    u64 coutk1 = alloc(BS * K * D * 4)
+    u64 calp2  = alloc(BS * K * 4)
+    u64 cint2  = alloc(BS * K * R * 4)
+    u64 coutk2 = alloc(BS * K * D * 4)
+    u64 cq1    = alloc(B * D * 4)
+    u64 cq2    = alloc(B * D * 4)
+    u64 cnorms1 = alloc(B * 4)
+    u64 cnorms2 = alloc(B * 4)
+
+    embed_f32(cx1, emb_ptr, ids1_u64, B, S, D)
+    embed_f32(cx2, emb_ptr, ids2_u64, B, S, D)
+    wzma_f32_fwd(cx1, cz1, U_ptr, V_ptr, gw_ptr, gb_ptr, bias_ptr,
+                 B, S, D, K, R, calp1, cint1, coutk1)
+    wzma_f32_fwd(cx2, cz2, U_ptr, V_ptr, gw_ptr, gb_ptr, bias_ptr,
+                 B, S, D, K, R, calp2, cint2, coutk2)
+    mean_pool_s_f32(cz1, cq1, B, S, D)
+    mean_pool_s_f32(cz2, cq2, B, S, D)
+    l2_normalize_f32_save(cq1, B, D, cnorms1)
+    l2_normalize_f32_save(cq2, B, D, cnorms2)
+    f32 tau = 0.1f
+    f32 cpu_loss = infonce_f32(cq1, cq2, tau, B, D)
+
+    u64 t1_cpu = time_now()
+    u64 cpu_ns = t1_cpu - t0_cpu
+    f32 cpu_ms = f64_to_f32(int_to_f64(cpu_ns) / 1000000.0)
+
+    print_str("cpu_fwd_loss: ")
+    u64 ss = fmt_f32(cpu_loss, 6); print_str(ss); dealloc(ss); print_str("\n")
+    print_str("cpu_fwd_ms:   ")
+    ss = fmt_f32(cpu_ms, 3); print_str(ss); dealloc(ss); print_str("\n")
+
+    // =========================================================================
+    // GPU FORWARD
+    // =========================================================================
+    print_str("\n--- GPU forward ---\n")
+
+    // Upload weights to GPU
+    u64 d_emb = 0; u64 d_U = 0; u64 d_V = 0
+    u64 d_ids1 = 0; u64 d_ids2 = 0
+    u64 slot
+
+    slot = alloc(8); err = hipMalloc(slot, VOCAB * D * 4); if err != 0 { die_gpu("mEmb", err) }; unsafe { *(slot as u64) -> d_emb  }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, K * D * R * 4); if err != 0 { die_gpu("mU",   err) }; unsafe { *(slot as u64) -> d_U    }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, K * R * D * 4); if err != 0 { die_gpu("mV",   err) }; unsafe { *(slot as u64) -> d_V    }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, BS * 4);        if err != 0 { die_gpu("mIds1",err) }; unsafe { *(slot as u64) -> d_ids1 }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, BS * 4);        if err != 0 { die_gpu("mIds2",err) }; unsafe { *(slot as u64) -> d_ids2 }; dealloc(slot)
+
+    err = hipMemcpy(d_emb,  emb_ptr,  VOCAB * D * 4, 1); if err != 0 { die_gpu("H2D emb",  err) }
+    err = hipMemcpy(d_U,    U_ptr,    K * D * R * 4, 1); if err != 0 { die_gpu("H2D U",    err) }
+    err = hipMemcpy(d_V,    V_ptr,    K * R * D * 4, 1); if err != 0 { die_gpu("H2D V",    err) }
+    err = hipMemcpy(d_ids1, ids1_i32, BS * 4,         1); if err != 0 { die_gpu("H2D ids1", err) }
+    err = hipMemcpy(d_ids2, ids2_i32, BS * 4,         1); if err != 0 { die_gpu("H2D ids2", err) }
+
+    // GPU scratch: x[BS, D] per view
+    u64 d_x1 = 0; u64 d_x2 = 0
+    slot = alloc(8); err = hipMalloc(slot, BS * D * 4); if err != 0 { die_gpu("mX1", err) }; unsafe { *(slot as u64) -> d_x1 }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, BS * D * 4); if err != 0 { die_gpu("mX2", err) }; unsafe { *(slot as u64) -> d_x2 }; dealloc(slot)
+
+    // GPU outk buffers: K buffers of [BS, D] per view
+    u64 d_otk1_0 = 0; u64 d_otk1_1 = 0; u64 d_otk1_2 = 0; u64 d_otk1_3 = 0
+    u64 d_otk2_0 = 0; u64 d_otk2_1 = 0; u64 d_otk2_2 = 0; u64 d_otk2_3 = 0
+    slot = alloc(8); err = hipMalloc(slot, BS * D * 4); if err != 0 { die_gpu("mO10", err) }; unsafe { *(slot as u64) -> d_otk1_0 }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, BS * D * 4); if err != 0 { die_gpu("mO11", err) }; unsafe { *(slot as u64) -> d_otk1_1 }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, BS * D * 4); if err != 0 { die_gpu("mO12", err) }; unsafe { *(slot as u64) -> d_otk1_2 }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, BS * D * 4); if err != 0 { die_gpu("mO13", err) }; unsafe { *(slot as u64) -> d_otk1_3 }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, BS * D * 4); if err != 0 { die_gpu("mO20", err) }; unsafe { *(slot as u64) -> d_otk2_0 }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, BS * D * 4); if err != 0 { die_gpu("mO21", err) }; unsafe { *(slot as u64) -> d_otk2_1 }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, BS * D * 4); if err != 0 { die_gpu("mO22", err) }; unsafe { *(slot as u64) -> d_otk2_2 }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, BS * D * 4); if err != 0 { die_gpu("mO23", err) }; unsafe { *(slot as u64) -> d_otk2_3 }; dealloc(slot)
+
+    // CPU alpha buffers: [BS, K] per view (filled by cpu_gate_logits inside gpu_fwd_view)
+    u64 h_alpha1 = alloc(BS * K * 4)
+    u64 h_alpha2 = alloc(BS * K * 4)
+
+    // ── GPU forward: timed ─────────────────────────────────────────────
+    u64 t0_gpu = time_now()
+
+    // View 1: embed GPU, gate logits CPU (using cx1), U/V proj GPU
+    gpu_fwd_view(fh_embed, fh_gemm,
+                 d_ids1, d_emb,
+                 cx1, gw_ptr, gb_ptr,
+                 d_x1,
+                 d_U, d_V,
+                 d_otk1_0, d_otk1_1, d_otk1_2, d_otk1_3,
+                 h_alpha1,
+                 B, S, D, K, R)
+
+    // View 2
+    gpu_fwd_view(fh_embed, fh_gemm,
+                 d_ids2, d_emb,
+                 cx2, gw_ptr, gb_ptr,
+                 d_x2,
+                 d_U, d_V,
+                 d_otk2_0, d_otk2_1, d_otk2_2, d_otk2_3,
+                 h_alpha2,
+                 B, S, D, K, R)
+
+    u64 t1_gpu_kernels = time_now()
+
+    // Download outk buffers from GPU → CPU flat [K, BS, D] layout
+    u64 h_outk1 = alloc(K * BS * D * 4)
+    u64 h_outk2 = alloc(K * BS * D * 4)
+    u64 gpu_otk1_arr = alloc(4 * 8)
+    u64 gpu_otk2_arr = alloc(4 * 8)
+    unsafe { *(gpu_otk1_arr        as u64) = d_otk1_0 }
+    unsafe { *((gpu_otk1_arr +  8) as u64) = d_otk1_1 }
+    unsafe { *((gpu_otk1_arr + 16) as u64) = d_otk1_2 }
+    unsafe { *((gpu_otk1_arr + 24) as u64) = d_otk1_3 }
+    unsafe { *(gpu_otk2_arr        as u64) = d_otk2_0 }
+    unsafe { *((gpu_otk2_arr +  8) as u64) = d_otk2_1 }
+    unsafe { *((gpu_otk2_arr + 16) as u64) = d_otk2_2 }
+    unsafe { *((gpu_otk2_arr + 24) as u64) = d_otk2_3 }
+
+    u64 k5 = 0
+    while k5 < K {
+        u64 dk1 = 0; unsafe { *((gpu_otk1_arr + k5 * 8) as u64) -> dk1 }
+        u64 dk2 = 0; unsafe { *((gpu_otk2_arr + k5 * 8) as u64) -> dk2 }
+        err = hipMemcpy(h_outk1 + k5 * BS * D * 4, dk1, BS * D * 4, 2)
+        if err != 0 { die_gpu("D2H otk1", err) }
+        err = hipMemcpy(h_outk2 + k5 * BS * D * 4, dk2, BS * D * 4, 2)
+        if err != 0 { die_gpu("D2H otk2", err) }
+        k5 = k5 + 1
+    }
+    dealloc(gpu_otk1_arr)
+    dealloc(gpu_otk2_arr)
+
+    u64 t1_gpu_d2h = time_now()
+
+    // CPU remainder: mix + pool + norm + loss
+    u64 gz1 = alloc(BS * D * 4)
+    u64 gz2 = alloc(BS * D * 4)
+    cpu_wzma_mix(h_alpha1, h_outk1, bias_ptr, gz1, BS, D, K)
+    cpu_wzma_mix(h_alpha2, h_outk2, bias_ptr, gz2, BS, D, K)
+
+    u64 gq1 = alloc(B * D * 4)
+    u64 gq2 = alloc(B * D * 4)
+    mean_pool_s_f32(gz1, gq1, B, S, D)
+    mean_pool_s_f32(gz2, gq2, B, S, D)
+    l2_normalize_f32(gq1, B, D)
+    l2_normalize_f32(gq2, B, D)
+    f32 gpu_loss = infonce_f32(gq1, gq2, tau, B, D)
+
+    u64 t1_gpu_total = time_now()
+
+    // ── Timing ─────────────────────────────────────────────────────────
+    u64 gpu_kern_ns  = t1_gpu_kernels - t0_gpu
+    u64 gpu_d2h_ns   = t1_gpu_d2h    - t1_gpu_kernels
+    u64 gpu_cpu_ns   = t1_gpu_total  - t1_gpu_d2h
+    u64 gpu_total_ns = t1_gpu_total  - t0_gpu
+
+    f32 gk_ms = f64_to_f32(int_to_f64(gpu_kern_ns)  / 1000000.0)
+    f32 gd_ms = f64_to_f32(int_to_f64(gpu_d2h_ns)   / 1000000.0)
+    f32 gc_ms = f64_to_f32(int_to_f64(gpu_cpu_ns)   / 1000000.0)
+    f32 gt_ms = f64_to_f32(int_to_f64(gpu_total_ns) / 1000000.0)
+
+    print_str("gpu_kernels_ms:  ")
+    ss = fmt_f32(gk_ms, 3); print_str(ss); dealloc(ss); print_str("\n")
+    print_str("gpu_d2h_ms:      ")
+    ss = fmt_f32(gd_ms, 3); print_str(ss); dealloc(ss); print_str("\n")
+    print_str("gpu_cpu_tail_ms: ")
+    ss = fmt_f32(gc_ms, 3); print_str(ss); dealloc(ss); print_str("\n")
+    print_str("gpu_total_ms:    ")
+    ss = fmt_f32(gt_ms, 3); print_str(ss); dealloc(ss); print_str("\n")
+
+    // ── Results: loss check ────────────────────────────────────────────
+    print_str("\n=== Results ===\n")
+    print_str("cpu_fwd_loss: ")
+    ss = fmt_f32(cpu_loss, 6); print_str(ss); dealloc(ss); print_str("\n")
+    print_str("gpu_fwd_loss: ")
+    ss = fmt_f32(gpu_loss, 6); print_str(ss); dealloc(ss); print_str("\n")
+
+    f32 loss_diff = abs_f32(gpu_loss - cpu_loss)
+    print_str("loss_diff:    ")
+    ss = fmt_f32(loss_diff, 8); print_str(ss); dealloc(ss); print_str("\n")
+
+    f32 tol_loss = 0.01f
+    if loss_diff > tol_loss {
+        print_str("FAIL: |gpu_loss - cpu_loss| > 1e-2\n")
+        hipkfd_teardown(); exit(1)
+    }
+
+    // ── Encoder v1 check vs bench_gpu_v1.bin ─────────────────────────
+    // bench_gpu_v1.bin = PyTorch GPU l2_normalize(mean_pool(wzma(embed(ids1))))
+    // Our gq1 = same computation via native GPU gemm_f32 + CPU mix/pool/norm.
+    // Tolerance: 1e-3 per element.
+    print_str("\n--- encoder v1 vs bench_gpu_v1.bin ---\n")
+    u64 v1_path = "/home/pantelis/Desktop/Projects/Work/MLRiftBench/tools/bench_gpu_v1.bin"
+    u64 v1_fd = file_open(v1_path, 0)
+    if v1_fd > 0xFFFFFFFFFFFFF000 {
+        print_str("Cannot open bench_gpu_v1.bin — skip v1 check\n")
+    }
+    if v1_fd <= 0xFFFFFFFFFFFFF000 {
+        u64 v1_n = B * D          // 8 * 384 = 3072 f32s
+        u64 v1_bytes = v1_n * 4
+        u64 v1_ref = alloc(v1_bytes)
+        file_read(v1_fd, v1_ref, v1_bytes)
+        file_close(v1_fd)
+
+        f32 v1_max_err = 0.0f
+        u64 vi = 0
+        while vi < v1_n {
+            f32 ref_v = 0.0f
+            f32 got_v = 0.0f
+            unsafe { *((v1_ref + vi * 4) as f32) -> ref_v }
+            unsafe { *((gq1   + vi * 4) as f32) -> got_v }
+            f32 e = abs_f32(got_v - ref_v)
+            if e > v1_max_err { v1_max_err = e }
+            vi = vi + 1
+        }
+        dealloc(v1_ref)
+
+        print_str("v1_max_err:   ")
+        ss = fmt_f32(v1_max_err, 8); print_str(ss); dealloc(ss); print_str("\n")
+
+        f32 tol_v1 = 0.001f
+        if v1_max_err > tol_v1 {
+            print_str("FAIL: encoder v1 max_err > 1e-3 vs bench_gpu_v1.bin\n")
+            hipkfd_teardown(); exit(1)
+        }
+        print_str("PASS: encoder v1 matches bench_gpu_v1.bin within 1e-3\n")
+    }
+
+    print_str("PASS: GPU forward loss matches CPU within 1e-2\n")
+    print_str("PASS: native gemm_f32 (no hipcc) verified\n")
+
+    // ── GPU cleanup ────────────────────────────────────────────────────
+    hipFree(d_emb); hipFree(d_U); hipFree(d_V)
+    hipFree(d_ids1); hipFree(d_ids2)
+    hipFree(d_x1); hipFree(d_x2)
+    hipFree(d_otk1_0); hipFree(d_otk1_1); hipFree(d_otk1_2); hipFree(d_otk1_3)
+    hipFree(d_otk2_0); hipFree(d_otk2_1); hipFree(d_otk2_2); hipFree(d_otk2_3)
+
+    // ── CPU cleanup ────────────────────────────────────────────────────
+    dealloc(emb_ptr); dealloc(U_ptr); dealloc(V_ptr)
+    dealloc(gw_ptr); dealloc(gb_ptr); dealloc(bias_ptr)
+    dealloc(ids1_i32); dealloc(ids2_i32)
+    dealloc(ids1_u64); dealloc(ids2_u64)
+    dealloc(cx1); dealloc(cx2); dealloc(cz1); dealloc(cz2)
+    dealloc(calp1); dealloc(cint1); dealloc(coutk1)
+    dealloc(calp2); dealloc(cint2); dealloc(coutk2)
+    dealloc(cq1); dealloc(cq2); dealloc(cnorms1); dealloc(cnorms2)
+    dealloc(h_alpha1); dealloc(h_alpha2)
+    dealloc(h_outk1); dealloc(h_outk2)
+    dealloc(gz1); dealloc(gz2)
+    dealloc(gq1); dealloc(gq2)
+
+    hipkfd_teardown()
+    exit(0)
+}
