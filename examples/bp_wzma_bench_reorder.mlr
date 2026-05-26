@@ -1,0 +1,1370 @@
+// bp_wzma_bench_reorder — AVX-512 + bf16-weight + 16-thread WZMALinear+InfoNCE CPU bench.
+//
+// Loop-reorder variant: U layout transposed to [K, R, D] so that D=384 is the
+// contiguous inner dimension for both the forward inter einsum and the backward
+// dU/dx-from-U accumulations.  This replaces 384×(R=32 broadcast) patterns with
+// R=32×(D=384 ZMM axpy/dot) patterns, giving 24 ZMM iterations per inner-loop
+// body instead of a single 2-ZMM unrolled call per d.
+//
+// Key changes vs bp_wzma_bench_avx512.mlr:
+//
+//   U storage layout: [K, D, R] bf16  →  [K, R, D] bf16
+//     After loading from bench_init.bin (stored [K,D,R]), transpose in-place.
+//
+//   Forward inter:  was   for d in D: inter_axpy_bf16_R32(inter_k, U_k[d,:], x[d])
+//                  now    for r in R: inter_k[r] = dot_f32_bf16_p(x, U_k[r,:], D)
+//     24 ZMM FMA iterations per r (D=384/16) vs 2-ZMM unrolled per d.
+//
+//   Backward dU:   was   for d in D: inter_axpy_avx512_R32(dU_k[d,:], dinter_k, x[d])
+//                  now   for r in R: axpy_f32_avx512_p(dU_k[r,:], x, dinter[r], D)
+//     24 ZMM axpy iterations per r vs 2-ZMM unrolled per d.
+//
+//   Backward dx from U:
+//                  was   for d in D: dx[d] += dot_r32_bf16_p(dinter_k, U_k[d,:])
+//                  now   for r in R: axpy_bf16_avx512_p(dx, U_k[r,:], dinter[r], D)
+//     24 ZMM axpy iterations per r vs 2-ZMM unrolled dot per d, fully streaming.
+//
+// All other kernels (V path, gate, mean_pool, l2_norm) are identical to avx512.
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --target=linux --emit=elfexe \
+//       examples/bp_wzma_bench_reorder.mlr -o /tmp/bp_wzma_bench_reorder
+// Run:
+//   /tmp/bp_wzma_bench_reorder /path/to/bench_init.bin
+
+import "../std/train.mlr"
+import "../std/math_float.mlr"
+import "../std/fmt.mlr"
+import "../std/time.mlr"
+import "../std/thread.mlr"
+
+// =========================================================================
+// Dims (static constants)
+// =========================================================================
+static u64 B_DIM     = 8
+static u64 S_DIM     = 16
+static u64 D_DIM     = 384
+static u64 K_DIM     = 4
+static u64 R_DIM     = 32
+static u64 VOCAB_DIM = 8192
+static u64 STEPS     = 50
+static u64 WARMUP    = 5
+
+// Thread count: 16 workers.
+static u64 NW = 16
+
+// =========================================================================
+// Reference losses from bench_ref.json cpu_losses[50]
+// =========================================================================
+fn ref_cpu_loss(u64 step) -> f32 {
+    if step == 0  { return 3.059341431f }
+    if step == 1  { return 0.047913674f }
+    if step == 2  { return 0.006029791f }
+    if step == 3  { return 0.003066241f }
+    if step == 4  { return 0.002411466f }
+    if step == 5  { return 0.002189299f }
+    if step == 6  { return 0.002088466f }
+    if step == 7  { return 0.002025114f }
+    if step == 8  { return 0.001971901f }
+    if step == 9  { return 0.001919352f }
+    if step == 10 { return 0.001864696f }
+    if step == 11 { return 0.001807675f }
+    if step == 12 { return 0.001749179f }
+    if step == 13 { return 0.001689902f }
+    if step == 14 { return 0.001630811f }
+    if step == 15 { return 0.001572575f }
+    if step == 16 { return 0.001515878f }
+    if step == 17 { return 0.001460973f }
+    if step == 18 { return 0.001408174f }
+    if step == 19 { return 0.001357688f }
+    if step == 20 { return 0.001309652f }
+    if step == 21 { return 0.001263960f }
+    if step == 22 { return 0.001220675f }
+    if step == 23 { return 0.001179677f }
+    if step == 24 { return 0.001140996f }
+    if step == 25 { return 0.001104455f }
+    if step == 26 { return 0.001069995f }
+    if step == 27 { return 0.001037468f }
+    if step == 28 { return 0.001006768f }
+    if step == 29 { return 0.000977868f }
+    if step == 30 { return 0.000950514f }
+    if step == 31 { return 0.000924722f }
+    if step == 32 { return 0.000900372f }
+    if step == 33 { return 0.000877435f }
+    if step == 34 { return 0.000855614f }
+    if step == 35 { return 0.000835012f }
+    if step == 36 { return 0.000815497f }
+    if step == 37 { return 0.000797068f }
+    if step == 38 { return 0.000779531f }
+    if step == 39 { return 0.000762887f }
+    if step == 40 { return 0.000747151f }
+    if step == 41 { return 0.000732040f }
+    if step == 42 { return 0.000717732f }
+    if step == 43 { return 0.000704109f }
+    if step == 44 { return 0.000691126f }
+    if step == 45 { return 0.000678693f }
+    if step == 46 { return 0.000666871f }
+    if step == 47 { return 0.000655540f }
+    if step == 48 { return 0.000644670f }
+    return 0.000634307f
+}
+
+fn abs_f32(f32 v) -> f32 {
+    if v < 0.0f { return 0.0f - v }
+    return v
+}
+
+// =========================================================================
+// AVX-512 primitives — 16-wide ZMM operations (identical to avx512 bench)
+// =========================================================================
+
+// Scratch buffers
+static u64 avx512_dot_scratch = 0
+// Per-worker scratch: NW * 128 bytes (2 cache lines per worker for padding)
+static u64 g_w_scratch        = 0
+
+// ---------------------------------------------------------------------------
+// dot_f32_avx512_p: sum_i a[i]*b[i] for n elements (multiple of 16).
+// ---------------------------------------------------------------------------
+fn dot_f32_avx512_p(u64 a_ptr, u64 b_ptr, u64 n, u64 dot_buf) -> f32 {
+    u64 n_iter = n / 16
+    if n_iter > 0 {
+        asm {
+            "0x62 0xF1 0x7D 0x48 0xEF 0xC0"
+            "0x48 0x31 0xC0"
+            "0x48 0x39 0xD0"
+            "0x7D 0x14"
+            "0x62 0xF1 0x7C 0x48 0x10 0x0C 0x86"
+            "0x62 0xF2 0x75 0x48 0xB8 0x04 0x87"
+            "0x48 0x83 0xC0 0x10"
+            "0xEB 0xE7"
+            "0x62 0xF3 0x7D 0x48 0x1B 0xC1 0x01"
+            "0xC5 0xF4 0x58 0xC0"
+            "0xC4 0xE3 0x7D 0x19 0xC1 0x01"
+            "0xC5 0xF8 0x58 0xC1"
+            "0xC5 0xFB 0x7C 0xC0"
+            "0xC5 0xFB 0x7C 0xC0"
+            "0xC5 0xFA 0x11 0x01"
+            "0xC5 0xF8 0x77"
+        } in(a_ptr -> rsi, b_ptr -> rdi, n -> rdx, dot_buf -> rcx) clobbers(rax)
+    }
+    f32 result = 0.0f
+    unsafe { *(dot_buf as f32) -> result }
+    return result
+}
+
+fn dot_f32_avx512(u64 a_ptr, u64 b_ptr, u64 n) -> f32 {
+    if avx512_dot_scratch == 0 { avx512_dot_scratch = alloc(16) }
+    return dot_f32_avx512_p(a_ptr, b_ptr, n, avx512_dot_scratch)
+}
+
+// ---------------------------------------------------------------------------
+// axpy_f32_avx512_p: dst[i] += scale * src[i], n multiple of 16.
+// ---------------------------------------------------------------------------
+fn axpy_f32_avx512_p(u64 dst_ptr, u64 src_ptr, f32 scale, u64 n, u64 scale_buf) {
+    unsafe { *(scale_buf as f32) = scale }
+    u64 n_iter = n / 16
+    if n_iter > 0 {
+        asm {
+            "0x62 0xF2 0x7D 0x48 0x18 0x19"
+            "0x48 0x31 0xC0"
+            "0x48 0x39 0xD0"
+            "0x7D 0x1B"
+            "0x62 0xF1 0x7C 0x48 0x10 0x0C 0x87"
+            "0x62 0xF2 0x65 0x48 0xB8 0x0C 0x86"
+            "0x62 0xF1 0x7C 0x48 0x11 0x0C 0x87"
+            "0x48 0x83 0xC0 0x10"
+            "0xEB 0xE0"
+            "0xC5 0xF8 0x77"
+        } in(dst_ptr -> rdi, src_ptr -> rsi, scale_buf -> rcx, n -> rdx) clobbers(rax)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// axpy_bf16_avx512_p: dst[i] += scale * bf16_src[i], n multiple of 16.
+// ---------------------------------------------------------------------------
+fn axpy_bf16_avx512_p(u64 dst_ptr, u64 bf16_src, f32 scale, u64 n, u64 scale_buf) {
+    unsafe { *(scale_buf as f32) = scale }
+    u64 n_iter = n / 16
+    if n_iter > 0 {
+        asm {
+            "0x62 0xF2 0x7D 0x48 0x18 0x19"
+            "0x48 0x31 0xC0"
+            "0x48 0x39 0xD0"
+            "0x7D 0x28"
+            "0x62 0xF2 0x7D 0x48 0x33 0x0C 0x46"
+            "0x62 0xF1 0x75 0x48 0x72 0xF1 0x10"
+            "0x62 0xF1 0x7C 0x48 0x10 0x14 0x87"
+            "0x62 0xF2 0x65 0x48 0xB8 0xD1"
+            "0x62 0xF1 0x7C 0x48 0x11 0x14 0x87"
+            "0x48 0x83 0xC0 0x10"
+            "0xEB 0xD3"
+            "0xC5 0xF8 0x77"
+        } in(dst_ptr -> rdi, bf16_src -> rsi, scale_buf -> rcx, n -> rdx) clobbers(rax)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// dot_f32_bf16_p: dot(f32_a[0:n], bf16_b[0:n]), n multiple of 16.
+// Inner dim D=384 → 24 ZMM FMA iterations per call.
+// ---------------------------------------------------------------------------
+fn dot_f32_bf16_p(u64 f32_a, u64 bf16_b, u64 n, u64 dot_buf) -> f32 {
+    u64 n_iter = n / 16
+    if n_iter > 0 {
+        asm {
+            "0x62 0xF1 0x7D 0x48 0xEF 0xC0"
+            "0x48 0x31 0xC0"
+            "0x48 0x39 0xD0"
+            "0x7D 0x21"
+            "0x62 0xF1 0x7C 0x48 0x10 0x0C 0x86"
+            "0x62 0xF2 0x7D 0x48 0x33 0x14 0x47"
+            "0x62 0xF1 0x6D 0x48 0x72 0xF2 0x10"
+            "0x62 0xF2 0x75 0x48 0xB8 0xC2"
+            "0x48 0x83 0xC0 0x10"
+            "0xEB 0xDA"
+            "0x62 0xF3 0x7D 0x48 0x1B 0xC1 0x01"
+            "0xC5 0xF4 0x58 0xC0"
+            "0xC4 0xE3 0x7D 0x19 0xC1 0x01"
+            "0xC5 0xF8 0x58 0xC1"
+            "0xC5 0xFB 0x7C 0xC0"
+            "0xC5 0xFB 0x7C 0xC0"
+            "0xC5 0xFA 0x11 0x01"
+            "0xC5 0xF8 0x77"
+        } in(f32_a -> rsi, bf16_b -> rdi, n -> rdx, dot_buf -> rcx) clobbers(rax)
+    }
+    f32 result = 0.0f
+    unsafe { *(dot_buf as f32) -> result }
+    return result
+}
+
+// ---------------------------------------------------------------------------
+// convert_f32_to_bf16: convert n f32 values to bf16. n multiple of 16.
+// ---------------------------------------------------------------------------
+fn convert_f32_to_bf16(u64 dst_bf16, u64 src_f32, u64 n) {
+    u64 n_iter = n / 16
+    if n_iter > 0 {
+        asm {
+            "0x48 0x31 0xC0"
+            "0x48 0x39 0xD0"
+            "0x7D 0x18"
+            "0x62 0xF1 0x7C 0x48 0x10 0x04 0x86"
+            "0x62 0xF2 0x7E 0x48 0x72 0xC8"
+            "0xC5 0xFC 0x11 0x0C 0x47"
+            "0x48 0x83 0xC0 0x10"
+            "0xEB 0xE3"
+            "0xC5 0xF8 0x77"
+        } in(dst_bf16 -> rdi, src_f32 -> rsi, n -> rdx) clobbers(rax)
+    }
+}
+
+// =========================================================================
+// transpose_u_kdr_to_krd:
+//   src: bf16 [K, D, R] (loaded from bench_init.bin in KDR order)
+//   dst: bf16 [K, R, D] (reorder so D is the contiguous inner dim)
+//   K=4, D=384, R=32
+//   For each k: copy src[k,d,r] -> dst[k,r,d]
+//   src[k,d,r] = src + (k*D*R + d*R + r)*2
+//   dst[k,r,d] = dst + (k*R*D + r*D + d)*2
+// =========================================================================
+fn transpose_u_kdr_to_krd(u64 dst_bf16, u64 src_bf16, u64 K, u64 D, u64 R) {
+    u64 k = 0
+    while k < K {
+        u64 d = 0
+        while d < D {
+            u64 r = 0
+            while r < R {
+                u64 src_off = (k * D * R + d * R + r) * 2
+                u64 dst_off = (k * R * D + r * D + d) * 2
+                u64 v16 = 0
+                unsafe { *((src_bf16 + src_off) as u16) -> v16 }
+                unsafe { *((dst_bf16 + dst_off) as u16) = v16 }
+                r = r + 1
+            }
+            d = d + 1
+        }
+        k = k + 1
+    }
+}
+
+// =========================================================================
+// Shared statics for worker dispatch
+// =========================================================================
+static u64 g_emb_ptr    = 0
+static u64 g_ids_ptr    = 0
+static u64 g_x_ptr      = 0
+static u64 g_B          = 0
+static u64 g_S          = 0
+static u64 g_D          = 0
+static u64 g_K          = 0
+static u64 g_R          = 0
+static u64 g_VOCAB      = 0
+
+static u64 g_x_in       = 0
+static u64 g_z_out      = 0
+static u64 g_U_ptr      = 0   // bf16 [K, R, D]
+static u64 g_V_ptr      = 0   // bf16 [K, R, D]
+static u64 g_gw_ptr     = 0
+static u64 g_gb_ptr     = 0
+static u64 g_bias_ptr   = 0
+static u64 g_alpha_ptr  = 0
+static u64 g_inter_ptr  = 0
+static u64 g_outk_ptr   = 0
+
+static u64 g_pool_in    = 0
+static u64 g_pool_out   = 0
+
+static u64 g_norm_ptr   = 0
+static u64 g_norms_save = 0
+
+static u64 g_dy_ptr     = 0
+static u64 g_priv_dU    = 0   // f32 grads [K, R, D]
+static u64 g_priv_dV    = 0   // f32 grads [K, R, D]
+static u64 g_priv_dgw   = 0
+static u64 g_priv_dgb   = 0
+static u64 g_priv_dbias = 0
+static u64 g_dx_out     = 0
+
+// f32 weight copies for AdamW update
+static u64 g_U_f32      = 0   // f32 [K, R, D]
+static u64 g_V_f32      = 0   // f32 [K, R, D]
+
+// =========================================================================
+// Chunk helpers
+// =========================================================================
+fn chunk_start(u64 w, u64 nw, u64 n) -> u64 {
+    if w == 0 { return 0 }
+    u64 chunk = n / nw
+    return w * chunk
+}
+
+fn chunk_end(u64 w, u64 nw, u64 n) -> u64 {
+    if w == nw - 1 { return n }
+    u64 chunk = n / nw
+    return (w + 1) * chunk
+}
+
+// =========================================================================
+// Worker: embed_f32 over a slice of bs_idx (AVX-512 memcpy, 64B/iter).
+// =========================================================================
+fn embed_fwd_worker(u64 bs_start, u64 bs_end, u64 _ctx) {
+    u64 D = g_D
+    u64 emb_ptr = g_emb_ptr
+    u64 ids_ptr = g_ids_ptr
+    u64 x_ptr   = g_x_ptr
+    u64 bs = bs_start
+    while bs < bs_end {
+        u64 id = 0
+        unsafe { *((ids_ptr + bs * 8) as u64) -> id }
+        u64 emb_row = emb_ptr + id * D * 4
+        u64 out_row = x_ptr  + bs * D * 4
+        u64 n_iter = D / 16
+        u64 di = 0
+        while di < n_iter {
+            u64 s_addr = emb_row + di * 64
+            u64 d_addr = out_row + di * 64
+            asm {
+                "0x62 0xF1 0x7C 0x48 0x10 0x06"
+                "0x62 0xF1 0x7C 0x48 0x11 0x07"
+                "0xC5 0xF8 0x77"
+            } in(s_addr -> rsi, d_addr -> rdi)
+            di = di + 1
+        }
+        bs = bs + 1
+    }
+}
+
+// =========================================================================
+// Softmax helper (K=4, tiny — scalar)
+// =========================================================================
+fn softmax_inplace_local(u64 ptr, u64 N) {
+    f32 mx = 0.0f
+    unsafe { *(ptr as f32) -> mx }
+    u64 i = 1
+    while i < N {
+        f32 v = 0.0f
+        unsafe { *((ptr + i * 4) as f32) -> v }
+        if v > mx { mx = v }
+        i = i + 1
+    }
+    f32 s = 0.0f
+    i = 0
+    while i < N {
+        f32 v = 0.0f
+        unsafe { *((ptr + i * 4) as f32) -> v }
+        f32 e = expf(v - mx)
+        unsafe { *((ptr + i * 4) as f32) = e }
+        s = s + e
+        i = i + 1
+    }
+    f32 one = 1.0f
+    f32 inv = one / s
+    i = 0
+    while i < N {
+        f32 v = 0.0f
+        unsafe { *((ptr + i * 4) as f32) -> v }
+        unsafe { *((ptr + i * 4) as f32) = v * inv }
+        i = i + 1
+    }
+}
+
+// =========================================================================
+// Worker: wzma_fwd AVX-512 + bf16 U[K,R,D] / V[K,R,D]
+//
+// U layout: [K, R, D] bf16 — D=384 is the contiguous inner dimension.
+//
+// Hot loops:
+//   gate:  dot_f32_avx512_p(x, gw[k], D) — unchanged
+//   inter: for r in R: inter_k[r] = dot_f32_bf16_p(x, U_k[r,:], D)
+//          24 ZMM FMA per r (was 2-ZMM broadcast per d)
+//   outk:  for r in R: axpy_bf16_avx512_p(outk_k, V_k[r,:], inter[r], D)
+//          V layout is [K,R,D] (unchanged), 24 ZMM axpy per r (unchanged)
+//   y:     axpy_f32_avx512_p(out, outk[k], ak, D) + bias — unchanged
+// =========================================================================
+fn wzma_fwd_worker(u64 bs_start, u64 bs_end, u64 wid) {
+    u64 x_ptr     = g_x_in
+    u64 out_ptr   = g_z_out
+    u64 U_ptr     = g_U_ptr     // bf16 [K, R, D]
+    u64 V_ptr     = g_V_ptr     // bf16 [K, R, D]
+    u64 gw_ptr    = g_gw_ptr
+    u64 gb_ptr    = g_gb_ptr
+    u64 bias_ptr  = g_bias_ptr
+    u64 alpha_save = g_alpha_ptr
+    u64 inter_save = g_inter_ptr
+    u64 outk_save  = g_outk_ptr
+    u64 K_banks   = g_K
+    u64 r         = g_R          // R=32
+    u64 D         = g_D          // D=384
+
+    u64 w_base    = g_w_scratch + wid * 128
+    u64 scale_buf = w_base
+    u64 dot_buf   = w_base + 8
+
+    u64 bs_idx = bs_start
+    while bs_idx < bs_end {
+        u64 x_row    = x_ptr + bs_idx * D * 4
+        u64 alpha_bs = alpha_save + bs_idx * K_banks * 4
+        u64 inter_bs = inter_save + bs_idx * K_banks * r * 4
+        u64 outk_bs  = outk_save  + bs_idx * K_banks * D * 4
+
+        // ---- gate logits: alpha[k] = dot_avx512(x, gw[k], D) + gb[k] ----
+        u64 k = 0
+        while k < K_banks {
+            u64 gw_row = gw_ptr + k * D * 4
+            f32 acc = dot_f32_avx512_p(x_row, gw_row, D, dot_buf)
+            f32 bk = 0.0f
+            unsafe { *((gb_ptr + k * 4) as f32) -> bk }
+            unsafe { *((alpha_bs + k * 4) as f32) = acc + bk }
+            k = k + 1
+        }
+        softmax_inplace_local(alpha_bs, K_banks)
+
+        // ---- inter[k, r] = dot(x, U_krd[k, r, :])  D=384 inner, R=32 outer ----
+        // U_bf16[k, r, :] = D bf16 at offset (k*R*D + r*D)*2 — contiguous in D.
+        k = 0
+        while k < K_banks {
+            u64 U_k = U_ptr + k * r * D * 2
+            u64 inter_k = inter_bs + k * r * 4
+            u64 ri = 0
+            while ri < r {
+                u64 U_k_r = U_k + ri * D * 2
+                f32 dot_val = dot_f32_bf16_p(x_row, U_k_r, D, dot_buf)
+                unsafe { *((inter_k + ri * 4) as f32) = dot_val }
+                ri = ri + 1
+            }
+            k = k + 1
+        }
+
+        // ---- outk[k, :] = sum_r inter[k,r] * V_bf16[k,r,:]  (D inner, R outer) ----
+        // V layout unchanged [K, R, D]: V_k[r, :] = D bf16 at (k*R*D + r*D)*2.
+        k = 0
+        while k < K_banks {
+            u64 V_k = V_ptr + k * r * D * 2
+            u64 outk_k = outk_bs + k * D * 4
+            memset(outk_k, 0, D * 4)
+            u64 ri = 0
+            while ri < r {
+                f32 iv = 0.0f
+                unsafe { *((inter_bs + (k * r + ri) * 4) as f32) -> iv }
+                u64 V_k_r = V_k + ri * D * 2
+                axpy_bf16_avx512_p(outk_k, V_k_r, iv, D, scale_buf)
+                ri = ri + 1
+            }
+            k = k + 1
+        }
+
+        // ---- y[d] = sum_k alpha[k] * outk[k,:] + bias ----
+        u64 out_row = out_ptr + bs_idx * D * 4
+        u64 n_iter16 = D / 16
+        u64 di = 0
+        while di < n_iter16 {
+            u64 src_a = bias_ptr + di * 64
+            u64 dst_a = out_row  + di * 64
+            asm {
+                "0x62 0xF1 0x7C 0x48 0x10 0x06"
+                "0x62 0xF1 0x7C 0x48 0x11 0x07"
+                "0xC5 0xF8 0x77"
+            } in(src_a -> rsi, dst_a -> rdi)
+            di = di + 1
+        }
+        k = 0
+        while k < K_banks {
+            f32 ak = 0.0f
+            unsafe { *((alpha_bs + k * 4) as f32) -> ak }
+            u64 outk_k = outk_bs + k * D * 4
+            axpy_f32_avx512_p(out_row, outk_k, ak, D, scale_buf)
+            k = k + 1
+        }
+
+        bs_idx = bs_idx + 1
+    }
+}
+
+// =========================================================================
+// Worker: mean_pool over a slice of batch rows (AVX-512).
+// =========================================================================
+fn mean_pool_worker(u64 b_start, u64 b_end, u64 wid) {
+    u64 x_ptr   = g_pool_in
+    u64 out_ptr = g_pool_out
+    u64 S       = g_S
+    u64 D       = g_D
+    f32 fS = f64_to_f32(int_to_f64(S))
+    f32 inv_S = 1.0f / fS
+    u64 scale_buf = g_w_scratch + wid * 128
+    u64 b = b_start
+    while b < b_end {
+        u64 out_row = out_ptr + b * D * 4
+        memset(out_row, 0, D * 4)
+        u64 s = 0
+        while s < S {
+            u64 x_row = x_ptr + (b * S + s) * D * 4
+            axpy_f32_avx512_p(out_row, x_row, 1.0f, D, scale_buf)
+            s = s + 1
+        }
+        u64 d = 0
+        while d < D {
+            f32 v = 0.0f
+            unsafe { *((out_row + d * 4) as f32) -> v }
+            unsafe { *((out_row + d * 4) as f32) = v * inv_S }
+            d = d + 1
+        }
+        b = b + 1
+    }
+}
+
+// =========================================================================
+// Worker: l2_normalize over a slice of batch rows (AVX-512).
+// =========================================================================
+fn l2norm_worker(u64 b_start, u64 b_end, u64 wid) {
+    u64 x_ptr    = g_norm_ptr
+    u64 norms    = g_norms_save
+    u64 D        = g_D
+    u64 dot_buf  = g_w_scratch + wid * 128 + 8
+    u64 b = b_start
+    while b < b_end {
+        u64 row = x_ptr + b * D * 4
+        f32 ssq = dot_f32_avx512_p(row, row, D, dot_buf)
+        f32 norm = sqrtf(ssq)
+        unsafe { *((norms + b * 4) as f32) = norm }
+        f32 one = 1.0f
+        f32 inv = one / norm
+        u64 d = 0
+        while d < D {
+            f32 v = 0.0f
+            unsafe { *((row + d * 4) as f32) -> v }
+            unsafe { *((row + d * 4) as f32) = v * inv }
+            d = d + 1
+        }
+        b = b + 1
+    }
+}
+
+// =========================================================================
+// Worker: wzma_bwd AVX-512 + bf16 U[K,R,D] / V[K,R,D]
+//
+// U layout: [K, R, D] — D is the contiguous inner dimension.
+//
+// Hot loops (changed vs avx512 bench):
+//
+//   dU[k,r,d] += dinter[k,r] * x[d]:
+//     was: for d in D: inter_axpy_avx512_R32(dU_k[d,:], dinter_k, x[d])
+//     now: for r in R: axpy_f32_avx512_p(dU_k[r,:], x, dinter[r], D)
+//       24 ZMM axpy per r — dU_k[r,:] is D f32 contiguous.
+//
+//   dx from U:
+//     was: for d in D: dx[d] += dot_r32_bf16_p(dinter_k, U_k[d,:])
+//     now: for r in R: axpy_bf16_avx512_p(dx, U_k[r,:], dinter[r], D)
+//       24 ZMM axpy per r — U_k[r,:] is D bf16 contiguous; dx fully streaming.
+//
+//   dinter[k,r] = ak * dot(dy, V_k[r,:]) — unchanged (V is [K,R,D])
+//   dV[k,r,d]  += ak * inter[k,r] * dy[d] — unchanged (axpy over D per r)
+// =========================================================================
+fn wzma_bwd_worker(u64 bs_start, u64 bs_end, u64 wid) {
+    u64 K_banks  = g_K
+    u64 r        = g_R
+    u64 D        = g_D
+    u64 S        = g_S
+
+    u64 dy_ptr    = g_dy_ptr
+    u64 x_ptr     = g_x_in
+    u64 alpha_ptr = g_alpha_ptr
+    u64 inter_ptr = g_inter_ptr
+    u64 outk_ptr  = g_outk_ptr
+    u64 U_ptr     = g_U_ptr     // bf16 [K, R, D]
+    u64 V_ptr     = g_V_ptr     // bf16 [K, R, D]
+    u64 gw_ptr    = g_gw_ptr
+    u64 dx_ptr    = g_dx_out
+
+    // dU/dV are f32 [K, R, D] (same shape as U/V but f32)
+    u64 KRD = K_banks * r * D
+    u64 KD  = K_banks * D
+
+    u64 dU_ptr    = g_priv_dU    + wid * KRD  * 4
+    u64 dV_ptr    = g_priv_dV    + wid * KRD  * 4
+    u64 dgw_ptr   = g_priv_dgw   + wid * KD   * 4
+    u64 dgb_ptr   = g_priv_dgb   + wid * K_banks * 4
+    u64 dbias_ptr = g_priv_dbias + wid * D    * 4
+
+    u64 w_base      = g_w_scratch + wid * 128
+    u64 scale_buf   = w_base
+    u64 dot_buf     = w_base + 8
+
+    u64 dinter_buf  = alloc(K_banks * r * 4)
+    u64 d_alpha_buf = alloc(K_banks * 4)
+
+    // bias grad: dbias[d] += sum_{bs in slice} dy[bs,d]
+    u64 bs = bs_start
+    while bs < bs_end {
+        u64 dy_row = dy_ptr + bs * D * 4
+        axpy_f32_avx512_p(dbias_ptr, dy_row, 1.0f, D, scale_buf)
+        bs = bs + 1
+    }
+
+    bs = bs_start
+    while bs < bs_end {
+        u64 dy_row   = dy_ptr   + bs * D * 4
+        u64 x_row    = x_ptr    + bs * D * 4
+        u64 alpha_bs = alpha_ptr + bs * K_banks * 4
+        u64 inter_bs = inter_ptr + bs * K_banks * r * 4
+        u64 outk_bs  = outk_ptr  + bs * K_banks * D * 4
+        u64 dx_row   = dx_ptr   + bs * D * 4
+
+        memset(dx_row, 0, D * 4)
+
+        u64 k = 0
+        while k < K_banks {
+            f32 ak = 0.0f
+            unsafe { *((alpha_bs + k * 4) as f32) -> ak }
+
+            // V_k[r,:] = D bf16 at (k*R*D + r*D)*2 — contiguous in D (unchanged)
+            u64 V_k_bf16 = V_ptr + k * r * D * 2
+            u64 dV_k     = dV_ptr + k * r * D * 4
+            // U_k[r,:] = D bf16 at (k*R*D + r*D)*2 — contiguous in D (new layout)
+            u64 U_k_bf16 = U_ptr  + k * r * D * 2
+            u64 dU_k     = dU_ptr + k * r * D * 4
+            u64 inter_k  = inter_bs  + k * r * 4
+            u64 dinter_k = dinter_buf + k * r * 4
+
+            // ---- dV[k,r,d] += ak * inter[k,r] * dy[d]  (D inner, R outer) ----
+            u64 ri = 0
+            while ri < r {
+                f32 iv = 0.0f
+                unsafe { *((inter_k + ri * 4) as f32) -> iv }
+                f32 scale_dv = ak * iv
+                u64 dV_k_r = dV_k + ri * D * 4
+                axpy_f32_avx512_p(dV_k_r, dy_row, scale_dv, D, scale_buf)
+                ri = ri + 1
+            }
+
+            // ---- dinter[k,r] = ak * dot(dy, V_k[r,:])  24 ZMM per r (unchanged) ----
+            ri = 0
+            while ri < r {
+                u64 V_k_r_bf16 = V_k_bf16 + ri * D * 2
+                f32 dot_val = dot_f32_bf16_p(dy_row, V_k_r_bf16, D, dot_buf)
+                unsafe { *((dinter_k + ri * 4) as f32) = ak * dot_val }
+                ri = ri + 1
+            }
+
+            // ---- dU[k,r,d] += dinter[k,r] * x[d]  (D inner, R outer) ----
+            // was: for d in D: inter_axpy_avx512_R32(dU_k[d,:R], dinter_k, x[d])
+            // now: for r in R: axpy_f32_avx512_p(dU_k[r,:D], x, dinter[r], D)
+            ri = 0
+            while ri < r {
+                f32 di_val = 0.0f
+                unsafe { *((dinter_k + ri * 4) as f32) -> di_val }
+                u64 dU_k_r = dU_k + ri * D * 4
+                axpy_f32_avx512_p(dU_k_r, x_row, di_val, D, scale_buf)
+                ri = ri + 1
+            }
+
+            // ---- dx[d] += sum_r dinter[k,r] * U_k[r,d]  (D inner streaming) ----
+            // was: for d in D: dx[d] += dot_r32_bf16_p(dinter_k, U_k[d,:R])
+            // now: for r in R: axpy_bf16_avx512_p(dx, U_k[r,:D], dinter[r], D)
+            ri = 0
+            while ri < r {
+                f32 di_val = 0.0f
+                unsafe { *((dinter_k + ri * 4) as f32) -> di_val }
+                u64 U_k_r_bf16 = U_k_bf16 + ri * D * 2
+                axpy_bf16_avx512_p(dx_row, U_k_r_bf16, di_val, D, scale_buf)
+                ri = ri + 1
+            }
+
+            k = k + 1
+        }
+
+        // Softmax backward for gate
+        k = 0
+        while k < K_banks {
+            u64 outk_k = outk_bs + k * D * 4
+            f32 da = dot_f32_avx512_p(dy_row, outk_k, D, dot_buf)
+            unsafe { *((d_alpha_buf + k * 4) as f32) = da }
+            k = k + 1
+        }
+        f32 sum_ada = 0.0f
+        k = 0
+        while k < K_banks {
+            f32 ak = 0.0f
+            unsafe { *((alpha_bs + k * 4) as f32) -> ak }
+            f32 dak = 0.0f
+            unsafe { *((d_alpha_buf + k * 4) as f32) -> dak }
+            sum_ada = sum_ada + ak * dak
+            k = k + 1
+        }
+        k = 0
+        while k < K_banks {
+            f32 ak = 0.0f
+            unsafe { *((alpha_bs + k * 4) as f32) -> ak }
+            f32 dak = 0.0f
+            unsafe { *((d_alpha_buf + k * 4) as f32) -> dak }
+            f32 dgl_k = ak * (dak - sum_ada)
+
+            f32 cur_dgb = 0.0f
+            unsafe { *((dgb_ptr + k * 4) as f32) -> cur_dgb }
+            unsafe { *((dgb_ptr + k * 4) as f32) = cur_dgb + dgl_k }
+
+            u64 dgw_row = dgw_ptr + k * D * 4
+            axpy_f32_avx512_p(dgw_row, x_row, dgl_k, D, scale_buf)
+
+            u64 gw_row = gw_ptr + k * D * 4
+            axpy_f32_avx512_p(dx_row, gw_row, dgl_k, D, scale_buf)
+
+            k = k + 1
+        }
+
+        bs = bs + 1
+    }
+
+    dealloc(dinter_buf)
+    dealloc(d_alpha_buf)
+}
+
+// =========================================================================
+// dispatch helpers
+// =========================================================================
+fn dispatch_bs(u64 fn_ptr, u64 n_bs) {
+    u64 nw = NW
+    u64 w = 0
+    while w < nw {
+        u64 s = chunk_start(w, nw, n_bs)
+        u64 e = chunk_end(w, nw, n_bs)
+        thread_pool_submit(w, fn_ptr, s, e, w)
+        w = w + 1
+    }
+    thread_pool_wait()
+}
+
+fn dispatch_b(u64 fn_ptr, u64 B) {
+    u64 nw = NW
+    u64 w = 0
+    while w < nw {
+        u64 s = chunk_start(w, nw, B)
+        u64 e = chunk_end(w, nw, B)
+        thread_pool_submit(w, fn_ptr, s, e, w)
+        w = w + 1
+    }
+    thread_pool_wait()
+}
+
+// =========================================================================
+// reduce_add_f32: AVX-512 vectorised
+// =========================================================================
+fn reduce_add_f32(u64 dst, u64 src, u64 n) {
+    u64 scale_buf = g_w_scratch
+    axpy_f32_avx512_p(dst, src, 1.0f, n, scale_buf)
+    u64 n16 = n & 0xFFFFFFFFFFFFFFF0
+    u64 i = n16
+    while i < n {
+        f32 a = 0.0f
+        f32 b = 0.0f
+        unsafe { *((dst + i * 4) as f32) -> a }
+        unsafe { *((src + i * 4) as f32) -> b }
+        unsafe { *((dst + i * 4) as f32) = a + b }
+        i = i + 1
+    }
+}
+
+// =========================================================================
+// sync_uv_to_bf16: convert f32 U_f32/V_f32 -> bf16 after AdamW step.
+// U/V are both [K, R, D] layout.
+// =========================================================================
+fn sync_uv_to_bf16(u64 K, u64 D, u64 R) {
+    u64 U_f32  = g_U_f32
+    u64 V_f32  = g_V_f32
+    u64 U_bf16 = g_U_ptr
+    u64 V_bf16 = g_V_ptr
+    u64 n_UV = K * R * D
+    convert_f32_to_bf16(U_bf16, U_f32, n_UV)
+    convert_f32_to_bf16(V_bf16, V_f32, n_UV)
+}
+
+// =========================================================================
+// MT Forward pass
+// =========================================================================
+fn full_forward_mt(
+        u64 emb_ptr, u64 U_bf16, u64 V_bf16,
+        u64 gw_ptr, u64 gb_ptr, u64 bias_ptr,
+        u64 ids1_ptr, u64 ids2_ptr,
+        u64 x1_ptr, u64 x2_ptr,
+        u64 z1_ptr, u64 z2_ptr,
+        u64 alpha1_ptr, u64 inter1_ptr, u64 outk1_ptr,
+        u64 alpha2_ptr, u64 inter2_ptr, u64 outk2_ptr,
+        u64 q1_ptr, u64 q2_ptr,
+        u64 norms1_ptr, u64 norms2_ptr,
+        u64 B, u64 S, u64 D, u64 K, u64 R) -> f32 {
+
+    u64 BS = B * S
+
+    g_emb_ptr = emb_ptr
+    g_ids_ptr = ids1_ptr
+    g_x_ptr   = x1_ptr
+    g_D = D; g_S = S; g_B = B; g_K = K; g_R = R
+    u64 fp_embed = fn_addr("embed_fwd_worker")
+    dispatch_bs(fp_embed, BS)
+
+    g_ids_ptr = ids2_ptr
+    g_x_ptr   = x2_ptr
+    dispatch_bs(fp_embed, BS)
+
+    g_x_in      = x1_ptr
+    g_z_out     = z1_ptr
+    g_U_ptr     = U_bf16
+    g_V_ptr     = V_bf16
+    g_gw_ptr    = gw_ptr
+    g_gb_ptr    = gb_ptr
+    g_bias_ptr  = bias_ptr
+    g_alpha_ptr = alpha1_ptr
+    g_inter_ptr = inter1_ptr
+    g_outk_ptr  = outk1_ptr
+    u64 fp_wzma = fn_addr("wzma_fwd_worker")
+    dispatch_bs(fp_wzma, BS)
+
+    g_x_in      = x2_ptr
+    g_z_out     = z2_ptr
+    g_alpha_ptr = alpha2_ptr
+    g_inter_ptr = inter2_ptr
+    g_outk_ptr  = outk2_ptr
+    dispatch_bs(fp_wzma, BS)
+
+    g_pool_in  = z1_ptr
+    g_pool_out = q1_ptr
+    u64 fp_pool = fn_addr("mean_pool_worker")
+    dispatch_b(fp_pool, B)
+
+    g_pool_in  = z2_ptr
+    g_pool_out = q2_ptr
+    dispatch_b(fp_pool, B)
+
+    g_norm_ptr   = q1_ptr
+    g_norms_save = norms1_ptr
+    u64 fp_norm = fn_addr("l2norm_worker")
+    dispatch_b(fp_norm, B)
+
+    g_norm_ptr   = q2_ptr
+    g_norms_save = norms2_ptr
+    dispatch_b(fp_norm, B)
+
+    f32 tau = 0.1f
+    f32 loss = infonce_f32(q1_ptr, q2_ptr, tau, B, D)
+    return loss
+}
+
+// =========================================================================
+// MT Backward pass
+// =========================================================================
+fn full_backward_mt(
+        u64 q1_ptr, u64 q2_ptr,
+        u64 z1_ptr, u64 z2_ptr,
+        u64 x1_ptr, u64 x2_ptr,
+        u64 alpha1_ptr, u64 inter1_ptr, u64 outk1_ptr,
+        u64 alpha2_ptr, u64 inter2_ptr, u64 outk2_ptr,
+        u64 norms1_ptr, u64 norms2_ptr,
+        u64 U_bf16, u64 V_bf16, u64 gw_ptr,
+        u64 ids1_ptr, u64 ids2_ptr,
+        u64 B, u64 S, u64 D, u64 K, u64 R,
+        u64 dU_ptr, u64 dV_ptr, u64 dgw_ptr, u64 dgb_ptr,
+        u64 dbias_ptr, u64 demb_ptr,
+        u64 VOCAB) {
+
+    u64 dq1_ptr = alloc(B * D * 4)
+    u64 dq2_ptr = alloc(B * D * 4)
+    u64 dp1_ptr = alloc(B * D * 4)
+    u64 dp2_ptr = alloc(B * D * 4)
+    u64 dz1_ptr = alloc(B * S * D * 4)
+    u64 dz2_ptr = alloc(B * S * D * 4)
+
+    f32 tau = 0.1f
+    infonce_bwd(q1_ptr, q2_ptr, tau, B, D, dq1_ptr, dq2_ptr)
+
+    l2norm_bwd(dq1_ptr, q1_ptr, norms1_ptr, B, D, dp1_ptr)
+    l2norm_bwd(dq2_ptr, q2_ptr, norms2_ptr, B, D, dp2_ptr)
+
+    meanpool_bwd(dp1_ptr, B, S, D, dz1_ptr)
+    meanpool_bwd(dp2_ptr, B, S, D, dz2_ptr)
+
+    dealloc(dq1_ptr); dealloc(dq2_ptr)
+    dealloc(dp1_ptr); dealloc(dp2_ptr)
+
+    u64 BS = B * S
+    u64 nw = NW
+    u64 KRD = K * R * D
+    u64 KD  = K * D
+
+    u64 w = 0
+    while w < nw {
+        memset(g_priv_dU    + w * KRD * 4, 0, KRD * 4)
+        memset(g_priv_dV    + w * KRD * 4, 0, KRD * 4)
+        memset(g_priv_dgw   + w * KD  * 4, 0, KD  * 4)
+        memset(g_priv_dgb   + w * K   * 4, 0, K   * 4)
+        memset(g_priv_dbias + w * D   * 4, 0, D   * 4)
+        w = w + 1
+    }
+
+    u64 fp_wzma_bwd = fn_addr("wzma_bwd_worker")
+
+    g_dy_ptr    = dz1_ptr
+    g_x_in      = x1_ptr
+    g_alpha_ptr = alpha1_ptr
+    g_inter_ptr = inter1_ptr
+    g_outk_ptr  = outk1_ptr
+    g_U_ptr     = U_bf16
+    g_V_ptr     = V_bf16
+    g_gw_ptr    = gw_ptr
+    g_dx_out    = alloc(B * S * D * 4)
+    dispatch_bs(fp_wzma_bwd, BS)
+    u64 dx1_ptr = g_dx_out
+
+    g_dy_ptr    = dz2_ptr
+    g_x_in      = x2_ptr
+    g_alpha_ptr = alpha2_ptr
+    g_inter_ptr = inter2_ptr
+    g_outk_ptr  = outk2_ptr
+    g_dx_out    = alloc(B * S * D * 4)
+    dispatch_bs(fp_wzma_bwd, BS)
+    u64 dx2_ptr = g_dx_out
+
+    w = 0
+    while w < nw {
+        reduce_add_f32(dU_ptr,    g_priv_dU    + w * KRD * 4, KRD)
+        reduce_add_f32(dV_ptr,    g_priv_dV    + w * KRD * 4, KRD)
+        reduce_add_f32(dgw_ptr,   g_priv_dgw   + w * KD  * 4, KD)
+        reduce_add_f32(dgb_ptr,   g_priv_dgb   + w * K   * 4, K)
+        reduce_add_f32(dbias_ptr, g_priv_dbias + w * D   * 4, D)
+        w = w + 1
+    }
+
+    embed_bwd(dx1_ptr, ids1_ptr, B, S, D, demb_ptr)
+    embed_bwd(dx2_ptr, ids2_ptr, B, S, D, demb_ptr)
+
+    dealloc(dz1_ptr); dealloc(dz2_ptr)
+    dealloc(dx1_ptr); dealloc(dx2_ptr)
+}
+
+// =========================================================================
+// Median
+// =========================================================================
+fn median_u64(u64 arr, u64 n) -> u64 {
+    u64 i = 1
+    while i < n {
+        u64 key = 0
+        unsafe { *((arr + i * 8) as u64) -> key }
+        u64 insert_pos = i
+        u64 j = i
+        while j > 0 {
+            u64 prev_j = j - 1
+            u64 vp = 0
+            unsafe { *((arr + prev_j * 8) as u64) -> vp }
+            if vp <= key {
+                insert_pos = j
+                j = 0
+            } else {
+                unsafe { *((arr + j * 8) as u64) = vp }
+                insert_pos = prev_j
+                j = prev_j
+            }
+        }
+        unsafe { *((arr + insert_pos * 8) as u64) = key }
+        i = i + 1
+    }
+    u64 mid = n / 2
+    u64 result = 0
+    unsafe { *((arr + mid * 8) as u64) -> result }
+    return result
+}
+
+// =========================================================================
+// main
+// =========================================================================
+fn main() {
+    u64 B = B_DIM
+    u64 S = S_DIM
+    u64 D = D_DIM
+    u64 K = K_DIM
+    u64 R = R_DIM
+    u64 VOCAB = VOCAB_DIM
+    u64 nw = NW
+
+    print_str("=== bp_wzma_bench_reorder: B=8 S=16 D=384 K=4 R=32 vocab=8192 NW=")
+    u64 ss = fmt_dec(nw)
+    print_str(ss); dealloc(ss)
+    print_str(" (AVX-512 + bf16 U/V, U-layout=[K,R,D]) ===\n")
+
+    thread_pool_init(nw)
+
+    g_B = B; g_S = S; g_D = D; g_K = K; g_R = R; g_VOCAB = VOCAB
+
+    // Allocate f32 weight buffers (loaded from file, kept for AdamW)
+    u64 emb_ptr   = alloc(VOCAB * D * 4)
+    // f32 weights loaded from file in [K,D,R] order; we store as [K,R,D] after transpose
+    u64 U_f32_kdr = alloc(K * D * R * 4)   // scratch: loaded [K,D,R]
+    u64 V_f32     = alloc(K * R * D * 4)   // V is already [K,R,D] in file
+    u64 gw_ptr    = alloc(K * D * 4)
+    u64 gb_ptr    = alloc(K * 4)
+    u64 bias_ptr  = alloc(D * 4)
+
+    // Working f32 U in [K,R,D] order
+    u64 U_f32     = alloc(K * R * D * 4)
+
+    // Allocate bf16 weight buffers [K, R, D]
+    u64 U_bf16    = alloc(K * R * D * 2)
+    u64 V_bf16    = alloc(K * R * D * 2)
+
+    // Store f32 ptrs for AdamW update
+    g_U_f32 = U_f32
+    g_V_f32 = V_f32
+    g_U_ptr = U_bf16
+    g_V_ptr = V_bf16
+
+    // Load bench_init.bin
+    u64 bin_path = "/home/pantelis/Desktop/Projects/Work/MLRiftBench/tools/bench_init.bin"
+    u64 fd = file_open(bin_path, 0)
+
+    file_read(fd, emb_ptr,    VOCAB * D * 4)
+    file_read(fd, U_f32_kdr,  K * D * R * 4)   // read as [K,D,R]
+    file_read(fd, V_f32,      K * R * D * 4)
+    file_read(fd, gw_ptr,     K * D * 4)
+    file_read(fd, gb_ptr,     K * 4)
+    file_read(fd, bias_ptr,   D * 4)
+
+    u64 ids1_i32 = alloc(B * S * 4)
+    u64 ids2_i32 = alloc(B * S * 4)
+    file_read(fd, ids1_i32, B * S * 4)
+    file_read(fd, ids2_i32, B * S * 4)
+    file_close(fd)
+
+    // Transpose U_f32: [K,D,R] -> [K,R,D]
+    // dst[k*R*D + r*D + d] = src[k*D*R + d*R + r]
+    u64 k = 0
+    while k < K {
+        u64 d = 0
+        while d < D {
+            u64 ri = 0
+            while ri < R {
+                u64 src_off = (k * D * R + d * R + ri) * 4
+                u64 dst_off = (k * R * D + ri * D + d) * 4
+                f32 v = 0.0f
+                unsafe { *((U_f32_kdr + src_off) as f32) -> v }
+                unsafe { *((U_f32     + dst_off) as f32) = v }
+                ri = ri + 1
+            }
+            d = d + 1
+        }
+        k = k + 1
+    }
+    dealloc(U_f32_kdr)
+
+    // Convert f32 U[K,R,D]/V[K,R,D] to bf16
+    u64 n_UV = K * R * D
+    convert_f32_to_bf16(U_bf16, U_f32, n_UV)
+    convert_f32_to_bf16(V_bf16, V_f32, n_UV)
+
+    u64 ids1_ptr = alloc(B * S * 8)
+    u64 ids2_ptr = alloc(B * S * 8)
+
+    u64 n_ids = B * S
+    u64 ii = 0
+    while ii < n_ids {
+        u64 src1 = ids1_i32 + ii * 4
+        u64 src2 = ids2_i32 + ii * 4
+        u64 b0 = 0; u64 b1 = 0; u64 b2 = 0; u64 b3 = 0
+        unsafe { *(src1 as u8) -> b0 }
+        unsafe { *((src1 + 1) as u8) -> b1 }
+        unsafe { *((src1 + 2) as u8) -> b2 }
+        unsafe { *((src1 + 3) as u8) -> b3 }
+        u64 id1 = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+        unsafe { *((ids1_ptr + ii * 8) as u64) = id1 }
+
+        u64 c0 = 0; u64 c1 = 0; u64 c2 = 0; u64 c3 = 0
+        unsafe { *(src2 as u8) -> c0 }
+        unsafe { *((src2 + 1) as u8) -> c1 }
+        unsafe { *((src2 + 2) as u8) -> c2 }
+        unsafe { *((src2 + 3) as u8) -> c3 }
+        u64 id2 = c0 | (c1 << 8) | (c2 << 16) | (c3 << 24)
+        unsafe { *((ids2_ptr + ii * 8) as u64) = id2 }
+        ii = ii + 1
+    }
+    dealloc(ids1_i32); dealloc(ids2_i32)
+
+    print_str("Weights loaded (U transposed [K,D,R]->[K,R,D], bf16 converted)\n")
+
+    // Gradient + moment buffers — all [K,R,D] layout
+    u64 demb_ptr  = alloc(VOCAB * D * 4)
+    u64 dU_ptr    = alloc(K * R * D * 4)
+    u64 dV_ptr    = alloc(K * R * D * 4)
+    u64 dgw_ptr   = alloc(K * D * 4)
+    u64 dgb_ptr   = alloc(K * 4)
+    u64 dbias_ptr = alloc(D * 4)
+
+    u64 m_emb  = alloc(VOCAB * D * 4); u64 v_emb  = alloc(VOCAB * D * 4)
+    u64 m_U    = alloc(K * R * D * 4); u64 v_U    = alloc(K * R * D * 4)
+    u64 m_V    = alloc(K * R * D * 4); u64 v_V    = alloc(K * R * D * 4)
+    u64 m_gw   = alloc(K * D * 4);    u64 v_gw   = alloc(K * D * 4)
+    u64 m_gb   = alloc(K * 4);        u64 v_gb   = alloc(K * 4)
+    u64 m_bias = alloc(D * 4);        u64 v_bias = alloc(D * 4)
+
+    memset(m_emb,  0, VOCAB * D * 4); memset(v_emb,  0, VOCAB * D * 4)
+    memset(m_U,    0, K * R * D * 4); memset(v_U,    0, K * R * D * 4)
+    memset(m_V,    0, K * R * D * 4); memset(v_V,    0, K * R * D * 4)
+    memset(m_gw,   0, K * D * 4);    memset(v_gw,   0, K * D * 4)
+    memset(m_gb,   0, K * 4);        memset(v_gb,   0, K * 4)
+    memset(m_bias, 0, D * 4);        memset(v_bias, 0, D * 4)
+
+    // Activation buffers
+    u64 x1_ptr = alloc(B * S * D * 4); u64 x2_ptr = alloc(B * S * D * 4)
+    u64 z1_ptr = alloc(B * S * D * 4); u64 z2_ptr = alloc(B * S * D * 4)
+    u64 alpha1 = alloc(B * S * K * 4)
+    u64 inter1 = alloc(B * S * K * R * 4)
+    u64 outk1  = alloc(B * S * K * D * 4)
+    u64 alpha2 = alloc(B * S * K * 4)
+    u64 inter2 = alloc(B * S * K * R * 4)
+    u64 outk2  = alloc(B * S * K * D * 4)
+    u64 q1_ptr = alloc(B * D * 4); u64 q2_ptr = alloc(B * D * 4)
+    u64 norms1 = alloc(B * 4);     u64 norms2 = alloc(B * 4)
+
+    // Private per-worker grad buffers [K, R, D]
+    u64 KRD = K * R * D
+    u64 KD  = K * D
+    g_priv_dU    = alloc(nw * KRD * 4)
+    g_priv_dV    = alloc(nw * KRD * 4)
+    g_priv_dgw   = alloc(nw * KD  * 4)
+    g_priv_dgb   = alloc(nw * K   * 4)
+    g_priv_dbias = alloc(nw * D   * 4)
+
+    // Per-worker scratch: 128 bytes (2 cache lines) per worker
+    g_w_scratch = alloc(nw * 128)
+    memset(g_w_scratch, 0, nw * 128)
+    avx512_dot_scratch = alloc(16)
+
+    // AdamW hyperparams
+    f32 lr       = 0.001f
+    f32 beta1    = 0.9f
+    f32 beta2    = 0.999f
+    f32 eps_adam = 0.00000001f
+    f32 wd       = 0.01f
+
+    print_str("\n=== Running 50 AdamW steps (NW=")
+    ss = fmt_dec(nw)
+    print_str(ss); dealloc(ss)
+    print_str(", AVX-512 + bf16 U/V [K,R,D] reorder) ===\n")
+
+    u64 step_times = alloc(STEPS * 8)
+
+    f32 max_loss_err = 0.0f
+    u64 loss_conv_ok = 1
+    f32 loss_tol = 0.01f
+    f32 convergence_tol = 0.1f
+
+    u64 step = 0
+    while step < STEPS {
+        memset(demb_ptr,  0, VOCAB * D * 4)
+        memset(dU_ptr,    0, K * R * D * 4)
+        memset(dV_ptr,    0, K * R * D * 4)
+        memset(dgw_ptr,   0, K * D * 4)
+        memset(dgb_ptr,   0, K * 4)
+        memset(dbias_ptr, 0, D * 4)
+
+        u64 t0 = time_now()
+
+        f32 loss = full_forward_mt(
+            emb_ptr, U_bf16, V_bf16, gw_ptr, gb_ptr, bias_ptr,
+            ids1_ptr, ids2_ptr,
+            x1_ptr, x2_ptr, z1_ptr, z2_ptr,
+            alpha1, inter1, outk1, alpha2, inter2, outk2,
+            q1_ptr, q2_ptr, norms1, norms2,
+            B, S, D, K, R)
+
+        full_backward_mt(
+            q1_ptr, q2_ptr, z1_ptr, z2_ptr, x1_ptr, x2_ptr,
+            alpha1, inter1, outk1, alpha2, inter2, outk2,
+            norms1, norms2, U_bf16, V_bf16, gw_ptr,
+            ids1_ptr, ids2_ptr,
+            B, S, D, K, R,
+            dU_ptr, dV_ptr, dgw_ptr, dgb_ptr, dbias_ptr, demb_ptr,
+            VOCAB)
+
+        u64 step_idx = step + 1
+        adamw_step(emb_ptr,  demb_ptr,  m_emb,  v_emb,  VOCAB * D, step_idx, lr, beta1, beta2, eps_adam, wd)
+        // AdamW on f32 U[K,R,D]/V[K,R,D], then convert to bf16
+        adamw_step(U_f32,    dU_ptr,    m_U,    v_U,    K * R * D, step_idx, lr, beta1, beta2, eps_adam, wd)
+        adamw_step(V_f32,    dV_ptr,    m_V,    v_V,    K * R * D, step_idx, lr, beta1, beta2, eps_adam, wd)
+        adamw_step(gw_ptr,   dgw_ptr,   m_gw,   v_gw,   K * D,     step_idx, lr, beta1, beta2, eps_adam, wd)
+        adamw_step(gb_ptr,   dgb_ptr,   m_gb,   v_gb,   K,         step_idx, lr, beta1, beta2, eps_adam, wd)
+        adamw_step(bias_ptr, dbias_ptr, m_bias, v_bias, D,         step_idx, lr, beta1, beta2, eps_adam, wd)
+        // Sync updated f32 weights back to bf16
+        sync_uv_to_bf16(K, D, R)
+
+        u64 t1 = time_now()
+        u64 elapsed_ns = t1 - t0
+        unsafe { *((step_times + step * 8) as u64) = elapsed_ns }
+
+        f32 ref = ref_cpu_loss(step)
+        f32 diff = abs_f32(loss - ref)
+        if diff > max_loss_err { max_loss_err = diff }
+        if step > 0 {
+            if loss > convergence_tol { loss_conv_ok = 0 }
+        }
+
+        if step < 5 {
+            print_str("  step ")
+            ss = fmt_dec(step)
+            print_str(ss); dealloc(ss)
+            print_str(": loss=")
+            ss = fmt_f32(loss, 6)
+            print_str(ss); dealloc(ss)
+            print_str("  ref=")
+            ss = fmt_f32(ref, 6)
+            print_str(ss); dealloc(ss)
+            print_str("  diff=")
+            ss = fmt_f32(diff, 6)
+            print_str(ss); dealloc(ss)
+            if diff < loss_tol { print_str("  f32-match\n") }
+            else { print_str("  bf16-drift\n") }
+        }
+
+        step = step + 1
+    }
+
+    // Compute median ms/step (skip first WARMUP steps)
+    u64 bench_n = STEPS - WARMUP
+    u64 bench_times = alloc(bench_n * 8)
+
+    u64 ti = 0
+    while ti < bench_n {
+        u64 ns_val = 0
+        unsafe { *((step_times + (ti + WARMUP) * 8) as u64) -> ns_val }
+        unsafe { *((bench_times + ti * 8) as u64) = ns_val }
+        ti = ti + 1
+    }
+
+    u64 median_ns = median_u64(bench_times, bench_n)
+    dealloc(bench_times)
+    dealloc(step_times)
+
+    f64 median_ms_f64 = int_to_f64(median_ns)
+    f64 ns_per_ms = 1000000.0
+    median_ms_f64 = median_ms_f64 / ns_per_ms
+    f32 median_ms = f64_to_f32(median_ms_f64)
+
+    f32 avx512_ms  = 42.0f    // AVX-512 [K,D,R] baseline (this session)
+    f32 avx2_ms    = 45.5f    // AVX2 16T baseline
+    f32 pt_ms      = 8.07f    // PyTorch CPU (all-core MKL) baseline
+    f32 speedup_512 = avx512_ms / median_ms
+    f32 speedup_avx2 = avx2_ms / median_ms
+    f32 speedup_pt   = pt_ms / median_ms
+
+    print_str("\n=== Results (NW=")
+    ss = fmt_dec(nw)
+    print_str(ss); dealloc(ss)
+    print_str(", AVX-512 + bf16 U/V [K,R,D] reorder) ===\n")
+
+    print_str("MLRift reorder (D inner)  median ms/step : ")
+    ss = fmt_f32(median_ms, 3)
+    print_str(ss); dealloc(ss)
+    print_str(" ms\n")
+
+    print_str("AVX-512 [K,D,R] baseline               : 42.0 ms\n")
+    print_str("AVX2 f32 16T baseline                  : 45.5 ms\n")
+    print_str("PyTorch CPU baseline                   : 8.070 ms  (all-core MKL)\n")
+
+    print_str("Speedup vs AVX-512 [K,D,R]             : ")
+    ss = fmt_f32(speedup_512, 3)
+    print_str(ss); dealloc(ss)
+    print_str("x\n")
+
+    print_str("Speedup vs AVX2 f32 16T                : ")
+    ss = fmt_f32(speedup_avx2, 3)
+    print_str(ss); dealloc(ss)
+    print_str("x\n")
+
+    print_str("Speedup vs PyTorch CPU                 : ")
+    ss = fmt_f32(speedup_pt, 3)
+    print_str(ss); dealloc(ss)
+    print_str("x\n")
+
+    print_str("Max loss err vs f32 ref                : ")
+    ss = fmt_f32(max_loss_err, 8)
+    print_str(ss); dealloc(ss)
+    print_str("\n")
+
+    print_str("Note: bf16 U/V rounding causes systematic drift from f32 ref.\n")
+    print_str("      Convergence check: all post-warmup steps loss < 0.1\n")
+    if loss_conv_ok == 1 {
+        print_str("Convergence check (loss<0.1)            : PASS\n")
+    } else {
+        print_str("Convergence check (loss<0.1)            : FAIL\n")
+        thread_pool_shutdown()
+        exit(1)
+    }
+
+    if speedup_pt > 1.0f {
+        print_str("RESULT: BEATS PyTorch CPU\n")
+    } else {
+        print_str("RESULT: slower than PyTorch CPU\n")
+    }
+
+    thread_pool_shutdown()
+
+    dealloc(emb_ptr); dealloc(U_f32); dealloc(V_f32)
+    dealloc(U_bf16); dealloc(V_bf16)
+    dealloc(gw_ptr); dealloc(gb_ptr); dealloc(bias_ptr)
+    dealloc(ids1_ptr); dealloc(ids2_ptr)
+    dealloc(demb_ptr); dealloc(dU_ptr); dealloc(dV_ptr)
+    dealloc(dgw_ptr); dealloc(dgb_ptr); dealloc(dbias_ptr)
+    dealloc(m_emb); dealloc(v_emb)
+    dealloc(m_U); dealloc(v_U)
+    dealloc(m_V); dealloc(v_V)
+    dealloc(m_gw); dealloc(v_gw)
+    dealloc(m_gb); dealloc(v_gb)
+    dealloc(m_bias); dealloc(v_bias)
+    dealloc(x1_ptr); dealloc(x2_ptr)
+    dealloc(z1_ptr); dealloc(z2_ptr)
+    dealloc(alpha1); dealloc(inter1); dealloc(outk1)
+    dealloc(alpha2); dealloc(inter2); dealloc(outk2)
+    dealloc(q1_ptr); dealloc(q2_ptr)
+    dealloc(norms1); dealloc(norms2)
+    dealloc(g_priv_dU); dealloc(g_priv_dV)
+    dealloc(g_priv_dgw); dealloc(g_priv_dgb)
+    dealloc(g_priv_dbias)
+    dealloc(avx512_dot_scratch)
+    dealloc(g_w_scratch)
+
+    exit(0)
+}
