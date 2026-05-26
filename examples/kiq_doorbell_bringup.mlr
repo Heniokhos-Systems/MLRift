@@ -13,10 +13,17 @@
 //        c. CP_MES_DOORBELL_CONTROL (GC1 0x2200): 7-value init sequence.
 //        d. MEC alive readback: CP_MEC_RS64_CNTL + CP_MEC_RS64_INSTR_PNTR
 //           (GC1 0x2849, traced); prints "MEC ALIVE" / "MEC DEAD".
-//   5. KIQ HQD (ME=3/PIPE=1/QUEUE=0): MQD+ring+rptr+wptr+eop in VRAM,
-//        CP_HQD_PQ_CONTROL=0xd8308011, DOORBELL_CONTROL=0x40000060 (offset=0x18/byte=0x60),
-//        WPTR via GTT poll addr, MEC doorbell range LOWER=0/UPPER=0x450.
-//   6. Write one PM4 NOP (0xC0001000) to ring, WPTR via GTT wptr slot.
+//   5. KIQ HQD (ME=3/PIPE=1/QUEUE=0, direct-HQD not MES):
+//        MQD in VRAM; ring+rptr+wptr in a GTT writeback page (IOMMU-mapped
+//        sysmem, top 0x7fff).  HQD slot selected via regGRBM_GFX_INDEX
+//        (GC0 0x96a0) raw instance index 0xd; HQD bank cleared first via
+//        DEQUEUE_REQUEST=1/wait/0.
+//        CP_HQD_PQ_BASE = ring_iova>>8, RPTR_REPORT = ring_iova,
+//        WPTR_POLL_ADDR = ring_iova+0x20.
+//        CP_HQD_PQ_CONTROL=0xd8308011, DOORBELL_CONTROL=0x40000060
+//        (offset=0x18/byte=0x60).
+//        RB range GC0 0x1dfa/0x1dfb = 0x458/0x7f8 + MEC range 0x1dfc/0x1dfd.
+//   6. Write one PM4 NOP (0xC0001000) to ring, WPTR=1 into sysmem page.
 //   7. Ring doorbell: *(bar2+0x60 as uint64)=1.
 //   8. Delay, read DOORBELL_HIT bit31 + HQD_RPTR.
 //   9. Verdict "KIQ CONSUMED NOP" if rptr>0;
@@ -56,16 +63,22 @@ static uint64 regCP_MQD_CONTROL                       = 0x1fcb
 static uint64 regCP_HQD_EOP_BASE_ADDR                 = 0x1fce
 static uint64 regCP_HQD_EOP_BASE_ADDR_HI              = 0x1fcf
 static uint64 regCP_HQD_EOP_CONTROL                   = 0x1fd0
+// CP registers BASE_IDX=0
+// CP_RB_DOORBELL_RANGE — GC0; GFX-ring doorbell aperture (trace 0x1dfa/0x1dfb).
+static uint64 regCP_RB_DOORBELL_RANGE_LOWER            = 0x1dfa
+static uint64 regCP_RB_DOORBELL_RANGE_UPPER            = 0x1dfb
+// MEC doorbell range — GC0 (ME-engine aperture); range 0 drops all doorbells.
+static uint64 regCP_MEC_DOORBELL_RANGE_LOWER           = 0x1dfc
+static uint64 regCP_MEC_DOORBELL_RANGE_UPPER           = 0x1dfd
 // CP registers BASE_IDX=1
-static uint64 regGRBM_GFX_CNTL                        = 0x0900
+// regGRBM_GFX_INDEX (GC0 0x96a0): raw instance-index select for direct-HQD.
+// For KIQ slot ME=3/PIPE=1/QUEUE=0 on Navi 32: instance index = 0xd.
+static uint64 regGRBM_GFX_INDEX                        = 0x96a0
 static uint64 regCP_ME_CNTL_dw                        = 0x0803
 static uint64 regCP_MEC_RS64_CNTL_dw                  = 0x2904
 static uint64 regCP_MEC_RS64_INSTR_PNTR_dw            = 0x2849
 static uint64 regCP_MES_CNTL_dw                       = 0x2807
 static uint64 regCP_MES_DOORBELL_CONTROL_dw            = 0x2200
-// MEC doorbell range — GC1 (ME-engine aperture); range 0 drops all doorbells.
-static uint64 regCP_MEC_DOORBELL_RANGE_LOWER           = 0x1dfc
-static uint64 regCP_MEC_DOORBELL_RANGE_UPPER           = 0x1dfd
 
 // CP_ME_CNTL ladder (amdgpu mmiotrace order, GC1 0x0803)
 static uint64 ME_CNTL_V0 = 0x153C0000
@@ -132,10 +145,13 @@ fn _dec(uint64 lab, uint64 ll, uint64 v) {
 }
 
 fn _select_hqd(uint64 dev, uint64 me, uint64 pipe, uint64 q, uint64 vmid) {
-    uint64 sel = (pipe << 0) | (me << 2) | (vmid << 4) | (q << 8)
-    uint32 sel32 = sel
-    gpu_reg_w32(dev, GPU_IP_GC1, regGRBM_GFX_CNTL, sel32)
-    uint32 _rb = gpu_reg_r32(dev, GPU_IP_GC1, regGRBM_GFX_CNTL)
+    // KIQ is direct-HQD (not MES): select via regGRBM_GFX_INDEX (GC0 0x96a0)
+    // raw instance index.  For ME=3/PIPE=1/QUEUE=0 on Navi 32 the instance
+    // index is 0xd (trace-confirmed amdgpu order).
+    uint64 instance = (vmid << 0) | (q << 4) | (pipe << 8) | (me << 12)
+    uint32 inst32 = instance
+    gpu_reg_w32(dev, GPU_IP_GC0, regGRBM_GFX_INDEX, inst32)
+    uint32 _rb = gpu_reg_r32(dev, GPU_IP_GC0, regGRBM_GFX_INDEX)
 }
 
 fn _delay(uint64 spins) {
@@ -301,7 +317,7 @@ fn main() {
     _delay(10000)
 
     // 4d) MEC alive readback: CP_MEC_RS64_CNTL + CP_MEC_RS64_INSTR_PNTR.
-    //     amdgpu reads INSTR_PNTR via GRBM_GFX_CNTL pipe=0/me=3 then pipe=1/me=3.
+    //     amdgpu reads INSTR_PNTR via GRBM_GFX_INDEX pipe=0/me=3 then pipe=1/me=3.
     //     We read both; CNTL halt-bit (bit30)=0 means unhalted; INSTR_PNTR!=0 means running.
     uint32 cntl_rb_w = gpu_reg_r32(dev, GPU_IP_GC1, regCP_MEC_RS64_CNTL_dw)
     uint64 cntl_rb = cntl_rb_w
@@ -347,40 +363,75 @@ fn main() {
     puts("MEC/MES unhalted")
 
     // -------------------------------------------------------
-    // 5) KIQ HQD bring-up (ME=3, PIPE=1, QUEUE=0).
-    //    Allocate MQD/ring/rptr/eop in VRAM.
+    // 5) KIQ HQD bring-up (ME=3, PIPE=1, QUEUE=0, direct-HQD).
+    //    MQD in VRAM; ring + RPTR-report + WPTR-poll in a GTT writeback
+    //    page (IOMMU-mapped sysmem, IOVA bits[47:32] = 0x7fff so the MEC
+    //    DMA engine sees top-of-GTT aperture addresses).
+    //    Layout within the GTT page (4 KiB):
+    //      offset 0x000 : ring (128 dwords)    — NOP at dword 0
+    //      offset 0x200 : RPTR-report slot     — 4 bytes
+    //      offset 0x220 : WPTR-poll slot       — 4 bytes
     // -------------------------------------------------------
     puts("")
     puts("=== KIQ HQD bring-up (ME=3/P1/Q0) ===")
 
+    // Allocate GTT writeback page: ring + rptr-report + wptr-poll.
+    uint64 gtt_outs = alloc(16)
+    unsafe { *((gtt_outs + 0) as uint64) = 0 }
+    unsafe { *((gtt_outs + 8) as uint64) = 0 }
+    uint64 gtt_e = gpu_dma_alloc(dev, 4096, GPU_DMA_GTT, gtt_outs + 0, gtt_outs + 8)
+    if gtt_e != 0 {
+        _dec("FAIL gpu_dma_alloc GTT", 21, gtt_e)
+        gpu_dma_free(dev, buf_host, buf_iova, 4096)
+        gmc_page_table_free(dev, pt_ctx)
+        dealloc(gtt_outs); gpu_close(dev); exit(12)
+    }
+    uint64 gtt_host = 0; unsafe { *((gtt_outs + 0) as uint64) -> gtt_host }
+    uint64 gtt_iova = 0; unsafe { *((gtt_outs + 8) as uint64) -> gtt_iova }
+    dealloc(gtt_outs)
+    _hex32("gtt_iova_lo", 11, gtt_iova & 0xFFFFFFFF)
+    _hex32("gtt_iova_hi", 11, gtt_iova >> 32)
+
+    // Sub-offsets within the GTT page.
+    uint64 ring_iova  = gtt_iova            // ring starts at base
+    uint64 rptr_iova  = gtt_iova + 0x200    // RPTR-report slot
+    uint64 wptr_iova  = gtt_iova + 0x220    // WPTR-poll slot
+    uint64 ring_hva   = gtt_host
+    uint64 rptr_hva   = gtt_host + 0x200
+    uint64 wptr_hva   = gtt_host + 0x220
+
+    // Zero the GTT page.
+    uint64 zi3 = 0
+    while zi3 < 4096 {
+        uint8 z8 = 0
+        unsafe { *((gtt_host + zi3) as uint8) = z8 }
+        zi3 = zi3 + 1
+    }
+
+    // Write PM4 NOP at ring[0].
+    uint32 nop_dw = 0xC0001000
+    unsafe { *(ring_hva as uint32) = nop_dw }
+
+    // MQD stays in VRAM.
     uint64 mqd_off  = 0xB00000
-    uint64 ring_off = 0xB01000
-    uint64 rptr_off = 0xB02000
-    uint64 wptr_off = 0xB03000
     uint64 eop_off  = 0xB04000
 
     uint32 fb_base_w = gpu_reg_r32(dev, GPU_IP_MMHUB, regMMMC_VM_FB_LOCATION_BASE)
     uint64 fb_base_64 = fb_base_w
     uint64 vram_mc_base = fb_base_64 << 24
     uint64 mqd_mc  = vram_mc_base + mqd_off
-    uint64 ring_mc = vram_mc_base + ring_off
-    uint64 rptr_mc = vram_mc_base + rptr_off
-    uint64 wptr_mc = vram_mc_base + wptr_off
     uint64 eop_mc  = vram_mc_base + eop_off
     _hex32("vram_mc_base", 12, vram_mc_base)
-    _hex32("ring_mc",       7, ring_mc)
+    _hex32("ring_iova",     9, ring_iova)
 
-    // Zero MQD + ring + rptr + wptr.
+    // Zero MQD in VRAM.
     uint64 zi2 = 0
     while zi2 < 0x1000 {
-        gpu_vram_w32(dev, mqd_off  + zi2, 0)
-        gpu_vram_w32(dev, ring_off + zi2, 0)
-        gpu_vram_w32(dev, rptr_off + zi2, 0)
-        gpu_vram_w32(dev, wptr_off + zi2, 0)
+        gpu_vram_w32(dev, mqd_off + zi2, 0)
         zi2 = zi2 + 4
     }
 
-    // Minimal MQD.
+    // Minimal MQD in VRAM.
     uint64 mqd_self_lo = mqd_mc & 0xFFFFFFFC
     uint64 mqd_self_hi = mqd_mc >> 32
     gpu_vram_w32(dev, mqd_off + 0  * 4, 0xC0310800)
@@ -400,11 +451,9 @@ fn main() {
     gpu_vram_w32(dev, mqd_off + 130 * 4, 1)
     gpu_vram_w32(dev, mqd_off + 160 * 4, 0x20004000)
 
-    // PM4 NOP at ring[0]: 0xC0001000 (single-dword NOP).
-    gpu_vram_w32(dev, ring_off, 0xC0001000)
-
-    // Select KIQ slot (ME=3, PIPE=1, QUEUE=0, VMID=0).
+    // Select KIQ slot (ME=3, PIPE=1, QUEUE=0, VMID=0) via GRBM_GFX_INDEX.
     _select_hqd(dev, 3, 1, 0, 0)
+    // Clear HQD bank before programming.
     gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_DEQUEUE_REQUEST, 1)
     _delay(50000)
     gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_DEQUEUE_REQUEST, 0)
@@ -416,15 +465,17 @@ fn main() {
     gpu_reg_w32(dev, GPU_IP_GC0, regCP_MQD_CONTROL, 0)
     gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_VMID, 0)
 
-    uint32 pq_base_lo = (ring_mc >> 8) & 0xFFFFFFFF
-    uint32 pq_base_hi = (ring_mc >> 8) >> 32
+    // CP_HQD_PQ_BASE = ring_iova >> 8 (GTT ring).
+    uint32 pq_base_lo = (ring_iova >> 8) & 0xFFFFFFFF
+    uint32 pq_base_hi = ((ring_iova >> 8) >> 32) & 0xFFFFFFFF
     gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_BASE,    pq_base_lo)
     gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_BASE_HI, pq_base_hi)
 
-    uint32 rptr_lo = rptr_mc & 0xFFFFFFFF
-    uint32 rptr_hi = rptr_mc >> 32
-    gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_RPTR_REPORT_ADDR,    rptr_lo)
-    gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_RPTR_REPORT_ADDR_HI, rptr_hi)
+    // RPTR-report: GTT page offset 0x200.
+    uint32 rptr_lo32 = rptr_iova & 0xFFFFFFFF
+    uint32 rptr_hi32 = (rptr_iova >> 32) & 0xFFFFFFFF
+    gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_RPTR_REPORT_ADDR,    rptr_lo32)
+    gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_RPTR_REPORT_ADDR_HI, rptr_hi32)
 
     uint32 eop_lo = (eop_mc >> 8) & 0xFFFFFFFF
     uint32 eop_hi = (eop_mc >> 8) >> 32
@@ -432,36 +483,44 @@ fn main() {
     gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_EOP_BASE_ADDR_HI, eop_hi)
     gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_EOP_CONTROL, 9)
 
-    // WPTR via GTT: point poll-addr to wptr_off slot; MEC reads wptr from memory.
-    uint32 wptr_mc_lo = wptr_mc & 0xFFFFFFFF
-    uint32 wptr_mc_hi = wptr_mc >> 32
-    gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_WPTR_POLL_ADDR_LO, wptr_mc_lo)
-    gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_WPTR_POLL_ADDR_HI, wptr_mc_hi)
-    gpu_vram_w32(dev, wptr_off, 0)
+    // WPTR-poll: GTT page offset 0x220.  MEC reads wptr from sysmem (not reg).
+    uint32 wptr_lo32 = wptr_iova & 0xFFFFFFFF
+    uint32 wptr_hi32 = (wptr_iova >> 32) & 0xFFFFFFFF
+    gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_WPTR_POLL_ADDR_LO, wptr_lo32)
+    gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_WPTR_POLL_ADDR_HI, wptr_hi32)
+    // wptr slot starts at 0 (no work queued yet).
+    uint32 wptr_zero = 0
+    unsafe { *(wptr_hva as uint32) = wptr_zero }
 
     gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_CONTROL,       0xd8308011)
     gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PERSISTENT_STATE, 0x0BE05501)
     gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_RPTR,           0)
 
-    // DOORBELL_CONTROL = 0x40000060: EN (bit30)=1, DOORBELL_OFFSET=0x18 (byte 0x60).
+    // DOORBELL_CONTROL = 0x40000060: EN (bit30)=1, DOORBELL_OFFSET=0x18 (byte=0x60).
     gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_DOORBELL_CONTROL, 0x40000060)
 
-    // MEC doorbell range: open the ME-engine aperture so doorbells are not dropped.
-    gpu_reg_w32(dev, GPU_IP_GC1, regCP_MEC_DOORBELL_RANGE_LOWER, 0x00000000)
-    gpu_reg_w32(dev, GPU_IP_GC1, regCP_MEC_DOORBELL_RANGE_UPPER, 0x00000450)
+    // RB doorbell range (GC0 0x1dfa/0x1dfb): opens GFX-ring aperture.
+    // Trace-confirmed: 0x1dfa→0x458, 0x1dfb→0x7f8.
+    gpu_reg_w32(dev, GPU_IP_GC0, regCP_RB_DOORBELL_RANGE_LOWER, 0x00000458)
+    gpu_reg_w32(dev, GPU_IP_GC0, regCP_RB_DOORBELL_RANGE_UPPER, 0x000007f8)
+
+    // MEC doorbell range (GC0 0x1dfc/0x1dfd): open ME-engine aperture.
+    gpu_reg_w32(dev, GPU_IP_GC0, regCP_MEC_DOORBELL_RANGE_LOWER, 0x00000000)
+    gpu_reg_w32(dev, GPU_IP_GC0, regCP_MEC_DOORBELL_RANGE_UPPER, 0x00000450)
 
     // Activate.
     gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_ACTIVE, 1)
     puts("KIQ HQD activated")
 
     // -------------------------------------------------------
-    // 6+7) Write NOP to ring, advance WPTR via GTT, ring doorbell at byte 0x60.
+    // 6+7) Write NOP to ring, advance WPTR via sysmem, ring doorbell at byte 0x60.
     // -------------------------------------------------------
     puts("")
     puts("=== Ring doorbell (offset=0x60) ===")
 
-    // NOP already at ring[0]; advance WPTR to 1 via GTT memory (not reg).
-    gpu_vram_w32(dev, wptr_off, 1)
+    // NOP already at ring_hva[0]; advance WPTR to 1 via sysmem (not VRAM).
+    uint32 wptr_one = 1
+    unsafe { *(wptr_hva as uint32) = wptr_one }
 
     // Ring: raw uint64 write to BAR2+0x60.
     unsafe { *((bar2 + 0x60) as uint64) = 1 }
@@ -469,17 +528,27 @@ fn main() {
 
     // -------------------------------------------------------
     // 8) Check DOORBELL_HIT bit31 + HQD_RPTR.
+    //    RPTR-report is written by MEC into the GTT sysmem page (rptr_hva).
+    //    The DOORBELL_HIT latch lives in the DOORBELL_CONTROL reg (bit31).
     // -------------------------------------------------------
     _select_hqd(dev, 3, 1, 0, 0)
     uint32 db_post_w = gpu_reg_r32(dev, GPU_IP_GC0, regCP_HQD_PQ_DOORBELL_CONTROL)
-    uint32 rptr_post_w = gpu_reg_r32(dev, GPU_IP_GC0, regCP_HQD_PQ_RPTR)
+    uint32 rptr_reg_w = gpu_reg_r32(dev, GPU_IP_GC0, regCP_HQD_PQ_RPTR)
     uint64 db_post = db_post_w
-    uint64 rptr_post = rptr_post_w
-    _hex32("DBELL_CTL_post", 14, db_post)
-    _hex32("HQD_RPTR_post",  13, rptr_post)
+    uint64 rptr_reg_val = rptr_reg_w
+    // Also read the sysmem RPTR-report slot (MEC writeback, GTT).
+    uint32 rptr_wb_w = 0
+    unsafe { *(rptr_hva as uint32) -> rptr_wb_w }
+    uint64 rptr_wb = rptr_wb_w
+    _hex32("DBELL_CTL_post",    14, db_post)
+    _hex32("HQD_RPTR_reg",      12, rptr_reg_val)
+    _hex32("RPTR_REPORT_wb",    14, rptr_wb)
 
     uint64 hit = (db_post >> 31) & 0x1
     _dec("DOORBELL_HIT", 12, hit)
+    // Consumed if either the register or the writeback slot advanced.
+    uint64 rptr_post = rptr_reg_val
+    if rptr_wb > rptr_post { rptr_post = rptr_wb }
     _dec("HQD_RPTR",      8, rptr_post)
 
     // -------------------------------------------------------
@@ -491,6 +560,7 @@ fn main() {
     puts("===========================================")
     if rptr_post > 0 {
         puts("KIQ CONSUMED NOP — doorbell delivery GREEN")
+        gpu_dma_free(dev, gtt_host, gtt_iova, 4096)
         gpu_dma_free(dev, buf_host, buf_iova, 4096)
         gmc_page_table_free(dev, pt_ctx)
         gpu_close(dev)
@@ -529,12 +599,16 @@ fn main() {
         uint64 dbcntl = (dword_off << 2) | (1 << 30)
         uint32 dbcntl_w = dbcntl
         gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_DOORBELL_CONTROL, dbcntl_w)
-        gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_RPTR,   0)
-        gpu_vram_w32(dev, wptr_off, 0)
-        gpu_vram_w32(dev, ring_off, 0xC0001000)
+        gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_PQ_RPTR, 0)
+        // Reset sysmem wptr and ring via GTT host pointer.
+        uint32 sw_zero = 0
+        unsafe { *(wptr_hva as uint32) = sw_zero }
+        uint32 sw_nop = 0xC0001000
+        unsafe { *(ring_hva as uint32) = sw_nop }
         gpu_reg_w32(dev, GPU_IP_GC0, regCP_HQD_ACTIVE, 1)
 
-        gpu_vram_w32(dev, wptr_off, 1)
+        uint32 sw_one = 1
+        unsafe { *(wptr_hva as uint32) = sw_one }
         unsafe { *((bar2 + byte_off) as uint64) = 1 }
         _delay(50000)
 
@@ -543,6 +617,11 @@ fn main() {
         uint32 rptr_sw = gpu_reg_r32(dev, GPU_IP_GC0, regCP_HQD_PQ_RPTR)
         uint64 db_sv = db_sw
         uint64 rptr_sv = rptr_sw
+        // Also check GTT RPTR-report writeback.
+        uint32 rptr_wb_sw = 0
+        unsafe { *(rptr_hva as uint32) -> rptr_wb_sw }
+        uint64 rptr_wb_sv = rptr_wb_sw
+        if rptr_wb_sv > rptr_sv { rptr_sv = rptr_wb_sv }
 
         _hex32("byte_off",    8,  byte_off)
         _hex32("  DBELL_CTL", 11, db_sv)
@@ -568,6 +647,7 @@ fn main() {
         puts("NO HIT in sweep — doorbell delivery broken")
     }
 
+    gpu_dma_free(dev, gtt_host, gtt_iova, 4096)
     gpu_dma_free(dev, buf_host, buf_iova, 4096)
     gmc_page_table_free(dev, pt_ctx)
     gpu_close(dev)
