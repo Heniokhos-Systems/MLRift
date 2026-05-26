@@ -1,0 +1,554 @@
+// bp_wzma_bench — WZMALinear+InfoNCE CPU training bench.
+//
+// Dims: B=8 S=16 D=384 K=4 R=32 vocab=8192
+// Reads initial weights + token ids from bench_init.bin (little-endian):
+//   embed.weight [8192,384] f32
+//   U            [4,384,32] f32
+//   V            [4,32,384] f32
+//   gate.weight  [4,384]    f32
+//   gate.bias    [4]        f32
+//   bias         [384]      f32
+//   ids1         [8,16]     int32
+//   ids2         [8,16]     int32
+//
+// Runs 50 AdamW steps, verifies losses vs bench_ref.json cpu_losses (tol=1e-2).
+// Reports median ms/step (skipping first 5 warmup steps) and speedup vs
+// PyTorch CPU baseline of 8.07 ms/step.
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --target=linux --emit=elfexe \
+//       examples/bp_wzma_bench.mlr -o /tmp/bp_wzma_bench
+// Run:
+//   /tmp/bp_wzma_bench /path/to/bench_init.bin
+
+import "../std/train.mlr"
+import "../std/math_float.mlr"
+import "../std/fmt.mlr"
+import "../std/time.mlr"
+
+// =========================================================================
+// Dims (static constants)
+// =========================================================================
+static u64 B_DIM     = 8
+static u64 S_DIM     = 16
+static u64 D_DIM     = 384
+static u64 K_DIM     = 4
+static u64 R_DIM     = 32
+static u64 VOCAB_DIM = 8192
+static u64 STEPS     = 50
+static u64 WARMUP    = 5
+
+// =========================================================================
+// Reference losses from bench_ref.json cpu_losses[50]
+// =========================================================================
+fn ref_cpu_loss(u64 step) -> f32 {
+    if step == 0  { return 3.059341431f }
+    if step == 1  { return 0.047913674f }
+    if step == 2  { return 0.006029791f }
+    if step == 3  { return 0.003066241f }
+    if step == 4  { return 0.002411466f }
+    if step == 5  { return 0.002189299f }
+    if step == 6  { return 0.002088466f }
+    if step == 7  { return 0.002025114f }
+    if step == 8  { return 0.001971901f }
+    if step == 9  { return 0.001919352f }
+    if step == 10 { return 0.001864696f }
+    if step == 11 { return 0.001807675f }
+    if step == 12 { return 0.001749179f }
+    if step == 13 { return 0.001689902f }
+    if step == 14 { return 0.001630811f }
+    if step == 15 { return 0.001572575f }
+    if step == 16 { return 0.001515878f }
+    if step == 17 { return 0.001460973f }
+    if step == 18 { return 0.001408174f }
+    if step == 19 { return 0.001357688f }
+    if step == 20 { return 0.001309652f }
+    if step == 21 { return 0.001263960f }
+    if step == 22 { return 0.001220675f }
+    if step == 23 { return 0.001179677f }
+    if step == 24 { return 0.001140996f }
+    if step == 25 { return 0.001104455f }
+    if step == 26 { return 0.001069995f }
+    if step == 27 { return 0.001037468f }
+    if step == 28 { return 0.001006768f }
+    if step == 29 { return 0.000977868f }
+    if step == 30 { return 0.000950514f }
+    if step == 31 { return 0.000924722f }
+    if step == 32 { return 0.000900372f }
+    if step == 33 { return 0.000877435f }
+    if step == 34 { return 0.000855614f }
+    if step == 35 { return 0.000835012f }
+    if step == 36 { return 0.000815497f }
+    if step == 37 { return 0.000797068f }
+    if step == 38 { return 0.000779531f }
+    if step == 39 { return 0.000762887f }
+    if step == 40 { return 0.000747151f }
+    if step == 41 { return 0.000732040f }
+    if step == 42 { return 0.000717732f }
+    if step == 43 { return 0.000704109f }
+    if step == 44 { return 0.000691126f }
+    if step == 45 { return 0.000678693f }
+    if step == 46 { return 0.000666871f }
+    if step == 47 { return 0.000655540f }
+    if step == 48 { return 0.000644670f }
+    return 0.000634307f
+}
+
+// =========================================================================
+// abs_f32
+// =========================================================================
+fn abs_f32(f32 v) -> f32 {
+    if v < 0.0f { return 0.0f - v }
+    return v
+}
+
+// =========================================================================
+// Forward pass: embed → wzma (×2 views) → meanpool → l2norm → infonce
+// Returns InfoNCE loss, saves all activations for backward.
+// =========================================================================
+fn full_forward(u64 emb_ptr, u64 U_ptr, u64 V_ptr,
+                u64 gw_ptr, u64 gb_ptr, u64 bias_ptr,
+                u64 ids1_ptr, u64 ids2_ptr,
+                u64 x1_ptr, u64 x2_ptr,
+                u64 z1_ptr, u64 z2_ptr,
+                u64 alpha1_ptr, u64 inter1_ptr, u64 outk1_ptr,
+                u64 alpha2_ptr, u64 inter2_ptr, u64 outk2_ptr,
+                u64 q1_ptr, u64 q2_ptr,
+                u64 norms1_ptr, u64 norms2_ptr,
+                u64 B, u64 S, u64 D, u64 K, u64 R) -> f32 {
+    embed_f32(x1_ptr, emb_ptr, ids1_ptr, B, S, D)
+    embed_f32(x2_ptr, emb_ptr, ids2_ptr, B, S, D)
+    wzma_f32_fwd(x1_ptr, z1_ptr, U_ptr, V_ptr, gw_ptr, gb_ptr, bias_ptr,
+                 B, S, D, K, R, alpha1_ptr, inter1_ptr, outk1_ptr)
+    wzma_f32_fwd(x2_ptr, z2_ptr, U_ptr, V_ptr, gw_ptr, gb_ptr, bias_ptr,
+                 B, S, D, K, R, alpha2_ptr, inter2_ptr, outk2_ptr)
+    mean_pool_s_f32(z1_ptr, q1_ptr, B, S, D)
+    mean_pool_s_f32(z2_ptr, q2_ptr, B, S, D)
+    l2_normalize_f32_save(q1_ptr, B, D, norms1_ptr)
+    l2_normalize_f32_save(q2_ptr, B, D, norms2_ptr)
+    f32 tau = 0.1f
+    f32 loss = infonce_f32(q1_ptr, q2_ptr, tau, B, D)
+    return loss
+}
+
+// =========================================================================
+// Backward pass: infonce_bwd → l2norm_bwd → meanpool_bwd → wzma_bwd → embed_bwd
+// =========================================================================
+fn full_backward(u64 q1_ptr, u64 q2_ptr,
+                 u64 z1_ptr, u64 z2_ptr,
+                 u64 x1_ptr, u64 x2_ptr,
+                 u64 alpha1_ptr, u64 inter1_ptr, u64 outk1_ptr,
+                 u64 alpha2_ptr, u64 inter2_ptr, u64 outk2_ptr,
+                 u64 norms1_ptr, u64 norms2_ptr,
+                 u64 U_ptr, u64 V_ptr, u64 gw_ptr,
+                 u64 ids1_ptr, u64 ids2_ptr,
+                 u64 B, u64 S, u64 D, u64 K, u64 R,
+                 u64 dU_ptr, u64 dV_ptr, u64 dgw_ptr, u64 dgb_ptr,
+                 u64 dbias_ptr, u64 demb_ptr) {
+    u64 dq1_ptr = alloc(B * D * 4)
+    u64 dq2_ptr = alloc(B * D * 4)
+    u64 dp1_ptr = alloc(B * D * 4)
+    u64 dp2_ptr = alloc(B * D * 4)
+    u64 dz1_ptr = alloc(B * S * D * 4)
+    u64 dz2_ptr = alloc(B * S * D * 4)
+    u64 dx1_ptr = alloc(B * S * D * 4)
+    u64 dx2_ptr = alloc(B * S * D * 4)
+
+    f32 tau = 0.1f
+    infonce_bwd(q1_ptr, q2_ptr, tau, B, D, dq1_ptr, dq2_ptr)
+
+    l2norm_bwd(dq1_ptr, q1_ptr, norms1_ptr, B, D, dp1_ptr)
+    l2norm_bwd(dq2_ptr, q2_ptr, norms2_ptr, B, D, dp2_ptr)
+
+    meanpool_bwd(dp1_ptr, B, S, D, dz1_ptr)
+    meanpool_bwd(dp2_ptr, B, S, D, dz2_ptr)
+
+    wzma_bwd(dz1_ptr, x1_ptr,
+             alpha1_ptr, inter1_ptr, outk1_ptr,
+             U_ptr, V_ptr, gw_ptr,
+             B, S, D, K, R,
+             dU_ptr, dV_ptr, dgw_ptr, dgb_ptr, dbias_ptr,
+             dx1_ptr)
+    wzma_bwd(dz2_ptr, x2_ptr,
+             alpha2_ptr, inter2_ptr, outk2_ptr,
+             U_ptr, V_ptr, gw_ptr,
+             B, S, D, K, R,
+             dU_ptr, dV_ptr, dgw_ptr, dgb_ptr, dbias_ptr,
+             dx2_ptr)
+
+    embed_bwd(dx1_ptr, ids1_ptr, B, S, D, demb_ptr)
+    embed_bwd(dx2_ptr, ids2_ptr, B, S, D, demb_ptr)
+
+    dealloc(dq1_ptr); dealloc(dq2_ptr)
+    dealloc(dp1_ptr); dealloc(dp2_ptr)
+    dealloc(dz1_ptr); dealloc(dz2_ptr)
+    dealloc(dx1_ptr); dealloc(dx2_ptr)
+}
+
+// =========================================================================
+// Median of an array of u64 values (simple insertion sort then pick middle)
+// =========================================================================
+fn median_u64(u64 arr, u64 n) -> u64 {
+    // Insertion sort: move each element left until sorted
+    u64 i = 1
+    while i < n {
+        u64 key = 0
+        unsafe { *((arr + i * 8) as u64) -> key }
+        // Shift elements larger than key one position right
+        // track insert position in insert_pos
+        u64 insert_pos = i
+        u64 j = i
+        while j > 0 {
+            u64 prev_j = j - 1
+            u64 vp = 0
+            unsafe { *((arr + prev_j * 8) as u64) -> vp }
+            if vp <= key {
+                // Found insertion point: insert_pos = j
+                insert_pos = j
+                j = 0  // break
+            } else {
+                // Shift vp right
+                unsafe { *((arr + j * 8) as u64) = vp }
+                insert_pos = prev_j
+                j = prev_j
+            }
+        }
+        unsafe { *((arr + insert_pos * 8) as u64) = key }
+        i = i + 1
+    }
+    u64 mid = n / 2
+    u64 result = 0
+    unsafe { *((arr + mid * 8) as u64) -> result }
+    return result
+}
+
+// =========================================================================
+// main
+// =========================================================================
+fn main() {
+    u64 B = B_DIM
+    u64 S = S_DIM
+    u64 D = D_DIM
+    u64 K = K_DIM
+    u64 R = R_DIM
+    u64 VOCAB = VOCAB_DIM
+
+    print_str("=== bp_wzma_bench: B=8 S=16 D=384 K=4 R=32 vocab=8192 ===\n")
+
+    // -------------------------------------------------------------------------
+    // Allocate weight buffers
+    // -------------------------------------------------------------------------
+    u64 emb_ptr  = alloc(VOCAB * D * 4)
+    u64 U_ptr    = alloc(K * D * R * 4)
+    u64 V_ptr    = alloc(K * R * D * 4)
+    u64 gw_ptr   = alloc(K * D * 4)
+    u64 gb_ptr   = alloc(K * 4)
+    u64 bias_ptr = alloc(D * 4)
+
+    // -------------------------------------------------------------------------
+    // Read bench_init.bin: embed, U, V, gw, gb, bias are f32 (direct copy)
+    // ids are int32 → expand to u64 (embed_f32 uses u64 ids)
+    // -------------------------------------------------------------------------
+    u64 bin_path = "/home/pantelis/Desktop/Projects/Work/MLRiftBench/tools/bench_init.bin"
+    u64 fd = file_open(bin_path, 0)
+
+    // Read f32 weight blobs directly
+    u64 emb_bytes  = VOCAB * D * 4
+    u64 U_bytes    = K * D * R * 4
+    u64 V_bytes    = K * R * D * 4
+    u64 gw_bytes   = K * D * 4
+    u64 gb_bytes   = K * 4
+    u64 bias_bytes = D * 4
+
+    file_read(fd, emb_ptr,  emb_bytes)
+    file_read(fd, U_ptr,    U_bytes)
+    file_read(fd, V_ptr,    V_bytes)
+    file_read(fd, gw_ptr,   gw_bytes)
+    file_read(fd, gb_ptr,   gb_bytes)
+    file_read(fd, bias_ptr, bias_bytes)
+
+    // ids are int32 in file; read into temp int32 buf then expand to u64
+    u64 ids1_i32 = alloc(B * S * 4)
+    u64 ids2_i32 = alloc(B * S * 4)
+    file_read(fd, ids1_i32, B * S * 4)
+    file_read(fd, ids2_i32, B * S * 4)
+    file_close(fd)
+
+    // Allocate u64 id buffers for embed_f32
+    u64 ids1_ptr = alloc(B * S * 8)
+    u64 ids2_ptr = alloc(B * S * 8)
+
+    // Expand int32 → u64 (zero-extend; IDs are non-negative)
+    u64 n_ids = B * S
+    u64 ii = 0
+    while ii < n_ids {
+        // Read 4-byte int32 (little-endian) at offset ii*4
+        // Load as u32 from the i32 buffer
+        u64 src_addr1 = ids1_i32 + ii * 4
+        u64 src_addr2 = ids2_i32 + ii * 4
+        // Read the 4-byte value; since we store as f32 load, do byte-by-byte build
+        // Actually we can just load the 4 bytes as a u32 via unsafe f32 trick:
+        // Use a 4-byte load. MLRift has no u32 load intrinsic directly,
+        // but we can load as f32 and bit-reinterpret. Instead, use the fact
+        // that int32 ids are small (< vocab=8192), so we load the low byte
+        // from each of the 4 bytes and reconstruct.
+        // Simpler: treat the int32 buffer as f32, but use bit manipulation.
+        // Actually the cleanest approach: read the 4 bytes as f32 (reinterpret bits),
+        // then convert the u64 bit pattern to a real u64 id.
+        // But f32 reinterpret is tricky. Use byte-by-byte:
+        u64 b0 = 0; u64 b1 = 0; u64 b2 = 0; u64 b3 = 0
+        u64 a0 = src_addr1
+        u64 a1 = src_addr1 + 1
+        u64 a2 = src_addr1 + 2
+        u64 a3 = src_addr1 + 3
+        unsafe { *(a0 as u8) -> b0 }
+        unsafe { *(a1 as u8) -> b1 }
+        unsafe { *(a2 as u8) -> b2 }
+        unsafe { *(a3 as u8) -> b3 }
+        u64 id1 = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+        unsafe { *((ids1_ptr + ii * 8) as u64) = id1 }
+
+        u64 c0 = 0; u64 c1 = 0; u64 c2 = 0; u64 c3 = 0
+        u64 ca0 = src_addr2
+        u64 ca1 = src_addr2 + 1
+        u64 ca2 = src_addr2 + 2
+        u64 ca3 = src_addr2 + 3
+        unsafe { *(ca0 as u8) -> c0 }
+        unsafe { *(ca1 as u8) -> c1 }
+        unsafe { *(ca2 as u8) -> c2 }
+        unsafe { *(ca3 as u8) -> c3 }
+        u64 id2 = c0 | (c1 << 8) | (c2 << 16) | (c3 << 24)
+        unsafe { *((ids2_ptr + ii * 8) as u64) = id2 }
+
+        ii = ii + 1
+    }
+    dealloc(ids1_i32)
+    dealloc(ids2_i32)
+
+    print_str("Weights loaded from bench_init.bin\n")
+
+    // -------------------------------------------------------------------------
+    // Gradient + moment buffers
+    // -------------------------------------------------------------------------
+    u64 demb_ptr  = alloc(VOCAB * D * 4)
+    u64 dU_ptr    = alloc(K * D * R * 4)
+    u64 dV_ptr    = alloc(K * R * D * 4)
+    u64 dgw_ptr   = alloc(K * D * 4)
+    u64 dgb_ptr   = alloc(K * 4)
+    u64 dbias_ptr = alloc(D * 4)
+
+    u64 m_emb  = alloc(VOCAB * D * 4)
+    u64 v_emb  = alloc(VOCAB * D * 4)
+    u64 m_U    = alloc(K * D * R * 4)
+    u64 v_U    = alloc(K * D * R * 4)
+    u64 m_V    = alloc(K * R * D * 4)
+    u64 v_V    = alloc(K * R * D * 4)
+    u64 m_gw   = alloc(K * D * 4)
+    u64 v_gw   = alloc(K * D * 4)
+    u64 m_gb   = alloc(K * 4)
+    u64 v_gb   = alloc(K * 4)
+    u64 m_bias = alloc(D * 4)
+    u64 v_bias = alloc(D * 4)
+
+    // Zero moment buffers (alloc gives zeroed memory, but be explicit)
+    memset(m_emb,  0, VOCAB * D * 4)
+    memset(v_emb,  0, VOCAB * D * 4)
+    memset(m_U,    0, K * D * R * 4)
+    memset(v_U,    0, K * D * R * 4)
+    memset(m_V,    0, K * R * D * 4)
+    memset(v_V,    0, K * R * D * 4)
+    memset(m_gw,   0, K * D * 4)
+    memset(v_gw,   0, K * D * 4)
+    memset(m_gb,   0, K * 4)
+    memset(v_gb,   0, K * 4)
+    memset(m_bias, 0, D * 4)
+    memset(v_bias, 0, D * 4)
+
+    // -------------------------------------------------------------------------
+    // Activation buffers
+    // -------------------------------------------------------------------------
+    u64 x1_ptr    = alloc(B * S * D * 4)
+    u64 x2_ptr    = alloc(B * S * D * 4)
+    u64 z1_ptr    = alloc(B * S * D * 4)
+    u64 z2_ptr    = alloc(B * S * D * 4)
+    u64 alpha1    = alloc(B * S * K * 4)
+    u64 inter1    = alloc(B * S * K * R * 4)
+    u64 outk1     = alloc(B * S * K * D * 4)
+    u64 alpha2    = alloc(B * S * K * 4)
+    u64 inter2    = alloc(B * S * K * R * 4)
+    u64 outk2     = alloc(B * S * K * D * 4)
+    u64 q1_ptr    = alloc(B * D * 4)
+    u64 q2_ptr    = alloc(B * D * 4)
+    u64 norms1    = alloc(B * 4)
+    u64 norms2    = alloc(B * 4)
+
+    // -------------------------------------------------------------------------
+    // AdamW hyperparams
+    // -------------------------------------------------------------------------
+    f32 lr       = 0.001f
+    f32 beta1    = 0.9f
+    f32 beta2    = 0.999f
+    f32 eps_adam = 0.00000001f
+    f32 wd       = 0.01f
+
+    // -------------------------------------------------------------------------
+    // 50 training steps with per-step timing
+    // -------------------------------------------------------------------------
+    print_str("\n=== Running 50 AdamW steps ===\n")
+
+    // Timing array for steps [0..49], 8 bytes each (nanoseconds)
+    u64 step_times = alloc(STEPS * 8)
+
+    f32 max_loss_err = 0.0f
+    u64 loss_ok = 1
+    f32 loss_tol = 0.01f
+
+    u64 step = 0
+    while step < STEPS {
+        // Zero gradients
+        memset(demb_ptr,  0, VOCAB * D * 4)
+        memset(dU_ptr,    0, K * D * R * 4)
+        memset(dV_ptr,    0, K * R * D * 4)
+        memset(dgw_ptr,   0, K * D * 4)
+        memset(dgb_ptr,   0, K * 4)
+        memset(dbias_ptr, 0, D * 4)
+
+        u64 t0 = time_now()
+
+        // Forward
+        f32 loss = full_forward(emb_ptr, U_ptr, V_ptr, gw_ptr, gb_ptr, bias_ptr,
+                                ids1_ptr, ids2_ptr,
+                                x1_ptr, x2_ptr, z1_ptr, z2_ptr,
+                                alpha1, inter1, outk1, alpha2, inter2, outk2,
+                                q1_ptr, q2_ptr, norms1, norms2,
+                                B, S, D, K, R)
+
+        // Backward
+        full_backward(q1_ptr, q2_ptr, z1_ptr, z2_ptr, x1_ptr, x2_ptr,
+                      alpha1, inter1, outk1, alpha2, inter2, outk2,
+                      norms1, norms2, U_ptr, V_ptr, gw_ptr, ids1_ptr, ids2_ptr,
+                      B, S, D, K, R,
+                      dU_ptr, dV_ptr, dgw_ptr, dgb_ptr, dbias_ptr, demb_ptr)
+
+        // AdamW step (1-based step index for bias correction)
+        u64 step_idx = step + 1
+        adamw_step(emb_ptr,  demb_ptr,  m_emb,  v_emb,  VOCAB * D, step_idx, lr, beta1, beta2, eps_adam, wd)
+        adamw_step(U_ptr,    dU_ptr,    m_U,    v_U,    K * D * R, step_idx, lr, beta1, beta2, eps_adam, wd)
+        adamw_step(V_ptr,    dV_ptr,    m_V,    v_V,    K * R * D, step_idx, lr, beta1, beta2, eps_adam, wd)
+        adamw_step(gw_ptr,   dgw_ptr,   m_gw,   v_gw,   K * D,     step_idx, lr, beta1, beta2, eps_adam, wd)
+        adamw_step(gb_ptr,   dgb_ptr,   m_gb,   v_gb,   K,         step_idx, lr, beta1, beta2, eps_adam, wd)
+        adamw_step(bias_ptr, dbias_ptr, m_bias, v_bias, D,         step_idx, lr, beta1, beta2, eps_adam, wd)
+
+        u64 t1 = time_now()
+        u64 elapsed_ns = t1 - t0
+        unsafe { *((step_times + step * 8) as u64) = elapsed_ns }
+
+        // Verify loss vs reference
+        f32 ref = ref_cpu_loss(step)
+        f32 diff = abs_f32(loss - ref)
+        if diff > max_loss_err { max_loss_err = diff }
+        if diff > loss_tol { loss_ok = 0 }
+
+        // Print progress every 10 steps + first 5
+        if step < 5 {
+            print_str("  step ")
+            u64 ss = fmt_dec(step)
+            print_str(ss); dealloc(ss)
+            print_str(": loss=")
+            ss = fmt_f32(loss, 6)
+            print_str(ss); dealloc(ss)
+            print_str("  ref=")
+            ss = fmt_f32(ref, 6)
+            print_str(ss); dealloc(ss)
+            print_str("  diff=")
+            ss = fmt_f32(diff, 6)
+            print_str(ss); dealloc(ss)
+            if diff < loss_tol { print_str("  OK\n") }
+            else { print_str("  FAIL\n") }
+        }
+
+        step = step + 1
+    }
+
+    // -------------------------------------------------------------------------
+    // Compute median ms/step (skip first WARMUP steps)
+    // -------------------------------------------------------------------------
+    u64 bench_n = STEPS - WARMUP
+    u64 bench_times = alloc(bench_n * 8)
+
+    u64 ti = 0
+    while ti < bench_n {
+        u64 ns_val = 0
+        unsafe { *((step_times + (ti + WARMUP) * 8) as u64) -> ns_val }
+        unsafe { *((bench_times + ti * 8) as u64) = ns_val }
+        ti = ti + 1
+    }
+
+    u64 median_ns = median_u64(bench_times, bench_n)
+    dealloc(bench_times)
+    dealloc(step_times)
+
+    // Convert median ns to ms (as f64 for precision)
+    f64 median_ms_f64 = int_to_f64(median_ns)
+    f64 ns_per_ms = 1000000.0
+    median_ms_f64 = median_ms_f64 / ns_per_ms
+    f32 median_ms = f64_to_f32(median_ms_f64)
+
+    // Speedup vs PyTorch CPU 8.07 ms/step
+    f32 pytorch_ms = 8.07f
+    f32 speedup = pytorch_ms / median_ms
+
+    // -------------------------------------------------------------------------
+    // Report
+    // -------------------------------------------------------------------------
+    print_str("\n=== Results ===\n")
+    print_str("MLRift median ms/step  : ")
+    u64 ss = fmt_f32(median_ms, 3)
+    print_str(ss); dealloc(ss)
+    print_str(" ms\n")
+
+    print_str("PyTorch CPU baseline   : 8.070 ms\n")
+
+    print_str("Speedup vs PyTorch CPU : ")
+    ss = fmt_f32(speedup, 3)
+    print_str(ss); dealloc(ss)
+    print_str("x\n")
+
+    print_str("Max loss err vs ref    : ")
+    ss = fmt_f32(max_loss_err, 8)
+    print_str(ss); dealloc(ss)
+    print_str("\n")
+
+    if loss_ok == 0 {
+        print_str("FAIL: loss trajectory does not match reference (tol=1e-2)\n")
+        exit(1)
+    }
+    print_str("Loss trajectory        : PASS (all 50 steps within 1e-2)\n")
+
+    if speedup > 1.0f {
+        print_str("RESULT: BEATS PyTorch CPU\n")
+    } else {
+        print_str("RESULT: slower than PyTorch CPU\n")
+    }
+
+    // Cleanup
+    dealloc(emb_ptr); dealloc(U_ptr); dealloc(V_ptr)
+    dealloc(gw_ptr); dealloc(gb_ptr); dealloc(bias_ptr)
+    dealloc(ids1_ptr); dealloc(ids2_ptr)
+    dealloc(demb_ptr); dealloc(dU_ptr); dealloc(dV_ptr)
+    dealloc(dgw_ptr); dealloc(dgb_ptr); dealloc(dbias_ptr)
+    dealloc(m_emb); dealloc(v_emb)
+    dealloc(m_U); dealloc(v_U)
+    dealloc(m_V); dealloc(v_V)
+    dealloc(m_gw); dealloc(v_gw)
+    dealloc(m_gb); dealloc(v_gb)
+    dealloc(m_bias); dealloc(v_bias)
+    dealloc(x1_ptr); dealloc(x2_ptr)
+    dealloc(z1_ptr); dealloc(z2_ptr)
+    dealloc(alpha1); dealloc(inter1); dealloc(outk1)
+    dealloc(alpha2); dealloc(inter2); dealloc(outk2)
+    dealloc(q1_ptr); dealloc(q2_ptr)
+    dealloc(norms1); dealloc(norms2)
+
+    exit(0)
+}
