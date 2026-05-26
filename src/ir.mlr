@@ -6869,7 +6869,8 @@ fn ir_emit_x86_insn(uint64 ii) {
 
     if op == 72 {
         // IR_MEMCPY: dst in src1, src in src2, len vreg in imm
-        // Use rep movsb: rdi=dst, rsi=src, rcx=len
+        // 8-byte fast loop + 1-byte tail (avoids rep movsb byte-at-a-time
+        // stalls when reading from WC-mapped GPU VRAM over PCIe BAR1).
         uint64 mc_dst = ir_resolve_src(s1_v, 0)
         uint64 mc_src = ir_resolve_src(s2_v, 1)
         // Resolve len from imm (stored as vreg index)
@@ -6882,18 +6883,69 @@ fn ir_emit_x86_insn(uint64 ii) {
                 mc_len = 10
             }
         }
-        // Save dst pointer for return value
-        // push rdi; push rsi (save caller-saved if needed)
+        // rdi=dst, rsi=src, rcx=len
         ir_emit_mov_r64_r64(7, mc_dst)   // rdi = dst
         ir_emit_mov_r64_r64(6, mc_src)   // rsi = src
         ir_emit_mov_r64_r64(1, mc_len)   // rcx = len
-        // rep movsb: F3 A4
-        emit_byte(0xF3)
-        emit_byte(0xA4)
-        // Result: return original dst (it was moved to rdi, but rdi was incremented)
-        // We need original dst; re-resolve or compute rdi - len
-        // Simplest: sub rdi, rcx wouldn't work since rcx is 0 now
-        // Re-resolve dst from its vreg
+        //
+        // 8-byte loop: while rcx >= 8 { qword copy; rsi+=8; rdi+=8; rcx-=8 }
+        //   loop8: cmp rcx, 8  (48 83 F9 08)
+        uint64 ir_mc_loop8 = out_len
+        emit_byte(0x48); emit_byte(0x83); emit_byte(0xF9); emit_byte(0x08)
+        //          jl tail8    (7C disp8, filled in)
+        emit_byte(0x7C)
+        uint64 ir_mc_jl_tail8 = out_len
+        emit_byte(0)
+        //          mov rax, [rsi]  (48 8B 06)
+        emit_byte(0x48); emit_byte(0x8B); emit_byte(0x06)
+        //          mov [rdi], rax  (48 89 07)
+        emit_byte(0x48); emit_byte(0x89); emit_byte(0x07)
+        //          add rsi, 8      (48 83 C6 08)
+        emit_byte(0x48); emit_byte(0x83); emit_byte(0xC6); emit_byte(0x08)
+        //          add rdi, 8      (48 83 C7 08)
+        emit_byte(0x48); emit_byte(0x83); emit_byte(0xC7); emit_byte(0x08)
+        //          sub rcx, 8      (48 83 E9 08)
+        emit_byte(0x48); emit_byte(0x83); emit_byte(0xE9); emit_byte(0x08)
+        //          jmp loop8       (EB disp8)
+        emit_byte(0xEB)
+        uint64 ir_mc_jmp8_disp = ir_mc_loop8 - out_len - 1
+        emit_byte(ir_mc_jmp8_disp & 0xFF)
+        // tail8: patch the jl displacement
+        uint64 ir_mc_tail8 = out_len
+        uint64 ir_mc_jl_disp = ir_mc_tail8 - ir_mc_jl_tail8 - 1
+        uint64 ir_mc_jl_p = out_buf + ir_mc_jl_tail8
+        uint8 ir_mc_jl_b = ir_mc_jl_disp & 0xFF
+        unsafe { *(ir_mc_jl_p as uint8) = ir_mc_jl_b }
+        //
+        // 1-byte tail: while rcx > 0 { byte copy; ++rsi; ++rdi; --rcx }
+        //   loop1: test rcx, rcx  (48 85 C9)
+        uint64 ir_mc_loop1 = out_len
+        emit_byte(0x48); emit_byte(0x85); emit_byte(0xC9)
+        //          jz done         (74 disp8, filled in)
+        emit_byte(0x74)
+        uint64 ir_mc_jz1 = out_len
+        emit_byte(0)
+        //          movzx eax, byte [rsi]  (0F B6 06)
+        emit_byte(0x0F); emit_byte(0xB6); emit_byte(0x06)
+        //          mov [rdi], al   (88 07)
+        emit_byte(0x88); emit_byte(0x07)
+        //          inc rsi         (48 FF C6)
+        emit_byte(0x48); emit_byte(0xFF); emit_byte(0xC6)
+        //          inc rdi         (48 FF C7)
+        emit_byte(0x48); emit_byte(0xFF); emit_byte(0xC7)
+        //          dec rcx         (48 FF C9)
+        emit_byte(0x48); emit_byte(0xFF); emit_byte(0xC9)
+        //          jmp loop1       (EB disp8)
+        emit_byte(0xEB)
+        uint64 ir_mc_back1 = ir_mc_loop1 - out_len - 1
+        emit_byte(ir_mc_back1 & 0xFF)
+        // done: patch jz
+        uint64 ir_mc_done = out_len
+        uint64 ir_mc_jz1_disp = ir_mc_done - ir_mc_jz1 - 1
+        uint64 ir_mc_jz1_p = out_buf + ir_mc_jz1
+        uint8 ir_mc_jz1_b = ir_mc_jz1_disp & 0xFF
+        unsafe { *(ir_mc_jz1_p as uint8) = ir_mc_jz1_b }
+        // Result: return original dst
         uint64 mc_dst2 = ir_resolve_src(s1_v, 0)
         if dst_r != 0xFFFFFFFF {
             ir_emit_mov_r64_r64(dst_r, mc_dst2)

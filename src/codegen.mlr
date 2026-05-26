@@ -417,6 +417,20 @@ fn patch_u64(uint64 offset, uint64 val) {
     patch_u32(offset + 4, (val >> 32) & 0xFFFFFFFF)
 }
 
+// Patch a single byte at `offset` in the output buffer.
+fn patch_byte(uint64 offset, uint64 val) {
+    uint64 p = out_buf + offset
+    uint8 b = val & 0xFF
+    unsafe { *(p as uint8) = b }
+}
+
+// Emit a signed 8-bit value (rel8 branch displacement) as one byte.
+// val is treated as a twos-complement int8 passed in a u64.
+fn emit_s8(uint64 val) {
+    uint8 b = val & 0xFF
+    emit_byte(b)
+}
+
 // ---------------------------------------------------------------------------
 // DWARF line table recording
 // ---------------------------------------------------------------------------
@@ -5669,31 +5683,61 @@ fn gen_expr(uint64 node) {
                 // Load src → rsi
                 emit_load_rax_from_stack(temp_slot_1)
                 emit_mov_rsi_rax()
-                // loop: test rcx, rcx
-                uint64 mc_loop = out_len
+                // rcx = byte count (already set above)
+                //
+                // 8-byte fast loop: while rcx >= 8 { qword copy; rsi+=8; rdi+=8; rcx-=8 }
+                //   loop8: cmp rcx, 8     (0x48 0x83 0xF9 0x08)
+                uint64 mc_loop8 = out_len
+                emit_byte(0x48); emit_byte(0x83); emit_byte(0xF9); emit_byte(0x08)
+                //           jl tail8      (0x7C disp8, filled in)
+                emit_byte(0x7C)
+                uint64 mc_jl_tail8 = out_len
+                emit_byte(0)
+                //           mov rax, [rsi]   (0x48 0x8B 0x06)
+                emit_byte(0x48); emit_byte(0x8B); emit_byte(0x06)
+                //           mov [rdi], rax   (0x48 0x89 0x07)
+                emit_byte(0x48); emit_byte(0x89); emit_byte(0x07)
+                //           add rsi, 8       (0x48 0x83 0xC6 0x08)
+                emit_byte(0x48); emit_byte(0x83); emit_byte(0xC6); emit_byte(0x08)
+                //           add rdi, 8       (0x48 0x83 0xC7 0x08)
+                emit_byte(0x48); emit_byte(0x83); emit_byte(0xC7); emit_byte(0x08)
+                //           sub rcx, 8       (0x48 0x83 0xE9 0x08)
+                emit_byte(0x48); emit_byte(0x83); emit_byte(0xE9); emit_byte(0x08)
+                //           jmp loop8        (0xEB disp8)
+                emit_byte(0xEB)
+                uint64 mc_jmp_loop8_disp = mc_loop8 - out_len - 1
+                emit_s8(mc_jmp_loop8_disp)
+                // tail8: (patch jl here)
+                uint64 mc_tail8 = out_len
+                uint64 mc_jl_tail8_disp = mc_tail8 - mc_jl_tail8 - 1
+                patch_byte(mc_jl_tail8, mc_jl_tail8_disp)
+                //
+                // 1-byte tail loop: while rcx > 0 { byte copy; rsi++; rdi++; rcx-- }
+                //   loop1: test rcx, rcx   (0x48 0x85 0xC9)
+                uint64 mc_loop1 = out_len
                 emit_byte(0x48); emit_byte(0x85); emit_byte(0xC9)
-                // jz done (near jump, 4-byte displacement)
-                emit_byte(0x0F); emit_byte(0x84)
-                uint64 mc_jz = out_len
-                emit_u32_le(0)
-                // movzx eax, byte [rsi]
+                //           jz done         (0x74 disp8, filled in)
+                emit_byte(0x74)
+                uint64 mc_jz1 = out_len
+                emit_byte(0)
+                //           movzx eax, byte [rsi]
                 emit_byte(0x0F); emit_byte(0xB6); emit_byte(0x06)
-                // mov [rdi], al
+                //           mov [rdi], al
                 emit_byte(0x88); emit_byte(0x07)
-                // inc rsi
+                //           inc rsi
                 emit_byte(0x48); emit_byte(0xFF); emit_byte(0xC6)
-                // inc rdi
+                //           inc rdi
                 emit_byte(0x48); emit_byte(0xFF); emit_byte(0xC7)
-                // dec rcx
+                //           dec rcx
                 emit_byte(0x48); emit_byte(0xFF); emit_byte(0xC9)
-                // jmp loop (near backward)
-                emit_byte(0xE9)
-                uint64 mc_back = mc_loop - out_len - 4
-                emit_u32_le(mc_back)
-                // done:
+                //           jmp loop1       (0xEB disp8)
+                emit_byte(0xEB)
+                uint64 mc_back1 = mc_loop1 - out_len - 1
+                emit_s8(mc_back1)
+                // done: (patch jz here)
                 uint64 mc_done = out_len
-                uint64 mc_done_disp = mc_done - mc_jz - 4
-                patch_u32(mc_jz, mc_done_disp)
+                uint64 mc_jz1_disp = mc_done - mc_jz1 - 1
+                patch_byte(mc_jz1, mc_jz1_disp)
             }
             // Return dst
             emit_load_rax_from_stack(temp_slot_0)

@@ -920,6 +920,160 @@ fn wzma_bwd(u64 dy_ptr, u64 x_ptr,
 }
 
 // ---------------------------------------------------------------------------
+// wzma_gate_only_bwd: backward for gate (dgw, dgb, dbias) only.
+//
+// Identical to wzma_bwd but SKIPS the expensive dU/dV inner loops.
+// Use this when dU and dV are computed elsewhere (e.g., on GPU), and
+// only dgw/dgb/dbias/dx need to be computed on CPU.
+//
+// dx_ptr receives the GATE-ONLY contribution:
+//   dx_gate[bs,d] += sum_k (dgl_k * gw[k,d])
+// The U/V contribution to dx is NOT included (caller adds it separately).
+//
+// Params same as wzma_bwd (U_ptr, V_ptr used for gw_ptr access only).
+// ---------------------------------------------------------------------------
+fn wzma_gate_only_bwd(u64 dy_ptr, u64 x_ptr,
+                      u64 alpha_ptr, u64 outk_ptr,
+                      u64 gw_ptr,
+                      u64 B, u64 S, u64 D, u64 K_banks,
+                      u64 dgw_ptr, u64 dgb_ptr, u64 dbias_ptr,
+                      u64 dx_ptr) {
+    // bias grad: dbias[d] += sum_{b,s} dy[b,s,d]
+    u64 b = 0
+    while b < B {
+        u64 s = 0
+        while s < S {
+            u64 dy_row = dy_ptr + (b * S + s) * D * 4
+            u64 d = 0
+            while d < D {
+                f32 g = 0.0f
+                unsafe { *((dy_row + d * 4) as f32) -> g }
+                f32 cur = 0.0f
+                unsafe { *((dbias_ptr + d * 4) as f32) -> cur }
+                unsafe { *((dbias_ptr + d * 4) as f32) = cur + g }
+                d = d + 1
+            }
+            s = s + 1
+        }
+        b = b + 1
+    }
+
+    // Gate backward: d_alpha[bs,k], dgl[bs,k], dgw, dgb, dx_gate
+    b = 0
+    while b < B {
+        u64 s = 0
+        while s < S {
+            u64 bs_idx    = b * S + s
+            u64 dy_row    = dy_ptr    + bs_idx * D * 4
+            u64 x_row     = x_ptr     + bs_idx * D * 4
+            u64 alpha_bs  = alpha_ptr + bs_idx * K_banks * 4
+            u64 outk_bs   = outk_ptr  + bs_idx * K_banks * D * 4
+            u64 dx_row    = dx_ptr    + bs_idx * D * 4
+
+            // Zero dx_gate for this (b,s)
+            u64 d = 0
+            while d < D {
+                unsafe { *((dx_row + d * 4) as f32) = 0.0f }
+                d = d + 1
+            }
+
+            // Compute d_alpha[k] = dot(dy[bs,:], outk[k][bs,:]) for each k
+            // Use up to 8 scalar variables to avoid heap alloc in the inner loop.
+            f32 da0 = 0.0f; f32 da1 = 0.0f; f32 da2 = 0.0f; f32 da3 = 0.0f
+            f32 da4 = 0.0f; f32 da5 = 0.0f; f32 da6 = 0.0f; f32 da7 = 0.0f
+            u64 k = 0
+            while k < K_banks {
+                u64 outk_k = outk_bs + k * D * 4
+                f32 da = 0.0f
+                d = 0
+                while d < D {
+                    f32 dyv = 0.0f
+                    unsafe { *((dy_row + d * 4) as f32) -> dyv }
+                    f32 okd = 0.0f
+                    unsafe { *((outk_k + d * 4) as f32) -> okd }
+                    f32 p_dyok = dyv * okd
+                    da = da + p_dyok
+                    d = d + 1
+                }
+                if k == 0 { da0 = da }
+                if k == 1 { da1 = da }
+                if k == 2 { da2 = da }
+                if k == 3 { da3 = da }
+                if k == 4 { da4 = da }
+                if k == 5 { da5 = da }
+                if k == 6 { da6 = da }
+                if k == 7 { da7 = da }
+                k = k + 1
+            }
+
+            // sum_ada = sum_j alpha[j]*d_alpha[j]
+            f32 sum_ada = 0.0f
+            k = 0
+            while k < K_banks {
+                f32 ak = 0.0f
+                unsafe { *((alpha_bs + k * 4) as f32) -> ak }
+                f32 dak = 0.0f
+                if k == 0 { dak = da0 }
+                if k == 1 { dak = da1 }
+                if k == 2 { dak = da2 }
+                if k == 3 { dak = da3 }
+                if k == 4 { dak = da4 }
+                if k == 5 { dak = da5 }
+                if k == 6 { dak = da6 }
+                if k == 7 { dak = da7 }
+                f32 p_akdak = ak * dak
+                sum_ada = sum_ada + p_akdak
+                k = k + 1
+            }
+
+            // For each k: dgl[k] = alpha[k]*(d_alpha[k] - sum_ada)
+            // dgb[k] += dgl_k
+            // dgw[k,d] += dgl_k * x[d]
+            // dx[d]    += dgl_k * gw[k,d]
+            k = 0
+            while k < K_banks {
+                f32 ak = 0.0f
+                unsafe { *((alpha_bs + k * 4) as f32) -> ak }
+                f32 dak = 0.0f
+                if k == 0 { dak = da0 }
+                if k == 1 { dak = da1 }
+                if k == 2 { dak = da2 }
+                if k == 3 { dak = da3 }
+                if k == 4 { dak = da4 }
+                if k == 5 { dak = da5 }
+                if k == 6 { dak = da6 }
+                if k == 7 { dak = da7 }
+                f32 dgl_k = ak * (dak - sum_ada)
+                f32 cur_dgb = 0.0f
+                unsafe { *((dgb_ptr + k * 4) as f32) -> cur_dgb }
+                unsafe { *((dgb_ptr + k * 4) as f32) = cur_dgb + dgl_k }
+                u64 dgw_row = dgw_ptr + k * D * 4
+                u64 gw_row  = gw_ptr  + k * D * 4
+                d = 0
+                while d < D {
+                    f32 xv = 0.0f
+                    unsafe { *((x_row + d * 4) as f32) -> xv }
+                    f32 cur_dgw = 0.0f
+                    unsafe { *((dgw_row + d * 4) as f32) -> cur_dgw }
+                    f32 p_dgl_xv = dgl_k * xv
+                    unsafe { *((dgw_row + d * 4) as f32) = cur_dgw + p_dgl_xv }
+                    f32 wv = 0.0f
+                    unsafe { *((gw_row + d * 4) as f32) -> wv }
+                    f32 cur_dx = 0.0f
+                    unsafe { *((dx_row + d * 4) as f32) -> cur_dx }
+                    f32 p_dgl_wv = dgl_k * wv
+                    unsafe { *((dx_row + d * 4) as f32) = cur_dx + p_dgl_wv }
+                    d = d + 1
+                }
+                k = k + 1
+            }
+            s = s + 1
+        }
+        b = b + 1
+    }
+}
+
+// ---------------------------------------------------------------------------
 // embed_bwd: scatter-add into embedding gradient.
 //
 // Accumulates (+=) into demb_ptr[vocab, D].

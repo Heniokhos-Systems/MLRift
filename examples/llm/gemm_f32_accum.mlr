@@ -1,0 +1,71 @@
+// gemm_f32_accum — C += A · B  (16×16 tile, one lane per output cell).
+//
+// Same structure as gemm_f32 (examples/llm/gemm_f32.mlr) but accumulates
+// into C instead of overwriting.  Recognised by
+// amdgpu_lower_gemm_f32_accum_3c in src/format_amdgpu.mlr via the
+// gemm_accum_marker() sentinel call.
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native \
+//       examples/llm/gemm_f32_accum.mlr -o /tmp/gemm_f32_accum
+//
+// The resulting /tmp/gemm_f32_accum.co exports one kernel symbol:
+//   gemm_f32_accum(a_ptr, b_ptr, c_ptr, m, n, k_dim)
+//
+// Launch: same grid/block as gemm_f32 (tiles_m * tiles_n blocks, 256 lanes).
+
+fn gemm_accum_marker() -> uint64 { return 0 }
+
+fn tid_x() -> uint64 {
+    return 0
+}
+
+@kernel
+fn gemm_f32_accum(
+    uint64 a_ptr,    // [M × K]
+    uint64 b_ptr,    // [K × N]
+    uint64 c_ptr,    // [M × N]  — ACCUMULATED: C[m,n] += A[m,:] · B[:,n]
+    uint64 m,
+    uint64 n,
+    uint64 k_dim
+) {
+    // Marker: tells the recogniser to emit accumulate ISA (C += ...).
+    uint64 _gam = gemm_accum_marker()
+
+    uint64 lane = tid_x()
+    uint64 tile_id   = lane / 256
+    uint64 within    = lane - tile_id * 256
+    uint64 i_in_tile = within / 16
+    uint64 j_in_tile = within - i_in_tile * 16
+
+    uint64 tiles_per_row = (n + 15) / 16
+    uint64 tile_row = tile_id / tiles_per_row
+    uint64 tile_col = tile_id - tile_row * tiles_per_row
+
+    uint64 row = tile_row * 16 + i_in_tile
+    uint64 col = tile_col * 16 + j_in_tile
+
+    if row < m {
+        if col < n {
+            f32 sum = 0.0
+            uint64 a_row_base = a_ptr + row * k_dim * 4
+            uint64 b_col_base = b_ptr + col * 4
+            uint64 t = 0
+            while t < k_dim {
+                uint64 ap = a_row_base + t * 4
+                uint64 bp = b_col_base + t * n * 4
+                f32 a = 0.0; unsafe { *(ap as f32) -> a }
+                f32 b = 0.0; unsafe { *(bp as f32) -> b }
+                sum = sum + a * b
+                t = t + 1
+            }
+            uint64 cp = c_ptr + (row * n + col) * 4
+            f32 c_old = 0.0; unsafe { *(cp as f32) -> c_old }
+            unsafe { *(cp as f32) = c_old + sum }
+        }
+    }
+}
+
+fn main() {
+    exit(0)
+}
