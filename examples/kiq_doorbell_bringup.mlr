@@ -6,7 +6,13 @@
 //        gmc_alloc_page_table → gmc_map(0x200000) → gmc_init_mmhub.
 //        Assert CTX0 enabled (bit 0 of regMMVM_CONTEXT0_CNTL).
 //   3. NBIO doorbell selfring init from BAR2 physical address.
-//   4. MEC reset/unhalt + MES unhalt.
+//   4. MEC/MES bring-up (amdgpu mmiotrace order):
+//        a. CP_ME_CNTL 4-step ladder (GC1 0x0803).
+//        b. CP_MEC_RS64_CNTL ladder 0x400f0000→0x40000000→0x3c000000 (unhalt);
+//           MES_CNTL 0x40030000→0x0c000000.
+//        c. CP_MES_DOORBELL_CONTROL (GC1 0x2200): 7-value init sequence.
+//        d. MEC alive readback: CP_MEC_RS64_CNTL + CP_MEC_RS64_INSTR_PNTR
+//           (GC1 0x2849, traced); prints "MEC ALIVE" / "MEC DEAD".
 //   5. KIQ HQD (ME=3/PIPE=1/QUEUE=0): MQD+ring+rptr+wptr+eop in VRAM,
 //        CP_HQD_PQ_CONTROL=0xd8308011, DOORBELL_CONTROL=0x40000060 (offset=0x18/byte=0x60),
 //        WPTR via GTT poll addr, MEC doorbell range LOWER=0/UPPER=0x450.
@@ -52,14 +58,26 @@ static uint64 regCP_HQD_EOP_BASE_ADDR_HI              = 0x1fcf
 static uint64 regCP_HQD_EOP_CONTROL                   = 0x1fd0
 // CP registers BASE_IDX=1
 static uint64 regGRBM_GFX_CNTL                        = 0x0900
+static uint64 regCP_ME_CNTL_dw                        = 0x0803
 static uint64 regCP_MEC_RS64_CNTL_dw                  = 0x2904
+static uint64 regCP_MEC_RS64_INSTR_PNTR_dw            = 0x2849
 static uint64 regCP_MES_CNTL_dw                       = 0x2807
+static uint64 regCP_MES_DOORBELL_CONTROL_dw            = 0x2200
 // MEC doorbell range — GC1 (ME-engine aperture); range 0 drops all doorbells.
 static uint64 regCP_MEC_DOORBELL_RANGE_LOWER           = 0x1dfc
 static uint64 regCP_MEC_DOORBELL_RANGE_UPPER           = 0x1dfd
 
-static uint64 MEC_RESET_VAL  = 0x400F0010
+// CP_ME_CNTL ladder (amdgpu mmiotrace order, GC1 0x0803)
+static uint64 ME_CNTL_V0 = 0x153C0000
+static uint64 ME_CNTL_V1 = 0x15300000
+static uint64 ME_CNTL_V2 = 0x15000000
+static uint64 ME_CNTL_V3 = 0x01000000
+// CP_MEC_RS64_CNTL ladder (amdgpu order, NOT 0x400f0010)
+static uint64 MEC_RESET_VAL  = 0x400F0000
+static uint64 MEC_HALT_VAL   = 0x40000000
 static uint64 MEC_UNHALT_VAL = 0x3C000000
+// CP_MES_CNTL ladder
+static uint64 MES_HALT_VAL   = 0x40030000
 static uint64 MES_UNHALT_VAL = 0x0C000000
 
 fn _hex32(uint64 lab, uint64 ll, uint64 v) {
@@ -229,16 +247,100 @@ fn main() {
     puts("NBIO doorbell selfring configured")
 
     // -------------------------------------------------------
-    // 4) MEC reset/unhalt + MES unhalt.
+    // 4) MEC/MES bring-up — amdgpu mmiotrace order.
     // -------------------------------------------------------
     puts("")
-    puts("=== MEC reset/unhalt + MES unhalt ===")
-    uint32 mec_reset_v  = MEC_RESET_VAL
-    uint32 mec_unhalt_v = MEC_UNHALT_VAL
-    uint32 mes_unhalt_v = MES_UNHALT_VAL
+    puts("=== MEC/MES bring-up (amdgpu order) ===")
+
+    // 4a) CP_ME_CNTL (GC1 0x0803): first two steps of the 4-step ladder.
+    //     Traced before MEC_RS64_CNTL reset: read-then-write 0x153c0000,
+    //     then write 0x15300000.
+    uint32 me_cntl_v0 = ME_CNTL_V0
+    uint32 me_cntl_v1 = ME_CNTL_V1
+    uint32 me_cntl_v2 = ME_CNTL_V2
+    uint32 me_cntl_v3 = ME_CNTL_V3
+    gpu_reg_w32(dev, GPU_IP_GC1, regCP_ME_CNTL_dw, me_cntl_v0)
+    _delay(10000)
+    gpu_reg_w32(dev, GPU_IP_GC1, regCP_ME_CNTL_dw, me_cntl_v1)
+    _delay(10000)
+
+    // 4b) CP_MEC_RS64_CNTL (GC1 0x2904): reset ladder 0x400f0000 → 0x40000000.
+    uint32 mec_reset_v = MEC_RESET_VAL
+    uint32 mec_halt_v  = MEC_HALT_VAL
     gpu_reg_w32(dev, GPU_IP_GC1, regCP_MEC_RS64_CNTL_dw, mec_reset_v)
+    _delay(10000)
+    gpu_reg_w32(dev, GPU_IP_GC1, regCP_MEC_RS64_CNTL_dw, mec_halt_v)
     _delay(50000)
+
+    // 4c) CP_MES_DOORBELL_CONTROL (GC1 0x2200): 7-value init sequence (amdgpu order).
+    uint32 mdbc0 = 0x40000000
+    uint32 mdbc1 = 0x40000100
+    uint32 mdbc2 = 0x40010000
+    uint32 mdbc3 = 0x40010100
+    uint32 mdbc4 = 0x40020000
+    uint32 mdbc5 = 0x40020100
+    uint32 mdbc6 = 0xe0000000
+    gpu_reg_w32(dev, GPU_IP_GC1, regCP_MES_DOORBELL_CONTROL_dw, mdbc0)
+    gpu_reg_w32(dev, GPU_IP_GC1, regCP_MES_DOORBELL_CONTROL_dw, mdbc1)
+    gpu_reg_w32(dev, GPU_IP_GC1, regCP_MES_DOORBELL_CONTROL_dw, mdbc2)
+    gpu_reg_w32(dev, GPU_IP_GC1, regCP_MES_DOORBELL_CONTROL_dw, mdbc3)
+    gpu_reg_w32(dev, GPU_IP_GC1, regCP_MES_DOORBELL_CONTROL_dw, mdbc4)
+    gpu_reg_w32(dev, GPU_IP_GC1, regCP_MES_DOORBELL_CONTROL_dw, mdbc5)
+    gpu_reg_w32(dev, GPU_IP_GC1, regCP_MES_DOORBELL_CONTROL_dw, mdbc6)
+    puts("CP_MES_DOORBELL_CONTROL init done")
+
+    // 4b-cont) Unhalt MEC: CP_MEC_RS64_CNTL → 0x3c000000 (halt-bit=bit30 clear).
+    uint32 mec_unhalt_v = MEC_UNHALT_VAL
     gpu_reg_w32(dev, GPU_IP_GC1, regCP_MEC_RS64_CNTL_dw, mec_unhalt_v)
+    _delay(100000)
+
+    // 4a-cont) CP_ME_CNTL last two steps: 0x15000000 → 0x01000000.
+    gpu_reg_w32(dev, GPU_IP_GC1, regCP_ME_CNTL_dw, me_cntl_v2)
+    _delay(10000)
+    gpu_reg_w32(dev, GPU_IP_GC1, regCP_ME_CNTL_dw, me_cntl_v3)
+    _delay(10000)
+
+    // 4d) MEC alive readback: CP_MEC_RS64_CNTL + CP_MEC_RS64_INSTR_PNTR.
+    //     amdgpu reads INSTR_PNTR via GRBM_GFX_CNTL pipe=0/me=3 then pipe=1/me=3.
+    //     We read both; CNTL halt-bit (bit30)=0 means unhalted; INSTR_PNTR!=0 means running.
+    uint32 cntl_rb_w = gpu_reg_r32(dev, GPU_IP_GC1, regCP_MEC_RS64_CNTL_dw)
+    uint64 cntl_rb = cntl_rb_w
+    _hex32("MEC_RS64_CNTL_post", 18, cntl_rb)
+
+    // INSTR_PNTR: select GC via GRBM (pipe=0,me=3) then read
+    _select_hqd(dev, 3, 0, 0, 0)
+    uint32 pntr0_w = gpu_reg_r32(dev, GPU_IP_GC1, regCP_MEC_RS64_INSTR_PNTR_dw)
+    uint64 pntr0 = pntr0_w
+    _hex32("MEC_RS64_INSTR_PNTR_pipe0", 25, pntr0)
+
+    _select_hqd(dev, 3, 1, 0, 0)
+    uint32 pntr1_w = gpu_reg_r32(dev, GPU_IP_GC1, regCP_MEC_RS64_INSTR_PNTR_dw)
+    uint64 pntr1 = pntr1_w
+    _hex32("MEC_RS64_INSTR_PNTR_pipe1", 25, pntr1)
+
+    // Re-select default (pipe=1, me=3) for HQD work below.
+    _select_hqd(dev, 3, 1, 0, 0)
+
+    // halt-bit = bit 30 of CNTL; INSTR_PNTR nonzero = MEC executing code.
+    uint64 halt_bit = (cntl_rb >> 30) & 0x1
+    if halt_bit == 0 {
+        if pntr0 != 0 {
+            puts("MEC ALIVE")
+        } else {
+            if pntr1 != 0 {
+                puts("MEC ALIVE")
+            } else {
+                puts("MEC DEAD (INSTR_PNTR=0 on both pipes)")
+            }
+        }
+    } else {
+        puts("MEC DEAD (halt-bit set)")
+    }
+
+    // 4e) MES unhalt: CP_MES_CNTL (GC1 0x2807) 0x40030000 → 0x0c000000.
+    uint32 mes_halt_v   = MES_HALT_VAL
+    uint32 mes_unhalt_v = MES_UNHALT_VAL
+    gpu_reg_w32(dev, GPU_IP_GC1, regCP_MES_CNTL_dw, mes_halt_v)
     _delay(100000)
     gpu_reg_w32(dev, GPU_IP_GC1, regCP_MES_CNTL_dw, mes_unhalt_v)
     _delay(100000)
