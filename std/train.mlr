@@ -1,16 +1,23 @@
-// MLRift Standard Library — Training primitives (CPU f32 forward pass).
+// MLRift Standard Library — Training primitives (CPU f32 forward + backward).
 //
-// Implements the ops needed for the WZMA encoder forward pass:
-//
+// Forward ops:
 //   embed_f32(ids[B,S]) -> [B,S,D]
-//   wzma_f32(x[B,S,D]) -> [B,S,D]
-//     gate: x @ gw^T + gb -> softmax over K -> alpha[B,S,K]
-//     inter = einsum(bsd,kdr->bskr)
-//     out_k = einsum(bskr,kro->bsko)
-//     y = einsum(bsko,bsk->bso) + bias
+//   wzma_f32_fwd(x[B,S,D], save_alpha[B,S,K], save_inter[B,S,K,R],
+//                save_outk[B,S,K,D]) -> [B,S,D]
+//   wzma_f32(x,out,...) -- legacy wrapper that discards saved activations
 //   mean_pool_s_f32([B,S,D]) -> [B,D]
-//   l2_normalize_f32([B,D]) in-place
+//   l2_normalize_f32([B,D]) in-place  (also stores per-row pre-norm into norms_ptr[B])
 //   infonce_f32(q1,q2,tau,B,D) -> f32 scalar
+//
+// Backward ops:
+//   infonce_bwd     -> dL/dq1[B,D], dL/dq2[B,D]
+//   l2norm_bwd      -> dL/d(pooled)[B,D]  (uses saved norms)
+//   meanpool_bwd    -> dL/dx[B,S,D]
+//   wzma_bwd        -> accumulate dL/dU, dL/dV, dL/dgw, dL/dgb, dL/dbias, dL/dx
+//   embed_bwd       -> scatter-add into embed grad[vocab,D]
+//
+// AdamW optimizer:
+//   adamw_step      -> update one param buffer in-place
 //
 // All tensors f32, contiguous, row-major.
 // libm expf/logf/sqrtf via @dynamic extern.
@@ -80,30 +87,35 @@ fn softmax_f32_inplace(u64 ptr, u64 N) {
 }
 
 // ---------------------------------------------------------------------------
-// wzma_f32: WZMALinear forward (static banks path).
-//   x_ptr:    [B, S, D] f32 input
-//   out_ptr:  [B, S, D] f32 output
-//   U_ptr:    [K, D, r] f32
-//   V_ptr:    [K, r, D] f32
-//   gw_ptr:   [K, D]    f32  gate weight (nn.Linear weight matrix, shape [out,in])
-//   gb_ptr:   [K]       f32  gate bias
-//   bias_ptr: [D]       f32  output bias
+// wzma_f32_fwd: WZMALinear forward with activation saving.
+//   x_ptr:       [B, S, D]     f32 input
+//   out_ptr:     [B, S, D]     f32 output
+//   U_ptr:       [K, D, r]     f32
+//   V_ptr:       [K, r, D]     f32
+//   gw_ptr:      [K, D]        f32  gate weight
+//   gb_ptr:      [K]           f32  gate bias
+//   bias_ptr:    [D]           f32  output bias
+//   alpha_save:  [B, S, K]     f32  saved softmax alpha (allocated by caller)
+//   inter_save:  [B, S, K, r]  f32  saved inter (allocated by caller)
+//   outk_save:   [B, S, K, D]  f32  saved out_k (allocated by caller)
 // ---------------------------------------------------------------------------
-fn wzma_f32(u64 x_ptr, u64 out_ptr,
-            u64 U_ptr, u64 V_ptr,
-            u64 gw_ptr, u64 gb_ptr, u64 bias_ptr,
-            u64 B, u64 S, u64 D, u64 K_banks, u64 r) {
-    u64 inter_buf = alloc(K_banks * r * 4)
-    u64 outk_buf  = alloc(K_banks * D * 4)
-    u64 alpha_buf = alloc(K_banks * 4)
-
+fn wzma_f32_fwd(u64 x_ptr, u64 out_ptr,
+                u64 U_ptr, u64 V_ptr,
+                u64 gw_ptr, u64 gb_ptr, u64 bias_ptr,
+                u64 B, u64 S, u64 D, u64 K_banks, u64 r,
+                u64 alpha_save, u64 inter_save, u64 outk_save) {
     u64 b = 0
     while b < B {
         u64 s = 0
         while s < S {
-            u64 x_row = x_ptr + (b * S + s) * D * 4
+            u64 bs_idx = b * S + s
+            u64 x_row = x_ptr + bs_idx * D * 4
+            // offset into save buffers for this (b,s) slice
+            u64 alpha_bs = alpha_save + bs_idx * K_banks * 4        // [K]
+            u64 inter_bs = inter_save + bs_idx * K_banks * r * 4    // [K,r]
+            u64 outk_bs  = outk_save  + bs_idx * K_banks * D * 4    // [K,D]
 
-            // gate logits: alpha_buf[k] = dot(x, gw[k]) + gb[k]
+            // gate logits: alpha_bs[k] = dot(x, gw[k]) + gb[k]
             u64 k = 0
             while k < K_banks {
                 u64 gw_row = gw_ptr + k * D * 4
@@ -120,12 +132,12 @@ fn wzma_f32(u64 x_ptr, u64 out_ptr,
                 f32 bk = 0.0f
                 unsafe { *((gb_ptr + k * 4) as f32) -> bk }
                 f32 logit = acc + bk
-                unsafe { *((alpha_buf + k * 4) as f32) = logit }
+                unsafe { *((alpha_bs + k * 4) as f32) = logit }
                 k = k + 1
             }
-            softmax_f32_inplace(alpha_buf, K_banks)
+            softmax_f32_inplace(alpha_bs, K_banks)
 
-            // inter[k, r_i] = sum_d x[d] * U[k, d, r_i]
+            // inter_bs[k, ri] = sum_d x[d] * U[k, d, ri]
             k = 0
             while k < K_banks {
                 u64 U_k = U_ptr + k * D * r * 4
@@ -141,13 +153,13 @@ fn wzma_f32(u64 x_ptr, u64 out_ptr,
                         acc = acc + xv * uv
                         d = d + 1
                     }
-                    unsafe { *((inter_buf + (k * r + ri) * 4) as f32) = acc }
+                    unsafe { *((inter_bs + (k * r + ri) * 4) as f32) = acc }
                     ri = ri + 1
                 }
                 k = k + 1
             }
 
-            // out_k[k, d] = sum_r inter[k, r_i] * V[k, r_i, d]
+            // outk_bs[k, d] = sum_r inter_bs[k, ri] * V[k, ri, d]
             k = 0
             while k < K_banks {
                 u64 V_k = V_ptr + k * r * D * 4
@@ -157,29 +169,29 @@ fn wzma_f32(u64 x_ptr, u64 out_ptr,
                     u64 ri = 0
                     while ri < r {
                         f32 iv = 0.0f
-                        unsafe { *((inter_buf + (k * r + ri) * 4) as f32) -> iv }
+                        unsafe { *((inter_bs + (k * r + ri) * 4) as f32) -> iv }
                         f32 vv = 0.0f
                         unsafe { *((V_k + (ri * D + d) * 4) as f32) -> vv }
                         acc = acc + iv * vv
                         ri = ri + 1
                     }
-                    unsafe { *((outk_buf + (k * D + d) * 4) as f32) = acc }
+                    unsafe { *((outk_bs + (k * D + d) * 4) as f32) = acc }
                     d = d + 1
                 }
                 k = k + 1
             }
 
-            // y[d] = sum_k alpha[k] * out_k[k, d] + bias[d]
-            u64 out_row = out_ptr + (b * S + s) * D * 4
+            // y[d] = sum_k alpha[k] * outk[k, d] + bias[d]
+            u64 out_row = out_ptr + bs_idx * D * 4
             u64 d = 0
             while d < D {
                 f32 acc = 0.0f
                 k = 0
                 while k < K_banks {
                     f32 ak = 0.0f
-                    unsafe { *((alpha_buf + k * 4) as f32) -> ak }
+                    unsafe { *((alpha_bs + k * 4) as f32) -> ak }
                     f32 ok = 0.0f
-                    unsafe { *((outk_buf + (k * D + d) * 4) as f32) -> ok }
+                    unsafe { *((outk_bs + (k * D + d) * 4) as f32) -> ok }
                     acc = acc + ok * ak
                     k = k + 1
                 }
@@ -193,10 +205,23 @@ fn wzma_f32(u64 x_ptr, u64 out_ptr,
         }
         b = b + 1
     }
+}
 
-    dealloc(inter_buf)
-    dealloc(outk_buf)
-    dealloc(alpha_buf)
+// ---------------------------------------------------------------------------
+// wzma_f32: legacy wrapper — discards activations (for smoke-test compat).
+// ---------------------------------------------------------------------------
+fn wzma_f32(u64 x_ptr, u64 out_ptr,
+            u64 U_ptr, u64 V_ptr,
+            u64 gw_ptr, u64 gb_ptr, u64 bias_ptr,
+            u64 B, u64 S, u64 D, u64 K_banks, u64 r) {
+    u64 alpha_tmp = alloc(B * S * K_banks * 4)
+    u64 inter_tmp = alloc(B * S * K_banks * r * 4)
+    u64 outk_tmp  = alloc(B * S * K_banks * D * 4)
+    wzma_f32_fwd(x_ptr, out_ptr, U_ptr, V_ptr, gw_ptr, gb_ptr, bias_ptr,
+                 B, S, D, K_banks, r, alpha_tmp, inter_tmp, outk_tmp)
+    dealloc(alpha_tmp)
+    dealloc(inter_tmp)
+    dealloc(outk_tmp)
 }
 
 // ---------------------------------------------------------------------------
@@ -227,6 +252,8 @@ fn mean_pool_s_f32(u64 x_ptr, u64 out_ptr, u64 B, u64 S, u64 D) {
 
 // ---------------------------------------------------------------------------
 // l2_normalize_f32: L2-normalise each row of [B, D] in-place.
+//   norms_ptr: [B] f32 — receives ||x[b]|| before normalisation (for backward).
+//              Pass 0 to discard norms.
 // ---------------------------------------------------------------------------
 fn l2_normalize_f32(u64 x_ptr, u64 B, u64 D) {
     u64 b = 0
@@ -241,6 +268,35 @@ fn l2_normalize_f32(u64 x_ptr, u64 B, u64 D) {
             d = d + 1
         }
         f32 norm = sqrtf(ssq)
+        f32 one = 1.0f
+        f32 inv = one / norm
+        d = 0
+        while d < D {
+            f32 v = 0.0f
+            unsafe { *((row + d * 4) as f32) -> v }
+            unsafe { *((row + d * 4) as f32) = v * inv }
+            d = d + 1
+        }
+        b = b + 1
+    }
+}
+
+// l2_normalize_f32_save: like l2_normalize_f32 but also writes pre-norm
+// magnitudes to norms_ptr[B] for use by l2norm_bwd.
+fn l2_normalize_f32_save(u64 x_ptr, u64 B, u64 D, u64 norms_ptr) {
+    u64 b = 0
+    while b < B {
+        u64 row = x_ptr + b * D * 4
+        f32 ssq = 0.0f
+        u64 d = 0
+        while d < D {
+            f32 v = 0.0f
+            unsafe { *((row + d * 4) as f32) -> v }
+            ssq = ssq + v * v
+            d = d + 1
+        }
+        f32 norm = sqrtf(ssq)
+        unsafe { *((norms_ptr + b * 4) as f32) = norm }
         f32 one = 1.0f
         f32 inv = one / norm
         d = 0
@@ -326,4 +382,627 @@ fn infonce_f32(u64 q1_ptr, u64 q2_ptr, f32 tau, u64 B, u64 D) -> f32 {
 
     f32 fB = f64_to_f32(int_to_f64(B))
     return total_loss / fB
+}
+
+// ---------------------------------------------------------------------------
+// infonce_bwd: backward through InfoNCE + the inner L2-re-normalisation.
+//
+// Inputs:
+//   q1_ptr, q2_ptr:     [B, D] f32  — already unit vectors (encoder output)
+//   tau:                f32 temperature
+//   B, D:               dims
+//   dq1_ptr, dq2_ptr:   [B, D] f32  — OUTPUT: accumulated gradients (zeroed first)
+//
+// Math (one-direction InfoNCE, labels = arange(B)):
+//   qa = normalize(q1)  (idempotent for unit q1)
+//   qb = normalize(q2)
+//   logits[i,j] = qa[i].qb[j] / tau
+//   CE loss = mean_i( logsumexp(logits[i]) - logits[i,i] )
+//
+//   dL/dlogits[i,j] = (softmax[i,j] - 1{i==j}) / B
+//   dL/dqa[i] = sum_j dL/dlogits[i,j] * qb[j] / tau
+//   dL/dqb[j] = sum_i dL/dlogits[i,j] * qa[i] / tau
+//
+//   backward through normalize (norm=1 for unit vectors):
+//   dL/dq1[b] = dL/dqa[b] - (dL/dqa[b].qa[b]) * qa[b]
+//   dL/dq2[b] = dL/dqb[b] - (dL/dqb[b].qb[b]) * qb[b]
+// ---------------------------------------------------------------------------
+fn infonce_bwd(u64 q1_ptr, u64 q2_ptr, f32 tau,
+               u64 B, u64 D,
+               u64 dq1_ptr, u64 dq2_ptr) {
+    // Zero output grad buffers
+    memset(dq1_ptr, 0, B * D * 4)
+    memset(dq2_ptr, 0, B * D * 4)
+
+    // Compute logits[i,j] and softmax[i,j]
+    u64 logits_buf = alloc(B * B * 4)
+    u64 i = 0
+    while i < B {
+        u64 q1_row = q1_ptr + i * D * 4
+        u64 j = 0
+        while j < B {
+            u64 q2_row = q2_ptr + j * D * 4
+            f32 dot = 0.0f
+            u64 d = 0
+            while d < D {
+                f32 a = 0.0f
+                unsafe { *((q1_row + d * 4) as f32) -> a }
+                f32 p = 0.0f
+                unsafe { *((q2_row + d * 4) as f32) -> p }
+                dot = dot + a * p
+                d = d + 1
+            }
+            f32 one_tau = 1.0f / tau
+            unsafe { *((logits_buf + (i * B + j) * 4) as f32) = dot * one_tau }
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    // Row-wise softmax of logits -> store back in logits_buf
+    i = 0
+    while i < B {
+        softmax_f32_inplace(logits_buf + i * B * 4, B)
+        i = i + 1
+    }
+    // logits_buf now holds softmax[i,j]
+
+    // dL/dlogits[i,j] = (softmax[i,j] - 1{i==j}) / B
+    // Subtract 1/B from diagonal, divide all by B
+    f32 fB = f64_to_f32(int_to_f64(B))
+    i = 0
+    while i < B {
+        u64 diag = logits_buf + (i * B + i) * 4
+        f32 v = 0.0f
+        unsafe { *(diag as f32) -> v }
+        f32 one = 1.0f
+        unsafe { *(diag as f32) = (v - one) / fB }
+        u64 j = 0
+        while j < B {
+            if j != i {
+                u64 pos = logits_buf + (i * B + j) * 4
+                f32 vij = 0.0f
+                unsafe { *(pos as f32) -> vij }
+                unsafe { *(pos as f32) = vij / fB }
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    // logits_buf now holds dL/dlogits[i,j]
+
+    // dL/dqa[i,d] = sum_j dL/dlogits[i,j] * qb[j,d] / tau
+    // dL/dqb[j,d] = sum_i dL/dlogits[i,j] * qa[i,d] / tau
+    // Store into dq1_ptr, dq2_ptr as dqa, dqb
+    f32 inv_tau = 1.0f / tau
+    i = 0
+    while i < B {
+        u64 dqa_row = dq1_ptr + i * D * 4
+        u64 j = 0
+        while j < B {
+            f32 dl_ij = 0.0f
+            unsafe { *((logits_buf + (i * B + j) * 4) as f32) -> dl_ij }
+            f32 scale = dl_ij * inv_tau
+            u64 q2_row = q2_ptr + j * D * 4
+            u64 d = 0
+            while d < D {
+                f32 qbv = 0.0f
+                unsafe { *((q2_row + d * 4) as f32) -> qbv }
+                f32 cur = 0.0f
+                unsafe { *((dqa_row + d * 4) as f32) -> cur }
+                unsafe { *((dqa_row + d * 4) as f32) = cur + scale * qbv }
+                d = d + 1
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < B {
+        u64 dqb_row = dq2_ptr + i * D * 4
+        u64 j = 0
+        while j < B {
+            f32 dl_ji = 0.0f
+            unsafe { *((logits_buf + (j * B + i) * 4) as f32) -> dl_ji }
+            f32 scale = dl_ji * inv_tau
+            u64 q1_row = q1_ptr + j * D * 4
+            u64 d = 0
+            while d < D {
+                f32 qav = 0.0f
+                unsafe { *((q1_row + d * 4) as f32) -> qav }
+                f32 cur = 0.0f
+                unsafe { *((dqb_row + d * 4) as f32) -> cur }
+                unsafe { *((dqb_row + d * 4) as f32) = cur + scale * qav }
+                d = d + 1
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    dealloc(logits_buf)
+
+    // Backward through L2 re-normalisation in InfoNCELoss (unit vectors, norm=1):
+    // dL/dq[b] = dL/dqa[b] - (dL/dqa[b] . qa[b]) * qa[b]
+    i = 0
+    while i < B {
+        u64 q1_row = q1_ptr + i * D * 4
+        u64 dq1_row = dq1_ptr + i * D * 4
+        f32 dot = 0.0f
+        u64 d = 0
+        while d < D {
+            f32 g = 0.0f
+            unsafe { *((dq1_row + d * 4) as f32) -> g }
+            f32 q = 0.0f
+            unsafe { *((q1_row + d * 4) as f32) -> q }
+            dot = dot + g * q
+            d = d + 1
+        }
+        d = 0
+        while d < D {
+            f32 g = 0.0f
+            unsafe { *((dq1_row + d * 4) as f32) -> g }
+            f32 q = 0.0f
+            unsafe { *((q1_row + d * 4) as f32) -> q }
+            unsafe { *((dq1_row + d * 4) as f32) = g - dot * q }
+            d = d + 1
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < B {
+        u64 q2_row = q2_ptr + i * D * 4
+        u64 dq2_row = dq2_ptr + i * D * 4
+        f32 dot = 0.0f
+        u64 d = 0
+        while d < D {
+            f32 g = 0.0f
+            unsafe { *((dq2_row + d * 4) as f32) -> g }
+            f32 q = 0.0f
+            unsafe { *((q2_row + d * 4) as f32) -> q }
+            dot = dot + g * q
+            d = d + 1
+        }
+        d = 0
+        while d < D {
+            f32 g = 0.0f
+            unsafe { *((dq2_row + d * 4) as f32) -> g }
+            f32 q = 0.0f
+            unsafe { *((q2_row + d * 4) as f32) -> q }
+            unsafe { *((dq2_row + d * 4) as f32) = g - dot * q }
+            d = d + 1
+        }
+        i = i + 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// l2norm_bwd: backward through the encoder's l2_normalize.
+//
+// Inputs:
+//   dq_ptr:    [B, D] f32  upstream grad (from infonce_bwd, already through re-norm)
+//   q_ptr:     [B, D] f32  normalised output (unit vectors)
+//   norms_ptr: [B]    f32  pre-norm magnitudes saved by l2_normalize_f32_save
+//   B, D:      dims
+//   dp_ptr:    [B, D] f32  OUTPUT: grad w.r.t. pooled (overwritten)
+//
+// Formula: dp[b] = (dq[b] - (dq[b].q[b]) * q[b]) / norm[b]
+// ---------------------------------------------------------------------------
+fn l2norm_bwd(u64 dq_ptr, u64 q_ptr, u64 norms_ptr,
+              u64 B, u64 D,
+              u64 dp_ptr) {
+    u64 b = 0
+    while b < B {
+        u64 dq_row = dq_ptr + b * D * 4
+        u64 q_row  = q_ptr  + b * D * 4
+        u64 dp_row = dp_ptr + b * D * 4
+        f32 norm = 0.0f
+        unsafe { *((norms_ptr + b * 4) as f32) -> norm }
+        f32 one = 1.0f
+        f32 inv_norm = one / norm
+        // dot = dq . q
+        f32 dot = 0.0f
+        u64 d = 0
+        while d < D {
+            f32 g = 0.0f
+            unsafe { *((dq_row + d * 4) as f32) -> g }
+            f32 q = 0.0f
+            unsafe { *((q_row + d * 4) as f32) -> q }
+            dot = dot + g * q
+            d = d + 1
+        }
+        d = 0
+        while d < D {
+            f32 g = 0.0f
+            unsafe { *((dq_row + d * 4) as f32) -> g }
+            f32 q = 0.0f
+            unsafe { *((q_row + d * 4) as f32) -> q }
+            unsafe { *((dp_row + d * 4) as f32) = (g - dot * q) * inv_norm }
+            d = d + 1
+        }
+        b = b + 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// meanpool_bwd: backward through mean_pool_s_f32.
+//
+// Inputs:
+//   dp_ptr:  [B, D]    f32  upstream grad (from l2norm_bwd)
+//   B, S, D: dims
+//   dx_ptr:  [B, S, D] f32  OUTPUT: grad w.r.t. pre-pool activations (overwritten)
+//
+// Formula: dx[b,s,d] = dp[b,d] / S
+// ---------------------------------------------------------------------------
+fn meanpool_bwd(u64 dp_ptr, u64 B, u64 S, u64 D, u64 dx_ptr) {
+    f32 fS = f64_to_f32(int_to_f64(S))
+    f32 inv_S = 1.0f / fS
+    u64 b = 0
+    while b < B {
+        u64 dp_row = dp_ptr + b * D * 4
+        u64 s = 0
+        while s < S {
+            u64 dx_row = dx_ptr + (b * S + s) * D * 4
+            u64 d = 0
+            while d < D {
+                f32 g = 0.0f
+                unsafe { *((dp_row + d * 4) as f32) -> g }
+                unsafe { *((dx_row + d * 4) as f32) = g * inv_S }
+                d = d + 1
+            }
+            s = s + 1
+        }
+        b = b + 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// wzma_bwd: backward through WZMALinear.
+//
+// Accumulates gradients (+=) into weight grad buffers — caller must zero them
+// before the first view's backward. Also produces dx_ptr (overwritten, not +=).
+//
+// Inputs (all f32):
+//   dy_ptr:      [B, S, D]    upstream grad
+//   x_ptr:       [B, S, D]    forward input (embed output)
+//   alpha_ptr:   [B, S, K]    saved softmax outputs
+//   inter_ptr:   [B, S, K, r] saved inter
+//   outk_ptr:    [B, S, K, D] saved out_k
+//   U_ptr:       [K, D, r]    current weight
+//   V_ptr:       [K, r, D]    current weight
+//   gw_ptr:      [K, D]       current gate weight
+//   B, S, D, K_banks, r: dims
+//
+// Outputs (accumulated +=):
+//   dU_ptr:      [K, D, r]
+//   dV_ptr:      [K, r, D]
+//   dgw_ptr:     [K, D]
+//   dgb_ptr:     [K]
+//   dbias_ptr:   [D]
+//
+// Output (overwritten):
+//   dx_ptr:      [B, S, D]
+// ---------------------------------------------------------------------------
+fn wzma_bwd(u64 dy_ptr, u64 x_ptr,
+            u64 alpha_ptr, u64 inter_ptr, u64 outk_ptr,
+            u64 U_ptr, u64 V_ptr, u64 gw_ptr,
+            u64 B, u64 S, u64 D, u64 K_banks, u64 r,
+            u64 dU_ptr, u64 dV_ptr, u64 dgw_ptr, u64 dgb_ptr, u64 dbias_ptr,
+            u64 dx_ptr) {
+    // bias grad: dbias[d] += sum_{b,s} dy[b,s,d]
+    u64 b = 0
+    while b < B {
+        u64 s = 0
+        while s < S {
+            u64 dy_row = dy_ptr + (b * S + s) * D * 4
+            u64 d = 0
+            while d < D {
+                f32 g = 0.0f
+                unsafe { *((dy_row + d * 4) as f32) -> g }
+                f32 cur = 0.0f
+                unsafe { *((dbias_ptr + d * 4) as f32) -> cur }
+                unsafe { *((dbias_ptr + d * 4) as f32) = cur + g }
+                d = d + 1
+            }
+            s = s + 1
+        }
+        b = b + 1
+    }
+
+    // Iterate over (b, s) for the rest
+    b = 0
+    while b < B {
+        u64 s = 0
+        while s < S {
+            u64 bs_idx = b * S + s
+            u64 dy_row    = dy_ptr    + bs_idx * D * 4
+            u64 x_row     = x_ptr     + bs_idx * D * 4
+            u64 alpha_bs  = alpha_ptr + bs_idx * K_banks * 4
+            u64 inter_bs  = inter_ptr + bs_idx * K_banks * r * 4
+            u64 outk_bs   = outk_ptr  + bs_idx * K_banks * D * 4
+            u64 dx_row    = dx_ptr    + bs_idx * D * 4
+
+            // Zero dx for this (b,s)
+            u64 d = 0
+            while d < D {
+                unsafe { *((dx_row + d * 4) as f32) = 0.0f }
+                d = d + 1
+            }
+
+            u64 k = 0
+            while k < K_banks {
+                // alpha[k], outk[k,:], inter[k,:]
+                f32 ak = 0.0f
+                unsafe { *((alpha_bs + k * 4) as f32) -> ak }
+
+                // dL/d(outk)[b,s,k,d] = dy[b,s,d] * alpha[b,s,k]
+                // dL/d(alpha)[b,s,k]  = sum_d dy[b,s,d] * outk[b,s,k,d]
+                f32 d_alpha_k = 0.0f
+                u64 V_k = V_ptr + k * r * D * 4
+                u64 dV_k = dV_ptr + k * r * D * 4
+                u64 inter_k = inter_bs + k * r * 4
+                u64 outk_k  = outk_bs  + k * D * 4
+                d = 0
+                while d < D {
+                    f32 dyv = 0.0f
+                    unsafe { *((dy_row + d * 4) as f32) -> dyv }
+                    f32 okd = 0.0f
+                    unsafe { *((outk_k + d * 4) as f32) -> okd }
+                    d_alpha_k = d_alpha_k + dyv * okd
+                    d = d + 1
+                }
+                // dV[k,r,d] += doutk[k,d] * inter[k,r]  =>  dV[k,r,d] += (dy*ak)*inter[k,r]
+                u64 ri = 0
+                while ri < r {
+                    f32 iv = 0.0f
+                    unsafe { *((inter_k + ri * 4) as f32) -> iv }
+                    d = 0
+                    while d < D {
+                        f32 dyv = 0.0f
+                        unsafe { *((dy_row + d * 4) as f32) -> dyv }
+                        f32 cur_dv = 0.0f
+                        unsafe { *((dV_k + (ri * D + d) * 4) as f32) -> cur_dv }
+                        unsafe { *((dV_k + (ri * D + d) * 4) as f32) = cur_dv + ak * dyv * iv }
+                        d = d + 1
+                    }
+                    ri = ri + 1
+                }
+                // dinter[k,r] = sum_d doutk[k,d]*V[k,r,d] = sum_d (dy*ak)*V[k,r,d]
+                // Also dx from inter: dx[b,s,d] += sum_{k,r} dinter[k,r]*U[k,d,r]
+                u64 U_k = U_ptr + k * D * r * 4
+                u64 dU_k = dU_ptr + k * D * r * 4
+                ri = 0
+                while ri < r {
+                    f32 dinter_kr = 0.0f
+                    d = 0
+                    while d < D {
+                        f32 dyv = 0.0f
+                        unsafe { *((dy_row + d * 4) as f32) -> dyv }
+                        f32 vv = 0.0f
+                        unsafe { *((V_k + (ri * D + d) * 4) as f32) -> vv }
+                        dinter_kr = dinter_kr + ak * dyv * vv
+                        d = d + 1
+                    }
+                    // dU[k,d,r] += dinter[k,r] * x[b,s,d]
+                    d = 0
+                    while d < D {
+                        f32 xv = 0.0f
+                        unsafe { *((x_row + d * 4) as f32) -> xv }
+                        f32 cur_du = 0.0f
+                        unsafe { *((dU_k + (d * r + ri) * 4) as f32) -> cur_du }
+                        unsafe { *((dU_k + (d * r + ri) * 4) as f32) = cur_du + dinter_kr * xv }
+                        d = d + 1
+                    }
+                    // dx[b,s,d] += dinter[k,r] * U[k,d,r]
+                    d = 0
+                    while d < D {
+                        f32 uv = 0.0f
+                        unsafe { *((U_k + (d * r + ri) * 4) as f32) -> uv }
+                        f32 cur_dx = 0.0f
+                        unsafe { *((dx_row + d * 4) as f32) -> cur_dx }
+                        unsafe { *((dx_row + d * 4) as f32) = cur_dx + dinter_kr * uv }
+                        d = d + 1
+                    }
+                    ri = ri + 1
+                }
+
+                // Gate softmax backward:
+                // dL/d(gate_logit)[k] = alpha[k]*(d_alpha_k - sum_j alpha[j]*d_alpha_j_total)
+                // We'll accumulate the full softmax bwd after the k loop
+                // Store d_alpha into a temp local array — but MLRift doesn't have
+                // local arrays easily, so inline the softmax bwd in a second pass
+                // (We accumulate d_alpha_k into a temp buffer)
+                k = k + 1
+            }
+
+            // Now do softmax backward for gate.
+            // We need d_alpha[k] for each k, then:
+            //   dgl[k] = alpha[k] * (d_alpha[k] - sum_j alpha[j]*d_alpha[j])
+            // We need to store d_alpha temporarily.
+            u64 d_alpha_buf = alloc(K_banks * 4)
+            k = 0
+            while k < K_banks {
+                f32 ak = 0.0f
+                unsafe { *((alpha_bs + k * 4) as f32) -> ak }
+                u64 outk_k = outk_bs + k * D * 4
+                f32 da = 0.0f
+                d = 0
+                while d < D {
+                    f32 dyv = 0.0f
+                    unsafe { *((dy_row + d * 4) as f32) -> dyv }
+                    f32 okd = 0.0f
+                    unsafe { *((outk_k + d * 4) as f32) -> okd }
+                    da = da + dyv * okd
+                    d = d + 1
+                }
+                unsafe { *((d_alpha_buf + k * 4) as f32) = da }
+                k = k + 1
+            }
+            // sum = sum_j alpha[j] * d_alpha[j]
+            f32 sum_ada = 0.0f
+            k = 0
+            while k < K_banks {
+                f32 ak = 0.0f
+                unsafe { *((alpha_bs + k * 4) as f32) -> ak }
+                f32 dak = 0.0f
+                unsafe { *((d_alpha_buf + k * 4) as f32) -> dak }
+                sum_ada = sum_ada + ak * dak
+                k = k + 1
+            }
+            // dgl[k] = alpha[k] * (d_alpha[k] - sum_ada)
+            // dgw[k,d] += dgl[k] * x[d]
+            // dgb[k]   += dgl[k]
+            // dx[d]    += dgl[k] * gw[k,d]
+            k = 0
+            while k < K_banks {
+                f32 ak = 0.0f
+                unsafe { *((alpha_bs + k * 4) as f32) -> ak }
+                f32 dak = 0.0f
+                unsafe { *((d_alpha_buf + k * 4) as f32) -> dak }
+                f32 dgl_k = ak * (dak - sum_ada)
+                // dgb[k] += dgl_k
+                f32 cur_dgb = 0.0f
+                unsafe { *((dgb_ptr + k * 4) as f32) -> cur_dgb }
+                unsafe { *((dgb_ptr + k * 4) as f32) = cur_dgb + dgl_k }
+                // dgw[k,d] += dgl_k * x[d]
+                u64 dgw_row = dgw_ptr + k * D * 4
+                d = 0
+                while d < D {
+                    f32 xv = 0.0f
+                    unsafe { *((x_row + d * 4) as f32) -> xv }
+                    f32 cur_dgw = 0.0f
+                    unsafe { *((dgw_row + d * 4) as f32) -> cur_dgw }
+                    unsafe { *((dgw_row + d * 4) as f32) = cur_dgw + dgl_k * xv }
+                    d = d + 1
+                }
+                // dx[d] += dgl_k * gw[k,d]
+                u64 gw_row = gw_ptr + k * D * 4
+                d = 0
+                while d < D {
+                    f32 wv = 0.0f
+                    unsafe { *((gw_row + d * 4) as f32) -> wv }
+                    f32 cur_dx = 0.0f
+                    unsafe { *((dx_row + d * 4) as f32) -> cur_dx }
+                    unsafe { *((dx_row + d * 4) as f32) = cur_dx + dgl_k * wv }
+                    d = d + 1
+                }
+                k = k + 1
+            }
+            dealloc(d_alpha_buf)
+
+            s = s + 1
+        }
+        b = b + 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// embed_bwd: scatter-add into embedding gradient.
+//
+// Accumulates (+=) into demb_ptr[vocab, D].
+//   dx_ptr:   [B, S, D] f32  upstream gradient
+//   ids_ptr:  [B, S] u64 token ids
+//   demb_ptr: [vocab, D] f32  gradient buffer (pre-zeroed by caller)
+// ---------------------------------------------------------------------------
+fn embed_bwd(u64 dx_ptr, u64 ids_ptr, u64 B, u64 S, u64 D, u64 demb_ptr) {
+    u64 b = 0
+    while b < B {
+        u64 s = 0
+        while s < S {
+            u64 id = 0
+            unsafe { *((ids_ptr + (b * S + s) * 8) as u64) -> id }
+            u64 dx_row   = dx_ptr   + (b * S + s) * D * 4
+            u64 demb_row = demb_ptr + id * D * 4
+            u64 d = 0
+            while d < D {
+                f32 g = 0.0f
+                unsafe { *((dx_row + d * 4) as f32) -> g }
+                f32 cur = 0.0f
+                unsafe { *((demb_row + d * 4) as f32) -> cur }
+                unsafe { *((demb_row + d * 4) as f32) = cur + g }
+                d = d + 1
+            }
+            s = s + 1
+        }
+        b = b + 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// adamw_step: one AdamW update for a single parameter tensor.
+//
+//   param_ptr:  [N] f32  parameter (updated in-place)
+//   grad_ptr:   [N] f32  gradient
+//   m_ptr:      [N] f32  first moment  (updated in-place)
+//   v_ptr:      [N] f32  second moment (updated in-place)
+//   N:          number of elements
+//   step:       u64 step index (1-based, used for bias correction)
+//   lr, beta1, beta2, eps, wd: optimizer hyperparams
+//
+// Update rule (PyTorch AdamW, decoupled weight decay):
+//   m = beta1*m + (1-beta1)*grad
+//   v = beta2*v + (1-beta2)*grad^2
+//   m_hat = m / (1 - beta1^step)
+//   v_hat = v / (1 - beta2^step)
+//   param = param * (1 - lr*wd) - lr * m_hat / (sqrt(v_hat) + eps)
+// ---------------------------------------------------------------------------
+fn adamw_step(u64 param_ptr, u64 grad_ptr, u64 m_ptr, u64 v_ptr,
+              u64 N, u64 step,
+              f32 lr, f32 beta1, f32 beta2, f32 eps, f32 wd) {
+    // Compute bias correction denominators as f32
+    // bc1 = 1 - beta1^step,  bc2 = 1 - beta2^step
+    f32 bc1 = 1.0f
+    f32 bc2 = 1.0f
+    f32 one = 1.0f
+    f32 b1p = 1.0f   // beta1^step
+    f32 b2p = 1.0f   // beta2^step
+    u64 t = 0
+    while t < step {
+        b1p = b1p * beta1
+        b2p = b2p * beta2
+        t = t + 1
+    }
+    bc1 = one - b1p
+    bc2 = one - b2p
+    f32 inv_bc1 = one / bc1
+    f32 inv_bc2 = one / bc2
+
+    f32 one_m_beta1 = one - beta1
+    f32 one_m_beta2 = one - beta2
+    f32 decay = one - lr * wd
+
+    u64 i = 0
+    while i < N {
+        u64 pp = param_ptr + i * 4
+        u64 gp = grad_ptr  + i * 4
+        u64 mp = m_ptr     + i * 4
+        u64 vp = v_ptr     + i * 4
+
+        f32 p = 0.0f
+        unsafe { *(pp as f32) -> p }
+        f32 g = 0.0f
+        unsafe { *(gp as f32) -> g }
+        f32 m = 0.0f
+        unsafe { *(mp as f32) -> m }
+        f32 v = 0.0f
+        unsafe { *(vp as f32) -> v }
+
+        f32 m_new = beta1 * m + one_m_beta1 * g
+        f32 v_new = beta2 * v + one_m_beta2 * g * g
+        unsafe { *(mp as f32) = m_new }
+        unsafe { *(vp as f32) = v_new }
+
+        f32 m_hat = m_new * inv_bc1
+        f32 v_hat = v_new * inv_bc2
+        f32 sv_hat = sqrtf(v_hat)
+        f32 denom_v = sv_hat + eps
+        f32 adam_update = lr * m_hat / denom_v
+        f32 p_scaled = p * decay
+        f32 p_new = p_scaled - adam_update
+        unsafe { *(pp as f32) = p_new }
+
+        // DEBUG: print for first element
+
+        i = i + 1
+    }
 }

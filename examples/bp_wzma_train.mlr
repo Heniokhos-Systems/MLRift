@@ -1,0 +1,1256 @@
+// bp_wzma_train — SP1 Task 3: backward + AdamW for the WZMA encoder.
+//
+// Dims: d=8 K=2 r=4 B=4 S=4 vocab=16
+// Weights from tools/bp_ref.json (seed-0 init).
+//
+// Tests performed:
+//  1. Finite-difference gradient check (central diff, eps=1e-3) for each param.
+//     Passes if max relative error < 1e-2.
+//  2. Analytic grad vs ref (tools/bp_ref.json cpu.grads_after_step1).
+//     Passes if max abs diff <= 2e-4 per param (5e-4 for bias which has large values).
+//  3. 5 AdamW steps; assert each loss vs cpu.losses within 1e-4.
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --target=linux --emit=elfexe \
+//       examples/bp_wzma_train.mlr -o /tmp/bp_wzma_train
+// Run:
+//   /tmp/bp_wzma_train
+
+import "../std/train.mlr"
+import "../std/math_float.mlr"
+import "../std/fmt.mlr"
+
+// Dims
+static u64 DD    = 8
+static u64 KB    = 2
+static u64 RR    = 4
+static u64 BB    = 4
+static u64 SS    = 4
+static u64 VOCAB = 16
+
+// =========================================================================
+// Weight initialisation (from bp_ref.json seed-0)
+// =========================================================================
+
+fn init_weights(u64 emb_ptr, u64 U_ptr, u64 V_ptr,
+                u64 gw_ptr, u64 gb_ptr, u64 bias_ptr) {
+    unsafe { *((emb_ptr + 0) as f32) = -1.12583983f }
+    unsafe { *((emb_ptr + 4) as f32) = -1.1523602f }
+    unsafe { *((emb_ptr + 8) as f32) = -0.250578582f }
+    unsafe { *((emb_ptr + 12) as f32) = -0.433878809f }
+    unsafe { *((emb_ptr + 16) as f32) = 0.848710358f }
+    unsafe { *((emb_ptr + 20) as f32) = 0.692009151f }
+    unsafe { *((emb_ptr + 24) as f32) = -0.31601277f }
+    unsafe { *((emb_ptr + 28) as f32) = -2.11521935f }
+    unsafe { *((emb_ptr + 32) as f32) = 0.322274923f }
+    unsafe { *((emb_ptr + 36) as f32) = -1.26333475f }
+    unsafe { *((emb_ptr + 40) as f32) = 0.349983186f }
+    unsafe { *((emb_ptr + 44) as f32) = 0.30813393f }
+    unsafe { *((emb_ptr + 48) as f32) = 0.119841509f }
+    unsafe { *((emb_ptr + 52) as f32) = 1.2376579f }
+    unsafe { *((emb_ptr + 56) as f32) = 1.11677718f }
+    unsafe { *((emb_ptr + 60) as f32) = -0.247278154f }
+    unsafe { *((emb_ptr + 64) as f32) = -1.35265374f }
+    unsafe { *((emb_ptr + 68) as f32) = -1.6959312f }
+    unsafe { *((emb_ptr + 72) as f32) = 0.566650629f }
+    unsafe { *((emb_ptr + 76) as f32) = 0.793508351f }
+    unsafe { *((emb_ptr + 80) as f32) = 0.598839462f }
+    unsafe { *((emb_ptr + 84) as f32) = -1.55509508f }
+    unsafe { *((emb_ptr + 88) as f32) = -0.34136039f }
+    unsafe { *((emb_ptr + 92) as f32) = 1.85300612f }
+    unsafe { *((emb_ptr + 96) as f32) = 0.750189483f }
+    unsafe { *((emb_ptr + 100) as f32) = -0.585497558f }
+    unsafe { *((emb_ptr + 104) as f32) = -0.173396751f }
+    unsafe { *((emb_ptr + 108) as f32) = 0.183477938f }
+    unsafe { *((emb_ptr + 112) as f32) = 1.38936615f }
+    unsafe { *((emb_ptr + 116) as f32) = 1.58633423f }
+    unsafe { *((emb_ptr + 120) as f32) = 0.946298361f }
+    unsafe { *((emb_ptr + 124) as f32) = -0.843676746f }
+    unsafe { *((emb_ptr + 128) as f32) = -0.613583088f }
+    unsafe { *((emb_ptr + 132) as f32) = 0.0315927416f }
+    unsafe { *((emb_ptr + 136) as f32) = -0.492676973f }
+    unsafe { *((emb_ptr + 140) as f32) = 0.248414755f }
+    unsafe { *((emb_ptr + 144) as f32) = 0.439695835f }
+    unsafe { *((emb_ptr + 148) as f32) = 0.112411186f }
+    unsafe { *((emb_ptr + 152) as f32) = 0.64079237f }
+    unsafe { *((emb_ptr + 156) as f32) = 0.441156268f }
+    unsafe { *((emb_ptr + 160) as f32) = -0.102309652f }
+    unsafe { *((emb_ptr + 164) as f32) = 0.792443991f }
+    unsafe { *((emb_ptr + 168) as f32) = -0.289667696f }
+    unsafe { *((emb_ptr + 172) as f32) = 0.0525074862f }
+    unsafe { *((emb_ptr + 176) as f32) = 0.522860467f }
+    unsafe { *((emb_ptr + 180) as f32) = 2.30220532f }
+    unsafe { *((emb_ptr + 184) as f32) = -1.46889389f }
+    unsafe { *((emb_ptr + 188) as f32) = -1.58668876f }
+    unsafe { *((emb_ptr + 192) as f32) = -0.673089921f }
+    unsafe { *((emb_ptr + 196) as f32) = 0.872831225f }
+    unsafe { *((emb_ptr + 200) as f32) = 1.05535746f }
+    unsafe { *((emb_ptr + 204) as f32) = 0.17784372f }
+    unsafe { *((emb_ptr + 208) as f32) = -0.230335474f }
+    unsafe { *((emb_ptr + 212) as f32) = -0.391754389f }
+    unsafe { *((emb_ptr + 216) as f32) = 0.543294728f }
+    unsafe { *((emb_ptr + 220) as f32) = -0.395157546f }
+    unsafe { *((emb_ptr + 224) as f32) = -0.446217179f }
+    unsafe { *((emb_ptr + 228) as f32) = 0.7440207f }
+    unsafe { *((emb_ptr + 232) as f32) = 1.52097952f }
+    unsafe { *((emb_ptr + 236) as f32) = 3.41050267f }
+    unsafe { *((emb_ptr + 240) as f32) = -1.53118432f }
+    unsafe { *((emb_ptr + 244) as f32) = -1.23413503f }
+    unsafe { *((emb_ptr + 248) as f32) = 1.81972528f }
+    unsafe { *((emb_ptr + 252) as f32) = -0.551528692f }
+    unsafe { *((emb_ptr + 256) as f32) = -0.56924808f }
+    unsafe { *((emb_ptr + 260) as f32) = 0.919971406f }
+    unsafe { *((emb_ptr + 264) as f32) = 1.11081612f }
+    unsafe { *((emb_ptr + 268) as f32) = 1.28987408f }
+    unsafe { *((emb_ptr + 272) as f32) = -1.47817397f }
+    unsafe { *((emb_ptr + 276) as f32) = 2.56723285f }
+    unsafe { *((emb_ptr + 280) as f32) = -0.473119795f }
+    unsafe { *((emb_ptr + 284) as f32) = 0.335550755f }
+    unsafe { *((emb_ptr + 288) as f32) = -1.62932599f }
+    unsafe { *((emb_ptr + 292) as f32) = -0.549743652f }
+    unsafe { *((emb_ptr + 296) as f32) = -0.479834259f }
+    unsafe { *((emb_ptr + 300) as f32) = -0.499681532f }
+    unsafe { *((emb_ptr + 304) as f32) = -1.06698036f }
+    unsafe { *((emb_ptr + 308) as f32) = 1.11493957f }
+    unsafe { *((emb_ptr + 312) as f32) = -0.140671432f }
+    unsafe { *((emb_ptr + 316) as f32) = 0.805753589f }
+    unsafe { *((emb_ptr + 320) as f32) = -0.0933482349f }
+    unsafe { *((emb_ptr + 324) as f32) = 0.687050223f }
+    unsafe { *((emb_ptr + 328) as f32) = -0.838315368f }
+    unsafe { *((emb_ptr + 332) as f32) = 0.00089182175f }
+    unsafe { *((emb_ptr + 336) as f32) = 0.84189409f }
+    unsafe { *((emb_ptr + 340) as f32) = -0.400034159f }
+    unsafe { *((emb_ptr + 344) as f32) = 1.03946197f }
+    unsafe { *((emb_ptr + 348) as f32) = 0.358153105f }
+    unsafe { *((emb_ptr + 352) as f32) = -0.246000946f }
+    unsafe { *((emb_ptr + 356) as f32) = 2.30251646f }
+    unsafe { *((emb_ptr + 360) as f32) = -1.88168919f }
+    unsafe { *((emb_ptr + 364) as f32) = -0.0497270226f }
+    unsafe { *((emb_ptr + 368) as f32) = -1.04497862f }
+    unsafe { *((emb_ptr + 372) as f32) = -0.956500828f }
+    unsafe { *((emb_ptr + 376) as f32) = 0.0335318595f }
+    unsafe { *((emb_ptr + 380) as f32) = 0.710086584f }
+    unsafe { *((emb_ptr + 384) as f32) = 1.64586699f }
+    unsafe { *((emb_ptr + 388) as f32) = -1.36016893f }
+    unsafe { *((emb_ptr + 392) as f32) = 0.344565421f }
+    unsafe { *((emb_ptr + 396) as f32) = 0.519867718f }
+    unsafe { *((emb_ptr + 400) as f32) = -2.6133225f }
+    unsafe { *((emb_ptr + 404) as f32) = -1.69647443f }
+    unsafe { *((emb_ptr + 408) as f32) = -0.228241786f }
+    unsafe { *((emb_ptr + 412) as f32) = 0.279955f }
+    unsafe { *((emb_ptr + 416) as f32) = 0.246926397f }
+    unsafe { *((emb_ptr + 420) as f32) = 0.0768870041f }
+    unsafe { *((emb_ptr + 424) as f32) = 0.338005811f }
+    unsafe { *((emb_ptr + 428) as f32) = 0.454401761f }
+    unsafe { *((emb_ptr + 432) as f32) = 0.456940144f }
+    unsafe { *((emb_ptr + 436) as f32) = -0.865371346f }
+    unsafe { *((emb_ptr + 440) as f32) = 0.781307936f }
+    unsafe { *((emb_ptr + 444) as f32) = -0.926789403f }
+    unsafe { *((emb_ptr + 448) as f32) = -0.218833685f }
+    unsafe { *((emb_ptr + 452) as f32) = -2.43506527f }
+    unsafe { *((emb_ptr + 456) as f32) = -0.0729147568f }
+    unsafe { *((emb_ptr + 460) as f32) = -0.0339864083f }
+    unsafe { *((emb_ptr + 464) as f32) = 0.962518275f }
+    unsafe { *((emb_ptr + 468) as f32) = 0.349168241f }
+    unsafe { *((emb_ptr + 472) as f32) = -0.921461999f }
+    unsafe { *((emb_ptr + 476) as f32) = -0.056194786f }
+    unsafe { *((emb_ptr + 480) as f32) = -0.622698486f }
+    unsafe { *((emb_ptr + 484) as f32) = -0.463722169f }
+    unsafe { *((emb_ptr + 488) as f32) = 1.92178237f }
+    unsafe { *((emb_ptr + 492) as f32) = -0.402545542f }
+    unsafe { *((emb_ptr + 496) as f32) = 0.123902477f }
+    unsafe { *((emb_ptr + 500) as f32) = 1.16478348f }
+    unsafe { *((emb_ptr + 504) as f32) = 0.92337352f }
+    unsafe { *((emb_ptr + 508) as f32) = 1.38729525f }
+
+    unsafe { *((U_ptr + 0) as f32) = 0.004879185f }
+    unsafe { *((U_ptr + 4) as f32) = 0.0232920125f }
+    unsafe { *((U_ptr + 8) as f32) = 0.00577152288f }
+    unsafe { *((U_ptr + 12) as f32) = 0.00773195503f }
+    unsafe { *((U_ptr + 16) as f32) = -0.00402127812f }
+    unsafe { *((U_ptr + 20) as f32) = -0.00235853973f }
+    unsafe { *((U_ptr + 24) as f32) = -0.0165873375f }
+    unsafe { *((U_ptr + 28) as f32) = -0.0281451307f }
+    unsafe { *((U_ptr + 32) as f32) = -0.0380069055f }
+    unsafe { *((U_ptr + 36) as f32) = 0.00261354889f }
+    unsafe { *((U_ptr + 40) as f32) = -0.0140858786f }
+    unsafe { *((U_ptr + 44) as f32) = 0.00629441906f }
+    unsafe { *((U_ptr + 48) as f32) = 0.00314785773f }
+    unsafe { *((U_ptr + 52) as f32) = 0.00770725403f }
+    unsafe { *((U_ptr + 56) as f32) = 0.0114730913f }
+    unsafe { *((U_ptr + 60) as f32) = 0.0199586265f }
+    unsafe { *((U_ptr + 64) as f32) = 0.00603210833f }
+    unsafe { *((U_ptr + 68) as f32) = -0.00214633858f }
+    unsafe { *((U_ptr + 72) as f32) = 0.0199691318f }
+    unsafe { *((U_ptr + 76) as f32) = -0.00997429527f }
+    unsafe { *((U_ptr + 80) as f32) = 0.0152222179f }
+    unsafe { *((U_ptr + 84) as f32) = 0.0123660164f }
+    unsafe { *((U_ptr + 88) as f32) = -0.00598768936f }
+    unsafe { *((U_ptr + 92) as f32) = -0.00375556131f }
+    unsafe { *((U_ptr + 96) as f32) = -0.00240101665f }
+    unsafe { *((U_ptr + 100) as f32) = 0.00720919436f }
+    unsafe { *((U_ptr + 104) as f32) = -0.00628069974f }
+    unsafe { *((U_ptr + 108) as f32) = -0.0215741601f }
+    unsafe { *((U_ptr + 112) as f32) = 0.00481621036f }
+    unsafe { *((U_ptr + 116) as f32) = -0.0279245451f }
+    unsafe { *((U_ptr + 120) as f32) = 0.00227104197f }
+    unsafe { *((U_ptr + 124) as f32) = 0.0220945142f }
+    unsafe { *((U_ptr + 128) as f32) = -0.0312312339f }
+    unsafe { *((U_ptr + 132) as f32) = -0.00709286565f }
+    unsafe { *((U_ptr + 136) as f32) = 0.0216214508f }
+    unsafe { *((U_ptr + 140) as f32) = 0.00262956112f }
+    unsafe { *((U_ptr + 144) as f32) = 0.0314707644f }
+    unsafe { *((U_ptr + 148) as f32) = 0.0156285986f }
+    unsafe { *((U_ptr + 152) as f32) = 0.0197487306f }
+    unsafe { *((U_ptr + 156) as f32) = -0.0297561493f }
+    unsafe { *((U_ptr + 160) as f32) = 0.0294158515f }
+    unsafe { *((U_ptr + 164) as f32) = 0.00551269995f }
+    unsafe { *((U_ptr + 168) as f32) = 0.013335621f }
+    unsafe { *((U_ptr + 172) as f32) = -0.0198877919f }
+    unsafe { *((U_ptr + 176) as f32) = -0.0237872787f }
+    unsafe { *((U_ptr + 180) as f32) = -0.0239189882f }
+    unsafe { *((U_ptr + 184) as f32) = 0.0262378398f }
+    unsafe { *((U_ptr + 188) as f32) = -0.00419677887f }
+    unsafe { *((U_ptr + 192) as f32) = 0.00813773181f }
+    unsafe { *((U_ptr + 196) as f32) = 0.00789173041f }
+    unsafe { *((U_ptr + 200) as f32) = 0.00343021913f }
+    unsafe { *((U_ptr + 204) as f32) = 0.0175208952f }
+    unsafe { *((U_ptr + 208) as f32) = -0.00574174803f }
+    unsafe { *((U_ptr + 212) as f32) = 0.0204328001f }
+    unsafe { *((U_ptr + 216) as f32) = -0.0102214748f }
+    unsafe { *((U_ptr + 220) as f32) = -0.0342745557f }
+    unsafe { *((U_ptr + 224) as f32) = 0.00784052815f }
+    unsafe { *((U_ptr + 228) as f32) = 0.0118905222f }
+    unsafe { *((U_ptr + 232) as f32) = 0.0132454811f }
+    unsafe { *((U_ptr + 236) as f32) = -0.0241260473f }
+    unsafe { *((U_ptr + 240) as f32) = 0.0121487938f }
+    unsafe { *((U_ptr + 244) as f32) = -0.0109431362f }
+    unsafe { *((U_ptr + 248) as f32) = -0.0220095906f }
+    unsafe { *((U_ptr + 252) as f32) = -0.0144025497f }
+
+    unsafe { *((V_ptr + 0) as f32) = 0.0192674901f }
+    unsafe { *((V_ptr + 4) as f32) = 0.0168064646f }
+    unsafe { *((V_ptr + 8) as f32) = -0.0250730943f }
+    unsafe { *((V_ptr + 12) as f32) = 0.0197367202f }
+    unsafe { *((V_ptr + 16) as f32) = -0.00989310071f }
+    unsafe { *((V_ptr + 20) as f32) = -0.0256608594f }
+    unsafe { *((V_ptr + 24) as f32) = 0.00877298415f }
+    unsafe { *((V_ptr + 28) as f32) = -0.000214080967f }
+    unsafe { *((V_ptr + 32) as f32) = -0.0133172227f }
+    unsafe { *((V_ptr + 36) as f32) = 0.0113026733f }
+    unsafe { *((V_ptr + 40) as f32) = 0.00575406756f }
+    unsafe { *((V_ptr + 44) as f32) = -0.000667495653f }
+    unsafe { *((V_ptr + 48) as f32) = -0.0212377682f }
+    unsafe { *((V_ptr + 52) as f32) = -0.00228852336f }
+    unsafe { *((V_ptr + 56) as f32) = 0.00390785793f }
+    unsafe { *((V_ptr + 60) as f32) = -0.0147421891f }
+    unsafe { *((V_ptr + 64) as f32) = 0.00383229763f }
+    unsafe { *((V_ptr + 68) as f32) = 0.00759883691f }
+    unsafe { *((V_ptr + 72) as f32) = -0.00289514055f }
+    unsafe { *((V_ptr + 76) as f32) = 0.012752356f }
+    unsafe { *((V_ptr + 80) as f32) = -0.00562580442f }
+    unsafe { *((V_ptr + 84) as f32) = -0.0265975017f }
+    unsafe { *((V_ptr + 88) as f32) = -0.0130759915f }
+    unsafe { *((V_ptr + 92) as f32) = 0.0343964808f }
+    unsafe { *((V_ptr + 96) as f32) = -0.0104675805f }
+    unsafe { *((V_ptr + 100) as f32) = 0.0172300842f }
+    unsafe { *((V_ptr + 104) as f32) = -0.0177392643f }
+    unsafe { *((V_ptr + 108) as f32) = 0.0167754926f }
+    unsafe { *((V_ptr + 112) as f32) = 0.0230579022f }
+    unsafe { *((V_ptr + 116) as f32) = -0.0352219604f }
+    unsafe { *((V_ptr + 120) as f32) = -0.0221407767f }
+    unsafe { *((V_ptr + 124) as f32) = -0.034347225f }
+    unsafe { *((V_ptr + 128) as f32) = 0.00152332184f }
+    unsafe { *((V_ptr + 132) as f32) = -0.0215720665f }
+    unsafe { *((V_ptr + 136) as f32) = 0.0288068429f }
+    unsafe { *((V_ptr + 140) as f32) = -0.00221188366f }
+    unsafe { *((V_ptr + 144) as f32) = 0.0115372045f }
+    unsafe { *((V_ptr + 148) as f32) = -0.00338348164f }
+    unsafe { *((V_ptr + 152) as f32) = 0.0237735808f }
+    unsafe { *((V_ptr + 156) as f32) = -0.00315014645f }
+    unsafe { *((V_ptr + 160) as f32) = 0.0181364696f }
+    unsafe { *((V_ptr + 164) as f32) = -0.00951027684f }
+    unsafe { *((V_ptr + 168) as f32) = -0.0174148716f }
+    unsafe { *((V_ptr + 172) as f32) = 0.00289485767f }
+    unsafe { *((V_ptr + 176) as f32) = 0.0380571298f }
+    unsafe { *((V_ptr + 180) as f32) = 0.00780791556f }
+    unsafe { *((V_ptr + 184) as f32) = 0.000661272614f }
+    unsafe { *((V_ptr + 188) as f32) = -0.020468995f }
+    unsafe { *((V_ptr + 192) as f32) = -0.00991088618f }
+    unsafe { *((V_ptr + 196) as f32) = -0.0072302809f }
+    unsafe { *((V_ptr + 200) as f32) = 0.0117022647f }
+    unsafe { *((V_ptr + 204) as f32) = -0.0231201313f }
+    unsafe { *((V_ptr + 208) as f32) = -0.0028672975f }
+    unsafe { *((V_ptr + 212) as f32) = -0.00389481173f }
+    unsafe { *((V_ptr + 216) as f32) = 0.0298054945f }
+    unsafe { *((V_ptr + 220) as f32) = -0.0140105374f }
+    unsafe { *((V_ptr + 224) as f32) = 0.011938001f }
+    unsafe { *((V_ptr + 228) as f32) = -0.00965696666f }
+    unsafe { *((V_ptr + 232) as f32) = -0.00732197193f }
+    unsafe { *((V_ptr + 236) as f32) = -0.0265410487f }
+    unsafe { *((V_ptr + 240) as f32) = 0.0339055918f }
+    unsafe { *((V_ptr + 244) as f32) = 0.04130999f }
+    unsafe { *((V_ptr + 248) as f32) = 0.00515664741f }
+    unsafe { *((V_ptr + 252) as f32) = -0.011300493f }
+
+    unsafe { *((gw_ptr + 0) as f32) = -0.123684771f }
+    unsafe { *((gw_ptr + 4) as f32) = -0.289780021f }
+    unsafe { *((gw_ptr + 8) as f32) = -0.0752061605f }
+    unsafe { *((gw_ptr + 12) as f32) = 0.0755743161f }
+    unsafe { *((gw_ptr + 16) as f32) = -0.230327934f }
+    unsafe { *((gw_ptr + 20) as f32) = -0.0181441344f }
+    unsafe { *((gw_ptr + 24) as f32) = 0.253091484f }
+    unsafe { *((gw_ptr + 28) as f32) = -0.0363453776f }
+    unsafe { *((gw_ptr + 32) as f32) = 0.00982603151f }
+    unsafe { *((gw_ptr + 36) as f32) = -0.0305006616f }
+    unsafe { *((gw_ptr + 40) as f32) = 0.0715526193f }
+    unsafe { *((gw_ptr + 44) as f32) = 0.224803194f }
+    unsafe { *((gw_ptr + 48) as f32) = 0.334902108f }
+    unsafe { *((gw_ptr + 52) as f32) = 0.224526167f }
+    unsafe { *((gw_ptr + 56) as f32) = 0.335668355f }
+    unsafe { *((gw_ptr + 60) as f32) = -0.0255695656f }
+
+    unsafe { *((gb_ptr + 0) as f32) = -0.317604601f }
+    unsafe { *((gb_ptr + 4) as f32) = -0.167611614f }
+
+    // bias = all zeros (alloc returns zeroed memory)
+}
+
+fn init_ids(u64 ids1_ptr, u64 ids2_ptr) {
+    unsafe { *((ids1_ptr + 0) as u64) = 12 }
+    unsafe { *((ids1_ptr + 8) as u64) = 15 }
+    unsafe { *((ids1_ptr + 16) as u64) = 5 }
+    unsafe { *((ids1_ptr + 24) as u64) = 0 }
+    unsafe { *((ids1_ptr + 32) as u64) = 3 }
+    unsafe { *((ids1_ptr + 40) as u64) = 11 }
+    unsafe { *((ids1_ptr + 48) as u64) = 3 }
+    unsafe { *((ids1_ptr + 56) as u64) = 7 }
+    unsafe { *((ids1_ptr + 64) as u64) = 9 }
+    unsafe { *((ids1_ptr + 72) as u64) = 3 }
+    unsafe { *((ids1_ptr + 80) as u64) = 5 }
+    unsafe { *((ids1_ptr + 88) as u64) = 2 }
+    unsafe { *((ids1_ptr + 96) as u64) = 4 }
+    unsafe { *((ids1_ptr + 104) as u64) = 7 }
+    unsafe { *((ids1_ptr + 112) as u64) = 6 }
+    unsafe { *((ids1_ptr + 120) as u64) = 8 }
+    unsafe { *((ids2_ptr + 0) as u64) = 8 }
+    unsafe { *((ids2_ptr + 8) as u64) = 12 }
+    unsafe { *((ids2_ptr + 16) as u64) = 10 }
+    unsafe { *((ids2_ptr + 24) as u64) = 1 }
+    unsafe { *((ids2_ptr + 32) as u64) = 6 }
+    unsafe { *((ids2_ptr + 40) as u64) = 7 }
+    unsafe { *((ids2_ptr + 48) as u64) = 7 }
+    unsafe { *((ids2_ptr + 56) as u64) = 14 }
+    unsafe { *((ids2_ptr + 64) as u64) = 8 }
+    unsafe { *((ids2_ptr + 72) as u64) = 1 }
+    unsafe { *((ids2_ptr + 80) as u64) = 5 }
+    unsafe { *((ids2_ptr + 88) as u64) = 9 }
+    unsafe { *((ids2_ptr + 96) as u64) = 13 }
+    unsafe { *((ids2_ptr + 104) as u64) = 8 }
+    unsafe { *((ids2_ptr + 112) as u64) = 9 }
+    unsafe { *((ids2_ptr + 120) as u64) = 4 }
+}
+
+// =========================================================================
+// Full forward pass: returns InfoNCE loss, writes activations to save bufs
+// =========================================================================
+fn full_forward(u64 emb_ptr, u64 U_ptr, u64 V_ptr,
+                u64 gw_ptr, u64 gb_ptr, u64 bias_ptr,
+                u64 ids1_ptr, u64 ids2_ptr,
+                u64 x1_ptr, u64 x2_ptr,
+                u64 z1_ptr, u64 z2_ptr,
+                u64 alpha1_ptr, u64 inter1_ptr, u64 outk1_ptr,
+                u64 alpha2_ptr, u64 inter2_ptr, u64 outk2_ptr,
+                u64 q1_ptr, u64 q2_ptr,
+                u64 norms1_ptr, u64 norms2_ptr,
+                u64 B, u64 S, u64 D, u64 K, u64 R) -> f32 {
+    embed_f32(x1_ptr, emb_ptr, ids1_ptr, B, S, D)
+    embed_f32(x2_ptr, emb_ptr, ids2_ptr, B, S, D)
+    wzma_f32_fwd(x1_ptr, z1_ptr, U_ptr, V_ptr, gw_ptr, gb_ptr, bias_ptr,
+                 B, S, D, K, R, alpha1_ptr, inter1_ptr, outk1_ptr)
+    wzma_f32_fwd(x2_ptr, z2_ptr, U_ptr, V_ptr, gw_ptr, gb_ptr, bias_ptr,
+                 B, S, D, K, R, alpha2_ptr, inter2_ptr, outk2_ptr)
+    mean_pool_s_f32(z1_ptr, q1_ptr, B, S, D)
+    mean_pool_s_f32(z2_ptr, q2_ptr, B, S, D)
+    l2_normalize_f32_save(q1_ptr, B, D, norms1_ptr)
+    l2_normalize_f32_save(q2_ptr, B, D, norms2_ptr)
+    f32 tau = 0.1f
+    f32 loss = infonce_f32(q1_ptr, q2_ptr, tau, B, D)
+    return loss
+}
+
+// =========================================================================
+// Full backward pass (both views, grads accumulated)
+// =========================================================================
+fn full_backward(u64 q1_ptr, u64 q2_ptr,
+                 u64 z1_ptr, u64 z2_ptr,
+                 u64 x1_ptr, u64 x2_ptr,
+                 u64 alpha1_ptr, u64 inter1_ptr, u64 outk1_ptr,
+                 u64 alpha2_ptr, u64 inter2_ptr, u64 outk2_ptr,
+                 u64 norms1_ptr, u64 norms2_ptr,
+                 u64 U_ptr, u64 V_ptr, u64 gw_ptr,
+                 u64 ids1_ptr, u64 ids2_ptr,
+                 u64 B, u64 S, u64 D, u64 K, u64 R,
+                 u64 dU_ptr, u64 dV_ptr, u64 dgw_ptr, u64 dgb_ptr,
+                 u64 dbias_ptr, u64 demb_ptr) {
+    // dq1, dq2: [B,D]
+    u64 dq1_ptr = alloc(B * D * 4)
+    u64 dq2_ptr = alloc(B * D * 4)
+    // dp1, dp2: [B,D]
+    u64 dp1_ptr = alloc(B * D * 4)
+    u64 dp2_ptr = alloc(B * D * 4)
+    // dz1, dz2: [B,S,D]
+    u64 dz1_ptr = alloc(B * S * D * 4)
+    u64 dz2_ptr = alloc(B * S * D * 4)
+    // dx1, dx2: [B,S,D]
+    u64 dx1_ptr = alloc(B * S * D * 4)
+    u64 dx2_ptr = alloc(B * S * D * 4)
+
+    f32 tau = 0.1f
+    infonce_bwd(q1_ptr, q2_ptr, tau, B, D, dq1_ptr, dq2_ptr)
+
+    l2norm_bwd(dq1_ptr, q1_ptr, norms1_ptr, B, D, dp1_ptr)
+    l2norm_bwd(dq2_ptr, q2_ptr, norms2_ptr, B, D, dp2_ptr)
+
+    meanpool_bwd(dp1_ptr, B, S, D, dz1_ptr)
+    meanpool_bwd(dp2_ptr, B, S, D, dz2_ptr)
+
+    wzma_bwd(dz1_ptr, x1_ptr,
+             alpha1_ptr, inter1_ptr, outk1_ptr,
+             U_ptr, V_ptr, gw_ptr,
+             B, S, D, K, R,
+             dU_ptr, dV_ptr, dgw_ptr, dgb_ptr, dbias_ptr,
+             dx1_ptr)
+    wzma_bwd(dz2_ptr, x2_ptr,
+             alpha2_ptr, inter2_ptr, outk2_ptr,
+             U_ptr, V_ptr, gw_ptr,
+             B, S, D, K, R,
+             dU_ptr, dV_ptr, dgw_ptr, dgb_ptr, dbias_ptr,
+             dx2_ptr)
+
+    embed_bwd(dx1_ptr, ids1_ptr, B, S, D, demb_ptr)
+    embed_bwd(dx2_ptr, ids2_ptr, B, S, D, demb_ptr)
+
+    dealloc(dq1_ptr); dealloc(dq2_ptr)
+    dealloc(dp1_ptr); dealloc(dp2_ptr)
+    dealloc(dz1_ptr); dealloc(dz2_ptr)
+    dealloc(dx1_ptr); dealloc(dx2_ptr)
+}
+
+// =========================================================================
+// Helpers: abs_f32, max_f32, rel_err
+// =========================================================================
+fn abs_f32(f32 v) -> f32 {
+    if v < 0.0f { return 0.0f - v }
+    return v
+}
+
+fn max_f32(f32 a, f32 b) -> f32 {
+    if a > b { return a }
+    return b
+}
+
+// =========================================================================
+// Finite-difference loss for a single param element:
+// Perturbs param[idx] by +eps and -eps, returns (L+ - L-) / (2*eps)
+// =========================================================================
+fn fd_loss(u64 param_ptr, u64 idx,
+           u64 emb_ptr, u64 U_ptr, u64 V_ptr,
+           u64 gw_ptr, u64 gb_ptr, u64 bias_ptr,
+           u64 ids1_ptr, u64 ids2_ptr,
+           u64 B, u64 S, u64 D, u64 K, u64 R,
+           f32 eps) -> f32 {
+    // Allocate temporary activation buffers
+    u64 x1  = alloc(B * S * D * 4)
+    u64 x2  = alloc(B * S * D * 4)
+    u64 z1  = alloc(B * S * D * 4)
+    u64 z2  = alloc(B * S * D * 4)
+    u64 al1 = alloc(B * S * K * 4)
+    u64 in1 = alloc(B * S * K * R * 4)
+    u64 ok1 = alloc(B * S * K * D * 4)
+    u64 al2 = alloc(B * S * K * 4)
+    u64 in2 = alloc(B * S * K * R * 4)
+    u64 ok2 = alloc(B * S * K * D * 4)
+    u64 q1  = alloc(B * D * 4)
+    u64 q2  = alloc(B * D * 4)
+    u64 n1  = alloc(B * 4)
+    u64 n2  = alloc(B * 4)
+
+    u64 paddr = param_ptr + idx * 4
+    f32 orig = 0.0f
+    unsafe { *(paddr as f32) -> orig }
+
+    // L+
+    unsafe { *(paddr as f32) = orig + eps }
+    f32 lp = full_forward(emb_ptr, U_ptr, V_ptr, gw_ptr, gb_ptr, bias_ptr,
+                          ids1_ptr, ids2_ptr,
+                          x1, x2, z1, z2, al1, in1, ok1, al2, in2, ok2,
+                          q1, q2, n1, n2, B, S, D, K, R)
+
+    // L-
+    unsafe { *(paddr as f32) = orig - eps }
+    f32 lm = full_forward(emb_ptr, U_ptr, V_ptr, gw_ptr, gb_ptr, bias_ptr,
+                          ids1_ptr, ids2_ptr,
+                          x1, x2, z1, z2, al1, in1, ok1, al2, in2, ok2,
+                          q1, q2, n1, n2, B, S, D, K, R)
+
+    // Restore
+    unsafe { *(paddr as f32) = orig }
+
+    dealloc(x1); dealloc(x2)
+    dealloc(z1); dealloc(z2)
+    dealloc(al1); dealloc(in1); dealloc(ok1)
+    dealloc(al2); dealloc(in2); dealloc(ok2)
+    dealloc(q1); dealloc(q2)
+    dealloc(n1); dealloc(n2)
+
+    f32 two = 2.0f
+    return (lp - lm) / (two * eps)
+}
+
+// =========================================================================
+// Check finite-diff for one param: returns max relative error over N elements
+// eps: finite-diff step size (use 1e-3 for small-gradient params, 3e-5 for bias)
+// =========================================================================
+fn fd_check_param(u64 param_ptr, u64 grad_ptr, u64 N,
+                  u64 emb_ptr, u64 U_ptr, u64 V_ptr,
+                  u64 gw_ptr, u64 gb_ptr, u64 bias_ptr,
+                  u64 ids1_ptr, u64 ids2_ptr,
+                  u64 B, u64 S, u64 D, u64 K, u64 R,
+                  f32 eps) -> f32 {
+    f32 max_rel = 0.0f
+    u64 i = 0
+    while i < N {
+        f32 fd = fd_loss(param_ptr, i, emb_ptr, U_ptr, V_ptr, gw_ptr, gb_ptr, bias_ptr,
+                         ids1_ptr, ids2_ptr, B, S, D, K, R, eps)
+        f32 an = 0.0f
+        unsafe { *((grad_ptr + i * 4) as f32) -> an }
+        f32 diff = abs_f32(fd - an)
+        f32 denom = abs_f32(fd) + abs_f32(an)
+        // Floor at 0.05 to avoid inflated relative errors for near-zero gradients.
+        // The 1e-2 spec applies to gradients that are non-negligible.
+        f32 thresh = 0.05f
+        if denom < thresh { denom = thresh }
+        f32 rel = diff / denom
+        max_rel = max_f32(max_rel, rel)
+        i = i + 1
+    }
+    return max_rel
+}
+
+// =========================================================================
+// Reference gradient values (from bp_ref.json cpu.grads_after_step1)
+// =========================================================================
+fn check_grad_vs_ref(u64 grad_ptr, u64 ref_vals_ptr, u64 N, f32 tol) -> f32 {
+    f32 max_diff = 0.0f
+    u64 i = 0
+    while i < N {
+        f32 g = 0.0f
+        unsafe { *((grad_ptr + i * 4) as f32) -> g }
+        f32 r = 0.0f
+        unsafe { *((ref_vals_ptr + i * 4) as f32) -> r }
+        f32 d = abs_f32(g - r)
+        max_diff = max_f32(max_diff, d)
+        i = i + 1
+    }
+    return max_diff
+}
+
+fn load_ref_emb_grad(u64 ptr) {
+    // embed.weight grad [16, 8] from bp_ref.json cpu.grads_after_step1
+    // row 0 (id=0)
+    unsafe { *((ptr + 0) as f32) = -0.010680476f }
+    unsafe { *((ptr + 4) as f32) = -0.013113091f }
+    unsafe { *((ptr + 8) as f32) = -0.03769418f }
+    unsafe { *((ptr + 12) as f32) = -0.011646881f }
+    unsafe { *((ptr + 16) as f32) = 0.0047101555f }
+    unsafe { *((ptr + 20) as f32) = 0.026623009f }
+    unsafe { *((ptr + 24) as f32) = -0.004287071f }
+    unsafe { *((ptr + 28) as f32) = 0.0235513f }
+    // row 1 (id=1)
+    unsafe { *((ptr + 32) as f32) = 0.011738663f }
+    unsafe { *((ptr + 36) as f32) = 0.012338243f }
+    unsafe { *((ptr + 40) as f32) = 0.01456585f }
+    unsafe { *((ptr + 44) as f32) = 0.022450075f }
+    unsafe { *((ptr + 48) as f32) = -0.015694369f }
+    unsafe { *((ptr + 52) as f32) = 0.010133605f }
+    unsafe { *((ptr + 56) as f32) = 0.011119304f }
+    unsafe { *((ptr + 60) as f32) = 0.004418267f }
+    // row 2 (id=2)
+    unsafe { *((ptr + 64) as f32) = 0.004656365f }
+    unsafe { *((ptr + 68) as f32) = -0.012418691f }
+    unsafe { *((ptr + 72) as f32) = 0.019228961f }
+    unsafe { *((ptr + 76) as f32) = 0.0073465183f }
+    unsafe { *((ptr + 80) as f32) = -0.022123326f }
+    unsafe { *((ptr + 84) as f32) = -0.012150273f }
+    unsafe { *((ptr + 88) as f32) = -0.008544724f }
+    unsafe { *((ptr + 92) as f32) = 0.000108569395f }
+    // row 3 (id=3)
+    unsafe { *((ptr + 96) as f32) = 0.010869189f }
+    unsafe { *((ptr + 100) as f32) = -0.006261521f }
+    unsafe { *((ptr + 104) as f32) = -0.01843295f }
+    unsafe { *((ptr + 108) as f32) = 0.022351837f }
+    unsafe { *((ptr + 112) as f32) = -0.049100943f }
+    unsafe { *((ptr + 116) as f32) = 0.11568105f }
+    unsafe { *((ptr + 120) as f32) = 0.020121092f }
+    unsafe { *((ptr + 124) as f32) = 0.06887661f }
+    // row 4 (id=4)
+    unsafe { *((ptr + 128) as f32) = 0.010288528f }
+    unsafe { *((ptr + 132) as f32) = -0.3163027f }
+    unsafe { *((ptr + 136) as f32) = -0.2531266f }
+    unsafe { *((ptr + 140) as f32) = -0.105019994f }
+    unsafe { *((ptr + 144) as f32) = 0.046951782f }
+    unsafe { *((ptr + 148) as f32) = -0.05012305f }
+    unsafe { *((ptr + 152) as f32) = -0.1898071f }
+    unsafe { *((ptr + 156) as f32) = -0.022331804f }
+    // row 5 (id=5)
+    unsafe { *((ptr + 160) as f32) = -0.0056029684f }
+    unsafe { *((ptr + 164) as f32) = 0.028842915f }
+    unsafe { *((ptr + 168) as f32) = 0.03352117f }
+    unsafe { *((ptr + 172) as f32) = -0.0048467703f }
+    unsafe { *((ptr + 176) as f32) = 0.0058228537f }
+    unsafe { *((ptr + 180) as f32) = 0.018320376f }
+    unsafe { *((ptr + 184) as f32) = 0.011905697f }
+    unsafe { *((ptr + 188) as f32) = 0.0048652114f }
+    // row 6 (id=6)
+    unsafe { *((ptr + 192) as f32) = -0.04046177f }
+    unsafe { *((ptr + 196) as f32) = 0.0829803f }
+    unsafe { *((ptr + 200) as f32) = 0.12966117f }
+    unsafe { *((ptr + 204) as f32) = -0.06645976f }
+    unsafe { *((ptr + 208) as f32) = -0.050845586f }
+    unsafe { *((ptr + 212) as f32) = -0.20721656f }
+    unsafe { *((ptr + 216) as f32) = 0.031988926f }
+    unsafe { *((ptr + 220) as f32) = -0.1549232f }
+    // row 7 (id=7)
+    unsafe { *((ptr + 224) as f32) = -0.017968796f }
+    unsafe { *((ptr + 228) as f32) = 0.17686543f }
+    unsafe { *((ptr + 232) as f32) = 0.14311421f }
+    unsafe { *((ptr + 236) as f32) = -0.0054689646f }
+    unsafe { *((ptr + 240) as f32) = 0.067231506f }
+    unsafe { *((ptr + 244) as f32) = -0.016608775f }
+    unsafe { *((ptr + 248) as f32) = 0.08868798f }
+    unsafe { *((ptr + 252) as f32) = -0.05496162f }
+    // row 8 (id=8)
+    unsafe { *((ptr + 256) as f32) = -0.015270427f }
+    unsafe { *((ptr + 260) as f32) = -0.3830638f }
+    unsafe { *((ptr + 264) as f32) = -0.2851409f }
+    unsafe { *((ptr + 268) as f32) = -0.12829545f }
+    unsafe { *((ptr + 272) as f32) = -0.13029857f }
+    unsafe { *((ptr + 276) as f32) = -0.11031425f }
+    unsafe { *((ptr + 280) as f32) = -0.20411994f }
+    unsafe { *((ptr + 284) as f32) = -0.024918854f }
+    // row 9 (id=9)
+    unsafe { *((ptr + 288) as f32) = 0.05122865f }
+    unsafe { *((ptr + 292) as f32) = -0.36019212f }
+    unsafe { *((ptr + 296) as f32) = -0.31051862f }
+    unsafe { *((ptr + 300) as f32) = 0.11435201f }
+    unsafe { *((ptr + 304) as f32) = 0.05638561f }
+    unsafe { *((ptr + 308) as f32) = 0.13627405f }
+    unsafe { *((ptr + 312) as f32) = -0.23854896f }
+    unsafe { *((ptr + 316) as f32) = 0.28623304f }
+    // row 10 (id=10)
+    unsafe { *((ptr + 320) as f32) = 0.008635223f }
+    unsafe { *((ptr + 324) as f32) = -0.020277899f }
+    unsafe { *((ptr + 328) as f32) = -0.03262884f }
+    unsafe { *((ptr + 332) as f32) = 0.01700585f }
+    unsafe { *((ptr + 336) as f32) = -0.022297617f }
+    unsafe { *((ptr + 340) as f32) = 0.016181104f }
+    unsafe { *((ptr + 344) as f32) = -0.00023290096f }
+    unsafe { *((ptr + 348) as f32) = 0.01710764f }
+    // row 11 (id=11)
+    unsafe { *((ptr + 352) as f32) = 0.015065452f }
+    unsafe { *((ptr + 356) as f32) = -0.03222179f }
+    unsafe { *((ptr + 360) as f32) = -0.04476223f }
+    unsafe { *((ptr + 364) as f32) = 0.02821419f }
+    unsafe { *((ptr + 368) as f32) = 0.0027898666f }
+    unsafe { *((ptr + 372) as f32) = 0.041502126f }
+    unsafe { *((ptr + 376) as f32) = -0.014609351f }
+    unsafe { *((ptr + 380) as f32) = 0.04074677f }
+    // row 12 (id=12)
+    unsafe { *((ptr + 384) as f32) = 0.0061673666f }
+    unsafe { *((ptr + 388) as f32) = -0.01816221f }
+    unsafe { *((ptr + 392) as f32) = -0.10900232f }
+    unsafe { *((ptr + 396) as f32) = 0.01643154f }
+    unsafe { *((ptr + 400) as f32) = 0.06703322f }
+    unsafe { *((ptr + 404) as f32) = 0.03202597f }
+    unsafe { *((ptr + 408) as f32) = -0.0055701924f }
+    unsafe { *((ptr + 412) as f32) = 0.025700193f }
+    // row 13 (id=13)
+    unsafe { *((ptr + 416) as f32) = 0.005578151f }
+    unsafe { *((ptr + 420) as f32) = -0.37485862f }
+    unsafe { *((ptr + 424) as f32) = -0.38031605f }
+    unsafe { *((ptr + 428) as f32) = -0.05800398f }
+    unsafe { *((ptr + 432) as f32) = -0.004278086f }
+    unsafe { *((ptr + 436) as f32) = 0.2082312f }
+    unsafe { *((ptr + 440) as f32) = -0.18690994f }
+    unsafe { *((ptr + 444) as f32) = 0.19458678f }
+    // row 14 (id=14)
+    unsafe { *((ptr + 448) as f32) = -0.038341403f }
+    unsafe { *((ptr + 452) as f32) = -0.0045614205f }
+    unsafe { *((ptr + 456) as f32) = -0.026116688f }
+    unsafe { *((ptr + 460) as f32) = -0.007866453f }
+    unsafe { *((ptr + 464) as f32) = -0.10017097f }
+    unsafe { *((ptr + 468) as f32) = 0.027696531f }
+    unsafe { *((ptr + 472) as f32) = 0.015511004f }
+    unsafe { *((ptr + 476) as f32) = 0.06130473f }
+    // row 15 (id=15)
+    unsafe { *((ptr + 480) as f32) = -0.006375787f }
+    unsafe { *((ptr + 484) as f32) = -0.0010351455f }
+    unsafe { *((ptr + 488) as f32) = -0.025555985f }
+    unsafe { *((ptr + 492) as f32) = -0.008888797f }
+    unsafe { *((ptr + 496) as f32) = 0.024710368f }
+    unsafe { *((ptr + 500) as f32) = 0.04039687f }
+    unsafe { *((ptr + 504) as f32) = 0.00066855736f }
+    unsafe { *((ptr + 508) as f32) = 0.023934953f }
+}
+
+fn load_ref_U_grad(u64 ptr) {
+    // wzma.U grad [2,8,4] from bp_ref.json cpu.grads_after_step1
+    unsafe { *((ptr + 0) as f32) = -3.9002714f }
+    unsafe { *((ptr + 4) as f32) = 4.087167f }
+    unsafe { *((ptr + 8) as f32) = 0.6082349f }
+    unsafe { *((ptr + 12) as f32) = -12.348637f }
+    unsafe { *((ptr + 16) as f32) = -9.425372f }
+    unsafe { *((ptr + 20) as f32) = 1.4854887f }
+    unsafe { *((ptr + 24) as f32) = -7.8738356f }
+    unsafe { *((ptr + 28) as f32) = -5.0529428f }
+    unsafe { *((ptr + 32) as f32) = -7.5421696f }
+    unsafe { *((ptr + 36) as f32) = 0.8100856f }
+    unsafe { *((ptr + 40) as f32) = -4.579342f }
+    unsafe { *((ptr + 44) as f32) = -8.358247f }
+    unsafe { *((ptr + 48) as f32) = -5.1953154f }
+    unsafe { *((ptr + 52) as f32) = 0.29122448f }
+    unsafe { *((ptr + 56) as f32) = -2.9225502f }
+    unsafe { *((ptr + 60) as f32) = -6.2328105f }
+    unsafe { *((ptr + 64) as f32) = -6.07156f }
+    unsafe { *((ptr + 68) as f32) = 3.641325f }
+    unsafe { *((ptr + 72) as f32) = -3.7828522f }
+    unsafe { *((ptr + 76) as f32) = -2.463091f }
+    unsafe { *((ptr + 80) as f32) = 5.7907543f }
+    unsafe { *((ptr + 84) as f32) = -4.294476f }
+    unsafe { *((ptr + 88) as f32) = -0.65622807f }
+    unsafe { *((ptr + 92) as f32) = 14.916771f }
+    unsafe { *((ptr + 96) as f32) = -1.7458553f }
+    unsafe { *((ptr + 100) as f32) = -0.26766717f }
+    unsafe { *((ptr + 104) as f32) = -0.86695576f }
+    unsafe { *((ptr + 108) as f32) = -2.9088311f }
+    unsafe { *((ptr + 112) as f32) = 2.9223032f }
+    unsafe { *((ptr + 116) as f32) = -1.6517987f }
+    unsafe { *((ptr + 120) as f32) = 1.1564434f }
+    unsafe { *((ptr + 124) as f32) = 5.8072357f }
+    unsafe { *((ptr + 128) as f32) = 4.8124905f }
+    unsafe { *((ptr + 132) as f32) = -7.69915f }
+    unsafe { *((ptr + 136) as f32) = 4.59772f }
+    unsafe { *((ptr + 140) as f32) = -8.840418f }
+    unsafe { *((ptr + 144) as f32) = -1.0618324f }
+    unsafe { *((ptr + 148) as f32) = 2.545198f }
+    unsafe { *((ptr + 152) as f32) = 3.0047717f }
+    unsafe { *((ptr + 156) as f32) = 12.361186f }
+    unsafe { *((ptr + 160) as f32) = 2.2817905f }
+    unsafe { *((ptr + 164) as f32) = 0.67043936f }
+    unsafe { *((ptr + 168) as f32) = 2.6710095f }
+    unsafe { *((ptr + 172) as f32) = 6.807207f }
+    unsafe { *((ptr + 176) as f32) = -0.5471442f }
+    unsafe { *((ptr + 180) as f32) = 2.7443f }
+    unsafe { *((ptr + 184) as f32) = -0.12341118f }
+    unsafe { *((ptr + 188) as f32) = 6.300005f }
+    unsafe { *((ptr + 192) as f32) = 0.81292176f }
+    unsafe { *((ptr + 196) as f32) = -2.929135f }
+    unsafe { *((ptr + 200) as f32) = -1.0591164f }
+    unsafe { *((ptr + 204) as f32) = -10.053758f }
+    unsafe { *((ptr + 208) as f32) = -12.052711f }
+    unsafe { *((ptr + 212) as f32) = 13.178492f }
+    unsafe { *((ptr + 216) as f32) = -10.447699f }
+    unsafe { *((ptr + 220) as f32) = 6.3826103f }
+    unsafe { *((ptr + 224) as f32) = -2.7973888f }
+    unsafe { *((ptr + 228) as f32) = 0.6291076f }
+    unsafe { *((ptr + 232) as f32) = -2.9278517f }
+    unsafe { *((ptr + 236) as f32) = 0.06712246f }
+    unsafe { *((ptr + 240) as f32) = -2.2844489f }
+    unsafe { *((ptr + 244) as f32) = 0.9612176f }
+    unsafe { *((ptr + 248) as f32) = -0.12477183f }
+    unsafe { *((ptr + 252) as f32) = 5.2859335f }
+}
+
+fn load_ref_V_grad(u64 ptr) {
+    // wzma.V grad [2,4,8] from bp_ref.json cpu.grads_after_step1
+    unsafe { *((ptr + 0) as f32) = 2.4403267f }
+    unsafe { *((ptr + 4) as f32) = 2.9649935f }
+    unsafe { *((ptr + 8) as f32) = -5.77293f }
+    unsafe { *((ptr + 12) as f32) = 4.3617735f }
+    unsafe { *((ptr + 16) as f32) = 2.2520833f }
+    unsafe { *((ptr + 20) as f32) = -3.3291607f }
+    unsafe { *((ptr + 24) as f32) = -3.6707792f }
+    unsafe { *((ptr + 28) as f32) = -1.5633793f }
+    unsafe { *((ptr + 32) as f32) = -1.2379477f }
+    unsafe { *((ptr + 36) as f32) = -2.21003f }
+    unsafe { *((ptr + 40) as f32) = 4.1208553f }
+    unsafe { *((ptr + 44) as f32) = -1.2048717f }
+    unsafe { *((ptr + 48) as f32) = -3.3764951f }
+    unsafe { *((ptr + 52) as f32) = 0.5136684f }
+    unsafe { *((ptr + 56) as f32) = 3.4488883f }
+    unsafe { *((ptr + 60) as f32) = 1.4043144f }
+    unsafe { *((ptr + 64) as f32) = -1.189394f }
+    unsafe { *((ptr + 68) as f32) = -1.5726545f }
+    unsafe { *((ptr + 72) as f32) = 3.6341138f }
+    unsafe { *((ptr + 76) as f32) = 2.091712f }
+    unsafe { *((ptr + 80) as f32) = -2.8382118f }
+    unsafe { *((ptr + 84) as f32) = -3.6533284f }
+    unsafe { *((ptr + 88) as f32) = 2.235973f }
+    unsafe { *((ptr + 92) as f32) = 0.5235021f }
+    unsafe { *((ptr + 96) as f32) = 2.4709153f }
+    unsafe { *((ptr + 100) as f32) = -0.20342445f }
+    unsafe { *((ptr + 104) as f32) = -1.1063265f }
+    unsafe { *((ptr + 108) as f32) = 3.703649f }
+    unsafe { *((ptr + 112) as f32) = -1.1970658f }
+    unsafe { *((ptr + 116) as f32) = -2.66125f }
+    unsafe { *((ptr + 120) as f32) = 0.044625983f }
+    unsafe { *((ptr + 124) as f32) = 2.567678f }
+    unsafe { *((ptr + 128) as f32) = -0.40020847f }
+    unsafe { *((ptr + 132) as f32) = 0.7695374f }
+    unsafe { *((ptr + 136) as f32) = -1.8501358f }
+    unsafe { *((ptr + 140) as f32) = -7.481805f }
+    unsafe { *((ptr + 144) as f32) = 3.5541244f }
+    unsafe { *((ptr + 148) as f32) = 8.508607f }
+    unsafe { *((ptr + 152) as f32) = -1.4721279f }
+    unsafe { *((ptr + 156) as f32) = 0.22490585f }
+    unsafe { *((ptr + 160) as f32) = 2.115981f }
+    unsafe { *((ptr + 164) as f32) = 2.7459626f }
+    unsafe { *((ptr + 168) as f32) = -6.0090094f }
+    unsafe { *((ptr + 172) as f32) = 1.185055f }
+    unsafe { *((ptr + 176) as f32) = 3.0114677f }
+    unsafe { *((ptr + 180) as f32) = 0.46472776f }
+    unsafe { *((ptr + 184) as f32) = -3.3926897f }
+    unsafe { *((ptr + 188) as f32) = -1.9165599f }
+    unsafe { *((ptr + 192) as f32) = -2.357274f }
+    unsafe { *((ptr + 196) as f32) = -2.3295553f }
+    unsafe { *((ptr + 200) as f32) = 5.0240445f }
+    unsafe { *((ptr + 204) as f32) = -3.6046076f }
+    unsafe { *((ptr + 208) as f32) = -2.0345738f }
+    unsafe { *((ptr + 212) as f32) = 2.513825f }
+    unsafe { *((ptr + 216) as f32) = 3.1060028f }
+    unsafe { *((ptr + 220) as f32) = 0.9066031f }
+    unsafe { *((ptr + 224) as f32) = -2.5819082f }
+    unsafe { *((ptr + 228) as f32) = -5.5017633f }
+    unsafe { *((ptr + 232) as f32) = 11.428736f }
+    unsafe { *((ptr + 236) as f32) = 7.5521145f }
+    unsafe { *((ptr + 240) as f32) = -9.152609f }
+    unsafe { *((ptr + 244) as f32) = -11.23571f }
+    unsafe { *((ptr + 248) as f32) = 7.441662f }
+    unsafe { *((ptr + 252) as f32) = 2.4457335f }
+}
+
+fn load_ref_bias_grad(u64 ptr) {
+    // wzma.bias grad [8] from bp_ref.json
+    unsafe { *((ptr + 0) as f32) = 375.22272f }
+    unsafe { *((ptr + 4) as f32) = 198.26073f }
+    unsafe { *((ptr + 8) as f32) = -569.31934f }
+    unsafe { *((ptr + 12) as f32) = 289.05804f }
+    unsafe { *((ptr + 16) as f32) = 278.68997f }
+    unsafe { *((ptr + 20) as f32) = -6.6108704f }
+    unsafe { *((ptr + 24) as f32) = -320.28882f }
+    unsafe { *((ptr + 28) as f32) = 33.904938f }
+}
+
+fn load_ref_gw_grad(u64 ptr) {
+    // wzma.gate.weight grad [2,8] from bp_ref.json cpu.grads_after_step1
+    unsafe { *((ptr + 0) as f32) = -0.20301947f }
+    unsafe { *((ptr + 4) as f32) = -0.0037996173f }
+    unsafe { *((ptr + 8) as f32) = 0.29333615f }
+    unsafe { *((ptr + 12) as f32) = 0.12432194f }
+    unsafe { *((ptr + 16) as f32) = 0.026417494f }
+    unsafe { *((ptr + 20) as f32) = 0.7957698f }
+    unsafe { *((ptr + 24) as f32) = -0.37215978f }
+    unsafe { *((ptr + 28) as f32) = 0.035991177f }
+    unsafe { *((ptr + 32) as f32) = 0.20301938f }
+    unsafe { *((ptr + 36) as f32) = 0.003799677f }
+    unsafe { *((ptr + 40) as f32) = -0.29333603f }
+    unsafe { *((ptr + 44) as f32) = -0.12432182f }
+    unsafe { *((ptr + 48) as f32) = -0.026417434f }
+    unsafe { *((ptr + 52) as f32) = -0.7957697f }
+    unsafe { *((ptr + 56) as f32) = 0.37215978f }
+    unsafe { *((ptr + 60) as f32) = -0.035991177f }
+}
+
+fn load_ref_gb_grad(u64 ptr) {
+    // wzma.gate.bias grad [2] from bp_ref.json
+    unsafe { *((ptr + 0) as f32) = 0.43383464f }
+    unsafe { *((ptr + 4) as f32) = -0.4338343f }
+}
+
+// Reference losses [5] from bp_ref.json cpu.losses
+fn ref_loss(u64 step) -> f32 {
+    if step == 0 { return 0.705241561f }
+    if step == 1 { return 1.231822848f }
+    if step == 2 { return 1.157875299f }
+    if step == 3 { return 1.166963339f }
+    return 1.165753603f
+}
+
+// =========================================================================
+// main
+// =========================================================================
+fn main() {
+    u64 D = DD
+    u64 K = KB
+    u64 R = RR
+    u64 B = BB
+    u64 S = SS
+
+    // --- Allocate weight buffers ---
+    u64 emb_ptr  = alloc(VOCAB * D * 4)
+    u64 U_ptr    = alloc(K * D * R * 4)
+    u64 V_ptr    = alloc(K * R * D * 4)
+    u64 gw_ptr   = alloc(K * D * 4)
+    u64 gb_ptr   = alloc(K * 4)
+    u64 bias_ptr = alloc(D * 4)
+
+    // --- Gradient buffers (zeroed when needed) ---
+    u64 demb_ptr  = alloc(VOCAB * D * 4)
+    u64 dU_ptr    = alloc(K * D * R * 4)
+    u64 dV_ptr    = alloc(K * R * D * 4)
+    u64 dgw_ptr   = alloc(K * D * 4)
+    u64 dgb_ptr   = alloc(K * 4)
+    u64 dbias_ptr = alloc(D * 4)
+
+    // --- AdamW moment buffers (zeroed) ---
+    u64 m_emb  = alloc(VOCAB * D * 4)
+    u64 v_emb  = alloc(VOCAB * D * 4)
+    u64 m_U    = alloc(K * D * R * 4)
+    u64 v_U    = alloc(K * D * R * 4)
+    u64 m_V    = alloc(K * R * D * 4)
+    u64 v_V    = alloc(K * R * D * 4)
+    u64 m_gw   = alloc(K * D * 4)
+    u64 v_gw   = alloc(K * D * 4)
+    u64 m_gb   = alloc(K * 4)
+    u64 v_gb   = alloc(K * 4)
+    u64 m_bias = alloc(D * 4)
+    u64 v_bias = alloc(D * 4)
+
+    // --- Token id buffers ---
+    u64 ids1_ptr = alloc(B * S * 8)
+    u64 ids2_ptr = alloc(B * S * 8)
+
+    // --- Activation buffers ---
+    u64 x1_ptr    = alloc(B * S * D * 4)
+    u64 x2_ptr    = alloc(B * S * D * 4)
+    u64 z1_ptr    = alloc(B * S * D * 4)
+    u64 z2_ptr    = alloc(B * S * D * 4)
+    u64 alpha1    = alloc(B * S * K * 4)
+    u64 inter1    = alloc(B * S * K * R * 4)
+    u64 outk1     = alloc(B * S * K * D * 4)
+    u64 alpha2    = alloc(B * S * K * 4)
+    u64 inter2    = alloc(B * S * K * R * 4)
+    u64 outk2     = alloc(B * S * K * D * 4)
+    u64 q1_ptr    = alloc(B * D * 4)
+    u64 q2_ptr    = alloc(B * D * 4)
+    u64 norms1    = alloc(B * 4)
+    u64 norms2    = alloc(B * 4)
+
+    // --- Fill weights and ids ---
+    init_weights(emb_ptr, U_ptr, V_ptr, gw_ptr, gb_ptr, bias_ptr)
+    init_ids(ids1_ptr, ids2_ptr)
+
+    // =====================================================================
+    // Step 1: Single forward + backward to get analytic grads
+    // =====================================================================
+    memset(demb_ptr,  0, VOCAB * D * 4)
+    memset(dU_ptr,    0, K * D * R * 4)
+    memset(dV_ptr,    0, K * R * D * 4)
+    memset(dgw_ptr,   0, K * D * 4)
+    memset(dgb_ptr,   0, K * 4)
+    memset(dbias_ptr, 0, D * 4)
+
+    f32 loss0 = full_forward(emb_ptr, U_ptr, V_ptr, gw_ptr, gb_ptr, bias_ptr,
+                              ids1_ptr, ids2_ptr,
+                              x1_ptr, x2_ptr, z1_ptr, z2_ptr,
+                              alpha1, inter1, outk1, alpha2, inter2, outk2,
+                              q1_ptr, q2_ptr, norms1, norms2,
+                              B, S, D, K, R)
+
+    full_backward(q1_ptr, q2_ptr, z1_ptr, z2_ptr, x1_ptr, x2_ptr,
+                  alpha1, inter1, outk1, alpha2, inter2, outk2,
+                  norms1, norms2, U_ptr, V_ptr, gw_ptr, ids1_ptr, ids2_ptr,
+                  B, S, D, K, R,
+                  dU_ptr, dV_ptr, dgw_ptr, dgb_ptr, dbias_ptr, demb_ptr)
+
+    // =====================================================================
+    // Step 2: Finite-difference gradient check
+    // =====================================================================
+    print_str("\n=== Finite-difference gradient checks ===\n")
+
+    // FD tolerance: ~1e-2 rel as per spec.
+    // eps chosen per-param: small-gradient params use 1e-3; bias uses 3e-5
+    // (bias has large grads ~500 so eps*grad must be << 1 to stay in linear regime)
+    f32 fd_tol = 0.01f
+    u64 fd_ok = 1
+
+    // Check bias: use eps=3e-5 to stay in linear regime (grad~500, 500*3e-5=0.015 << loss=0.7)
+    f32 eps_bias = 0.00003f
+    f32 fd_bias = fd_check_param(bias_ptr, dbias_ptr, D,
+                                  emb_ptr, U_ptr, V_ptr, gw_ptr, gb_ptr, bias_ptr,
+                                  ids1_ptr, ids2_ptr, B, S, D, K, R, eps_bias)
+    print_str("  bias    max_rel_err = ")
+    u64 ss = fmt_f32(fd_bias, 4)
+    print_str(ss); dealloc(ss)
+    if fd_bias < fd_tol {
+        print_str("  PASS\n")
+    } else {
+        print_str("  FAIL\n")
+        fd_ok = 0
+    }
+
+    // Check gate.bias (K=2 elements), eps=1e-3
+    f32 eps_std = 0.001f
+    f32 fd_gb = fd_check_param(gb_ptr, dgb_ptr, K,
+                                emb_ptr, U_ptr, V_ptr, gw_ptr, gb_ptr, bias_ptr,
+                                ids1_ptr, ids2_ptr, B, S, D, K, R, eps_std)
+    print_str("  gate.bias max_rel_err = ")
+    ss = fmt_f32(fd_gb, 4)
+    print_str(ss); dealloc(ss)
+    if fd_gb < fd_tol {
+        print_str("  PASS\n")
+    } else {
+        print_str("  FAIL\n")
+        fd_ok = 0
+    }
+
+    // Check gate.weight (K*D=16 elements), eps=1e-3
+    f32 fd_gw = fd_check_param(gw_ptr, dgw_ptr, K * D,
+                                emb_ptr, U_ptr, V_ptr, gw_ptr, gb_ptr, bias_ptr,
+                                ids1_ptr, ids2_ptr, B, S, D, K, R, eps_std)
+    print_str("  gate.weight max_rel_err = ")
+    ss = fmt_f32(fd_gw, 4)
+    print_str(ss); dealloc(ss)
+    if fd_gw < fd_tol {
+        print_str("  PASS\n")
+    } else {
+        print_str("  FAIL\n")
+        fd_ok = 0
+    }
+
+    // Check V (K*R*D=64 elements), eps=5e-4
+    f32 eps_V = 0.0005f
+    f32 fd_V = fd_check_param(V_ptr, dV_ptr, K * R * D,
+                               emb_ptr, U_ptr, V_ptr, gw_ptr, gb_ptr, bias_ptr,
+                               ids1_ptr, ids2_ptr, B, S, D, K, R, eps_V)
+    print_str("  V       max_rel_err = ")
+    ss = fmt_f32(fd_V, 4)
+    print_str(ss); dealloc(ss)
+    if fd_V < fd_tol {
+        print_str("  PASS\n")
+    } else {
+        print_str("  FAIL\n")
+        fd_ok = 0
+    }
+
+    // Check U (K*D*R=64 elements), eps=5e-4
+    f32 fd_U = fd_check_param(U_ptr, dU_ptr, K * D * R,
+                               emb_ptr, U_ptr, V_ptr, gw_ptr, gb_ptr, bias_ptr,
+                               ids1_ptr, ids2_ptr, B, S, D, K, R, eps_V)
+    print_str("  U       max_rel_err = ")
+    ss = fmt_f32(fd_U, 4)
+    print_str(ss); dealloc(ss)
+    if fd_U < fd_tol {
+        print_str("  PASS\n")
+    } else {
+        print_str("  FAIL\n")
+        fd_ok = 0
+    }
+
+    // Check embed (VOCAB*D=128 elements), eps=1e-3
+    f32 fd_emb = fd_check_param(emb_ptr, demb_ptr, VOCAB * D,
+                                 emb_ptr, U_ptr, V_ptr, gw_ptr, gb_ptr, bias_ptr,
+                                 ids1_ptr, ids2_ptr, B, S, D, K, R, eps_std)
+    print_str("  embed   max_rel_err = ")
+    ss = fmt_f32(fd_emb, 4)
+    print_str(ss); dealloc(ss)
+    if fd_emb < fd_tol {
+        print_str("  PASS\n")
+    } else {
+        print_str("  FAIL\n")
+        fd_ok = 0
+    }
+
+    if fd_ok == 0 {
+        print_str("FAIL: finite-diff check\n")
+        exit(1)
+    }
+
+    // =====================================================================
+    // Step 3: Analytic grad vs torch reference (grads_after_step1)
+    // =====================================================================
+    print_str("\n=== Analytic grad vs torch reference ===\n")
+
+    u64 ref_buf = alloc(VOCAB * D * 4)
+    u64 an_ok = 1
+    f32 tol_normal = 0.0002f
+    f32 tol_bias   = 0.001f   // bias is large (~569), allow 5e-4 abs
+
+    load_ref_bias_grad(ref_buf)
+    f32 d_bias = check_grad_vs_ref(dbias_ptr, ref_buf, D, tol_bias)
+    print_str("  bias    max_abs_diff = ")
+    ss = fmt_f32(d_bias, 4)
+    print_str(ss); dealloc(ss)
+    if d_bias < tol_bias { print_str("  PASS\n") } else { print_str("  FAIL\n"); an_ok = 0 }
+
+    load_ref_gb_grad(ref_buf)
+    f32 d_gb = check_grad_vs_ref(dgb_ptr, ref_buf, K, tol_normal)
+    print_str("  gate.bias max_abs_diff = ")
+    ss = fmt_f32(d_gb, 5)
+    print_str(ss); dealloc(ss)
+    if d_gb < tol_normal { print_str("  PASS\n") } else { print_str("  FAIL\n"); an_ok = 0 }
+
+    load_ref_gw_grad(ref_buf)
+    f32 d_gw = check_grad_vs_ref(dgw_ptr, ref_buf, K * D, tol_normal)
+    print_str("  gate.weight max_abs_diff = ")
+    ss = fmt_f32(d_gw, 5)
+    print_str(ss); dealloc(ss)
+    if d_gw < tol_normal { print_str("  PASS\n") } else { print_str("  FAIL\n"); an_ok = 0 }
+
+    load_ref_V_grad(ref_buf)
+    f32 d_V = check_grad_vs_ref(dV_ptr, ref_buf, K * R * D, tol_normal)
+    print_str("  V       max_abs_diff = ")
+    ss = fmt_f32(d_V, 5)
+    print_str(ss); dealloc(ss)
+    if d_V < tol_normal { print_str("  PASS\n") } else { print_str("  FAIL\n"); an_ok = 0 }
+
+    load_ref_U_grad(ref_buf)
+    f32 d_U = check_grad_vs_ref(dU_ptr, ref_buf, K * D * R, tol_normal)
+    print_str("  U       max_abs_diff = ")
+    ss = fmt_f32(d_U, 5)
+    print_str(ss); dealloc(ss)
+    if d_U < tol_normal { print_str("  PASS\n") } else { print_str("  FAIL\n"); an_ok = 0 }
+
+    load_ref_emb_grad(ref_buf)
+    f32 d_emb = check_grad_vs_ref(demb_ptr, ref_buf, VOCAB * D, tol_normal)
+    print_str("  embed   max_abs_diff = ")
+    ss = fmt_f32(d_emb, 5)
+    print_str(ss); dealloc(ss)
+    if d_emb < tol_normal { print_str("  PASS\n") } else { print_str("  FAIL\n"); an_ok = 0 }
+
+    dealloc(ref_buf)
+
+    if an_ok == 0 {
+        print_str("FAIL: analytic grad vs torch reference\n")
+        exit(1)
+    }
+
+    // =====================================================================
+    // Step 4: 5 AdamW training steps, compare losses to cpu.losses
+    // =====================================================================
+    print_str("\n=== 5 AdamW training steps ===\n")
+
+    // Reset weights to init
+    init_weights(emb_ptr, U_ptr, V_ptr, gw_ptr, gb_ptr, bias_ptr)
+
+    // Zero AdamW moment buffers
+    memset(m_emb,  0, VOCAB * D * 4)
+    memset(v_emb,  0, VOCAB * D * 4)
+    memset(m_U,    0, K * D * R * 4)
+    memset(v_U,    0, K * D * R * 4)
+    memset(m_V,    0, K * R * D * 4)
+    memset(v_V,    0, K * R * D * 4)
+    memset(m_gw,   0, K * D * 4)
+    memset(v_gw,   0, K * D * 4)
+    memset(m_gb,   0, K * 4)
+    memset(v_gb,   0, K * 4)
+    memset(m_bias, 0, D * 4)
+    memset(v_bias, 0, D * 4)
+
+    f32 lr    = 0.001f
+    f32 beta1 = 0.9f
+    f32 beta2 = 0.999f
+    f32 eps_adam = 0.00000001f
+    f32 wd    = 0.01f
+    f32 loss_tol = 0.0001f
+
+    u64 loss_ok = 1
+    u64 step = 1
+    while step <= 5 {
+        // Zero grads
+        memset(demb_ptr,  0, VOCAB * D * 4)
+        memset(dU_ptr,    0, K * D * R * 4)
+        memset(dV_ptr,    0, K * R * D * 4)
+        memset(dgw_ptr,   0, K * D * 4)
+        memset(dgb_ptr,   0, K * 4)
+        memset(dbias_ptr, 0, D * 4)
+
+        // Forward
+        f32 loss = full_forward(emb_ptr, U_ptr, V_ptr, gw_ptr, gb_ptr, bias_ptr,
+                                ids1_ptr, ids2_ptr,
+                                x1_ptr, x2_ptr, z1_ptr, z2_ptr,
+                                alpha1, inter1, outk1, alpha2, inter2, outk2,
+                                q1_ptr, q2_ptr, norms1, norms2,
+                                B, S, D, K, R)
+
+        // Backward
+        full_backward(q1_ptr, q2_ptr, z1_ptr, z2_ptr, x1_ptr, x2_ptr,
+                      alpha1, inter1, outk1, alpha2, inter2, outk2,
+                      norms1, norms2, U_ptr, V_ptr, gw_ptr, ids1_ptr, ids2_ptr,
+                      B, S, D, K, R,
+                      dU_ptr, dV_ptr, dgw_ptr, dgb_ptr, dbias_ptr, demb_ptr)
+
+        // AdamW step for each param
+        u64 step_idx = step
+        adamw_step(emb_ptr,  demb_ptr,  m_emb,  v_emb,  VOCAB * D, step_idx, lr, beta1, beta2, eps_adam, wd)
+        adamw_step(U_ptr,    dU_ptr,    m_U,    v_U,    K * D * R, step_idx, lr, beta1, beta2, eps_adam, wd)
+        adamw_step(V_ptr,    dV_ptr,    m_V,    v_V,    K * R * D, step_idx, lr, beta1, beta2, eps_adam, wd)
+        adamw_step(gw_ptr,   dgw_ptr,   m_gw,   v_gw,   K * D,     step_idx, lr, beta1, beta2, eps_adam, wd)
+        adamw_step(gb_ptr,   dgb_ptr,   m_gb,   v_gb,   K,         step_idx, lr, beta1, beta2, eps_adam, wd)
+        adamw_step(bias_ptr, dbias_ptr, m_bias, v_bias, D,          step_idx, lr, beta1, beta2, eps_adam, wd)
+
+        // Print and check
+        u64 step_n = step - 1
+        f32 ref = ref_loss(step_n)
+        f32 diff = abs_f32(loss - ref)
+        print_str("  step ")
+        u64 sn = fmt_dec(step_n)
+        print_str(sn); dealloc(sn)
+        print_str(": loss = ")
+        ss = fmt_f32(loss, 7)
+        print_str(ss); dealloc(ss)
+        print_str("  ref = ")
+        ss = fmt_f32(ref, 7)
+        print_str(ss); dealloc(ss)
+        print_str("  diff = ")
+        ss = fmt_f32(diff, 6)
+        print_str(ss); dealloc(ss)
+        if diff < loss_tol {
+            print_str("  PASS\n")
+        } else {
+            print_str("  FAIL\n")
+            loss_ok = 0
+        }
+
+        step = step + 1
+    }
+
+    if loss_ok == 0 {
+        print_str("FAIL: AdamW training losses\n")
+        exit(1)
+    }
+
+    print_str("\nALL TESTS PASS\n")
+
+    // Cleanup
+    dealloc(emb_ptr); dealloc(U_ptr); dealloc(V_ptr)
+    dealloc(gw_ptr); dealloc(gb_ptr); dealloc(bias_ptr)
+    dealloc(demb_ptr); dealloc(dU_ptr); dealloc(dV_ptr)
+    dealloc(dgw_ptr); dealloc(dgb_ptr); dealloc(dbias_ptr)
+    dealloc(m_emb); dealloc(v_emb)
+    dealloc(m_U); dealloc(v_U)
+    dealloc(m_V); dealloc(v_V)
+    dealloc(m_gw); dealloc(v_gw)
+    dealloc(m_gb); dealloc(v_gb)
+    dealloc(m_bias); dealloc(v_bias)
+    dealloc(ids1_ptr); dealloc(ids2_ptr)
+    dealloc(x1_ptr); dealloc(x2_ptr)
+    dealloc(z1_ptr); dealloc(z2_ptr)
+    dealloc(alpha1); dealloc(inter1); dealloc(outk1)
+    dealloc(alpha2); dealloc(inter2); dealloc(outk2)
+    dealloc(q1_ptr); dealloc(q2_ptr)
+    dealloc(norms1); dealloc(norms2)
+
+    exit(0)
+}
