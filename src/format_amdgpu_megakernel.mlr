@@ -7969,6 +7969,101 @@ fn _wzm_emit_embed_bwd_view(uint64 ids_saddr, uint64 dx_kofs) {
     asm_u32(0xBFBD0000)                   // s_barrier
 }
 
+// ── Task 6 helper: in-kernel AdamW for ONE dense param tensor ─────────────
+// Mirrors std/train.mlr fn adamw_step EXACTLY (decoupled weight decay):
+//   m   = beta1*m + (1-beta1)*g
+//   v   = beta2*v + (1-beta2)*(g*g)
+//   m_hat = m * inv_bc1 ;  v_hat = v * inv_bc2
+//   denom = sqrt(v_hat) + eps              (correctly-rounded f32 sqrt)
+//   update = lr * m_hat / denom            (IEEE-correct f32 div)
+//   p   = p*decay - update
+// param/grad/m/v are updated in place.  Each kernarg slot is a global ptr.
+// The 9 f32 hyperparams are pre-loaded by the caller into uniform VGPRs:
+//   v24=inv_bc1 v25=inv_bc2 v26=decay v27=beta1 v28=beta2
+//   v29=one_m_b1 v30=one_m_b2 v31=lr v32=eps
+// N is a compile-time element count (the < N gate uses a literal).
+// Lane d=v0 strides by 512 over the N elements; the partial last block is
+// EXEC-gated (gid < N) so inactive lanes NEVER issue an OOB global op
+// (feedback_oob_address_pad_lane_wedge).  Pointers load into s[64..71].
+//   Clobbers: v1,v16..v23,v33..v40 ; s2,s34..s39,s[64:71].
+fn _wzm_emit_adamw_param(uint64 param_kofs, uint64 grad_kofs,
+                         uint64 m_kofs, uint64 v_kofs, uint64 N) {
+    asm_s_load_b64_off(32, 0, param_kofs)   // s[64:65] = param
+    asm_s_load_b64_off(33, 0, grad_kofs)    // s[66:67] = grad
+    asm_s_load_b64_off(34, 0, m_kofs)       // s[68:69] = m
+    asm_s_load_b64_off(35, 0, v_kofs)       // s[70:71] = v
+    asm_u32(0xBF89FC07)                     // lgkmcnt(0)
+
+    wzm_s_mov_b32_0(34)                     // s34 = block base = 0
+    uint64 aw_top = asm_text_len / 4
+    // s_cmp_ge_u32 s34, N  → scc; exit when base >= N  (SOPC; src1=0xFF→literal)
+    asm_u32(0xBF090000 | (0xFF << 8) | 34)   // s_cmp_ge_u32 s34, lit
+    asm_u32(N & 0xFFFFFFFF)
+    uint64 aw_exit = asm_text_len / 4
+    asm_u32(0xBFA20000)                     // s_cbranch_scc1 .Law_end (patched)
+
+    // gid = base + d (lane) → v16.
+    wzm_v_add_nc_u32_sv0(16, 34)            // v16 = s34 + v0
+    // EXEC-gate gid < N : v_cmp_gt_u32 vcc, N(lit), v16 ; saveexec s2.
+    asm_u32(0x7C980000 | (16 << 9) | 0xFF)  // v_cmp_gt_u32_e32 vcc_lo, N, v16
+    asm_u32(N & 0xFFFFFFFF)
+    asm_u32(0xBE82206A)                     // s_and_saveexec_b32 s2, vcc_lo
+    uint64 aw_execz = asm_text_len / 4
+    asm_u32(0xBFA50000)                     // s_cbranch_execz .Law_next (patched)
+
+    // byte offset = gid*4 → v17.
+    wzm_v_shl2_e32(17, 16)                  // v17 = gid*4
+
+    // load p,g,m,v.
+    wzm_gload_b32_saddr(18, 17, 64)         // v18 = p
+    wzm_gload_b32_saddr(19, 17, 66)         // v19 = g
+    wzm_gload_b32_saddr(20, 17, 68)         // v20 = m
+    wzm_gload_b32_saddr(21, 17, 70)         // v21 = v
+    asm_u32(0xBF8903F7)                     // vmcnt(0)
+
+    // m_new = beta1*m + one_m_b1*g.
+    wzm_v_mul_f32_e32(22, 27, 20)           // v22 = beta1*m
+    wzm_v_mul_f32_e32(23, 29, 19)           // v23 = one_m_b1*g
+    wzm_v_add_f32_e32(20, 22, 23)           // v20 = m_new
+    // v_new = beta2*v + one_m_b2*(g*g).
+    wzm_v_mul_f32_e32(33, 19, 19)           // v33 = g*g
+    wzm_v_mul_f32_e32(22, 28, 21)           // v22 = beta2*v
+    wzm_v_mul_f32_e32(23, 30, 33)           // v23 = one_m_b2*gg
+    wzm_v_add_f32_e32(21, 22, 23)           // v21 = v_new
+    // store m_new, v_new back.
+    wzm_gstore_b32_saddr(17, 20, 68)        // m[gid] = m_new
+    wzm_gstore_b32_saddr(17, 21, 70)        // v[gid] = v_new
+    asm_u32(0xBC7C0000)                     // vscnt(0)
+
+    // m_hat = m_new*inv_bc1 ; v_hat = v_new*inv_bc2.
+    wzm_v_mul_f32_e32(22, 20, 24)           // v22 = m_hat
+    wzm_v_mul_f32_e32(23, 21, 25)           // v23 = v_hat
+    // denom = sqrt(v_hat) + eps.
+    asm_v_sqrt_f32_e32_v(23, 23)            // v23 = sqrt(v_hat)
+    wzm_v_add_f32_e32(23, 23, 32)           // v23 = sqrt(v_hat)+eps
+    // numer = lr * m_hat.
+    wzm_v_mul_f32_e32(22, 31, 22)           // v22 = lr*m_hat
+    // update = numer / denom  (IEEE-correct f32 div; scratch v34..v39).
+    asm_v_div_f32_ieee(22, 22, 23, 34, 35, 36, 37, 38)   // v22 = numer/denom
+    // p_new = p*decay - update.
+    wzm_v_mul_f32_e32(18, 18, 26)           // v18 = p*decay
+    wzm_v_sub_f32_e32(18, 18, 22)           // v18 = p*decay - update
+    wzm_gstore_b32_saddr(17, 18, 64)        // param[gid] = p_new
+    asm_u32(0xBC7C0000)                     // vscnt(0)
+
+    // .Law_next: restore full exec, base += 512, loop.
+    uint64 aw_next = asm_text_len / 4
+    asm_patch_u32(aw_execz, 0xBFA50000 | ((aw_next - aw_execz - 1) & 0xFFFF))
+    asm_u32(0xBEFE0002)                     // s_mov_b32 exec_lo, s2 (restore)
+    // s34 += 512.
+    asm_u32((0x80 << 24) | (34 << 16) | (0xFF << 8) | 34)    // s_add_u32 s34, s34, lit
+    asm_u32(512)
+    uint64 aw_back = (aw_top - (asm_text_len / 4) - 1) & 0xFFFF
+    asm_u32(0xBFA00000 | aw_back)           // s_branch .Law_top
+    uint64 aw_end = asm_text_len / 4
+    asm_patch_u32(aw_exit, 0xBFA20000 | ((aw_end - aw_exit - 1) & 0xFFFF))
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // WZMA+InfoNCE training mega-kernel — single-workgroup, all-resident.
 //
@@ -8992,22 +9087,64 @@ fn amdgpu_lower_wzma_train_mega(uint64 kname_ptr, uint64 nl) -> uint64 {
     _wzm_emit_embed_bwd_view(40, 0x130)   // view 0 (ids1)
     _wzm_emit_embed_bwd_view(42, 0x138)   // view 1 (ids2)
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // Task 6: in-kernel AdamW for the 5 DENSE params (U,V,gw,gb,bias).  Runs
+    // AFTER backward (all grads accumulated over both views) + a barrier.  The
+    // embed param (demb) stays CPU — the launcher does sparse AdamW + H2D.
+    //   m/v moment buffers are resident kernargs (zero-init before step 1).
+    //   bias-correction scalars (inv_bc1/inv_bc2) + decay/betas/lr/eps are
+    //   passed by-value, computed CPU-side per step (matches std/train.mlr
+    //   adamw_step and bp_wzma_gpu_train_v2 launch_adamw exactly).
+    // ═══════════════════════════════════════════════════════════════════════
+    asm_u32(0xBFBD0000)   // s_barrier — embed_bwd grads visible before AdamW
+
+    // Load the 9 f32 hyperparams (kernargs 50..58, offsets 0x190..0x1D0) into
+    // uniform VGPRs v24..v32 (read by every _wzm_emit_adamw_param invocation).
+    asm_s_load_b32(19, 0, 0x190); asm_u32(0xBF89FC07); wzm_v_mov_s(24, 38)  // inv_bc1
+    asm_s_load_b32(19, 0, 0x198); asm_u32(0xBF89FC07); wzm_v_mov_s(25, 38)  // inv_bc2
+    asm_s_load_b32(19, 0, 0x1A0); asm_u32(0xBF89FC07); wzm_v_mov_s(26, 38)  // decay
+    asm_s_load_b32(19, 0, 0x1A8); asm_u32(0xBF89FC07); wzm_v_mov_s(27, 38)  // beta1
+    asm_s_load_b32(19, 0, 0x1B0); asm_u32(0xBF89FC07); wzm_v_mov_s(28, 38)  // beta2
+    asm_s_load_b32(19, 0, 0x1B8); asm_u32(0xBF89FC07); wzm_v_mov_s(29, 38)  // one_m_b1
+    asm_s_load_b32(19, 0, 0x1C0); asm_u32(0xBF89FC07); wzm_v_mov_s(30, 38)  // one_m_b2
+    asm_s_load_b32(19, 0, 0x1C8); asm_u32(0xBF89FC07); wzm_v_mov_s(31, 38)  // lr
+    asm_s_load_b32(19, 0, 0x1D0); asm_u32(0xBF89FC07); wzm_v_mov_s(32, 38)  // eps
+
+    // AdamW per dense param: (param_kofs, grad_kofs, m_kofs, v_kofs, N).
+    //   U:    w 0x18  g 0xE0  m 0x140 v 0x148  N=K*D*R=49152
+    //   V:    w 0x20  g 0xE8  m 0x150 v 0x158  N=K*R*D=49152
+    //   gw:   w 0x28  g 0xF0  m 0x160 v 0x168  N=K*D=1536
+    //   gb:   w 0x30  g 0xF8  m 0x170 v 0x178  N=K=4
+    //   bias: w 0x38  g 0x100 m 0x180 v 0x188  N=D=384
+    _wzm_emit_adamw_param(0x18, 0xE0,  0x140, 0x148, 49152)   // U
+    _wzm_emit_adamw_param(0x20, 0xE8,  0x150, 0x158, 49152)   // V
+    _wzm_emit_adamw_param(0x28, 0xF0,  0x160, 0x168, 1536)    // gw
+    _wzm_emit_adamw_param(0x30, 0xF8,  0x170, 0x178, 4)       // gb
+    _wzm_emit_adamw_param(0x38, 0x100, 0x180, 0x188, 384)     // bias
+
     asm_u32(0xBFB00000)   // s_endpgm
 
-    // ── Arg descriptor block (40 args × 8 bytes = 320 bytes) ──────────────
-    // Task 4 added arg 17 = d_loss.  Task 5 adds args 18..39:
+    // ── Arg descriptor block (59 args × 8 bytes = 472 bytes) ──────────────
+    // Task 4 added arg 17 = d_loss.  Task 5 added args 18..39:
     //   18 x1  19 x2  20 a1  21 a2  22 i1  23 i2  24 o1  25 o2  26 n1  27 n2
     //   28 dU  29 dV  30 dgw 31 dgb 32 dbias 33 demb
     //   34 dv1 35 dv2 36 dz1 37 dz2 38 dx1   39 dx2   (all global_buffer ptrs)
-    uint64 n_args = 40
+    // Task 6 adds args 40..58:
+    //   40 m_U  41 v_U  42 m_V  43 v_V  44 m_gw  45 v_gw  46 m_gb  47 v_gb
+    //   48 m_bias 49 v_bias                                  (global_buffer ptrs)
+    //   50 inv_bc1 51 inv_bc2 52 decay 53 beta1 54 beta2
+    //   55 one_m_b1 56 one_m_b2 57 lr   58 eps               (f32 by_value)
+    uint64 n_args = 59
     uint64 args_desc = alloc(n_args * 16)
     uint64 ai = 0
     while ai < n_args {
         uint64 sp = args_desc + ai * 16;       unsafe { *(sp as uint64) = 8 }
         uint64 kp = args_desc + ai * 16 + 8
-        // 12,13 = BS,D (by-value) ; everything else is a global_buffer ptr.
+        // 12,13 = BS,D (by-value) ; 50..58 = AdamW f32 hyperparams (by-value) ;
+        // everything else is a global_buffer ptr.
         if ai == 12 { unsafe { *(kp as uint64) = AMD_ARG_KIND_BY_VALUE } }
         else if ai == 13 { unsafe { *(kp as uint64) = AMD_ARG_KIND_BY_VALUE } }
+        else if ai >= 50 { unsafe { *(kp as uint64) = AMD_ARG_KIND_BY_VALUE } }
         else { unsafe { *(kp as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER } }
         ai = ai + 1
     }

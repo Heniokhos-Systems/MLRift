@@ -260,6 +260,7 @@ fn main() {
     slot = alloc(8); err = hipMalloc(slot, BS * D * 4);      if err != 0 { die_gpu("mDX2",  err) }; unsafe { *(slot as u64) -> d_dx2   }; dealloc(slot)
 
     // Zero the grad accumulators (dU,dV,dgw,dgb,dbias,demb) — kernel does += .
+    // (Re-zeroed each step inside the training loop below.)
     u64 h_zero_big = alloc(VOCAB * D * 4)
     memset(h_zero_big, 0, VOCAB * D * 4)
     err = hipMemcpy(d_dU,    h_zero_big, K * D * R * 4, 1); if err != 0 { die_gpu("z dU",    err) }
@@ -268,6 +269,57 @@ fn main() {
     err = hipMemcpy(d_dgb,   h_zero_big, K * 4,         1); if err != 0 { die_gpu("z dgb",   err) }
     err = hipMemcpy(d_dbias, h_zero_big, D * 4,         1); if err != 0 { die_gpu("z dbias", err) }
     err = hipMemcpy(d_demb,  h_zero_big, VOCAB * D * 4, 1); if err != 0 { die_gpu("z demb",  err) }
+
+    // ── Task 6: AdamW moment buffers (m/v) for the 5 dense params, GPU-resident.
+    //   Zero-init before step 1 (the kernel updates them in place each step).
+    u64 d_m_U = 0; u64 d_v_U = 0; u64 d_m_V = 0; u64 d_v_V = 0
+    u64 d_m_gw = 0; u64 d_v_gw = 0; u64 d_m_gb = 0; u64 d_v_gb = 0
+    u64 d_m_bias = 0; u64 d_v_bias = 0
+    slot = alloc(8); err = hipMalloc(slot, K * D * R * 4); if err != 0 { die_gpu("mMU",  err) }; unsafe { *(slot as u64) -> d_m_U    }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, K * D * R * 4); if err != 0 { die_gpu("mVU",  err) }; unsafe { *(slot as u64) -> d_v_U    }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, K * R * D * 4); if err != 0 { die_gpu("mMV",  err) }; unsafe { *(slot as u64) -> d_m_V    }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, K * R * D * 4); if err != 0 { die_gpu("mVV",  err) }; unsafe { *(slot as u64) -> d_v_V    }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, K * D * 4);     if err != 0 { die_gpu("mMGW", err) }; unsafe { *(slot as u64) -> d_m_gw   }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, K * D * 4);     if err != 0 { die_gpu("mVGW", err) }; unsafe { *(slot as u64) -> d_v_gw   }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, K * 4);         if err != 0 { die_gpu("mMGB", err) }; unsafe { *(slot as u64) -> d_m_gb   }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, K * 4);         if err != 0 { die_gpu("mVGB", err) }; unsafe { *(slot as u64) -> d_v_gb   }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, D * 4);         if err != 0 { die_gpu("mMBI", err) }; unsafe { *(slot as u64) -> d_m_bias }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, D * 4);         if err != 0 { die_gpu("mVBI", err) }; unsafe { *(slot as u64) -> d_v_bias }; dealloc(slot)
+    err = hipMemcpy(d_m_U,    h_zero_big, K * D * R * 4, 1); if err != 0 { die_gpu("z mU",  err) }
+    err = hipMemcpy(d_v_U,    h_zero_big, K * D * R * 4, 1); if err != 0 { die_gpu("z vU",  err) }
+    err = hipMemcpy(d_m_V,    h_zero_big, K * R * D * 4, 1); if err != 0 { die_gpu("z mV",  err) }
+    err = hipMemcpy(d_v_V,    h_zero_big, K * R * D * 4, 1); if err != 0 { die_gpu("z vV",  err) }
+    err = hipMemcpy(d_m_gw,   h_zero_big, K * D * 4,     1); if err != 0 { die_gpu("z mgw", err) }
+    err = hipMemcpy(d_v_gw,   h_zero_big, K * D * 4,     1); if err != 0 { die_gpu("z vgw", err) }
+    err = hipMemcpy(d_m_gb,   h_zero_big, K * 4,         1); if err != 0 { die_gpu("z mgb", err) }
+    err = hipMemcpy(d_v_gb,   h_zero_big, K * 4,         1); if err != 0 { die_gpu("z vgb", err) }
+    err = hipMemcpy(d_m_bias, h_zero_big, D * 4,         1); if err != 0 { die_gpu("z mbi", err) }
+    err = hipMemcpy(d_v_bias, h_zero_big, D * 4,         1); if err != 0 { die_gpu("z vbi", err) }
+
+    // CPU moment buffers for the sparse embedding AdamW (stays on CPU).
+    u64 m_emb = alloc(VOCAB * D * 4); memset(m_emb, 0, VOCAB * D * 4)
+    u64 v_emb = alloc(VOCAB * D * 4); memset(v_emb, 0, VOCAB * D * 4)
+    // u64 token-id arrays for the CPU embed AdamW dedup + embed_bwd reference.
+    u64 ids1_u64 = alloc(BS * 8)
+    u64 ids2_u64 = alloc(BS * 8)
+    u64 cvi = 0
+    while cvi < BS {
+        u32 a1 = 0; u32 a2 = 0
+        unsafe { *((ids1_i32 + cvi * 4) as u32) -> a1 }
+        unsafe { *((ids2_i32 + cvi * 4) as u32) -> a2 }
+        u64 u1 = a1; u64 u2 = a2
+        unsafe { *((ids1_u64 + cvi * 8) as u64) = u1 }
+        unsafe { *((ids2_u64 + cvi * 8) as u64) = u2 }
+        cvi = cvi + 1
+    }
+
+    // AdamW hyperparams (match std/train.mlr adamw_step + bench).
+    f32 lr    = 1e-3f
+    f32 beta1 = 0.9f
+    f32 beta2 = 0.999f
+    f32 eps   = 1e-8f
+    f32 wd    = 0.01f
+    u64 h_demb = alloc(VOCAB * D * 4)
 
     // H2D: all forward inputs (both views' ids)
     err = hipMemcpy(d_emb,  emb_ptr,  VOCAB * D * 4, 1); if err != 0 { die_gpu("H2D emb",  err) }
@@ -282,7 +334,7 @@ fn main() {
 
     // ── Launch ONE 1-WG / 512-thread dispatch (embed + WZMA fwd + pool/norm,
     //    both views) ────────────────────────────────────────────────────────
-    u64 NA = 40
+    u64 NA = 59
     u64 p0  = alloc(8); unsafe { *(p0  as u64) = d_ids }
     u64 p1  = alloc(8); unsafe { *(p1  as u64) = d_emb }
     u64 p2  = alloc(8); unsafe { *(p2  as u64) = d_x_out }
@@ -323,6 +375,27 @@ fn main() {
     u64 p37 = alloc(8); unsafe { *(p37 as u64) = d_dz2 }
     u64 p38 = alloc(8); unsafe { *(p38 as u64) = d_dx1 }
     u64 p39 = alloc(8); unsafe { *(p39 as u64) = d_dx2 }
+    // Task 6: AdamW m/v ptrs (40..49) + f32 hyperparam scalars (50..58).
+    // Scalar values (inv_bc1/inv_bc2 + derived) are (re)written per step below.
+    u64 p40 = alloc(8); unsafe { *(p40 as u64) = d_m_U }
+    u64 p41 = alloc(8); unsafe { *(p41 as u64) = d_v_U }
+    u64 p42 = alloc(8); unsafe { *(p42 as u64) = d_m_V }
+    u64 p43 = alloc(8); unsafe { *(p43 as u64) = d_v_V }
+    u64 p44 = alloc(8); unsafe { *(p44 as u64) = d_m_gw }
+    u64 p45 = alloc(8); unsafe { *(p45 as u64) = d_v_gw }
+    u64 p46 = alloc(8); unsafe { *(p46 as u64) = d_m_gb }
+    u64 p47 = alloc(8); unsafe { *(p47 as u64) = d_v_gb }
+    u64 p48 = alloc(8); unsafe { *(p48 as u64) = d_m_bias }
+    u64 p49 = alloc(8); unsafe { *(p49 as u64) = d_v_bias }
+    u64 p50 = alloc(8)   // inv_bc1
+    u64 p51 = alloc(8)   // inv_bc2
+    u64 p52 = alloc(8)   // decay
+    u64 p53 = alloc(8)   // beta1
+    u64 p54 = alloc(8)   // beta2
+    u64 p55 = alloc(8)   // one_m_b1
+    u64 p56 = alloc(8)   // one_m_b2
+    u64 p57 = alloc(8)   // lr
+    u64 p58 = alloc(8)   // eps
     u64 kp = alloc(NA * 8)
     unsafe { *((kp +   0) as u64) = p0 }
     unsafe { *((kp +   8) as u64) = p1 }
@@ -364,13 +437,128 @@ fn main() {
     unsafe { *((kp + 296) as u64) = p37 }
     unsafe { *((kp + 304) as u64) = p38 }
     unsafe { *((kp + 312) as u64) = p39 }
+    unsafe { *((kp + 320) as u64) = p40 }
+    unsafe { *((kp + 328) as u64) = p41 }
+    unsafe { *((kp + 336) as u64) = p42 }
+    unsafe { *((kp + 344) as u64) = p43 }
+    unsafe { *((kp + 352) as u64) = p44 }
+    unsafe { *((kp + 360) as u64) = p45 }
+    unsafe { *((kp + 368) as u64) = p46 }
+    unsafe { *((kp + 376) as u64) = p47 }
+    unsafe { *((kp + 384) as u64) = p48 }
+    unsafe { *((kp + 392) as u64) = p49 }
+    unsafe { *((kp + 400) as u64) = p50 }
+    unsafe { *((kp + 408) as u64) = p51 }
+    unsafe { *((kp + 416) as u64) = p52 }
+    unsafe { *((kp + 424) as u64) = p53 }
+    unsafe { *((kp + 432) as u64) = p54 }
+    unsafe { *((kp + 440) as u64) = p55 }
+    unsafe { *((kp + 448) as u64) = p56 }
+    unsafe { *((kp + 456) as u64) = p57 }
+    unsafe { *((kp + 464) as u64) = p58 }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // Training loop (Task 6 validation = v2 frozen-loss killer).  Two steps:
+    //   loss[0] must = 3.059341 ; loss[1] must ≈ 0.048 (DROPPING proves the
+    //   in-kernel AdamW actually updates the resident weights).
+    // Each step: re-zero grads, set per-step bias-correction scalars, launch
+    // ONE dispatch (fwd + bwd + dense AdamW), read loss, then CPU sparse embed
+    // AdamW + sparse H2D of touched rows.
+    // ═══════════════════════════════════════════════════════════════════════
     u32 grid  = 1
     u32 block = 512
-    err = hipModuleLaunchKernel(fh, grid, 1, 1, block, 1, 1, 0, 0, kp, 0)
-    if err != 0 { die_gpu("launch wzma_train_mega", err) }
-    err = hipDeviceSynchronize()
-    if err != 0 { die_gpu("sync", err) }
+    u64 STEPS = 2
+    f32 loss0_saved = 0.0f
+    f32 loss1_saved = 0.0f
+    u64 step = 0
+    while step < STEPS {
+        u64 step1 = step + 1
+
+        // Re-zero the 6 grad accumulators (kernel does += over both views).
+        err = hipMemcpy(d_dU,    h_zero_big, K * D * R * 4, 1); if err != 0 { die_gpu("rz dU",    err) }
+        err = hipMemcpy(d_dV,    h_zero_big, K * R * D * 4, 1); if err != 0 { die_gpu("rz dV",    err) }
+        err = hipMemcpy(d_dgw,   h_zero_big, K * D * 4,     1); if err != 0 { die_gpu("rz dgw",   err) }
+        err = hipMemcpy(d_dgb,   h_zero_big, K * 4,         1); if err != 0 { die_gpu("rz dgb",   err) }
+        err = hipMemcpy(d_dbias, h_zero_big, D * 4,         1); if err != 0 { die_gpu("rz dbias", err) }
+        err = hipMemcpy(d_demb,  h_zero_big, VOCAB * D * 4, 1); if err != 0 { die_gpu("rz demb",  err) }
+
+        // Per-step bias-correction scalars (CPU side; matches launch_adamw).
+        f32 b1p = 1.0f; f32 b2p = 1.0f
+        u64 tt = 0
+        while tt < step1 { b1p = b1p * beta1; b2p = b2p * beta2; tt = tt + 1 }
+        f32 one      = 1.0f
+        f32 inv_bc1  = one / (one - b1p)
+        f32 inv_bc2  = one / (one - b2p)
+        f32 decay    = one - lr * wd
+        f32 one_m_b1 = one - beta1
+        f32 one_m_b2 = one - beta2
+        unsafe { *(p50 as f32) = inv_bc1 }
+        unsafe { *(p51 as f32) = inv_bc2 }
+        unsafe { *(p52 as f32) = decay }
+        unsafe { *(p53 as f32) = beta1 }
+        unsafe { *(p54 as f32) = beta2 }
+        unsafe { *(p55 as f32) = one_m_b1 }
+        unsafe { *(p56 as f32) = one_m_b2 }
+        unsafe { *(p57 as f32) = lr }
+        unsafe { *(p58 as f32) = eps }
+
+        err = hipModuleLaunchKernel(fh, grid, 1, 1, block, 1, 1, 0, 0, kp, 0)
+        if err != 0 { die_gpu("launch wzma_train_mega", err) }
+        err = hipDeviceSynchronize()
+        if err != 0 { die_gpu("sync", err) }
+
+        // Read the scalar InfoNCE loss for this step (computed with the
+        // weights as they were ON ENTRY — before this step's AdamW update).
+        u64 h_loss_s = alloc(4)
+        err = hipMemcpy(h_loss_s, d_loss, 4, 2); if err != 0 { die_gpu("D2H loss", err) }
+        f32 loss_s = 0.0f
+        unsafe { *(h_loss_s as f32) -> loss_s }
+        dealloc(h_loss_s)
+        if step == 0 { loss0_saved = loss_s }
+        if step == 1 { loss1_saved = loss_s }
+        print_str("loss[")
+        u64 sstr = fmt_dec(step); print_str(sstr); dealloc(sstr)
+        print_str("] = ")
+        u64 lstr = fmt_f32(loss_s, 6); print_str(lstr); dealloc(lstr)
+        print_str("\n")
+
+        // ── Sparse embedding AdamW (CPU) + sparse H2D of updated rows ──────
+        err = hipMemcpy(h_demb, d_demb, VOCAB * D * 4, 2); if err != 0 { die_gpu("D2H demb", err) }
+        u64 uniq    = alloc(2 * BS * 8)
+        u64 n_uniq  = 0
+        u64 gi = 0
+        while gi < 2 * BS {
+            u64 cand = 0
+            if gi < BS { unsafe { *((ids1_u64 + gi * 8) as u64) -> cand } }
+            else       { unsafe { *((ids2_u64 + (gi - BS) * 8) as u64) -> cand } }
+            u64 found = 0
+            u64 ui = 0
+            while ui < n_uniq {
+                u64 existing = 0; unsafe { *((uniq + ui * 8) as u64) -> existing }
+                if existing == cand { found = 1 }
+                ui = ui + 1
+            }
+            if found == 0 {
+                unsafe { *((uniq + n_uniq * 8) as u64) = cand }
+                n_uniq = n_uniq + 1
+            }
+            gi = gi + 1
+        }
+        u64 uii = 0
+        while uii < n_uniq {
+            u64 row = 0; unsafe { *((uniq + uii * 8) as u64) -> row }
+            adamw_step(emb_ptr + row * D * 4, h_demb + row * D * 4,
+                       m_emb + row * D * 4, v_emb + row * D * 4,
+                       D, step1, lr, beta1, beta2, eps, wd)
+            err = hipMemcpy(d_emb + row * D * 4, emb_ptr + row * D * 4, D * 4, 1)
+            if err != 0 { die_gpu("H2D emb_row", err) }
+            uii = uii + 1
+        }
+        dealloc(uniq)
+
+        step = step + 1
+    }
+    print_str("Training loop (2 steps) + sync OK.\n")
 
     dealloc(p0); dealloc(p1); dealloc(p2); dealloc(p3); dealloc(p4); dealloc(p5); dealloc(p6)
     dealloc(p7); dealloc(p8); dealloc(p9); dealloc(p10); dealloc(p11); dealloc(p12); dealloc(p13)
@@ -378,314 +566,52 @@ fn main() {
     dealloc(p18); dealloc(p19); dealloc(p20); dealloc(p21); dealloc(p22); dealloc(p23); dealloc(p24)
     dealloc(p25); dealloc(p26); dealloc(p27); dealloc(p28); dealloc(p29); dealloc(p30); dealloc(p31)
     dealloc(p32); dealloc(p33); dealloc(p34); dealloc(p35); dealloc(p36); dealloc(p37); dealloc(p38); dealloc(p39)
+    dealloc(p40); dealloc(p41); dealloc(p42); dealloc(p43); dealloc(p44); dealloc(p45); dealloc(p46)
+    dealloc(p47); dealloc(p48); dealloc(p49); dealloc(p50); dealloc(p51); dealloc(p52); dealloc(p53)
+    dealloc(p54); dealloc(p55); dealloc(p56); dealloc(p57); dealloc(p58)
     dealloc(kp)
-    print_str("Launch + sync OK.\n")
-
-    // ── D2H gathered embed output + WZMA forward output ────────────────────
-    u64 h_x_gpu   = alloc(BS * D * 4)
-    u64 h_out_gpu = alloc(BS * D * 4)
-    // Task 5: the gathered embed input now persists per-view in d_x1/d_x2
-    // (the shared d_x_out scratch is no longer written).  view-1 = d_x2.
-    err = hipMemcpy(h_x_gpu,   d_x2, BS * D * 4, 2); if err != 0 { die_gpu("D2H x_out", err) }
-    err = hipMemcpy(h_out_gpu, d_out,   BS * D * 4, 2); if err != 0 { die_gpu("D2H out",   err) }
-
-    // ── CPU references ──────────────────────────────────────────────────────
-    // The view loop runs ids1 then ids2 through the SHARED x_out/out scratch,
-    // so the resident GPU x_out/out hold the LAST view (ids2).  v1 (view-0) is
-    // built from the ids1 wzma_fwd output (h_out_ref); the embed/wzma_fwd
-    // scratch checks below use the ids2 references (h_x_ref2/h_out_ref2).
-    // wzma_f32_fwd treats x as [B,S,D]; with B=BS, S=1 the (b*S+s) index == bs,
-    // matching the GPU [BS,D] flat layout exactly.
-
-    // ids1 (view-0) — used by the v1 mean-pool + L2-norm reference.
-    u64 h_x_ref     = alloc(BS * D * 4)
-    cpu_embed_i32(h_x_ref, emb_ptr, ids1_i32, BS, D)
-    u64 h_out_ref   = alloc(BS * D * 4)
-    u64 ref_alpha   = alloc(BS * K * 4)
-    u64 ref_inter   = alloc(BS * K * R * 4)
-    u64 ref_outk    = alloc(BS * K * D * 4)
-    wzma_f32_fwd(h_x_ref, h_out_ref, U_ptr, V_ptr, gw_ptr, gb_ptr, bias_ptr,
-                 BS, 1, D, K, R, ref_alpha, ref_inter, ref_outk)
-
-    // ids2 (view-1, last view) — matches the resident GPU x_out/out scratch.
-    u64 h_x_ref2    = alloc(BS * D * 4)
-    cpu_embed_i32(h_x_ref2, emb_ptr, ids2_i32, BS, D)
-    u64 h_out_ref2  = alloc(BS * D * 4)
-    u64 ref_alpha2  = alloc(BS * K * 4)
-    u64 ref_inter2  = alloc(BS * K * R * 4)
-    u64 ref_outk2   = alloc(BS * K * D * 4)
-    wzma_f32_fwd(h_x_ref2, h_out_ref2, U_ptr, V_ptr, gw_ptr, gb_ptr, bias_ptr,
-                 BS, 1, D, K, R, ref_alpha2, ref_inter2, ref_outk2)
-
-    // ── Compare embed output (bit-exact) — GPU scratch is view-1 (ids2) ──────
-    f32 max_err_e = 0.0f
-    u64 ne = BS * D
-    u64 ie = 0
-    while ie < ne {
-        f32 g = 0.0f; f32 r = 0.0f
-        unsafe { *((h_x_gpu  + ie * 4) as f32) -> g }
-        unsafe { *((h_x_ref2 + ie * 4) as f32) -> r }
-        f32 e = abs_f32(g - r)
-        if e > max_err_e { max_err_e = e }
-        ie = ie + 1
-    }
-    if max_err_e < 1e-5f { print_str("embed PASS max_err ") }
-    else                 { print_str("embed FAIL max_err ") }
-    u64 ese = fmt_f32(max_err_e, 7); print_str(ese); dealloc(ese)
-    print_str("\n")
-
-    // ── Compare WZMA forward output over BS*D — GPU scratch is view-1 (ids2) ──
-    f32 max_err = 0.0f
-    u64 n = BS * D
-    u64 i = 0
-    while i < n {
-        f32 g = 0.0f; f32 r = 0.0f
-        unsafe { *((h_out_gpu  + i * 4) as f32) -> g }
-        unsafe { *((h_out_ref2 + i * 4) as f32) -> r }
-        f32 e = abs_f32(g - r)
-        if e > max_err { max_err = e }
-        i = i + 1
-    }
-    if max_err < 1e-3f { print_str("wzma_fwd PASS max_err ") }
-    else               { print_str("wzma_fwd FAIL max_err ") }
-    u64 es = fmt_f32(max_err, 7); print_str(es); dealloc(es)
-    print_str("\n")
-
     // ═══════════════════════════════════════════════════════════════════════
-    // Task 3: validate v1[B,D] = L2norm(mean_pool_S(wzma_fwd(embed(ids1))))
-    // against PyTorch GPU encoder output bench_gpu_v1.bin (the GPU↔GPU gate).
+    // Task 6 validation — the v2 frozen-loss killer.
+    //   loss[0] must = 3.059341 (initial weights) ; loss[1] must ≈ 0.048
+    //   (matches MLRiftBench/tools/bench_ref.json cpu_losses[0..1], tol 1e-2).
+    //   loss[1] DROPPING (not frozen at 3.059) proves the in-kernel AdamW
+    //   actually updates the resident dense weights + the CPU sparse-embed
+    //   AdamW updates the embedding rows.
     // ═══════════════════════════════════════════════════════════════════════
-    u64 h_v1_gpu = alloc(B * D * 4)
-    u64 h_v2_gpu = alloc(B * D * 4)
-    err = hipMemcpy(h_v1_gpu, d_v1, B * D * 4, 2); if err != 0 { die_gpu("D2H v1", err) }
-    err = hipMemcpy(h_v2_gpu, d_v2, B * D * 4, 2); if err != 0 { die_gpu("D2H v2", err) }
+    print_str("--- Task 6: 2-step training validation ---\n")
+    f32 ref0 = 3.059341f
+    f32 ref1 = 0.04791371f
 
-    // CPU reference (exact port of std/train.mlr mean_pool_s_f32 + l2_normalize_f32)
-    // over the GPU's own wzma_fwd output, then compare GPU↔CPU (consistency).
-    u64 h_pooled_ref = alloc(B * D * 4)
-    mean_pool_s_f32(h_out_ref, h_pooled_ref, B, S, D)
-    l2_normalize_f32(h_pooled_ref, B, D)
-
-    // Load PyTorch GPU encoder reference v1[B,D].
-    u64 v1_path = "/home/pantelis/Desktop/Projects/Work/MLRiftBench/tools/bench_gpu_v1.bin"
-    u64 h_v1_bench = alloc(B * D * 4)
-    u64 vfd = file_open(v1_path, 0)
-    if vfd > 0xFFFFFFFFFFFFF000 {
-        print_str("Cannot open bench_gpu_v1.bin\n")
-        hipkfd_teardown(); exit(1)
-    }
-    file_read(vfd, h_v1_bench, B * D * 4)
-    file_close(vfd)
-
-    // GPU v1 vs PyTorch GPU bench (THE gate).
-    f32 max_err_v1 = 0.0f
-    u64 nv = B * D
-    u64 iv = 0
-    while iv < nv {
-        f32 g = 0.0f; f32 r = 0.0f
-        unsafe { *((h_v1_gpu   + iv * 4) as f32) -> g }
-        unsafe { *((h_v1_bench + iv * 4) as f32) -> r }
-        f32 e = abs_f32(g - r)
-        if e > max_err_v1 { max_err_v1 = e }
-        iv = iv + 1
-    }
-    if max_err_v1 < 1e-3f { print_str("v1 PASS max_err ") }
-    else                  { print_str("v1 FAIL max_err ") }
-    u64 ev1 = fmt_f32(max_err_v1, 7); print_str(ev1); dealloc(ev1)
-    print_str("\n")
-
-    // GPU v1 vs CPU-ref v1 (std/train.mlr consistency check).
-    f32 max_err_v1c = 0.0f
-    iv = 0
-    while iv < nv {
-        f32 g = 0.0f; f32 r = 0.0f
-        unsafe { *((h_v1_gpu     + iv * 4) as f32) -> g }
-        unsafe { *((h_pooled_ref + iv * 4) as f32) -> r }
-        f32 e = abs_f32(g - r)
-        if e > max_err_v1c { max_err_v1c = e }
-        iv = iv + 1
-    }
-    if max_err_v1c < 1e-3f { print_str("v1-vs-CPU PASS max_err ") }
-    else                   { print_str("v1-vs-CPU FAIL max_err ") }
-    u64 ev1c = fmt_f32(max_err_v1c, 7); print_str(ev1c); dealloc(ev1c)
-    print_str("\n")
-
-    // GPU v2 vs CPU-ref v2 (view-1 mean-pool + L2-norm of ids2 fwd).
-    u64 h_pooled_ref2 = alloc(B * D * 4)
-    mean_pool_s_f32(h_out_ref2, h_pooled_ref2, B, S, D)
-    l2_normalize_f32(h_pooled_ref2, B, D)
-    f32 max_err_v2c = 0.0f
-    iv = 0
-    while iv < nv {
-        f32 g = 0.0f; f32 r = 0.0f
-        unsafe { *((h_v2_gpu      + iv * 4) as f32) -> g }
-        unsafe { *((h_pooled_ref2 + iv * 4) as f32) -> r }
-        f32 e = abs_f32(g - r)
-        if e > max_err_v2c { max_err_v2c = e }
-        iv = iv + 1
-    }
-    if max_err_v2c < 1e-3f { print_str("v2-vs-CPU PASS max_err ") }
-    else                   { print_str("v2-vs-CPU FAIL max_err ") }
-    u64 ev2c = fmt_f32(max_err_v2c, 7); print_str(ev2c); dealloc(ev2c)
-    print_str("\n")
-
-    // Sanity: v2 differs from v1 (two distinct views actually ran).
-    f32 max_diff_v = 0.0f
-    iv = 0
-    while iv < nv {
-        f32 a = 0.0f; f32 c = 0.0f
-        unsafe { *((h_v1_gpu + iv * 4) as f32) -> a }
-        unsafe { *((h_v2_gpu + iv * 4) as f32) -> c }
-        f32 e = abs_f32(a - c)
-        if e > max_diff_v { max_diff_v = e }
-        iv = iv + 1
-    }
-    print_str("v1-v2 max abs diff (should be >0): ")
-    u64 evd = fmt_f32(max_diff_v, 7); print_str(evd); dealloc(evd)
-    print_str("\n")
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // Task 4 (FORWARD complete): InfoNCE scalar loss.
-    //   Expected loss[0] = 3.059341 (= MLRiftBench bench_ref.json cpu_losses[0],
-    //   tol 1e-2).  GPU kernel matches std/train.mlr fn infonce_f32 (tau=0.1,
-    //   B=8, no re-normalisation — F.normalize idempotent on unit vectors).
-    // ═══════════════════════════════════════════════════════════════════════
-    // CPU reference: infonce_f32 over the GPU's own downloaded v1/v2 (isolates
-    // whether a loss mismatch is in the GPU loss math or upstream in v1/v2).
-    f32 cpu_loss = infonce_f32(h_v1_gpu, h_v2_gpu, 0.1f, B, D)
-    print_str("CPU infonce_f32(GPU v1,v2) = ")
-    u64 ecl = fmt_f32(cpu_loss, 6); print_str(ecl); dealloc(ecl)
-    print_str("\n")
-
-    u64 h_loss = alloc(4)
-    err = hipMemcpy(h_loss, d_loss, 4, 2); if err != 0 { die_gpu("D2H loss", err) }
-    f32 loss0 = 0.0f
-    unsafe { *(h_loss as f32) -> loss0 }
     print_str("loss[0] = ")
-    u64 els = fmt_f32(loss0, 6); print_str(els); dealloc(els)
-    print_str("\n")
-    f32 loss_ref = 3.059341f
-    f32 loss_err = abs_f32(loss0 - loss_ref)
-    if loss_err < 1e-2f { print_str("loss PASS (vs 3.059341) err ") }
-    else                { print_str("loss FAIL (vs 3.059341) err ") }
-    u64 ele = fmt_f32(loss_err, 6); print_str(ele); dealloc(ele)
-    print_str("\n")
+    u64 l0s = fmt_f32(loss0_saved, 6); print_str(l0s); dealloc(l0s)
+    print_str(" (ref 3.059341)\n")
+    print_str("loss[1] = ")
+    u64 l1s = fmt_f32(loss1_saved, 6); print_str(l1s); dealloc(l1s)
+    print_str(" (ref 0.047914)\n")
 
-    // ═══════════════════════════════════════════════════════════════════════
-    // Task 5 — BACKWARD validation.  Build the CPU reference by running
-    // std/train.mlr's backward ops on the GPU's OWN forward activations
-    // (downloaded), then compare each GPU grad buffer.  This isolates the GPU
-    // backward MATH (forward precision already validated in T3/T4).
-    //   Chain: infonce_bwd(dv) → l2norm_bwd(dp) → meanpool_bwd(dz)
-    //        → wzma_bwd(dU,dV,dgw,dgb,dbias,dx) → embed_bwd(demb), per view,
-    //          grads accumulated over both views.
-    // ═══════════════════════════════════════════════════════════════════════
-    print_str("--- Task 5 backward validation ---\n")
-    f32 tau = 0.1f
+    f32 e0 = abs_f32(loss0_saved - ref0)
+    f32 e1 = abs_f32(loss1_saved - ref1)
+    u64 ok0 = 0
+    if e0 < 1e-2f { print_str("loss[0] PASS err "); ok0 = 1 }
+    else          { print_str("loss[0] FAIL err ") }
+    u64 e0s = fmt_f32(e0, 6); print_str(e0s); dealloc(e0s); print_str("\n")
+    u64 ok1 = 0
+    if e1 < 1e-2f { print_str("loss[1] PASS err "); ok1 = 1 }
+    else          { print_str("loss[1] FAIL err ") }
+    u64 e1s = fmt_f32(e1, 6); print_str(e1s); dealloc(e1s); print_str("\n")
 
-    // D2H the GPU's saved per-view forward activations + norms.
-    u64 h_x1 = alloc(BS * D * 4);  u64 h_x2 = alloc(BS * D * 4)
-    u64 h_a1 = alloc(BS * K * 4);  u64 h_a2 = alloc(BS * K * 4)
-    u64 h_i1 = alloc(BS * K * R * 4); u64 h_i2 = alloc(BS * K * R * 4)
-    u64 h_o1 = alloc(BS * K * D * 4); u64 h_o2 = alloc(BS * K * D * 4)
-    u64 h_n1 = alloc(B * 4);       u64 h_n2 = alloc(B * 4)
-    err = hipMemcpy(h_x1, d_x1, BS * D * 4, 2);     if err != 0 { die_gpu("D2H x1", err) }
-    err = hipMemcpy(h_x2, d_x2, BS * D * 4, 2);     if err != 0 { die_gpu("D2H x2", err) }
-    err = hipMemcpy(h_a1, d_a1, BS * K * 4, 2);     if err != 0 { die_gpu("D2H a1", err) }
-    err = hipMemcpy(h_a2, d_a2, BS * K * 4, 2);     if err != 0 { die_gpu("D2H a2", err) }
-    err = hipMemcpy(h_i1, d_i1, BS * K * R * 4, 2); if err != 0 { die_gpu("D2H i1", err) }
-    err = hipMemcpy(h_i2, d_i2, BS * K * R * 4, 2); if err != 0 { die_gpu("D2H i2", err) }
-    err = hipMemcpy(h_o1, d_o1, BS * K * D * 4, 2); if err != 0 { die_gpu("D2H o1", err) }
-    err = hipMemcpy(h_o2, d_o2, BS * K * D * 4, 2); if err != 0 { die_gpu("D2H o2", err) }
-    err = hipMemcpy(h_n1, d_n1, B * 4, 2);          if err != 0 { die_gpu("D2H n1", err) }
-    err = hipMemcpy(h_n2, d_n2, B * 4, 2);          if err != 0 { die_gpu("D2H n2", err) }
-
-    // CPU reference: infonce_bwd → l2norm_bwd → meanpool_bwd, both views.
-    // Inputs q1/q2 = the GPU's downloaded v1/v2 (h_v1_gpu/h_v2_gpu).
-    u64 r_dv1 = alloc(B * D * 4);  u64 r_dv2 = alloc(B * D * 4)
-    u64 r_dp1 = alloc(B * D * 4);  u64 r_dp2 = alloc(B * D * 4)
-    u64 r_dz1 = alloc(BS * D * 4); u64 r_dz2 = alloc(BS * D * 4)
-    infonce_bwd(h_v1_gpu, h_v2_gpu, tau, B, D, r_dv1, r_dv2)
-    l2norm_bwd(r_dv1, h_v1_gpu, h_n1, B, D, r_dp1)
-    l2norm_bwd(r_dv2, h_v2_gpu, h_n2, B, D, r_dp2)
-    meanpool_bwd(r_dp1, B, S, D, r_dz1)
-    meanpool_bwd(r_dp2, B, S, D, r_dz2)
-
-    // CPU reference grads (accumulated over both views).
-    u64 r_dU    = alloc(K * D * R * 4)
-    u64 r_dV    = alloc(K * R * D * 4)
-    u64 r_dgw   = alloc(K * D * 4)
-    u64 r_dgb   = alloc(K * 4)
-    u64 r_dbias = alloc(D * 4)
-    u64 r_demb  = alloc(VOCAB * D * 4)
-    u64 r_dx1   = alloc(BS * D * 4)
-    u64 r_dx2   = alloc(BS * D * 4)
-    memset(r_dU, 0, K * D * R * 4); memset(r_dV, 0, K * R * D * 4)
-    memset(r_dgw, 0, K * D * 4);    memset(r_dgb, 0, K * 4)
-    memset(r_dbias, 0, D * 4);      memset(r_demb, 0, VOCAB * D * 4)
-    // wzma_bwd treats x as [B,S,D]; with B=BS, S=1 the (b*S+s) index == bs,
-    // matching the GPU [BS,D] flat layout — same trick as the fwd validation.
-    wzma_bwd(r_dz1, h_x1, h_a1, h_i1, h_o1, U_ptr, V_ptr, gw_ptr,
-             BS, 1, D, K, R, r_dU, r_dV, r_dgw, r_dgb, r_dbias, r_dx1)
-    wzma_bwd(r_dz2, h_x2, h_a2, h_i2, h_o2, U_ptr, V_ptr, gw_ptr,
-             BS, 1, D, K, R, r_dU, r_dV, r_dgw, r_dgb, r_dbias, r_dx2)
-    // embed_bwd scatter-add into r_demb (uses u64 ids over [B,S]; B*S=BS).
-    u64 ids1_u64 = alloc(BS * 8)
-    u64 ids2_u64 = alloc(BS * 8)
-    u64 ci = 0
-    while ci < BS {
-        u32 a1 = 0; u32 a2 = 0
-        unsafe { *((ids1_i32 + ci * 4) as u32) -> a1 }
-        unsafe { *((ids2_i32 + ci * 4) as u32) -> a2 }
-        u64 u1 = a1; u64 u2 = a2
-        unsafe { *((ids1_u64 + ci * 8) as u64) = u1 }
-        unsafe { *((ids2_u64 + ci * 8) as u64) = u2 }
-        ci = ci + 1
+    // The DROP check: loss[1] must be far below loss[0] (frozen → FAIL).
+    if loss1_saved < loss0_saved {
+        print_str("loss DROPPED (")
+        u64 ds = fmt_f32(loss0_saved - loss1_saved, 6); print_str(ds); dealloc(ds)
+        print_str(") — weights updated, NOT frozen\n")
+    } else {
+        print_str("loss FROZEN — AdamW did NOT update weights (v2 bug)\n")
     }
-    embed_bwd(r_dx1, ids1_u64, B, S, D, r_demb)
-    embed_bwd(r_dx2, ids2_u64, B, S, D, r_demb)
 
-    // D2H GPU grads + intermediates and compare.
-    u64 g_dv1 = alloc(B * D * 4);  u64 g_dv2 = alloc(B * D * 4)
-    u64 g_dz1 = alloc(BS * D * 4); u64 g_dz2 = alloc(BS * D * 4)
-    u64 g_dx1 = alloc(BS * D * 4); u64 g_dx2 = alloc(BS * D * 4)
-    u64 g_dU    = alloc(K * D * R * 4)
-    u64 g_dV    = alloc(K * R * D * 4)
-    u64 g_dgw   = alloc(K * D * 4)
-    u64 g_dgb   = alloc(K * 4)
-    u64 g_dbias = alloc(D * 4)
-    u64 g_demb  = alloc(VOCAB * D * 4)
-    err = hipMemcpy(g_dv1, d_dv1, B * D * 4, 2);     if err != 0 { die_gpu("D2H g_dv1", err) }
-    err = hipMemcpy(g_dv2, d_dv2, B * D * 4, 2);     if err != 0 { die_gpu("D2H g_dv2", err) }
-    err = hipMemcpy(g_dz1, d_dz1, BS * D * 4, 2);    if err != 0 { die_gpu("D2H g_dz1", err) }
-    err = hipMemcpy(g_dz2, d_dz2, BS * D * 4, 2);    if err != 0 { die_gpu("D2H g_dz2", err) }
-    err = hipMemcpy(g_dx1, d_dx1, BS * D * 4, 2);    if err != 0 { die_gpu("D2H g_dx1", err) }
-    err = hipMemcpy(g_dx2, d_dx2, BS * D * 4, 2);    if err != 0 { die_gpu("D2H g_dx2", err) }
-    err = hipMemcpy(g_dU,    d_dU,    K * D * R * 4, 2); if err != 0 { die_gpu("D2H g_dU",    err) }
-    err = hipMemcpy(g_dV,    d_dV,    K * R * D * 4, 2); if err != 0 { die_gpu("D2H g_dV",    err) }
-    err = hipMemcpy(g_dgw,   d_dgw,   K * D * 4,     2); if err != 0 { die_gpu("D2H g_dgw",   err) }
-    err = hipMemcpy(g_dgb,   d_dgb,   K * 4,         2); if err != 0 { die_gpu("D2H g_dgb",   err) }
-    err = hipMemcpy(g_dbias, d_dbias, D * 4,         2); if err != 0 { die_gpu("D2H g_dbias", err) }
-    err = hipMemcpy(g_demb,  d_demb,  VOCAB * D * 4, 2); if err != 0 { die_gpu("D2H g_demb",  err) }
+    if ok0 * ok1 == 1 { print_str("TASK 6 PASS\n") }
+    else              { print_str("TASK 6 FAIL\n") }
 
-    // Intermediate checks (debug aid — not in the "6 grads" tally).
-    cmp_grad("dv1 (infonce_bwd)", g_dv1, r_dv1, B * D)
-    cmp_grad("dv2 (infonce_bwd)", g_dv2, r_dv2, B * D)
-    cmp_grad("dz1 (l2+meanpool)", g_dz1, r_dz1, BS * D)
-    cmp_grad("dz2 (l2+meanpool)", g_dz2, r_dz2, BS * D)
-    cmp_grad("dx1 (wzma_bwd)",    g_dx1, r_dx1, BS * D)
-    cmp_grad("dx2 (wzma_bwd)",    g_dx2, r_dx2, BS * D)
-
-    // The 6 required grads.
-    u64 ok_dU    = cmp_grad("dU",    g_dU,    r_dU,    K * D * R)
-    u64 ok_dV    = cmp_grad("dV",    g_dV,    r_dV,    K * R * D)
-    u64 ok_dgw   = cmp_grad("dgw",   g_dgw,   r_dgw,   K * D)
-    u64 ok_dgb   = cmp_grad("dgb",   g_dgb,   r_dgb,   K)
-    u64 ok_dbias = cmp_grad("dbias", g_dbias, r_dbias, D)
-    u64 ok_demb  = cmp_grad("d_embgrad", g_demb, r_demb, VOCAB * D)
-    u64 all_ok = ok_dU * ok_dV * ok_dgw * ok_dgb * ok_dbias * ok_demb
-    if all_ok == 1 { print_str("ALL 6 GRADS PASS\n") }
-    else           { print_str("SOME GRADS FAILED\n") }
 
     hipFree(d_x1); hipFree(d_x2); hipFree(d_a1); hipFree(d_a2)
     hipFree(d_i1); hipFree(d_i2); hipFree(d_o1); hipFree(d_o2)
@@ -710,6 +636,9 @@ fn main() {
     hipFree(d_alpha)
     hipFree(d_inter)
     hipFree(d_outk)
+    hipFree(d_m_U); hipFree(d_v_U); hipFree(d_m_V); hipFree(d_v_V)
+    hipFree(d_m_gw); hipFree(d_v_gw); hipFree(d_m_gb); hipFree(d_v_gb)
+    hipFree(d_m_bias); hipFree(d_v_bias)
     hipkfd_teardown()
     exit(0)
 }
