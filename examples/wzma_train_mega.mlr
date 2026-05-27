@@ -1,0 +1,219 @@
+// wzma_train_mega launcher (DEBUG MODE) — Task 1 of 8.
+//
+// Single-workgroup WZMA+InfoNCE training mega-kernel, phase 1 (embed-gather)
+// validation harness.  Loads the name-routed amdgpu-native .co, uploads the
+// bench embedding table + token ids, launches ONE 1-WG / 512-thread dispatch,
+// downloads the gathered [BS,D] output, and compares element-wise against a
+// CPU reference port of std/train.mlr fn embed_f32.
+//
+// Dims: B=8 S=16 D=384 K=4 R=32 vocab=8192 BS=128 (=B*S).
+//
+// bench_init.bin layout (sequential f32/i32, see MLRiftBench/tools):
+//   emb[8192,384] f32, U, V, gw, gb, bias,
+//   ids1[128] i32, ids2[128] i32        (BS=128 ids each = [B,S] flattened)
+// NOTE: the ids arrays are BS=128 entries each (NOT 8) — the [8] in the
+// original plan note refers to B; the on-disk layout is [B,S]=[8,16]=128.
+//
+// Build:
+//   ./build/mlrc --target=amdgpu-native examples/wzma_train_mega.mlr \
+//       -o ~/mlrift_bin/wzma_train/wzma_train_mega
+// (the kernel .co must exist at ~/mlrift_bin/wzma_train/wzma_train_mega.co)
+//
+// Run (ONLY after a GPU cold-cycle — see hardware safety notes):
+//   ~/mlrift_bin/wzma_train/wzma_train_mega
+//
+// Expected: "embed PASS max_err <e>" with e ~ 0 (bit-exact: pure copy).
+
+import "../std/math_float.mlr"
+import "../std/fmt.mlr"
+import "../std/hip.mlr"
+
+static u64 D_DIM     = 384
+static u64 VOCAB_DIM = 8192
+static u64 BS_DIM    = 128      // B * S
+static u64 K_DIM     = 4
+static u64 R_DIM     = 32
+
+fn abs_f32(f32 v) -> f32 {
+    if v < 0.0f { return 0.0f - v }
+    return v
+}
+
+fn die_gpu(u64 msg, u64 code) {
+    print_str(msg)
+    print_str(" err=")
+    u64 s = fmt_dec(code); print_str(s); dealloc(s)
+    print_str("\n")
+    hipkfd_teardown()
+    exit(1)
+}
+
+fn load_co(u64 co_path, u64 fn_name) -> u64 {
+    u64 fd = file_open(co_path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        print_str("Cannot open .co: ")
+        print_str(co_path)
+        print_str("\n")
+        hipkfd_teardown(); exit(1)
+    }
+    u64 sz   = file_size(fd)
+    u64 blob = alloc(sz)
+    file_read(fd, blob, sz)
+    file_close(fd)
+
+    u64 mod_slot = alloc(8)
+    u32 err = hipModuleLoadData(mod_slot, blob)
+    if err != 0 { die_gpu("hipModuleLoadData", err) }
+    u64 mod = 0
+    unsafe { *(mod_slot as u64) -> mod }
+
+    u64 fh_slot = alloc(8)
+    err = hipModuleGetFunction(fh_slot, mod, fn_name)
+    if err != 0 { die_gpu("hipModuleGetFunction", err) }
+    u64 fh = 0
+    unsafe { *(fh_slot as u64) -> fh }
+
+    dealloc(mod_slot)
+    dealloc(fh_slot)
+    return fh
+}
+
+// CPU reference (port of std/train.mlr embed_f32 semantics, but reading the
+// i32 ids the bench file stores, matching the GPU kernel exactly):
+//   x_out[bs*D + d] = emb[ids[bs]*D + d]
+fn cpu_embed_i32(u64 out_ptr, u64 emb_ptr, u64 ids_i32_ptr, u64 BS, u64 D) {
+    u64 bs = 0
+    while bs < BS {
+        u32 id32 = 0
+        unsafe { *((ids_i32_ptr + bs * 4) as u32) -> id32 }
+        u64 id = id32
+        u64 emb_row = emb_ptr + id * D * 4
+        u64 out_row = out_ptr + bs * D * 4
+        u64 d = 0
+        while d < D {
+            f32 v = 0.0f
+            unsafe { *((emb_row + d * 4) as f32) -> v }
+            unsafe { *((out_row + d * 4) as f32) = v }
+            d = d + 1
+        }
+        bs = bs + 1
+    }
+}
+
+fn main() {
+    u64 D     = D_DIM
+    u64 VOCAB = VOCAB_DIM
+    u64 BS    = BS_DIM
+    u64 K     = K_DIM
+    u64 R     = R_DIM
+
+    print_str("=== wzma_train_mega: phase-1 embed-gather validation (B=8 S=16 D=384 BS=128) ===\n")
+
+    u32 err = hipSetDevice(0)
+    if err != 0 { print_str("hipSetDevice failed\n"); exit(1) }
+
+    print_str("Loading kernel wzma_train_mega...\n")
+    u64 fh = load_co("/home/pantelis/mlrift_bin/wzma_train/wzma_train_mega.co", "wzma_train_mega")
+
+    // ── Read bench_init.bin (full layout, sequentially) ───────────────────
+    u64 emb_ptr  = alloc(VOCAB * D * 4)
+    u64 U_ptr    = alloc(K * D * R * 4)
+    u64 V_ptr    = alloc(K * R * D * 4)
+    u64 gw_ptr   = alloc(K * D * 4)
+    u64 gb_ptr   = alloc(K * 4)
+    u64 bias_ptr = alloc(D * 4)
+    u64 ids1_i32 = alloc(BS * 4)
+    u64 ids2_i32 = alloc(BS * 4)
+
+    u64 bin_path = "/home/pantelis/Desktop/Projects/Work/MLRiftBench/tools/bench_init.bin"
+    u64 fd = file_open(bin_path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        print_str("Cannot open bench_init.bin\n")
+        hipkfd_teardown(); exit(1)
+    }
+    file_read(fd, emb_ptr,  VOCAB * D * 4)
+    file_read(fd, U_ptr,    K * D * R * 4)
+    file_read(fd, V_ptr,    K * R * D * 4)
+    file_read(fd, gw_ptr,   K * D * 4)
+    file_read(fd, gb_ptr,   K * 4)
+    file_read(fd, bias_ptr, D * 4)
+    file_read(fd, ids1_i32, BS * 4)
+    file_read(fd, ids2_i32, BS * 4)
+    file_close(fd)
+    print_str("Weights + ids loaded from bench_init.bin.\n")
+
+    // ── GPU buffers ───────────────────────────────────────────────────────
+    u64 d_emb   = 0
+    u64 d_ids   = 0
+    u64 d_x_out = 0
+    u64 slot
+
+    slot = alloc(8); err = hipMalloc(slot, VOCAB * D * 4); if err != 0 { die_gpu("mEmb",  err) }; unsafe { *(slot as u64) -> d_emb   }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, BS * 4);        if err != 0 { die_gpu("mIds",  err) }; unsafe { *(slot as u64) -> d_ids   }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, BS * D * 4);    if err != 0 { die_gpu("mXout", err) }; unsafe { *(slot as u64) -> d_x_out }; dealloc(slot)
+
+    // H2D: emb table + view-1 ids
+    err = hipMemcpy(d_emb, emb_ptr,  VOCAB * D * 4, 1); if err != 0 { die_gpu("H2D emb", err) }
+    err = hipMemcpy(d_ids, ids1_i32, BS * 4,        1); if err != 0 { die_gpu("H2D ids", err) }
+    print_str("emb + ids on GPU.\n")
+
+    // ── Launch ONE 1-WG / 512-thread dispatch ─────────────────────────────
+    u64 p0 = alloc(8); unsafe { *(p0 as u64) = d_ids }
+    u64 p1 = alloc(8); unsafe { *(p1 as u64) = d_emb }
+    u64 p2 = alloc(8); unsafe { *(p2 as u64) = d_x_out }
+    u64 p3 = alloc(8); unsafe { *(p3 as u64) = BS }
+    u64 p4 = alloc(8); unsafe { *(p4 as u64) = D }
+    u64 kp = alloc(5 * 8)
+    unsafe { *(kp        as u64) = p0 }
+    unsafe { *((kp +  8) as u64) = p1 }
+    unsafe { *((kp + 16) as u64) = p2 }
+    unsafe { *((kp + 24) as u64) = p3 }
+    unsafe { *((kp + 32) as u64) = p4 }
+
+    u32 grid  = 1
+    u32 block = 512
+    err = hipModuleLaunchKernel(fh, grid, 1, 1, block, 1, 1, 0, 0, kp, 0)
+    if err != 0 { die_gpu("launch wzma_train_mega", err) }
+    err = hipDeviceSynchronize()
+    if err != 0 { die_gpu("sync", err) }
+
+    dealloc(p0); dealloc(p1); dealloc(p2); dealloc(p3); dealloc(p4); dealloc(kp)
+    print_str("Launch + sync OK.\n")
+
+    // ── D2H gathered output ────────────────────────────────────────────────
+    u64 h_x_gpu = alloc(BS * D * 4)
+    err = hipMemcpy(h_x_gpu, d_x_out, BS * D * 4, 2)
+    if err != 0 { die_gpu("D2H x_out", err) }
+
+    // ── CPU reference ──────────────────────────────────────────────────────
+    u64 h_x_ref = alloc(BS * D * 4)
+    cpu_embed_i32(h_x_ref, emb_ptr, ids1_i32, BS, D)
+
+    // ── Compare over BS*D elements ──────────────────────────────────────────
+    f32 max_err = 0.0f
+    u64 n = BS * D
+    u64 i = 0
+    while i < n {
+        f32 g = 0.0f; f32 r = 0.0f
+        unsafe { *((h_x_gpu + i * 4) as f32) -> g }
+        unsafe { *((h_x_ref + i * 4) as f32) -> r }
+        f32 e = abs_f32(g - r)
+        if e > max_err { max_err = e }
+        i = i + 1
+    }
+
+    if max_err < 1e-5f {
+        print_str("embed PASS max_err ")
+    } else {
+        print_str("embed FAIL max_err ")
+    }
+    u64 es = fmt_f32(max_err, 7); print_str(es); dealloc(es)
+    print_str("\n")
+
+    // ── Cleanup (teardown is MANDATORY before every exit path) ─────────────
+    hipFree(d_emb)
+    hipFree(d_ids)
+    hipFree(d_x_out)
+    hipkfd_teardown()
+    exit(0)
+}

@@ -7402,3 +7402,146 @@ fn recognize_megakernel_swiglu_dense_gqa_speck4(uint64 fn_node, uint64 source,
 
     return mega_emit_stub_kernel_speck4(kname_ptr, nl, body)
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WZMA+InfoNCE training mega-kernel — single-workgroup, all-resident.
+//
+// Task 1 of 8 (wzma-train-megakernel): scaffold + phase 1 (embed-gather).
+//
+// Design rationale: a single 1-WG / 512-thread dispatch per training step,
+// with all intermediate state resident in VRAM and ONLY intra-WG s_barrier
+// for synchronisation.  This is structurally wedge-proof — unlike the
+// multi-kernel v2 (bp_wzma_gpu_train_v2) which wedged MES via cross-kernel
+// dependency chains.  Phases will be appended inline (no s_endpgm between
+// them) in Tasks 2-8; Task 1 emits ONLY phase 1 + s_endpgm.
+//
+// Dims (target): B=8 S=16 D=384 K=4 R=32 vocab=8192 BS=128 (=B*S).
+//
+// ── Phase 1: embed-gather ────────────────────────────────────────────────
+// One workgroup, 512 threads (lanes 0..383 active for D=384, 384..511 idle).
+// Lane d gathers, for every bs in 0..BS-1:
+//     x_out[bs*D + d] = emb[ids[bs]*D + d]
+// where ids[bs] is a u32 token id (read scalar-uniform from d_ids).  This is
+// the GPU analogue of std/train.mlr fn embed_f32 — note that embed_f32 reads
+// u64 ids over an [B,S] layout (B*S = BS rows), whereas the launcher here
+// uploads the bench i32 ids verbatim, so the kernel reads 4-byte ids.
+//
+// Kernarg layout (5 args × 8 bytes = 40 bytes):
+//   0x00 d_ids   (u64) → s[4:5]   (i32 token ids, BS of them, [B,S] flattened)
+//   0x08 d_emb   (u64) → s[6:7]   (f32 [vocab,D] embedding table)
+//   0x10 d_x_out (u64) → s[8:9]   (f32 [BS,D] gathered output)
+//   0x18 BS      (u64) → s10      (loop bound — 128)
+//   0x20 D       (u64) → s12      (lane-active bound — 384; ISA hardcodes 0x180)
+//
+// Block = 512, Grid = 1.  No LDS (group_segment_fixed_size = 0).
+// ISA verified via `llvm-mc -mcpu=gfx1100` (see commit message / agent log).
+// ═══════════════════════════════════════════════════════════════════════════
+fn amdgpu_lower_wzma_train_mega(uint64 kname_ptr, uint64 nl) -> uint64 {
+    asm_init()
+
+    // ── Prologue: stash wg_id_x (s15→s3, grid=1 so always 0) + load kernargs ──
+    asm_u32(0xBE83000F)   // s_mov_b32 s3, s15
+    asm_u32(0xF40C0100)   // s_load_b256 s[4:11], s[0:1], 0x0
+    asm_u32(0xF8000000)
+    asm_u32(0xF4040300)   // s_load_b64 s[12:13], s[0:1], 0x20  (D)
+    asm_u32(0xF8000020)
+    asm_u32(0xBF89FC07)   // s_waitcnt lgkmcnt(0)
+
+    // ── Phase 1: embed-gather ─────────────────────────────────────────────
+    asm_u32(0x30060082)   // v_lshlrev_b32_e32 v3, 2, v0        (d*4, reserved)
+    asm_u32(0x7C98000C)   // v_cmp_gt_u32_e32 vcc_lo, s12, v0   (d < D)
+    asm_u32(0xBE82206A)   // s_and_saveexec_b32 s2, vcc_lo
+    asm_u32(0xBFA50024)   // s_cbranch_execz .Lend  (+36 dwords)
+
+    asm_u32(0xBE8E0080)   // s_mov_b32 s14, 0                   (bs = 0)
+    // .Lloop:
+    asm_u32(0xBF0A0A0E)   // s_cmp_lt_u32 s14, s10              (bs < BS)
+    asm_u32(0xBFA10020)   // s_cbranch_scc0 .Lloopend  (+32 dwords)
+
+    // id = ids[bs] : scalar load from d_ids + bs*4
+    asm_u32(0x8410820E)   // s_lshl_b32 s16, s14, 2             (bs*4)
+    asm_u32(0x80121004)   // s_add_u32  s18, s4, s16
+    asm_u32(0x82138005)   // s_addc_u32 s19, s5, 0
+    asm_u32(0xF4000509)   // s_load_b32 s20, s[18:19], 0x0
+    asm_u32(0xF8000000)
+    asm_u32(0xBF89FC07)   // s_waitcnt lgkmcnt(0)               (id in s20)
+
+    // emb source addr = d_emb + (id*D + d)*4
+    asm_u32(0x9615FF14)   // s_mul_i32 s21, s20, 0x180          (id * 384)
+    asm_u32(0x00000180)
+    asm_u32(0x4A080015)   // v_add_nc_u32_e32 v4, s21, v0       (id*D + d)
+    asm_u32(0x30080882)   // v_lshlrev_b32_e32 v4, 2, v4        (*4)
+    asm_u32(0x7E0A0280)   // v_mov_b32_e32 v5, 0
+    asm_u32(0xD7006A04)   // v_add_co_u32 v4, vcc_lo, s6, v4
+    asm_u32(0x00020806)
+    asm_u32(0xD5207C05)   // v_add_co_ci_u32_e64 v5, null, s7, v5, vcc_lo
+    asm_u32(0x01AA0A07)
+    asm_u32(0xDC520000)   // global_load_b32 v6, v[4:5], off
+    asm_u32(0x067C0004)
+    asm_u32(0xBF8903F7)   // s_waitcnt vmcnt(0)
+
+    // dest addr = d_x_out + (bs*D + d)*4
+    asm_u32(0x9616FF0E)   // s_mul_i32 s22, s14, 0x180          (bs * 384)
+    asm_u32(0x00000180)
+    asm_u32(0x4A0E0016)   // v_add_nc_u32_e32 v7, s22, v0       (bs*D + d)
+    asm_u32(0x300E0E82)   // v_lshlrev_b32_e32 v7, 2, v7        (*4)
+    asm_u32(0x7E100280)   // v_mov_b32_e32 v8, 0
+    asm_u32(0xD7006A07)   // v_add_co_u32 v7, vcc_lo, s8, v7
+    asm_u32(0x00020E08)
+    asm_u32(0xD5207C08)   // v_add_co_ci_u32_e64 v8, null, s9, v8, vcc_lo
+    asm_u32(0x01AA1009)
+    asm_u32(0xDC6A0000)   // global_store_b32 v[7:8], v6, off
+    asm_u32(0x007C0607)
+    asm_u32(0xBC7C0000)   // s_waitcnt_vscnt null, 0x0
+
+    asm_u32(0x800E810E)   // s_add_u32 s14, s14, 1             (bs += 1)
+    asm_u32(0xBFA0FFDE)   // s_branch .Lloop  (-34 dwords)
+    // .Lloopend:
+    asm_u32(0xBEFE0002)   // s_mov_b32 exec_lo, s2             (restore EXEC)
+    // .Lend:
+    asm_u32(0xBFB00000)   // s_endpgm
+
+    // ── Arg descriptor block (5 args × 8 bytes = 40 bytes) ────────────────
+    uint64 args_desc = alloc(5 * 16)
+    // arg 0: d_ids
+    uint64 a0s = args_desc + 0;   unsafe { *(a0s as uint64) = 8 }
+    uint64 a0k = args_desc + 8;   unsafe { *(a0k as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    // arg 1: d_emb
+    uint64 a1s = args_desc + 16;  unsafe { *(a1s as uint64) = 8 }
+    uint64 a1k = args_desc + 24;  unsafe { *(a1k as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    // arg 2: d_x_out
+    uint64 a2s = args_desc + 32;  unsafe { *(a2s as uint64) = 8 }
+    uint64 a2k = args_desc + 40;  unsafe { *(a2k as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    // arg 3: BS (by-value u64)
+    uint64 a3s = args_desc + 48;  unsafe { *(a3s as uint64) = 8 }
+    uint64 a3k = args_desc + 56;  unsafe { *(a3k as uint64) = AMD_ARG_KIND_BY_VALUE }
+    // arg 4: D (by-value u64)
+    uint64 a4s = args_desc + 64;  unsafe { *(a4s as uint64) = 8 }
+    uint64 a4k = args_desc + 72;  unsafe { *(a4k as uint64) = AMD_ARG_KIND_BY_VALUE }
+
+    // ── Copy emitted ISA into a kernel-owned buffer ───────────────────────
+    uint64 k_text_size = asm_text_len
+    uint64 k_text_buf  = alloc(k_text_size)
+    uint64 ci = 0
+    while ci < k_text_size {
+        uint64 sp = asm_text_buf + ci
+        uint64 b = 0
+        unsafe { *(sp as uint8) -> b }
+        uint64 dp = k_text_buf + ci
+        uint8 b8 = b
+        unsafe { *(dp as uint8) = b8 }
+        ci = ci + 1
+    }
+
+    // rsrc1: v0..v8 used → 9 VGPRs → granule 1 (16 VGPRs). s0..s22 used → 23
+    // SGPRs.  Match the granule encoding established by row_scale_f32.
+    uint64 rsrc1 = 0xE0AF0001
+    uint64 rsrc2 = 0x0000009E
+    uint64 rsrc3 = 0x00000010
+    uint64 props = 0x0408
+    kt_push(kname_ptr, nl, k_text_buf, k_text_size,
+            args_desc, 5, 40,
+            23, 16,
+            rsrc1, rsrc2, rsrc3, props)
+    return 0
+}
