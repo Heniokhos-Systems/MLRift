@@ -7571,6 +7571,16 @@ fn wzm_s_add_u32_ss(uint64 sdst, uint64 ssrc0, uint64 ssrc1) {
 fn wzm_s_lshl2(uint64 sdst, uint64 ssrc0) {
     asm_u32(0x84000000 | ((sdst & 0x7F) << 16) | (0x82 << 8) | (ssrc0 & 0xFF))
 }
+// v_and_b32_e32 vdst, inline_imm, vsrc1   (VOP2 op 0x1B; src0 = inline 0..64)
+//   Verified pattern: `v_and_b32 v26, 15, v0` = 0x3634008F (op 0x1B, src0 0x8F).
+fn wzm_v_and_b32_iv(uint64 vdst, uint64 inline_u, uint64 v_src1) {
+    asm_u32((0x1B << 25) | ((vdst & 0xFF) << 17) | ((v_src1 & 0xFF) << 9) | (0x80 + (inline_u & 0x3F)))
+}
+// v_lshrrev_b32_e32 vdst, shift, vsrc1   (VOP2 op 0x19; src0 = inline shift)
+//   Verified pattern: `v_lshrrev_b32 v25, 4, v0` = 0x32320084 (op 0x19, src0 0x84).
+fn wzm_v_lshrrev_iv(uint64 vdst, uint64 shift, uint64 v_src1) {
+    asm_u32((0x19 << 25) | ((vdst & 0xFF) << 17) | ((v_src1 & 0xFF) << 9) | (0x80 + (shift & 0x3F)))
+}
 
 // ── Multi-WG BS-row split for the WZMA training mega-kernel (Task 1) ───────
 // Emit the per-bs loop counter init.  The per-bs loops iterate over BS=128
@@ -8734,59 +8744,81 @@ fn amdgpu_lower_wzma_train_mega(uint64 kname_ptr, uint64 nl) -> uint64 {
     asm_u32(0xBC7C0000)                      // vscnt(0)
     asm_u32(0xBEFE0002)                      // s_mov_b32 exec_lo, s2  (restore full exec)
 
-    // ── inter[bs,k,r] = dot_d(x, U[k,:,r]), k=0..3 unrolled, r runtime loop ──
-    // U element index for lane d = k*D*R + d*R + r = k*12288 + d*32 + r.
-    //   v11 = d*32 already.  s_base = k*12288 + r.  v_idx = v11 + s_base.
-    // Save inter to: LDS[2048 + (k*R+r)*4] (for outk) AND inter[bs,k,r] GMEM.
-    uint64 ik = 0
-    while ik < 4 {
-        wzm_s_mov_b32_0(36)                  // s36 = r = 0
-        uint64 ir_top = asm_text_len / 4
-        asm_u32(0xBF090000 | (0xA0 << 8) | 36)   // s_cmp_ge_u32 s36, 32  (r >= R)
-        uint64 ir_exit = asm_text_len / 4
-        asm_u32(0xBFA20000)                  // s_cbranch_scc1 .Lir_end (patch)
+    // ── inter[bs,k,r] = dot_d(x, U[k,:,r])  — TILED GEMM (Task 1 GO/NO-GO) ────
+    // GEMM shape per bs row: M-row = this one bs, N = K*R = 128 outputs, Kdim = D.
+    // OLD path ran K*R = 128 full 512-lane LDS reduce trees per bs row (~9
+    // barriers each → ~1150 barriers/row).  NEW path: stage x[bs,:] in LDS ONCE,
+    // then lanes g=0..127 each compute ONE inter[k,r] dot serially from registers
+    // (zero barriers in the inner loop).  Output map: g → (k = g>>5, r = g&31).
+    // U element index for (k,d,r) = k*D*R + d*R + r = k*12288 + d*32 + r; the
+    // per-lane d-stride is R=32 elements = 128 bytes.  x[d] is a uniform LDS
+    // broadcast (same addr every lane), so no global x re-read.  Summation order
+    // is now sequential d=0..383 (vs the reduce tree's pairwise order) — within
+    // the 1e-2 loss / 1e-3 grad tolerances since these are not bit-exact checks.
+    //
+    // ⚠ OOB rule: only lanes g<128 issue the global U load; lanes 128..511 are
+    // exec-gated OFF for the whole block, so no inactive/edge lane ever forms an
+    // out-of-range U address.  Max in-bounds U elem = 3*12288+383*32+31 = 49151
+    // = K*D*R-1, so the active lanes never go OOB either.
+    //
+    // ── Stage x[bs,:] into LDS[d*4] (d<D lanes; OOB-gated) ──
+    asm_u32(0x7C980020)                  // v_cmp_gt_u32_e32 vcc_lo, s32, v0  (d<D)
+    asm_u32(0xBE82206A)                  // s_and_saveexec_b32 s2, vcc_lo  (gate d<D)
+    wzm_ds_store_b32(6, 10, 0)           // LDS[v6 = d*4] = x[bs,d]  (v10)
+    asm_u32(0xBF89FC07)                  // lgkmcnt(0)
+    asm_u32(0xBEFE0002)                  // restore full exec
+    asm_u32(0xBFBD0000)                  // s_barrier — x panel visible to all lanes
 
-        // U element index lane d = k*12288 + d*32 + r ; v11 = d*32.
-        wzm_s_mov_b32_lit(35, ik * 12288)    // s35 = k*12288
-        wzm_s_add_u32_ss(35, 35, 36)         // s35 += r
-        wzm_v_add_nc_u32_sv(1, 35, 11)       // v1 = s35 + v11(d*32)
-        wzm_v_shl2_e32(1, 1)                 // *4
-        wzm_clamp_off_dlt_D(1)               // OOB guard for d>=D (U row stride d*32)
-        wzm_gload_b32_saddr(16, 1, 10)       // v16 = U[k,d,r]  (s[10:11])
-        asm_u32(0xBF8903F7)                  // vmcnt(0)
-        wzm_v_mul_f32_e32(5, 10, 16)         // v5 = x*U   (x=0 for d>=D)
-        _emit_lds_reduce_tree_512()          // sum → LDS[0]
-        wzm_ds_load_b32(17, 9, 0)            // v17 = inter_kr (broadcast)
-        asm_u32(0xBF89FC07)                  // lgkmcnt(0)
-
-        // store inter to LDS scratch[2048 + (k*R+r)*4] and GMEM inter[bs,k,r] (lane 0)
-        asm_u32(0x7C940080)                  // v_cmp_eq_u32_e32 vcc_lo, 0, v0
-        asm_u32(0xBE82206A)                  // s_and_saveexec_b32 s2, vcc_lo
-        // LDS slot offset (rel) = k*128 + r*4
-        wzm_s_mov_b32_lit(37, ik * 128)      // s37 = k*128
-        wzm_s_lshl2(38, 36)                  // s38 = r*4
-        wzm_s_add_u32_ss(37, 37, 38)         // s37 = k*128 + r*4
-        wzm_v_mov_s(1, 37)                   // v1 = LDS rel byte offset
-        wzm_ds_store_b32(1, 17, 2048)        // LDS[2048 + v1] = inter_kr
-        asm_u32(0xBF89FC07)                  // lgkmcnt(0)
-        // GMEM inter[bs,k,r]: idx = bs*128 + k*32 + r ; *4
-        wzm_s_mul_i32_lit(38, 34, 128)       // s38 = bs*128
-        wzm_s_mov_b32_lit(39, ik * 32)       // s39 = k*32
-        wzm_s_add_u32_ss(38, 38, 39)         // s38 = bs*128 + k*32
-        wzm_s_add_u32_ss(38, 38, 36)         // s38 += r
-        wzm_v_mov_s(1, 38)
-        wzm_v_shl2_e32(1, 1)                 // *4
-        wzm_gstore_b32_saddr(1, 17, 26)      // inter[bs,k,r]  (s[26:27])
-        asm_u32(0xBC7C0000)                  // vscnt(0)
-        asm_u32(0xBEFE0002)                  // restore exec
-
-        wzm_s_add_u32_1(36, 36)              // r += 1
-        uint64 ir_back = (ir_top - (asm_text_len / 4) - 1) & 0xFFFF
-        asm_u32(0xBFA00000 | ir_back)        // s_branch .Lir_top
-        uint64 ir_end = asm_text_len / 4
-        asm_patch_u32(ir_exit, 0xBFA20000 | ((ir_end - ir_exit - 1) & 0xFFFF))
-        ik = ik + 1
-    }
+    // ── Compute lanes g<128: inter[k,r] = Σ_d x[d]·U[k,d,r] (register dot) ──
+    asm_u32(0x7C9800FF)                  // v_cmp_gt_u32_e32 vcc_lo, 128, v0  (g<128)
+    asm_u32(0x00000080)                  // literal 128
+    asm_u32(0xBE82206A)                  // s_and_saveexec_b32 s2, vcc_lo  (gate g<128)
+    uint64 ig_execz = asm_text_len / 4
+    asm_u32(0xBFA50000)                  // s_cbranch_execz .Linter_end (patched)
+    // r = g & 31 ; k = g >> 5
+    wzm_v_and_b32_iv(16, 31, 0)          // v16 = r = g & 31
+    wzm_v_lshrrev_iv(17, 5, 0)           // v17 = k = g >> 5
+    // U elem base (d=0) = k*12288 + r = (k<<13) + (k<<12) + r  (12288 = 2^13+2^12).
+    asm_v_lshlrev_b32_imm(18, 13, 17)    // v18 = k<<13
+    asm_v_lshlrev_b32_imm(19, 12, 17)    // v19 = k<<12
+    asm_u32((0x25 << 25) | (18 << 17) | (19 << 9) | (0x100 | 18))   // v_add_nc_u32 v18, v18, v19  (= k*12288)
+    asm_u32((0x25 << 25) | (18 << 17) | (16 << 9) | (0x100 | 18))   // v_add_nc_u32 v18, v18, v16  (+ r)
+    wzm_v_shl2_e32(19, 18)               // v19 = U byte offset (d=0) = elem*4
+    asm_u32(0x7E280280)                  // v_mov_b32_e32 v20, 0  (accumulator)
+    asm_u32(0x7E040280)                  // v_mov_b32_e32 v2, 0   (LDS x byte addr = d*4)
+    asm_v_mov_b32_lit32(3, 128)          // v3 = 128 (= R*4, U byteoff d-stride)
+    // d loop (s36 = d = 0..383)
+    wzm_s_mov_b32_0(36)                  // s36 = d = 0
+    uint64 idd_top = asm_text_len / 4
+    asm_u32(0xBF090000 | (32 << 8) | 36) // s_cmp_ge_u32 s36, s32(D)  (d >= D)
+    uint64 idd_exit = asm_text_len / 4
+    asm_u32(0xBFA20000)                  // s_cbranch_scc1 .Lidd_end (patch)
+    wzm_ds_load_b32(5, 2, 0)             // v5 = x[d]  (LDS broadcast at v2=d*4)
+    asm_u32(0xBF89FC07)                  // lgkmcnt(0)
+    wzm_gload_b32_saddr(16, 19, 10)      // v16 = U[k,d,r]  (s[10:11], byteoff v19)
+    asm_u32(0xBF8903F7)                  // vmcnt(0)
+    asm_v_fma_f32_e64_vvv(20, 5, 16, 20) // acc += x[d]*U[k,d,r]
+    // advance: U byteoff += R*4 = 128 (v3) ; LDS x addr += 4
+    wzm_v_add_nc_u32_iv(2, 4, 2)         // v2 += 4
+    asm_u32((0x25 << 25) | (19 << 17) | (3 << 9) | (0x100 | 19))   // v_add_nc_u32 v19, v19, v3  (+128)
+    wzm_s_add_u32_1(36, 36)              // d += 1
+    uint64 idd_back = (idd_top - (asm_text_len / 4) - 1) & 0xFFFF
+    asm_u32(0xBFA00000 | idd_back)       // s_branch .Lidd_top
+    uint64 idd_end = asm_text_len / 4
+    asm_patch_u32(idd_exit, 0xBFA20000 | ((idd_end - idd_exit - 1) & 0xFFFF))
+    // result inter[k,r] in v20.  Store to LDS[2048 + g*4] (= 2048 + (k*128+r*4))
+    // and GMEM inter[bs, g] (= bs*128 + k*32 + r).
+    wzm_v_shl2_e32(1, 0)                 // v1 = g*4 (LDS rel byte offset, = k*128+r*4)
+    wzm_ds_store_b32(1, 20, 2048)        // LDS[2048 + g*4] = inter[k,r]
+    asm_u32(0xBF89FC07)                  // lgkmcnt(0)
+    wzm_s_mul_i32_lit(38, 34, 128)       // s38 = bs*128
+    wzm_v_add_nc_u32_sv(1, 38, 0)        // v1 = bs*128 + g
+    wzm_v_shl2_e32(1, 1)                 // *4
+    wzm_gstore_b32_saddr(1, 20, 26)      // inter[bs, g]  (s[26:27])
+    asm_u32(0xBC7C0000)                  // vscnt(0)
+    uint64 ig_end = asm_text_len / 4
+    asm_patch_u32(ig_execz, 0xBFA50000 | ((ig_end - ig_execz - 1) & 0xFFFF))
+    asm_u32(0xBEFE0002)                  // restore full exec
 
     asm_u32(0xBFBD0000)   // s_barrier — inter LDS scratch visible to all lanes
 
