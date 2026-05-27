@@ -31,6 +31,19 @@ static uint64 MEGA_KERNARG_COUNT = 24
 //   Matches the HIP source #define WG_PERSIST 512.
 static uint64 MEGA_WG_PERSIST = 512
 
+// ── WZMA training mega-kernel: multi-WG row split (Task 1) ────────────────
+// MEGA_TRAIN_NW: number of workgroups the WZMA training mega-kernel launches.
+//   The BS=128 rows are split evenly: rows_per_wg = BS/NW, and WG `wg`
+//   processes the half-open range [wg*rows_per_wg, (wg+1)*rows_per_wg) in the
+//   per-bs loops (embed, fwd, and the wzma_bwd dbias + per-bs loops).
+//   At NW=1 the range is [0, BS) and the emitted bytes are byte-identical to
+//   the single-WG oracle (commit ded3f50): the gate helpers fall back to the
+//   exact original `s34=0` init + `s_cmp_ge_u32 s34, s30` bound when NW==1.
+//   Phases inherently over all B (pool/L2, InfoNCE fwd/bwd, AdamW over params)
+//   stay single-WG for now — at NW=1 every WG runs everything, which is
+//   correct; multi-WG correctness for those phases is a later task.
+static uint64 MEGA_TRAIN_NW = 1
+
 // ── speck4 mega-kernel constants ──────────────────────────────────────────
 // Slice 4.20.0: scaffold for the M_EFF=4 multi-query mega-kernel
 // (qwen3_layer_megakernel_speck4).  Identical 24-arg kernarg layout as the
@@ -7469,6 +7482,35 @@ fn wzm_s_add_u32_ss(uint64 sdst, uint64 ssrc0, uint64 ssrc1) {
 fn wzm_s_lshl2(uint64 sdst, uint64 ssrc0) {
     asm_u32(0x84000000 | ((sdst & 0x7F) << 16) | (0x82 << 8) | (ssrc0 & 0xFF))
 }
+
+// ── Multi-WG BS-row split for the WZMA training mega-kernel (Task 1) ───────
+// Emit the per-bs loop counter init.  The per-bs loops iterate over BS=128
+// rows; under MEGA_TRAIN_NW>1 each WG owns the half-open row range
+//   [wg*rows_per_wg, (wg+1)*rows_per_wg),  rows_per_wg = BS/NW.
+// s3 holds wg_id_x (stashed in the prologue), s30 holds BS.
+//   NW==1 path:  emit exactly `s_mov_b32 s<ctr>, 0` (byte-identical to oracle)
+//                and leave the loop bound as s30 (BS) — see wzm_train_bs_bound.
+//   NW> 1 path:  s<ctr> = lo = wg_id*rows_per_wg ; s31 = hi = lo+rows_per_wg.
+// rows_per_wg is a compile-time constant (BS=128 / NW) so the multiply is a
+// single s_mul_i32 by a literal.  s31 is otherwise unused in this kernel and
+// persists across the loop body as the bound register.
+fn wzm_train_bs_loop_init(uint64 ctr) {
+    if MEGA_TRAIN_NW <= 1 {
+        wzm_s_mov_b32_0(ctr)              // bs = 0   (oracle-identical)
+    } else {
+        uint64 rpw = 128 / MEGA_TRAIN_NW  // rows_per_wg (BS=128)
+        wzm_s_mul_i32_lit(ctr, 3, rpw)    // s<ctr> = lo = wg_id * rows_per_wg
+        // s31 = hi = lo + rows_per_wg  (s_add_u32 s31, s<ctr>, rpw via literal)
+        asm_u32((0x80 << 24) | (31 << 16) | (0xFF << 8) | (ctr & 0xFF))
+        asm_u32(rpw & 0xFFFFFFFF)
+    }
+}
+// SGPR# to compare the per-bs loop counter against (the exclusive upper bound).
+//   NW==1: s30 (BS) — oracle-identical.   NW>1: s31 (per-WG hi).
+fn wzm_train_bs_bound() -> uint64 {
+    if MEGA_TRAIN_NW <= 1 { return 30 }
+    return 31
+}
 // v_add_nc_u32_e32 vdst, s_src0, v_src1   (op 0x25; src0 SGPR, src1 VGPR)
 fn wzm_v_add_nc_u32_sv(uint64 vdst, uint64 s_src0, uint64 v_src1) {
     asm_u32((0x25 << 25) | ((vdst & 0xFF) << 17) | ((v_src1 & 0xFF) << 9) | (s_src0 & 0x1FF))
@@ -7641,9 +7683,9 @@ fn _wzm_emit_wzma_bwd_view(uint64 x_saddr, uint64 alpha_saddr,
     uint64 db_execz = asm_text_len / 4
     asm_u32(0xBFA50000)                   // execz .Ldb_end (patched)
     asm_u32(0x7E220280)                   // v17 = 0 (acc)
-    wzm_s_mov_b32_0(34)                   // bs = 0
+    wzm_train_bs_loop_init(34)            // bs = lo (=0 at NW=1); s31 = hi (NW>1)
     uint64 db_top = asm_text_len / 4
-    asm_u32(0xBF090000 | (30 << 8) | 34)  // bs >= BS
+    asm_u32(0xBF090000 | (wzm_train_bs_bound() << 8) | 34)  // bs >= hi
     uint64 db_exit = asm_text_len / 4
     asm_u32(0xBFA20000)
     wzm_s_mul_i32_lit(35, 34, 0x180)      // bs*384
@@ -7670,10 +7712,10 @@ fn _wzm_emit_wzma_bwd_view(uint64 x_saddr, uint64 alpha_saddr,
     asm_u32(0xBEFE0002)                   // restore exec
     asm_u32(0xBFBD0000)                   // s_barrier
 
-    // ── per-bs loop ──
-    wzm_s_mov_b32_0(34)                   // bs = 0
+    // ── per-bs loop — WG-gated row range [lo,hi) (Task 1 multi-WG) ──
+    wzm_train_bs_loop_init(34)            // bs = lo (=0 at NW=1); s31 = hi (NW>1)
     uint64 bs_top = asm_text_len / 4
-    asm_u32(0xBF090000 | (30 << 8) | 34)  // bs >= BS
+    asm_u32(0xBF090000 | (wzm_train_bs_bound() << 8) | 34)  // bs >= hi
     uint64 bs_exit = asm_text_len / 4
     asm_u32(0xBFA20000)
 
@@ -8226,9 +8268,9 @@ fn amdgpu_lower_wzma_train_mega(uint64 kname_ptr, uint64 nl) -> uint64 {
     uint64 e_execz = asm_text_len / 4
     asm_u32(0xBFA50000)   // s_cbranch_execz .Lembed_end  (patched)
 
-    wzm_s_mov_b32_0(34)   // s34 = bs = 0
+    wzm_train_bs_loop_init(34)   // s34 = bs = lo (=0 at NW=1); s31 = hi (NW>1)
     uint64 e_loop_top = asm_text_len / 4
-    asm_u32(0xBF090000 | (30 << 8) | 34)   // s_cmp_ge_u32 s34, s30  (bs >= BS)
+    asm_u32(0xBF090000 | (wzm_train_bs_bound() << 8) | 34)   // s_cmp_ge_u32 s34, hi  (bs >= hi)
     uint64 e_loop_exit = asm_text_len / 4
     asm_u32(0xBFA20000)   // s_cbranch_scc1 .Lembed_end (patched)
 
@@ -8274,10 +8316,10 @@ fn amdgpu_lower_wzma_train_mega(uint64 kname_ptr, uint64 nl) -> uint64 {
     asm_u32((0x18 << 25) | (11 << 17) | (0 << 9) | (0x80 + 5))  // v_lshlrev_b32 v11, 5, v0  (d*32)
     asm_v_mov_b32_lit32(23, 0x3FB8AA3B)   // v23 = 1.44269504 (log2 e)
 
-    // bs loop counter in s34
-    wzm_s_mov_b32_0(34)                // bs = 0
+    // bs loop counter in s34 — WG-gated row range [lo,hi) (Task 1 multi-WG)
+    wzm_train_bs_loop_init(34)         // bs = lo (=0 at NW=1); s31 = hi (NW>1)
     uint64 w_loop_top = asm_text_len / 4
-    asm_u32(0xBF090000 | (30 << 8) | 34)   // s_cmp_ge_u32 s34, s30  (bs >= BS)
+    asm_u32(0xBF090000 | (wzm_train_bs_bound() << 8) | 34)   // s_cmp_ge_u32 s34, hi  (bs >= hi)
     uint64 w_loop_exit = asm_text_len / 4
     asm_u32(0xBFA20000)                // s_cbranch_scc1 .Lwzma_end (patched)
 
