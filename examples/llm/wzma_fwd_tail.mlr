@@ -1,0 +1,136 @@
+// wzma_fwd_tail — fused WZMA forward-tail kernel (gate-softmax → combine →
+// mean-pool → L2-norm), one WG × 512 lanes.
+//
+// Multi-dispatch pivot: the heavy einsums (embed / gate-logits / U / V) run as
+// full-occupancy gemm_f32 + embedding_lookup_f32 dispatches.  This ONE kernel
+// runs the 4 tiny transcendental reductions on the GPU so x/alpha/outk/v stay
+// resident in VRAM — killing the per-phase D2H of outk[K,BS,D] (786 KB) and the
+// H2D round-trips of the CPU tail (combine 1.74ms / pool 0.29ms / L2 0.04ms).
+//
+// The native --target=amdgpu-native backend name-routes this @kernel to
+// amdgpu_lower_wzma_fwd_tail (src/format_amdgpu_megakernel.mlr), which emits the
+// SAME validated gate-softmax / combine / mean-pool / L2-norm ISA as the
+// WZMA-training mega-kernel — only the standalone prologue/kernarg/epilogue and
+// the global outk source differ.  The body below is structural only (so MLRift
+// can validate types + the launcher can take the @kernel address); the native
+// target ignores it and emits the hand-tuned ISA.
+//
+// Dims: B=8 S=16 D=384 K=4 BS=128 (B*S).  outk layout = [K,BS,D] (k-major).
+//
+// Build (--target=amdgpu-native):
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native \
+//       examples/llm/wzma_fwd_tail.mlr -o /tmp/wzma_fwd_tail
+//   (produces /tmp/wzma_fwd_tail.co with kernel symbol `wzma_fwd_tail`.)
+
+fn block_idx_x() -> uint64 { return 0 }
+fn tid_local_x() -> uint64 { return 0 }
+fn lds_reduce_sum_f32(f32 x) -> f32 { return x }
+
+@kernel
+fn wzma_fwd_tail(
+    uint64 x_ptr,       // [BS,D]   input rows
+    uint64 gw_ptr,      // [K,D]    gate weights
+    uint64 gb_ptr,      // [K]      gate bias
+    uint64 outk_ptr,    // [K,BS,D] per-bank outputs (from V gemm)
+    uint64 bias_ptr,    // [D]      combine bias
+    uint64 alpha_ptr,   // [BS,K]   softmax gate weights (written)
+    uint64 z_ptr,       // [BS,D]   combine output (written)
+    uint64 v_ptr,       // [B,D]    L2-normed encoder out (written)
+    uint64 norms_ptr,   // [B]      pre-L2 magnitudes (written)
+    uint64 BS, uint64 D
+) {
+    uint64 K = 4
+    uint64 S = 16
+    uint64 B = 8
+    uint64 d = tid_local_x()
+
+    // ── Phase A: per-bs gate-softmax → alpha, combine αk·outk + bias → z ──
+    uint64 bs = 0
+    while bs < BS {
+        if d < D {
+            f32 xv = 0.0
+            unsafe { *((x_ptr + (bs * D + d) * 4) as f32) -> xv }
+
+            // gate logits gl[k] = dot_d(x, gw[k]) + gb[k]
+            f32 g0 = 0.0
+            f32 g1 = 0.0
+            f32 g2 = 0.0
+            f32 g3 = 0.0
+            f32 w0 = 0.0
+            f32 w1 = 0.0
+            f32 w2 = 0.0
+            f32 w3 = 0.0
+            unsafe { *((gw_ptr + (0 * D + d) * 4) as f32) -> w0 }
+            unsafe { *((gw_ptr + (1 * D + d) * 4) as f32) -> w1 }
+            unsafe { *((gw_ptr + (2 * D + d) * 4) as f32) -> w2 }
+            unsafe { *((gw_ptr + (3 * D + d) * 4) as f32) -> w3 }
+            g0 = lds_reduce_sum_f32(xv * w0)
+            g1 = lds_reduce_sum_f32(xv * w1)
+            g2 = lds_reduce_sum_f32(xv * w2)
+            g3 = lds_reduce_sum_f32(xv * w3)
+            f32 b0 = 0.0
+            f32 b1 = 0.0
+            f32 b2 = 0.0
+            f32 b3 = 0.0
+            unsafe { *((gb_ptr + 0 * 4) as f32) -> b0 }
+            unsafe { *((gb_ptr + 1 * 4) as f32) -> b1 }
+            unsafe { *((gb_ptr + 2 * 4) as f32) -> b2 }
+            unsafe { *((gb_ptr + 3 * 4) as f32) -> b3 }
+            g0 = g0 + b0
+            g1 = g1 + b1
+            g2 = g2 + b2
+            g3 = g3 + b3
+
+            // outk[k,bs,d] = k*BS*D + bs*D + d  (k-major resident layout)
+            f32 ok0 = 0.0
+            f32 ok1 = 0.0
+            f32 ok2 = 0.0
+            f32 ok3 = 0.0
+            unsafe { *((outk_ptr + (0 * BS * D + bs * D + d) * 4) as f32) -> ok0 }
+            unsafe { *((outk_ptr + (1 * BS * D + bs * D + d) * 4) as f32) -> ok1 }
+            unsafe { *((outk_ptr + (2 * BS * D + bs * D + d) * 4) as f32) -> ok2 }
+            unsafe { *((outk_ptr + (3 * BS * D + bs * D + d) * 4) as f32) -> ok3 }
+
+            f32 bv = 0.0
+            unsafe { *((bias_ptr + d * 4) as f32) -> bv }
+
+            // softmax over K (computed redundantly per lane), then combine
+            f32 zv = g0 * ok0 + g1 * ok1 + g2 * ok2 + g3 * ok3 + bv
+            unsafe { *((z_ptr + (bs * D + d) * 4) as f32) = zv }
+
+            if d == 0 {
+                unsafe { *((alpha_ptr + (bs * K + 0) * 4) as f32) = g0 }
+                unsafe { *((alpha_ptr + (bs * K + 1) * 4) as f32) = g1 }
+                unsafe { *((alpha_ptr + (bs * K + 2) * 4) as f32) = g2 }
+                unsafe { *((alpha_ptr + (bs * K + 3) * 4) as f32) = g3 }
+            }
+        }
+        bs = bs + 1
+    }
+
+    // ── Phase B: mean-pool over S + L2-normalize → v[B,D], save norms[b] ──
+    uint64 b = 0
+    while b < B {
+        if d < D {
+            f32 pooled = 0.0
+            uint64 s = 0
+            while s < S {
+                f32 zv = 0.0
+                unsafe { *((z_ptr + ((b * S + s) * D + d) * 4) as f32) -> zv }
+                pooled = pooled + zv
+                s = s + 1
+            }
+            pooled = pooled * 0.0625
+            f32 ssq = lds_reduce_sum_f32(pooled * pooled)
+            f32 mag = ssq
+            f32 inv = 1.0 / mag
+            unsafe { *((v_ptr + (b * D + d) * 4) as f32) = pooled * inv }
+            if d == 0 {
+                unsafe { *((norms_ptr + b * 4) as f32) = mag }
+            }
+        }
+        b = b + 1
+    }
+}
+
+fn main() { exit(0) }

@@ -140,6 +140,45 @@ fn launch_embed(u64 fh, u64 d_ids, u64 d_emb, u64 d_out, u64 seq, u64 D) {
     dealloc(p0); dealloc(p1); dealloc(p2); dealloc(p3); dealloc(kp)
 }
 
+// wzma_fwd_tail: fused gate-softmax → combine → mean-pool → L2-norm.
+//   In:  x[BS,D], gw[K,D], gb[K], outk[K,BS,D], bias[D]
+//   Out: alpha[BS,K], z[BS,D], v[B,D], norms[B]   (all GPU-resident)
+//   Grid: 1 WG × 512 lanes (single-WG, exactly like the mega-kernel forward).
+fn launch_fwd_tail(u64 fh, u64 d_x, u64 d_gw, u64 d_gb, u64 d_otk,
+                   u64 d_bias, u64 d_alpha, u64 d_z, u64 d_v, u64 d_norms,
+                   u64 BS, u64 D) {
+    u64 p0 = alloc(8); unsafe { *(p0 as u64) = d_x }
+    u64 p1 = alloc(8); unsafe { *(p1 as u64) = d_gw }
+    u64 p2 = alloc(8); unsafe { *(p2 as u64) = d_gb }
+    u64 p3 = alloc(8); unsafe { *(p3 as u64) = d_otk }
+    u64 p4 = alloc(8); unsafe { *(p4 as u64) = d_bias }
+    u64 p5 = alloc(8); unsafe { *(p5 as u64) = d_alpha }
+    u64 p6 = alloc(8); unsafe { *(p6 as u64) = d_z }
+    u64 p7 = alloc(8); unsafe { *(p7 as u64) = d_v }
+    u64 p8 = alloc(8); unsafe { *(p8 as u64) = d_norms }
+    u64 p9 = alloc(8); unsafe { *(p9 as u64) = BS }
+    u64 pA = alloc(8); unsafe { *(pA as u64) = D }
+    u64 kp = alloc(11 * 8)
+    unsafe { *(kp        as u64) = p0 }
+    unsafe { *((kp +  8) as u64) = p1 }
+    unsafe { *((kp + 16) as u64) = p2 }
+    unsafe { *((kp + 24) as u64) = p3 }
+    unsafe { *((kp + 32) as u64) = p4 }
+    unsafe { *((kp + 40) as u64) = p5 }
+    unsafe { *((kp + 48) as u64) = p6 }
+    unsafe { *((kp + 56) as u64) = p7 }
+    unsafe { *((kp + 64) as u64) = p8 }
+    unsafe { *((kp + 72) as u64) = p9 }
+    unsafe { *((kp + 80) as u64) = pA }
+    u32 grid  = 1
+    u32 block = 512
+    u32 err = hipModuleLaunchKernel(fh, grid, 1, 1, block, 1, 1, 0, 0, kp, 0)
+    if err != 0 { die_gpu("launch fwd_tail", err) }
+    dealloc(p0); dealloc(p1); dealloc(p2); dealloc(p3); dealloc(p4)
+    dealloc(p5); dealloc(p6); dealloc(p7); dealloc(p8); dealloc(p9); dealloc(pA)
+    dealloc(kp)
+}
+
 fn sync_or_die(u64 tag) {
     u32 err = hipDeviceSynchronize()
     if err != 0 { die_gpu(tag, err) }
@@ -153,50 +192,8 @@ fn print_ms(u64 label, f32 ms) {
     print_str(" ms\n")
 }
 
-// CPU gate post: gl[BS,K] (raw X@gwT) + gb[K], softmax over K → alpha[BS,K].
-fn cpu_gate_post(u64 gl, u64 gb, u64 alpha, u64 BS, u64 K) {
-    u64 bs = 0
-    while bs < BS {
-        u64 gl_row = gl + bs * K * 4
-        u64 a_row  = alpha + bs * K * 4
-        u64 k = 0
-        while k < K {
-            f32 g = 0.0f; unsafe { *((gl_row + k * 4) as f32) -> g }
-            f32 b = 0.0f; unsafe { *((gb + k * 4) as f32) -> b }
-            unsafe { *((a_row + k * 4) as f32) = g + b }
-            k = k + 1
-        }
-        softmax_f32_inplace(a_row, K)
-        bs = bs + 1
-    }
-}
-
-// CPU combine: z[bs,d] = Σ_k alpha[bs,k]·outk[k,bs,d] + bias[d].
-//   outk_flat is [K, BS, D] (K contiguous [BS,D] blocks).
-fn cpu_combine(u64 alpha, u64 outk_flat, u64 bias, u64 z, u64 BS, u64 D, u64 K) {
-    u64 bs = 0
-    while bs < BS {
-        u64 a_row = alpha + bs * K * 4
-        u64 z_row = z + bs * D * 4
-        u64 d = 0
-        while d < D {
-            f32 acc = 0.0f
-            u64 k = 0
-            while k < K {
-                f32 ak = 0.0f; unsafe { *((a_row + k * 4) as f32) -> ak }
-                f32 ok = 0.0f
-                u64 op = outk_flat + (k * BS * D + bs * D + d) * 4
-                unsafe { *(op as f32) -> ok }
-                acc = acc + ak * ok
-                k = k + 1
-            }
-            f32 bv = 0.0f; unsafe { *((bias + d * 4) as f32) -> bv }
-            unsafe { *((z_row + d * 4) as f32) = acc + bv }
-            d = d + 1
-        }
-        bs = bs + 1
-    }
-}
+// (CPU gate-softmax/combine/mean-pool/L2 helpers removed — these phases are now
+//  GPU-resident inside the wzma_fwd_tail kernel; only InfoNCE CE stays on CPU.)
 
 fn main() {
     u64 B     = B_DIM
@@ -215,7 +212,8 @@ fn main() {
     print_str("Loading kernels...\n")
     u64 fh_embed = load_co("/tmp/embedding_lookup_f32.co", "embedding_lookup_f32")
     u64 fh_gemm  = load_co("/tmp/gemm_f32_native.co",      "gemm_f32")
-    print_str("Kernels loaded (native gemm_f32 + embed, no hipcc).\n")
+    u64 fh_tail  = load_co("/tmp/wzma_fwd_tail.co",        "wzma_fwd_tail")
+    print_str("Kernels loaded (native gemm_f32 + embed + wzma_fwd_tail, no hipcc).\n")
 
     // ── Read bench_init.bin (weights) ──────────────────────────────────
     u64 emb_ptr  = alloc(VOCAB * D * 4)
@@ -241,49 +239,41 @@ fn main() {
     file_close(fd)
     print_str("Weights loaded.\n")
 
-    // gwT[D,K]: transpose gw[K,D] on CPU once (resident weight for gate gemm).
-    u64 gwT_ptr = alloc(D * K * 4)
-    u64 kk = 0
-    while kk < K {
-        u64 dd = 0
-        while dd < D {
-            f32 v = 0.0f
-            unsafe { *((gw_ptr + (kk * D + dd) * 4) as f32) -> v }
-            unsafe { *((gwT_ptr + (dd * K + kk) * 4) as f32) = v }
-            dd = dd + 1
-        }
-        kk = kk + 1
-    }
-
     // ── Upload RESIDENT weights ────────────────────────────────────────
+    // gw is uploaded RAW [K,D] (the fwd_tail kernel reads gw[k,d] directly,
+    // matching the mega-kernel's gate-softmax — no transpose needed now that
+    // the gate gemm dispatch is gone).
     u64 d_emb  = gpu_malloc(VOCAB * D * 4, "mEmb")
     u64 d_U    = gpu_malloc(K * D * R * 4, "mU")
     u64 d_V    = gpu_malloc(K * R * D * 4, "mV")
-    u64 d_gwT  = gpu_malloc(D * K * 4,     "mGwT")
+    u64 d_gw   = gpu_malloc(K * D * 4,     "mGw")
+    u64 d_gb   = gpu_malloc(K * 4,         "mGb")
+    u64 d_bias = gpu_malloc(D * 4,         "mBias")
     u64 d_ids1 = gpu_malloc(BS * 4,        "mIds1")
     u64 d_ids2 = gpu_malloc(BS * 4,        "mIds2")
 
     err = hipMemcpy(d_emb,  emb_ptr,  VOCAB * D * 4, 1); if err != 0 { die_gpu("H2D emb", err) }
     err = hipMemcpy(d_U,    U_ptr,    K * D * R * 4, 1); if err != 0 { die_gpu("H2D U", err) }
     err = hipMemcpy(d_V,    V_ptr,    K * R * D * 4, 1); if err != 0 { die_gpu("H2D V", err) }
-    err = hipMemcpy(d_gwT,  gwT_ptr,  D * K * 4,     1); if err != 0 { die_gpu("H2D gwT", err) }
+    err = hipMemcpy(d_gw,   gw_ptr,   K * D * 4,     1); if err != 0 { die_gpu("H2D gw", err) }
+    err = hipMemcpy(d_gb,   gb_ptr,   K * 4,         1); if err != 0 { die_gpu("H2D gb", err) }
+    err = hipMemcpy(d_bias, bias_ptr, D * 4,         1); if err != 0 { die_gpu("H2D bias", err) }
     err = hipMemcpy(d_ids1, ids1_i32, BS * 4,        1); if err != 0 { die_gpu("H2D ids1", err) }
     err = hipMemcpy(d_ids2, ids2_i32, BS * 4,        1); if err != 0 { die_gpu("H2D ids2", err) }
 
-    // ── GPU scratch ────────────────────────────────────────────────────
-    u64 d_x   = gpu_malloc(BS * D * 4, "mX")
-    u64 d_gl  = gpu_malloc(BS * K * 4, "mGl")
-    u64 d_int = gpu_malloc(K * BS * R * 4, "mInt")
-    u64 d_otk = gpu_malloc(K * BS * D * 4, "mOtk")
-    u64 d_v1  = gpu_malloc(B * D * 4, "mV1")
-    u64 d_v2T = gpu_malloc(D * B * 4, "mV2T")
+    // ── GPU scratch (all forward intermediates stay RESIDENT) ──────────
+    u64 d_x     = gpu_malloc(BS * D * 4, "mX")
+    u64 d_int   = gpu_malloc(K * BS * R * 4, "mInt")
+    u64 d_otk   = gpu_malloc(K * BS * D * 4, "mOtk")   // V output — NO D2H now
+    u64 d_alpha = gpu_malloc(BS * K * 4, "mAlpha")     // fwd_tail output
+    u64 d_z     = gpu_malloc(BS * D * 4, "mZ")         // combine output
+    u64 d_norms = gpu_malloc(B * 4,      "mNorms")     // pre-L2 magnitudes
+    u64 d_v1    = gpu_malloc(B * D * 4, "mV1")         // view-0 encoder out (resident)
+    u64 d_v2    = gpu_malloc(B * D * 4, "mV2")         // view-1 encoder out (resident)
+    u64 d_v2T   = gpu_malloc(D * B * 4, "mV2T")
     u64 d_logit = gpu_malloc(B * B * 4, "mLogit")
 
-    // ── CPU-side host buffers for the reduction phases ─────────────────
-    u64 h_gl    = alloc(BS * K * 4)
-    u64 h_alpha = alloc(BS * K * 4)
-    u64 h_outk  = alloc(K * BS * D * 4)
-    u64 h_z     = alloc(BS * D * 4)
+    // ── CPU-side host buffers (only the tiny v[B,D] crosses PCIe now) ──
     u64 h_q1    = alloc(B * D * 4)
     u64 h_q2    = alloc(B * D * 4)
 
@@ -291,19 +281,18 @@ fn main() {
 
     // ── Per-phase timing accumulators (ns), summed over 2 views ────────
     u64 ns_embed = 0
-    u64 ns_gate  = 0
     u64 ns_u     = 0
     u64 ns_v     = 0
-    u64 ns_comb  = 0
-    u64 ns_pool  = 0
-    u64 ns_l2    = 0
+    u64 ns_tail  = 0
+    u64 ns_d2h   = 0
     u64 ns_nce   = 0
 
     u64 view = 0
     while view < 2 {
         u64 d_ids = d_ids1
         u64 h_q = h_q1
-        if view == 1 { d_ids = d_ids2; h_q = h_q2 }
+        u64 d_v = d_v1
+        if view == 1 { d_ids = d_ids2; h_q = h_q2; d_v = d_v2 }
 
         // Phase 1: embed (GPU)
         u64 t0 = time_now()
@@ -311,15 +300,7 @@ fn main() {
         sync_or_die("sync embed")
         u64 t1 = time_now(); ns_embed = ns_embed + (t1 - t0)
 
-        // Phase 2: gate logits (GPU gemm) + gate post softmax (CPU)
-        t0 = time_now()
-        launch_gemm(fh_gemm, d_x, d_gwT, d_gl, BS, K, D)
-        sync_or_die("sync gate-gemm")
-        err = hipMemcpy(h_gl, d_gl, BS * K * 4, 2); if err != 0 { die_gpu("D2H gl", err) }
-        cpu_gate_post(h_gl, gb_ptr, h_alpha, BS, K)
-        t1 = time_now(); ns_gate = ns_gate + (t1 - t0)
-
-        // Phase 3: U einsum — inter_k[BS,R] = X[BS,D] @ U_k[D,R] (GPU gemm ×K)
+        // Phase 2: U einsum — inter_k[BS,R] = X[BS,D] @ U_k[D,R] (GPU gemm ×K)
         t0 = time_now()
         u64 ku = 0
         while ku < K {
@@ -331,7 +312,7 @@ fn main() {
         sync_or_die("sync U")
         t1 = time_now(); ns_u = ns_u + (t1 - t0)
 
-        // Phase 4: V einsum — outk_k[BS,D] = inter_k[BS,R] @ V_k[R,D] (GPU gemm ×K)
+        // Phase 3: V einsum — outk_k[BS,D] = inter_k[BS,R] @ V_k[R,D] (GPU gemm ×K)
         t0 = time_now()
         u64 kv = 0
         while kv < K {
@@ -344,23 +325,18 @@ fn main() {
         sync_or_die("sync V")
         t1 = time_now(); ns_v = ns_v + (t1 - t0)
 
-        // D2H outk for the CPU combine.
-        err = hipMemcpy(h_outk, d_otk, K * BS * D * 4, 2); if err != 0 { die_gpu("D2H outk", err) }
-
-        // Phase 5: combine αk·outk + bias → z[BS,D] (CPU)
+        // Phase 4: GPU forward tail (gate-softmax → combine → mean-pool → L2).
+        // outk stays RESIDENT (NO D2H) — x/alpha/outk/z/v never leave VRAM.
         t0 = time_now()
-        cpu_combine(h_alpha, h_outk, bias_ptr, h_z, BS, D, K)
-        t1 = time_now(); ns_comb = ns_comb + (t1 - t0)
+        launch_fwd_tail(fh_tail, d_x, d_gw, d_gb, d_otk, d_bias,
+                        d_alpha, d_z, d_v, d_norms, BS, D)
+        sync_or_die("sync fwd_tail")
+        t1 = time_now(); ns_tail = ns_tail + (t1 - t0)
 
-        // Phase 6: mean-pool over S → q[B,D] (CPU)
+        // D2H only the tiny encoder output v[B,D] (12 KB) for the InfoNCE step.
         t0 = time_now()
-        mean_pool_s_f32(h_z, h_q, B, S, D)
-        t1 = time_now(); ns_pool = ns_pool + (t1 - t0)
-
-        // Phase 7: L2-normalize q[B,D] in place (CPU)
-        t0 = time_now()
-        l2_normalize_f32(h_q, B, D)
-        t1 = time_now(); ns_l2 = ns_l2 + (t1 - t0)
+        err = hipMemcpy(h_q, d_v, B * D * 4, 2); if err != 0 { die_gpu("D2H v", err) }
+        t1 = time_now(); ns_d2h = ns_d2h + (t1 - t0)
 
         view = view + 1
     }
@@ -392,17 +368,16 @@ fn main() {
     u64 t1 = time_now(); ns_nce = ns_nce + (t1 - t0)
 
     // ── Per-phase timing report ────────────────────────────────────────
-    print_str("\n--- per-phase ms (embed/gate/U/V/comb/pool/L2 summed over 2 views; InfoNCE once) ---\n")
-    print_ms("embed       [GPU]: ", ms_of(ns_embed))
-    print_ms("gate        [GPU+CPU]: ", ms_of(ns_gate))
-    print_ms("U einsum    [GPU]: ", ms_of(ns_u))
-    print_ms("V einsum    [GPU]: ", ms_of(ns_v))
-    print_ms("combine     [CPU]: ", ms_of(ns_comb))
-    print_ms("mean-pool   [CPU]: ", ms_of(ns_pool))
-    print_ms("L2-norm     [CPU]: ", ms_of(ns_l2))
-    print_ms("InfoNCE     [GPU+CPU]: ", ms_of(ns_nce))
-    u64 ns_total = ns_embed + ns_gate + ns_u + ns_v + ns_comb + ns_pool + ns_l2 + ns_nce
-    print_ms("TOTAL fwd   : ", ms_of(ns_total))
+    print_str("\n--- per-phase ms (embed/U/V/fwd_tail/D2H summed over 2 views; InfoNCE once) ---\n")
+    print_ms("embed         [GPU]: ", ms_of(ns_embed))
+    print_ms("U einsum      [GPU]: ", ms_of(ns_u))
+    print_ms("V einsum      [GPU]: ", ms_of(ns_v))
+    print_ms("fwd_tail      [GPU]: ", ms_of(ns_tail))
+    print_ms("D2H v[B,D]    [PCIe]: ", ms_of(ns_d2h))
+    print_ms("InfoNCE       [GPU+CPU]: ", ms_of(ns_nce))
+    u64 ns_total = ns_embed + ns_u + ns_v + ns_tail + ns_d2h + ns_nce
+    print_ms("TOTAL fwd     : ", ms_of(ns_total))
+    print_str("(gate-softmax + combine + mean-pool + L2 are now GPU-resident inside fwd_tail)\n")
 
     // ── Loss assertion vs bench_ref cpu_losses[0] = 3.0593414 ──────────
     print_str("\n=== Results ===\n")
@@ -446,13 +421,14 @@ fn main() {
     if ok == 1 { print_str("PASS: loss[0] within 1e-2\n") }
 
     // ── Cleanup ────────────────────────────────────────────────────────
-    hipFree(d_emb); hipFree(d_U); hipFree(d_V); hipFree(d_gwT)
+    hipFree(d_emb); hipFree(d_U); hipFree(d_V)
+    hipFree(d_gw); hipFree(d_gb); hipFree(d_bias)
     hipFree(d_ids1); hipFree(d_ids2)
-    hipFree(d_x); hipFree(d_gl); hipFree(d_int); hipFree(d_otk)
-    hipFree(d_v1); hipFree(d_v2T); hipFree(d_logit)
+    hipFree(d_x); hipFree(d_int); hipFree(d_otk)
+    hipFree(d_alpha); hipFree(d_z); hipFree(d_norms)
+    hipFree(d_v1); hipFree(d_v2); hipFree(d_v2T); hipFree(d_logit)
     dealloc(emb_ptr); dealloc(U_ptr); dealloc(V_ptr); dealloc(gw_ptr); dealloc(gb_ptr)
-    dealloc(bias_ptr); dealloc(gwT_ptr); dealloc(ids1_i32); dealloc(ids2_i32)
-    dealloc(h_gl); dealloc(h_alpha); dealloc(h_outk); dealloc(h_z)
+    dealloc(bias_ptr); dealloc(ids1_i32); dealloc(ids2_i32)
     dealloc(h_q1); dealloc(h_q2)
 
     hipkfd_teardown()
