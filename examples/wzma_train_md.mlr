@@ -28,6 +28,20 @@
 //
 // Loss: each step within 1e-2 of bench_ref.json.  Grads ≤1e-3 vs oracle_grads.bin.
 //
+// STATUS (2026-05-27): forward + InfoNCE GREEN (loss[0]=3.059341 bit-exact).
+// Backward is RUN-BLOCKED: the first bwd_uv view-prep dispatch, gate_bwd_bs_f32,
+// HANGS the WG (hipDeviceSynchronize 5 s timeout; 1 packet outstanding, NOT ring
+// back-pressure — only 6 dispatches/sync here, well under the 64-slot ring).
+// Pinpointed via per-dispatch sync probe: "VP0 pre gate_bwd_bs" prints, then the
+// kernel never retires.  gate_bwd_bs_f32 is the ONE backward kernel the isolated
+// bwd_uv_smoke (examples/bwd_uv_smoke.mlr) never exercised — its 3-packet view-
+// prep covered only dbias-gemm_accum + 2 transposes, NOT gate_bwd_bs/_dgrad/repack.
+// Root cause is inside the gate_bwd_bs_f32 cross-wave 512-lane LDS reduce
+// (_emit_lds_reduce_tree_512 in src/format_amdgpu.mlr) — needs a dedicated fix.
+// The AQL-ring syncs (per-bank + view-prep) ARE in place and are correct; they
+// were not the wedge cause.  The GPU is NOT firmware-wedged — the hang is a
+// per-process kernel spin our 5 s watchdog catches; the queue is reclaimed at exit.
+//
 // Build (--target=amdgpu-native):
 //   ./build/mlrc --target=amdgpu-native examples/wzma_train_md.mlr \
 //       -o ~/mlrift_bin/wzma_train/wzma_train_md
@@ -215,6 +229,126 @@ fn launch_repack(u64 fh, u64 d_in, u64 d_out, u64 A, u64 Bm, u64 W) {
     dealloc(p0); dealloc(p1); dealloc(p2); dealloc(p3); dealloc(p4); dealloc(kp)
 }
 
+// gemm_f32_accum: C[M,N] += A[M,K_dim] @ B[K_dim,N]  (ACCUMULATE).  Same grid/
+// block as gemm_f32 (tiles_m*tiles_n WGs, 256 lanes).  Used for dV/dU/dx/dbias
+// accumulation across banks + views (the bwd_uv GEMM rewrite).
+fn launch_gemm_accum(u64 fh, u64 d_a, u64 d_b, u64 d_c, u64 m, u64 n, u64 k_dim) {
+    u64 p0 = alloc(8); unsafe { *(p0 as u64) = d_a }
+    u64 p1 = alloc(8); unsafe { *(p1 as u64) = d_b }
+    u64 p2 = alloc(8); unsafe { *(p2 as u64) = d_c }
+    u64 p3 = alloc(8); unsafe { *(p3 as u64) = m }
+    u64 p4 = alloc(8); unsafe { *(p4 as u64) = n }
+    u64 p5 = alloc(8); unsafe { *(p5 as u64) = k_dim }
+    u64 kp = alloc(6 * 8)
+    unsafe { *(kp        as u64) = p0 }
+    unsafe { *((kp +  8) as u64) = p1 }
+    unsafe { *((kp + 16) as u64) = p2 }
+    unsafe { *((kp + 24) as u64) = p3 }
+    unsafe { *((kp + 32) as u64) = p4 }
+    unsafe { *((kp + 40) as u64) = p5 }
+    u64 tiles_m = (m + 15) / 16
+    u64 tiles_n = (n + 15) / 16
+    u32 grid  = tiles_m * tiles_n
+    u32 block = 256
+    u32 err = hipModuleLaunchKernel(fh, grid, 1, 1, block, 1, 1, 0, 0, kp, 0)
+    if err != 0 { die_gpu("launch gemm_accum", err) }
+    dealloc(p0); dealloc(p1); dealloc(p2); dealloc(p3); dealloc(p4); dealloc(p5); dealloc(kp)
+}
+
+// transpose_f32: out[N,M] = transpose(in[M,N]).  16x16 LDS tiles, 256 lanes.
+fn launch_transpose(u64 fh, u64 d_in, u64 d_out, u64 m, u64 n) {
+    u64 p0 = alloc(8); unsafe { *(p0 as u64) = d_in }
+    u64 p1 = alloc(8); unsafe { *(p1 as u64) = d_out }
+    u64 p2 = alloc(8); unsafe { *(p2 as u64) = m }
+    u64 p3 = alloc(8); unsafe { *(p3 as u64) = n }
+    u64 kp = alloc(4 * 8)
+    unsafe { *(kp        as u64) = p0 }
+    unsafe { *((kp +  8) as u64) = p1 }
+    unsafe { *((kp + 16) as u64) = p2 }
+    unsafe { *((kp + 24) as u64) = p3 }
+    u64 tiles_m = (m + 15) / 16
+    u64 tiles_n = (n + 15) / 16
+    u32 grid  = tiles_m * tiles_n
+    u32 block = 256
+    u32 err = hipModuleLaunchKernel(fh, grid, 1, 1, block, 1, 1, 0, 0, kp, 0)
+    if err != 0 { die_gpu("launch transpose", err) }
+    dealloc(p0); dealloc(p1); dealloc(p2); dealloc(p3); dealloc(kp)
+}
+
+// row_scale_f32: out[bs,d] = in[bs,d] * scale[bs].  grid=(n+255)/256, block=256.
+// Used to form doutk_k[bs,d] = alpha_k[bs] * dz[bs,d] (alpha applied ONCE).
+fn launch_row_scale(u64 fh, u64 d_in, u64 d_scale, u64 d_out, u64 n, u64 row_width) {
+    u64 p0 = alloc(8); unsafe { *(p0 as u64) = d_in }
+    u64 p1 = alloc(8); unsafe { *(p1 as u64) = d_scale }
+    u64 p2 = alloc(8); unsafe { *(p2 as u64) = d_out }
+    u64 p3 = alloc(8); unsafe { *(p3 as u64) = n }
+    u64 p4 = alloc(8); unsafe { *(p4 as u64) = row_width }
+    u64 kp = alloc(5 * 8)
+    unsafe { *(kp        as u64) = p0 }
+    unsafe { *((kp +  8) as u64) = p1 }
+    unsafe { *((kp + 16) as u64) = p2 }
+    unsafe { *((kp + 24) as u64) = p3 }
+    unsafe { *((kp + 32) as u64) = p4 }
+    u64 grid_u = (n + 255) / 256
+    u32 grid   = grid_u
+    u32 block  = 256
+    u32 err = hipModuleLaunchKernel(fh, grid, 1, 1, block, 1, 1, 0, 0, kp, 0)
+    if err != 0 { die_gpu("launch row_scale", err) }
+    dealloc(p0); dealloc(p1); dealloc(p2); dealloc(p3); dealloc(p4); dealloc(kp)
+}
+
+// gate_bwd_bs_f32: per-bs gate-softmax backward.  In: dy(=dz)[BS,D], x[BS,D],
+// alpha[BS,K], outk[BS,K,D] (bs-major), gw[K,D].  Out: dx_gate[BS,D], dgl[BS,K].
+// grid=BS, block=512 (hardcoded D=384 padded to 512).
+fn launch_gate_bwd_bs(u64 fh, u64 d_dy, u64 d_x, u64 d_alpha, u64 d_outk_bskd,
+                      u64 d_gw, u64 d_dx_gate, u64 d_dgl, u64 BS, u64 D, u64 K) {
+    u64 p0 = alloc(8); unsafe { *(p0 as u64) = d_dy }
+    u64 p1 = alloc(8); unsafe { *(p1 as u64) = d_x }
+    u64 p2 = alloc(8); unsafe { *(p2 as u64) = d_alpha }
+    u64 p3 = alloc(8); unsafe { *(p3 as u64) = d_outk_bskd }
+    u64 p4 = alloc(8); unsafe { *(p4 as u64) = d_gw }
+    u64 p5 = alloc(8); unsafe { *(p5 as u64) = d_dx_gate }
+    u64 p6 = alloc(8); unsafe { *(p6 as u64) = d_dgl }
+    u64 p7 = alloc(8); unsafe { *(p7 as u64) = BS }
+    u64 p8 = alloc(8); unsafe { *(p8 as u64) = D }
+    u64 p9 = alloc(8); unsafe { *(p9 as u64) = K }
+    u64 kp = alloc(10 * 8)
+    unsafe { *(kp        as u64) = p0 }; unsafe { *((kp +  8) as u64) = p1 }
+    unsafe { *((kp + 16) as u64) = p2 }; unsafe { *((kp + 24) as u64) = p3 }
+    unsafe { *((kp + 32) as u64) = p4 }; unsafe { *((kp + 40) as u64) = p5 }
+    unsafe { *((kp + 48) as u64) = p6 }; unsafe { *((kp + 56) as u64) = p7 }
+    unsafe { *((kp + 64) as u64) = p8 }; unsafe { *((kp + 72) as u64) = p9 }
+    u32 grid  = BS
+    u32 block = 512
+    u32 err = hipModuleLaunchKernel(fh, grid, 1, 1, block, 1, 1, 0, 0, kp, 0)
+    if err != 0 { die_gpu("launch gate_bwd_bs", err) }
+    dealloc(p0); dealloc(p1); dealloc(p2); dealloc(p3); dealloc(p4)
+    dealloc(p5); dealloc(p6); dealloc(p7); dealloc(p8); dealloc(p9); dealloc(kp)
+}
+
+// gate_bwd_dgrad_f32: dgw[K,D] += sum_bs dgl[bs,k]*x[bs,d] ; dgb[K] += sum_bs dgl.
+// ACCUMULATES into dgw/dgb (both views).  grid=K, block=D.
+fn launch_gate_bwd_dgrad(u64 fh, u64 d_x, u64 d_dgl, u64 d_dgw, u64 d_dgb,
+                         u64 BS, u64 D, u64 K) {
+    u64 p0 = alloc(8); unsafe { *(p0 as u64) = d_x }
+    u64 p1 = alloc(8); unsafe { *(p1 as u64) = d_dgl }
+    u64 p2 = alloc(8); unsafe { *(p2 as u64) = d_dgw }
+    u64 p3 = alloc(8); unsafe { *(p3 as u64) = d_dgb }
+    u64 p4 = alloc(8); unsafe { *(p4 as u64) = BS }
+    u64 p5 = alloc(8); unsafe { *(p5 as u64) = D }
+    u64 p6 = alloc(8); unsafe { *(p6 as u64) = K }
+    u64 kp = alloc(7 * 8)
+    unsafe { *(kp        as u64) = p0 }; unsafe { *((kp +  8) as u64) = p1 }
+    unsafe { *((kp + 16) as u64) = p2 }; unsafe { *((kp + 24) as u64) = p3 }
+    unsafe { *((kp + 32) as u64) = p4 }; unsafe { *((kp + 40) as u64) = p5 }
+    unsafe { *((kp + 48) as u64) = p6 }
+    u32 grid  = K
+    u32 block = D
+    u32 err = hipModuleLaunchKernel(fh, grid, 1, 1, block, 1, 1, 0, 0, kp, 0)
+    if err != 0 { die_gpu("launch gate_bwd_dgrad", err) }
+    dealloc(p0); dealloc(p1); dealloc(p2); dealloc(p3); dealloc(p4); dealloc(p5); dealloc(p6); dealloc(kp)
+}
+
 // launch_fill: zero an f32 buffer of n_f32 elements ON THE GPU via the grid-fill
 // kernel (buf[gid]=value as f64, gid<n_f64).  We treat the buffer as f64 elems:
 // n_f64 = n_f32/2, value=0.0 → all bytes zero (0.0f64 == 0.0f32 == all-zero).
@@ -349,6 +483,12 @@ fn main() {
     u64 fh_bemb   = load_co("/tmp/wzma_bwd_embed.co",         "wzma_bwd_embed")
     u64 fh_bred   = load_co("/tmp/wzma_bwd_reduce.co",        "wzma_bwd_reduce")
     u64 fh_adamw  = load_co("/tmp/adamw_step_f32.co",         "adamw_step_f32")
+    // ── GEMM-based bwd_uv replacement (full-occupancy contractions) ─────────
+    u64 fh_gaccum = load_co("/tmp/gemm_f32_accum.co",         "gemm_f32_accum")
+    u64 fh_transp = load_co("/tmp/transpose_f32.co",          "transpose_f32")
+    u64 fh_rscale = load_co("/tmp/row_scale_f32.co",          "row_scale_f32")
+    u64 fh_gbs    = load_co("/tmp/gate_bwd_bs_f32.co",        "gate_bwd_bs_f32")
+    u64 fh_gdgrad = load_co("/tmp/gate_bwd_dgrad_f32.co",     "gate_bwd_dgrad_f32")
     // grid-fill (f64 splat) — GPU-side zero of d_demb + d_partial each step,
     // replacing the per-step host H2D zeros (12.6 MB demb + 3.2 MB partial = the
     // 0.82 ms/step "demb-zero-H2D" regression).  Native grid-fill emitter, no hipcc.
@@ -432,6 +572,22 @@ fn main() {
     u64 d_partial = gpu_malloc(WZM_BWD_NW * PART_N * 4, "mPartial")
     u64 d_barrier = gpu_malloc(4096, "mBarrier")  // dummy (no in-kernel cross-WG barrier)
 
+    // ── GEMM-bwd scratch (full-occupancy bwd_uv replacement) ───────────────
+    // doutk_k[bs,d] = alpha_k[bs]*dz[bs,d]  (per view, all K banks contiguous).
+    u64 d_doutk    = gpu_malloc(K * BS * D * 4, "mDoutk")     // [K,BS,D]
+    // raw inter repacked k-major: inter_k[bs,r] contiguous per bank (== validated
+    // repack of the bs-major d_i1/d_i2 saved activation; alpha applied ONCE in dV
+    // via doutk, never to inter).
+    u64 d_inter_kr = gpu_malloc(K * BS * R * 4, "mInterKR")   // [K,BS,R]
+    u64 d_alphaT   = gpu_malloc(K * BS * 4,     "mAlphaT")    // alpha^T [K,BS] → row k = alpha[:,k]
+    u64 d_xT       = gpu_malloc(D * BS * 4,     "mXT")        // x^T [D,BS]
+    u64 d_interT   = gpu_malloc(R * BS * 4,     "mInterT")    // inter_k^T [R,BS] (reused per k)
+    u64 d_VkT      = gpu_malloc(D * R * 4,      "mVkT")       // V_k^T [D,R] (reused per k)
+    u64 d_UkT      = gpu_malloc(R * D * 4,      "mUkT")       // U_k^T [R,D] (reused per k)
+    u64 d_dinter   = gpu_malloc(BS * R * 4,     "mDinter")    // dinter_k [BS,R] (reused per k)
+    u64 d_dgl1     = gpu_malloc(BS * K * 4,     "mDgl1");  u64 d_dgl2 = gpu_malloc(BS * K * 4, "mDgl2")
+    u64 d_ones_bs  = gpu_malloc(BS * 4,         "mOnesBS")   // [1,BS] all-ones for dbias gemm
+
     // ── AdamW moment buffers (zero-init once) ──────────────────────────────
     u64 d_mU=gpu_malloc(K*D*R*4,"mMU"); u64 d_vU=gpu_malloc(K*D*R*4,"mVU")
     u64 d_mV=gpu_malloc(K*R*D*4,"mMV"); u64 d_vV=gpu_malloc(K*R*D*4,"mVV")
@@ -451,6 +607,13 @@ fn main() {
     err = hipMemcpy(d_mBias,zbig,D*4,1);   err = hipMemcpy(d_vBias,zbig,D*4,1)
     err = hipMemcpy(d_mEmb,zbig,VOCAB*D*4,1); err = hipMemcpy(d_vEmb,zbig,VOCAB*D*4,1)
     err = hipMemcpy(d_demb,zbig,VOCAB*D*4,1)  // demb zeroed once at init; per-step re-zero now on-GPU via launch_fill (no H2D)
+
+    // d_ones_bs = [1.0]*BS (for dbias = ones[1,BS] @ dz[BS,D] via gemm_accum)
+    u64 zones = alloc(BS * 4)
+    u64 oi = 0
+    while oi < BS { unsafe { *((zones + oi*4) as f32) = 1.0f } oi = oi + 1 }
+    err = hipMemcpy(d_ones_bs, zones, BS*4, 1); if err != 0 { die_gpu("H2D ones", err) }
+    dealloc(zones)
 
     print_str("Buffers allocated + moments/demb zero-init.\n")
 
@@ -558,15 +721,16 @@ fn main() {
             print_str(" |err|="); ss = fmt_f32(lerr, 8); print_str(ss); dealloc(ss); print_str("\n")
         }
 
-        // ════════════════ Zero d_partial (NW slots) + d_demb scatter accum ══
-        // Both are RMW (+=) accumulators in the backward, so they MUST start at 0
-        // each step.  Was a per-step host H2D memset (12.6 MB demb + 3.2 MB partial
-        // → ~0.82 ms/step PCIe staging "demb-zero-H2D" regression).  NOW zeroed
+        // ════════════════ Zero d_grads + d_demb (RMW accumulators) ══════════
+        // dU|dV|dgw|dgb|dbias (d_grads, PART_N) and demb are += accumulators in
+        // the GEMM backward (gemm_f32_accum + gate_bwd dgrad scatter into them
+        // across both views/banks), so they MUST start at 0 each step.  Zeroed
         // ON THE GPU via the native grid-fill kernel — no host buffer, no D2H/H2D.
-        // Both dispatches are driver-synced before the backward RMW reads them.
+        // (d_partial is no longer used — the per-WG-partial + reduce machinery was
+        //  the reduce-tree bwd_uv; the GEMM contractions accumulate directly.)
         t0 = time_now()
-        launch_fill(fh_fill, d_partial, WZM_BWD_NW * PART_N)
-        launch_fill(fh_fill, d_demb,    VOCAB * D)
+        launch_fill(fh_fill, d_grads, PART_N)
+        launch_fill(fh_fill, d_demb,  VOCAB * D)
         sync_or_die("sync gpu-zero"); t1 = time_now(); ns_zero = ns_zero + (t1 - t0)
 
         // ════════════════ BACKWARD — build shared 63-arg kernarg block ═══════
@@ -666,12 +830,77 @@ fn main() {
         sync_or_die("sync bwd_pre"); t1 = time_now()
         ns_bpre = ns_bpre + (t1 - t0) + (kb_t1 - kb_t0)
 
-        // Phase 2: wzma_bwd_uv (grid=NW) — wzma_bwd ×2 → per-WG partial dense
-        // grads + dx1/dx2.  THE heavy phase; BS rows split across NW WGs.
+        // Phase 2: bwd_uv via FULL-OCCUPANCY GEMM (replaces the grid=NW serial
+        // per-bank K=4 reduce-tree adjoint that was 48% of the step).  Every heavy
+        // contraction is a standalone driver-synced gemm_f32 / gemm_f32_accum /
+        // transpose_f32 dispatch at full 60-CU occupancy.  The gate-softmax bwd
+        // (dgw/dgb/dx_gate) stays in the small validated gate_bwd_bs/dgrad kernels;
+        // dbias is a 1×D gemm_accum (ones[1,BS]·dz[BS,D]).  NO AQL chain, NO cross-WG
+        // barrier (each dispatch boundary IS the barrier).  NW serial path retired.
+        //
+        // Per view v, per bank k (mirrors the validated wzma_bwd math exactly):
+        //   doutk_k[bs,d] = alpha_k[bs]·dz[bs,d]                  (row_scale; α ONCE)
+        //   dinter_k[bs,r] = doutk_k[BS,D] · V_k^T[D,R]            (gemm)
+        //   dV_k[r,d]     += inter_k^T[R,BS] · doutk_k[BS,D]       (gemm_accum, raw inter)
+        //   dU_k[d,r]     += x^T[D,BS] · dinter_k[BS,R]            (gemm_accum)
+        //   dx[bs,d]      += dinter_k[BS,R] · U_k^T[R,D]           (gemm_accum into dx_gate)
         t0 = time_now()
-        berr = hipModuleLaunchKernel(fh_buv, NW32, 1, 1, 512, 1, 1, 0, 0, kp, 0)
-        if berr != 0 { die_gpu("launch wzma_bwd_uv", berr) }
-        sync_or_die("sync bwd_uv"); t1 = time_now(); ns_buv = ns_buv + (t1 - t0)
+        u64 vw = 0
+        while vw < 2 {
+            u64 d_xv   = d_x1;  u64 d_av  = d_a1;  u64 d_iv = d_i1;  u64 d_ov = d_o1
+            u64 d_dzv  = d_dz1; u64 d_dxv = d_dx1; u64 d_dglv = d_dgl1
+            if vw == 1 {
+                d_xv = d_x2;  d_av = d_a2;  d_iv = d_i2;  d_ov = d_o2
+                d_dzv = d_dz2; d_dxv = d_dx2; d_dglv = d_dgl2
+            }
+            // gate-softmax bwd: dx_gate (→ dx buffer base) + dgl[bs,k]; then
+            // dgw/dgb += (accumulated across both views).  outk is bs-major [BS,K,D].
+            launch_gate_bwd_bs(fh_gbs, d_dzv, d_xv, d_av, d_ov, d_gw, d_dxv, d_dglv, BS, D, K)
+            launch_gate_bwd_dgrad(fh_gdgrad, d_xv, d_dglv, d_dgw, d_dgb, BS, D, K)
+            // dbias[d] += sum_bs dz[bs,d]  (ones[1,BS] @ dz[BS,D] → [1,D])
+            launch_gemm_accum(fh_gaccum, d_ones_bs, d_dzv, d_dbias, 1, D, BS)
+            // alpha^T[K,BS]: row k = alpha[:,k] (contiguous per bank for row_scale)
+            launch_transpose(fh_transp, d_av, d_alphaT, BS, K)
+            // raw inter repacked k-major: [BS,K,R] → [K,BS,R] (validated repack)
+            launch_repack(fh_repack, d_iv, d_inter_kr, BS, K, R)
+            // x^T[D,BS] (shared by all banks of this view)
+            launch_transpose(fh_transp, d_xv, d_xT, BS, D)
+            // Driver-sync the view-prep dispatches (6 packets) before the bank
+            // loop.  The KFD shim only rings the doorbell at hipDeviceSynchronize
+            // and the AQL ring holds 64 packets — so we MUST sync well within 64
+            // dispatches/sync or the ring back-pressures forever (CP never started).
+            sync_or_die("sync bwd_uv view-prep")
+            u64 kk = 0
+            while kk < K {
+                u64 d_Uk  = d_U + kk*D*R*4
+                u64 d_Vk  = d_V + kk*R*D*4
+                u64 d_dUk = d_dU + kk*D*R*4
+                u64 d_dVk = d_dV + kk*R*D*4
+                u64 d_intk   = d_inter_kr + kk*BS*R*4          // raw inter_k [BS,R]
+                u64 d_doutk_k = d_doutk   + kk*BS*D*4          // doutk_k [BS,D]
+                u64 d_alphak = d_alphaT   + kk*BS*4            // alpha_k [BS]
+                // doutk_k = alpha_k · dz   (α applied ONCE here)
+                launch_row_scale(fh_rscale, d_dzv, d_alphak, d_doutk_k, BS*D, D)
+                // dinter_k[BS,R] = doutk_k[BS,D] · V_k^T[D,R]
+                launch_transpose(fh_transp, d_Vk, d_VkT, R, D)        // V_k[R,D]→[D,R]
+                launch_gemm(fh_gemm, d_doutk_k, d_VkT, d_dinter, BS, R, D)
+                // dV_k[R,D] += inter_k^T[R,BS] · doutk_k[BS,D]
+                launch_transpose(fh_transp, d_intk, d_interT, BS, R)  // inter_k[BS,R]→[R,BS]
+                launch_gemm_accum(fh_gaccum, d_interT, d_doutk_k, d_dVk, R, D, BS)
+                // dU_k[D,R] += x^T[D,BS] · dinter_k[BS,R]
+                launch_gemm_accum(fh_gaccum, d_xT, d_dinter, d_dUk, D, R, BS)
+                // dx[BS,D] += dinter_k[BS,R] · U_k^T[R,D]  (accumulate onto dx_gate)
+                launch_transpose(fh_transp, d_Uk, d_UkT, D, R)        // U_k[D,R]→[R,D]
+                launch_gemm_accum(fh_gaccum, d_dinter, d_UkT, d_dxv, BS, D, R)
+                // Sync per bank (8 packets) — bounds ring depth AND fences the
+                // shared scratch (d_dinter/d_VkT/d_interT/d_UkT) before reuse by
+                // the next bank.  This IS the driver-sync between GEMM dispatches.
+                sync_or_die("sync bwd_uv bank")
+                kk = kk + 1
+            }
+            vw = vw + 1
+        }
+        t1 = time_now(); ns_buv = ns_buv + (t1 - t0)
 
         // Phase 3: wzma_bwd_embed (grid=1) — embed_bwd ×2 scatter → demb.
         t0 = time_now()
@@ -679,12 +908,10 @@ fn main() {
         if berr != 0 { die_gpu("launch wzma_bwd_embed", berr) }
         sync_or_die("sync bwd_embed"); t1 = time_now(); ns_bemb = ns_bemb + (t1 - t0)
 
-        // Phase 4: wzma_bwd_reduce (grid=NW) — fixed-order reduce of NW partial
-        // slots → final dU/dV/dgw/dgb/dbias (contiguous in d_grads).
-        t0 = time_now()
-        berr = hipModuleLaunchKernel(fh_bred, NW32, 1, 1, 512, 1, 1, 0, 0, kp, 0)
-        if berr != 0 { die_gpu("launch wzma_bwd_reduce", berr) }
-        sync_or_die("sync bwd_reduce"); t1 = time_now(); ns_bred = ns_bred + (t1 - t0)
+        // Phase 4 (wzma_bwd_reduce / per-WG partial reduce) RETIRED — the GEMM
+        // contractions in phase 2 accumulate dU/dV/dgw/dgb/dbias DIRECTLY into the
+        // final contiguous d_grads (no per-WG partial slots), so there is nothing
+        // to reduce.  ns_bred stays 0 in the profile.
 
         // free the per-arg value slots
         u64 fi = 0
@@ -721,13 +948,13 @@ fn main() {
     print_ms("repack  [GPU]: ", ms_of(ns_repack))
     print_ms("fwd_tail[GPU]: ", ms_of(ns_tail))
     print_ms("InfoNCE [GPU+CPU+loss]: ", ms_of(ns_nce))
-    print_ms("zero dP+demb [GPU fill, was H2D]: ", ms_of(ns_zero))
-    print_str("--- BACKWARD (was 1 single-WG dispatch ~34ms/step; now 4 full-occ phases + 6 AdamW) ---\n")
-    print_ms("  bwd_pre    [GPU grid=1] : ", ms_of(ns_bpre))
-    print_ms("  bwd_uv     [GPU grid=NW]: ", ms_of(ns_buv))
-    print_ms("  bwd_embed  [GPU grid=1] : ", ms_of(ns_bemb))
-    print_ms("  bwd_reduce [GPU grid=NW]: ", ms_of(ns_bred))
-    print_ms("  AdamW x6   [GPU full-occ]: ", ms_of(ns_badamw))
+    print_ms("zero dGrads+demb [GPU fill, was H2D]: ", ms_of(ns_zero))
+    print_str("--- BACKWARD (bwd_uv now full-occupancy GEMM; old reduce-tree was 4.35ms/48%) ---\n")
+    print_ms("  bwd_pre    [GPU grid=1]      : ", ms_of(ns_bpre))
+    print_ms("  bwd_uv     [GPU GEMM full-occ]: ", ms_of(ns_buv))
+    print_ms("  bwd_embed  [GPU grid=1]      : ", ms_of(ns_bemb))
+    print_ms("  bwd_reduce [RETIRED — GEMM accumulates direct]: ", ms_of(ns_bred))
+    print_ms("  AdamW x6   [GPU full-occ]    : ", ms_of(ns_badamw))
     f32 ms_bwd_total = ms_of(ns_bpre) + ms_of(ns_buv) + ms_of(ns_bemb) + ms_of(ns_bred) + ms_of(ns_badamw)
     print_ms("  BACKWARD total (vs old 34ms/step → ", ms_bwd_total / 50.0f)
     print_ms("TOTAL 50-step: ", ms_of(ns_total_step))

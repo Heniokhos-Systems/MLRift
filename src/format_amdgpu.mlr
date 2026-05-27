@@ -18923,7 +18923,13 @@ fn amdgpu_lower_repack_abw_to_baw_f32(uint64 kname_ptr, uint64 nl) -> uint64 {
 
 // ── row_scale_f32 ──────────────────────────────────────────────────────────
 // Per-element scale: out[gid] = in[gid] * scale[gid/row_width]
-// Uses float reciprocal divide for bs = gid/row_width (valid for gid < 2^23).
+// Row index bs = floor(gid/row_width).  The float-reciprocal estimate
+// (v_rcp_f32) is NOT correctly rounded — it can land ±1 ULP either side of the
+// true quotient, so trunc(gid*rcp(rw)) is off-by-one for exact multiples
+// (e.g. gid=6528, rw=384: 6528/384 = 17 exactly, but rcp underestimates →
+// 16.9999 → trunc 16 → wrong row).  We compute the float estimate, truncate to
+// a candidate q, then do an EXACT two-sided integer correction (q-1 / q+1) so
+// bs is the true floor.  Valid for gid,row_width < 2^23 (exact in f32).
 // Grid: ceil(n/256) blocks × 256 threads.
 // Kernarg (5 args × 8 bytes = 40 bytes):
 //   0x00 in_ptr    (u64) → s[4:5]
@@ -18943,12 +18949,25 @@ fn amdgpu_lower_row_scale_f32(uint64 kname_ptr, uint64 nl) -> uint64 {
     asm_u32(0x4A020002)   // v_add_nc_u32_e32 v1, s2, v0     (gid)
     asm_u32(0x7C98020A)   // v_cmp_gt_u32_e32 vcc_lo, s10, v1  (gid < n)
     asm_u32(0xBE82206A)   // s_and_saveexec_b32 s2, vcc_lo
-    asm_u32(0xBFA50020)   // s_cbranch_execz 32
+    asm_u32(0xBFA5002D)   // s_cbranch_execz 45  (skip if-body; +13 dwords for the int-div correction)
     asm_u32(0x7E040D01)   // v_cvt_f32_u32_e32 v2, v1         (float(gid))
     asm_u32(0x7E060C0C)   // v_cvt_f32_u32_e32 v3, s12        (float(row_width))
     asm_u32(0x7E065503)   // v_rcp_f32_e32 v3, v3
     asm_u32(0x10040702)   // v_mul_f32_e32 v2, v2, v3
-    asm_u32(0x7E040F02)   // v_cvt_u32_f32_e32 v2, v2         (bs)
+    asm_u32(0x7E040F02)   // v_cvt_u32_f32_e32 v2, v2         (q = trunc estimate; may be ±1 off)
+    // ── EXACT integer-floor correction (q := floor(gid/row_width)) ──
+    // prod = q*row_width
+    asm_u32(0xD72C0003); asm_u32(0x00001902)   // v_mul_lo_u32 v3, v2, s12
+    // correct DOWN: if prod > gid → q := q-1
+    asm_u32(0x4A0804C1)                         // v_add_nc_u32_e32 v4, -1, v2   (q-1; imm -1 = 0xC1)
+    asm_u32(0x7C980303)                         // v_cmp_gt_u32_e32 vcc_lo, v3, v1   (prod > gid?)
+    asm_u32(0xD5010002); asm_u32(0x01AA0902)    // v_cndmask_b32_e64 v2, v2, v4, vcc_lo
+    // recompute prod for corrected q, then correct UP: if (q+1)*rw <= gid → q := q+1
+    asm_u32(0xD72C0003); asm_u32(0x00001902)   // v_mul_lo_u32 v3, v2, s12         (prod = q*rw)
+    asm_u32(0x4A06060C)                         // v_add_nc_u32_e32 v3, s12, v3     ((q+1)*rw)
+    asm_u32(0x4A080481)                         // v_add_nc_u32_e32 v4, 1, v2       (q+1)
+    asm_u32(0x7C960303)                         // v_cmp_le_u32_e32 vcc_lo, v3, v1  ((q+1)*rw <= gid?)
+    asm_u32(0xD5010002); asm_u32(0x01AA0902)    // v_cndmask_b32_e64 v2, v2, v4, vcc_lo  (bs := floor)
     asm_u32(0x30060282)   // v_lshlrev_b32_e32 v3, 2, v1      (gid*4)
     asm_u32(0x7E080280)   // v_mov_b32_e32 v4, 0
     asm_u32(0xD7006A03)   // v_add_co_u32 v3, vcc_lo, s4, v3
