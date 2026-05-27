@@ -1,10 +1,24 @@
-// wzma_train_mega launcher (DEBUG MODE) — Task 1 of 8.
+// wzma_train_mega launcher — Task 7 of 8 (full 50-step training + benchmark).
 //
-// Single-workgroup WZMA+InfoNCE training mega-kernel, phase 1 (embed-gather)
-// validation harness.  Loads the name-routed amdgpu-native .co, uploads the
-// bench embedding table + token ids, launches ONE 1-WG / 512-thread dispatch,
-// downloads the gathered [BS,D] output, and compares element-wise against a
-// CPU reference port of std/train.mlr fn embed_f32.
+// Single-workgroup WZMA+InfoNCE training mega-kernel.  Loads the name-routed
+// amdgpu-native .co, uploads the bench embedding table + token ids + dense
+// weights, then runs a FULL 50-step training loop: each step launches ONE
+// 1-WG / 512-thread dispatch (embed-gather + WZMA fwd + mean-pool + L2-norm +
+// InfoNCE loss + full backward + in-kernel dense AdamW for both views), reads
+// the scalar loss, then does CPU sparse-embed AdamW on the touched rows.
+//
+// Validation: each of the 50 losses is asserted within 1e-2 of
+// MLRiftBench/tools/bench_ref.json cpu_losses[] (3.059 → 0.000634).
+// Benchmark: median ms/step over steps 5..49 (warmup-skip first 5) via
+// time_now(), plus the device-buffer VRAM footprint.  The whole point of the
+// single-WG design is wedge-proofness across repeated runs (1 dispatch/step).
+//
+// PERF NOTE: the dominant per-step cost USED to be a full 12.6 MB D2H of the
+// d_demb gradient table every step (~1219 ms/step on this KFD shim, whose D2H
+// path is slow).  Since the token ids are constant across all 50 steps, the
+// set of touched embedding rows is precomputed ONCE and only those rows are
+// D2H'd / H2D'd / re-zeroed each step.  This cut the step from ~1300 ms to
+// ~120-156 ms; the residual ~81 ms/step is the single-WG kernel itself.
 //
 // Dims: B=8 S=16 D=384 K=4 R=32 vocab=8192 BS=128 (=B*S).
 //
@@ -28,6 +42,7 @@ import "../std/train.mlr"
 import "../std/math_float.mlr"
 import "../std/fmt.mlr"
 import "../std/hip.mlr"
+import "../std/time.mlr"
 
 static u64 D_DIM     = 384
 static u64 VOCAB_DIM = 8192
@@ -38,6 +53,37 @@ static u64 R_DIM     = 32
 fn abs_f32(f32 v) -> f32 {
     if v < 0.0f { return 0.0f - v }
     return v
+}
+
+// Median of an array of u64 values (insertion sort then pick middle).
+// (Ported verbatim from examples/bp_wzma_bench.mlr.)
+fn median_u64(u64 arr, u64 n) -> u64 {
+    u64 i = 1
+    while i < n {
+        u64 key = 0
+        unsafe { *((arr + i * 8) as u64) -> key }
+        u64 insert_pos = i
+        u64 j = i
+        while j > 0 {
+            u64 prev_j = j - 1
+            u64 vp = 0
+            unsafe { *((arr + prev_j * 8) as u64) -> vp }
+            if vp <= key {
+                insert_pos = j
+                j = 0  // break
+            } else {
+                unsafe { *((arr + j * 8) as u64) = vp }
+                insert_pos = prev_j
+                j = prev_j
+            }
+        }
+        unsafe { *((arr + insert_pos * 8) as u64) = key }
+        i = i + 1
+    }
+    u64 mid = n / 2
+    u64 result = 0
+    unsafe { *((arr + mid * 8) as u64) -> result }
+    return result
 }
 
 // Compare a GPU grad buffer (already D2H'd to h_gpu) against a CPU reference
@@ -313,6 +359,32 @@ fn main() {
         cvi = cvi + 1
     }
 
+    // Precompute the UNIQUE touched embedding rows ONCE — the token ids are
+    // constant across all 50 steps, so the set of rows the megakernel writes
+    // gradients into never changes.  This lets each step D2H/H2D only the
+    // touched rows instead of the full 12.6 MB d_demb table (the full-table
+    // D2H was the dominant per-step cost: ~1219 ms/step → ~0 with this).
+    u64 uniq_rows = alloc(2 * BS * 8)
+    u64 n_uniq_rows = 0
+    u64 pgi = 0
+    while pgi < 2 * BS {
+        u64 cand = 0
+        if pgi < BS { unsafe { *((ids1_u64 + pgi * 8) as u64) -> cand } }
+        else        { unsafe { *((ids2_u64 + (pgi - BS) * 8) as u64) -> cand } }
+        u64 found = 0
+        u64 ui = 0
+        while ui < n_uniq_rows {
+            u64 existing = 0; unsafe { *((uniq_rows + ui * 8) as u64) -> existing }
+            if existing == cand { found = 1 }
+            ui = ui + 1
+        }
+        if found == 0 {
+            unsafe { *((uniq_rows + n_uniq_rows * 8) as u64) = cand }
+            n_uniq_rows = n_uniq_rows + 1
+        }
+        pgi = pgi + 1
+    }
+
     // AdamW hyperparams (match std/train.mlr adamw_step + bench).
     f32 lr    = 1e-3f
     f32 beta1 = 0.9f
@@ -458,29 +530,98 @@ fn main() {
     unsafe { *((kp + 464) as u64) = p58 }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // Training loop (Task 6 validation = v2 frozen-loss killer).  Two steps:
-    //   loss[0] must = 3.059341 ; loss[1] must ≈ 0.048 (DROPPING proves the
-    //   in-kernel AdamW actually updates the resident weights).
-    // Each step: re-zero grads, set per-step bias-correction scalars, launch
-    // ONE dispatch (fwd + bwd + dense AdamW), read loss, then CPU sparse embed
-    // AdamW + sparse H2D of touched rows.
+    // Task 7: full 50-step training loop + benchmark.
+    //   Each step: re-zero grads, set per-step bias-correction scalars, launch
+    //   ONE dispatch (fwd + bwd + dense AdamW), read loss, then CPU sparse
+    //   embed AdamW + sparse H2D of touched rows.
+    //   Assert EACH of the 50 losses within 1e-2 of bench_ref.json cpu_losses[].
+    //   Median ms/step over steps 5..49 (warmup-skip first 5) via time_now().
     // ═══════════════════════════════════════════════════════════════════════
     u32 grid  = 1
     u32 block = 512
-    u64 STEPS = 2
-    f32 loss0_saved = 0.0f
-    f32 loss1_saved = 0.0f
+    u64 STEPS  = 50
+    u64 WARMUP = 5
+
+    // Reference loss trajectory (MLRiftBench/tools/bench_ref.json cpu_losses).
+    u64 ref_losses = alloc(STEPS * 4)
+    unsafe { *((ref_losses + 0 * 4) as f32) = 3.05934143f }
+    unsafe { *((ref_losses + 1 * 4) as f32) = 0.04791371f }
+    unsafe { *((ref_losses + 2 * 4) as f32) = 0.00602975f }
+    unsafe { *((ref_losses + 3 * 4) as f32) = 0.00306626f }
+    unsafe { *((ref_losses + 4 * 4) as f32) = 0.00241147f }
+    unsafe { *((ref_losses + 5 * 4) as f32) = 0.00218930f }
+    unsafe { *((ref_losses + 6 * 4) as f32) = 0.00208848f }
+    unsafe { *((ref_losses + 7 * 4) as f32) = 0.00202513f }
+    unsafe { *((ref_losses + 8 * 4) as f32) = 0.00197190f }
+    unsafe { *((ref_losses + 9 * 4) as f32) = 0.00191937f }
+    unsafe { *((ref_losses + 10 * 4) as f32) = 0.00186470f }
+    unsafe { *((ref_losses + 11 * 4) as f32) = 0.00180768f }
+    unsafe { *((ref_losses + 12 * 4) as f32) = 0.00174918f }
+    unsafe { *((ref_losses + 13 * 4) as f32) = 0.00168990f }
+    unsafe { *((ref_losses + 14 * 4) as f32) = 0.00163081f }
+    unsafe { *((ref_losses + 15 * 4) as f32) = 0.00157258f }
+    unsafe { *((ref_losses + 16 * 4) as f32) = 0.00151586f }
+    unsafe { *((ref_losses + 17 * 4) as f32) = 0.00146097f }
+    unsafe { *((ref_losses + 18 * 4) as f32) = 0.00140817f }
+    unsafe { *((ref_losses + 19 * 4) as f32) = 0.00135769f }
+    unsafe { *((ref_losses + 20 * 4) as f32) = 0.00130967f }
+    unsafe { *((ref_losses + 21 * 4) as f32) = 0.00126396f }
+    unsafe { *((ref_losses + 22 * 4) as f32) = 0.00122067f }
+    unsafe { *((ref_losses + 23 * 4) as f32) = 0.00117968f }
+    unsafe { *((ref_losses + 24 * 4) as f32) = 0.00114100f }
+    unsafe { *((ref_losses + 25 * 4) as f32) = 0.00110447f }
+    unsafe { *((ref_losses + 26 * 4) as f32) = 0.00106998f }
+    unsafe { *((ref_losses + 27 * 4) as f32) = 0.00103747f }
+    unsafe { *((ref_losses + 28 * 4) as f32) = 0.00100677f }
+    unsafe { *((ref_losses + 29 * 4) as f32) = 0.00097785f }
+    unsafe { *((ref_losses + 30 * 4) as f32) = 0.00095051f }
+    unsafe { *((ref_losses + 31 * 4) as f32) = 0.00092472f }
+    unsafe { *((ref_losses + 32 * 4) as f32) = 0.00090036f }
+    unsafe { *((ref_losses + 33 * 4) as f32) = 0.00087745f }
+    unsafe { *((ref_losses + 34 * 4) as f32) = 0.00085560f }
+    unsafe { *((ref_losses + 35 * 4) as f32) = 0.00083501f }
+    unsafe { *((ref_losses + 36 * 4) as f32) = 0.00081551f }
+    unsafe { *((ref_losses + 37 * 4) as f32) = 0.00079707f }
+    unsafe { *((ref_losses + 38 * 4) as f32) = 0.00077953f }
+    unsafe { *((ref_losses + 39 * 4) as f32) = 0.00076289f }
+    unsafe { *((ref_losses + 40 * 4) as f32) = 0.00074715f }
+    unsafe { *((ref_losses + 41 * 4) as f32) = 0.00073204f }
+    unsafe { *((ref_losses + 42 * 4) as f32) = 0.00071773f }
+    unsafe { *((ref_losses + 43 * 4) as f32) = 0.00070411f }
+    unsafe { *((ref_losses + 44 * 4) as f32) = 0.00069113f }
+    unsafe { *((ref_losses + 45 * 4) as f32) = 0.00067869f }
+    unsafe { *((ref_losses + 46 * 4) as f32) = 0.00066687f }
+    unsafe { *((ref_losses + 47 * 4) as f32) = 0.00065554f }
+    unsafe { *((ref_losses + 48 * 4) as f32) = 0.00064467f }
+    unsafe { *((ref_losses + 49 * 4) as f32) = 0.00063431f }
+
+    // Per-step wall-clock (ns); median over [WARMUP, STEPS) reported below.
+    u64 step_times = alloc(STEPS * 8)
+
+    f32 loss0_saved   = 0.0f
+    f32 lossN_saved   = 0.0f
+    f32 max_loss_err  = 0.0f
+    u64 all_loss_ok   = 1
     u64 step = 0
     while step < STEPS {
+        u64 t0 = time_now()
         u64 step1 = step + 1
 
-        // Re-zero the 6 grad accumulators (kernel does += over both views).
+        // Re-zero the dense grad accumulators (kernel does += over both views).
         err = hipMemcpy(d_dU,    h_zero_big, K * D * R * 4, 1); if err != 0 { die_gpu("rz dU",    err) }
         err = hipMemcpy(d_dV,    h_zero_big, K * R * D * 4, 1); if err != 0 { die_gpu("rz dV",    err) }
         err = hipMemcpy(d_dgw,   h_zero_big, K * D * 4,     1); if err != 0 { die_gpu("rz dgw",   err) }
         err = hipMemcpy(d_dgb,   h_zero_big, K * 4,         1); if err != 0 { die_gpu("rz dgb",   err) }
         err = hipMemcpy(d_dbias, h_zero_big, D * 4,         1); if err != 0 { die_gpu("rz dbias", err) }
-        err = hipMemcpy(d_demb,  h_zero_big, VOCAB * D * 4, 1); if err != 0 { die_gpu("rz demb",  err) }
+        // d_demb: only the TOUCHED rows accumulate gradient and only those rows
+        // are read back, so zero just those rows (not the full 12.6 MB table).
+        u64 rzi = 0
+        while rzi < n_uniq_rows {
+            u64 rzrow = 0; unsafe { *((uniq_rows + rzi * 8) as u64) -> rzrow }
+            err = hipMemcpy(d_demb + rzrow * D * 4, h_zero_big, D * 4, 1)
+            if err != 0 { die_gpu("rz demb_row", err) }
+            rzi = rzi + 1
+        }
 
         // Per-step bias-correction scalars (CPU side; matches launch_adamw).
         f32 b1p = 1.0f; f32 b2p = 1.0f
@@ -514,51 +655,54 @@ fn main() {
         f32 loss_s = 0.0f
         unsafe { *(h_loss_s as f32) -> loss_s }
         dealloc(h_loss_s)
-        if step == 0 { loss0_saved = loss_s }
-        if step == 1 { loss1_saved = loss_s }
+        if step == 0          { loss0_saved = loss_s }
+        if step == STEPS - 1  { lossN_saved = loss_s }
+
+        // Per-step assertion vs reference (tol 1e-2).
+        f32 ref_s = 0.0f
+        unsafe { *((ref_losses + step * 4) as f32) -> ref_s }
+        f32 err_s = abs_f32(loss_s - ref_s)
+        if err_s > max_loss_err { max_loss_err = err_s }
         print_str("loss[")
         u64 sstr = fmt_dec(step); print_str(sstr); dealloc(sstr)
         print_str("] = ")
         u64 lstr = fmt_f32(loss_s, 6); print_str(lstr); dealloc(lstr)
-        print_str("\n")
-
-        // ── Sparse embedding AdamW (CPU) + sparse H2D of updated rows ──────
-        err = hipMemcpy(h_demb, d_demb, VOCAB * D * 4, 2); if err != 0 { die_gpu("D2H demb", err) }
-        u64 uniq    = alloc(2 * BS * 8)
-        u64 n_uniq  = 0
-        u64 gi = 0
-        while gi < 2 * BS {
-            u64 cand = 0
-            if gi < BS { unsafe { *((ids1_u64 + gi * 8) as u64) -> cand } }
-            else       { unsafe { *((ids2_u64 + (gi - BS) * 8) as u64) -> cand } }
-            u64 found = 0
-            u64 ui = 0
-            while ui < n_uniq {
-                u64 existing = 0; unsafe { *((uniq + ui * 8) as u64) -> existing }
-                if existing == cand { found = 1 }
-                ui = ui + 1
-            }
-            if found == 0 {
-                unsafe { *((uniq + n_uniq * 8) as u64) = cand }
-                n_uniq = n_uniq + 1
-            }
-            gi = gi + 1
+        if err_s < 1e-2f {
+            print_str("  OK\n")
+        } else {
+            all_loss_ok = 0
+            print_str("  MISMATCH ref=")
+            u64 rstr = fmt_f32(ref_s, 6); print_str(rstr); dealloc(rstr)
+            print_str(" err=")
+            u64 estr = fmt_f32(err_s, 6); print_str(estr); dealloc(estr)
+            print_str("\n")
         }
+
+        // ── Sparse embedding AdamW (CPU) + sparse D2H/H2D of touched rows ──
+        // Only the precomputed uniq_rows carry nonzero gradients; D2H/H2D just
+        // those rows (D*4 bytes each) instead of the whole 12.6 MB table.
         u64 uii = 0
-        while uii < n_uniq {
-            u64 row = 0; unsafe { *((uniq + uii * 8) as u64) -> row }
+        while uii < n_uniq_rows {
+            u64 row = 0; unsafe { *((uniq_rows + uii * 8) as u64) -> row }
+            // D2H this row's gradient.
+            err = hipMemcpy(h_demb + row * D * 4, d_demb + row * D * 4, D * 4, 2)
+            if err != 0 { die_gpu("D2H demb_row", err) }
+            // CPU AdamW on the embedding row.
             adamw_step(emb_ptr + row * D * 4, h_demb + row * D * 4,
                        m_emb + row * D * 4, v_emb + row * D * 4,
                        D, step1, lr, beta1, beta2, eps, wd)
+            // H2D the updated embedding row.
             err = hipMemcpy(d_emb + row * D * 4, emb_ptr + row * D * 4, D * 4, 1)
             if err != 0 { die_gpu("H2D emb_row", err) }
             uii = uii + 1
         }
-        dealloc(uniq)
+
+        u64 t1 = time_now()
+        unsafe { *((step_times + step * 8) as u64) = t1 - t0 }
 
         step = step + 1
     }
-    print_str("Training loop (2 steps) + sync OK.\n")
+    print_str("Training loop (50 steps) + sync OK.\n")
 
     dealloc(p0); dealloc(p1); dealloc(p2); dealloc(p3); dealloc(p4); dealloc(p5); dealloc(p6)
     dealloc(p7); dealloc(p8); dealloc(p9); dealloc(p10); dealloc(p11); dealloc(p12); dealloc(p13)
@@ -571,46 +715,82 @@ fn main() {
     dealloc(p54); dealloc(p55); dealloc(p56); dealloc(p57); dealloc(p58)
     dealloc(kp)
     // ═══════════════════════════════════════════════════════════════════════
-    // Task 6 validation — the v2 frozen-loss killer.
-    //   loss[0] must = 3.059341 (initial weights) ; loss[1] must ≈ 0.048
-    //   (matches MLRiftBench/tools/bench_ref.json cpu_losses[0..1], tol 1e-2).
-    //   loss[1] DROPPING (not frozen at 3.059) proves the in-kernel AdamW
-    //   actually updates the resident dense weights + the CPU sparse-embed
-    //   AdamW updates the embedding rows.
+    // Task 7 report — full 50-step run + benchmark.
     // ═══════════════════════════════════════════════════════════════════════
-    print_str("--- Task 6: 2-step training validation ---\n")
-    f32 ref0 = 3.059341f
-    f32 ref1 = 0.04791371f
+    print_str("--- Task 7: 50-step training run + benchmark ---\n")
 
-    print_str("loss[0] = ")
+    // Median ms/step over steps [WARMUP, STEPS) (skip first 5 warmup steps).
+    u64 bench_n     = STEPS - WARMUP
+    u64 bench_times = alloc(bench_n * 8)
+    u64 ti = 0
+    while ti < bench_n {
+        u64 ns_val = 0
+        unsafe { *((step_times + (ti + WARMUP) * 8) as u64) -> ns_val }
+        unsafe { *((bench_times + ti * 8) as u64) = ns_val }
+        ti = ti + 1
+    }
+    u64 median_ns = median_u64(bench_times, bench_n)
+    dealloc(bench_times)
+
+    f64 median_ms_f64 = int_to_f64(median_ns)
+    f64 ns_per_ms     = 1000000.0
+    median_ms_f64 = median_ms_f64 / ns_per_ms
+    f32 median_ms = f64_to_f32(median_ms_f64)
+
+    print_str("loss[0]  = ")
     u64 l0s = fmt_f32(loss0_saved, 6); print_str(l0s); dealloc(l0s)
     print_str(" (ref 3.059341)\n")
-    print_str("loss[1] = ")
-    u64 l1s = fmt_f32(loss1_saved, 6); print_str(l1s); dealloc(l1s)
-    print_str(" (ref 0.047914)\n")
+    print_str("loss[49] = ")
+    u64 lNs = fmt_f32(lossN_saved, 6); print_str(lNs); dealloc(lNs)
+    print_str(" (ref 0.000634)\n")
 
-    f32 e0 = abs_f32(loss0_saved - ref0)
-    f32 e1 = abs_f32(loss1_saved - ref1)
-    u64 ok0 = 0
-    if e0 < 1e-2f { print_str("loss[0] PASS err "); ok0 = 1 }
-    else          { print_str("loss[0] FAIL err ") }
-    u64 e0s = fmt_f32(e0, 6); print_str(e0s); dealloc(e0s); print_str("\n")
-    u64 ok1 = 0
-    if e1 < 1e-2f { print_str("loss[1] PASS err "); ok1 = 1 }
-    else          { print_str("loss[1] FAIL err ") }
-    u64 e1s = fmt_f32(e1, 6); print_str(e1s); dealloc(e1s); print_str("\n")
+    print_str("max loss err vs ref (50 steps): ")
+    u64 mes = fmt_f32(max_loss_err, 8); print_str(mes); dealloc(mes)
+    print_str("\n")
 
-    // The DROP check: loss[1] must be far below loss[0] (frozen → FAIL).
-    if loss1_saved < loss0_saved {
-        print_str("loss DROPPED (")
-        u64 ds = fmt_f32(loss0_saved - loss1_saved, 6); print_str(ds); dealloc(ds)
-        print_str(") — weights updated, NOT frozen\n")
+    if all_loss_ok == 1 {
+        print_str("LOSS: all 50 steps within 1e-2 of bench_ref.json  PASS\n")
     } else {
-        print_str("loss FROZEN — AdamW did NOT update weights (v2 bug)\n")
+        print_str("LOSS: one or more steps OUTSIDE 1e-2  FAIL\n")
     }
 
-    if ok0 * ok1 == 1 { print_str("TASK 6 PASS\n") }
-    else              { print_str("TASK 6 FAIL\n") }
+    print_str("megakernel: ")
+    u64 mms = fmt_f32(median_ms, 3); print_str(mms); dealloc(mms)
+    print_str(" ms/step  (vs native 17.6 / PyTorch GPU 1.62)\n")
+
+    // VRAM: exact device-buffer footprint of this run (sum of every hipMalloc).
+    //   emb+demb = 2*VOCAB*D*4 ; U/V/dU/dV/mU/vU/mV/vV = 8*K*D*R*4 ;
+    //   gw/dgw/mgw/vgw = 4*K*D*4 ; gb/dgb/mgb/vgb = 4*K*4 ;
+    //   bias/dbias/mbias/vbias = 4*D*4 ; x_out/x1/x2/dz1/dz2/dx1/dx2/out = 8*BS*D*4 ;
+    //   alpha/a1/a2 = 3*BS*K*4 ; inter/i1/i2 = 3*BS*K*R*4 ;
+    //   outk/o1/o2 = 3*BS*K*D*4 ; v1/v2/dv1/dv2 = 4*B*D*4 ; n1/n2 = 2*B*4 ;
+    //   ids/ids2 = 2*BS*4 ; loss = 4.
+    u64 bytes_vram = 0
+    bytes_vram = bytes_vram + 2 * VOCAB * D * 4
+    bytes_vram = bytes_vram + 8 * K * D * R * 4
+    bytes_vram = bytes_vram + 4 * K * D * 4
+    bytes_vram = bytes_vram + 4 * K * 4
+    bytes_vram = bytes_vram + 4 * D * 4
+    bytes_vram = bytes_vram + 8 * BS * D * 4
+    bytes_vram = bytes_vram + 3 * BS * K * 4
+    bytes_vram = bytes_vram + 3 * BS * K * R * 4
+    bytes_vram = bytes_vram + 3 * BS * K * D * 4
+    bytes_vram = bytes_vram + 4 * B * D * 4
+    bytes_vram = bytes_vram + 2 * B * 4
+    bytes_vram = bytes_vram + 2 * BS * 4
+    bytes_vram = bytes_vram + 4
+    u64 vram_mib = bytes_vram / (1024 * 1024)
+    print_str("VRAM ~")
+    u64 vms = fmt_dec(vram_mib); print_str(vms); dealloc(vms)
+    print_str(" MiB device buffers (vs PyTorch 126)\n")
+    print_str("VRAM live total: see [KFD alloc summary] on teardown (authoritative; includes module/queue/EOP) — ~57 MiB measured\n")
+
+    dealloc(ref_losses)
+    dealloc(step_times)
+    dealloc(uniq_rows)
+
+    if all_loss_ok == 1 { print_str("TASK 7 PASS\n") }
+    else                { print_str("TASK 7 FAIL\n") }
 
 
     hipFree(d_x1); hipFree(d_x2); hipFree(d_a1); hipFree(d_a2)
