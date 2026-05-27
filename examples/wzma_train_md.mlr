@@ -96,6 +96,20 @@ fn gpu_malloc(u64 nbytes, u64 tag) -> u64 {
     return p
 }
 
+// gtt_malloc: host-coherent GTT (system RAM mapped into the GPU's VA).  The
+// GPU writes it over PCIe; the HOST reads it directly via dev_host_ptr (plain
+// cache-coherent memory read) — NO hipMemcpy D2H staging dispatch.  Use for
+// the small readback buffers (encoder v[B,D], InfoNCE logits) that the CPU
+// consumes after a GPU phase.
+fn gtt_malloc(u64 nbytes, u64 tag) -> u64 {
+    u64 slot = alloc(8)
+    u32 err = hipMallocGTT(slot, nbytes)
+    if err != 0 { die_gpu(tag, err) }
+    u64 p = 0; unsafe { *(slot as u64) -> p }
+    dealloc(slot)
+    return p
+}
+
 // gemm_f32: C[M,N] = A[M,K_dim] @ B[K_dim,N], 16x16 tiles, block=256.
 // The KFD-shim treats kernel_params[i] as a POINTER to the i-th arg value
 // (HIP ptr-table ABI), so each arg gets its own 8-byte value slot.
@@ -268,14 +282,24 @@ fn main() {
     u64 d_alpha = gpu_malloc(BS * K * 4, "mAlpha")     // fwd_tail output
     u64 d_z     = gpu_malloc(BS * D * 4, "mZ")         // combine output
     u64 d_norms = gpu_malloc(B * 4,      "mNorms")     // pre-L2 magnitudes
-    u64 d_v1    = gpu_malloc(B * D * 4, "mV1")         // view-0 encoder out (resident)
-    u64 d_v2    = gpu_malloc(B * D * 4, "mV2")         // view-1 encoder out (resident)
+    // d_v1/d_v2: encoder outputs the HOST reads after fwd_tail.  GTT (host-
+    // coherent system RAM mapped into the GPU's VA) so the CPU reads them
+    // DIRECTLY via dev_host_ptr — NO hipMemcpy D2H, NO _kfd_copy_u64 staging
+    // dispatch (the ~2.6 ms/view killer).  Zero-copy readback, same pattern as
+    // the megakernel launcher (bp_wzma_gpu_train_native.mlr:794-800).
+    u64 d_v1    = gtt_malloc(B * D * 4, "mV1")         // view-0 encoder out (GTT, host-readable)
+    u64 d_v2    = gtt_malloc(B * D * 4, "mV2")         // view-1 encoder out (GTT, host-readable)
     u64 d_v2T   = gpu_malloc(D * B * 4, "mV2T")
-    u64 d_logit = gpu_malloc(B * B * 4, "mLogit")
+    // d_logit: the InfoNCE B×B matrix the HOST reads for the loss scalar —
+    // also GTT so the per-step loss readback is zero-copy (no staging D2H).
+    u64 d_logit = gtt_malloc(B * B * 4, "mLogit")
 
-    // ── CPU-side host buffers (only the tiny v[B,D] crosses PCIe now) ──
-    u64 h_q1    = alloc(B * D * 4)
-    u64 h_q2    = alloc(B * D * 4)
+    // ── Host-readable views of the encoder outputs ────────────────────
+    // d_v1/d_v2 are GTT, so the host can read them in place via dev_host_ptr.
+    // h_q1/h_q2 are NOT separate allocations any more — they ALIAS the GTT
+    // host pointers (set after the fwd_tail sync below).  Zero D2H copies.
+    u64 h_q1    = 0
+    u64 h_q2    = 0
 
     f32 tau = 0.1f
 
@@ -299,9 +323,8 @@ fn main() {
     u64 view = 0
     while view < 2 {
         u64 d_ids = d_ids1
-        u64 h_q = h_q1
         u64 d_v = d_v1
-        if view == 1 { d_ids = d_ids2; h_q = h_q2; d_v = d_v2 }
+        if view == 1 { d_ids = d_ids2; d_v = d_v2 }
 
         // Phase 1: embed (GPU)
         u64 t0 = time_now()
@@ -342,21 +365,15 @@ fn main() {
         sync_or_die("sync fwd_tail")
         t1 = time_now(); ns_tail = ns_tail + (t1 - t0)
 
-        // Drain barrier BEFORE the D2H so its measured time charges only the
-        // D2H mechanism, never residual GPU work from the phases above.  With
-        // the per-phase syncs in place this barrier is ~0.02 ms (GPU already
-        // idle) — its near-zero cost is the proof the upstream per-phase
-        // times are real, not enqueue artifacts.
-        sync_or_die("sync pre-D2H")
-
-        // D2H the tiny encoder output v[B,D] (12 KB) for the InfoNCE step.
-        // NOTE: this is NOT raw PCIe transfer time.  In the KFD shim a D2H
-        // from host-visible VRAM is staged via a _kfd_copy_u64 dispatch +
-        // device-sync round-trip (std/hip_kfd.mlr hipMemcpy kind==2), so the
-        // ~2.6 ms/view is the staging-kernel launch+sync overhead, not the
-        // 12 KB move itself.  Labelled [D2H-mech] below, not [PCIe].
+        // Zero-copy readback.  fwd_tail's sync above already guarantees the
+        // GPU finished writing d_v (GTT, host-coherent), so the host can read
+        // it in place — NO hipMemcpy D2H, NO _kfd_copy_u64 staging dispatch.
+        // dev_host_ptr just resolves the GTT VA→host-mapping (a table lookup,
+        // no transfer), so this "phase" is ~0 ms vs the old ~2.6 ms/view.
         t0 = time_now()
-        err = hipMemcpy(h_q, d_v, B * D * 4, 2); if err != 0 { die_gpu("D2H v", err) }
+        u64 h_v = dev_host_ptr(d_v)
+        if view == 0 { h_q1 = h_v }
+        if view == 1 { h_q2 = h_v }
         t1 = time_now(); ns_d2h = ns_d2h + (t1 - t0)
 
         view = view + 1
@@ -377,15 +394,19 @@ fn main() {
         }
         bi = bi + 1
     }
-    err = hipMemcpy(d_v1,  h_q1,  B * D * 4, 1); if err != 0 { die_gpu("H2D q1", err) }
+    // d_v1 IS the GTT buffer h_q1 aliases — it already holds the view-0
+    // encoder output the GPU wrote in fwd_tail, so NO H2D is needed (the old
+    // hipMemcpy(d_v1, h_q1, ...) was a self-copy).  Only d_v2T (a transposed
+    // VRAM scratch built on the host) still needs an H2D upload.
     err = hipMemcpy(d_v2T, h_v2T, D * B * 4, 1); if err != 0 { die_gpu("H2D v2T", err) }
     launch_gemm(fh_gemm, d_v1, d_v2T, d_logit, B, B, D)   // L[B,B] = q1@q2T raw dot
     sync_or_die("sync nce-gemm")
-    // CE on CPU over the B×B logit matrix (÷tau folded here via infonce-style).
-    u64 h_logit = alloc(B * B * 4)
-    err = hipMemcpy(h_logit, d_logit, B * B * 4, 2); if err != 0 { die_gpu("D2H logit", err) }
+    // CE on CPU over the B×B logit matrix.  d_logit is GTT, so the host reads
+    // it in place via dev_host_ptr — zero-copy, NO staging D2H.  This is the
+    // per-step loss-scalar readback path the full training step would reuse.
+    u64 h_logit = dev_host_ptr(d_logit)
     f32 gpu_loss = ce_from_raw_dots(h_logit, tau, B)
-    dealloc(h_logit); dealloc(h_v2T)
+    dealloc(h_v2T)
     u64 t1 = time_now(); ns_nce = ns_nce + (t1 - t0)
 
     // ── Per-phase timing report ────────────────────────────────────────
@@ -394,7 +415,7 @@ fn main() {
     print_ms("U einsum      [GPU]: ", ms_of(ns_u))
     print_ms("V einsum      [GPU]: ", ms_of(ns_v))
     print_ms("fwd_tail      [GPU]: ", ms_of(ns_tail))
-    print_ms("D2H v[B,D]    [D2H-mech]: ", ms_of(ns_d2h))
+    print_ms("readback v[B,D] [GTT zero-copy]: ", ms_of(ns_d2h))
     print_ms("InfoNCE       [GPU+CPU]: ", ms_of(ns_nce))
     u64 ns_total = ns_embed + ns_u + ns_v + ns_tail + ns_d2h + ns_nce
     print_ms("TOTAL fwd     : ", ms_of(ns_total))
@@ -450,7 +471,8 @@ fn main() {
     hipFree(d_v1); hipFree(d_v2); hipFree(d_v2T); hipFree(d_logit)
     dealloc(emb_ptr); dealloc(U_ptr); dealloc(V_ptr); dealloc(gw_ptr); dealloc(gb_ptr)
     dealloc(bias_ptr); dealloc(ids1_i32); dealloc(ids2_i32)
-    dealloc(h_q1); dealloc(h_q2)
+    // h_q1/h_q2 are NOT heap allocations — they alias the GTT host pointers of
+    // d_v1/d_v2, already released by hipFree(d_v1)/hipFree(d_v2) above.
 
     hipkfd_teardown()
     if ok == 1 { exit(0) }
