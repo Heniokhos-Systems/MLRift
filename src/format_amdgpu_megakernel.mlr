@@ -8903,24 +8903,26 @@ fn amdgpu_lower_wzma_fwd_tail(uint64 kname_ptr, uint64 nl) -> uint64 {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-// _wzm_emit_backward_and_adamw — the shared Task-5/6 backward + AdamW body.
-//
-// Extracted VERBATIM from amdgpu_lower_wzma_train_mega so the multi-dispatch
-// backward kernel (amdgpu_lower_wzma_train_bwd) can reuse the SAME validated
-// ISA that produced the NW=1 oracle.  Expects the caller's prologue to have
-// loaded (identical SGPR/kernarg layout to the megakernel):
+// ── SHARED SGPR/kernarg contract for the backward emitters ────────────────
+// All _wzm_emit_* backward helpers expect the caller's prologue to have loaded
+// (identical SGPR/kernarg layout to the megakernel):
 //   s[10:11]=U s[12:13]=V s[16:17]=gw ; s[40:41]=ids1 s[42:43]=ids2
 //   s[44:45]=v1 s[46:47]=v2 ; s30=BS s32=D
 //   s[54:55]=x1 s[56:57]=x2 s[58:59]=alpha1 s[60:61]=alpha2
 //   s[62:63]=inter1 s[64:65]=inter2 s[66:67]=outk1 s[68:69]=outk2
 //   s[70:71]=norms1 s[72:73]=norms2 ; s[52:53]=d_loss
 // and that the grad/scratch/moment kernargs sit at the megakernel offsets
-// (dU 0xE0 .. v_emb 0x1F0).  At MEGA_TRAIN_NW=1 the cross-WG barriers
-// degrade to plain s_barrier and the reduce is an identity copy → bit-exact.
-fn _wzm_emit_backward_and_adamw() {
-    // PHASE BOUNDARY 1: InfoNCE (1 WG writes d_loss/dlogits) → backward (all
-    // WGs).  NW>1: cross-WG barrier so all WGs see the loss before backward.
-    _wzm_emit_phase_barrier(1)            // s_barrier — v1/v2 fully written & visible
+// (dU 0xE0 .. v_emb 0x1F0).  At MEGA_TRAIN_NW=1 the cross-WG barriers degrade
+// to plain s_barrier and the reduce is an identity copy → bit-exact.
+//
+// _wzm_emit_infonce_dv_bwd — the InfoNCE backward (logits→softmax→dlogits→
+// dv1/dv2) lifted VERBATIM out of _wzm_emit_backward_and_adamw's B-1/B-2/B-3.
+// Inherently single-WG (B=8 logits matrix lives in LDS, lane-0 softmax).  The
+// multi-dispatch backward (Task: full-occupancy phase split) calls this as its
+// own grid=1 dispatch; the megakernel/standalone-bwd call it inline.  Expects
+// the prologue SGPR map (v1=s44:45, v2=s46:47, BS=s30, D=s32) already loaded.
+//   Writes dv1[B,D] (= dqa, pre re-norm) @0x110, dv2[B,D] @0x118.
+fn _wzm_emit_infonce_dv_bwd() {
     wzm_v_shl2_e32(6, 0)                  // v6 = d*4 (reduce-tree LDS offset)
     asm_u32(0x7E120280)                   // v_mov_b32_e32 v9, 0 (broadcast ds addr)
 
@@ -9179,6 +9181,16 @@ fn _wzm_emit_backward_and_adamw() {
     asm_patch_u32(dv2_execz, 0xBFA50000 | ((dv2_end - dv2_execz - 1) & 0xFFFF))
     asm_u32(0xBEFE0002)                   // restore exec
     asm_u32(0xBFBD0000)                   // s_barrier — dv1/dv2 (= dqa/dqb) visible
+}
+
+// _wzm_emit_backward_and_adamw — the shared Task-5/6 backward + AdamW body
+// (megakernel + standalone single-dispatch wzma_train_bwd).  See header above
+// _wzm_emit_infonce_dv_bwd for the SGPR contract.
+fn _wzm_emit_backward_and_adamw() {
+    // PHASE BOUNDARY 1: InfoNCE (1 WG writes d_loss/dlogits) → backward (all
+    // WGs).  NW>1: cross-WG barrier so all WGs see the loss before backward.
+    _wzm_emit_phase_barrier(1)            // s_barrier — v1/v2 fully written & visible
+    _wzm_emit_infonce_dv_bwd()            // B-1/B-2/B-3 (logits→softmax→dv1/dv2)
 
     // ── B-4 + B-5: InfoNCE re-norm bwd + l2norm_bwd + meanpool_bwd, per view.
     //   view 0: q=v1(s44:45) dv=0x110 norm=n1(s70:71) dz=0x120
@@ -9296,11 +9308,12 @@ fn _wzm_emit_backward_and_adamw() {
 //   0x140.. m/v moment pairs  0x190.. f32 hyperparams (by-value)
 //   0x1D8 d_barrier(dummy@NW=1) 0x1E0 d_partial(==final grads@NW=1)
 //   0x1E8 m_emb 0x1F0 v_emb   (63 args → 504-B kernarg segment)
-fn amdgpu_lower_wzma_train_bwd(uint64 kname_ptr, uint64 nl) -> uint64 {
-    asm_init()
-
-    // ── Prologue: identical to the megakernel — load every kernarg the
-    //    backward + AdamW helpers reference into its canonical SGPR home. ──
+// _wzm_emit_bwd_prologue — load every backward kernarg into its canonical SGPR
+// home (identical to the megakernel prologue).  Shared by amdgpu_lower_wzma_
+// train_bwd AND every multi-dispatch full-occupancy backward phase kernel, so
+// they all reuse the SAME _wzm_emit_* helpers byte-for-byte.  Stashes wg_id_x
+// in s3 (=0 at grid=1; =wg index at NW>1).
+fn _wzm_emit_bwd_prologue() {
     asm_u32(0xBE83000F)   // s_mov_b32 s3, s15  (wg_id_x; =0 at NW=1)
     asm_s_load_b64_off(3,  0, 0x08)   // s[6:7]   = emb       (AdamW embed param)
     asm_s_load_b64_off(4,  0, 0x10)   // s[8:9]   = x_out     (unused; kept for layout)
@@ -9331,15 +9344,16 @@ fn amdgpu_lower_wzma_train_bwd(uint64 kname_ptr, uint64 nl) -> uint64 {
     asm_s_load_b64_off(35, 0, 0xD0)   // s[70:71] = norms1
     asm_s_load_b64_off(36, 0, 0xD8)   // s[72:73] = norms2
     asm_u32(0xBF89FC07)   // s_waitcnt lgkmcnt(0)
+}
 
-    // ── Backward + AdamW (the validated NW=1 oracle math) ──
-    _wzm_emit_backward_and_adamw()
-
+// _wzm_finalize_bwd_kernel — emit the s_endpgm, build the 63-arg descriptor,
+// copy the asm text, and push the kernel object.  Shared finalize for the
+// standalone wzma_train_bwd AND the multi-dispatch phase kernels — they all
+// take the SAME 63-arg kernarg block (so the launcher can use one kernarg
+// builder per kernel) and the same rsrc (80 VGPR / 48 SGPR / 2560 B LDS).
+fn _wzm_finalize_bwd_kernel(uint64 kname_ptr, uint64 nl) {
     asm_u32(0xBFB00000)   // s_endpgm
 
-    // ── Arg descriptor — IDENTICAL 63-arg block to the megakernel ──
-    //    (Task-4 dinter scratch arg 63 reverted with the tiled-dU adjoint;
-    //     63 args → kernarg segment 504 B.)
     uint64 n_args = 63
     uint64 args_desc = alloc(n_args * 16)
     uint64 ai = 0
@@ -9375,6 +9389,109 @@ fn amdgpu_lower_wzma_train_bwd(uint64 kname_ptr, uint64 nl) -> uint64 {
                 80, 48,
                 rsrc1, rsrc2, rsrc3, props,
                 2560)
+}
+
+fn amdgpu_lower_wzma_train_bwd(uint64 kname_ptr, uint64 nl) -> uint64 {
+    asm_init()
+
+    // ── Prologue: identical to the megakernel — load every kernarg the
+    //    backward + AdamW helpers reference into its canonical SGPR home. ──
+    _wzm_emit_bwd_prologue()
+
+    // ── Backward + AdamW (the validated NW=1 oracle math) ── then finalize
+    //    (s_endpgm + 63-arg descriptor + kt_push_lds).
+    _wzm_emit_backward_and_adamw()
+    _wzm_finalize_bwd_kernel(kname_ptr, nl)
+    return 0
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// MULTI-DISPATCH FULL-OCCUPANCY BACKWARD — phase split of wzma_train_bwd.
+//
+// The single-WG wzma_train_bwd dispatch ran the ENTIRE backward serially in one
+// 512-thread WG (~34 ms = 89% of the step).  These kernels split it into a
+// SEQUENCE of separately-dispatched phases (driver-synced; NO in-kernel cross-WG
+// barrier — the dispatch boundary IS the barrier, which is exactly the spin-
+// barrier that wedged MES at NW>1).  Each phase reuses the SAME validated
+// _wzm_emit_* ISA byte-for-byte, so the math stays bit-exact vs the NW=1 oracle.
+//
+//   wzma_bwd_pre   grid=1   — InfoNCE-bwd (dv1/dv2) + renorm/L2/meanpool (dz1/dz2)
+//                             [inherently single-WG: B=8 logits in LDS]
+//   wzma_bwd_uv    grid=NW  — wzma_bwd ×2 views → per-WG PARTIAL dU/dV/dgw/dgb/
+//                             dbias + dx1/dx2.  BS rows split across NW WGs; each
+//                             WG owns a disjoint row range and a private partial
+//                             slot (d_partial[wg*SLOT+..]) → race-free.
+//   wzma_bwd_embed grid=1   — embed_bwd ×2 (scatter-add dx→demb).  Stays single-
+//                             WG: ids2 has duplicate tokens, so multi-WG scatter
+//                             would race the shared demb rows.
+//   wzma_bwd_reduce grid=NW — deterministic fixed-order reduce of the NW partial
+//                             slots → final dU/dV/dgw/dgb/dbias (@NW=1 identity).
+//   AdamW (dense+embed)     — the standalone full-occupancy adamw_step_f32 kernel
+//                             (launcher dispatches it 6×).
+//
+// WZM_BWD_NW must divide BS=128 evenly.  The per-WG partial buffer is
+// NW*WZM_PART_SLOT bytes (zeroed per step by the launcher).  s3=wg_id_x; the
+// reduce + per-bs partition helpers read MEGA_TRAIN_NW, so each lowerer flips
+// it to WZM_BWD_NW for the duration of its emit.
+// ══════════════════════════════════════════════════════════════════════════
+static uint64 WZM_BWD_NW = 8
+
+// amdgpu_lower_wzma_bwd_pre — InfoNCE-bwd + renorm/L2/meanpool.  grid=1.
+fn amdgpu_lower_wzma_bwd_pre(uint64 kname_ptr, uint64 nl) -> uint64 {
+    asm_init()
+    _wzm_emit_bwd_prologue()
+    // B-1/B-2/B-3: logits→softmax→dlogits→dv1/dv2 (single-WG by construction).
+    _wzm_emit_infonce_dv_bwd()
+    // B-4/B-5: InfoNCE re-norm bwd + l2norm_bwd + meanpool_bwd → dz1/dz2.
+    _wzm_emit_renorm_pool_bwd_view(44, 0x110, 70, 0x120)   // view 0
+    _wzm_emit_renorm_pool_bwd_view(46, 0x118, 72, 0x128)   // view 1
+    _wzm_finalize_bwd_kernel(kname_ptr, nl)
+    return 0
+}
+
+// amdgpu_lower_wzma_bwd_uv — wzma_bwd ×2 views.  grid=WZM_BWD_NW.  Accumulates
+// into per-WG PARTIAL dense grads + writes per-row dx1/dx2.  The bs-loop in
+// _wzm_emit_wzma_bwd_view partitions BS rows by wg_id at NW>1, and the per-WG
+// partial-grad pointer offsets by wg_id*SLOT → fully race-free across WGs.
+fn amdgpu_lower_wzma_bwd_uv(uint64 kname_ptr, uint64 nl) -> uint64 {
+    uint64 saved_nw = MEGA_TRAIN_NW
+    MEGA_TRAIN_NW = WZM_BWD_NW
+    asm_init()
+    _wzm_emit_bwd_prologue()
+    _wzm_emit_wzma_bwd_view(54, 58, 62, 66, 0x120, 0x130)   // view 0
+    _wzm_emit_wzma_bwd_view(56, 60, 64, 68, 0x128, 0x138)   // view 1
+    _wzm_finalize_bwd_kernel(kname_ptr, nl)
+    MEGA_TRAIN_NW = saved_nw
+    return 0
+}
+
+// amdgpu_lower_wzma_bwd_embed — embed_bwd ×2 views (scatter-add dx→demb).
+// grid=1 (serial scatter; race-safe for duplicate token ids).
+fn amdgpu_lower_wzma_bwd_embed(uint64 kname_ptr, uint64 nl) -> uint64 {
+    asm_init()
+    _wzm_emit_bwd_prologue()
+    _wzm_emit_embed_bwd_view(40, 0x130)   // view 0 (ids1)
+    _wzm_emit_embed_bwd_view(42, 0x138)   // view 1 (ids2)
+    _wzm_finalize_bwd_kernel(kname_ptr, nl)
+    return 0
+}
+
+// amdgpu_lower_wzma_bwd_reduce — deterministic fixed-order reduce of the NW
+// per-WG partial slots → final dU/dV/dgw/dgb/dbias.  grid=WZM_BWD_NW.  At NW=1
+// this is the identity copy (bit-exact vs oracle); at NW>1 it sums partial[0..NW)
+// in fixed wg order per output element (order-independent of owning thread).
+fn amdgpu_lower_wzma_bwd_reduce(uint64 kname_ptr, uint64 nl) -> uint64 {
+    uint64 saved_nw = MEGA_TRAIN_NW
+    MEGA_TRAIN_NW = WZM_BWD_NW
+    asm_init()
+    _wzm_emit_bwd_prologue()
+    _wzm_emit_reduce_grad(0xE0,  WZM_PART_DU_OFF,    WZM_PART_DU_N)
+    _wzm_emit_reduce_grad(0xE8,  WZM_PART_DV_OFF,    WZM_PART_DV_N)
+    _wzm_emit_reduce_grad(0xF0,  WZM_PART_DGW_OFF,   WZM_PART_DGW_N)
+    _wzm_emit_reduce_grad(0xF8,  WZM_PART_DGB_OFF,   WZM_PART_DGB_N)
+    _wzm_emit_reduce_grad(0x100, WZM_PART_DBIAS_OFF, WZM_PART_DBIAS_N)
+    _wzm_finalize_bwd_kernel(kname_ptr, nl)
+    MEGA_TRAIN_NW = saved_nw
     return 0
 }
 

@@ -1,42 +1,40 @@
-// wzma_train_md — multi-dispatch WZMALinear+InfoNCE FORWARD + loss.
+// wzma_train_md — multi-dispatch WZMALinear+InfoNCE FULL TRAINING STEP.
 //
-// Task 1 of the multi-dispatch WZMA training pivot.  Replaces the fragile
-// single-dispatch spin-barrier megakernel with a sequence of phase steps,
-// each driver-synced via hipDeviceSynchronize (NO AQL chain, NO in-kernel
-// cross-WG barrier).  Heavy / parallel phases run as full-occupancy GPU
-// dispatches via the PROVEN, bit-tested kernels (embedding_lookup_f32 +
-// gemm_f32 from --target=amdgpu-native).  The small transcendental
-// reductions (gate softmax over K=4, output combine, mean-pool, L2-norm,
-// InfoNCE cross-entropy) run on the CPU between dispatches, mirroring the
-// validated reference launcher examples/bp_wzma_gpu_fwd_native.mlr.
+// Multi-dispatch WZMA training: forward + backward + AdamW run as a SEQUENCE of
+// driver-synced GPU dispatches (NO AQL chain, NO in-kernel cross-WG barrier —
+// the dispatch boundary IS the barrier).  Intermediates stay GPU-resident; only
+// the InfoNCE loss is read back (GTT zero-copy).  Every kernel is a hand-emitted,
+// name-dispatched ISA template (amdgpu-native; no hipcc/ROCm/clang).
 //
-// Rationale: MLRift's amdgpu-native backend has NO general AST→ISA walker —
-// every GPU kernel is a hand-emitted, shape/name-dispatched ISA template.
-// New hand-ISA for the 5 tiny reductions (each with exp/log/sqrt/rcp and
-// per-lane address math) is the recurring MES-wedge cause
-// (feedback_oob_address_pad_lane_wedge), so Task 1 ships them on CPU and
-// leaves their GPU port to a later task where each .co can be objdump- and
-// oracle-validated in isolation.  The U/V einsums dominate the forward
-// (see per-phase ms), so they are the only phases that meaningfully matter
-// for occupancy — and they ARE on the GPU.
+// FORWARD (full grid occupancy, hipDeviceSynchronize between each):
+//   embed-gather  embedding_lookup_f32   x[BS,D]      grid=BS  block=D
+//   U einsum (×K) gemm_f32               inter_k[BS,R]=X@U_k[D,R]
+//   V einsum (×K) gemm_f32               outk_k[BS,D]=inter_k@V_k[R,D]
+//   repack        repack_abw_to_baw_f32  k-major→bs-major
+//   fwd_tail      wzma_fwd_tail          gate-softmax→combine→meanpool→L2 (grid=1)
+//   InfoNCE dot   gemm_f32 + CPU CE      L[B,B]=v1@v2T[D,B]
+//
+// BACKWARD — split out of the old single-WG wzma_train_bwd (~34 ms = 89% of the
+// step) into 4 full-occupancy phase dispatches that REUSE the same validated
+// _wzm_emit_* ISA byte-for-byte (so still bit-exact vs the NW=1 oracle):
+//   wzma_bwd_pre    grid=1   InfoNCE-bwd (dv1/dv2) + renorm/L2/meanpool (dz1/dz2)
+//   wzma_bwd_uv     grid=NW  wzma_bwd ×2 → per-WG PARTIAL dU/dV/dgw/dgb/dbias + dx
+//                            (BS rows split across WZM_BWD_NW WGs; race-free)
+//   wzma_bwd_embed  grid=1   embed_bwd ×2 scatter → demb (serial; dup-id safe)
+//   wzma_bwd_reduce grid=NW  fixed-order reduce of NW partial slots → final grads
+// then AdamW: standalone full-occupancy adamw_step_f32 ×6 (5 dense + embed).
 //
 // Dims: B=8 S=16 D=384 K=4 R=32 vocab=8192 BS=128.
 //
-// GPU dispatches (full grid occupancy, hipDeviceSynchronize between each):
-//   embed-gather  embedding_lookup_f32   x[BS,D]      grid=BS  block=D
-//   gate logits   gemm_f32               gl[BS,K]=X@gwT[D,K]
-//   U einsum (×K) gemm_f32               inter_k[BS,R]=X@U_k[D,R]
-//   V einsum (×K) gemm_f32               outk_k[BS,D]=inter_k@V_k[R,D]
-//   InfoNCE dot   gemm_f32               L[B,B]=v1@v2T[D,B]
-// CPU phases (timed): gate-post softmax, combine+bias, mean-pool, L2-norm, CE.
-//
-// Loss assertion: |loss[0] - 3.0593414| < 1e-2.  Encoder v1 vs
-// bench_gpu_v1.bin: max_err <= 1e-3 (B*D = 3072 f32).
+// Loss: each step within 1e-2 of bench_ref.json.  Grads ≤1e-3 vs oracle_grads.bin.
 //
 // Build (--target=amdgpu-native):
 //   ./build/mlrc --target=amdgpu-native examples/wzma_train_md.mlr \
 //       -o ~/mlrift_bin/wzma_train/wzma_train_md
-//   (gemm_f32.co + embedding_lookup_f32.co built separately — see below.)
+//   (the 9 helper .co built separately — see scripts/rebuild_helper_cos.sh +
+//    examples/llm/{wzma_bwd_pre,wzma_bwd_uv,wzma_bwd_embed,wzma_bwd_reduce,
+//    adamw_step_f32,wzma_fwd_tail,repack_abw_to_baw_f32,gemm_f32}.mlr,
+//    embedding_lookup_f32 flag emit.)
 //
 // kfd-safe: every exit path calls hipkfd_teardown(); driver sync only.
 
@@ -53,6 +51,10 @@ static u64 K_DIM     = 4
 static u64 R_DIM     = 32
 static u64 VOCAB_DIM = 8192
 static u64 BS_DIM    = 128
+// WZM_BWD_NW: workgroups for the full-occupancy backward UV + reduce phases.
+// MUST match the WZM_BWD_NW static in src/format_amdgpu_megakernel.mlr (the
+// per-WG partial slot layout + the bs-row split depend on it).  Divides BS=128.
+static u64 WZM_BWD_NW = 8
 
 fn abs_f32(f32 v) -> f32 {
     if v < 0.0f { return 0.0f - v }
@@ -228,6 +230,57 @@ fn sync_or_die(u64 tag) {
     if err != 0 { die_gpu(tag, err) }
 }
 
+// launch_adamw: standalone full-occupancy adamw_step_f32 (decoupled wd).  Bit-
+// identical math to the in-kernel AdamW; step is 1-based.  grid=(n+255)/256.
+fn launch_adamw(u64 fh, u64 d_param, u64 d_grad, u64 d_m, u64 d_v, u64 n,
+                u64 step1, f32 lr, f32 beta1, f32 beta2, f32 eps, f32 wd) {
+    f32 one = 1.0f
+    f32 b1p = 1.0f; f32 b2p = 1.0f; u64 t = 0
+    while t < step1 { b1p = b1p * beta1; b2p = b2p * beta2; t = t + 1 }
+    f32 inv_bc1  = one / (one - b1p)
+    f32 inv_bc2  = one / (one - b2p)
+    f32 decay    = one - lr * wd
+    f32 one_m_b1 = one - beta1
+    f32 one_m_b2 = one - beta2
+    u64 p0=alloc(8); unsafe { *(p0 as u64)=d_param }
+    u64 p1=alloc(8); unsafe { *(p1 as u64)=d_grad }
+    u64 p2=alloc(8); unsafe { *(p2 as u64)=d_m }
+    u64 p3=alloc(8); unsafe { *(p3 as u64)=d_v }
+    u64 p4=alloc(8); unsafe { *(p4 as u64)=n }
+    u64 p5=alloc(8); unsafe { *(p5 as f32)=inv_bc1 }
+    u64 p6=alloc(8); unsafe { *(p6 as f32)=inv_bc2 }
+    u64 p7=alloc(8); unsafe { *(p7 as f32)=decay }
+    u64 p8=alloc(8); unsafe { *(p8 as f32)=beta1 }
+    u64 p9=alloc(8); unsafe { *(p9 as f32)=beta2 }
+    u64 p10=alloc(8); unsafe { *(p10 as f32)=one_m_b1 }
+    u64 p11=alloc(8); unsafe { *(p11 as f32)=one_m_b2 }
+    u64 p12=alloc(8); unsafe { *(p12 as f32)=lr }
+    u64 p13=alloc(8); unsafe { *(p13 as f32)=eps }
+    u64 kp=alloc(14*8)
+    unsafe { *(kp        as u64)=p0 }
+    unsafe { *((kp +  8) as u64)=p1 }
+    unsafe { *((kp + 16) as u64)=p2 }
+    unsafe { *((kp + 24) as u64)=p3 }
+    unsafe { *((kp + 32) as u64)=p4 }
+    unsafe { *((kp + 40) as u64)=p5 }
+    unsafe { *((kp + 48) as u64)=p6 }
+    unsafe { *((kp + 56) as u64)=p7 }
+    unsafe { *((kp + 64) as u64)=p8 }
+    unsafe { *((kp + 72) as u64)=p9 }
+    unsafe { *((kp + 80) as u64)=p10 }
+    unsafe { *((kp + 88) as u64)=p11 }
+    unsafe { *((kp + 96) as u64)=p12 }
+    unsafe { *((kp +104) as u64)=p13 }
+    u64 grid_u = (n + 255) / 256
+    u32 grid   = grid_u
+    u32 block  = 256
+    u32 err = hipModuleLaunchKernel(fh, grid, 1, 1, block, 1, 1, 0, 0, kp, 0)
+    if err != 0 { die_gpu("launch adamw", err) }
+    dealloc(p0); dealloc(p1); dealloc(p2); dealloc(p3); dealloc(p4)
+    dealloc(p5); dealloc(p6); dealloc(p7); dealloc(p8); dealloc(p9)
+    dealloc(p10); dealloc(p11); dealloc(p12); dealloc(p13); dealloc(kp)
+}
+
 fn ms_of(u64 ns) -> f32 { return f64_to_f32(int_to_f64(ns) / 1000000.0) }
 
 fn print_ms(u64 label, f32 ms) {
@@ -259,8 +312,13 @@ fn main() {
     u64 fh_gemm   = load_co("/tmp/gemm_f32_native.co",        "gemm_f32")
     u64 fh_tail   = load_co("/tmp/wzma_fwd_tail.co",          "wzma_fwd_tail")
     u64 fh_repack = load_co("/tmp/repack_abw_to_baw_f32.co",  "repack_abw_to_baw_f32")
-    u64 fh_bwd    = load_co("/tmp/wzma_train_bwd.co",         "wzma_train_bwd")
-    print_str("Kernels loaded (embed, gemm_f32, fwd_tail, repack, wzma_train_bwd; all native, no hipcc).\n")
+    // ── Multi-dispatch full-occupancy BACKWARD phase kernels ───────────────
+    u64 fh_bpre   = load_co("/tmp/wzma_bwd_pre.co",           "wzma_bwd_pre")
+    u64 fh_buv    = load_co("/tmp/wzma_bwd_uv.co",            "wzma_bwd_uv")
+    u64 fh_bemb   = load_co("/tmp/wzma_bwd_embed.co",         "wzma_bwd_embed")
+    u64 fh_bred   = load_co("/tmp/wzma_bwd_reduce.co",        "wzma_bwd_reduce")
+    u64 fh_adamw  = load_co("/tmp/adamw_step_f32.co",         "adamw_step_f32")
+    print_str("Kernels loaded (embed, gemm_f32, fwd_tail, repack, bwd_pre/uv/embed/reduce, adamw; all native, no hipcc).\n")
 
     // ── Read bench_init.bin (weights + 2 views of token ids) ──────────────
     u64 emb_ptr  = alloc(VOCAB * D * 4)
@@ -319,21 +377,25 @@ fn main() {
     u64 d_v2T = gpu_malloc(D * B * 4, "mV2T")
     u64 d_logit = gtt_malloc(B * B * 4, "mLogit")    // InfoNCE B×B (GTT zero-copy loss read)
 
-    // ── Gradient buffers (final, from NW=1 reduce) + scatter demb ──────────
-    u64 d_dU    = gpu_malloc(K * D * R * 4, "mdU")
-    u64 d_dV    = gpu_malloc(K * R * D * 4, "mdV")
-    u64 d_dgw   = gpu_malloc(K * D * 4,     "mdGw")
-    u64 d_dgb   = gpu_malloc(K * 4,         "mdGb")
-    u64 d_dbias = gpu_malloc(D * 4,         "mdBias")
+    // ── Final dense grads — ONE CONTIGUOUS buffer (== oracle layout:
+    //    dU|dV|dgw|dgb|dbias = 100228 f32) so step-0 validation reads it
+    //    directly and the reduce-phase final-grad kernargs are slices of it. ──
+    u64 PART_N    = K*D*R + K*R*D + K*D + K + D    // 100228
+    u64 d_grads   = gpu_malloc(PART_N * 4, "mGrads")
+    u64 d_dU    = d_grads + 0
+    u64 d_dV    = d_grads + (K*D*R) * 4
+    u64 d_dgw   = d_grads + (K*D*R + K*R*D) * 4
+    u64 d_dgb   = d_grads + (K*D*R + K*R*D + K*D) * 4
+    u64 d_dbias = d_grads + (K*D*R + K*R*D + K*D + K) * 4
     u64 d_demb  = gpu_malloc(VOCAB * D * 4, "mdEmb")
     // backward intermediate grads (resident)
     u64 d_dv1 = gpu_malloc(B * D * 4,  "mdV1");  u64 d_dv2 = gpu_malloc(B * D * 4,  "mdV2")
     u64 d_dz1 = gpu_malloc(BS * D * 4, "mdZ1");  u64 d_dz2 = gpu_malloc(BS * D * 4, "mdZ2")
     u64 d_dx1 = gpu_malloc(BS * D * 4, "mdX1");  u64 d_dx2 = gpu_malloc(BS * D * 4, "mdX2")
-    // NW=1 per-WG partial grad slot (== oracle layout: dU|dV|dgw|dgb|dbias = 100228 f32)
-    u64 PART_N    = K*D*R + K*R*D + K*D + K + D    // 100228
-    u64 d_partial = gpu_malloc(PART_N * 4, "mPartial")
-    u64 d_barrier = gpu_malloc(4096, "mBarrier")  // dummy at NW=1
+    // per-WG partial grad slots: WZM_BWD_NW slots of the oracle layout, summed
+    // by the reduce phase into d_grads.  At WZM_BWD_NW=1 the reduce is identity.
+    u64 d_partial = gpu_malloc(WZM_BWD_NW * PART_N * 4, "mPartial")
+    u64 d_barrier = gpu_malloc(4096, "mBarrier")  // dummy (no in-kernel cross-WG barrier)
 
     // ── AdamW moment buffers (zero-init once) ──────────────────────────────
     u64 d_mU=gpu_malloc(K*D*R*4,"mMU"); u64 d_vU=gpu_malloc(K*D*R*4,"mVU")
@@ -367,7 +429,9 @@ fn main() {
 
     // ── per-phase timing accumulators (ns), summed over the whole run ──────
     u64 ns_embed=0; u64 ns_u=0; u64 ns_v=0; u64 ns_repack=0; u64 ns_tail=0
-    u64 ns_nce=0; u64 ns_bwd=0; u64 ns_zero=0
+    u64 ns_nce=0; u64 ns_zero=0
+    // per-phase backward accumulators
+    u64 ns_bpre=0; u64 ns_buv=0; u64 ns_bemb=0; u64 ns_bred=0; u64 ns_badamw=0
     u64 ns_total_step = 0
 
     u64 NSTEPS = 50
@@ -459,15 +523,20 @@ fn main() {
             print_str(" |err|="); ss = fmt_f32(lerr, 8); print_str(ss); dealloc(ss); print_str("\n")
         }
 
-        // ════════════════ Zero d_partial (grad accumulator) ════════════════
+        // ════════════════ Zero d_partial (NW slots) + d_demb scatter accum ══
+        // Both are RMW (+=) accumulators in the backward, so they MUST start at
+        // 0 each step.  (The in-kernel embed-AdamW that used to re-zero demb is
+        // gone — the standalone adamw_step_f32 doesn't touch the grad, so demb is
+        // re-zeroed here.)
         t0 = time_now()
-        err = hipMemcpy(d_partial, zbig, PART_N * 4, 1); if err != 0 { die_gpu("zero partial", err) }
+        err = hipMemcpy(d_partial, zbig, WZM_BWD_NW * PART_N * 4, 1); if err != 0 { die_gpu("zero partial", err) }
+        err = hipMemcpy(d_demb,    zbig, VOCAB * D * 4,            1); if err != 0 { die_gpu("zero demb", err) }
         t1 = time_now(); ns_zero = ns_zero + (t1 - t0)
 
-        // ════════════════ BACKWARD + AdamW (one dispatch) ════════════════
-        // Build 63-arg kernarg block (KFD ptr-table: each entry → 8-byte value slot).
-        // (Task-4 dinter scratch arg 63 reverted with the tiled-dU adjoint.)
-        t0 = time_now()
+        // ════════════════ BACKWARD — build shared 63-arg kernarg block ═══════
+        // KFD ptr-table: each entry → 8-byte value slot.  Reused by all 4 phase
+        // dispatches (they share the megakernel's byte-for-byte kernarg layout).
+        u64 kb_t0 = time_now()
         u64 NA = 63
         u64 kp = alloc(NA * 8)
         set_arg_ptr(kp, 0,  d_ids1)   // 0x00
@@ -543,19 +612,66 @@ fn main() {
         set_arg_ptr(kp, 61, d_mEmb)    // 0x1E8
         set_arg_ptr(kp, 62, d_vEmb)    // 0x1F0
 
-        u32 berr = hipModuleLaunchKernel(fh_bwd, 1, 1, 1, 512, 1, 1, 0, 0, kp, 0)
-        if berr != 0 { die_gpu("launch wzma_train_bwd", berr) }
-        sync_or_die("sync bwd")
+        u64 kb_t1 = time_now()   // kernarg-build cost (folded into ns_bpre)
+
+        // ════════════════ BACKWARD — 4 full-occupancy phase dispatches ═══════
+        // Each phase is its own driver-synced dispatch (NO in-kernel cross-WG
+        // barrier — the dispatch boundary IS the barrier).  All 4 reuse the SAME
+        // 63-arg kernarg block (validated _wzm_emit_* ISA, byte-for-byte the
+        // NW=1 oracle math).
+        u32 berr = 0
+        u32 NW32 = WZM_BWD_NW
+
+        // Phase 1: wzma_bwd_pre (grid=1) — InfoNCE-bwd → dv1/dv2, renorm/L2/
+        // meanpool → dz1/dz2.  Single WG (B=8 logits in LDS).
+        t0 = time_now()
+        berr = hipModuleLaunchKernel(fh_bpre, 1, 1, 1, 512, 1, 1, 0, 0, kp, 0)
+        if berr != 0 { die_gpu("launch wzma_bwd_pre", berr) }
+        sync_or_die("sync bwd_pre"); t1 = time_now()
+        ns_bpre = ns_bpre + (t1 - t0) + (kb_t1 - kb_t0)
+
+        // Phase 2: wzma_bwd_uv (grid=NW) — wzma_bwd ×2 → per-WG partial dense
+        // grads + dx1/dx2.  THE heavy phase; BS rows split across NW WGs.
+        t0 = time_now()
+        berr = hipModuleLaunchKernel(fh_buv, NW32, 1, 1, 512, 1, 1, 0, 0, kp, 0)
+        if berr != 0 { die_gpu("launch wzma_bwd_uv", berr) }
+        sync_or_die("sync bwd_uv"); t1 = time_now(); ns_buv = ns_buv + (t1 - t0)
+
+        // Phase 3: wzma_bwd_embed (grid=1) — embed_bwd ×2 scatter → demb.
+        t0 = time_now()
+        berr = hipModuleLaunchKernel(fh_bemb, 1, 1, 1, 512, 1, 1, 0, 0, kp, 0)
+        if berr != 0 { die_gpu("launch wzma_bwd_embed", berr) }
+        sync_or_die("sync bwd_embed"); t1 = time_now(); ns_bemb = ns_bemb + (t1 - t0)
+
+        // Phase 4: wzma_bwd_reduce (grid=NW) — fixed-order reduce of NW partial
+        // slots → final dU/dV/dgw/dgb/dbias (contiguous in d_grads).
+        t0 = time_now()
+        berr = hipModuleLaunchKernel(fh_bred, NW32, 1, 1, 512, 1, 1, 0, 0, kp, 0)
+        if berr != 0 { die_gpu("launch wzma_bwd_reduce", berr) }
+        sync_or_die("sync bwd_reduce"); t1 = time_now(); ns_bred = ns_bred + (t1 - t0)
+
         // free the per-arg value slots
         u64 fi = 0
         while fi < NA { u64 sp = 0; unsafe { *((kp + fi*8) as u64) -> sp } dealloc(sp); fi = fi + 1 }
         dealloc(kp)
-        t1 = time_now(); ns_bwd = ns_bwd + (t1 - t0)
 
-        // ── Step-0: validate grads vs oracle_grads.bin (dU|dV|dgw|dgb|dbias) ──
+        // ── Step-0: validate FINAL reduced grads vs oracle (dU|dV|dgw|dgb|dbias) ──
         if step == 0 {
-            validate_grads(d_partial, PART_N)
+            validate_grads(d_grads, PART_N)
         }
+
+        // ════════════════ AdamW — 6 standalone full-occupancy dispatches ═════
+        // 5 dense (U,V,gw,gb,bias) + embed.  Bit-identical decoupled-wd math to
+        // the in-kernel AdamW.  step1 = step+1 (1-based bias correction).
+        t0 = time_now()
+        u64 step1 = step + 1
+        launch_adamw(fh_adamw, d_U,    d_dU,    d_mU,    d_vU,    K*D*R,     step1, lr, beta1, beta2, eps, wd)
+        launch_adamw(fh_adamw, d_V,    d_dV,    d_mV,    d_vV,    K*R*D,     step1, lr, beta1, beta2, eps, wd)
+        launch_adamw(fh_adamw, d_gw,   d_dgw,   d_mGw,   d_vGw,   K*D,       step1, lr, beta1, beta2, eps, wd)
+        launch_adamw(fh_adamw, d_gb,   d_dgb,   d_mGb,   d_vGb,   K,         step1, lr, beta1, beta2, eps, wd)
+        launch_adamw(fh_adamw, d_bias, d_dbias, d_mBias, d_vBias, D,         step1, lr, beta1, beta2, eps, wd)
+        launch_adamw(fh_adamw, d_emb,  d_demb,  d_mEmb,  d_vEmb,  VOCAB*D,   step1, lr, beta1, beta2, eps, wd)
+        sync_or_die("sync adamw"); t1 = time_now(); ns_badamw = ns_badamw + (t1 - t0)
 
         u64 step_t1 = time_now(); ns_total_step = ns_total_step + (step_t1 - step_t0)
         step = step + 1
@@ -569,8 +685,15 @@ fn main() {
     print_ms("repack  [GPU]: ", ms_of(ns_repack))
     print_ms("fwd_tail[GPU]: ", ms_of(ns_tail))
     print_ms("InfoNCE [GPU+CPU+loss]: ", ms_of(ns_nce))
-    print_ms("zero dP [H2D]: ", ms_of(ns_zero))
-    print_ms("backward+AdamW [GPU 1-dispatch]: ", ms_of(ns_bwd))
+    print_ms("zero dP+demb [H2D]: ", ms_of(ns_zero))
+    print_str("--- BACKWARD (was 1 single-WG dispatch ~34ms/step; now 4 full-occ phases + 6 AdamW) ---\n")
+    print_ms("  bwd_pre    [GPU grid=1] : ", ms_of(ns_bpre))
+    print_ms("  bwd_uv     [GPU grid=NW]: ", ms_of(ns_buv))
+    print_ms("  bwd_embed  [GPU grid=1] : ", ms_of(ns_bemb))
+    print_ms("  bwd_reduce [GPU grid=NW]: ", ms_of(ns_bred))
+    print_ms("  AdamW x6   [GPU full-occ]: ", ms_of(ns_badamw))
+    f32 ms_bwd_total = ms_of(ns_bpre) + ms_of(ns_buv) + ms_of(ns_bemb) + ms_of(ns_bred) + ms_of(ns_badamw)
+    print_ms("  BACKWARD total (vs old 34ms/step → ", ms_bwd_total / 50.0f)
     print_ms("TOTAL 50-step: ", ms_of(ns_total_step))
     f32 per_step = ms_of(ns_total_step) / 50.0f
     print_ms("ms / step    : ", per_step)
