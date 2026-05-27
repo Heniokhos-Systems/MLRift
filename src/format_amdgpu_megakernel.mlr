@@ -7506,6 +7506,469 @@ fn wzm_clamp_off_dlt_D(uint64 v_off) {
     wzm_v_cndmask_zero_e32(v_off, v_off)   // v_off = (d<D) ? v_off : 0
 }
 
+// ── Task-5 backward helper: InfoNCE re-norm bwd + l2norm_bwd + meanpool_bwd,
+//    fused for one view.  Mirrors std/train.mlr exactly:
+//      infonce_bwd re-norm:  dq[b,d]  = dqa[b,d] - (dqa·q)[b] * q[b,d]
+//      l2norm_bwd:           dp[b,d]  = (dq[b,d] - (dq·q)[b] * q[b,d]) / norm[b]
+//      meanpool_bwd:         dz[b,s,d]= dp[b,d] / S            (broadcast over S)
+//    dq (= dv after re-norm) is written back to the dv buffer for validation.
+//    All 512 lanes participate in the two per-b reduce trees (full exec); the
+//    final dz store is exec-gated d<D.  B=8, S=16, D=384 hardcoded.
+//  Params:
+//    q_saddr   = low SGPR of q-ptr pair (44=v1 / 46=v2)   [persistent]
+//    dv_kofs   = kernarg byte offset of the dv ptr (0x110 / 0x118)
+//    norm_saddr= low SGPR of norms-ptr pair (70 / 72)     [persistent]
+//    dz_kofs   = kernarg byte offset of the dz ptr (0x120 / 0x128)
+//  Clobbers: v1,v5,v6,v7,v9,v10..v14 ; s2,s14,s34..s39,s[74:77].
+fn _wzm_emit_renorm_pool_bwd_view(uint64 q_saddr, uint64 dv_kofs,
+                                  uint64 norm_saddr, uint64 dz_kofs) {
+    // Load dv/dz ptrs into scratch pairs s[74:75], s[76:77].
+    asm_s_load_b64_off(37, 0, dv_kofs)    // s[74:75] = dv
+    asm_s_load_b64_off(38, 0, dz_kofs)    // s[76:77] = dz
+    asm_u32(0xBF89FC07)                   // lgkmcnt(0)
+    wzm_v_shl2_e32(6, 0)                  // v6 = d*4 (reduce-tree LDS offset)
+    asm_u32(0x7E120280)                   // v9 = 0 (broadcast ds addr)
+    asm_v_mov_b32_lit32(14, 0x3D800000)   // v14 = 1/S = 0.0625
+
+    wzm_s_mov_b32_0(34)                   // b = 0
+    uint64 b_top = asm_text_len / 4
+    asm_u32(0xBF090000 | (0x88 << 8) | 34)   // s_cmp_ge_u32 s34, 8
+    uint64 b_exit = asm_text_len / 4
+    asm_u32(0xBFA20000)                   // s_cbranch_scc1 .Lb_end (patched)
+
+    // off = (b*384 + d)*4 — shared for q, dv (lane d).
+    wzm_s_mul_i32_lit(35, 34, 0x180)      // s35 = b*384
+    wzm_v_add_nc_u32_sv(1, 35, 0)         // v1 = b*384 + d
+    wzm_v_shl2_e32(1, 1)                  // *4
+    wzm_clamp_off_dlt_D(1)                // OOB guard (d>=D → off 0)
+    wzm_gload_b32_saddr(10, 1, q_saddr)   // v10 = q[b,d]
+    wzm_gload_b32_saddr(11, 1, 74)        // v11 = dv[b,d] (= dqa)
+    asm_u32(0xBF8903F7)                   // vmcnt(0)
+    asm_u32(0x7C980020)                   // vcc = d<D
+    wzm_v_cndmask_zero_e32(10, 10)        // zero q for d>=D
+    wzm_v_cndmask_zero_e32(11, 11)        // zero dv for d>=D
+
+    // dot1 = sum_d dqa*q
+    wzm_v_mul_f32_e32(5, 11, 10)          // v5 = dqa*q
+    _emit_lds_reduce_tree_512()
+    wzm_ds_load_b32(12, 9, 0)             // v12 = dot1
+    asm_u32(0xBF89FC07)                   // lgkmcnt(0)
+    // dq = dqa - dot1*q   (infonce re-norm bwd)
+    wzm_v_mul_f32_e32(13, 12, 10)         // v13 = dot1*q
+    wzm_v_sub_f32_e32(11, 11, 13)         // v11 = dq
+    // store dq back to dv[b,d] (validation: matches CPU infonce_bwd output)
+    asm_u32(0x7C980020)                   // d<D
+    asm_u32(0xBE82206A)                   // saveexec s2
+    wzm_gstore_b32_saddr(1, 11, 74)       // dv[b,d] = dq
+    asm_u32(0xBC7C0000)                   // vscnt(0)
+    asm_u32(0xBEFE0002)                   // restore exec
+
+    // dot2 = sum_d dq*q
+    wzm_v_mul_f32_e32(5, 11, 10)          // v5 = dq*q  (d>=D already 0 in v11/v10)
+    _emit_lds_reduce_tree_512()
+    wzm_ds_load_b32(12, 9, 0)             // v12 = dot2
+    asm_u32(0xBF89FC07)
+    // dp = (dq - dot2*q) / norm[b] ; then dz_d = dp / S  (kept in v12).
+    wzm_v_mul_f32_e32(13, 12, 10)         // dot2*q
+    wzm_v_sub_f32_e32(11, 11, 13)         // v11 = dq - dot2*q
+    // norm[b]: build address norm_ptr + b*4 into s[78:79], scalar-load → s39.
+    wzm_s_lshl2(36, 34)                   // s36 = b*4
+    wzm_s_add_u32_ss(78, norm_saddr, 36)        // s78 = norm_lo + b*4
+    asm_u32(0x82000000 | (79 << 16) | (0x80 << 8) | (norm_saddr + 1))  // s_addc_u32 s79, norm_hi, 0
+    asm_s_load_b32(39, 39, 0x0)           // s78 = norm[b]  (sdata_pair 39→s78, base s[78:79])
+    asm_u32(0xBF89FC07)                   // lgkmcnt(0)
+    wzm_v_mov_s(13, 78)                   // v13 = norm[b]  (= s78)
+    asm_v_rcp_f32_e64_v(13, 13)           // v13 = 1/norm[b]
+    wzm_v_mul_f32_e32(11, 11, 13)         // v11 = dp = (dq-dot2*q)/norm
+    wzm_v_mul_f32_e32(12, 11, 14)         // v12 = dz_d = dp / S  (v14 = 1/S)
+
+    // ── dz[b,s,d] = dp[b,d]/S  for s=0..S-1 (lane d, d<D gated) ──
+    asm_u32(0x7C980020)                   // d<D
+    asm_u32(0xBE82206A)                   // saveexec s2
+    wzm_s_mov_b32_0(36)                   // s = 0
+    uint64 s_top = asm_text_len / 4
+    asm_u32(0xBF090000 | (0x90 << 8) | 36)   // s_cmp_ge_u32 s36, 16
+    uint64 s_exit = asm_text_len / 4
+    asm_u32(0xBFA20000)
+    wzm_s_mul_i32_lit(37, 34, 16)         // s37 = b*16
+    wzm_s_add_u32_ss(37, 37, 36)          // s37 = b*16 + s = row
+    wzm_s_mul_i32_lit(37, 37, 0x180)      // row*384
+    wzm_v_add_nc_u32_sv(1, 37, 0)         // + d
+    wzm_v_shl2_e32(1, 1)                  // *4
+    wzm_gstore_b32_saddr(1, 12, 76)       // dz[row,d] = dz_d (v12 holds dz_d)
+    asm_u32(0xBC7C0000)
+    wzm_s_add_u32_1(36, 36)
+    uint64 s_back = (s_top - (asm_text_len / 4) - 1) & 0xFFFF
+    asm_u32(0xBFA00000 | s_back)
+    uint64 s_end = asm_text_len / 4
+    asm_patch_u32(s_exit, 0xBFA20000 | ((s_end - s_exit - 1) & 0xFFFF))
+    asm_u32(0xBEFE0002)                   // restore exec
+
+    wzm_s_add_u32_1(34, 34)               // b += 1
+    uint64 b_back = (b_top - (asm_text_len / 4) - 1) & 0xFFFF
+    asm_u32(0xBFA00000 | b_back)
+    uint64 b_end = asm_text_len / 4
+    asm_patch_u32(b_exit, 0xBFA20000 | ((b_end - b_exit - 1) & 0xFFFF))
+    asm_u32(0xBFBD0000)                   // s_barrier — dz visible to all lanes
+}
+
+// ── Task-5 backward helper: wzma_bwd for one view.  Mirrors std/train.mlr fn
+//    wzma_bwd EXACTLY.  Accumulates (+=) into dU,dV,dgw,dgb,dbias and writes
+//    dx (overwrite).  Per (bs): lane = d (d<D).  K=4 unrolled, R=32 / D=384.
+//
+//  g[k,r]    = sum_d dy[d]*V[k,r,d]   (512-lane reduce tree → LDS[2048+(k*32+r)*4])
+//  d_alpha_k = sum_d dy[d]*outk[k,d]  (reduce tree → v24+k broadcast; matches CPU)
+//  dinter_kr = alpha_k * g[k,r]
+//
+//  Params (low-SGPR of persistent pairs / kernarg byte offsets):
+//    x_saddr (54/56)  alpha_saddr (58/60)  inter_saddr (62/64)  outk_saddr (66/68)
+//    dy_kofs (dz 0x120/0x128)   dx_kofs (0x130/0x138)
+//  Persistent pairs: U=s[10:11], V=s[12:13], gw=s[16:17].
+//  Grad bases loaded on-demand into s[78:79]: dU 0xE0 dV 0xE8 dgw 0xF0 dgb 0xF8
+//    dbias 0x100.   Clobbers v1,v5-v9,v10-v21,v24-v29 ; s2,s14,s34-39,s[74:79].
+fn _wzm_emit_wzma_bwd_view(uint64 x_saddr, uint64 alpha_saddr,
+                           uint64 inter_saddr, uint64 outk_saddr,
+                           uint64 dy_kofs, uint64 dx_kofs) {
+    asm_s_load_b64_off(37, 0, dy_kofs)    // s[74:75] = dy (dz)
+    asm_s_load_b64_off(38, 0, dx_kofs)    // s[76:77] = dx
+    asm_u32(0xBF89FC07)                   // lgkmcnt(0)
+    wzm_v_shl2_e32(6, 0)                  // v6 = d*4 (reduce tree LDS off)
+    asm_u32(0x7E120280)                   // v9 = 0
+
+    // ── dbias[d] += sum_bs dy[bs,d]   (lane d, d<D) ──
+    asm_u32(0x7C980020)                   // vcc = d<D
+    asm_u32(0xBE82206A)                   // saveexec s2
+    uint64 db_execz = asm_text_len / 4
+    asm_u32(0xBFA50000)                   // execz .Ldb_end (patched)
+    asm_u32(0x7E220280)                   // v17 = 0 (acc)
+    wzm_s_mov_b32_0(34)                   // bs = 0
+    uint64 db_top = asm_text_len / 4
+    asm_u32(0xBF090000 | (30 << 8) | 34)  // bs >= BS
+    uint64 db_exit = asm_text_len / 4
+    asm_u32(0xBFA20000)
+    wzm_s_mul_i32_lit(35, 34, 0x180)      // bs*384
+    wzm_v_add_nc_u32_sv(1, 35, 0)
+    wzm_v_shl2_e32(1, 1)
+    wzm_gload_b32_saddr(10, 1, 74)        // dy[bs,d]
+    asm_u32(0xBF8903F7)
+    wzm_v_add_f32_e32(17, 17, 10)
+    wzm_s_add_u32_1(34, 34)
+    uint64 db_back = (db_top - (asm_text_len / 4) - 1) & 0xFFFF
+    asm_u32(0xBFA00000 | db_back)
+    uint64 db_end = asm_text_len / 4
+    asm_patch_u32(db_exit, 0xBFA20000 | ((db_end - db_exit - 1) & 0xFFFF))
+    asm_s_load_b64_off(39, 0, 0x100)      // s[78:79] = dbias
+    asm_u32(0xBF89FC07)
+    wzm_v_shl2_e32(1, 0)                  // d*4
+    wzm_gload_b32_saddr(16, 1, 78)        // v16 = dbias[d]
+    asm_u32(0xBF8903F7)
+    wzm_v_add_f32_e32(16, 16, 17)
+    wzm_gstore_b32_saddr(1, 16, 78)
+    asm_u32(0xBC7C0000)
+    uint64 db_e = asm_text_len / 4
+    asm_patch_u32(db_execz, 0xBFA50000 | ((db_e - db_execz - 1) & 0xFFFF))
+    asm_u32(0xBEFE0002)                   // restore exec
+    asm_u32(0xBFBD0000)                   // s_barrier
+
+    // ── per-bs loop ──
+    wzm_s_mov_b32_0(34)                   // bs = 0
+    uint64 bs_top = asm_text_len / 4
+    asm_u32(0xBF090000 | (30 << 8) | 34)  // bs >= BS
+    uint64 bs_exit = asm_text_len / 4
+    asm_u32(0xBFA20000)
+
+    // v8 = d*32 (U/dU column index), load dy[d]→v10, x[d]→v11 (zeroed d>=D).
+    asm_u32((0x18 << 25) | (8 << 17) | (0 << 9) | (0x80 + 5))  // v_lshlrev_b32 v8, 5, v0
+    wzm_s_mul_i32_lit(35, 34, 0x180)      // bs*384
+    wzm_v_add_nc_u32_sv(1, 35, 0)
+    wzm_v_shl2_e32(1, 1)
+    wzm_clamp_off_dlt_D(1)
+    wzm_gload_b32_saddr(10, 1, 74)        // dy[bs,d]
+    wzm_gload_b32_saddr(11, 1, x_saddr)   // x[bs,d]
+    asm_u32(0xBF8903F7)
+    asm_u32(0x7C980020)                   // d<D
+    wzm_v_cndmask_zero_e32(10, 10)
+    wzm_v_cndmask_zero_e32(11, 11)
+
+    // alpha[bs,0..3] → v12..v15.
+    wzm_s_mul_i32_lit(36, 34, 16)         // bs*16
+    uint64 ak0 = 0
+    while ak0 < 4 {
+        wzm_s_mov_b32_lit(37, ak0 * 4)
+        wzm_s_add_u32_ss(38, 36, 37)      // bs*16 + k*4
+        wzm_v_mov_s(1, 38)
+        wzm_gload_b32_saddr(12 + ak0, 1, alpha_saddr)
+        ak0 = ak0 + 1
+    }
+    asm_u32(0xBF8903F7)
+
+    // ── g[k,r] = sum_d dy[d]*V[k,r,d] → LDS[2048 + (k*32+r)*4], K unrolled ──
+    uint64 gk = 0
+    while gk < 4 {
+        wzm_s_mov_b32_0(36)               // r = 0
+        uint64 gr_top = asm_text_len / 4
+        asm_u32(0xBF090000 | (0xA0 << 8) | 36)   // r >= 32
+        uint64 gr_exit = asm_text_len / 4
+        asm_u32(0xBFA20000)
+        wzm_s_mov_b32_lit(35, gk * 12288)
+        wzm_s_mul_i32_lit(37, 36, 0x180)  // r*384
+        wzm_s_add_u32_ss(35, 35, 37)
+        wzm_v_add_nc_u32_sv(1, 35, 0)     // + d
+        wzm_v_shl2_e32(1, 1)
+        wzm_clamp_off_dlt_D(1)
+        wzm_gload_b32_saddr(16, 1, 12)    // V[k,r,d]  (s[12:13])
+        asm_u32(0xBF8903F7)
+        wzm_v_mul_f32_e32(5, 10, 16)      // dy*V
+        _emit_lds_reduce_tree_512()
+        wzm_ds_load_b32(16, 9, 0)         // v16 = g[k,r]
+        asm_u32(0xBF89FC07)
+        asm_u32(0x7C940080)               // lane 0
+        asm_u32(0xBE82206A)               // saveexec s2
+        wzm_s_mov_b32_lit(37, gk * 128)
+        wzm_s_lshl2(38, 36)
+        wzm_s_add_u32_ss(37, 37, 38)
+        wzm_v_mov_s(1, 37)
+        wzm_ds_store_b32(1, 16, 2048)     // LDS g[k,r]
+        asm_u32(0xBF89FC07)
+        asm_u32(0xBEFE0002)
+        wzm_s_add_u32_1(36, 36)
+        uint64 gr_back = (gr_top - (asm_text_len / 4) - 1) & 0xFFFF
+        asm_u32(0xBFA00000 | gr_back)
+        uint64 gr_end = asm_text_len / 4
+        asm_patch_u32(gr_exit, 0xBFA20000 | ((gr_end - gr_exit - 1) & 0xFFFF))
+        gk = gk + 1
+    }
+
+    // ── d_alpha_k = sum_d dy[d]*outk[k,d] → v(24+k) broadcast (K reduce trees) ──
+    uint64 dak = 0
+    while dak < 4 {
+        // outk[bs,k,d] off = (bs*1536 + k*384 + d)*4
+        wzm_s_mul_i32_lit(35, 34, 1536)
+        wzm_s_mov_b32_lit(37, dak * 384)
+        wzm_s_add_u32_ss(35, 35, 37)
+        wzm_v_add_nc_u32_sv(1, 35, 0)
+        wzm_v_shl2_e32(1, 1)
+        wzm_clamp_off_dlt_D(1)
+        wzm_gload_b32_saddr(16, 1, outk_saddr)   // outk[bs,k,d]
+        asm_u32(0xBF8903F7)
+        wzm_v_mul_f32_e32(5, 10, 16)      // dy*outk
+        _emit_lds_reduce_tree_512()
+        wzm_ds_load_b32(24 + dak, 9, 0)   // v(24+k) = d_alpha_k
+        asm_u32(0xBF89FC07)
+        dak = dak + 1
+    }
+    asm_u32(0xBFBD0000)                   // s_barrier — g[k,r] LDS visible to all
+
+    // ── lane=d work (d<D): dV, dU, dx (UV part), gate bwd, dx store ──
+    asm_u32(0x7C980020)                   // d<D
+    asm_u32(0xBE82206A)                   // saveexec s2
+    uint64 lw_execz = asm_text_len / 4
+    asm_u32(0xBFA50000)                   // execz .Llw_end (patched)
+    asm_u32(0x7E220280)                   // v17 = 0 (dx acc)
+
+    uint64 kk = 0
+    while kk < 4 {
+        wzm_s_mov_b32_0(36)               // r = 0
+        uint64 kr_top = asm_text_len / 4
+        asm_u32(0xBF090000 | (0xA0 << 8) | 36)   // r >= 32
+        uint64 kr_exit = asm_text_len / 4
+        asm_u32(0xBFA20000)
+        // g[k,r] from LDS → v16
+        wzm_s_mov_b32_lit(37, kk * 128)
+        wzm_s_lshl2(38, 36)
+        wzm_s_add_u32_ss(37, 37, 38)
+        wzm_v_mov_s(1, 37)
+        wzm_ds_load_b32(16, 1, 2048)      // g[k,r]
+        asm_u32(0xBF89FC07)
+        wzm_v_mul_f32_e32(18, 12 + kk, 16)   // dinter = alpha_k*g
+        // inter[bs,k,r] → v19 ; off=(bs*128 + k*32 + r)*4
+        wzm_s_mul_i32_lit(35, 34, 128)
+        wzm_s_mov_b32_lit(37, kk * 32)
+        wzm_s_add_u32_ss(35, 35, 37)
+        wzm_s_add_u32_ss(35, 35, 36)
+        wzm_v_mov_s(1, 35)
+        wzm_v_shl2_e32(1, 1)
+        wzm_gload_b32_saddr(19, 1, inter_saddr)   // inter[bs,k,r]
+        asm_u32(0xBF8903F7)
+        // dV[k,r,d] += (alpha_k*inter)*dy[d]   off=(k*12288 + r*384 + d)*4
+        wzm_v_mul_f32_e32(20, 12 + kk, 19)   // alpha_k*inter
+        asm_s_load_b64_off(39, 0, 0xE8)   // s[78:79] = dV
+        asm_u32(0xBF89FC07)
+        wzm_s_mov_b32_lit(35, kk * 12288)
+        wzm_s_mul_i32_lit(37, 36, 0x180)  // r*384
+        wzm_s_add_u32_ss(35, 35, 37)
+        wzm_v_add_nc_u32_sv(1, 35, 0)
+        wzm_v_shl2_e32(1, 1)
+        wzm_gload_b32_saddr(16, 1, 78)    // dV[k,r,d]
+        asm_u32(0xBF8903F7)
+        wzm_v_mul_f32_e32(21, 20, 10)     // *dy[d]
+        wzm_v_add_f32_e32(16, 16, 21)
+        wzm_gstore_b32_saddr(1, 16, 78)
+        asm_u32(0xBC7C0000)
+        // dU[k,d,r] += dinter*x[d]   off=(k*12288 + d*32 + r)*4
+        asm_s_load_b64_off(39, 0, 0xE0)   // s[78:79] = dU
+        asm_u32(0xBF89FC07)
+        wzm_s_mov_b32_lit(35, kk * 12288)
+        wzm_s_add_u32_ss(35, 35, 36)      // k*12288 + r
+        wzm_v_add_nc_u32_sv(1, 35, 8)     // + d*32 (v8)
+        wzm_v_shl2_e32(1, 1)
+        wzm_gload_b32_saddr(16, 1, 78)    // dU[k,d,r]
+        asm_u32(0xBF8903F7)
+        wzm_v_mul_f32_e32(21, 18, 11)     // dinter*x[d]
+        wzm_v_add_f32_e32(16, 16, 21)
+        wzm_gstore_b32_saddr(1, 16, 78)
+        asm_u32(0xBC7C0000)
+        // dx[d] += dinter*U[k,d,r]   (U s[10:11]) off=(k*12288 + d*32 + r)*4
+        wzm_s_mov_b32_lit(35, kk * 12288)
+        wzm_s_add_u32_ss(35, 35, 36)
+        wzm_v_add_nc_u32_sv(1, 35, 8)
+        wzm_v_shl2_e32(1, 1)
+        wzm_gload_b32_saddr(16, 1, 10)    // U[k,d,r]
+        asm_u32(0xBF8903F7)
+        asm_v_fma_f32_e64_vvv(17, 18, 16, 17)   // dx += dinter*U
+        wzm_s_add_u32_1(36, 36)
+        uint64 kr_back = (kr_top - (asm_text_len / 4) - 1) & 0xFFFF
+        asm_u32(0xBFA00000 | kr_back)
+        uint64 kr_end = asm_text_len / 4
+        asm_patch_u32(kr_exit, 0xBFA20000 | ((kr_end - kr_exit - 1) & 0xFFFF))
+        kk = kk + 1
+    }
+
+    // ── Gate softmax bwd ──
+    // sum_ada = sum_k alpha_k * d_alpha_k     (uniform → v28)
+    wzm_v_mul_f32_e32(28, 12, 24)
+    asm_v_fma_f32_e64_vvv(28, 13, 25, 28)
+    asm_v_fma_f32_e64_vvv(28, 14, 26, 28)
+    asm_v_fma_f32_e64_vvv(28, 15, 27, 28)
+    uint64 gbk = 0
+    while gbk < 4 {
+        // dgl_k = alpha_k * (d_alpha_k - sum_ada)   → v29
+        wzm_v_sub_f32_e32(29, 24 + gbk, 28)   // d_alpha_k - sum_ada
+        wzm_v_mul_f32_e32(29, 12 + gbk, 29)   // * alpha_k
+        // dgw[k,d] += dgl_k * x[d]    off=(k*384 + d)*4
+        asm_s_load_b64_off(39, 0, 0xF0)   // s[78:79] = dgw
+        asm_u32(0xBF89FC07)
+        wzm_s_mov_b32_lit(35, gbk * 384)
+        wzm_v_add_nc_u32_sv(1, 35, 0)
+        wzm_v_shl2_e32(1, 1)
+        wzm_gload_b32_saddr(16, 1, 78)    // dgw[k,d]
+        asm_u32(0xBF8903F7)
+        wzm_v_mul_f32_e32(21, 29, 11)     // dgl_k*x[d]
+        wzm_v_add_f32_e32(16, 16, 21)
+        wzm_gstore_b32_saddr(1, 16, 78)
+        asm_u32(0xBC7C0000)
+        // dx[d] += dgl_k * gw[k,d]   (gw s[16:17]) off=(k*384 + d)*4
+        wzm_s_mov_b32_lit(35, gbk * 384)
+        wzm_v_add_nc_u32_sv(1, 35, 0)
+        wzm_v_shl2_e32(1, 1)
+        wzm_gload_b32_saddr(16, 1, 16)    // gw[k,d]
+        asm_u32(0xBF8903F7)
+        asm_v_fma_f32_e64_vvv(17, 29, 16, 17)   // dx += dgl_k*gw
+        // dgb[k] += dgl_k handled in the lane-0 sub-block after this loop.
+        gbk = gbk + 1
+    }
+
+    // dgb[k] += dgl_k done in a lane-0 sub-block after the per-k loop:
+    // (handled separately to avoid nested exec save inside the d<D region)
+
+    // store dx[bs,d] = v17   off=(bs*384 + d)*4
+    wzm_s_mul_i32_lit(35, 34, 0x180)
+    wzm_v_add_nc_u32_sv(1, 35, 0)
+    wzm_v_shl2_e32(1, 1)
+    wzm_gstore_b32_saddr(1, 17, 76)       // dx[bs,d] (s[76:77])
+    asm_u32(0xBC7C0000)
+
+    uint64 lw_e = asm_text_len / 4
+    asm_patch_u32(lw_execz, 0xBFA50000 | ((lw_e - lw_execz - 1) & 0xFFFF))
+    asm_u32(0xBEFE0002)                   // restore exec
+
+    // ── dgb[k] += dgl_k  (lane 0 only; recompute dgl_k from v24..27, v12..15) ──
+    asm_u32(0x7C940080)                   // v_cmp_eq_u32_e32 vcc_lo, 0, v0 (lane 0)
+    asm_u32(0xBE82206A)                   // saveexec s2
+    uint64 gb_execz = asm_text_len / 4
+    asm_u32(0xBFA50000)                   // execz .Lgb_end
+    asm_s_load_b64_off(39, 0, 0xF8)       // s[78:79] = dgb
+    asm_u32(0xBF89FC07)
+    uint64 gck = 0
+    while gck < 4 {
+        wzm_v_sub_f32_e32(29, 24 + gck, 28)   // d_alpha_k - sum_ada
+        wzm_v_mul_f32_e32(29, 12 + gck, 29)   // dgl_k
+        wzm_s_mov_b32_lit(35, gck * 4)
+        wzm_v_mov_s(1, 35)
+        wzm_gload_b32_saddr(16, 1, 78)    // dgb[k]
+        asm_u32(0xBF8903F7)
+        wzm_v_add_f32_e32(16, 16, 29)
+        wzm_gstore_b32_saddr(1, 16, 78)
+        asm_u32(0xBC7C0000)
+        gck = gck + 1
+    }
+    uint64 gb_e = asm_text_len / 4
+    asm_patch_u32(gb_execz, 0xBFA50000 | ((gb_e - gb_execz - 1) & 0xFFFF))
+    asm_u32(0xBEFE0002)                   // restore exec
+    asm_u32(0xBFBD0000)                   // s_barrier (LDS g[] reuse next bs)
+
+    wzm_s_add_u32_1(34, 34)               // bs += 1
+    uint64 bs_back = (bs_top - (asm_text_len / 4) - 1) & 0xFFFF
+    asm_u32(0xBFA00000 | bs_back)
+    uint64 bs_end = asm_text_len / 4
+    asm_patch_u32(bs_exit, 0xBFA20000 | ((bs_end - bs_exit - 1) & 0xFFFF))
+    asm_u32(0xBFBD0000)                   // s_barrier — dU/dV/dgw/dgb/dx done
+}
+
+// ── Task-5 backward helper: embed_bwd for one view (scatter-add into demb).
+//    demb[id*D + d] += dx[bs,d]  for each bs (id = ids[bs]).  Lane = d (d<D).
+//    Mirrors std/train.mlr fn embed_bwd.  NOTE: bench ids are i32 (4 bytes).
+//  Params: ids_saddr (40/42), dx_kofs (0x130/0x138).  demb base 0x108→s[78:79].
+//  Single-lane-per-d, serial over bs (RMW into shared rows — different bs may
+//  hit the same id, so this MUST be serial; one WG, lane=d handles distinct d).
+//  Clobbers v1,v10,v16 ; s2,s34,s36..s39,s[74:79].
+fn _wzm_emit_embed_bwd_view(uint64 ids_saddr, uint64 dx_kofs) {
+    asm_s_load_b64_off(37, 0, dx_kofs)    // s[74:75] = dx
+    asm_s_load_b64_off(39, 0, 0x108)      // s[78:79] = demb
+    asm_u32(0xBF89FC07)
+    asm_u32(0x7C980020)                   // d<D
+    asm_u32(0xBE82206A)                   // saveexec s2
+    uint64 eb_execz = asm_text_len / 4
+    asm_u32(0xBFA50000)                   // execz .Leb_end (patched)
+    wzm_s_mov_b32_0(34)                   // bs = 0
+    uint64 eb_top = asm_text_len / 4
+    asm_u32(0xBF090000 | (30 << 8) | 34)  // bs >= BS
+    uint64 eb_exit = asm_text_len / 4
+    asm_u32(0xBFA20000)
+    // id = ids[bs] (i32) → s36 (scalar); base ids_ptr + bs*4.
+    wzm_s_lshl2(35, 34)                   // bs*4
+    wzm_s_add_u32_ss(74, ids_saddr, 35)   // s74 = ids_lo + bs*4
+    asm_u32(0x82000000 | (75 << 16) | (0x80 << 8) | (ids_saddr + 1))  // s_addc_u32 s75, ids_hi, 0
+    asm_s_load_b32(18, 37, 0x0)           // s36 = ids[bs]  (sdata_pair 18 → s36, base s[74:75])
+    asm_u32(0xBF89FC07)
+    // dx[bs,d]  off=(bs*384 + d)*4 → but s[74:75] was clobbered; reload dx.
+    asm_s_load_b64_off(37, 0, dx_kofs)    // s[74:75] = dx (restore)
+    asm_u32(0xBF89FC07)
+    wzm_s_mul_i32_lit(35, 34, 0x180)      // bs*384
+    wzm_v_add_nc_u32_sv(1, 35, 0)
+    wzm_v_shl2_e32(1, 1)
+    wzm_gload_b32_saddr(10, 1, 74)        // v10 = dx[bs,d]
+    asm_u32(0xBF8903F7)
+    // demb[id*D + d]  off=(id*384 + d)*4
+    wzm_s_mul_i32_lit(35, 36, 0x180)      // id*384
+    wzm_v_add_nc_u32_sv(1, 35, 0)
+    wzm_v_shl2_e32(1, 1)
+    wzm_gload_b32_saddr(16, 1, 78)        // v16 = demb[id,d]
+    asm_u32(0xBF8903F7)
+    wzm_v_add_f32_e32(16, 16, 10)         // += dx
+    wzm_gstore_b32_saddr(1, 16, 78)
+    asm_u32(0xBC7C0000)
+    wzm_s_add_u32_1(34, 34)
+    uint64 eb_back = (eb_top - (asm_text_len / 4) - 1) & 0xFFFF
+    asm_u32(0xBFA00000 | eb_back)
+    uint64 eb_end = asm_text_len / 4
+    asm_patch_u32(eb_exit, 0xBFA20000 | ((eb_end - eb_exit - 1) & 0xFFFF))
+    uint64 eb_e = asm_text_len / 4
+    asm_patch_u32(eb_execz, 0xBFA50000 | ((eb_e - eb_execz - 1) & 0xFFFF))
+    asm_u32(0xBEFE0002)                   // restore exec
+    asm_u32(0xBFBD0000)                   // s_barrier
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // WZMA+InfoNCE training mega-kernel — single-workgroup, all-resident.
 //
@@ -7595,6 +8058,19 @@ fn amdgpu_lower_wzma_train_mega(uint64 kname_ptr, uint64 nl) -> uint64 {
     asm_s_load_b64_off(22, 0, 0x78)   // s[44:45] = v1   (view-0 encoder out [B,D])
     asm_s_load_b64_off(23, 0, 0x80)   // s[46:47] = v2   (view-1 encoder out [B,D])
     asm_s_load_b64_off(26, 0, 0x88)   // s[52:53] = d_loss (Task 4: scalar InfoNCE loss)
+    // ── Task 5 (BACKWARD): per-view persistent activation + grad kernargs ──
+    // Per-view saved activations let the backward run after BOTH forward views
+    // (the working scratch pairs s8/24/26/28 are view-selected into these).
+    asm_s_load_b64_off(27, 0, 0x90)   // s[54:55] = x1     (view-0 embed input [BS,D])
+    asm_s_load_b64_off(28, 0, 0x98)   // s[56:57] = x2     (view-1 embed input [BS,D])
+    asm_s_load_b64_off(29, 0, 0xA0)   // s[58:59] = alpha1 (view-0 saved softmax [BS,K])
+    asm_s_load_b64_off(30, 0, 0xA8)   // s[60:61] = alpha2 (view-1 saved softmax [BS,K])
+    asm_s_load_b64_off(31, 0, 0xB0)   // s[62:63] = inter1 (view-0 saved inter [BS,K,R])
+    asm_s_load_b64_off(32, 0, 0xB8)   // s[64:65] = inter2 (view-1 saved inter [BS,K,R])
+    asm_s_load_b64_off(33, 0, 0xC0)   // s[66:67] = outk1  (view-0 saved outk [BS,K,D])
+    asm_s_load_b64_off(34, 0, 0xC8)   // s[68:69] = outk2  (view-1 saved outk [BS,K,D])
+    asm_s_load_b64_off(35, 0, 0xD0)   // s[70:71] = norms1 (view-0 pre-L2 magnitudes [B])
+    asm_s_load_b64_off(36, 0, 0xD8)   // s[72:73] = norms2 (view-1 pre-L2 magnitudes [B])
     asm_u32(0xBF89FC07)   // s_waitcnt lgkmcnt(0)
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -7614,6 +8090,16 @@ fn amdgpu_lower_wzma_train_mega(uint64 kname_ptr, uint64 nl) -> uint64 {
     asm_s_mov_b32(5, 41)
     asm_s_mov_b32(48, 44)
     asm_s_mov_b32(49, 45)
+    // Task 5: route view-0 activations into the working scratch pairs so they
+    // persist (x_out=s8:9, alpha=s24:25, inter=s26:27, outk=s28:29).
+    asm_s_mov_b32(8,  54)
+    asm_s_mov_b32(9,  55)
+    asm_s_mov_b32(24, 58)
+    asm_s_mov_b32(25, 59)
+    asm_s_mov_b32(26, 62)
+    asm_s_mov_b32(27, 63)
+    asm_s_mov_b32(28, 66)
+    asm_s_mov_b32(29, 67)
     uint64 v_sel_done = asm_text_len / 4
     asm_u32(0xBFA00000)                    // s_branch .Lview_sel_end (patched)
     // .Lview1: view == 1: ids2 (s42:43) → s[4:5] ; v2 (s46:47) → s[48:49]
@@ -7623,6 +8109,15 @@ fn amdgpu_lower_wzma_train_mega(uint64 kname_ptr, uint64 nl) -> uint64 {
     asm_s_mov_b32(5, 43)
     asm_s_mov_b32(48, 46)
     asm_s_mov_b32(49, 47)
+    // Task 5: view-1 activations → working scratch pairs.
+    asm_s_mov_b32(8,  56)
+    asm_s_mov_b32(9,  57)
+    asm_s_mov_b32(24, 60)
+    asm_s_mov_b32(25, 61)
+    asm_s_mov_b32(26, 64)
+    asm_s_mov_b32(27, 65)
+    asm_s_mov_b32(28, 68)
+    asm_s_mov_b32(29, 69)
     uint64 v_sel_end = asm_text_len / 4
     asm_patch_u32(v_sel_done, 0xBFA00000 | ((v_sel_end - v_sel_done - 1) & 0xFFFF))
 
@@ -7956,7 +8451,30 @@ fn amdgpu_lower_wzma_train_mega(uint64 kname_ptr, uint64 nl) -> uint64 {
     wzm_ds_load_b32(31, 9, 0)             // v31 = ssq (broadcast)
     asm_u32(0xBF89FC07)                   // lgkmcnt(0)
     // inv = 1 / sqrt(ssq)
-    asm_v_sqrt_f32_e32_v(31, 31)          // v31 = sqrt(ssq)
+    asm_v_sqrt_f32_e32_v(31, 31)          // v31 = sqrt(ssq) = pre-L2 norm magnitude
+    // ── Task 5: save norm[b] = sqrt(ssq) into the view-selected norms buffer ──
+    // (matches std/train.mlr fn l2_normalize_f32_save).  Select norms1 (s70:71)
+    // for view 0, norms2 (s72:73) for view 1 via s50; lane-0-gated scalar store.
+    asm_u32(0x7C940080)                   // v_cmp_eq_u32_e32 vcc_lo, 0, v0 (lane 0)
+    asm_u32(0xBE82206A)                   // s_and_saveexec_b32 s2, vcc_lo  (save exec→s2)
+    asm_s_cmp_eq_u32(50, 0x80)            // scc = (view == 0)
+    uint64 nrm_else = asm_text_len / 4
+    asm_u32(0xBFA10000)                   // s_cbranch_scc0 .Lnrm_v1 (patched)
+    asm_s_mov_b32(36, 70)                 // s[36:37] = norms1
+    asm_s_mov_b32(37, 71)
+    uint64 nrm_done = asm_text_len / 4
+    asm_u32(0xBFA00000)                   // s_branch .Lnrm_end (patched)
+    uint64 nrm_else_tgt = asm_text_len / 4
+    asm_patch_u32(nrm_else, 0xBFA10000 | ((nrm_else_tgt - nrm_else - 1) & 0xFFFF))
+    asm_s_mov_b32(36, 72)                 // s[36:37] = norms2
+    asm_s_mov_b32(37, 73)
+    uint64 nrm_end = asm_text_len / 4
+    asm_patch_u32(nrm_done, 0xBFA00000 | ((nrm_end - nrm_done - 1) & 0xFFFF))
+    wzm_s_lshl2(35, 34)                   // s35 = b*4 (byte offset into norms[B])
+    wzm_v_mov_s(1, 35)                    // v1 = b*4
+    wzm_gstore_b32_saddr(1, 31, 36)       // norms[b] = sqrt(ssq)  (s[36:37])
+    asm_u32(0xBC7C0000)                   // vscnt(0)
+    asm_u32(0xBEFE0002)                   // s_mov_b32 exec_lo, s2 (restore full exec)
     asm_v_rcp_f32_e64_v(32, 31)           // v32 = 1/sqrt(ssq) = inv
     // v[b,d] = pooled * inv  (d<D gated store) ; idx = b*D + d = b*384 + d.
     wzm_v_mul_f32_e32(30, 30, 32)         // v30 = pooled * inv
@@ -8171,17 +8689,323 @@ fn amdgpu_lower_wzma_train_mega(uint64 kname_ptr, uint64 nl) -> uint64 {
     asm_patch_u32(ce_execz, 0xBFA50000 | ((ce_end - ce_execz - 1) & 0xFFFF))
     asm_u32(0xBEFE0002)                   // s_mov_b32 exec_lo, s2 (restore full exec)
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // ═══════════════════════════════════════════════════════════════════════
+    // TASK 5 — BACKWARD PASS.  Mirrors std/train.mlr exactly:
+    //   d_loss → infonce_bwd(dv1,dv2) → l2norm_bwd(dp) → meanpool_bwd(dz)
+    //          → wzma_bwd(dU,dV,dgw,dgb,dbias,dx) → embed_bwd(demb)
+    // Grads accumulate over BOTH views (dU/dV/dgw/dgb/dbias) — caller zeroes
+    // them before launch.  All resident; intra-WG s_barrier only.
+    //
+    // Extra kernargs (args 18..39):
+    //   0x90 x1   s[54:55]   0x98 x2   s[56:57]   (view embed inputs [BS,D])
+    //   0xA0 a1   s[58:59]   0xA8 a2   s[60:61]   (saved alpha [BS,K])
+    //   0xB0 i1   s[62:63]   0xB8 i2   s[64:65]   (saved inter [BS,K,R])
+    //   0xC0 o1   s[66:67]   0xC8 o2   s[68:69]   (saved outk  [BS,K,D])
+    //   0xD0 n1   s[70:71]   0xD8 n2   s[72:73]   (pre-L2 norms [B])
+    //   0xE0 dU   0xE8 dV    0xF0 dgw   0xF8 dgb   0x100 dbias  0x108 demb
+    //   0x110 dv1 0x118 dv2  0x120 dz1  0x128 dz2  0x130 dx1    0x138 dx2
+    // Grad/scratch ptrs (0xE0..0x138) are loaded on-demand into s[74:75] (and
+    // s[76:77]) right before use — no permanent SGPR home.
+    // LDS layout (backward): [0..2047] reduce-tree scratch (lane*4),
+    //   [2048..2303] dlogits[8,8] (64 f32).
+    // ═══════════════════════════════════════════════════════════════════════
+    asm_u32(0xBFBD0000)                   // s_barrier — v1/v2 fully written & visible
+    wzm_v_shl2_e32(6, 0)                  // v6 = d*4 (reduce-tree LDS offset)
+    asm_u32(0x7E120280)                   // v_mov_b32_e32 v9, 0 (broadcast ds addr)
+
+    // ── B-1: build logits[i,j] = dot_d(v1[i],v2[j])/tau → LDS[2048+(i*8+j)*4] ──
+    // (identical to Task-4 logit build; we need the matrix again for softmax.)
+    wzm_s_mov_b32_0(34)                   // i = 0
+    uint64 bl_i_top = asm_text_len / 4
+    asm_u32(0xBF090000 | (0x88 << 8) | 34)   // s_cmp_ge_u32 s34, 8
+    uint64 bl_i_exit = asm_text_len / 4
+    asm_u32(0xBFA20000)                   // s_cbranch_scc1 .Lbl_i_end (patched)
+    wzm_s_mov_b32_0(35)                   // j = 0
+    uint64 bl_j_top = asm_text_len / 4
+    asm_u32(0xBF090000 | (0x88 << 8) | 35)   // s_cmp_ge_u32 s35, 8
+    uint64 bl_j_exit = asm_text_len / 4
+    asm_u32(0xBFA20000)                   // s_cbranch_scc1 .Lbl_j_end (patched)
+    wzm_s_mul_i32_lit(36, 34, 0x180)      // s36 = i*384
+    wzm_v_add_nc_u32_sv(1, 36, 0)         // v1 = i*384 + d
+    wzm_v_shl2_e32(1, 1)                  // *4
+    wzm_clamp_off_dlt_D(1)                // OOB guard
+    wzm_gload_b32_saddr(10, 1, 44)        // v10 = v1[i,d] (s[44:45])
+    asm_u32(0xBF8903F7)                   // vmcnt(0)
+    asm_u32(0x7C980020)                   // v_cmp_gt_u32 vcc_lo, s32, v0 (d<D)
+    wzm_v_cndmask_zero_e32(10, 10)        // zero d>=D
+    wzm_s_mul_i32_lit(37, 35, 0x180)      // s37 = j*384
+    wzm_v_add_nc_u32_sv(16, 37, 0)        // v16 = j*384 + d
+    wzm_v_shl2_e32(16, 16)
+    wzm_clamp_off_dlt_D(16)
+    wzm_gload_b32_saddr(16, 16, 46)       // v16 = v2[j,d] (s[46:47])
+    asm_u32(0xBF8903F7)                   // vmcnt(0)
+    asm_u32(0x7C980020)                   // d<D
+    wzm_v_cndmask_zero_e32(16, 16)
+    wzm_v_mul_f32_e32(5, 10, 16)          // v5 = v1[i,d]*v2[j,d]
+    _emit_lds_reduce_tree_512()           // sum_d → LDS[0]
+    wzm_ds_load_b32(17, 9, 0)             // v17 = dot
+    asm_u32(0xBF89FC07)                   // lgkmcnt(0)
+    asm_v_mov_b32_lit32(18, 0x41200000)   // 1/tau = 10.0
+    wzm_v_mul_f32_e32(17, 17, 18)         // logit = dot/tau
+    asm_u32(0x7C940080)                   // lane 0
+    asm_u32(0xBE82206A)                   // saveexec s2
+    wzm_s_mul_i32_lit(38, 34, 32)         // i*32
+    wzm_s_lshl2(36, 35)                   // j*4
+    wzm_s_add_u32_ss(38, 38, 36)
+    wzm_v_mov_s(1, 38)
+    wzm_ds_store_b32(1, 17, 2048)         // dlogits LDS[2048 + i*32 + j*4] = logit
+    asm_u32(0xBF89FC07)                   // lgkmcnt(0)
+    asm_u32(0xBEFE0002)                   // restore exec
+    wzm_s_add_u32_1(35, 35)               // j += 1
+    uint64 bl_j_back = (bl_j_top - (asm_text_len / 4) - 1) & 0xFFFF
+    asm_u32(0xBFA00000 | bl_j_back)
+    uint64 bl_j_end = asm_text_len / 4
+    asm_patch_u32(bl_j_exit, 0xBFA20000 | ((bl_j_end - bl_j_exit - 1) & 0xFFFF))
+    wzm_s_add_u32_1(34, 34)               // i += 1
+    uint64 bl_i_back = (bl_i_top - (asm_text_len / 4) - 1) & 0xFFFF
+    asm_u32(0xBFA00000 | bl_i_back)
+    uint64 bl_i_end = asm_text_len / 4
+    asm_patch_u32(bl_i_exit, 0xBFA20000 | ((bl_i_end - bl_i_exit - 1) & 0xFFFF))
+    asm_u32(0xBFBD0000)                   // s_barrier — all logits visible
+
+    // ── B-2: lane 0 converts each row to softmax P[i,j], then dlogits[i,j] =
+    //         (P[i,j] - 1{i==j}) / B  (B=8, 1/B=0.125), in place in LDS. ──
+    asm_u32(0x7C940080)                   // lane 0
+    asm_u32(0xBE82206A)                   // saveexec s2
+    uint64 sm_execz = asm_text_len / 4
+    asm_u32(0xBFA50000)                   // s_cbranch_execz .Lsm_end (patched)
+    asm_v_mov_b32_lit32(29, 0x3FB8AA3B)   // v29 = log2(e)
+    asm_v_mov_b32_lit32(40, 0x3E000000)   // v40 = 0.125 (1/B)
+    wzm_s_mov_b32_0(34)                   // i = 0
+    uint64 sm_i_top = asm_text_len / 4
+    asm_u32(0xBF090000 | (0x88 << 8) | 34)   // i >= 8
+    uint64 sm_i_exit = asm_text_len / 4
+    asm_u32(0xBFA20000)
+    wzm_s_mul_i32_lit(36, 34, 32)         // s36 = row base = i*32
+    // rowmax over j
+    wzm_v_mov_s(1, 36)
+    wzm_ds_load_b32(24, 1, 2048)          // v24 = logits[i,0] (rowmax init)
+    asm_u32(0xBF89FC07)
+    wzm_s_mov_b32_lit(35, 1)              // j = 1
+    uint64 sm_mx_top = asm_text_len / 4
+    asm_u32(0xBF090000 | (0x88 << 8) | 35)
+    uint64 sm_mx_exit = asm_text_len / 4
+    asm_u32(0xBFA20000)
+    wzm_s_lshl2(37, 35); wzm_s_add_u32_ss(37, 36, 37)
+    wzm_v_mov_s(1, 37)
+    wzm_ds_load_b32(26, 1, 2048)
+    asm_u32(0xBF89FC07)
+    asm_v_max_f32_e64_vv(24, 24, 26)
+    wzm_s_add_u32_1(35, 35)
+    uint64 sm_mx_back = (sm_mx_top - (asm_text_len / 4) - 1) & 0xFFFF
+    asm_u32(0xBFA00000 | sm_mx_back)
+    uint64 sm_mx_end = asm_text_len / 4
+    asm_patch_u32(sm_mx_exit, 0xBFA20000 | ((sm_mx_end - sm_mx_exit - 1) & 0xFFFF))
+    // sumexp over j ; store exp(logit-rowmax) back to LDS (unnormalized P)
+    asm_u32(0x7E320280)                   // v25 = 0 (sumexp)
+    wzm_s_mov_b32_0(35)                   // j = 0
+    uint64 sm_se_top = asm_text_len / 4
+    asm_u32(0xBF090000 | (0x88 << 8) | 35)
+    uint64 sm_se_exit = asm_text_len / 4
+    asm_u32(0xBFA20000)
+    wzm_s_lshl2(37, 35); wzm_s_add_u32_ss(37, 36, 37)
+    wzm_v_mov_s(1, 37)
+    wzm_ds_load_b32(26, 1, 2048)          // v26 = logit
+    asm_u32(0xBF89FC07)
+    wzm_v_sub_f32_e32(31, 26, 24)         // logit - rowmax
+    wzm_v_mul_f32_e32(31, 31, 29)         // * log2e
+    asm_v_exp_f32_e64_v(31, 31)           // exp2 = exp(logit-rowmax)
+    wzm_v_add_f32_e32(25, 25, 31)         // sumexp += e
+    wzm_ds_store_b32(1, 31, 2048)         // LDS = e (unnormalized)
+    asm_u32(0xBF89FC07)
+    wzm_s_add_u32_1(35, 35)
+    uint64 sm_se_back = (sm_se_top - (asm_text_len / 4) - 1) & 0xFFFF
+    asm_u32(0xBFA00000 | sm_se_back)
+    uint64 sm_se_end = asm_text_len / 4
+    asm_patch_u32(sm_se_exit, 0xBFA20000 | ((sm_se_end - sm_se_exit - 1) & 0xFFFF))
+    asm_v_rcp_f32_e64_v(25, 25)           // v25 = 1/sumexp
+    // P[i,j] = e / sumexp ; dlogits = (P - 1{i==j}) / B
+    wzm_s_mov_b32_0(35)                   // j = 0
+    uint64 sm_n_top = asm_text_len / 4
+    asm_u32(0xBF090000 | (0x88 << 8) | 35)
+    uint64 sm_n_exit = asm_text_len / 4
+    asm_u32(0xBFA20000)
+    wzm_s_lshl2(37, 35); wzm_s_add_u32_ss(37, 36, 37)
+    wzm_v_mov_s(1, 37)
+    wzm_ds_load_b32(26, 1, 2048)          // v26 = e
+    asm_u32(0xBF89FC07)
+    wzm_v_mul_f32_e32(26, 26, 25)         // v26 = P[i,j]
+    // subtract 1 if i==j
+    asm_s_cmp_eq_u32(34, 35)              // scc = (i==j)
+    uint64 sm_diag_else = asm_text_len / 4
+    asm_u32(0xBFA10000)                   // s_cbranch_scc0 .Lsm_nodiag (patched)
+    asm_v_mov_b32_lit32(27, 0x3F800000)   // 1.0
+    wzm_v_sub_f32_e32(26, 26, 27)         // P - 1
+    uint64 sm_diag_end = asm_text_len / 4
+    asm_patch_u32(sm_diag_else, 0xBFA10000 | ((sm_diag_end - sm_diag_else - 1) & 0xFFFF))
+    wzm_v_mul_f32_e32(26, 26, 40)         // * 1/B
+    wzm_ds_store_b32(1, 26, 2048)         // dlogits[i,j]
+    asm_u32(0xBF89FC07)
+    wzm_s_add_u32_1(35, 35)
+    uint64 sm_n_back = (sm_n_top - (asm_text_len / 4) - 1) & 0xFFFF
+    asm_u32(0xBFA00000 | sm_n_back)
+    uint64 sm_n_end = asm_text_len / 4
+    asm_patch_u32(sm_n_exit, 0xBFA20000 | ((sm_n_end - sm_n_exit - 1) & 0xFFFF))
+    wzm_s_add_u32_1(34, 34)               // i += 1
+    uint64 sm_i_back = (sm_i_top - (asm_text_len / 4) - 1) & 0xFFFF
+    asm_u32(0xBFA00000 | sm_i_back)
+    uint64 sm_i_end = asm_text_len / 4
+    asm_patch_u32(sm_i_exit, 0xBFA20000 | ((sm_i_end - sm_i_exit - 1) & 0xFFFF))
+    uint64 sm_end = asm_text_len / 4
+    asm_patch_u32(sm_execz, 0xBFA50000 | ((sm_end - sm_execz - 1) & 0xFFFF))
+    asm_u32(0xBEFE0002)                   // restore exec
+    asm_u32(0xBFBD0000)                   // s_barrier — dlogits visible to all lanes
+
+    // ── B-3: dv1[i,d] = (1/tau) sum_j dlogits[i,j]*v2[j,d]  (lane=d, d<D) ──
+    //         dv2[j,d] = (1/tau) sum_i dlogits[i,j]*v1[i,d]
+    //         then re-norm bwd (unit vec): dv -= (dv·q)*q.  Stored to dv1/dv2.
+    // dv1: load dv1 ptr (0x110) → s[74:75].
+    asm_s_load_b64_off(37, 0, 0x110)      // s[74:75] = dv1
+    asm_u32(0xBF89FC07)
+    asm_u32(0x7C980020)                   // vcc = d<D
+    asm_u32(0xBE82206A)                   // saveexec s2 (gate d<D for all of B-3 dv1)
+    uint64 dv1_execz = asm_text_len / 4
+    asm_u32(0xBFA50000)                   // execz .Ldv1_end (patched)
+    asm_v_mov_b32_lit32(28, 0x41200000)   // v28 = 1/tau = 10.0
+    wzm_s_mov_b32_0(34)                   // i = 0
+    uint64 dv1_i_top = asm_text_len / 4
+    asm_u32(0xBF090000 | (0x88 << 8) | 34)
+    uint64 dv1_i_exit = asm_text_len / 4
+    asm_u32(0xBFA20000)
+    asm_u32(0x7E3C0280)                   // v30 = 0 (accumulator dv1[i,d])
+    wzm_s_mul_i32_lit(35, 34, 32)         // s35 = i*32 (dlogits row base)
+    wzm_s_mov_b32_0(36)                   // j = 0
+    uint64 dv1_j_top = asm_text_len / 4
+    asm_u32(0xBF090000 | (0x88 << 8) | 36)
+    uint64 dv1_j_exit = asm_text_len / 4
+    asm_u32(0xBFA20000)
+    // dlogits[i,j] from LDS[2048 + i*32 + j*4] (uniform; lane reads its own copy)
+    wzm_s_lshl2(38, 36); wzm_s_add_u32_ss(38, 35, 38)
+    wzm_v_mov_s(1, 38)
+    wzm_ds_load_b32(16, 1, 2048)          // v16 = dlogits[i,j]
+    asm_u32(0xBF89FC07)
+    // v2[j,d] : off = (j*384 + d)*4  (d<D guaranteed by exec gate)
+    wzm_s_mul_i32_lit(39, 36, 0x180)      // j*384
+    wzm_v_add_nc_u32_sv(1, 39, 0)
+    wzm_v_shl2_e32(1, 1)
+    wzm_gload_b32_saddr(17, 1, 46)        // v17 = v2[j,d]
+    asm_u32(0xBF8903F7)                   // vmcnt(0)
+    asm_v_fma_f32_e64_vvv(30, 16, 17, 30) // acc += dlogits*v2
+    wzm_s_add_u32_1(36, 36)
+    uint64 dv1_j_back = (dv1_j_top - (asm_text_len / 4) - 1) & 0xFFFF
+    asm_u32(0xBFA00000 | dv1_j_back)
+    uint64 dv1_j_end = asm_text_len / 4
+    asm_patch_u32(dv1_j_exit, 0xBFA20000 | ((dv1_j_end - dv1_j_exit - 1) & 0xFFFF))
+    wzm_v_mul_f32_e32(30, 30, 28)         // *= 1/tau  → dqa[i,d]
+    // store dqa to dv1[i,d] (pre re-norm); idx=(i*384+d)*4
+    wzm_s_mul_i32_lit(39, 34, 0x180)
+    wzm_v_add_nc_u32_sv(1, 39, 0)
+    wzm_v_shl2_e32(1, 1)
+    wzm_gstore_b32_saddr(1, 30, 74)       // dv1[i,d] = dqa
+    asm_u32(0xBC7C0000)                   // vscnt(0)
+    wzm_s_add_u32_1(34, 34)
+    uint64 dv1_i_back = (dv1_i_top - (asm_text_len / 4) - 1) & 0xFFFF
+    asm_u32(0xBFA00000 | dv1_i_back)
+    uint64 dv1_i_end = asm_text_len / 4
+    asm_patch_u32(dv1_i_exit, 0xBFA20000 | ((dv1_i_end - dv1_i_exit - 1) & 0xFFFF))
+    uint64 dv1_end = asm_text_len / 4
+    asm_patch_u32(dv1_execz, 0xBFA50000 | ((dv1_end - dv1_execz - 1) & 0xFFFF))
+    asm_u32(0xBEFE0002)                   // restore exec
+
+    // dv2[j,d] = (1/tau) sum_i dlogits[i,j]*v1[i,d]
+    asm_s_load_b64_off(37, 0, 0x118)      // s[74:75] = dv2
+    asm_u32(0xBF89FC07)
+    asm_u32(0x7C980020)                   // d<D
+    asm_u32(0xBE82206A)                   // saveexec s2
+    uint64 dv2_execz = asm_text_len / 4
+    asm_u32(0xBFA50000)
+    asm_v_mov_b32_lit32(28, 0x41200000)   // 1/tau
+    wzm_s_mov_b32_0(36)                   // j = 0
+    uint64 dv2_j_top = asm_text_len / 4
+    asm_u32(0xBF090000 | (0x88 << 8) | 36)
+    uint64 dv2_j_exit = asm_text_len / 4
+    asm_u32(0xBFA20000)
+    asm_u32(0x7E3C0280)                   // v30 = 0
+    wzm_s_lshl2(35, 36)                   // s35 = j*4 (column offset within dlogits row)
+    wzm_s_mov_b32_0(34)                   // i = 0
+    uint64 dv2_i_top = asm_text_len / 4
+    asm_u32(0xBF090000 | (0x88 << 8) | 34)
+    uint64 dv2_i_exit = asm_text_len / 4
+    asm_u32(0xBFA20000)
+    wzm_s_mul_i32_lit(38, 34, 32)         // i*32
+    wzm_s_add_u32_ss(38, 38, 35)          // + j*4
+    wzm_v_mov_s(1, 38)
+    wzm_ds_load_b32(16, 1, 2048)          // v16 = dlogits[i,j]
+    asm_u32(0xBF89FC07)
+    wzm_s_mul_i32_lit(39, 34, 0x180)      // i*384
+    wzm_v_add_nc_u32_sv(1, 39, 0)
+    wzm_v_shl2_e32(1, 1)
+    wzm_gload_b32_saddr(17, 1, 44)        // v17 = v1[i,d]
+    asm_u32(0xBF8903F7)
+    asm_v_fma_f32_e64_vvv(30, 16, 17, 30)
+    wzm_s_add_u32_1(34, 34)
+    uint64 dv2_i_back = (dv2_i_top - (asm_text_len / 4) - 1) & 0xFFFF
+    asm_u32(0xBFA00000 | dv2_i_back)
+    uint64 dv2_i_end = asm_text_len / 4
+    asm_patch_u32(dv2_i_exit, 0xBFA20000 | ((dv2_i_end - dv2_i_exit - 1) & 0xFFFF))
+    wzm_v_mul_f32_e32(30, 30, 28)         // *= 1/tau → dqb[j,d]
+    wzm_s_mul_i32_lit(39, 36, 0x180)      // j*384
+    wzm_v_add_nc_u32_sv(1, 39, 0)
+    wzm_v_shl2_e32(1, 1)
+    wzm_gstore_b32_saddr(1, 30, 74)       // dv2[j,d] = dqb
+    asm_u32(0xBC7C0000)
+    wzm_s_add_u32_1(36, 36)
+    uint64 dv2_j_back = (dv2_j_top - (asm_text_len / 4) - 1) & 0xFFFF
+    asm_u32(0xBFA00000 | dv2_j_back)
+    uint64 dv2_j_end = asm_text_len / 4
+    asm_patch_u32(dv2_j_exit, 0xBFA20000 | ((dv2_j_end - dv2_j_exit - 1) & 0xFFFF))
+    uint64 dv2_end = asm_text_len / 4
+    asm_patch_u32(dv2_execz, 0xBFA50000 | ((dv2_end - dv2_execz - 1) & 0xFFFF))
+    asm_u32(0xBEFE0002)                   // restore exec
+    asm_u32(0xBFBD0000)                   // s_barrier — dv1/dv2 (= dqa/dqb) visible
+
+    // ── B-4 + B-5: InfoNCE re-norm bwd + l2norm_bwd + meanpool_bwd, per view.
+    //   view 0: q=v1(s44:45) dv=0x110 norm=n1(s70:71) dz=0x120
+    //   view 1: q=v2(s46:47) dv=0x118 norm=n2(s72:73) dz=0x128
+    _wzm_emit_renorm_pool_bwd_view(44, 0x110, 70, 0x120)
+    _wzm_emit_renorm_pool_bwd_view(46, 0x118, 72, 0x128)
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // B-6: wzma_bwd, per view — accumulates dU,dV,dgw,dgb,dbias and writes dx.
+    //   dy = dz (s[76:77] dz1/dz2), x = view embed input (s8:9 holds view-1 x
+    //   after the fwd view loop; we re-route per view), alpha/inter/outk saved
+    //   per view (s58.., s62.., s66..).  Mirrors std/train.mlr fn wzma_bwd.
+    // ═══════════════════════════════════════════════════════════════════════
+    _wzm_emit_wzma_bwd_view(54, 58, 62, 66, 0x120, 0x130)   // view 0
+    _wzm_emit_wzma_bwd_view(56, 60, 64, 68, 0x128, 0x138)   // view 1
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // B-7: embed_bwd — scatter-add dx into demb[id*D + d].  Per view, lane=d.
+    //   ids per view = s40:41 / s42:43 ; dx = 0x130 / 0x138 ; demb = 0x108.
+    // ═══════════════════════════════════════════════════════════════════════
+    _wzm_emit_embed_bwd_view(40, 0x130)   // view 0 (ids1)
+    _wzm_emit_embed_bwd_view(42, 0x138)   // view 1 (ids2)
+
     asm_u32(0xBFB00000)   // s_endpgm
 
-    // ── Arg descriptor block (18 args × 8 bytes = 144 bytes) ──────────────
-    // Task 4 adds arg 17 = d_loss (ptr, scalar InfoNCE loss out).
-    uint64 n_args = 18
+    // ── Arg descriptor block (40 args × 8 bytes = 320 bytes) ──────────────
+    // Task 4 added arg 17 = d_loss.  Task 5 adds args 18..39:
+    //   18 x1  19 x2  20 a1  21 a2  22 i1  23 i2  24 o1  25 o2  26 n1  27 n2
+    //   28 dU  29 dV  30 dgw 31 dgb 32 dbias 33 demb
+    //   34 dv1 35 dv2 36 dz1 37 dz2 38 dx1   39 dx2   (all global_buffer ptrs)
+    uint64 n_args = 40
     uint64 args_desc = alloc(n_args * 16)
     uint64 ai = 0
     while ai < n_args {
         uint64 sp = args_desc + ai * 16;       unsafe { *(sp as uint64) = 8 }
         uint64 kp = args_desc + ai * 16 + 8
-        // 0..11 = ptrs ; 12,13 = BS,D (by-value) ; 14=ids2, 15=v1, 16=v2, 17=d_loss (ptrs)
+        // 12,13 = BS,D (by-value) ; everything else is a global_buffer ptr.
         if ai == 12 { unsafe { *(kp as uint64) = AMD_ARG_KIND_BY_VALUE } }
         else if ai == 13 { unsafe { *(kp as uint64) = AMD_ARG_KIND_BY_VALUE } }
         else { unsafe { *(kp as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER } }
@@ -8202,17 +9026,19 @@ fn amdgpu_lower_wzma_train_mega(uint64 kname_ptr, uint64 nl) -> uint64 {
         ci = ci + 1
     }
 
-    // rsrc1: VGPR granule 5 (48 VGPRs; we use v0..v33) + SGPR granule 6
-    // (56 SGPRs; Task 3 view loop + Phase 3 push usage to s0..s50).
+    // rsrc1: VGPR granule 5 (48 VGPRs; we use v0..v40) + SGPR granule 9
+    // (80 SGPRs; Task 5 backward pushes pointer homes to s0..s79).
+    //   SGPR field bits[9:6] = 9 → (9+1)*8 = 80.  0x0185→0x0245.
     // rsrc2=0x9E (USER_SGPR=15 + wg_id_x, TGID_X).
-    uint64 rsrc1 = 0xE0AF0185
+    uint64 rsrc1 = 0xE0AF0245
     uint64 rsrc2 = 0x0000009E
     uint64 rsrc3 = 0x00000010
     uint64 props = 0x0408
-    // LDS = 2560 bytes: [0..2047] reduce-tree scratch + [2048..2559] inter[K*R].
+    // LDS = 2560 bytes: [0..2047] reduce-tree scratch + [2048..2559] scratch
+    // (inter[K*R] in fwd; dlogits[8,8]=256B in backward).
     kt_push_lds(kname_ptr, nl, k_text_buf, k_text_size,
                 args_desc, n_args, n_args * 8,
-                56, 48,
+                80, 48,
                 rsrc1, rsrc2, rsrc3, props,
                 2560)
     return 0
