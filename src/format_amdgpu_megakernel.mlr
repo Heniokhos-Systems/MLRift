@@ -7594,6 +7594,7 @@ fn amdgpu_lower_wzma_train_mega(uint64 kname_ptr, uint64 nl) -> uint64 {
     asm_s_load_b64_off(21, 0, 0x70)   // s[42:43] = ids2 (view-1 token ids)
     asm_s_load_b64_off(22, 0, 0x78)   // s[44:45] = v1   (view-0 encoder out [B,D])
     asm_s_load_b64_off(23, 0, 0x80)   // s[46:47] = v2   (view-1 encoder out [B,D])
+    asm_s_load_b64_off(26, 0, 0x88)   // s[52:53] = d_loss (Task 4: scalar InfoNCE loss)
     asm_u32(0xBF89FC07)   // s_waitcnt lgkmcnt(0)
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -7981,16 +7982,206 @@ fn amdgpu_lower_wzma_train_mega(uint64 kname_ptr, uint64 nl) -> uint64 {
     asm_s_cmp_lt_u32(50, 0x82)            // scc = (view < 2)  (inline const 2 = 0x82)
     uint64 view_back = (view_loop_top - (asm_text_len / 4) - 1) & 0xFFFF
     asm_s_cbranch_scc1(view_back)         // s_cbranch_scc1 .Lview_loop_top
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Task 4 (FORWARD complete): InfoNCE loss.  Matches std/train.mlr fn
+    //   infonce_f32 EXACTLY (B=8, tau=0.1).  v1[B,D]=s[44:45], v2[B,D]=s[46:47]
+    //   are resident unit vectors (T3 already L2-normalised them; the PyTorch
+    //   reference's F.normalize is idempotent on unit vectors, so we do NOT
+    //   re-normalise — same as infonce_f32, which assumes pre-normalised input).
+    //
+    //   logits[i,j] = dot_d(v1[i,:], v2[j,:]) / tau          (8×8 = 64 logits)
+    //   loss = mean_i( rowmax_i + log(sum_j exp(logits[i,j]-rowmax_i))
+    //                  - logits[i,i] )
+    //
+    //   Approach (simple & correct over clever): the 64 dot products are each
+    //   reduced over D=384 by the shared 512-lane LDS reduce tree (all lanes
+    //   participate; OOB lanes clamped to offset 0 + zeroed — same OOB-guard
+    //   discipline as Phase 2/3).  Each scaled logit is written by lane 0 into
+    //   an LDS scratch region [2048 + (i*8+j)*4] (64 floats = 256B, fits the
+    //   2560B LDS).  The cross-entropy reduction (rowmax / logsumexp / mean)
+    //   then runs ENTIRELY on lane 0, reading the 64 logits back from LDS, and
+    //   lane 0 stores the final scalar to d_loss[0]=s[52:53].
+    //
+    //   B=8, D=384, tau=0.1 (1/tau = 10.0 = 0x41200000) hardcoded.  exp/log via
+    //   the hardware exp2/log2 units: exp(x)=exp2(x*log2e), log(x)=log2(x)*ln2.
+    //     log2(e) = 0x3FB8AA3B,  ln(2) = 0x3F317218.
+    // ═══════════════════════════════════════════════════════════════════════
+    asm_u32(0xBFBD0000)                   // s_barrier — v1/v2 fully written & visible
+    wzm_v_shl2_e32(6, 0)                  // v6 = d*4 (reduce-tree LDS offset)
+    asm_u32(0x7E120280)                   // v_mov_b32_e32 v9, 0 (broadcast ds addr)
+
+    // ── Build logits[i,j] = dot_d(v1[i,:], v2[j,:]) / tau into LDS[2048+...] ──
+    //   s34 = i (0..7), s35 = j (0..7), s36/s37/s38 = address scratch.
+    wzm_s_mov_b32_0(34)                   // i = 0
+    uint64 li_top = asm_text_len / 4
+    asm_u32(0xBF090000 | (0x88 << 8) | 34)   // s_cmp_ge_u32 s34, 8  (i >= B)
+    uint64 li_exit = asm_text_len / 4
+    asm_u32(0xBFA20000)                   // s_cbranch_scc1 .Lli_end (patched)
+
+    wzm_s_mov_b32_0(35)                   // j = 0
+    uint64 lj_top = asm_text_len / 4
+    asm_u32(0xBF090000 | (0x88 << 8) | 35)   // s_cmp_ge_u32 s35, 8  (j >= B)
+    uint64 lj_exit = asm_text_len / 4
+    asm_u32(0xBFA20000)                   // s_cbranch_scc1 .Llj_end (patched)
+
+    // v1[i,d]: off = (i*D + d)*4 ; clamp d>=D ; load from s[44:45].
+    wzm_s_mul_i32_lit(36, 34, 0x180)      // s36 = i*384
+    wzm_v_add_nc_u32_sv(1, 36, 0)         // v1off = i*384 + d
+    wzm_v_shl2_e32(1, 1)                  // *4
+    wzm_clamp_off_dlt_D(1)                // OOB guard for d>=D
+    wzm_gload_b32_saddr(10, 1, 44)        // v10 = v1[i,d]  (s[44:45]; saddr=low SGPR)
+    asm_u32(0xBF8903F7)                   // vmcnt(0)
+    asm_u32(0x7C980020)                   // v_cmp_gt_u32_e32 vcc_lo, s32, v0 (d<D)
+    wzm_v_cndmask_zero_e32(10, 10)        // v10 = (d<D) ? v1[i,d] : 0
+    // v2[j,d]: off = (j*D + d)*4 ; clamp d>=D ; load from s[46:47].
+    wzm_s_mul_i32_lit(37, 35, 0x180)      // s37 = j*384
+    wzm_v_add_nc_u32_sv(16, 37, 0)        // (reuse v16 as offset reg) = j*384 + d
+    wzm_v_shl2_e32(16, 16)                // *4
+    wzm_clamp_off_dlt_D(16)               // OOB guard for d>=D
+    wzm_gload_b32_saddr(16, 16, 46)       // v16 = v2[j,d]  (s[46:47]; saddr=low SGPR)
+    asm_u32(0xBF8903F7)                   // vmcnt(0)
+    asm_u32(0x7C980020)                   // v_cmp_gt_u32_e32 vcc_lo, s32, v0 (d<D)
+    wzm_v_cndmask_zero_e32(16, 16)        // v16 = (d<D) ? v2[j,d] : 0
+    // per-lane product → reduce tree → LDS[0] (broadcast).
+    wzm_v_mul_f32_e32(5, 10, 16)          // v5 = v1[i,d]*v2[j,d]
+    _emit_lds_reduce_tree_512()           // sum_d → LDS[0] / v5
+    wzm_ds_load_b32(17, 9, 0)             // v17 = dot (broadcast)
+    asm_u32(0xBF89FC07)                   // lgkmcnt(0)
+    // scale by 1/tau = 10.0 and store to logits LDS[2048 + (i*8+j)*4] (lane 0).
+    asm_v_mov_b32_lit32(18, 0x41200000)   // v18 = 10.0f (1/tau)
+    wzm_v_mul_f32_e32(17, 17, 18)         // v17 = dot/tau
+    asm_u32(0x7C940080)                   // v_cmp_eq_u32_e32 vcc_lo, 0, v0 (lane 0)
+    asm_u32(0xBE82206A)                   // s_and_saveexec_b32 s2, vcc_lo
+    wzm_s_mul_i32_lit(38, 34, 32)         // s38 = i*8*4 = i*32
+    wzm_s_lshl2(36, 35)                   // s36 = j*4
+    wzm_s_add_u32_ss(38, 38, 36)          // s38 = i*32 + j*4 (rel LDS byte off)
+    wzm_v_mov_s(1, 38)                    // v1 = LDS rel offset
+    wzm_ds_store_b32(1, 17, 2048)         // LDS[2048 + v1] = logits[i,j]
+    asm_u32(0xBF89FC07)                   // lgkmcnt(0)
+    asm_u32(0xBEFE0002)                   // s_mov_b32 exec_lo, s2 (restore full exec)
+
+    wzm_s_add_u32_1(35, 35)               // j += 1
+    uint64 lj_back = (lj_top - (asm_text_len / 4) - 1) & 0xFFFF
+    asm_u32(0xBFA00000 | lj_back)         // s_branch .Llj_top
+    uint64 lj_end = asm_text_len / 4
+    asm_patch_u32(lj_exit, 0xBFA20000 | ((lj_end - lj_exit - 1) & 0xFFFF))
+
+    wzm_s_add_u32_1(34, 34)               // i += 1
+    uint64 li_back = (li_top - (asm_text_len / 4) - 1) & 0xFFFF
+    asm_u32(0xBFA00000 | li_back)         // s_branch .Lli_top
+    uint64 li_end = asm_text_len / 4
+    asm_patch_u32(li_exit, 0xBFA20000 | ((li_end - li_exit - 1) & 0xFFFF))
+
+    asm_u32(0xBFBD0000)                   // s_barrier — all 64 logits in LDS visible
+
+    // ── Cross-entropy reduction on lane 0 only ──────────────────────────────
+    //   total = sum_i ( rowmax_i + log(sum_j exp(logits[i,j]-rowmax_i))
+    //                   - logits[i,i] )    ;    loss = total / B
+    //   v24=rowmax  v25=sumexp  v26=cur logit  v27=diag logit  v28=total
+    //   v29=log2e   v30=ln2     v31=exp scratch   v1=LDS addr
+    asm_u32(0x7C940080)                   // v_cmp_eq_u32_e32 vcc_lo, 0, v0 (lane 0)
+    asm_u32(0xBE82206A)                   // s_and_saveexec_b32 s2, vcc_lo
+    uint64 ce_execz = asm_text_len / 4
+    asm_u32(0xBFA50000)                   // s_cbranch_execz .Lce_end (patched)
+
+    asm_v_mov_b32_lit32(29, 0x3FB8AA3B)   // v29 = log2(e)
+    asm_v_mov_b32_lit32(30, 0x3F317218)   // v30 = ln(2)
+    asm_u32(0x7E380280)                   // v_mov_b32_e32 v28, 0  (total = 0)
+
+    wzm_s_mov_b32_0(34)                   // i = 0
+    uint64 ce_i_top = asm_text_len / 4
+    asm_u32(0xBF090000 | (0x88 << 8) | 34)   // s_cmp_ge_u32 s34, 8  (i >= B)
+    uint64 ce_i_exit = asm_text_len / 4
+    asm_u32(0xBFA20000)                   // s_cbranch_scc1 .Lce_i_end (patched)
+
+    // s36 = LDS rel byte offset of row i base = i*32 ; load logits[i,0] → rowmax.
+    wzm_s_mul_i32_lit(36, 34, 32)         // s36 = i*32 (row base rel off)
+    wzm_v_mov_s(1, 36)                    // v1 = row base
+    wzm_ds_load_b32(24, 1, 2048)          // v24 = logits[i,0] (init rowmax)
+    asm_u32(0xBF89FC07)                   // lgkmcnt(0)
+    // rowmax over j=1..7
+    wzm_s_mov_b32_lit(35, 1)              // j = 1
+    uint64 ce_mx_top = asm_text_len / 4
+    asm_u32(0xBF090000 | (0x88 << 8) | 35)   // s_cmp_ge_u32 s35, 8  (j >= B)
+    uint64 ce_mx_exit = asm_text_len / 4
+    asm_u32(0xBFA20000)                   // s_cbranch_scc1 .Lce_mx_end (patched)
+    wzm_s_lshl2(37, 35)                   // s37 = j*4
+    wzm_s_add_u32_ss(37, 36, 37)          // s37 = i*32 + j*4
+    wzm_v_mov_s(1, 37)
+    wzm_ds_load_b32(26, 1, 2048)          // v26 = logits[i,j]
+    asm_u32(0xBF89FC07)                   // lgkmcnt(0)
+    asm_v_max_f32_e64_vv(24, 24, 26)      // rowmax = max(rowmax, logits[i,j])
+    wzm_s_add_u32_1(35, 35)               // j += 1
+    uint64 ce_mx_back = (ce_mx_top - (asm_text_len / 4) - 1) & 0xFFFF
+    asm_u32(0xBFA00000 | ce_mx_back)      // s_branch .Lce_mx_top
+    uint64 ce_mx_end = asm_text_len / 4
+    asm_patch_u32(ce_mx_exit, 0xBFA20000 | ((ce_mx_end - ce_mx_exit - 1) & 0xFFFF))
+
+    // sumexp = sum_j exp(logits[i,j] - rowmax) = sum_j exp2((logits-rowmax)*log2e)
+    asm_u32(0x7E320280)                   // v_mov_b32_e32 v25, 0  (sumexp = 0)
+    wzm_s_mov_b32_0(35)                   // j = 0
+    uint64 ce_se_top = asm_text_len / 4
+    asm_u32(0xBF090000 | (0x88 << 8) | 35)   // s_cmp_ge_u32 s35, 8  (j >= B)
+    uint64 ce_se_exit = asm_text_len / 4
+    asm_u32(0xBFA20000)                   // s_cbranch_scc1 .Lce_se_end (patched)
+    wzm_s_lshl2(37, 35)                   // s37 = j*4
+    wzm_s_add_u32_ss(37, 36, 37)          // s37 = i*32 + j*4
+    wzm_v_mov_s(1, 37)
+    wzm_ds_load_b32(26, 1, 2048)          // v26 = logits[i,j]
+    asm_u32(0xBF89FC07)                   // lgkmcnt(0)
+    wzm_v_sub_f32_e32(31, 26, 24)         // v31 = logits[i,j] - rowmax
+    wzm_v_mul_f32_e32(31, 31, 29)         // *= log2e
+    asm_v_exp_f32_e64_v(31, 31)           // v31 = exp2(...) = exp(logits-rowmax)
+    wzm_v_add_f32_e32(25, 25, 31)         // sumexp += exp(...)
+    wzm_s_add_u32_1(35, 35)               // j += 1
+    uint64 ce_se_back = (ce_se_top - (asm_text_len / 4) - 1) & 0xFFFF
+    asm_u32(0xBFA00000 | ce_se_back)      // s_branch .Lce_se_top
+    uint64 ce_se_end = asm_text_len / 4
+    asm_patch_u32(ce_se_exit, 0xBFA20000 | ((ce_se_end - ce_se_exit - 1) & 0xFFFF))
+
+    // diag logit logits[i,i] : off = i*32 + i*4
+    wzm_s_lshl2(37, 34)                   // s37 = i*4
+    wzm_s_add_u32_ss(37, 36, 37)          // s37 = i*32 + i*4
+    wzm_v_mov_s(1, 37)
+    wzm_ds_load_b32(27, 1, 2048)          // v27 = logits[i,i]
+    asm_u32(0xBF89FC07)                   // lgkmcnt(0)
+    // loss_i = rowmax + log(sumexp) - logits[i,i]  ; log(x)=log2(x)*ln2
+    asm_v_log_f32_e64_v(25, 25)           // v25 = log2(sumexp)
+    wzm_v_mul_f32_e32(25, 25, 30)         // v25 = log(sumexp)
+    wzm_v_add_f32_e32(25, 25, 24)         // += rowmax
+    wzm_v_sub_f32_e32(25, 25, 27)         // -= logits[i,i]   = loss_i
+    wzm_v_add_f32_e32(28, 28, 25)         // total += loss_i
+
+    wzm_s_add_u32_1(34, 34)               // i += 1
+    uint64 ce_i_back = (ce_i_top - (asm_text_len / 4) - 1) & 0xFFFF
+    asm_u32(0xBFA00000 | ce_i_back)       // s_branch .Lce_i_top
+    uint64 ce_i_end = asm_text_len / 4
+    asm_patch_u32(ce_i_exit, 0xBFA20000 | ((ce_i_end - ce_i_exit - 1) & 0xFFFF))
+
+    // loss = total / B = total * (1/8) = total * 0.125  (0.125 = 0x3E000000)
+    asm_v_mov_b32_lit32(31, 0x3E000000)   // v31 = 0.125f
+    wzm_v_mul_f32_e32(28, 28, 31)         // v28 = total/B = loss
+    // store scalar to d_loss[0] = s[52:53] ; byte offset 0.
+    asm_u32(0x7E020280)                   // v_mov_b32_e32 v1, 0  (byte offset 0)
+    wzm_gstore_b32_saddr(1, 28, 52)       // d_loss[0] = loss  (s[52:53])
+    asm_u32(0xBC7C0000)                   // s_waitcnt_vscnt null, 0
+    // .Lce_end:
+    uint64 ce_end = asm_text_len / 4
+    asm_patch_u32(ce_execz, 0xBFA50000 | ((ce_end - ce_execz - 1) & 0xFFFF))
+    asm_u32(0xBEFE0002)                   // s_mov_b32 exec_lo, s2 (restore full exec)
+
     asm_u32(0xBFB00000)   // s_endpgm
 
-    // ── Arg descriptor block (17 args × 8 bytes = 136 bytes) ──────────────
-    uint64 n_args = 17
+    // ── Arg descriptor block (18 args × 8 bytes = 144 bytes) ──────────────
+    // Task 4 adds arg 17 = d_loss (ptr, scalar InfoNCE loss out).
+    uint64 n_args = 18
     uint64 args_desc = alloc(n_args * 16)
     uint64 ai = 0
     while ai < n_args {
         uint64 sp = args_desc + ai * 16;       unsafe { *(sp as uint64) = 8 }
         uint64 kp = args_desc + ai * 16 + 8
-        // 0..11 = ptrs ; 12,13 = BS,D (by-value) ; 14=ids2, 15=v1, 16=v2 (ptrs)
+        // 0..11 = ptrs ; 12,13 = BS,D (by-value) ; 14=ids2, 15=v1, 16=v2, 17=d_loss (ptrs)
         if ai == 12 { unsafe { *(kp as uint64) = AMD_ARG_KIND_BY_VALUE } }
         else if ai == 13 { unsafe { *(kp as uint64) = AMD_ARG_KIND_BY_VALUE } }
         else { unsafe { *(kp as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER } }

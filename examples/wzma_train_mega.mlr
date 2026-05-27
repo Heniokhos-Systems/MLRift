@@ -161,6 +161,7 @@ fn main() {
     u64 d_ids2  = 0
     u64 d_v1    = 0
     u64 d_v2    = 0
+    u64 d_loss  = 0
     u64 slot
 
     slot = alloc(8); err = hipMalloc(slot, VOCAB * D * 4);   if err != 0 { die_gpu("mEmb",  err) }; unsafe { *(slot as u64) -> d_emb   }; dealloc(slot)
@@ -178,6 +179,7 @@ fn main() {
     slot = alloc(8); err = hipMalloc(slot, BS * 4);          if err != 0 { die_gpu("mIds2", err) }; unsafe { *(slot as u64) -> d_ids2  }; dealloc(slot)
     slot = alloc(8); err = hipMalloc(slot, B * D * 4);       if err != 0 { die_gpu("mV1",   err) }; unsafe { *(slot as u64) -> d_v1    }; dealloc(slot)
     slot = alloc(8); err = hipMalloc(slot, B * D * 4);       if err != 0 { die_gpu("mV2",   err) }; unsafe { *(slot as u64) -> d_v2    }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, 4);               if err != 0 { die_gpu("mLoss", err) }; unsafe { *(slot as u64) -> d_loss  }; dealloc(slot)
 
     // H2D: all forward inputs (both views' ids)
     err = hipMemcpy(d_emb,  emb_ptr,  VOCAB * D * 4, 1); if err != 0 { die_gpu("H2D emb",  err) }
@@ -192,7 +194,7 @@ fn main() {
 
     // ── Launch ONE 1-WG / 512-thread dispatch (embed + WZMA fwd + pool/norm,
     //    both views) ────────────────────────────────────────────────────────
-    u64 NA = 17
+    u64 NA = 18
     u64 p0  = alloc(8); unsafe { *(p0  as u64) = d_ids }
     u64 p1  = alloc(8); unsafe { *(p1  as u64) = d_emb }
     u64 p2  = alloc(8); unsafe { *(p2  as u64) = d_x_out }
@@ -210,6 +212,7 @@ fn main() {
     u64 p14 = alloc(8); unsafe { *(p14 as u64) = d_ids2 }
     u64 p15 = alloc(8); unsafe { *(p15 as u64) = d_v1 }
     u64 p16 = alloc(8); unsafe { *(p16 as u64) = d_v2 }
+    u64 p17 = alloc(8); unsafe { *(p17 as u64) = d_loss }
     u64 kp = alloc(NA * 8)
     unsafe { *((kp +   0) as u64) = p0 }
     unsafe { *((kp +   8) as u64) = p1 }
@@ -228,6 +231,7 @@ fn main() {
     unsafe { *((kp + 112) as u64) = p14 }
     unsafe { *((kp + 120) as u64) = p15 }
     unsafe { *((kp + 128) as u64) = p16 }
+    unsafe { *((kp + 136) as u64) = p17 }
 
     u32 grid  = 1
     u32 block = 512
@@ -238,7 +242,7 @@ fn main() {
 
     dealloc(p0); dealloc(p1); dealloc(p2); dealloc(p3); dealloc(p4); dealloc(p5); dealloc(p6)
     dealloc(p7); dealloc(p8); dealloc(p9); dealloc(p10); dealloc(p11); dealloc(p12); dealloc(p13)
-    dealloc(p14); dealloc(p15); dealloc(p16)
+    dealloc(p14); dealloc(p15); dealloc(p16); dealloc(p17)
     dealloc(kp)
     print_str("Launch + sync OK.\n")
 
@@ -403,7 +407,35 @@ fn main() {
     u64 evd = fmt_f32(max_diff_v, 7); print_str(evd); dealloc(evd)
     print_str("\n")
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // Task 4 (FORWARD complete): InfoNCE scalar loss.
+    //   Expected loss[0] = 3.059341 (= MLRiftBench bench_ref.json cpu_losses[0],
+    //   tol 1e-2).  GPU kernel matches std/train.mlr fn infonce_f32 (tau=0.1,
+    //   B=8, no re-normalisation — F.normalize idempotent on unit vectors).
+    // ═══════════════════════════════════════════════════════════════════════
+    // CPU reference: infonce_f32 over the GPU's own downloaded v1/v2 (isolates
+    // whether a loss mismatch is in the GPU loss math or upstream in v1/v2).
+    f32 cpu_loss = infonce_f32(h_v1_gpu, h_v2_gpu, 0.1f, B, D)
+    print_str("CPU infonce_f32(GPU v1,v2) = ")
+    u64 ecl = fmt_f32(cpu_loss, 6); print_str(ecl); dealloc(ecl)
+    print_str("\n")
+
+    u64 h_loss = alloc(4)
+    err = hipMemcpy(h_loss, d_loss, 4, 2); if err != 0 { die_gpu("D2H loss", err) }
+    f32 loss0 = 0.0f
+    unsafe { *(h_loss as f32) -> loss0 }
+    print_str("loss[0] = ")
+    u64 els = fmt_f32(loss0, 6); print_str(els); dealloc(els)
+    print_str("\n")
+    f32 loss_ref = 3.059341f
+    f32 loss_err = abs_f32(loss0 - loss_ref)
+    if loss_err < 1e-2f { print_str("loss PASS (vs 3.059341) err ") }
+    else                { print_str("loss FAIL (vs 3.059341) err ") }
+    u64 ele = fmt_f32(loss_err, 6); print_str(ele); dealloc(ele)
+    print_str("\n")
+
     // ── Cleanup (teardown is MANDATORY before every exit path) ─────────────
+    hipFree(d_loss)
     hipFree(d_ids2)
     hipFree(d_v1)
     hipFree(d_v2)
