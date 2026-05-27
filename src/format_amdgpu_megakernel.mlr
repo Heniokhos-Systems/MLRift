@@ -633,6 +633,34 @@ fn _wzm_emit_train_barrier(uint64 phase_idx) {
 
     // ── restore full exec after spin ─────────────────────────────────────
     asm_u32(0x8C7E4E7E)               // s_or_b32 exec_lo, exec_lo, s78
+
+    // ── ACQUIRE fence (slice 4 train, 2026-05-27) ────────────────────────
+    // Cross-WG memory-ordering fix.  The barrier above orders WG ARRIVAL
+    // (the GLC spin-load on the GL2-coherent counter is fresh) but does NOT
+    // make the readers that run AFTER the barrier re-fetch the DATA that the
+    // arriving WGs produced.  At every phase boundary this barrier guards a
+    // cross-WG GLOBAL write→read:
+    //   bar(0)  fwd v1/v2 rows     → InfoNCE dot reads v1[i]/v2[j]
+    //   bar(1)  d_loss/dlogits     → backward re-reads them
+    //   bar(2)  per-WG d_partial   → reduce reads partial[wg][·]  ← the wedge
+    //   bar(3)  final dense grads  → AdamW reads them
+    // ALL of those reads use the train kernel's PLAIN global_load_b32
+    // (wzm_gload_b32_saddr, word1=0xDC520000 — GLC clear), so a stale GL0/GL1
+    // line (the d_partial / grad buffers are REUSED every step) can shadow the
+    // value just committed to GL2 by another WG.  That is the
+    // partial-write→barrier→reduce-read hazard: at NW=8 it produced the wrong
+    // loss (2.974328 vs 3.059341) + the MES wedge (garbage grads → AdamW).
+    //
+    // The producer side already RELEASES correctly: the threadfence at the top
+    // of this fn does s_waitcnt vscnt(0) (RDNA3 global stores are write-through
+    // to GL2, so vscnt==0 == committed-to-GL2) BEFORE the arrival atomic.  The
+    // missing half is the ACQUIRE: invalidate L0 *and* L1 here so the plain
+    // post-barrier reads miss → re-fetch from GL2.  gl1_inv is intentionally
+    // NOT in the spin body (the GLC spin-load bypasses L1 — see comment above);
+    // re-adding it ONCE here, at barrier EXIT, costs ~1 op/barrier (4/step) and
+    // does not undo that per-spin-iteration optimisation.
+    asm_buffer_gl0_inv()              // invalidate L0  → reader re-fetches
+    asm_buffer_gl1_inv()              // invalidate L1  → reader re-fetches from GL2
 }
 
 // _wzm_emit_phase_barrier — emit the right barrier at a TRUE phase boundary:
