@@ -8822,10 +8822,32 @@ fn amdgpu_lower_wzma_train_mega(uint64 kname_ptr, uint64 nl) -> uint64 {
 
     asm_u32(0xBFBD0000)   // s_barrier — inter LDS scratch visible to all lanes
 
-    // ── outk[bs,k,d] = sum_r inter[bs,k,r]*V[k,r,d], per-lane d ──
-    // V element index lane d = k*R*D + r*D + d = k*12288 + r*384 + d.
+    // ── outk[bs,k,d] = sum_r inter[bs,k,r]*V[k,r,d]  — TILED GEMM (Task 2) ─────
+    // GEMM shape per bs row: M = these BS rows, N = D = 384 outputs, Kdim = R=32,
+    // computed PER bank k (4 independent [*,N]·[Kdim,N] products).  Lane d owns
+    // outk[bs,0..3,d] (kept this way so the downstream out[bs,d]=Σ_k alpha·outk
+    // combine + the outk save stay naturally d-parallel).
+    //
+    // OLD path: the r loop did K=4 (ds_load inter + lgkmcnt(0) + gload V +
+    // vmcnt(0) + fma) UNROLLED — i.e. 8 serializing memory WAITS per r (256 per
+    // bs row).  Those per-(r,k) full waits, not the FLOPs, were the cost, exactly
+    // like Task 1's per-output reduce trees.  NEW path keeps the same d-parallel
+    // accumulation but SOFTWARE-PIPELINES each r iteration: issue all 4 inter LDS
+    // loads → ONE lgkmcnt(0); issue all 4 V global loads → ONE vmcnt(0); then 4
+    // fmas.  Waits drop 8→2 per r (4× fewer), with the SAME Σ_r order so the loss
+    // / grad results are byte-identical to the pre-Task-2 outk (no oracle change
+    // needed for THIS einsum — its summation order is unchanged).
+    //
+    // inter[bs,k,r] is a lane-UNIFORM LDS broadcast at byte 2048 + (k*32+r)*4 =
+    // (2048 + k*128) + r*4.  Per k the LDS offset differs only by the immediate
+    // k*128, so one v_addr (= r*4) drives all 4 ds_loads via the offset field.
+    //
+    // ⚠ OOB rule: each k's V byte-offset is computed INDEPENDENTLY and clamped to
+    // 0 for d>=D lanes (wzm_clamp_off_dlt_D) BEFORE the load, so neither inactive
+    // edge lanes (d=384..511) nor any per-k stride ever forms an out-of-range V
+    // address.  Max in-bounds V elem = 3*12288+31*384+383 = K*R*D-1.  inter LDS
+    // reads are bounded by the just-written 2048..2048+128*4 scratch region.
     //   v18..v21 = outk0..3 accumulators (per lane).
-    // inter[bs,k,r] reloaded from LDS[2048 + (k*32+r)*4].
     asm_u32(0x7E240280)   // v_mov_b32_e32 v18, 0
     asm_u32(0x7E260280)   // v_mov_b32_e32 v19, 0
     asm_u32(0x7E280280)   // v_mov_b32_e32 v20, 0
@@ -8837,28 +8859,48 @@ fn amdgpu_lower_wzma_train_mega(uint64 kname_ptr, uint64 nl) -> uint64 {
     uint64 or_exit = asm_text_len / 4
     asm_u32(0xBFA20000)   // s_cbranch_scc1 .Lor_end (patch)
 
-    // For each k=0..3: load inter_kr from LDS, load V[k,r,d], fma into outk_k.
-    uint64 ok = 0
-    while ok < 4 {
-        // inter LDS offset (rel) = k*128 + r*4
-        wzm_s_mov_b32_lit(37, ok * 128)      // s37 = k*128
-        wzm_s_lshl2(38, 36)                  // s38 = r*4
-        wzm_s_add_u32_ss(37, 37, 38)         // s37 = k*128 + r*4
-        wzm_v_mov_s(1, 37)                   // v1 = LDS rel byte offset
-        wzm_ds_load_b32(17, 1, 2048)         // v17 = inter[bs,k,r]
-        asm_u32(0xBF89FC07)                  // lgkmcnt(0)
-        // V offset lane d = (k*12288 + r*384 + d)*4
-        wzm_s_mov_b32_lit(38, ok * 12288)    // s38 = k*12288
-        wzm_s_mul_i32_lit(39, 36, 384)       // s39 = r*384
-        wzm_s_add_u32_ss(38, 38, 39)         // s38 = k*12288 + r*384
-        wzm_v_add_nc_u32_sv(1, 38, 0)        // v1 = s38 + d
-        wzm_v_shl2_e32(1, 1)                 // *4
-        wzm_clamp_off_dlt_D(1)               // OOB guard for d>=D
-        wzm_gload_b32_saddr(16, 1, 12)       // v16 = V[k,r,d]  (s[12:13])
-        asm_u32(0xBF8903F7)                  // vmcnt(0)
-        asm_v_fma_f32_e64_vvv(18 + ok, 17, 16, 18 + ok)   // outk_k += inter*V
-        ok = ok + 1
-    }
+    // ── inter[bs,k,r] for k=0..3: one v_addr (= r*4), 4 ds_loads via offset, ONE wait
+    wzm_s_lshl2(38, 36)                  // s38 = r*4
+    wzm_v_mov_s(1, 38)                   // v1 = LDS rel byte addr (r*4); k via offset
+    wzm_ds_load_b32(17, 1, 2048)         // v17 = inter[bs,0,r]  (off 2048 + 0*128)
+    wzm_ds_load_b32(22, 1, 2176)         // v22 = inter[bs,1,r]  (off 2048 + 1*128)
+    wzm_ds_load_b32(25, 1, 2304)         // v25 = inter[bs,2,r]  (off 2048 + 2*128)
+    wzm_ds_load_b32(26, 1, 2432)         // v26 = inter[bs,3,r]  (off 2048 + 3*128)
+    asm_u32(0xBF89FC07)                  // lgkmcnt(0)  (all 4 inter visible)
+
+    // ── V[k,r,d] for k=0..3: compute + clamp 4 byte-offsets, 4 gloads, ONE wait ─
+    // V byte-offset(k) = (k*12288 + r*384 + d)*4.  s39 = r*384 (shared base).
+    wzm_s_mul_i32_lit(39, 36, 384)       // s39 = r*384
+    // k=0 → v27 ; k=1 → v28 ; k=2 → v29 ; k=3 → v30
+    wzm_v_add_nc_u32_sv(27, 39, 0)       // v27 = (r*384 + d)            (k=0)
+    wzm_v_shl2_e32(27, 27)               // *4
+    wzm_clamp_off_dlt_D(27)              // OOB guard d>=D
+    wzm_s_mov_b32_lit(37, 12288)         // s37 = k*12288 (k=1)
+    wzm_s_add_u32_ss(37, 37, 39)         // s37 = 12288 + r*384
+    wzm_v_add_nc_u32_sv(28, 37, 0)       // v28 = 12288 + r*384 + d      (k=1)
+    wzm_v_shl2_e32(28, 28)
+    wzm_clamp_off_dlt_D(28)
+    wzm_s_mov_b32_lit(37, 24576)         // s37 = 2*12288 (k=2)
+    wzm_s_add_u32_ss(37, 37, 39)         // s37 = 24576 + r*384
+    wzm_v_add_nc_u32_sv(29, 37, 0)       // v29 = 24576 + r*384 + d      (k=2)
+    wzm_v_shl2_e32(29, 29)
+    wzm_clamp_off_dlt_D(29)
+    wzm_s_mov_b32_lit(37, 36864)         // s37 = 3*12288 (k=3)
+    wzm_s_add_u32_ss(37, 37, 39)         // s37 = 36864 + r*384
+    wzm_v_add_nc_u32_sv(30, 37, 0)       // v30 = 36864 + r*384 + d      (k=3)
+    wzm_v_shl2_e32(30, 30)
+    wzm_clamp_off_dlt_D(30)
+    wzm_gload_b32_saddr(31, 27, 12)      // v31 = V[0,r,d]  (s[12:13])
+    wzm_gload_b32_saddr(32, 28, 12)      // v32 = V[1,r,d]
+    wzm_gload_b32_saddr(33, 29, 12)      // v33 = V[2,r,d]
+    wzm_gload_b32_saddr(34, 30, 12)      // v34 = V[3,r,d]
+    asm_u32(0xBF8903F7)                  // vmcnt(0)  (all 4 V visible)
+
+    asm_v_fma_f32_e64_vvv(18, 17, 31, 18)   // outk0 += inter[0,r]*V[0,r,d]
+    asm_v_fma_f32_e64_vvv(19, 22, 32, 19)   // outk1 += inter[1,r]*V[1,r,d]
+    asm_v_fma_f32_e64_vvv(20, 25, 33, 20)   // outk2 += inter[2,r]*V[2,r,d]
+    asm_v_fma_f32_e64_vvv(21, 26, 34, 21)   // outk3 += inter[3,r]*V[3,r,d]
+
     wzm_s_add_u32_1(36, 36)                  // r += 1
     uint64 or_back = (or_top - (asm_text_len / 4) - 1) & 0xFFFF
     asm_u32(0xBFA00000 | or_back)            // s_branch .Lor_top
