@@ -350,6 +350,16 @@ fn main() {
     slot = alloc(8); err = hipMalloc(slot, D * 4);         if err != 0 { die_gpu("mMBI", err) }; unsafe { *(slot as u64) -> d_m_bias }; dealloc(slot)
     slot = alloc(8); err = hipMalloc(slot, D * 4);         if err != 0 { die_gpu("mVBI", err) }; unsafe { *(slot as u64) -> d_v_bias }; dealloc(slot)
 
+    // ── EMBED-ADAMW: resident m/v moment buffers for the embedding table.
+    //   These let the in-kernel embed AdamW phase update d_emb in place ON-DEVICE
+    //   (DENSE over all VOCAB*D=3.1M elements) with ZERO per-step embed transfer —
+    //   eliminating the ~46ms/step host D2H/H2D round-trip bottleneck.  Both are
+    //   VOCAB*D*4 (~12.6 MB each) and zero-init ONCE before step 1 (the kernel
+    //   updates them in place each step, identically to the dense m/v above).
+    u64 d_m_emb = 0; u64 d_v_emb = 0
+    slot = alloc(8); err = hipMalloc(slot, VOCAB * D * 4); if err != 0 { die_gpu("mMEMB", err) }; unsafe { *(slot as u64) -> d_m_emb }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, VOCAB * D * 4); if err != 0 { die_gpu("mVEMB", err) }; unsafe { *(slot as u64) -> d_v_emb }; dealloc(slot)
+
     // ── Task 2 (multi-WG): cross-WG barrier counter (mega_emit_barrier_isa).
     //   ONE monotonic u32 at offset 0 (the kernel's _wzm_emit_train_barrier
     //   does global_atomic_add_u32 to d_barrier[0] + spin-poll vs (phase+1)*NW).
@@ -382,57 +392,27 @@ fn main() {
     err = hipMemcpy(d_v_gb,   h_zero_big, K * 4,         1); if err != 0 { die_gpu("z vgb", err) }
     err = hipMemcpy(d_m_bias, h_zero_big, D * 4,         1); if err != 0 { die_gpu("z mbi", err) }
     err = hipMemcpy(d_v_bias, h_zero_big, D * 4,         1); if err != 0 { die_gpu("z vbi", err) }
+    // EMBED-ADAMW: zero the resident embed m/v ONCE (h_zero_big >= VOCAB*D*4).
+    err = hipMemcpy(d_m_emb,  h_zero_big, VOCAB * D * 4, 1); if err != 0 { die_gpu("z memb", err) }
+    err = hipMemcpy(d_v_emb,  h_zero_big, VOCAB * D * 4, 1); if err != 0 { die_gpu("z vemb", err) }
 
-    // CPU moment buffers for the sparse embedding AdamW (stays on CPU).
-    u64 m_emb = alloc(VOCAB * D * 4); memset(m_emb, 0, VOCAB * D * 4)
-    u64 v_emb = alloc(VOCAB * D * 4); memset(v_emb, 0, VOCAB * D * 4)
-    // u64 token-id arrays for the CPU embed AdamW dedup + embed_bwd reference.
-    u64 ids1_u64 = alloc(BS * 8)
-    u64 ids2_u64 = alloc(BS * 8)
-    u64 cvi = 0
-    while cvi < BS {
-        u32 a1 = 0; u32 a2 = 0
-        unsafe { *((ids1_i32 + cvi * 4) as u32) -> a1 }
-        unsafe { *((ids2_i32 + cvi * 4) as u32) -> a2 }
-        u64 u1 = a1; u64 u2 = a2
-        unsafe { *((ids1_u64 + cvi * 8) as u64) = u1 }
-        unsafe { *((ids2_u64 + cvi * 8) as u64) = u2 }
-        cvi = cvi + 1
-    }
+    // EMBED-ADAMW is now ON-DEVICE: the embedding-table AdamW runs INSIDE the
+    // megakernel (DENSE over all VOCAB*D elements, m/v resident in d_m_emb/d_v_emb),
+    // and the kernel re-zeroes d_demb in the same pass.  There is therefore NO CPU
+    // sparse-embed AdamW, NO touched-row D2H/H2D, NO per-row re-zero, and NO
+    // touched-row precompute — the entire ~46ms/step host embed section is gone.
+    // The DENSE update gives the IDENTICAL loss to the old CPU sparse path because
+    // the loss depends only on the touched rows; untouched-row decoupled weight
+    // decay never feeds the loss (the embed-table values on untouched rows DO
+    // differ from the CPU-sparse run, but that is expected and irrelevant).
 
-    // Precompute the UNIQUE touched embedding rows ONCE — the token ids are
-    // constant across all 50 steps, so the set of rows the megakernel writes
-    // gradients into never changes.  This lets each step D2H/H2D only the
-    // touched rows instead of the full 12.6 MB d_demb table (the full-table
-    // D2H was the dominant per-step cost: ~1219 ms/step → ~0 with this).
-    u64 uniq_rows = alloc(2 * BS * 8)
-    u64 n_uniq_rows = 0
-    u64 pgi = 0
-    while pgi < 2 * BS {
-        u64 cand = 0
-        if pgi < BS { unsafe { *((ids1_u64 + pgi * 8) as u64) -> cand } }
-        else        { unsafe { *((ids2_u64 + (pgi - BS) * 8) as u64) -> cand } }
-        u64 found = 0
-        u64 ui = 0
-        while ui < n_uniq_rows {
-            u64 existing = 0; unsafe { *((uniq_rows + ui * 8) as u64) -> existing }
-            if existing == cand { found = 1 }
-            ui = ui + 1
-        }
-        if found == 0 {
-            unsafe { *((uniq_rows + n_uniq_rows * 8) as u64) = cand }
-            n_uniq_rows = n_uniq_rows + 1
-        }
-        pgi = pgi + 1
-    }
-
-    // AdamW hyperparams (match std/train.mlr adamw_step + bench).
+    // AdamW hyperparams (match std/train.mlr adamw_step + bench).  These now feed
+    // ONLY the per-step bias-correction kernarg scalars (the kernel's AdamW math).
     f32 lr    = 1e-3f
     f32 beta1 = 0.9f
     f32 beta2 = 0.999f
     f32 eps   = 1e-8f
     f32 wd    = 0.01f
-    u64 h_demb = alloc(VOCAB * D * 4)
 
     // H2D: all forward inputs (both views' ids)
     err = hipMemcpy(d_emb,  emb_ptr,  VOCAB * D * 4, 1); if err != 0 { die_gpu("H2D emb",  err) }
@@ -452,7 +432,7 @@ fn main() {
     //   unconditionally).  At NW=1 the d_barrier slot is a dummy (never read by
     //   the elided barrier ISA) but its kernarg slot must still exist so
     //   d_partial lands at 0x1E0.
-    u64 NA = 61
+    u64 NA = 63
     u64 p0  = alloc(8); unsafe { *(p0  as u64) = d_ids }
     u64 p1  = alloc(8); unsafe { *(p1  as u64) = d_emb }
     u64 p2  = alloc(8); unsafe { *(p2  as u64) = d_x_out }
@@ -516,6 +496,8 @@ fn main() {
     u64 p58 = alloc(8)   // eps
     u64 p59 = alloc(8); unsafe { *(p59 as u64) = d_barrier }   // Task 2: cross-WG counter
     u64 p60 = alloc(8); unsafe { *(p60 as u64) = d_partial }   // Task 3: per-WG grad partials
+    u64 p61 = alloc(8); unsafe { *(p61 as u64) = d_m_emb }     // EMBED-ADAMW: embed m (resident)
+    u64 p62 = alloc(8); unsafe { *(p62 as u64) = d_v_emb }     // EMBED-ADAMW: embed v (resident)
     u64 kp = alloc(NA * 8)
     unsafe { *((kp +   0) as u64) = p0 }
     unsafe { *((kp +   8) as u64) = p1 }
@@ -581,6 +563,10 @@ fn main() {
     // (per-WG dense-grad slots, read unconditionally by the reduce phase).
     unsafe { *((kp + 472) as u64) = p59 }
     unsafe { *((kp + 480) as u64) = p60 }
+    // EMBED-ADAMW: slot 61 (offset 488 = 0x1E8) = d_m_emb, slot 62 (offset 496 =
+    // 0x1F0) = d_v_emb — read by the in-kernel embed AdamW phase.
+    unsafe { *((kp + 488) as u64) = p61 }
+    unsafe { *((kp + 496) as u64) = p62 }
 
     // ═══════════════════════════════════════════════════════════════════════
     // Task 7: full 50-step training loop + benchmark.
@@ -683,15 +669,9 @@ fn main() {
         err = hipMemcpy(d_dgw,   h_zero_big, K * D * 4,     1); if err != 0 { die_gpu("rz dgw",   err) }
         err = hipMemcpy(d_dgb,   h_zero_big, K * 4,         1); if err != 0 { die_gpu("rz dgb",   err) }
         err = hipMemcpy(d_dbias, h_zero_big, D * 4,         1); if err != 0 { die_gpu("rz dbias", err) }
-        // d_demb: only the TOUCHED rows accumulate gradient and only those rows
-        // are read back, so zero just those rows (not the full 12.6 MB table).
-        u64 rzi = 0
-        while rzi < n_uniq_rows {
-            u64 rzrow = 0; unsafe { *((uniq_rows + rzi * 8) as u64) -> rzrow }
-            err = hipMemcpy(d_demb + rzrow * D * 4, h_zero_big, D * 4, 1)
-            if err != 0 { die_gpu("rz demb_row", err) }
-            rzi = rzi + 1
-        }
+        // d_demb is re-zeroed ON-DEVICE inside the embed-AdamW phase (after it
+        // reads the gradient), so NO host re-zero is needed here — the per-row
+        // re-zero loop (and its ~200 H2D calls) is gone with the embed section.
 
         // Per-step bias-correction scalars (CPU side; matches launch_adamw).
         f32 b1p = 1.0f; f32 b2p = 1.0f
@@ -828,55 +808,15 @@ fn main() {
             print_str("\n")
         }
 
-        // ── Sparse embedding AdamW (CPU) + sparse D2H/H2D of touched rows ──
-        // Only the precomputed uniq_rows carry nonzero gradients; D2H/H2D just
-        // those rows (D*4 bytes each) instead of the whole 12.6 MB table.
-        //
-        // PERF (2026-05-27): the OLD form interleaved [D2H row][CPU AdamW][H2D row]
-        // per row.  Restructured into THREE non-interleaved phases to remove any
-        // interleave stalls and let same-direction copies pipeline:
-        //   D.1  loop: D2H every touched row's grad into the packed h_demb buffer
-        //   D.2  loop: CPU AdamW on all touched rows (pure CPU, no GPU calls)
-        //   D.3  loop: H2D every updated embedding row back to d_emb
-        // (h_demb / emb_ptr / m_emb / v_emb are already full-VOCAB host buffers
-        // indexed by row, so the rows are naturally packed — no extra staging.)
-        //
-        // RESULT: segment D stayed ~45.9 ms (was ~45.8 ms) — restructure is a
-        // NO-OP for perf.  This DECISIVELY proves the bottleneck is per-call KFD
-        // -shim D2H completion-wait latency (~230 us/row * ~200 rows), NOT
-        // interleave/pipelining.  Same-direction batching can't help while the
-        // call COUNT is unchanged.  The real fix is a GPU embed-AdamW kernel that
-        // updates the touched rows in-place on-device (eliminating the ~200 D2H +
-        // ~200 H2D round-trips entirely) — that is a separate (emitter/.co) task.
-        // Kept the 3-phase form anyway: it is correctness-neutral and is the right
-        // host-side structure once the per-row copies are replaced by 1 bulk copy.
-        // ── Segment D start: EMBED SPARSE ADAMW ──
+        // ── EMBED ADAMW is now ON-DEVICE (folded into the megakernel) ──
+        // The entire host embed section is GONE: no per-row grad D2H, no CPU
+        // sparse AdamW, no per-row H2D, no per-row re-zero.  The in-kernel
+        // embed-AdamW phase updated d_emb in place (DENSE over all VOCAB*D) and
+        // re-zeroed d_demb during segment B's single dispatch.  Segment D is now
+        // measured empty — it should report ~0 ms/step (vs the old ~46 ms).
+        // ── Segment D start: EMBED ADAMW (now on-device — empty host segment) ──
         u64 seg_d_t0 = time_now()
-        // D.1 — coalesce all grad D2H copies (no interleaved CPU/H2D work).
-        u64 uii = 0
-        while uii < n_uniq_rows {
-            u64 row = 0; unsafe { *((uniq_rows + uii * 8) as u64) -> row }
-            err = hipMemcpy(h_demb + row * D * 4, d_demb + row * D * 4, D * 4, 2)
-            if err != 0 { die_gpu("D2H demb_row", err) }
-            uii = uii + 1
-        }
-        // D.2 — pure-CPU AdamW on every touched row (no GPU calls in this loop).
-        uii = 0
-        while uii < n_uniq_rows {
-            u64 row = 0; unsafe { *((uniq_rows + uii * 8) as u64) -> row }
-            adamw_step(emb_ptr + row * D * 4, h_demb + row * D * 4,
-                       m_emb + row * D * 4, v_emb + row * D * 4,
-                       D, step1, lr, beta1, beta2, eps, wd)
-            uii = uii + 1
-        }
-        // D.3 — coalesce all updated-row H2D copies (no interleaved CPU/D2H work).
-        uii = 0
-        while uii < n_uniq_rows {
-            u64 row = 0; unsafe { *((uniq_rows + uii * 8) as u64) -> row }
-            err = hipMemcpy(d_emb + row * D * 4, emb_ptr + row * D * 4, D * 4, 1)
-            if err != 0 { die_gpu("H2D emb_row", err) }
-            uii = uii + 1
-        }
+        // (intentionally empty — embed AdamW + demb re-zero happen in-kernel)
         // ── Segment D end ──
         u64 seg_d_t1 = time_now()
 
@@ -904,6 +844,7 @@ fn main() {
     dealloc(p40); dealloc(p41); dealloc(p42); dealloc(p43); dealloc(p44); dealloc(p45); dealloc(p46)
     dealloc(p47); dealloc(p48); dealloc(p49); dealloc(p50); dealloc(p51); dealloc(p52); dealloc(p53)
     dealloc(p54); dealloc(p55); dealloc(p56); dealloc(p57); dealloc(p58); dealloc(p59); dealloc(p60)
+    dealloc(p61); dealloc(p62)
     dealloc(kp)
     // ═══════════════════════════════════════════════════════════════════════
     // Task 7 report — full 50-step run + benchmark.
@@ -1007,7 +948,8 @@ fn main() {
     //   outk/o1/o2 = 3*BS*K*D*4 ; v1/v2/dv1/dv2 = 4*B*D*4 ; n1/n2 = 2*B*4 ;
     //   ids/ids2 = 2*BS*4 ; loss = 4.
     u64 bytes_vram = 0
-    bytes_vram = bytes_vram + 2 * VOCAB * D * 4
+    // emb + demb + m_emb + v_emb = 4 full VOCAB*D tables (embed AdamW now on-device).
+    bytes_vram = bytes_vram + 4 * VOCAB * D * 4
     bytes_vram = bytes_vram + 8 * K * D * R * 4
     bytes_vram = bytes_vram + 4 * K * D * 4
     bytes_vram = bytes_vram + 4 * K * 4
@@ -1031,7 +973,6 @@ fn main() {
 
     dealloc(ref_losses)
     dealloc(step_times)
-    dealloc(uniq_rows)
 
     if all_loss_ok == 1 { print_str("TASK 7 PASS\n") }
     else                { print_str("TASK 7 FAIL\n") }
@@ -1063,6 +1004,7 @@ fn main() {
     hipFree(d_m_U); hipFree(d_v_U); hipFree(d_m_V); hipFree(d_v_V)
     hipFree(d_m_gw); hipFree(d_v_gw); hipFree(d_m_gb); hipFree(d_v_gb)
     hipFree(d_m_bias); hipFree(d_v_bias)
+    hipFree(d_m_emb); hipFree(d_v_emb)
     hipFree(d_barrier)
     hipFree(d_partial)
     hipkfd_teardown()

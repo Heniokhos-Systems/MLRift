@@ -8343,6 +8343,111 @@ fn _wzm_emit_adamw_param(uint64 param_kofs, uint64 grad_kofs,
     asm_patch_u32(aw_exit, 0xBFA20000 | ((aw_end - aw_exit - 1) & 0xFFFF))
 }
 
+// ── Embed-AdamW + in-place demb re-zero (on-device, multi-WG) ──────────────
+// Folds the embedding-table AdamW INTO the megakernel so there is ZERO per-step
+// embed D2H/H2D (the 82% / ~46ms host bottleneck).  Updates ALL VOCAB*D embed
+// elements DENSELY in-place — identical LOSS to the CPU sparse path because the
+// loss depends only on the TOUCHED rows; untouched-row decoupled weight-decay
+// never feeds the loss (see task spec KEY INSIGHT).  No touched-row list needed.
+//
+// The 3.1M elements are partitioned across ALL NW*512 threads:
+//   gid = block_base + wg_id*512 + lane,  stride NW*512   (mirrors reduce_grad)
+// every global op is EXEC-gated gid<N so inactive (gid>=N) lanes NEVER issue an
+// OOB global op (feedback_oob_address_pad_lane_wedge).
+//
+// AdamW math is BIT-IDENTICAL to _wzm_emit_adamw_param (decoupled wd, the same
+// v24..v32 broadcast hyperparam VGPRs the caller pre-loaded).  After reading the
+// grad g=demb[gid] it writes demb[gid]=0 (re-zero) so the next step's backward
+// scatter-add starts clean on-device — no host re-zero, no separate phase.
+//   p_kofs = d_emb (0x08) ; g_kofs = d_demb (0x108) ; m_kofs/v_kofs = new args.
+//   N = VOCAB*D = 8192*384 = 3145728 (compile-time literal).
+//   Pointers: s[64:65]=p, s[66:67]=g, s[68:69]=m, s[70:71]=v.
+//   s2 saveexec ; s34=block base ; s36=wg thread base.
+//   Clobbers: v1,v16..v23,v33..v39 ; s2,s34,s36,s[64:71].
+fn _wzm_emit_adamw_embed(uint64 p_kofs, uint64 g_kofs,
+                         uint64 m_kofs, uint64 v_kofs, uint64 N) {
+    uint64 nw = MEGA_TRAIN_NW
+    uint64 total_threads = nw * 512                 // global thread count
+    asm_s_load_b64_off(32, 0, p_kofs)               // s[64:65] = param (d_emb)
+    asm_s_load_b64_off(33, 0, g_kofs)               // s[66:67] = grad  (d_demb)
+    asm_s_load_b64_off(34, 0, m_kofs)               // s[68:69] = m     (d_m_emb)
+    asm_s_load_b64_off(35, 0, v_kofs)               // s[70:71] = v     (d_v_emb)
+    asm_u32(0xBF89FC07)                             // lgkmcnt(0)
+
+    // s36 = wg_id*512 (this WG's global thread base; s3 = wg_id_x).
+    wzm_s_mul_i32_lit(36, 3, 512)
+
+    wzm_s_mov_b32_0(34)                              // s34 = block base = 0
+    uint64 ae_top = asm_text_len / 4
+    asm_u32(0xBF090000 | (0xFF << 8) | 34)           // s_cmp_ge_u32 s34, N
+    asm_u32(N & 0xFFFFFFFF)
+    uint64 ae_exit = asm_text_len / 4
+    asm_u32(0xBFA20000)                              // s_cbranch_scc1 .Lae_end (patched)
+
+    // gid = block_base + wg_id*512 + lane.
+    wzm_v_add_nc_u32_sv0(16, 34)                     // v16 = s34 + v0
+    wzm_v_add_nc_u32_sv(16, 36, 16)                  // v16 = v16 + s36 (wg base)
+    // EXEC-gate gid < N : v_cmp_gt_u32 vcc, N(lit), v16 ; saveexec s2.
+    asm_u32(0x7C980000 | (16 << 9) | 0xFF)           // v_cmp_gt_u32_e32 vcc_lo, N, v16
+    asm_u32(N & 0xFFFFFFFF)
+    asm_u32(0xBE82206A)                              // s_and_saveexec_b32 s2, vcc_lo
+    uint64 ae_execz = asm_text_len / 4
+    asm_u32(0xBFA50000)                              // s_cbranch_execz .Lae_next (patched)
+
+    // byte offset = gid*4 → v17.
+    wzm_v_shl2_e32(17, 16)                           // v17 = gid*4
+
+    // load p,g,m,v.
+    wzm_gload_b32_saddr(18, 17, 64)                  // v18 = p
+    wzm_gload_b32_saddr(19, 17, 66)                  // v19 = g
+    wzm_gload_b32_saddr(20, 17, 68)                  // v20 = m
+    wzm_gload_b32_saddr(21, 17, 70)                  // v21 = v
+    asm_u32(0xBF8903F7)                              // vmcnt(0)
+
+    // m_new = beta1*m + one_m_b1*g.
+    wzm_v_mul_f32_e32(22, 27, 20)                    // v22 = beta1*m
+    wzm_v_mul_f32_e32(23, 29, 19)                    // v23 = one_m_b1*g
+    wzm_v_add_f32_e32(20, 22, 23)                    // v20 = m_new
+    // v_new = beta2*v + one_m_b2*(g*g).
+    wzm_v_mul_f32_e32(33, 19, 19)                    // v33 = g*g
+    wzm_v_mul_f32_e32(22, 28, 21)                    // v22 = beta2*v
+    wzm_v_mul_f32_e32(23, 30, 33)                    // v23 = one_m_b2*gg
+    wzm_v_add_f32_e32(21, 22, 23)                    // v21 = v_new
+    // store m_new, v_new + RE-ZERO grad (demb[gid]=0 for next step's scatter).
+    wzm_gstore_b32_saddr(17, 20, 68)                 // m[gid] = m_new
+    wzm_gstore_b32_saddr(17, 21, 70)                 // v[gid] = v_new
+    asm_u32(0x7E260280)                              // v_mov_b32_e32 v19, 0
+    wzm_gstore_b32_saddr(17, 19, 66)                 // demb[gid] = 0 (re-zero)
+    asm_u32(0xBC7C0000)                              // vscnt(0)
+
+    // m_hat = m_new*inv_bc1 ; v_hat = v_new*inv_bc2.
+    wzm_v_mul_f32_e32(22, 20, 24)                    // v22 = m_hat
+    wzm_v_mul_f32_e32(23, 21, 25)                    // v23 = v_hat
+    // denom = sqrt(v_hat) + eps.
+    asm_v_sqrt_f32_e32_v(23, 23)                     // v23 = sqrt(v_hat)
+    wzm_v_add_f32_e32(23, 23, 32)                    // v23 = sqrt(v_hat)+eps
+    // numer = lr * m_hat.
+    wzm_v_mul_f32_e32(22, 31, 22)                    // v22 = lr*m_hat
+    // update = numer / denom  (IEEE-correct f32 div; scratch v34..v39).
+    asm_v_div_f32_ieee(22, 22, 23, 34, 35, 36, 37, 38)   // v22 = numer/denom
+    // p_new = p*decay - update.
+    wzm_v_mul_f32_e32(18, 18, 26)                    // v18 = p*decay
+    wzm_v_sub_f32_e32(18, 18, 22)                    // v18 = p*decay - update
+    wzm_gstore_b32_saddr(17, 18, 64)                 // param[gid] = p_new
+    asm_u32(0xBC7C0000)                              // vscnt(0)
+
+    // .Lae_next: restore exec, block_base += total_threads, loop.
+    uint64 ae_next = asm_text_len / 4
+    asm_patch_u32(ae_execz, 0xBFA50000 | ((ae_next - ae_execz - 1) & 0xFFFF))
+    asm_u32(0xBEFE0002)                              // s_mov_b32 exec_lo, s2 (restore)
+    asm_u32((0x80 << 24) | (34 << 16) | (0xFF << 8) | 34)   // s_add_u32 s34, s34, total
+    asm_u32(total_threads & 0xFFFFFFFF)
+    uint64 ae_back = (ae_top - (asm_text_len / 4) - 1) & 0xFFFF
+    asm_u32(0xBFA00000 | ae_back)                    // s_branch .Lae_top
+    uint64 ae_end = asm_text_len / 4
+    asm_patch_u32(ae_exit, 0xBFA20000 | ((ae_end - ae_exit - 1) & 0xFFFF))
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // WZMA+InfoNCE training mega-kernel — single-workgroup, all-resident.
 //
@@ -9428,6 +9533,18 @@ fn amdgpu_lower_wzma_train_mega(uint64 kname_ptr, uint64 nl) -> uint64 {
     _wzm_emit_adamw_param(0x30, 0xF8,  0x170, 0x178, 4)       // gb
     _wzm_emit_adamw_param(0x38, 0x100, 0x180, 0x188, 384)     // bias
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // EMBED-ADAMW (on-device) — folds the embedding-table AdamW INTO the kernel
+    // so there is ZERO per-step embed D2H/H2D round-trip (was 82% / ~46ms of the
+    // host step — the bottleneck this change eliminates).  d_emb + d_demb are
+    // already resident; m/v are new resident kernargs (zero-init before step 1).
+    // Updates ALL VOCAB*D=3145728 elements DENSELY in-place (identical LOSS to the
+    // CPU sparse path — see KEY INSIGHT) and re-zeroes d_demb[gid]=0 in the same
+    // pass so next step's backward scatter-add starts clean.  Reuses the SAME
+    // v24..v32 hyperparam broadcasts loaded above for the dense params.
+    //   p d_emb 0x08  g d_demb 0x108  m d_m_emb 0x1E8  v d_v_emb 0x1F0  N=VOCAB*D
+    _wzm_emit_adamw_embed(0x08, 0x108, 0x1E8, 0x1F0, 3145728)
+
     asm_u32(0xBFB00000)   // s_endpgm
 
     // ── Arg descriptor block (59 args × 8 bytes = 472 bytes) ──────────────
@@ -9447,7 +9564,11 @@ fn amdgpu_lower_wzma_train_mega(uint64 kname_ptr, uint64 nl) -> uint64 {
     //   regardless of NW — the reduce phase reads 0x1E0 unconditionally.  At NW=1
     //   the d_barrier ISA load is still elided (only d_partial is consumed), and
     //   the launcher must populate both slots (d_barrier may be a dummy at NW=1).
-    uint64 n_args = 61
+    // EMBED-ADAMW adds args 61 = d_m_emb (0x1E8) and 62 = d_v_emb (0x1F0), the
+    //   resident embed AdamW moment buffers (global_buffer), so the in-kernel
+    //   embed AdamW phase has its m/v on-device — eliminating the per-step embed
+    //   D2H/H2D entirely.  n_args = 63.
+    uint64 n_args = 63
     uint64 args_desc = alloc(n_args * 16)
     uint64 ai = 0
     while ai < n_args {
