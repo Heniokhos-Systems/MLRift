@@ -215,6 +215,37 @@ fn launch_repack(u64 fh, u64 d_in, u64 d_out, u64 A, u64 Bm, u64 W) {
     dealloc(p0); dealloc(p1); dealloc(p2); dealloc(p3); dealloc(p4); dealloc(kp)
 }
 
+// launch_fill: zero an f32 buffer of n_f32 elements ON THE GPU via the grid-fill
+// kernel (buf[gid]=value as f64, gid<n_f64).  We treat the buffer as f64 elems:
+// n_f64 = n_f32/2, value=0.0 → all bytes zero (0.0f64 == 0.0f32 == all-zero).
+// n_f32 MUST be even (VOCAB*D and NW*PART_N both are).  This replaces the per-step
+// host H2D memset — the GPU writes its own scratch, no PCIe D2H/H2D staging.
+//
+// fill_step kernarg = (buf, u32 n, f64 value, u32 bdim).  The KFD shim takes the
+// HIP ptr-table ABI (kernel_params[i] → 8-byte storage for arg i), so build a
+// 4-entry pointer table; the shim packs each into the native 28-byte kernarg
+// block per the .co descriptor.  bdim MUST be supplied (multi-block: the kernel
+// computes gid = block_id_x()*bdim + tid_x()).  grid = ceil(n_f64/bdim).
+fn launch_fill(u64 fh, u64 d_buf, u64 n_f32) {
+    u64 n_f64 = n_f32 / 2
+    u64 bdim  = 256
+    u64 a0 = alloc(8); unsafe { *(a0 as u64) = d_buf }   // buf
+    u64 a1 = alloc(8); unsafe { *(a1 as u64) = n_f64 }   // n   (u32; high bits ignored)
+    u64 a2 = alloc(8); unsafe { *(a2 as f64) = 0.0 }     // value (f64 0.0)
+    u64 a3 = alloc(8); unsafe { *(a3 as u64) = bdim }    // bdim
+    u64 pt = alloc(4 * 8)
+    unsafe { *((pt + 0)  as u64) = a0 }
+    unsafe { *((pt + 8)  as u64) = a1 }
+    unsafe { *((pt + 16) as u64) = a2 }
+    unsafe { *((pt + 24) as u64) = a3 }
+    u64 grid_u = (n_f64 + bdim - 1) / bdim
+    u32 grid   = grid_u
+    u32 block  = bdim
+    u32 err = hipModuleLaunchKernel(fh, grid, 1, 1, block, 1, 1, 0, 0, pt, 0)
+    if err != 0 { die_gpu("launch fill", err) }
+    dealloc(a0); dealloc(a1); dealloc(a2); dealloc(a3); dealloc(pt)
+}
+
 // set one f32 by-value kernarg slot (each KFD ptr-table arg is a pointer-to-value)
 fn set_arg_ptr(u64 kp, u64 idx, u64 val) {
     u64 slot = alloc(8); unsafe { *(slot as u64) = val }
@@ -318,7 +349,11 @@ fn main() {
     u64 fh_bemb   = load_co("/tmp/wzma_bwd_embed.co",         "wzma_bwd_embed")
     u64 fh_bred   = load_co("/tmp/wzma_bwd_reduce.co",        "wzma_bwd_reduce")
     u64 fh_adamw  = load_co("/tmp/adamw_step_f32.co",         "adamw_step_f32")
-    print_str("Kernels loaded (embed, gemm_f32, fwd_tail, repack, bwd_pre/uv/embed/reduce, adamw; all native, no hipcc).\n")
+    // grid-fill (f64 splat) — GPU-side zero of d_demb + d_partial each step,
+    // replacing the per-step host H2D zeros (12.6 MB demb + 3.2 MB partial = the
+    // 0.82 ms/step "demb-zero-H2D" regression).  Native grid-fill emitter, no hipcc.
+    u64 fh_fill   = load_co("/tmp/fill_step.co",              "fill_step")
+    print_str("Kernels loaded (embed, gemm_f32, fwd_tail, repack, bwd_pre/uv/embed/reduce, adamw, fill_step; all native, no hipcc).\n")
 
     // ── Read bench_init.bin (weights + 2 views of token ids) ──────────────
     u64 emb_ptr  = alloc(VOCAB * D * 4)
@@ -415,7 +450,7 @@ fn main() {
     err = hipMemcpy(d_mGb,zbig,K*4,1);     err = hipMemcpy(d_vGb,zbig,K*4,1)
     err = hipMemcpy(d_mBias,zbig,D*4,1);   err = hipMemcpy(d_vBias,zbig,D*4,1)
     err = hipMemcpy(d_mEmb,zbig,VOCAB*D*4,1); err = hipMemcpy(d_vEmb,zbig,VOCAB*D*4,1)
-    err = hipMemcpy(d_demb,zbig,VOCAB*D*4,1)  // demb zeroed once; backward re-zeroes in-kernel each step
+    err = hipMemcpy(d_demb,zbig,VOCAB*D*4,1)  // demb zeroed once at init; per-step re-zero now on-GPU via launch_fill (no H2D)
 
     print_str("Buffers allocated + moments/demb zero-init.\n")
 
@@ -524,14 +559,15 @@ fn main() {
         }
 
         // ════════════════ Zero d_partial (NW slots) + d_demb scatter accum ══
-        // Both are RMW (+=) accumulators in the backward, so they MUST start at
-        // 0 each step.  (The in-kernel embed-AdamW that used to re-zero demb is
-        // gone — the standalone adamw_step_f32 doesn't touch the grad, so demb is
-        // re-zeroed here.)
+        // Both are RMW (+=) accumulators in the backward, so they MUST start at 0
+        // each step.  Was a per-step host H2D memset (12.6 MB demb + 3.2 MB partial
+        // → ~0.82 ms/step PCIe staging "demb-zero-H2D" regression).  NOW zeroed
+        // ON THE GPU via the native grid-fill kernel — no host buffer, no D2H/H2D.
+        // Both dispatches are driver-synced before the backward RMW reads them.
         t0 = time_now()
-        err = hipMemcpy(d_partial, zbig, WZM_BWD_NW * PART_N * 4, 1); if err != 0 { die_gpu("zero partial", err) }
-        err = hipMemcpy(d_demb,    zbig, VOCAB * D * 4,            1); if err != 0 { die_gpu("zero demb", err) }
-        t1 = time_now(); ns_zero = ns_zero + (t1 - t0)
+        launch_fill(fh_fill, d_partial, WZM_BWD_NW * PART_N)
+        launch_fill(fh_fill, d_demb,    VOCAB * D)
+        sync_or_die("sync gpu-zero"); t1 = time_now(); ns_zero = ns_zero + (t1 - t0)
 
         // ════════════════ BACKWARD — build shared 63-arg kernarg block ═══════
         // KFD ptr-table: each entry → 8-byte value slot.  Reused by all 4 phase
@@ -685,7 +721,7 @@ fn main() {
     print_ms("repack  [GPU]: ", ms_of(ns_repack))
     print_ms("fwd_tail[GPU]: ", ms_of(ns_tail))
     print_ms("InfoNCE [GPU+CPU+loss]: ", ms_of(ns_nce))
-    print_ms("zero dP+demb [H2D]: ", ms_of(ns_zero))
+    print_ms("zero dP+demb [GPU fill, was H2D]: ", ms_of(ns_zero))
     print_str("--- BACKWARD (was 1 single-WG dispatch ~34ms/step; now 4 full-occ phases + 6 AdamW) ---\n")
     print_ms("  bwd_pre    [GPU grid=1] : ", ms_of(ns_bpre))
     print_ms("  bwd_uv     [GPU grid=NW]: ", ms_of(ns_buv))
