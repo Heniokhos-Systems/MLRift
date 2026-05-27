@@ -651,6 +651,16 @@ fn main() {
     // Per-step wall-clock (ns); median over [WARMUP, STEPS) reported below.
     u64 step_times = alloc(STEPS * 8)
 
+    // ── Per-segment wall-clock profiling (ns, accumulated over steps 5..49) ──
+    // A) ZEROING   = re-zero memcpys + scalar setup (lines ~663-705)
+    // B) LAUNCH+SYNC = the actual GPU compute (hipModuleLaunchKernel+sync)
+    // C) LOSS D2H  = d_loss scalar readback
+    // D) EMBED ADAMW = sparse D2H touched rows + CPU AdamW + H2D touched rows
+    u64 seg_a_zero   = 0
+    u64 seg_b_launch = 0
+    u64 seg_c_loss   = 0
+    u64 seg_d_embed  = 0
+
     f32 loss0_saved   = 0.0f
     f32 lossN_saved   = 0.0f
     f32 max_loss_err  = 0.0f
@@ -659,6 +669,9 @@ fn main() {
     while step < STEPS {
         u64 t0 = time_now()
         u64 step1 = step + 1
+
+        // ── Segment A start: ZEROING + scalar setup ──
+        u64 seg_a_t0 = time_now()
 
         // Task 3: re-zero the PER-WG partial dense-grad buffer (kernel does +=
         // into d_partial over both views; the reduce then sums slots → final).
@@ -704,18 +717,29 @@ fn main() {
         // within one dispatch — phase thresholds are (phase+1)*NW from zero).
         err = hipMemcpy(d_barrier, h_zero_big, BARRIER_BYTES, 1); if err != 0 { die_gpu("rz barrier", err) }
 
+        // ── Segment A end / Segment B start ──
+        u64 seg_a_t1 = time_now()
+        u64 seg_b_t0 = time_now()
+
         err = hipModuleLaunchKernel(fh, grid, 1, 1, block, 1, 1, 0, 0, kp, 0)
         if err != 0 { die_gpu("launch wzma_train_mega", err) }
         err = hipDeviceSynchronize()
         if err != 0 { die_gpu("sync", err) }
 
+        // ── Segment B end ──
+        u64 seg_b_t1 = time_now()
+
         // Read the scalar InfoNCE loss for this step (computed with the
         // weights as they were ON ENTRY — before this step's AdamW update).
+        // ── Segment C start: LOSS D2H ──
+        u64 seg_c_t0 = time_now()
         u64 h_loss_s = alloc(4)
         err = hipMemcpy(h_loss_s, d_loss, 4, 2); if err != 0 { die_gpu("D2H loss", err) }
         f32 loss_s = 0.0f
         unsafe { *(h_loss_s as f32) -> loss_s }
         dealloc(h_loss_s)
+        // ── Segment C end ──
+        u64 seg_c_t1 = time_now()
         if step == 0          { loss0_saved = loss_s }
         if step == STEPS - 1  { lossN_saved = loss_s }
 
@@ -807,6 +831,8 @@ fn main() {
         // ── Sparse embedding AdamW (CPU) + sparse D2H/H2D of touched rows ──
         // Only the precomputed uniq_rows carry nonzero gradients; D2H/H2D just
         // those rows (D*4 bytes each) instead of the whole 12.6 MB table.
+        // ── Segment D start: EMBED SPARSE ADAMW ──
+        u64 seg_d_t0 = time_now()
         u64 uii = 0
         while uii < n_uniq_rows {
             u64 row = 0; unsafe { *((uniq_rows + uii * 8) as u64) -> row }
@@ -821,6 +847,16 @@ fn main() {
             err = hipMemcpy(d_emb + row * D * 4, emb_ptr + row * D * 4, D * 4, 1)
             if err != 0 { die_gpu("H2D emb_row", err) }
             uii = uii + 1
+        }
+        // ── Segment D end ──
+        u64 seg_d_t1 = time_now()
+
+        // Accumulate per-segment time only for benchmarked steps [WARMUP, STEPS).
+        if step >= WARMUP {
+            seg_a_zero   = seg_a_zero   + (seg_a_t1 - seg_a_t0)
+            seg_b_launch = seg_b_launch + (seg_b_t1 - seg_b_t0)
+            seg_c_loss   = seg_c_loss   + (seg_c_t1 - seg_c_t0)
+            seg_d_embed  = seg_d_embed  + (seg_d_t1 - seg_d_t0)
         }
 
         u64 t1 = time_now()
@@ -883,6 +919,56 @@ fn main() {
     print_str("megakernel: ")
     u64 mms = fmt_f32(median_ms, 3); print_str(mms); dealloc(mms)
     print_str(" ms/step  (vs native 17.6 / PyTorch GPU 1.62)\n")
+
+    // ── Per-segment breakdown (mean ms/step + % of segment total) over [WARMUP, STEPS) ──
+    print_str("--- Per-step segment breakdown (mean over steps 5..49) ---\n")
+    f64 n_bench_f  = int_to_f64(bench_n)
+    f64 ns_per_ms2 = 1000000.0
+    f64 seg_a_f    = int_to_f64(seg_a_zero)
+    f64 seg_b_f    = int_to_f64(seg_b_launch)
+    f64 seg_c_f    = int_to_f64(seg_c_loss)
+    f64 seg_d_f    = int_to_f64(seg_d_embed)
+    f64 seg_tot_f  = seg_a_f + seg_b_f + seg_c_f + seg_d_f
+    // Per-step means (ms).
+    f64 a_ms = (seg_a_f / n_bench_f) / ns_per_ms2
+    f64 b_ms = (seg_b_f / n_bench_f) / ns_per_ms2
+    f64 c_ms = (seg_c_f / n_bench_f) / ns_per_ms2
+    f64 d_ms = (seg_d_f / n_bench_f) / ns_per_ms2
+    f64 t_ms = (seg_tot_f / n_bench_f) / ns_per_ms2
+    // Percentages of measured segment total.
+    f64 hundred = 100.0
+    f64 a_pct = seg_a_f * hundred / seg_tot_f
+    f64 b_pct = seg_b_f * hundred / seg_tot_f
+    f64 c_pct = seg_c_f * hundred / seg_tot_f
+    f64 d_pct = seg_d_f * hundred / seg_tot_f
+
+    print_str("segment A zeroing:        ")
+    u64 a_ms_s = fmt_f32(f64_to_f32(a_ms), 3); print_str(a_ms_s); dealloc(a_ms_s)
+    print_str(" ms/step  (")
+    u64 a_pct_s = fmt_f32(f64_to_f32(a_pct), 1); print_str(a_pct_s); dealloc(a_pct_s)
+    print_str("%)\n")
+
+    print_str("segment B launch+sync:    ")
+    u64 b_ms_s = fmt_f32(f64_to_f32(b_ms), 3); print_str(b_ms_s); dealloc(b_ms_s)
+    print_str(" ms/step  (")
+    u64 b_pct_s = fmt_f32(f64_to_f32(b_pct), 1); print_str(b_pct_s); dealloc(b_pct_s)
+    print_str("%)\n")
+
+    print_str("segment C loss D2H:       ")
+    u64 c_ms_s = fmt_f32(f64_to_f32(c_ms), 3); print_str(c_ms_s); dealloc(c_ms_s)
+    print_str(" ms/step  (")
+    u64 c_pct_s = fmt_f32(f64_to_f32(c_pct), 1); print_str(c_pct_s); dealloc(c_pct_s)
+    print_str("%)\n")
+
+    print_str("segment D embed adamw:    ")
+    u64 d_ms_s = fmt_f32(f64_to_f32(d_ms), 3); print_str(d_ms_s); dealloc(d_ms_s)
+    print_str(" ms/step  (")
+    u64 d_pct_s = fmt_f32(f64_to_f32(d_pct), 1); print_str(d_pct_s); dealloc(d_pct_s)
+    print_str("%)\n")
+
+    print_str("segment total (A+B+C+D):  ")
+    u64 t_ms_s = fmt_f32(f64_to_f32(t_ms), 3); print_str(t_ms_s); dealloc(t_ms_s)
+    print_str(" ms/step\n")
 
     // VRAM: exact device-buffer footprint of this run (sum of every hipMalloc).
     //   emb+demb = 2*VOCAB*D*4 ; U/V/dU/dV/mU/vU/mV/vV = 8*K*D*R*4 ;
