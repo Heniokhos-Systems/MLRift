@@ -107,8 +107,10 @@ fn main() {
     u64 BS    = BS_DIM
     u64 K     = K_DIM
     u64 R     = R_DIM
+    u64 B     = 8        // batch (BS = B*S, S = 16)
+    u64 S     = 16
 
-    print_str("=== wzma_train_mega: phase-1 embed-gather validation (B=8 S=16 D=384 BS=128) ===\n")
+    print_str("=== wzma_train_mega: embed + WZMA fwd + mean-pool + L2-norm (both views; B=8 S=16 D=384 BS=128) ===\n")
 
     u32 err = hipSetDevice(0)
     if err != 0 { print_str("hipSetDevice failed\n"); exit(1) }
@@ -143,7 +145,7 @@ fn main() {
     file_close(fd)
     print_str("Weights + ids loaded from bench_init.bin.\n")
 
-    // ── GPU buffers (14 kernargs) ─────────────────────────────────────────
+    // ── GPU buffers (17 kernargs) ─────────────────────────────────────────
     u64 d_emb   = 0
     u64 d_ids   = 0
     u64 d_x_out = 0
@@ -156,6 +158,9 @@ fn main() {
     u64 d_alpha = 0
     u64 d_inter = 0
     u64 d_outk  = 0
+    u64 d_ids2  = 0
+    u64 d_v1    = 0
+    u64 d_v2    = 0
     u64 slot
 
     slot = alloc(8); err = hipMalloc(slot, VOCAB * D * 4);   if err != 0 { die_gpu("mEmb",  err) }; unsafe { *(slot as u64) -> d_emb   }; dealloc(slot)
@@ -170,19 +175,24 @@ fn main() {
     slot = alloc(8); err = hipMalloc(slot, BS * K * 4);      if err != 0 { die_gpu("mAlph", err) }; unsafe { *(slot as u64) -> d_alpha }; dealloc(slot)
     slot = alloc(8); err = hipMalloc(slot, BS * K * R * 4);  if err != 0 { die_gpu("mIntr", err) }; unsafe { *(slot as u64) -> d_inter }; dealloc(slot)
     slot = alloc(8); err = hipMalloc(slot, BS * K * D * 4);  if err != 0 { die_gpu("mOutk", err) }; unsafe { *(slot as u64) -> d_outk  }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, BS * 4);          if err != 0 { die_gpu("mIds2", err) }; unsafe { *(slot as u64) -> d_ids2  }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, B * D * 4);       if err != 0 { die_gpu("mV1",   err) }; unsafe { *(slot as u64) -> d_v1    }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, B * D * 4);       if err != 0 { die_gpu("mV2",   err) }; unsafe { *(slot as u64) -> d_v2    }; dealloc(slot)
 
-    // H2D: all forward inputs
+    // H2D: all forward inputs (both views' ids)
     err = hipMemcpy(d_emb,  emb_ptr,  VOCAB * D * 4, 1); if err != 0 { die_gpu("H2D emb",  err) }
-    err = hipMemcpy(d_ids,  ids1_i32, BS * 4,        1); if err != 0 { die_gpu("H2D ids",  err) }
+    err = hipMemcpy(d_ids,  ids1_i32, BS * 4,        1); if err != 0 { die_gpu("H2D ids1", err) }
+    err = hipMemcpy(d_ids2, ids2_i32, BS * 4,        1); if err != 0 { die_gpu("H2D ids2", err) }
     err = hipMemcpy(d_U,    U_ptr,    K * D * R * 4, 1); if err != 0 { die_gpu("H2D U",    err) }
     err = hipMemcpy(d_V,    V_ptr,    K * R * D * 4, 1); if err != 0 { die_gpu("H2D V",    err) }
     err = hipMemcpy(d_gw,   gw_ptr,   K * D * 4,     1); if err != 0 { die_gpu("H2D gw",   err) }
     err = hipMemcpy(d_gb,   gb_ptr,   K * 4,         1); if err != 0 { die_gpu("H2D gb",   err) }
     err = hipMemcpy(d_bias, bias_ptr, D * 4,         1); if err != 0 { die_gpu("H2D bias", err) }
-    print_str("All forward inputs on GPU.\n")
+    print_str("All forward inputs on GPU (both views).\n")
 
-    // ── Launch ONE 1-WG / 512-thread dispatch (embed + WZMA forward) ───────
-    u64 NA = 14
+    // ── Launch ONE 1-WG / 512-thread dispatch (embed + WZMA fwd + pool/norm,
+    //    both views) ────────────────────────────────────────────────────────
+    u64 NA = 17
     u64 p0  = alloc(8); unsafe { *(p0  as u64) = d_ids }
     u64 p1  = alloc(8); unsafe { *(p1  as u64) = d_emb }
     u64 p2  = alloc(8); unsafe { *(p2  as u64) = d_x_out }
@@ -197,6 +207,9 @@ fn main() {
     u64 p11 = alloc(8); unsafe { *(p11 as u64) = d_outk }
     u64 p12 = alloc(8); unsafe { *(p12 as u64) = BS }
     u64 p13 = alloc(8); unsafe { *(p13 as u64) = D }
+    u64 p14 = alloc(8); unsafe { *(p14 as u64) = d_ids2 }
+    u64 p15 = alloc(8); unsafe { *(p15 as u64) = d_v1 }
+    u64 p16 = alloc(8); unsafe { *(p16 as u64) = d_v2 }
     u64 kp = alloc(NA * 8)
     unsafe { *((kp +   0) as u64) = p0 }
     unsafe { *((kp +   8) as u64) = p1 }
@@ -212,6 +225,9 @@ fn main() {
     unsafe { *((kp +  88) as u64) = p11 }
     unsafe { *((kp +  96) as u64) = p12 }
     unsafe { *((kp + 104) as u64) = p13 }
+    unsafe { *((kp + 112) as u64) = p14 }
+    unsafe { *((kp + 120) as u64) = p15 }
+    unsafe { *((kp + 128) as u64) = p16 }
 
     u32 grid  = 1
     u32 block = 512
@@ -222,6 +238,7 @@ fn main() {
 
     dealloc(p0); dealloc(p1); dealloc(p2); dealloc(p3); dealloc(p4); dealloc(p5); dealloc(p6)
     dealloc(p7); dealloc(p8); dealloc(p9); dealloc(p10); dealloc(p11); dealloc(p12); dealloc(p13)
+    dealloc(p14); dealloc(p15); dealloc(p16)
     dealloc(kp)
     print_str("Launch + sync OK.\n")
 
@@ -231,12 +248,17 @@ fn main() {
     err = hipMemcpy(h_x_gpu,   d_x_out, BS * D * 4, 2); if err != 0 { die_gpu("D2H x_out", err) }
     err = hipMemcpy(h_out_gpu, d_out,   BS * D * 4, 2); if err != 0 { die_gpu("D2H out",   err) }
 
-    // ── CPU reference: embed → wzma_f32_fwd (the exact function we match) ───
-    u64 h_x_ref = alloc(BS * D * 4)
-    cpu_embed_i32(h_x_ref, emb_ptr, ids1_i32, BS, D)
+    // ── CPU references ──────────────────────────────────────────────────────
+    // The view loop runs ids1 then ids2 through the SHARED x_out/out scratch,
+    // so the resident GPU x_out/out hold the LAST view (ids2).  v1 (view-0) is
+    // built from the ids1 wzma_fwd output (h_out_ref); the embed/wzma_fwd
+    // scratch checks below use the ids2 references (h_x_ref2/h_out_ref2).
+    // wzma_f32_fwd treats x as [B,S,D]; with B=BS, S=1 the (b*S+s) index == bs,
+    // matching the GPU [BS,D] flat layout exactly.
 
-    // wzma_f32_fwd treats x as [B,S,D]; with B=BS, S=1 the (b*S+s) index ==
-    // bs, matching the GPU [BS,D] flat layout exactly.
+    // ids1 (view-0) — used by the v1 mean-pool + L2-norm reference.
+    u64 h_x_ref     = alloc(BS * D * 4)
+    cpu_embed_i32(h_x_ref, emb_ptr, ids1_i32, BS, D)
     u64 h_out_ref   = alloc(BS * D * 4)
     u64 ref_alpha   = alloc(BS * K * 4)
     u64 ref_inter   = alloc(BS * K * R * 4)
@@ -244,14 +266,24 @@ fn main() {
     wzma_f32_fwd(h_x_ref, h_out_ref, U_ptr, V_ptr, gw_ptr, gb_ptr, bias_ptr,
                  BS, 1, D, K, R, ref_alpha, ref_inter, ref_outk)
 
-    // ── Compare embed output (bit-exact) ────────────────────────────────────
+    // ids2 (view-1, last view) — matches the resident GPU x_out/out scratch.
+    u64 h_x_ref2    = alloc(BS * D * 4)
+    cpu_embed_i32(h_x_ref2, emb_ptr, ids2_i32, BS, D)
+    u64 h_out_ref2  = alloc(BS * D * 4)
+    u64 ref_alpha2  = alloc(BS * K * 4)
+    u64 ref_inter2  = alloc(BS * K * R * 4)
+    u64 ref_outk2   = alloc(BS * K * D * 4)
+    wzma_f32_fwd(h_x_ref2, h_out_ref2, U_ptr, V_ptr, gw_ptr, gb_ptr, bias_ptr,
+                 BS, 1, D, K, R, ref_alpha2, ref_inter2, ref_outk2)
+
+    // ── Compare embed output (bit-exact) — GPU scratch is view-1 (ids2) ──────
     f32 max_err_e = 0.0f
     u64 ne = BS * D
     u64 ie = 0
     while ie < ne {
         f32 g = 0.0f; f32 r = 0.0f
-        unsafe { *((h_x_gpu + ie * 4) as f32) -> g }
-        unsafe { *((h_x_ref + ie * 4) as f32) -> r }
+        unsafe { *((h_x_gpu  + ie * 4) as f32) -> g }
+        unsafe { *((h_x_ref2 + ie * 4) as f32) -> r }
         f32 e = abs_f32(g - r)
         if e > max_err_e { max_err_e = e }
         ie = ie + 1
@@ -261,14 +293,14 @@ fn main() {
     u64 ese = fmt_f32(max_err_e, 7); print_str(ese); dealloc(ese)
     print_str("\n")
 
-    // ── Compare WZMA forward output over BS*D ────────────────────────────────
+    // ── Compare WZMA forward output over BS*D — GPU scratch is view-1 (ids2) ──
     f32 max_err = 0.0f
     u64 n = BS * D
     u64 i = 0
     while i < n {
         f32 g = 0.0f; f32 r = 0.0f
-        unsafe { *((h_out_gpu + i * 4) as f32) -> g }
-        unsafe { *((h_out_ref + i * 4) as f32) -> r }
+        unsafe { *((h_out_gpu  + i * 4) as f32) -> g }
+        unsafe { *((h_out_ref2 + i * 4) as f32) -> r }
         f32 e = abs_f32(g - r)
         if e > max_err { max_err = e }
         i = i + 1
@@ -278,7 +310,103 @@ fn main() {
     u64 es = fmt_f32(max_err, 7); print_str(es); dealloc(es)
     print_str("\n")
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // Task 3: validate v1[B,D] = L2norm(mean_pool_S(wzma_fwd(embed(ids1))))
+    // against PyTorch GPU encoder output bench_gpu_v1.bin (the GPU↔GPU gate).
+    // ═══════════════════════════════════════════════════════════════════════
+    u64 h_v1_gpu = alloc(B * D * 4)
+    u64 h_v2_gpu = alloc(B * D * 4)
+    err = hipMemcpy(h_v1_gpu, d_v1, B * D * 4, 2); if err != 0 { die_gpu("D2H v1", err) }
+    err = hipMemcpy(h_v2_gpu, d_v2, B * D * 4, 2); if err != 0 { die_gpu("D2H v2", err) }
+
+    // CPU reference (exact port of std/train.mlr mean_pool_s_f32 + l2_normalize_f32)
+    // over the GPU's own wzma_fwd output, then compare GPU↔CPU (consistency).
+    u64 h_pooled_ref = alloc(B * D * 4)
+    mean_pool_s_f32(h_out_ref, h_pooled_ref, B, S, D)
+    l2_normalize_f32(h_pooled_ref, B, D)
+
+    // Load PyTorch GPU encoder reference v1[B,D].
+    u64 v1_path = "/home/pantelis/Desktop/Projects/Work/MLRiftBench/tools/bench_gpu_v1.bin"
+    u64 h_v1_bench = alloc(B * D * 4)
+    u64 vfd = file_open(v1_path, 0)
+    if vfd > 0xFFFFFFFFFFFFF000 {
+        print_str("Cannot open bench_gpu_v1.bin\n")
+        hipkfd_teardown(); exit(1)
+    }
+    file_read(vfd, h_v1_bench, B * D * 4)
+    file_close(vfd)
+
+    // GPU v1 vs PyTorch GPU bench (THE gate).
+    f32 max_err_v1 = 0.0f
+    u64 nv = B * D
+    u64 iv = 0
+    while iv < nv {
+        f32 g = 0.0f; f32 r = 0.0f
+        unsafe { *((h_v1_gpu   + iv * 4) as f32) -> g }
+        unsafe { *((h_v1_bench + iv * 4) as f32) -> r }
+        f32 e = abs_f32(g - r)
+        if e > max_err_v1 { max_err_v1 = e }
+        iv = iv + 1
+    }
+    if max_err_v1 < 1e-3f { print_str("v1 PASS max_err ") }
+    else                  { print_str("v1 FAIL max_err ") }
+    u64 ev1 = fmt_f32(max_err_v1, 7); print_str(ev1); dealloc(ev1)
+    print_str("\n")
+
+    // GPU v1 vs CPU-ref v1 (std/train.mlr consistency check).
+    f32 max_err_v1c = 0.0f
+    iv = 0
+    while iv < nv {
+        f32 g = 0.0f; f32 r = 0.0f
+        unsafe { *((h_v1_gpu     + iv * 4) as f32) -> g }
+        unsafe { *((h_pooled_ref + iv * 4) as f32) -> r }
+        f32 e = abs_f32(g - r)
+        if e > max_err_v1c { max_err_v1c = e }
+        iv = iv + 1
+    }
+    if max_err_v1c < 1e-3f { print_str("v1-vs-CPU PASS max_err ") }
+    else                   { print_str("v1-vs-CPU FAIL max_err ") }
+    u64 ev1c = fmt_f32(max_err_v1c, 7); print_str(ev1c); dealloc(ev1c)
+    print_str("\n")
+
+    // GPU v2 vs CPU-ref v2 (view-1 mean-pool + L2-norm of ids2 fwd).
+    u64 h_pooled_ref2 = alloc(B * D * 4)
+    mean_pool_s_f32(h_out_ref2, h_pooled_ref2, B, S, D)
+    l2_normalize_f32(h_pooled_ref2, B, D)
+    f32 max_err_v2c = 0.0f
+    iv = 0
+    while iv < nv {
+        f32 g = 0.0f; f32 r = 0.0f
+        unsafe { *((h_v2_gpu      + iv * 4) as f32) -> g }
+        unsafe { *((h_pooled_ref2 + iv * 4) as f32) -> r }
+        f32 e = abs_f32(g - r)
+        if e > max_err_v2c { max_err_v2c = e }
+        iv = iv + 1
+    }
+    if max_err_v2c < 1e-3f { print_str("v2-vs-CPU PASS max_err ") }
+    else                   { print_str("v2-vs-CPU FAIL max_err ") }
+    u64 ev2c = fmt_f32(max_err_v2c, 7); print_str(ev2c); dealloc(ev2c)
+    print_str("\n")
+
+    // Sanity: v2 differs from v1 (two distinct views actually ran).
+    f32 max_diff_v = 0.0f
+    iv = 0
+    while iv < nv {
+        f32 a = 0.0f; f32 c = 0.0f
+        unsafe { *((h_v1_gpu + iv * 4) as f32) -> a }
+        unsafe { *((h_v2_gpu + iv * 4) as f32) -> c }
+        f32 e = abs_f32(a - c)
+        if e > max_diff_v { max_diff_v = e }
+        iv = iv + 1
+    }
+    print_str("v1-v2 max abs diff (should be >0): ")
+    u64 evd = fmt_f32(max_diff_v, 7); print_str(evd); dealloc(evd)
+    print_str("\n")
+
     // ── Cleanup (teardown is MANDATORY before every exit path) ─────────────
+    hipFree(d_ids2)
+    hipFree(d_v1)
+    hipFree(d_v2)
     hipFree(d_emb)
     hipFree(d_ids)
     hipFree(d_x_out)
