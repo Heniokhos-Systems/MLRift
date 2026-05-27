@@ -8637,7 +8637,17 @@ fn _wzm_emit_adamw_embed(uint64 p_kofs, uint64 g_kofs,
 //   0x50 D      (by-value u64)     → s32
 //
 // B=8, S=16, K=4 are hardcoded (bench dims), matching the mega-kernel.
-// ═══════════════════════════════════════════════════════════════════════════
+//
+// FWD_TAIL_NW: number of workgroups for the standalone fwd_tail dispatch.
+//   The mean-pool / L2 / softmax reductions are all PER-ROW independent
+//   (each output row b owns the S=BS/B contiguous BS-rows [b*S,(b+1)*S) in
+//   Phase A and emits exactly output row b in Phase B), so the kernel
+//   parallelizes cleanly over the B=8 encoder rows with NO cross-WG reduce.
+//   At FWD_TAIL_NW==1 every gated branch falls through to the original
+//   single-WG full-BS loop → byte-identical to the pre-parallel emitter.
+//   At FWD_TAIL_NW==8 WG b=wg_id_x (s3) handles only its own row(s).
+//   Reductions stay intra-WG (LDS tree + s_barrier) — fully race-free.
+static uint64 FWD_TAIL_NW = 8
 fn amdgpu_lower_wzma_fwd_tail(uint64 kname_ptr, uint64 nl) -> uint64 {
     asm_init()
 
@@ -8665,9 +8675,21 @@ fn amdgpu_lower_wzma_fwd_tail(uint64 kname_ptr, uint64 nl) -> uint64 {
     asm_u32(0x7E120280)                // v_mov_b32_e32 v9, 0
     asm_v_mov_b32_lit32(23, 0x3FB8AA3B)   // v23 = 1.44269504 (log2 e)
 
-    wzm_s_mov_b32_0(34)                // s34 = bs = 0
+    // ── Per-WG BS-row partition (Phase A) ──
+    //   NW==1: bs runs 0..BS (s34=0, bound = s30=BS) — byte-identical to oracle.
+    //   NW>1 : WG b=s3 owns rows [b*S, (b+1)*S), S=BS/B=BS>>3 (B=8 hardcoded).
+    //          s39=S ; s34=lo=b*S ; s31=hi=lo+S ; bound = s31.
+    uint64 a_bound = 30                 // SGPR# of exclusive upper bound
+    if FWD_TAIL_NW <= 1 {
+        wzm_s_mov_b32_0(34)            // s34 = bs = 0
+    } else {
+        asm_u32(0x85000000 | (39 << 16) | (0x83 << 8) | 30)   // s39 = BS >> 3 = S
+        wzm_s_mul_i32_ss(34, 3, 39)    // s34 = lo = wg_id * S
+        wzm_s_add_u32_ss(31, 34, 39)   // s31 = hi = lo + S
+        a_bound = 31
+    }
     uint64 a_loop_top = asm_text_len / 4
-    asm_u32(0xBF090000 | (30 << 8) | 34)   // s_cmp_ge_u32 s34, s30(BS)  (bs >= BS)
+    asm_u32(0xBF090000 | (a_bound << 8) | 34)   // s_cmp_ge_u32 s34, bound  (bs >= bound)
     uint64 a_loop_exit = asm_text_len / 4
     asm_u32(0xBFA20000)                // s_cbranch_scc1 .La_end (patched)
 
@@ -8795,9 +8817,23 @@ fn amdgpu_lower_wzma_fwd_tail(uint64 kname_ptr, uint64 nl) -> uint64 {
     wzm_v_shl2_e32(6, 0)                  // v6 = d*4 (reduce-tree LDS offset)
     asm_u32(0x7E120280)                   // v_mov_b32_e32 v9, 0 (broadcast ds addr)
 
-    wzm_s_mov_b32_0(34)                   // s34 = b = 0
+    // ── Per-WG B-row partition (Phase B) ──
+    //   NW==1: b runs 0..B (s34=0, bound = inline 8) — byte-identical to oracle.
+    //   NW>1 : WG b=s3 emits exactly its own output row b (bound = b+1 in s31).
+    uint64 p_bound_use_imm = 1
+    if FWD_TAIL_NW <= 1 {
+        wzm_s_mov_b32_0(34)               // s34 = b = 0
+    } else {
+        asm_u32(0xBE800000 | (34 << 16) | 0x03)   // s_mov_b32 s34, s3  (b = wg_id)
+        wzm_s_add_u32_1(31, 34)           // s31 = b + 1  (exclusive bound)
+        p_bound_use_imm = 0
+    }
     uint64 p_loop_top = asm_text_len / 4
-    asm_u32(0xBF090000 | (0x88 << 8) | 34)   // s_cmp_ge_u32 s34, 8  (b >= B)
+    if p_bound_use_imm != 0 {
+        asm_u32(0xBF090000 | (0x88 << 8) | 34)   // s_cmp_ge_u32 s34, 8  (b >= B)
+    } else {
+        asm_u32(0xBF090000 | (31 << 8) | 34)     // s_cmp_ge_u32 s34, s31(=b+1)
+    }
     uint64 p_loop_exit = asm_text_len / 4
     asm_u32(0xBFA20000)                   // s_cbranch_scc1 .Lpool_end (patched)
 
