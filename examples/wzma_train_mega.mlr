@@ -831,19 +831,48 @@ fn main() {
         // ── Sparse embedding AdamW (CPU) + sparse D2H/H2D of touched rows ──
         // Only the precomputed uniq_rows carry nonzero gradients; D2H/H2D just
         // those rows (D*4 bytes each) instead of the whole 12.6 MB table.
+        //
+        // PERF (2026-05-27): the OLD form interleaved [D2H row][CPU AdamW][H2D row]
+        // per row.  Restructured into THREE non-interleaved phases to remove any
+        // interleave stalls and let same-direction copies pipeline:
+        //   D.1  loop: D2H every touched row's grad into the packed h_demb buffer
+        //   D.2  loop: CPU AdamW on all touched rows (pure CPU, no GPU calls)
+        //   D.3  loop: H2D every updated embedding row back to d_emb
+        // (h_demb / emb_ptr / m_emb / v_emb are already full-VOCAB host buffers
+        // indexed by row, so the rows are naturally packed — no extra staging.)
+        //
+        // RESULT: segment D stayed ~45.9 ms (was ~45.8 ms) — restructure is a
+        // NO-OP for perf.  This DECISIVELY proves the bottleneck is per-call KFD
+        // -shim D2H completion-wait latency (~230 us/row * ~200 rows), NOT
+        // interleave/pipelining.  Same-direction batching can't help while the
+        // call COUNT is unchanged.  The real fix is a GPU embed-AdamW kernel that
+        // updates the touched rows in-place on-device (eliminating the ~200 D2H +
+        // ~200 H2D round-trips entirely) — that is a separate (emitter/.co) task.
+        // Kept the 3-phase form anyway: it is correctness-neutral and is the right
+        // host-side structure once the per-row copies are replaced by 1 bulk copy.
         // ── Segment D start: EMBED SPARSE ADAMW ──
         u64 seg_d_t0 = time_now()
+        // D.1 — coalesce all grad D2H copies (no interleaved CPU/H2D work).
         u64 uii = 0
         while uii < n_uniq_rows {
             u64 row = 0; unsafe { *((uniq_rows + uii * 8) as u64) -> row }
-            // D2H this row's gradient.
             err = hipMemcpy(h_demb + row * D * 4, d_demb + row * D * 4, D * 4, 2)
             if err != 0 { die_gpu("D2H demb_row", err) }
-            // CPU AdamW on the embedding row.
+            uii = uii + 1
+        }
+        // D.2 — pure-CPU AdamW on every touched row (no GPU calls in this loop).
+        uii = 0
+        while uii < n_uniq_rows {
+            u64 row = 0; unsafe { *((uniq_rows + uii * 8) as u64) -> row }
             adamw_step(emb_ptr + row * D * 4, h_demb + row * D * 4,
                        m_emb + row * D * 4, v_emb + row * D * 4,
                        D, step1, lr, beta1, beta2, eps, wd)
-            // H2D the updated embedding row.
+            uii = uii + 1
+        }
+        // D.3 — coalesce all updated-row H2D copies (no interleaved CPU/D2H work).
+        uii = 0
+        while uii < n_uniq_rows {
+            u64 row = 0; unsafe { *((uniq_rows + uii * 8) as u64) -> row }
             err = hipMemcpy(d_emb + row * D * 4, emb_ptr + row * D * 4, D * 4, 1)
             if err != 0 { die_gpu("H2D emb_row", err) }
             uii = uii + 1
