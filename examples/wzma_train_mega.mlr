@@ -54,7 +54,7 @@ static u64 R_DIM     = 32
 //   Must equal MEGA_TRAIN_NW in src/format_amdgpu_megakernel.mlr (the kernel
 //   splits BS=128 rows into NW per-WG ranges).  Keep NW=1 for now: launches
 //   ONE 512-thread dispatch per step — byte-identical to the single-WG oracle.
-static u64 WZMA_MEGA_NW = 1
+static u64 WZMA_MEGA_NW = 8
 
 // Task 3: per-WG dense-grad partial slot stride (bytes).  Must match
 // WZM_PART_SLOT in src/format_amdgpu_megakernel.mlr:
@@ -712,43 +712,69 @@ fn main() {
         if step == 0          { loss0_saved = loss_s }
         if step == STEPS - 1  { lossN_saved = loss_s }
 
-        // ── Task 3 debug: verify the cross-WG REDUCE is a faithful copy at NW=1.
-        // At NW=1 the reduce is final[e] = partial[0][e] (identity), so the final
-        // dU/dV/dgw/dgb/dbias buffers MUST equal partial slot 0 element-wise
-        // (max_err 0).  The AdamW phase runs AFTER the reduce and modifies only
-        // param/m/v (not the grads), so the grads still hold the reduced values.
-        // (Partial slot 0 is at d_partial+0; SLOT offsets: dU 0, dV 196608,
-        // dgw 393216, dgb 399360, dbias 399376.)  demb (the 6th grad) is the
-        // per-row embed grad — written DIRECTLY (no reduce), checked via the loss
-        // trajectory + the existing sparse-AdamW path; reported here for context.
+        // ── Task 4 debug: cross-WG REDUCE correctness vs the NW=1 ORACLE grads.
+        // The 5 reduced dense grads (dU,dV,dgw,dgb,dbias) at step 0 are compared
+        // against an oracle dumped by the NW=1 build.  At NW=1 the reduce is an
+        // identity copy of partial[0]; at NW>1 it SUMS NW per-WG partial slots in
+        // a fixed wg order.  The sum-of-partials math equals the single-WG inline
+        // accumulation modulo float add-order, so the reduced grads must match the
+        // NW=1 oracle to ≤1e-3 (likely much tighter; the per-element add order is
+        // identical regardless of owning thread — see _wzm_emit_reduce_grad).
+        //
+        //   WZMA_MEGA_NW==1 → DUMP the 5 final grads to oracle_grads.bin.
+        //   WZMA_MEGA_NW> 1 → LOAD oracle_grads.bin and compare element-wise.
+        // (demb, the 6th grad, is written DIRECTLY per row — no reduce — and is
+        // covered by the loss trajectory + sparse-AdamW path.)
         if step == 0 {
-            print_str("--- Task 3: reduce identity check (NW=1) vs partial slot 0 ---\n")
-            u64 hg = alloc(K * D * R * 4)   // big enough for the largest grad (49152 f32)
-            u64 hr = alloc(K * D * R * 4)
-            u64 red_ok = 1
-            // dU  (N=49152, partial off 0)
-            err = hipMemcpy(hg, d_dU, K*D*R*4, 2);            if err != 0 { die_gpu("D2H dU", err) }
-            err = hipMemcpy(hr, d_partial + 0, K*D*R*4, 2);   if err != 0 { die_gpu("D2H pU", err) }
-            if cmp_grad("dU", hg, hr, K*D*R) == 0 { red_ok = 0 }
-            // dV  (N=49152, partial off 196608)
-            err = hipMemcpy(hg, d_dV, K*R*D*4, 2);            if err != 0 { die_gpu("D2H dV", err) }
-            err = hipMemcpy(hr, d_partial + 196608, K*R*D*4, 2); if err != 0 { die_gpu("D2H pV", err) }
-            if cmp_grad("dV", hg, hr, K*R*D) == 0 { red_ok = 0 }
-            // dgw (N=1536, partial off 393216)
-            err = hipMemcpy(hg, d_dgw, K*D*4, 2);             if err != 0 { die_gpu("D2H dgw", err) }
-            err = hipMemcpy(hr, d_partial + 393216, K*D*4, 2);   if err != 0 { die_gpu("D2H pgw", err) }
-            if cmp_grad("dgw", hg, hr, K*D) == 0 { red_ok = 0 }
-            // dgb (N=4, partial off 399360)
-            err = hipMemcpy(hg, d_dgb, K*4, 2);               if err != 0 { die_gpu("D2H dgb", err) }
-            err = hipMemcpy(hr, d_partial + 399360, K*4, 2);     if err != 0 { die_gpu("D2H pgb", err) }
-            if cmp_grad("dgb", hg, hr, K) == 0 { red_ok = 0 }
-            // dbias (N=384, partial off 399376)
-            err = hipMemcpy(hg, d_dbias, D*4, 2);             if err != 0 { die_gpu("D2H dbias", err) }
-            err = hipMemcpy(hr, d_partial + 399376, D*4, 2);     if err != 0 { die_gpu("D2H pbias", err) }
-            if cmp_grad("dbias", hg, hr, D) == 0 { red_ok = 0 }
-            dealloc(hg); dealloc(hr)
-            if red_ok == 1 { print_str("REDUCE identity check: all 5 dense grads == partial[0]  PASS\n") }
-            else           { print_str("REDUCE identity check: FAIL\n") }
+            u64 grad_path = "/home/pantelis/mlrift_bin/wzma_train/oracle_grads.bin"
+            u64 nU = K*D*R; u64 nV = K*R*D; u64 nGW = K*D; u64 nGB = K; u64 nBIAS = D
+            u64 bU = nU*4; u64 bV = nV*4; u64 bGW = nGW*4; u64 bGB = nGB*4; u64 bBIAS = nBIAS*4
+            // Pull the 5 reduced final grads to host.
+            u64 hU    = alloc(bU);    err = hipMemcpy(hU,    d_dU,    bU,    2); if err != 0 { die_gpu("D2H dU", err) }
+            u64 hV    = alloc(bV);    err = hipMemcpy(hV,    d_dV,    bV,    2); if err != 0 { die_gpu("D2H dV", err) }
+            u64 hGW   = alloc(bGW);   err = hipMemcpy(hGW,   d_dgw,   bGW,   2); if err != 0 { die_gpu("D2H dgw", err) }
+            u64 hGB   = alloc(bGB);   err = hipMemcpy(hGB,   d_dgb,   bGB,   2); if err != 0 { die_gpu("D2H dgb", err) }
+            u64 hBIAS = alloc(bBIAS); err = hipMemcpy(hBIAS, d_dbias, bBIAS, 2); if err != 0 { die_gpu("D2H dbias", err) }
+
+            if WZMA_MEGA_NW == 1 {
+                // Oracle dump (run this build FIRST).
+                print_str("--- Task 4: dumping NW=1 ORACLE grads → oracle_grads.bin ---\n")
+                u64 fd = file_open(grad_path, 1)
+                if fd == 0 { print_str("Cannot open oracle_grads.bin for write\n") }
+                else {
+                    file_write(fd, hU,    bU)
+                    file_write(fd, hV,    bV)
+                    file_write(fd, hGW,   bGW)
+                    file_write(fd, hGB,   bGB)
+                    file_write(fd, hBIAS, bBIAS)
+                    file_close(fd)
+                    print_str("ORACLE grads dumped (dU,dV,dgw,dgb,dbias).\n")
+                }
+            } else {
+                // Compare vs the NW=1 oracle.
+                print_str("--- Task 4: REDUCE check (NW>1) vs NW=1 oracle_grads.bin ---\n")
+                u64 fd = file_open(grad_path, 0)
+                if fd == 0 {
+                    print_str("Cannot open oracle_grads.bin — run the NW=1 build first!\n")
+                } else {
+                    u64 oU    = alloc(bU);    file_read(fd, oU,    bU)
+                    u64 oV    = alloc(bV);    file_read(fd, oV,    bV)
+                    u64 oGW   = alloc(bGW);   file_read(fd, oGW,   bGW)
+                    u64 oGB   = alloc(bGB);   file_read(fd, oGB,   bGB)
+                    u64 oBIAS = alloc(bBIAS); file_read(fd, oBIAS, bBIAS)
+                    file_close(fd)
+                    u64 red_ok = 1
+                    if cmp_grad("dU",    hU,    oU,    nU)    == 0 { red_ok = 0 }
+                    if cmp_grad("dV",    hV,    oV,    nV)    == 0 { red_ok = 0 }
+                    if cmp_grad("dgw",   hGW,   oGW,   nGW)   == 0 { red_ok = 0 }
+                    if cmp_grad("dgb",   hGB,   oGB,   nGB)   == 0 { red_ok = 0 }
+                    if cmp_grad("dbias", hBIAS, oBIAS, nBIAS) == 0 { red_ok = 0 }
+                    dealloc(oU); dealloc(oV); dealloc(oGW); dealloc(oGB); dealloc(oBIAS)
+                    if red_ok == 1 { print_str("REDUCE vs oracle: all 5 dense grads <=1e-3  PASS\n") }
+                    else           { print_str("REDUCE vs oracle: FAIL\n") }
+                }
+            }
+            dealloc(hU); dealloc(hV); dealloc(hGW); dealloc(hGB); dealloc(hBIAS)
         }
 
         // Per-step assertion vs reference (tol 1e-2).
