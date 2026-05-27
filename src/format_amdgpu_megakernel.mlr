@@ -7901,42 +7901,87 @@ fn _wzm_emit_wzma_bwd_view(uint64 x_saddr, uint64 alpha_saddr,
     }
     asm_u32(0xBF8903F7)
 
-    // ── g[k,r] = sum_d dy[d]*V[k,r,d] → LDS[2048 + (k*32+r)*4], K unrolled ──
-    uint64 gk = 0
-    while gk < 4 {
-        wzm_s_mov_b32_0(36)               // r = 0
-        uint64 gr_top = asm_text_len / 4
-        asm_u32(0xBF090000 | (0xA0 << 8) | 36)   // r >= 32
-        uint64 gr_exit = asm_text_len / 4
-        asm_u32(0xBFA20000)
-        wzm_s_mov_b32_lit(35, gk * 12288)
-        wzm_s_mul_i32_lit(37, 36, 0x180)  // r*384
-        wzm_s_add_u32_ss(35, 35, 37)
-        wzm_v_add_nc_u32_sv(1, 35, 0)     // + d
-        wzm_v_shl2_e32(1, 1)
-        wzm_clamp_off_dlt_D(1)
-        wzm_gload_b32_saddr(16, 1, 12)    // V[k,r,d]  (s[12:13])
-        asm_u32(0xBF8903F7)
-        wzm_v_mul_f32_e32(5, 10, 16)      // dy*V
-        _emit_lds_reduce_tree_512()
-        wzm_ds_load_b32(16, 9, 0)         // v16 = g[k,r]
-        asm_u32(0xBF89FC07)
-        asm_u32(0x7C940080)               // lane 0
-        asm_u32(0xBE82206A)               // saveexec s2
-        wzm_s_mov_b32_lit(37, gk * 128)
-        wzm_s_lshl2(38, 36)
-        wzm_s_add_u32_ss(37, 37, 38)
-        wzm_v_mov_s(1, 37)
-        wzm_ds_store_b32(1, 16, 2048)     // LDS g[k,r]
-        asm_u32(0xBF89FC07)
-        asm_u32(0xBEFE0002)
-        wzm_s_add_u32_1(36, 36)
-        uint64 gr_back = (gr_top - (asm_text_len / 4) - 1) & 0xFFFF
-        asm_u32(0xBFA00000 | gr_back)
-        uint64 gr_end = asm_text_len / 4
-        asm_patch_u32(gr_exit, 0xBFA20000 | ((gr_end - gr_exit - 1) & 0xFFFF))
-        gk = gk + 1
-    }
+    // ── g[k,r] = sum_d dy[d]*V[k,r,d]  — TILED GEMM (Task 3 V-bwd dinter) ──────
+    // g[k,r] is the V-backward inner product: dinter[k,r] = alpha_k · g[k,r],
+    // dinter[k,bs,r] = Σ_d doutk[k,bs,d]·V[k,r,d] (contraction over D=384).
+    //
+    // OLD path ran K*R = 128 full 512-lane LDS reduce trees per bs row (~9
+    // barriers each → ~1150 barriers/row) — this was THE reduce-tree cost of the
+    // V backward.  NEW path (mirrors Task 1's inter tiling): stage dy[bs,:] in
+    // LDS ONCE, then lanes g=0..127 each compute ONE g[k,r] dot serially from
+    // registers (zero barriers in the inner loop).  Output map: g → (k = g>>5,
+    // r = g&31).  V element index for (k,r,d) = k*R*D + r*D + d = k*12288 +
+    // r*384 + d; the per-lane d-stride is 1 element = 4 bytes.  dy[d] is a
+    // uniform LDS broadcast (same addr every lane), so no global dy re-read.
+    // Summation order is now sequential d=0..383 (vs the reduce tree's pairwise
+    // order) — within the 1e-2 loss / 1e-3 grad tolerances (NW=1 dV oracle is
+    // regenerated against this order, exactly as Task 1 did for inter).
+    //
+    // ⚠ OOB rule (feedback_oob_address_pad_lane_wedge): only lanes g<128 issue
+    // the global V load; lanes 128..511 are exec-gated OFF for the whole block,
+    // so no inactive/edge lane forms an out-of-range V address.  Max in-bounds V
+    // elem = 3*12288+31*384+383 = 49151 = K*R*D-1.  The dy stage is gated d<D so
+    // LDS writes stay in [0..1535]; the dy broadcast read is at v2=d*4<1536.
+    //
+    // ── Stage dy[bs,:] into LDS[d*4] (d<D lanes; OOB-gated). dy[d] in v10, v6=d*4
+    asm_u32(0x7C980020)                  // v_cmp_gt_u32_e32 vcc_lo, s32, v0  (d<D)
+    asm_u32(0xBE82206A)                  // s_and_saveexec_b32 s2, vcc_lo  (gate d<D)
+    wzm_ds_store_b32(6, 10, 0)           // LDS[v6 = d*4] = dy[bs,d]  (v10)
+    asm_u32(0xBF89FC07)                  // lgkmcnt(0)
+    asm_u32(0xBEFE0002)                  // restore full exec
+    asm_u32(0xBFBD0000)                  // s_barrier — dy panel visible to all lanes
+
+    // ── Compute lanes g<128: g[k,r] = Σ_d dy[d]·V[k,r,d] (register dot) ──
+    asm_u32(0x7C9800FF)                  // v_cmp_gt_u32_e32 vcc_lo, 128, v0  (g<128)
+    asm_u32(0x00000080)                  // literal 128
+    asm_u32(0xBE82206A)                  // s_and_saveexec_b32 s2, vcc_lo  (gate g<128)
+    uint64 gg_execz = asm_text_len / 4
+    asm_u32(0xBFA50000)                  // s_cbranch_execz .Lg_end (patched)
+    // r = g & 31 ; k = g >> 5
+    wzm_v_and_b32_iv(21, 31, 0)          // v21 = r = g & 31
+    wzm_v_lshrrev_iv(18, 5, 0)           // v18 = k = g >> 5
+    // V elem base (d=0) = k*12288 + r*384.  12288 = 2^13+2^12 ; 384 = 2^8+2^7.
+    asm_v_lshlrev_b32_imm(16, 13, 18)    // v16 = k<<13
+    asm_v_lshlrev_b32_imm(19, 12, 18)    // v19 = k<<12
+    asm_u32((0x25 << 25) | (16 << 17) | (19 << 9) | (0x100 | 16))   // v_add_nc_u32 v16, v16, v19  (= k*12288)
+    asm_v_lshlrev_b32_imm(5,  8,  21)    // v5 = r<<8
+    asm_v_lshlrev_b32_imm(19, 7,  21)    // v19 = r<<7
+    asm_u32((0x25 << 25) | (5 << 17)  | (19 << 9) | (0x100 | 5))    // v_add_nc_u32 v5, v5, v19    (= r*384)
+    asm_u32((0x25 << 25) | (16 << 17) | (5 << 9)  | (0x100 | 16))   // v_add_nc_u32 v16, v16, v5   (+ r*384)
+    wzm_v_shl2_e32(19, 16)               // v19 = V byte offset (d=0) = elem*4
+    asm_u32(0x7E280280)                  // v_mov_b32_e32 v20, 0  (accumulator)
+    asm_u32(0x7E040280)                  // v_mov_b32_e32 v2, 0   (LDS dy byte addr = d*4)
+    asm_v_mov_b32_lit32(3, 4)            // v3 = 4 (= per-d V byteoff stride, 1 elem)
+    // d loop (s36 = d = 0..383)
+    wzm_s_mov_b32_0(36)                  // s36 = d = 0
+    uint64 gd_top = asm_text_len / 4
+    asm_u32(0xBF090000 | (32 << 8) | 36) // s_cmp_ge_u32 s36, s32(D)  (d >= D)
+    uint64 gd_exit = asm_text_len / 4
+    asm_u32(0xBFA20000)                  // s_cbranch_scc1 .Lgd_end (patch)
+    wzm_ds_load_b32(5, 2, 0)             // v5 = dy[d]  (LDS broadcast at v2=d*4)
+    asm_u32(0xBF89FC07)                  // lgkmcnt(0)
+    wzm_gload_b32_saddr(16, 19, 12)      // v16 = V[k,r,d]  (s[12:13], byteoff v19)
+    asm_u32(0xBF8903F7)                  // vmcnt(0)
+    asm_v_fma_f32_e64_vvv(20, 5, 16, 20) // acc += dy[d]*V[k,r,d]
+    // advance: V byteoff += 4 (v3) ; LDS dy addr += 4
+    wzm_v_add_nc_u32_iv(2, 4, 2)         // v2 += 4
+    asm_u32((0x25 << 25) | (19 << 17) | (3 << 9) | (0x100 | 19))   // v_add_nc_u32 v19, v19, v3  (+4)
+    wzm_s_add_u32_1(36, 36)              // d += 1
+    uint64 gd_back = (gd_top - (asm_text_len / 4) - 1) & 0xFFFF
+    asm_u32(0xBFA00000 | gd_back)        // s_branch .Lgd_top
+    uint64 gd_end = asm_text_len / 4
+    asm_patch_u32(gd_exit, 0xBFA20000 | ((gd_end - gd_exit - 1) & 0xFFFF))
+    // result g[k,r] in v20.  Store to LDS[2048 + g*4]  (= 2048 + (k*32+r)*4,
+    // matching the old k*128 + r*4 layout the downstream consumer reads).
+    wzm_v_shl2_e32(1, 0)                 // v1 = g*4 (LDS rel byte offset)
+    wzm_ds_store_b32(1, 20, 2048)        // LDS[2048 + g*4] = g[k,r]
+    asm_u32(0xBF89FC07)                  // lgkmcnt(0)
+    uint64 gg_end = asm_text_len / 4
+    asm_patch_u32(gg_execz, 0xBFA50000 | ((gg_end - gg_execz - 1) & 0xFFFF))
+    asm_u32(0xBEFE0002)                  // restore full exec
+    asm_u32(0xBFBD0000)                  // s_barrier — g[k,r] visible; fences dy
+                                         //   reads before d_alpha reduce trees
+                                         //   below reuse LDS[0..2047].
 
     // ── d_alpha_k = sum_d dy[d]*outk[k,d] → v(24+k) broadcast (K reduce trees) ──
     uint64 dak = 0
