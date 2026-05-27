@@ -557,6 +557,95 @@ fn mega_emit_barrier_isa(uint64 phase_idx, uint64 wg_persist) {
     asm_u32(0x8C7E037E)
 }
 
+// ── WZMA-training cross-WG barrier (Task 2) ───────────────────────────────
+// _wzm_emit_train_barrier — phase boundary sync for the multi-WG WZMA training
+// mega-kernel.  Replicates the PROVEN mega_emit_barrier_isa sequence (global-
+// atomic counter + spin-poll; ONE dispatch, NOT AQL) but with REGISTERS chosen
+// so it does NOT clobber the train kernel's persistent state:
+//   - mega_emit_barrier_isa hardcodes s3 (saved-exec) + s[8:9] (counter ptr);
+//     in the TRAIN kernel s3 = wg_id_x (read by every phase's WG→row gate) and
+//     s[8:9] = x_out.  Both must survive the barrier.
+//   - This emitter instead uses s78 for saved-exec (otherwise unused) and the
+//     s[76:77] on-demand scratch pair (dead at every phase boundary) for the
+//     barrier counter pointer, which it (re)loads from kernarg d_barrier
+//     (offset 0x1D8) right before the atomic.  s3 (wg_id_x), s[8:9] (x_out),
+//     and all kernarg-home pairs are left intact.
+//
+// Gating: at MEGA_TRAIN_NW<=1 the CALLER emits the original intra-WG s_barrier
+// (0xBFBD0000) so NW=1 stays BYTE-IDENTICAL to the single-WG oracle / Task 1;
+// this fn is only invoked when MEGA_TRAIN_NW>1.
+//
+// phase_idx: monotonically increasing per kernel invocation (each cross-WG
+//   barrier runs EXACTLY ONCE per step — never inside the view loop).  The
+//   counter at d_barrier[0] is monotonic; threshold = (phase_idx+1)*NW.  Caller
+//   must assert (phase_idx+1)*NW <= 0xFFFF (16-bit spin-compare immediate).
+fn _wzm_emit_train_barrier(uint64 phase_idx) {
+    uint64 nw = MEGA_TRAIN_NW
+    uint64 threshold = (phase_idx + 1) * nw
+    if threshold > 0xFFFF {
+        write(2, "_wzm_emit_train_barrier: (phase+1)*NW > 0xFFFF overflow\n", 56)
+        exit(1)
+    }
+
+    // Reload the d_barrier counter pointer into the s[76:77] scratch pair.
+    //   s_load_b64 s[76:77], s[0:1], 0x1D8   (kernarg arg 59 = d_barrier)
+    asm_s_load_b64_off(38, 0, 0x1D8)   // sdata_pair 38 → s[76:77]
+    asm_u32(0xBF89FC07)                // s_waitcnt lgkmcnt(0)
+
+    // ── threadfence ──────────────────────────────────────────────────────
+    asm_s_waitcnt_lgkmcnt_zero()
+    asm_s_waitcnt_vscnt_zero()
+    asm_buffer_gl1_inv()
+    asm_buffer_gl0_inv()
+
+    // ── lane-0 mask ───────────────────────────────────────────────────────
+    asm_v_cmp_eq_u32_imm_vgpr(0, 0)    // v_cmp_eq_u32_e32 vcc_lo, 0, v0
+    asm_s_and_saveexec_b32_vcc_lo(78)  // s78 = old exec; exec &= vcc_lo
+    asm_s_cbranch_execz(9)             // skip 9-dword atomic if lane0 inactive
+
+    // ── lane-0 atomic path (9 dwords) ────────────────────────────────────
+    asm_v_mov_b32_inline_u(1, 0)       // v1 = 0  (vaddr)
+    asm_v_mov_b32_inline_u(2, 1)       // v2 = 1  (vdata = increment)
+    // global_atomic_add_u32 v2, v1, s[76:77]
+    //   word2 = (saddr<<16)|(vdata<<8)|vaddr = (76<<16)|(2<<8)|1
+    asm_u32(0xDCD60000)
+    asm_u32((76 << 16) | (2 << 8) | 1)   // 0x004C0201
+    asm_s_waitcnt_vscnt_zero()
+    asm_buffer_gl1_inv()
+    asm_buffer_gl0_inv()
+
+    // ── restore exec before spin (skip_atomic target) ─────────────────────
+    // s_or_b32 exec_lo, exec_lo, s78   ; 0x8C7E007E | (78<<8) = 0x8C7E4E7E
+    asm_u32(0x8C7E4E7E)
+
+    // ── spin loop (9 dwords) ──────────────────────────────────────────────
+    asm_v_mov_b32_inline_u(1, 0)       // v1 = 0 (vaddr for spin load)
+    // global_load_b32 glc v2, v1, s[76:77]
+    //   word2 = (vdst<<24)|(saddr<<16)|vaddr = (2<<24)|(76<<16)|1
+    asm_u32(0xDC524000)
+    asm_u32((2 << 24) | (76 << 16) | 1)   // 0x024C0001
+    asm_s_waitcnt_vmcnt_zero()
+    asm_buffer_gl0_inv()
+    // v_cmp_gt_u32_e32 vcc_lo, <lit>, v2   ; spin while counter < threshold
+    asm_u32(0x7C9804FF)
+    asm_u32(threshold & 0xFFFFFFFF)
+    asm_s_cbranch_vccnz(0xFFF7)        // simm16 = -9 → back to v_mov v1,0
+
+    // ── restore full exec after spin ─────────────────────────────────────
+    asm_u32(0x8C7E4E7E)               // s_or_b32 exec_lo, exec_lo, s78
+}
+
+// _wzm_emit_phase_barrier — emit the right barrier at a TRUE phase boundary:
+//   NW<=1 → original intra-WG s_barrier (byte-identical to oracle/Task 1)
+//   NW> 1 → cross-WG _wzm_emit_train_barrier(phase_idx)
+fn _wzm_emit_phase_barrier(uint64 phase_idx) {
+    if MEGA_TRAIN_NW <= 1 {
+        asm_u32(0xBFBD0000)            // s_barrier (oracle-identical)
+    } else {
+        _wzm_emit_train_barrier(phase_idx)
+    }
+}
+
 // ── Shared wave-XOR reduce helpers ───────────────────────────────────────
 //
 // _emit_v_xor_b32_e32_imm_v0 — emit v_xor_b32_e32 vdst, imm, v0.
@@ -8662,7 +8751,9 @@ fn amdgpu_lower_wzma_train_mega(uint64 kname_ptr, uint64 nl) -> uint64 {
     //   the hardware exp2/log2 units: exp(x)=exp2(x*log2e), log(x)=log2(x)*ln2.
     //     log2(e) = 0x3FB8AA3B,  ln(2) = 0x3F317218.
     // ═══════════════════════════════════════════════════════════════════════
-    asm_u32(0xBFBD0000)                   // s_barrier — v1/v2 fully written & visible
+    // PHASE BOUNDARY 0: row-parallel front (all WGs, both views) → InfoNCE.
+    // NW>1: cross-WG barrier so all WGs' v1/v2 rows are visible before InfoNCE.
+    _wzm_emit_phase_barrier(0)            // s_barrier — v1/v2 fully written & visible
     wzm_v_shl2_e32(6, 0)                  // v6 = d*4 (reduce-tree LDS offset)
     asm_u32(0x7E120280)                   // v_mov_b32_e32 v9, 0 (broadcast ds addr)
 
@@ -8847,7 +8938,9 @@ fn amdgpu_lower_wzma_train_mega(uint64 kname_ptr, uint64 nl) -> uint64 {
     // LDS layout (backward): [0..2047] reduce-tree scratch (lane*4),
     //   [2048..2303] dlogits[8,8] (64 f32).
     // ═══════════════════════════════════════════════════════════════════════
-    asm_u32(0xBFBD0000)                   // s_barrier — v1/v2 fully written & visible
+    // PHASE BOUNDARY 1: InfoNCE (1 WG writes d_loss/dlogits) → backward (all
+    // WGs).  NW>1: cross-WG barrier so all WGs see the loss before backward.
+    _wzm_emit_phase_barrier(1)            // s_barrier — v1/v2 fully written & visible
     wzm_v_shl2_e32(6, 0)                  // v6 = d*4 (reduce-tree LDS offset)
     asm_u32(0x7E120280)                   // v_mov_b32_e32 v9, 0 (broadcast ds addr)
 
@@ -9138,7 +9231,11 @@ fn amdgpu_lower_wzma_train_mega(uint64 kname_ptr, uint64 nl) -> uint64 {
     //   passed by-value, computed CPU-side per step (matches std/train.mlr
     //   adamw_step and bp_wzma_gpu_train_v2 launch_adamw exactly).
     // ═══════════════════════════════════════════════════════════════════════
-    asm_u32(0xBFBD0000)   // s_barrier — embed_bwd grads visible before AdamW
+    // PHASE BOUNDARY 2: backward (all WGs accumulate grads) → AdamW.  NW>1:
+    // cross-WG barrier so all grad contributions are visible before the update.
+    // (Task 3 inserts a per-WG-partial reduce phase between these; the AdamW
+    // update itself is element-wise and splits cleanly across WGs.)
+    _wzm_emit_phase_barrier(2)   // s_barrier — embed_bwd grads visible before AdamW
 
     // Load the 9 f32 hyperparams (kernargs 50..58, offsets 0x190..0x1D0) into
     // uniform VGPRs v24..v32 (read by every _wzm_emit_adamw_param invocation).
@@ -9176,17 +9273,22 @@ fn amdgpu_lower_wzma_train_mega(uint64 kname_ptr, uint64 nl) -> uint64 {
     //   48 m_bias 49 v_bias                                  (global_buffer ptrs)
     //   50 inv_bc1 51 inv_bc2 52 decay 53 beta1 54 beta2
     //   55 one_m_b1 56 one_m_b2 57 lr   58 eps               (f32 by_value)
+    // Task 2 (multi-WG) adds arg 59 = d_barrier (cross-WG counter, global_buffer
+    //   at offset 0x1D8) ONLY when MEGA_TRAIN_NW>1 — at NW=1 n_args stays 59 so
+    //   the emitted .co (text + metadata) is byte-identical to the single-WG
+    //   oracle / Task 1.
     uint64 n_args = 59
+    if MEGA_TRAIN_NW > 1 { n_args = 60 }
     uint64 args_desc = alloc(n_args * 16)
     uint64 ai = 0
     while ai < n_args {
         uint64 sp = args_desc + ai * 16;       unsafe { *(sp as uint64) = 8 }
         uint64 kp = args_desc + ai * 16 + 8
         // 12,13 = BS,D (by-value) ; 50..58 = AdamW f32 hyperparams (by-value) ;
-        // everything else is a global_buffer ptr.
+        // 59 = d_barrier (global_buffer) ; everything else is a global_buffer ptr.
         if ai == 12 { unsafe { *(kp as uint64) = AMD_ARG_KIND_BY_VALUE } }
         else if ai == 13 { unsafe { *(kp as uint64) = AMD_ARG_KIND_BY_VALUE } }
-        else if ai >= 50 { unsafe { *(kp as uint64) = AMD_ARG_KIND_BY_VALUE } }
+        else if ai >= 50 && ai <= 58 { unsafe { *(kp as uint64) = AMD_ARG_KIND_BY_VALUE } }
         else { unsafe { *(kp as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER } }
         ai = ai + 1
     }

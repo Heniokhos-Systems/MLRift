@@ -337,6 +337,18 @@ fn main() {
     slot = alloc(8); err = hipMalloc(slot, K * 4);         if err != 0 { die_gpu("mVGB", err) }; unsafe { *(slot as u64) -> d_v_gb   }; dealloc(slot)
     slot = alloc(8); err = hipMalloc(slot, D * 4);         if err != 0 { die_gpu("mMBI", err) }; unsafe { *(slot as u64) -> d_m_bias }; dealloc(slot)
     slot = alloc(8); err = hipMalloc(slot, D * 4);         if err != 0 { die_gpu("mVBI", err) }; unsafe { *(slot as u64) -> d_v_bias }; dealloc(slot)
+
+    // ── Task 2 (multi-WG): cross-WG barrier counter (mega_emit_barrier_isa).
+    //   ONE monotonic u32 at offset 0 (the kernel's _wzm_emit_train_barrier
+    //   does global_atomic_add_u32 to d_barrier[0] + spin-poll vs (phase+1)*NW).
+    //   64 bytes = 16 u32 slots for headroom.  Used ONLY when WZMA_MEGA_NW>1;
+    //   at NW=1 the kernel emits intra-WG s_barrier and never reads it, but we
+    //   still allocate/zero it so the launcher path is uniform.  MUST be re-zeroed
+    //   before EVERY step's launch (the counter is monotonic within one dispatch).
+    u64 BARRIER_BYTES = 64
+    u64 d_barrier = 0
+    slot = alloc(8); err = hipMalloc(slot, BARRIER_BYTES); if err != 0 { die_gpu("mBAR", err) }; unsafe { *(slot as u64) -> d_barrier }; dealloc(slot)
+    err = hipMemcpy(d_barrier, h_zero_big, BARRIER_BYTES, 1); if err != 0 { die_gpu("z barrier", err) }
     err = hipMemcpy(d_m_U,    h_zero_big, K * D * R * 4, 1); if err != 0 { die_gpu("z mU",  err) }
     err = hipMemcpy(d_v_U,    h_zero_big, K * D * R * 4, 1); if err != 0 { die_gpu("z vU",  err) }
     err = hipMemcpy(d_m_V,    h_zero_big, K * R * D * 4, 1); if err != 0 { die_gpu("z mV",  err) }
@@ -412,7 +424,10 @@ fn main() {
 
     // ── Launch ONE 1-WG / 512-thread dispatch (embed + WZMA fwd + pool/norm,
     //    both views) ────────────────────────────────────────────────────────
+    // Task 2: arg 59 = d_barrier is appended ONLY when NW>1 (kernel emits the
+    //   d_barrier kernarg load + cross-WG barriers only at MEGA_TRAIN_NW>1).
     u64 NA = 59
+    if WZMA_MEGA_NW > 1 { NA = 60 }
     u64 p0  = alloc(8); unsafe { *(p0  as u64) = d_ids }
     u64 p1  = alloc(8); unsafe { *(p1  as u64) = d_emb }
     u64 p2  = alloc(8); unsafe { *(p2  as u64) = d_x_out }
@@ -474,6 +489,7 @@ fn main() {
     u64 p56 = alloc(8)   // one_m_b2
     u64 p57 = alloc(8)   // lr
     u64 p58 = alloc(8)   // eps
+    u64 p59 = alloc(8); unsafe { *(p59 as u64) = d_barrier }   // Task 2: cross-WG counter
     u64 kp = alloc(NA * 8)
     unsafe { *((kp +   0) as u64) = p0 }
     unsafe { *((kp +   8) as u64) = p1 }
@@ -534,6 +550,9 @@ fn main() {
     unsafe { *((kp + 448) as u64) = p56 }
     unsafe { *((kp + 456) as u64) = p57 }
     unsafe { *((kp + 464) as u64) = p58 }
+    // Task 2: slot 59 (offset 472 = 0x1D8) = d_barrier — only consumed by the
+    // kernel when NW>1; NA=59 at NW=1 so this slot is never read by the launch.
+    if WZMA_MEGA_NW > 1 { unsafe { *((kp + 472) as u64) = p59 } }
 
     // ═══════════════════════════════════════════════════════════════════════
     // Task 7: full 50-step training loop + benchmark.
@@ -649,6 +668,10 @@ fn main() {
         unsafe { *(p57 as f32) = lr }
         unsafe { *(p58 as f32) = eps }
 
+        // Task 2: re-zero the cross-WG barrier counter each step (monotonic
+        // within one dispatch — phase thresholds are (phase+1)*NW from zero).
+        err = hipMemcpy(d_barrier, h_zero_big, BARRIER_BYTES, 1); if err != 0 { die_gpu("rz barrier", err) }
+
         err = hipModuleLaunchKernel(fh, grid, 1, 1, block, 1, 1, 0, 0, kp, 0)
         if err != 0 { die_gpu("launch wzma_train_mega", err) }
         err = hipDeviceSynchronize()
@@ -718,7 +741,7 @@ fn main() {
     dealloc(p32); dealloc(p33); dealloc(p34); dealloc(p35); dealloc(p36); dealloc(p37); dealloc(p38); dealloc(p39)
     dealloc(p40); dealloc(p41); dealloc(p42); dealloc(p43); dealloc(p44); dealloc(p45); dealloc(p46)
     dealloc(p47); dealloc(p48); dealloc(p49); dealloc(p50); dealloc(p51); dealloc(p52); dealloc(p53)
-    dealloc(p54); dealloc(p55); dealloc(p56); dealloc(p57); dealloc(p58)
+    dealloc(p54); dealloc(p55); dealloc(p56); dealloc(p57); dealloc(p58); dealloc(p59)
     dealloc(kp)
     // ═══════════════════════════════════════════════════════════════════════
     // Task 7 report — full 50-step run + benchmark.
@@ -825,6 +848,7 @@ fn main() {
     hipFree(d_m_U); hipFree(d_v_U); hipFree(d_m_V); hipFree(d_v_V)
     hipFree(d_m_gw); hipFree(d_v_gw); hipFree(d_m_gb); hipFree(d_v_gb)
     hipFree(d_m_bias); hipFree(d_v_bias)
+    hipFree(d_barrier)
     hipkfd_teardown()
     exit(0)
 }
