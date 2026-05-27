@@ -24,6 +24,7 @@
 //
 // Expected: "embed PASS max_err <e>" with e ~ 0 (bit-exact: pure copy).
 
+import "../std/train.mlr"
 import "../std/math_float.mlr"
 import "../std/fmt.mlr"
 import "../std/hip.mlr"
@@ -142,33 +143,75 @@ fn main() {
     file_close(fd)
     print_str("Weights + ids loaded from bench_init.bin.\n")
 
-    // ── GPU buffers ───────────────────────────────────────────────────────
+    // ── GPU buffers (14 kernargs) ─────────────────────────────────────────
     u64 d_emb   = 0
     u64 d_ids   = 0
     u64 d_x_out = 0
+    u64 d_U     = 0
+    u64 d_V     = 0
+    u64 d_gw    = 0
+    u64 d_gb    = 0
+    u64 d_bias  = 0
+    u64 d_out   = 0
+    u64 d_alpha = 0
+    u64 d_inter = 0
+    u64 d_outk  = 0
     u64 slot
 
-    slot = alloc(8); err = hipMalloc(slot, VOCAB * D * 4); if err != 0 { die_gpu("mEmb",  err) }; unsafe { *(slot as u64) -> d_emb   }; dealloc(slot)
-    slot = alloc(8); err = hipMalloc(slot, BS * 4);        if err != 0 { die_gpu("mIds",  err) }; unsafe { *(slot as u64) -> d_ids   }; dealloc(slot)
-    slot = alloc(8); err = hipMalloc(slot, BS * D * 4);    if err != 0 { die_gpu("mXout", err) }; unsafe { *(slot as u64) -> d_x_out }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, VOCAB * D * 4);   if err != 0 { die_gpu("mEmb",  err) }; unsafe { *(slot as u64) -> d_emb   }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, BS * 4);          if err != 0 { die_gpu("mIds",  err) }; unsafe { *(slot as u64) -> d_ids   }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, BS * D * 4);      if err != 0 { die_gpu("mXout", err) }; unsafe { *(slot as u64) -> d_x_out }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, K * D * R * 4);   if err != 0 { die_gpu("mU",    err) }; unsafe { *(slot as u64) -> d_U     }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, K * R * D * 4);   if err != 0 { die_gpu("mV",    err) }; unsafe { *(slot as u64) -> d_V     }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, K * D * 4);       if err != 0 { die_gpu("mGw",   err) }; unsafe { *(slot as u64) -> d_gw    }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, K * 4);           if err != 0 { die_gpu("mGb",   err) }; unsafe { *(slot as u64) -> d_gb    }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, D * 4);           if err != 0 { die_gpu("mBias", err) }; unsafe { *(slot as u64) -> d_bias  }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, BS * D * 4);      if err != 0 { die_gpu("mOut",  err) }; unsafe { *(slot as u64) -> d_out   }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, BS * K * 4);      if err != 0 { die_gpu("mAlph", err) }; unsafe { *(slot as u64) -> d_alpha }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, BS * K * R * 4);  if err != 0 { die_gpu("mIntr", err) }; unsafe { *(slot as u64) -> d_inter }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, BS * K * D * 4);  if err != 0 { die_gpu("mOutk", err) }; unsafe { *(slot as u64) -> d_outk  }; dealloc(slot)
 
-    // H2D: emb table + view-1 ids
-    err = hipMemcpy(d_emb, emb_ptr,  VOCAB * D * 4, 1); if err != 0 { die_gpu("H2D emb", err) }
-    err = hipMemcpy(d_ids, ids1_i32, BS * 4,        1); if err != 0 { die_gpu("H2D ids", err) }
-    print_str("emb + ids on GPU.\n")
+    // H2D: all forward inputs
+    err = hipMemcpy(d_emb,  emb_ptr,  VOCAB * D * 4, 1); if err != 0 { die_gpu("H2D emb",  err) }
+    err = hipMemcpy(d_ids,  ids1_i32, BS * 4,        1); if err != 0 { die_gpu("H2D ids",  err) }
+    err = hipMemcpy(d_U,    U_ptr,    K * D * R * 4, 1); if err != 0 { die_gpu("H2D U",    err) }
+    err = hipMemcpy(d_V,    V_ptr,    K * R * D * 4, 1); if err != 0 { die_gpu("H2D V",    err) }
+    err = hipMemcpy(d_gw,   gw_ptr,   K * D * 4,     1); if err != 0 { die_gpu("H2D gw",   err) }
+    err = hipMemcpy(d_gb,   gb_ptr,   K * 4,         1); if err != 0 { die_gpu("H2D gb",   err) }
+    err = hipMemcpy(d_bias, bias_ptr, D * 4,         1); if err != 0 { die_gpu("H2D bias", err) }
+    print_str("All forward inputs on GPU.\n")
 
-    // ── Launch ONE 1-WG / 512-thread dispatch ─────────────────────────────
-    u64 p0 = alloc(8); unsafe { *(p0 as u64) = d_ids }
-    u64 p1 = alloc(8); unsafe { *(p1 as u64) = d_emb }
-    u64 p2 = alloc(8); unsafe { *(p2 as u64) = d_x_out }
-    u64 p3 = alloc(8); unsafe { *(p3 as u64) = BS }
-    u64 p4 = alloc(8); unsafe { *(p4 as u64) = D }
-    u64 kp = alloc(5 * 8)
-    unsafe { *(kp        as u64) = p0 }
-    unsafe { *((kp +  8) as u64) = p1 }
-    unsafe { *((kp + 16) as u64) = p2 }
-    unsafe { *((kp + 24) as u64) = p3 }
-    unsafe { *((kp + 32) as u64) = p4 }
+    // ── Launch ONE 1-WG / 512-thread dispatch (embed + WZMA forward) ───────
+    u64 NA = 14
+    u64 p0  = alloc(8); unsafe { *(p0  as u64) = d_ids }
+    u64 p1  = alloc(8); unsafe { *(p1  as u64) = d_emb }
+    u64 p2  = alloc(8); unsafe { *(p2  as u64) = d_x_out }
+    u64 p3  = alloc(8); unsafe { *(p3  as u64) = d_U }
+    u64 p4  = alloc(8); unsafe { *(p4  as u64) = d_V }
+    u64 p5  = alloc(8); unsafe { *(p5  as u64) = d_gw }
+    u64 p6  = alloc(8); unsafe { *(p6  as u64) = d_gb }
+    u64 p7  = alloc(8); unsafe { *(p7  as u64) = d_bias }
+    u64 p8  = alloc(8); unsafe { *(p8  as u64) = d_out }
+    u64 p9  = alloc(8); unsafe { *(p9  as u64) = d_alpha }
+    u64 p10 = alloc(8); unsafe { *(p10 as u64) = d_inter }
+    u64 p11 = alloc(8); unsafe { *(p11 as u64) = d_outk }
+    u64 p12 = alloc(8); unsafe { *(p12 as u64) = BS }
+    u64 p13 = alloc(8); unsafe { *(p13 as u64) = D }
+    u64 kp = alloc(NA * 8)
+    unsafe { *((kp +   0) as u64) = p0 }
+    unsafe { *((kp +   8) as u64) = p1 }
+    unsafe { *((kp +  16) as u64) = p2 }
+    unsafe { *((kp +  24) as u64) = p3 }
+    unsafe { *((kp +  32) as u64) = p4 }
+    unsafe { *((kp +  40) as u64) = p5 }
+    unsafe { *((kp +  48) as u64) = p6 }
+    unsafe { *((kp +  56) as u64) = p7 }
+    unsafe { *((kp +  64) as u64) = p8 }
+    unsafe { *((kp +  72) as u64) = p9 }
+    unsafe { *((kp +  80) as u64) = p10 }
+    unsafe { *((kp +  88) as u64) = p11 }
+    unsafe { *((kp +  96) as u64) = p12 }
+    unsafe { *((kp + 104) as u64) = p13 }
 
     u32 grid  = 1
     u32 block = 512
@@ -177,36 +220,61 @@ fn main() {
     err = hipDeviceSynchronize()
     if err != 0 { die_gpu("sync", err) }
 
-    dealloc(p0); dealloc(p1); dealloc(p2); dealloc(p3); dealloc(p4); dealloc(kp)
+    dealloc(p0); dealloc(p1); dealloc(p2); dealloc(p3); dealloc(p4); dealloc(p5); dealloc(p6)
+    dealloc(p7); dealloc(p8); dealloc(p9); dealloc(p10); dealloc(p11); dealloc(p12); dealloc(p13)
+    dealloc(kp)
     print_str("Launch + sync OK.\n")
 
-    // ── D2H gathered output ────────────────────────────────────────────────
-    u64 h_x_gpu = alloc(BS * D * 4)
-    err = hipMemcpy(h_x_gpu, d_x_out, BS * D * 4, 2)
-    if err != 0 { die_gpu("D2H x_out", err) }
+    // ── D2H gathered embed output + WZMA forward output ────────────────────
+    u64 h_x_gpu   = alloc(BS * D * 4)
+    u64 h_out_gpu = alloc(BS * D * 4)
+    err = hipMemcpy(h_x_gpu,   d_x_out, BS * D * 4, 2); if err != 0 { die_gpu("D2H x_out", err) }
+    err = hipMemcpy(h_out_gpu, d_out,   BS * D * 4, 2); if err != 0 { die_gpu("D2H out",   err) }
 
-    // ── CPU reference ──────────────────────────────────────────────────────
+    // ── CPU reference: embed → wzma_f32_fwd (the exact function we match) ───
     u64 h_x_ref = alloc(BS * D * 4)
     cpu_embed_i32(h_x_ref, emb_ptr, ids1_i32, BS, D)
 
-    // ── Compare over BS*D elements ──────────────────────────────────────────
+    // wzma_f32_fwd treats x as [B,S,D]; with B=BS, S=1 the (b*S+s) index ==
+    // bs, matching the GPU [BS,D] flat layout exactly.
+    u64 h_out_ref   = alloc(BS * D * 4)
+    u64 ref_alpha   = alloc(BS * K * 4)
+    u64 ref_inter   = alloc(BS * K * R * 4)
+    u64 ref_outk    = alloc(BS * K * D * 4)
+    wzma_f32_fwd(h_x_ref, h_out_ref, U_ptr, V_ptr, gw_ptr, gb_ptr, bias_ptr,
+                 BS, 1, D, K, R, ref_alpha, ref_inter, ref_outk)
+
+    // ── Compare embed output (bit-exact) ────────────────────────────────────
+    f32 max_err_e = 0.0f
+    u64 ne = BS * D
+    u64 ie = 0
+    while ie < ne {
+        f32 g = 0.0f; f32 r = 0.0f
+        unsafe { *((h_x_gpu + ie * 4) as f32) -> g }
+        unsafe { *((h_x_ref + ie * 4) as f32) -> r }
+        f32 e = abs_f32(g - r)
+        if e > max_err_e { max_err_e = e }
+        ie = ie + 1
+    }
+    if max_err_e < 1e-5f { print_str("embed PASS max_err ") }
+    else                 { print_str("embed FAIL max_err ") }
+    u64 ese = fmt_f32(max_err_e, 7); print_str(ese); dealloc(ese)
+    print_str("\n")
+
+    // ── Compare WZMA forward output over BS*D ────────────────────────────────
     f32 max_err = 0.0f
     u64 n = BS * D
     u64 i = 0
     while i < n {
         f32 g = 0.0f; f32 r = 0.0f
-        unsafe { *((h_x_gpu + i * 4) as f32) -> g }
-        unsafe { *((h_x_ref + i * 4) as f32) -> r }
+        unsafe { *((h_out_gpu + i * 4) as f32) -> g }
+        unsafe { *((h_out_ref + i * 4) as f32) -> r }
         f32 e = abs_f32(g - r)
         if e > max_err { max_err = e }
         i = i + 1
     }
-
-    if max_err < 1e-5f {
-        print_str("embed PASS max_err ")
-    } else {
-        print_str("embed FAIL max_err ")
-    }
+    if max_err < 1e-3f { print_str("wzma_fwd PASS max_err ") }
+    else               { print_str("wzma_fwd FAIL max_err ") }
     u64 es = fmt_f32(max_err, 7); print_str(es); dealloc(es)
     print_str("\n")
 
@@ -214,6 +282,15 @@ fn main() {
     hipFree(d_emb)
     hipFree(d_ids)
     hipFree(d_x_out)
+    hipFree(d_U)
+    hipFree(d_V)
+    hipFree(d_gw)
+    hipFree(d_gb)
+    hipFree(d_bias)
+    hipFree(d_out)
+    hipFree(d_alpha)
+    hipFree(d_inter)
+    hipFree(d_outk)
     hipkfd_teardown()
     exit(0)
 }
