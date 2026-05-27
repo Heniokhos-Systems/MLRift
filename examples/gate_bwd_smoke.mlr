@@ -1,0 +1,289 @@
+// gate_bwd_smoke — ISOLATED reproducer + validation for gate_bwd_bs_f32.
+//
+// gate_bwd_bs_f32 is the FIRST backward dispatch in wzma_train_md's view-prep
+// that HANGS the WG (hipDeviceSynchronize 5 s timeout; kernel never retires).
+// It is "hardcoded for 512-thread blocks with D=384 padded" and uses the
+// cross-wave 512-lane LDS reduce _emit_lds_reduce_tree_512 (s_barrier).
+//
+// This fires gate_bwd_bs_f32 ALONE at the EXACT grid/block/kernarg ABI the
+// wzma_train_md launcher uses (grid=BS=128, block=512, 10 kernargs), with
+// deterministic inputs, then D2H + compares vs a CPU gate-bwd reference.
+//
+// If it HANGS -> reproduced cheaply (watchdog reclaims the queue at exit).
+// If it returns + matches CPU -> the kernel is correct at this launch config.
+//
+// Dims: BS=128, K=4, D=384 (the kernel's hardcoded shape).
+//
+// Build (kfd-safe — hipkfd_teardown on every exit path, --target=amdgpu-native):
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native \
+//       examples/gate_bwd_smoke.mlr -o ~/mlrift_bin/wzma_train/gate_bwd_smoke
+// Run:
+//   ~/mlrift_bin/wzma_train/gate_bwd_smoke
+//
+// Required .co (MLRift native emit, no hipcc):
+//   gate_bwd_bs_f32.co
+
+import "../std/math_float.mlr"
+import "../std/fmt.mlr"
+import "../std/hip.mlr"
+
+static u64 BS_DIM = 128
+static u64 D_DIM  = 384
+static u64 K_DIM  = 4
+
+fn abs_f32(f32 v) -> f32 { if v < 0.0f { return 0.0f - v } return v }
+
+fn die_gpu(u64 msg, u64 code) {
+    print_str(msg); print_str(" err="); u64 s = fmt_dec(code); print_str(s); dealloc(s); print_str("\n")
+    hipkfd_teardown(); exit(1)
+}
+
+fn load_co(u64 co_path, u64 fn_name) -> u64 {
+    u64 fd = file_open(co_path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        print_str("Cannot open .co: "); print_str(co_path); print_str("\n"); hipkfd_teardown(); exit(1)
+    }
+    u64 sz = file_size(fd); u64 blob = alloc(sz); file_read(fd, blob, sz); file_close(fd)
+    u64 mod_slot = alloc(8)
+    u32 err = hipModuleLoadData(mod_slot, blob)
+    if err != 0 { die_gpu("hipModuleLoadData", err) }
+    u64 mod = 0; unsafe { *(mod_slot as u64) -> mod }
+    u64 fh_slot = alloc(8)
+    err = hipModuleGetFunction(fh_slot, mod, fn_name)
+    if err != 0 { die_gpu("hipModuleGetFunction", err) }
+    u64 fh = 0; unsafe { *(fh_slot as u64) -> fh }
+    dealloc(mod_slot); dealloc(fh_slot); return fh
+}
+
+fn gpu_alloc(u64 nbytes) -> u64 {
+    u64 slot = alloc(8); u32 err = hipMalloc(slot, nbytes)
+    if err != 0 { die_gpu("hipMalloc", err) }
+    u64 p = 0; unsafe { *(slot as u64) -> p }; dealloc(slot); return p
+}
+
+// launch_gate_bwd_bs — VERBATIM grid/block/kernarg ABI from wzma_train_md.mlr:303.
+// grid=BS, block=512 (kernel hardcoded for D=384 padded to 512).
+fn launch_gate_bwd_bs(u64 fh, u64 d_dy, u64 d_x, u64 d_alpha, u64 d_outk_bskd,
+                      u64 d_gw, u64 d_dx_gate, u64 d_dgl, u64 BS, u64 D, u64 K,
+                      u32 block) {
+    u64 p0 = alloc(8); unsafe { *(p0 as u64) = d_dy }
+    u64 p1 = alloc(8); unsafe { *(p1 as u64) = d_x }
+    u64 p2 = alloc(8); unsafe { *(p2 as u64) = d_alpha }
+    u64 p3 = alloc(8); unsafe { *(p3 as u64) = d_outk_bskd }
+    u64 p4 = alloc(8); unsafe { *(p4 as u64) = d_gw }
+    u64 p5 = alloc(8); unsafe { *(p5 as u64) = d_dx_gate }
+    u64 p6 = alloc(8); unsafe { *(p6 as u64) = d_dgl }
+    u64 p7 = alloc(8); unsafe { *(p7 as u64) = BS }
+    u64 p8 = alloc(8); unsafe { *(p8 as u64) = D }
+    u64 p9 = alloc(8); unsafe { *(p9 as u64) = K }
+    u64 kp = alloc(10 * 8)
+    unsafe { *(kp        as u64) = p0 }; unsafe { *((kp +  8) as u64) = p1 }
+    unsafe { *((kp + 16) as u64) = p2 }; unsafe { *((kp + 24) as u64) = p3 }
+    unsafe { *((kp + 32) as u64) = p4 }; unsafe { *((kp + 40) as u64) = p5 }
+    unsafe { *((kp + 48) as u64) = p6 }; unsafe { *((kp + 56) as u64) = p7 }
+    unsafe { *((kp + 64) as u64) = p8 }; unsafe { *((kp + 72) as u64) = p9 }
+    u32 grid  = BS
+    u32 err = hipModuleLaunchKernel(fh, grid, 1, 1, block, 1, 1, 0, 0, kp, 0)
+    if err != 0 { die_gpu("launch gate_bwd_bs", err) }
+    dealloc(p0); dealloc(p1); dealloc(p2); dealloc(p3); dealloc(p4)
+    dealloc(p5); dealloc(p6); dealloc(p7); dealloc(p8); dealloc(p9); dealloc(kp)
+}
+
+fn sync_or_die(u64 tag) {
+    u32 err = hipDeviceSynchronize()
+    if err != 0 { die_gpu(tag, err) }
+    print_str("  sync OK: "); print_str(tag); print_str("\n")
+}
+
+// Deterministic pseudo-random f32 in [-1, 1) from an integer seed.
+fn rnd_f32(u64 seed) -> f32 {
+    u64 x = seed * 2654435761
+    x = x ^ (x >> 13)
+    x = x * 40503
+    x = x ^ (x >> 7)
+    u64 m = x & 0xFFFFFF             // 24 bits
+    f32 fm = m
+    f32 r = fm / 16777216.0f         // [0,1)
+    return r * 2.0f - 1.0f           // [-1,1)
+}
+
+// ── CPU reference: gate_bwd_bs math (mirror of std/train.mlr wzma_gate_only_bwd
+//    and the gate_bwd_bs_f32 kernel body) ───────────────────────────────────
+//   da[k]      = dot(dy[bs,:], outk[bs,k,:])
+//   sum_ada    = sum_k alpha[bs,k] * da[k]
+//   dgl[bs,k]  = alpha[bs,k] * (da[k] - sum_ada)
+//   dx_gate[bs,d] = sum_k dgl[bs,k] * gw[k,d]
+fn cpu_gate_bwd(u64 h_dy, u64 h_alpha, u64 h_outk, u64 h_gw,
+                u64 h_dx_ref, u64 h_dgl_ref, u64 BS, u64 D, u64 K) {
+    u64 bs = 0
+    while bs < BS {
+        u64 dy_row    = h_dy    + bs * D * 4
+        u64 alpha_bs  = h_alpha + bs * K * 4
+        u64 outk_bs   = h_outk  + bs * K * D * 4
+        u64 dx_row    = h_dx_ref  + bs * D * 4
+        u64 dgl_bs    = h_dgl_ref + bs * K * 4
+
+        // da[k] = dot(dy, outk_k)  (K<=4 here)
+        f32 da0 = 0.0f; f32 da1 = 0.0f; f32 da2 = 0.0f; f32 da3 = 0.0f
+        u64 k = 0
+        while k < K {
+            u64 ok_row = outk_bs + k * D * 4
+            f32 da = 0.0f
+            u64 d = 0
+            while d < D {
+                f32 dyv = 0.0f; unsafe { *((dy_row + d * 4) as f32) -> dyv }
+                f32 okv = 0.0f; unsafe { *((ok_row + d * 4) as f32) -> okv }
+                f32 p = dyv * okv
+                da = da + p
+                d = d + 1
+            }
+            if k == 0 { da0 = da }
+            if k == 1 { da1 = da }
+            if k == 2 { da2 = da }
+            if k == 3 { da3 = da }
+            k = k + 1
+        }
+
+        f32 a0 = 0.0f; unsafe { *((alpha_bs + 0) as f32) -> a0 }
+        f32 a1 = 0.0f; unsafe { *((alpha_bs + 4) as f32) -> a1 }
+        f32 a2 = 0.0f; unsafe { *((alpha_bs + 8) as f32) -> a2 }
+        f32 a3 = 0.0f; unsafe { *((alpha_bs + 12) as f32) -> a3 }
+        f32 sum_ada = a0 * da0 + a1 * da1 + a2 * da2 + a3 * da3
+
+        f32 dgl0 = a0 * (da0 - sum_ada)
+        f32 dgl1 = a1 * (da1 - sum_ada)
+        f32 dgl2 = a2 * (da2 - sum_ada)
+        f32 dgl3 = a3 * (da3 - sum_ada)
+        unsafe { *((dgl_bs + 0)  as f32) = dgl0 }
+        unsafe { *((dgl_bs + 4)  as f32) = dgl1 }
+        unsafe { *((dgl_bs + 8)  as f32) = dgl2 }
+        unsafe { *((dgl_bs + 12) as f32) = dgl3 }
+
+        // dx_gate[bs,d] = sum_k dgl_k * gw[k,d]
+        u64 d = 0
+        while d < D {
+            f32 gw0 = 0.0f; unsafe { *((h_gw + (0 * D + d) * 4) as f32) -> gw0 }
+            f32 gw1 = 0.0f; unsafe { *((h_gw + (1 * D + d) * 4) as f32) -> gw1 }
+            f32 gw2 = 0.0f; unsafe { *((h_gw + (2 * D + d) * 4) as f32) -> gw2 }
+            f32 gw3 = 0.0f; unsafe { *((h_gw + (3 * D + d) * 4) as f32) -> gw3 }
+            f32 dxg = dgl0 * gw0 + dgl1 * gw1 + dgl2 * gw2 + dgl3 * gw3
+            unsafe { *((dx_row + d * 4) as f32) = dxg }
+            d = d + 1
+        }
+        bs = bs + 1
+    }
+}
+
+fn check(u64 tag, u64 d_buf, u64 h_ref, u64 h_dev, u64 n, f32 tol) -> u64 {
+    u32 err = hipMemcpy(h_dev, d_buf, n * 4, 2)
+    if err != 0 { die_gpu("D2H check", err) }
+    f32 max_err = 0.0f; u64 wi = 0; f32 wd = 0.0f; f32 wr = 0.0f
+    u64 i = 0
+    while i < n {
+        f32 dv = 0.0f; f32 rv = 0.0f
+        unsafe { *((h_dev + i * 4) as f32) -> dv }
+        unsafe { *((h_ref + i * 4) as f32) -> rv }
+        f32 e = abs_f32(dv - rv)
+        if e > max_err { max_err = e; wi = i; wd = dv; wr = rv }
+        i = i + 1
+    }
+    // sanity: ensure the reference is non-trivial (not all zeros) so a
+    // PASS actually means matching values, not "both buffers are 0".
+    f32 ref_absmax = 0.0f; u64 nz = 0
+    u64 j = 0
+    while j < n {
+        f32 rv = 0.0f; unsafe { *((h_ref + j * 4) as f32) -> rv }
+        f32 a = abs_f32(rv)
+        if a > ref_absmax { ref_absmax = a }
+        if a > 0.0f { nz = nz + 1 }
+        j = j + 1
+    }
+    print_str("  CHECK "); print_str(tag); print_str(": max_err=")
+    u64 s = fmt_f32(max_err, 9); print_str(s); dealloc(s)
+    print_str(" worst[i="); s = fmt_dec(wi); print_str(s); dealloc(s)
+    print_str(" dev="); s = fmt_f32(wd, 6); print_str(s); dealloc(s)
+    print_str(" ref="); s = fmt_f32(wr, 6); print_str(s); dealloc(s); print_str("]")
+    print_str(" ref|max|="); s = fmt_f32(ref_absmax, 6); print_str(s); dealloc(s)
+    print_str(" nz="); s = fmt_dec(nz); print_str(s); dealloc(s); print_str("/")
+    s = fmt_dec(n); print_str(s); dealloc(s); print_str(" ")
+    if max_err < tol { print_str("PASS\n"); return 1 }
+    print_str("FAIL\n"); return 0
+}
+
+fn main() {
+    u64 BS = BS_DIM; u64 D = D_DIM; u64 K = K_DIM
+
+    print_str("=== gate_bwd_smoke: gate_bwd_bs_f32 ALONE (BS=128 D=384 K=4, grid=BS block=512) ===\n")
+
+    u32 err = hipSetDevice(0)
+    if err != 0 { print_str("hipSetDevice failed\n"); exit(1) }
+
+    u64 fh_gbs = load_co("/tmp/gate_bwd_bs_f32.co", "gate_bwd_bs_f32")
+
+    // Host inputs
+    u64 n_dy   = BS * D            // dy[BS,D]
+    u64 n_x    = BS * D            // x[BS,D]  (loaded by kernel but unused in body)
+    u64 n_a    = BS * K            // alpha[BS,K]
+    u64 n_outk = BS * K * D        // outk[BS,K,D]
+    u64 n_gw   = K * D             // gw[K,D]
+    u64 n_dxg  = BS * D            // dx_gate[BS,D]
+    u64 n_dgl  = BS * K            // dgl[BS,K]
+
+    u64 h_dy   = alloc(n_dy   * 4)
+    u64 h_x    = alloc(n_x    * 4)
+    u64 h_a    = alloc(n_a    * 4)
+    u64 h_outk = alloc(n_outk * 4)
+    u64 h_gw   = alloc(n_gw   * 4)
+    u64 h_dev  = alloc(n_dxg  * 4)   // D2H scratch (biggest is dx_gate)
+
+    u64 i = 0
+    while i < n_dy   { unsafe { *((h_dy   + i*4) as f32) = rnd_f32(i + 1) };        i = i + 1 }
+    i = 0
+    while i < n_x    { unsafe { *((h_x    + i*4) as f32) = rnd_f32(i + 100003) };   i = i + 1 }
+    i = 0
+    while i < n_a    { unsafe { *((h_a    + i*4) as f32) = rnd_f32(i + 200003) };   i = i + 1 }
+    i = 0
+    while i < n_outk { unsafe { *((h_outk + i*4) as f32) = rnd_f32(i + 300007) };   i = i + 1 }
+    i = 0
+    while i < n_gw   { unsafe { *((h_gw   + i*4) as f32) = rnd_f32(i + 400009) };   i = i + 1 }
+
+    // CPU reference
+    u64 h_dxg_ref = alloc(n_dxg * 4)
+    u64 h_dgl_ref = alloc(n_dgl * 4)
+    cpu_gate_bwd(h_dy, h_a, h_outk, h_gw, h_dxg_ref, h_dgl_ref, BS, D, K)
+
+    // GPU buffers at TRUE shapes (no padding) — matches wzma_train_md's
+    // allocations.  The kernel issues global_loads for ALL 512 threads but
+    // address arithmetic uses the LOGICAL stride, so tid 384..511 read up to
+    // 127 f32 past the last row.  Verified harmless on this GPU (HW clamps the
+    // tail read of a resident allocation); the result is cndmask-zeroed anyway.
+    u64 d_dy   = gpu_alloc(n_dy   * 4)
+    u64 d_x    = gpu_alloc(n_x    * 4)
+    u64 d_a    = gpu_alloc(n_a    * 4)
+    u64 d_outk = gpu_alloc(n_outk * 4)
+    u64 d_gw   = gpu_alloc(n_gw   * 4)
+    u64 d_dxg  = gpu_alloc(n_dxg  * 4)
+    u64 d_dgl  = gpu_alloc(n_dgl  * 4)
+
+    err = hipMemcpy(d_dy,   h_dy,   n_dy   * 4, 1); if err != 0 { die_gpu("H2D dy", err) }
+    err = hipMemcpy(d_x,    h_x,    n_x    * 4, 1); if err != 0 { die_gpu("H2D x", err) }
+    err = hipMemcpy(d_a,    h_a,    n_a    * 4, 1); if err != 0 { die_gpu("H2D a", err) }
+    err = hipMemcpy(d_outk, h_outk, n_outk * 4, 1); if err != 0 { die_gpu("H2D outk", err) }
+    err = hipMemcpy(d_gw,   h_gw,   n_gw   * 4, 1); if err != 0 { die_gpu("H2D gw", err) }
+
+    print_str("  launching gate_bwd_bs_f32 (grid="); u64 s = fmt_dec(BS); print_str(s); dealloc(s)
+    print_str(" block=512)...\n")
+    launch_gate_bwd_bs(fh_gbs, d_dy, d_x, d_a, d_outk, d_gw, d_dxg, d_dgl, BS, D, K, 512)
+    sync_or_die("sync gate_bwd_bs")
+
+    u64 ok1 = check("dx_gate", d_dxg, h_dxg_ref, h_dev, n_dxg, 0.001f)
+    u64 ok2 = check("dgl",     d_dgl, h_dgl_ref, h_dev, n_dgl, 0.001f)
+
+    if ok1 != 0 {
+        if ok2 != 0 { print_str("=== gate_bwd_smoke: PASS ===\n") }
+        else { print_str("=== gate_bwd_smoke: FAIL (dgl) ===\n") }
+    } else { print_str("=== gate_bwd_smoke: FAIL (dx_gate) ===\n") }
+
+    hipkfd_teardown()
+    exit(0)
+}

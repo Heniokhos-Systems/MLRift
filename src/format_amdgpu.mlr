@@ -19217,10 +19217,20 @@ fn amdgpu_lower_gate_bwd_bs_f32(uint64 kname_ptr, uint64 nl) -> uint64 {
     // Compute v6 = d*4 (LDS offset)
     asm_u32(0x300C0082)   // v_lshlrev_b32_e32 v6, 2, v0
 
-    // Load dy[bs*D + d] via bs*384 offset
+    // v8 = min(d, D-1=383): CLAMPED load index.  The block is 512 wide but each
+    // row is only D=384 — threads 384..511 have no in-row element.  Their loads
+    // are issued UNMASKED (cndmask only zeroes the RESULT), so an address built
+    // from raw d=384..511 runs up to 127 f32 PAST the last row's allocation and
+    // page-faults → queue wedge.  Clamp the ADDRESS to d=383 (an in-bounds row
+    // element); the value is discarded by the d<D cndmask anyway.  (Mirrors the
+    // documented "clamp the address, not just gate the store" pad-lane fix.)
+    asm_u32(0x261000FF)   // v_min_u32_e32 v8, 0x17F, v0
+    asm_u32(0x0000017F)
+
+    // Load dy[bs*D + d] via bs*384 offset (clamped index v8)
     asm_u32(0x9602FF03)   // s_mul_i32 s2, s3, 0x180  (s3 × 384)
     asm_u32(0x00000180)
-    asm_u32(0x4A020002)   // v_add_nc_u32_e32 v1, s2, v0
+    asm_u32(0x4A021002)   // v_add_nc_u32_e32 v1, s2, v8
     asm_u32(0x30040282)   // v_lshlrev_b32_e32 v2, 2, v1
     asm_u32(0x7E060280)   // v_mov_b32_e32 v3, 0
     asm_u32(0xD7006A02)   // v_add_co_u32 v2, vcc_lo, s4, v2
@@ -19233,10 +19243,10 @@ fn amdgpu_lower_gate_bwd_bs_f32(uint64 kname_ptr, uint64 nl) -> uint64 {
     asm_u32(0x7C980018)   // v_cmp_gt_u32_e32 vcc_lo, s24, v0  (d < D=384)
     asm_u32(0x02141480)   // v_cndmask_b32_e32 v10, 0, v10, vcc_lo
 
-    // Load outk[bs*K*D + k*D + d] for k=0..3 (K*D=1536)
+    // Load outk[bs*K*D + k*D + d] for k=0..3 (K*D=1536) (clamped index v8)
     asm_u32(0x9602FF03)   // s_mul_i32 s2, s3, 0x600  (bs × 1536)
     asm_u32(0x00000600)
-    asm_u32(0x4A020002)   // v_add_nc_u32_e32 v1, s2, v0
+    asm_u32(0x4A021002)   // v_add_nc_u32_e32 v1, s2, v8
     asm_u32(0x30040282)   // v_lshlrev_b32_e32 v2, 2, v1
     asm_u32(0x7E060280)   // v_mov_b32_e32 v3, 0
     asm_u32(0xD7006A02)   // v_add_co_u32 v2, vcc_lo, s10, v2
@@ -19273,6 +19283,12 @@ fn amdgpu_lower_gate_bwd_bs_f32(uint64 kname_ptr, uint64 nl) -> uint64 {
     asm_u32(0xD8D80000)   // ds_load_b32 v15, v9  (broadcast sum → da0)
     asm_u32(0x0F000009)
     asm_u32(0xBF89FC07)   // s_waitcnt lgkmcnt(0)
+    // BARRIER between broadcast-read and the NEXT reduce's first ds_store:
+    // without it, a wave racing ahead into reduce N+1's ds_store overwrites
+    // LDS[lane*4] while a lagging wave is still broadcast-reading LDS[0] from
+    // reduce N — a WAR hazard on shared LDS that corrupts da and (with the
+    // 16-wave WG) wedges the workgroup.  All lanes active here (post-restore).
+    asm_u32(0xBFBD0000)   // s_barrier
 
     // === LDS reduce for da1 = dot(dy, ok1) ===
     asm_u32(0x100A190A)   // v_mul_f32_e32 v5, v10, v12
@@ -19280,6 +19296,7 @@ fn amdgpu_lower_gate_bwd_bs_f32(uint64 kname_ptr, uint64 nl) -> uint64 {
     asm_u32(0xD8D80000)   // ds_load_b32 v16, v9
     asm_u32(0x10000009)
     asm_u32(0xBF89FC07)
+    asm_u32(0xBFBD0000)   // s_barrier (see note above)
 
     // === LDS reduce for da2 = dot(dy, ok2) ===
     asm_u32(0x100A1B0A)   // v_mul_f32_e32 v5, v10, v13
@@ -19287,6 +19304,7 @@ fn amdgpu_lower_gate_bwd_bs_f32(uint64 kname_ptr, uint64 nl) -> uint64 {
     asm_u32(0xD8D80000)   // ds_load_b32 v17, v9
     asm_u32(0x11000009)
     asm_u32(0xBF89FC07)
+    asm_u32(0xBFBD0000)   // s_barrier (see note above)
 
     // === LDS reduce for da3 = dot(dy, ok3) ===
     asm_u32(0x100A1D0A)   // v_mul_f32_e32 v5, v10, v14
@@ -19327,8 +19345,8 @@ fn amdgpu_lower_gate_bwd_bs_f32(uint64 kname_ptr, uint64 nl) -> uint64 {
     asm_u32(0x08240B12)   // v_sub_f32_e32 v18, v18, v5
     asm_u32(0x103C2516)   // v_mul_f32_e32 v30, v22, v18   (dgl3)
 
-    // --- Load gw[k*D + d] for k=0..3 ---
-    asm_u32(0x30040082)   // v_lshlrev_b32_e32 v2, 2, v0   (d*4)
+    // --- Load gw[k*D + d] for k=0..3 (clamped index v8) ---
+    asm_u32(0x30041082)   // v_lshlrev_b32_e32 v2, 2, v8   (d_clamped*4)
     asm_u32(0x7E060280)   // v_mov_b32_e32 v3, 0
     asm_u32(0xD7006A02)   // v_add_co_u32 v2, vcc_lo, s16, v2
     asm_u32(0x00020410)
