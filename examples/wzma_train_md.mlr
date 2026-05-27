@@ -724,13 +724,21 @@ fn main() {
         // ════════════════ Zero d_grads + d_demb (RMW accumulators) ══════════
         // dU|dV|dgw|dgb|dbias (d_grads, PART_N) and demb are += accumulators in
         // the GEMM backward (gemm_f32_accum + gate_bwd dgrad scatter into them
-        // across both views/banks), so they MUST start at 0 each step.  Zeroed
-        // ON THE GPU via the native grid-fill kernel — no host buffer, no D2H/H2D.
-        // (d_partial is no longer used — the per-WG-partial + reduce machinery was
-        //  the reduce-tree bwd_uv; the GEMM contractions accumulate directly.)
+        // across both views/banks), so they MUST start at 0 each step.
+        //
+        // NOTE: the device-side grid-fill (launch_fill / fill_step) is BROKEN for
+        // buffers larger than one workgroup — the fill_step ISA addresses
+        // buf[tid_local] with NO workgroup offset (see emit_amdgpu_fill_step_blob
+        // in src/format_amdgpu.mlr: store addr = v0*8, v0 = workitem id only), so
+        // every WG writes the same first `block` elements and the tail is left
+        // UNINITIALIZED.  With the GEMM-ified backward that surfaced as ~80% of
+        // d_grads being NaN/inf garbage.  Reverted to a correct H2D memset from the
+        // host zero buffer (zbig is VOCAB*D*4, covers both).  Costs ~0.8 ms/step of
+        // PCIe staging — correctness over the GPU-fill optimization until fill_step
+        // is given a global-id address.
         t0 = time_now()
-        launch_fill(fh_fill, d_grads, PART_N)
-        launch_fill(fh_fill, d_demb,  VOCAB * D)
+        err = hipMemcpy(d_grads, zbig, PART_N * 4,    1); if err != 0 { die_gpu("zero grads", err) }
+        err = hipMemcpy(d_demb,  zbig, VOCAB * D * 4, 1); if err != 0 { die_gpu("zero demb", err) }
         sync_or_die("sync gpu-zero"); t1 = time_now(); ns_zero = ns_zero + (t1 - t0)
 
         // ════════════════ BACKWARD — build shared 63-arg kernarg block ═══════
@@ -999,20 +1007,52 @@ fn validate_grads(u64 d_partial, u64 PART_N) {
     u32 e = hipMemcpy(hbuf, d_partial, PART_N * 4, 2)   // D2H (one-time validation only)
     if e != 0 { print_str("(grad D2H failed; skip)\n"); dealloc(oref); dealloc(hbuf); return }
     f32 gmax = 0.0f
+    u64 gmax_i = 0
+    u64 n_bad  = 0          // entries with |err| > 1e-3
+    u64 n_nan  = 0          // NaN/inf entries in the GPU grads
     u64 gi = 0
     while gi < PART_N {
         f32 a = 0.0f; f32 b = 0.0f
         unsafe { *((oref + gi*4) as f32) -> a }
         unsafe { *((hbuf + gi*4) as f32) -> b }
+        // NaN/inf guard on the GPU grad: NaN != itself; inf via |b|>1e30
+        f32 babs = b; if babs < 0.0f { babs = 0.0f - babs }
+        if b != b { n_nan = n_nan + 1 }
+        if babs > 1.0e18f { n_nan = n_nan + 1 }
         f32 ee = a - b
         if ee < 0.0f { ee = 0.0f - ee }
-        if ee > gmax { gmax = ee }
+        if ee > 0.001f { n_bad = n_bad + 1 }
+        // clamp the tracked max to a finite range so fmt_f32 can't blow the buffer
+        if ee != ee { ee = 9999.0f }
+        if ee > 1.0e9f { ee = 9999.0f }
+        if ee > 1.0e18f { ee = 9999.0f }
+        if ee > gmax { gmax = ee; gmax_i = gi }
         gi = gi + 1
     }
-    dealloc(oref); dealloc(hbuf)
     print_str("step-0 grads max|err| vs oracle (dU|dV|dgw|dgb|dbias): ")
     u64 s = fmt_f32(gmax, 8); print_str(s); dealloc(s)
     if gmax <= 0.001f { print_str("  PASS (<=1e-3)\n") } else { print_str("  WARN (>1e-3)\n") }
+    // diagnostics
+    print_str("  n_bad(>1e-3)="); u64 sb = fmt_dec(n_bad); print_str(sb); dealloc(sb)
+    print_str("  n_nan_inf=");    u64 sn = fmt_dec(n_nan); print_str(sn); dealloc(sn)
+    print_str("  worst@idx=");    u64 sw = fmt_dec(gmax_i); print_str(sw); dealloc(sw)
+    f32 oa = 0.0f; f32 ob = 0.0f
+    unsafe { *((oref + gmax_i*4) as f32) -> oa }
+    unsafe { *((hbuf + gmax_i*4) as f32) -> ob }
+    print_str("  oracle="); u64 soa = fmt_f32(oa, 6); print_str(soa); dealloc(soa)
+    print_str("  gpu=");    u64 sob = fmt_f32(ob, 6); print_str(sob); dealloc(sob)
+    print_str("\n")
+    // per-block boundaries: dU=K*D*R | dV=K*R*D | dgw=K*D | dgb=K | dbias=D
+    u64 KDR_ = K_DIM*D_DIM*R_DIM
+    u64 KRD_ = K_DIM*R_DIM*D_DIM
+    u64 KD_  = K_DIM*D_DIM
+    print_str("  block layout: dU[0.."); u64 b1 = fmt_dec(KDR_); print_str(b1); dealloc(b1)
+    print_str(") dV(..");  u64 b2 = fmt_dec(KDR_ + KRD_); print_str(b2); dealloc(b2)
+    print_str(") dgw(.."); u64 b3 = fmt_dec(KDR_ + KRD_ + KD_); print_str(b3); dealloc(b3)
+    print_str(") dgb(.."); u64 b4 = fmt_dec(KDR_ + KRD_ + KD_ + K_DIM); print_str(b4); dealloc(b4)
+    print_str(") dbias(.."); u64 b5 = fmt_dec(PART_N); print_str(b5); dealloc(b5)
+    print_str(")\n")
+    dealloc(oref); dealloc(hbuf)
 }
 
 fn ce_from_raw_dots(u64 raw, f32 tau, u64 B) -> f32 {
