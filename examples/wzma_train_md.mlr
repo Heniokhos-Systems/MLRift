@@ -280,6 +280,15 @@ fn main() {
     f32 tau = 0.1f
 
     // ── Per-phase timing accumulators (ns), summed over 2 views ────────
+    // TRUE-profile contract: each GPU phase is wrapped
+    //     t0 = time_now(); launch(phase); hipDeviceSynchronize(); t1 = time_now()
+    // so the recorded delta is the phase's REAL GPU execution time, not its
+    // async-enqueue time.  hipModuleLaunchKernel is async in the KFD shim
+    // (std/hip_kfd.mlr) — without the per-phase drain ALL the work would
+    // pool at the first downstream sync (the D2H) and that sync would be
+    // mis-charged the whole forward (~5 ms for a 12 KB transfer).  The extra
+    // syncs add round-trip overhead but give a trustworthy bottleneck
+    // breakdown; drop them for a production timing-free run.
     u64 ns_embed = 0
     u64 ns_u     = 0
     u64 ns_v     = 0
@@ -333,7 +342,19 @@ fn main() {
         sync_or_die("sync fwd_tail")
         t1 = time_now(); ns_tail = ns_tail + (t1 - t0)
 
-        // D2H only the tiny encoder output v[B,D] (12 KB) for the InfoNCE step.
+        // Drain barrier BEFORE the D2H so its measured time charges only the
+        // D2H mechanism, never residual GPU work from the phases above.  With
+        // the per-phase syncs in place this barrier is ~0.02 ms (GPU already
+        // idle) — its near-zero cost is the proof the upstream per-phase
+        // times are real, not enqueue artifacts.
+        sync_or_die("sync pre-D2H")
+
+        // D2H the tiny encoder output v[B,D] (12 KB) for the InfoNCE step.
+        // NOTE: this is NOT raw PCIe transfer time.  In the KFD shim a D2H
+        // from host-visible VRAM is staged via a _kfd_copy_u64 dispatch +
+        // device-sync round-trip (std/hip_kfd.mlr hipMemcpy kind==2), so the
+        // ~2.6 ms/view is the staging-kernel launch+sync overhead, not the
+        // 12 KB move itself.  Labelled [D2H-mech] below, not [PCIe].
         t0 = time_now()
         err = hipMemcpy(h_q, d_v, B * D * 4, 2); if err != 0 { die_gpu("D2H v", err) }
         t1 = time_now(); ns_d2h = ns_d2h + (t1 - t0)
@@ -373,7 +394,7 @@ fn main() {
     print_ms("U einsum      [GPU]: ", ms_of(ns_u))
     print_ms("V einsum      [GPU]: ", ms_of(ns_v))
     print_ms("fwd_tail      [GPU]: ", ms_of(ns_tail))
-    print_ms("D2H v[B,D]    [PCIe]: ", ms_of(ns_d2h))
+    print_ms("D2H v[B,D]    [D2H-mech]: ", ms_of(ns_d2h))
     print_ms("InfoNCE       [GPU+CPU]: ", ms_of(ns_nce))
     u64 ns_total = ns_embed + ns_u + ns_v + ns_tail + ns_d2h + ns_nce
     print_ms("TOTAL fwd     : ", ms_of(ns_total))
