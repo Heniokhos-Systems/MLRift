@@ -56,6 +56,11 @@ static u64 R_DIM     = 32
 //   ONE 512-thread dispatch per step — byte-identical to the single-WG oracle.
 static u64 WZMA_MEGA_NW = 1
 
+// Task 3: per-WG dense-grad partial slot stride (bytes).  Must match
+// WZM_PART_SLOT in src/format_amdgpu_megakernel.mlr:
+//   dU(49152)+dV(49152)+dgw(1536)+dgb(4)+dbias(384) = 100228 f32 = 400912 bytes.
+static u64 WZMA_PART_SLOT = 400912
+
 fn abs_f32(f32 v) -> f32 {
     if v < 0.0f { return 0.0f - v }
     return v
@@ -349,6 +354,17 @@ fn main() {
     u64 d_barrier = 0
     slot = alloc(8); err = hipMalloc(slot, BARRIER_BYTES); if err != 0 { die_gpu("mBAR", err) }; unsafe { *(slot as u64) -> d_barrier }; dealloc(slot)
     err = hipMemcpy(d_barrier, h_zero_big, BARRIER_BYTES, 1); if err != 0 { die_gpu("z barrier", err) }
+
+    // ── Task 3: per-WG dense-grad PARTIAL buffer (NW slots × SLOT bytes) ──────
+    //   Backward accumulates each WG's dU/dV/dgw/dgb/dbias contributions into its
+    //   private slot d_partial[wg*SLOT + ·]; the in-kernel REDUCE phase then sums
+    //   slots 0..NW in fixed wg order into the final dU/dV/dgw/dgb/dbias buffers.
+    //   MUST be re-zeroed before EVERY step's launch (kernel does += into it).
+    //   At NW=1 it is one slot and the reduce is an identity copy → bit-exact.
+    u64 PARTIAL_BYTES = WZMA_MEGA_NW * WZMA_PART_SLOT
+    u64 d_partial = 0
+    slot = alloc(8); err = hipMalloc(slot, PARTIAL_BYTES); if err != 0 { die_gpu("mPART", err) }; unsafe { *(slot as u64) -> d_partial }; dealloc(slot)
+    err = hipMemcpy(d_partial, h_zero_big, PARTIAL_BYTES, 1); if err != 0 { die_gpu("z partial", err) }
     err = hipMemcpy(d_m_U,    h_zero_big, K * D * R * 4, 1); if err != 0 { die_gpu("z mU",  err) }
     err = hipMemcpy(d_v_U,    h_zero_big, K * D * R * 4, 1); if err != 0 { die_gpu("z vU",  err) }
     err = hipMemcpy(d_m_V,    h_zero_big, K * R * D * 4, 1); if err != 0 { die_gpu("z mV",  err) }
@@ -424,10 +440,12 @@ fn main() {
 
     // ── Launch ONE 1-WG / 512-thread dispatch (embed + WZMA fwd + pool/norm,
     //    both views) ────────────────────────────────────────────────────────
-    // Task 2: arg 59 = d_barrier is appended ONLY when NW>1 (kernel emits the
-    //   d_barrier kernarg load + cross-WG barriers only at MEGA_TRAIN_NW>1).
-    u64 NA = 59
-    if WZMA_MEGA_NW > 1 { NA = 60 }
+    // Task 2/3: arg 59 = d_barrier, arg 60 = d_partial are ALWAYS present now
+    //   (kernel metadata fixes d_partial at offset 0x1E0; the reduce reads it
+    //   unconditionally).  At NW=1 the d_barrier slot is a dummy (never read by
+    //   the elided barrier ISA) but its kernarg slot must still exist so
+    //   d_partial lands at 0x1E0.
+    u64 NA = 61
     u64 p0  = alloc(8); unsafe { *(p0  as u64) = d_ids }
     u64 p1  = alloc(8); unsafe { *(p1  as u64) = d_emb }
     u64 p2  = alloc(8); unsafe { *(p2  as u64) = d_x_out }
@@ -490,6 +508,7 @@ fn main() {
     u64 p57 = alloc(8)   // lr
     u64 p58 = alloc(8)   // eps
     u64 p59 = alloc(8); unsafe { *(p59 as u64) = d_barrier }   // Task 2: cross-WG counter
+    u64 p60 = alloc(8); unsafe { *(p60 as u64) = d_partial }   // Task 3: per-WG grad partials
     u64 kp = alloc(NA * 8)
     unsafe { *((kp +   0) as u64) = p0 }
     unsafe { *((kp +   8) as u64) = p1 }
@@ -550,9 +569,11 @@ fn main() {
     unsafe { *((kp + 448) as u64) = p56 }
     unsafe { *((kp + 456) as u64) = p57 }
     unsafe { *((kp + 464) as u64) = p58 }
-    // Task 2: slot 59 (offset 472 = 0x1D8) = d_barrier — only consumed by the
-    // kernel when NW>1; NA=59 at NW=1 so this slot is never read by the launch.
-    if WZMA_MEGA_NW > 1 { unsafe { *((kp + 472) as u64) = p59 } }
+    // Task 2/3: slot 59 (offset 472 = 0x1D8) = d_barrier (dummy at NW=1, live
+    // cross-WG counter at NW>1) and slot 60 (offset 480 = 0x1E0) = d_partial
+    // (per-WG dense-grad slots, read unconditionally by the reduce phase).
+    unsafe { *((kp + 472) as u64) = p59 }
+    unsafe { *((kp + 480) as u64) = p60 }
 
     // ═══════════════════════════════════════════════════════════════════════
     // Task 7: full 50-step training loop + benchmark.
@@ -632,7 +653,11 @@ fn main() {
         u64 t0 = time_now()
         u64 step1 = step + 1
 
-        // Re-zero the dense grad accumulators (kernel does += over both views).
+        // Task 3: re-zero the PER-WG partial dense-grad buffer (kernel does +=
+        // into d_partial over both views; the reduce then sums slots → final).
+        err = hipMemcpy(d_partial, h_zero_big, PARTIAL_BYTES, 1); if err != 0 { die_gpu("rz partial", err) }
+        // Final grad buffers are now WRITTEN (not +=) by the reduce phase, so
+        // they need no pre-zeroing; we re-zero them anyway (cheap, deterministic).
         err = hipMemcpy(d_dU,    h_zero_big, K * D * R * 4, 1); if err != 0 { die_gpu("rz dU",    err) }
         err = hipMemcpy(d_dV,    h_zero_big, K * R * D * 4, 1); if err != 0 { die_gpu("rz dV",    err) }
         err = hipMemcpy(d_dgw,   h_zero_big, K * D * 4,     1); if err != 0 { die_gpu("rz dgw",   err) }
@@ -686,6 +711,45 @@ fn main() {
         dealloc(h_loss_s)
         if step == 0          { loss0_saved = loss_s }
         if step == STEPS - 1  { lossN_saved = loss_s }
+
+        // ── Task 3 debug: verify the cross-WG REDUCE is a faithful copy at NW=1.
+        // At NW=1 the reduce is final[e] = partial[0][e] (identity), so the final
+        // dU/dV/dgw/dgb/dbias buffers MUST equal partial slot 0 element-wise
+        // (max_err 0).  The AdamW phase runs AFTER the reduce and modifies only
+        // param/m/v (not the grads), so the grads still hold the reduced values.
+        // (Partial slot 0 is at d_partial+0; SLOT offsets: dU 0, dV 196608,
+        // dgw 393216, dgb 399360, dbias 399376.)  demb (the 6th grad) is the
+        // per-row embed grad — written DIRECTLY (no reduce), checked via the loss
+        // trajectory + the existing sparse-AdamW path; reported here for context.
+        if step == 0 {
+            print_str("--- Task 3: reduce identity check (NW=1) vs partial slot 0 ---\n")
+            u64 hg = alloc(K * D * R * 4)   // big enough for the largest grad (49152 f32)
+            u64 hr = alloc(K * D * R * 4)
+            u64 red_ok = 1
+            // dU  (N=49152, partial off 0)
+            err = hipMemcpy(hg, d_dU, K*D*R*4, 2);            if err != 0 { die_gpu("D2H dU", err) }
+            err = hipMemcpy(hr, d_partial + 0, K*D*R*4, 2);   if err != 0 { die_gpu("D2H pU", err) }
+            if cmp_grad("dU", hg, hr, K*D*R) == 0 { red_ok = 0 }
+            // dV  (N=49152, partial off 196608)
+            err = hipMemcpy(hg, d_dV, K*R*D*4, 2);            if err != 0 { die_gpu("D2H dV", err) }
+            err = hipMemcpy(hr, d_partial + 196608, K*R*D*4, 2); if err != 0 { die_gpu("D2H pV", err) }
+            if cmp_grad("dV", hg, hr, K*R*D) == 0 { red_ok = 0 }
+            // dgw (N=1536, partial off 393216)
+            err = hipMemcpy(hg, d_dgw, K*D*4, 2);             if err != 0 { die_gpu("D2H dgw", err) }
+            err = hipMemcpy(hr, d_partial + 393216, K*D*4, 2);   if err != 0 { die_gpu("D2H pgw", err) }
+            if cmp_grad("dgw", hg, hr, K*D) == 0 { red_ok = 0 }
+            // dgb (N=4, partial off 399360)
+            err = hipMemcpy(hg, d_dgb, K*4, 2);               if err != 0 { die_gpu("D2H dgb", err) }
+            err = hipMemcpy(hr, d_partial + 399360, K*4, 2);     if err != 0 { die_gpu("D2H pgb", err) }
+            if cmp_grad("dgb", hg, hr, K) == 0 { red_ok = 0 }
+            // dbias (N=384, partial off 399376)
+            err = hipMemcpy(hg, d_dbias, D*4, 2);             if err != 0 { die_gpu("D2H dbias", err) }
+            err = hipMemcpy(hr, d_partial + 399376, D*4, 2);     if err != 0 { die_gpu("D2H pbias", err) }
+            if cmp_grad("dbias", hg, hr, D) == 0 { red_ok = 0 }
+            dealloc(hg); dealloc(hr)
+            if red_ok == 1 { print_str("REDUCE identity check: all 5 dense grads == partial[0]  PASS\n") }
+            else           { print_str("REDUCE identity check: FAIL\n") }
+        }
 
         // Per-step assertion vs reference (tol 1e-2).
         f32 ref_s = 0.0f
@@ -741,7 +805,7 @@ fn main() {
     dealloc(p32); dealloc(p33); dealloc(p34); dealloc(p35); dealloc(p36); dealloc(p37); dealloc(p38); dealloc(p39)
     dealloc(p40); dealloc(p41); dealloc(p42); dealloc(p43); dealloc(p44); dealloc(p45); dealloc(p46)
     dealloc(p47); dealloc(p48); dealloc(p49); dealloc(p50); dealloc(p51); dealloc(p52); dealloc(p53)
-    dealloc(p54); dealloc(p55); dealloc(p56); dealloc(p57); dealloc(p58); dealloc(p59)
+    dealloc(p54); dealloc(p55); dealloc(p56); dealloc(p57); dealloc(p58); dealloc(p59); dealloc(p60)
     dealloc(kp)
     // ═══════════════════════════════════════════════════════════════════════
     // Task 7 report — full 50-step run + benchmark.
@@ -849,6 +913,7 @@ fn main() {
     hipFree(d_m_gw); hipFree(d_v_gw); hipFree(d_m_gb); hipFree(d_v_gb)
     hipFree(d_m_bias); hipFree(d_v_bias)
     hipFree(d_barrier)
+    hipFree(d_partial)
     hipkfd_teardown()
     exit(0)
 }

@@ -7637,6 +7637,64 @@ fn wzm_clamp_off_dlt_D(uint64 v_off) {
     wzm_v_cndmask_zero_e32(v_off, v_off)   // v_off = (d<D) ? v_off : 0
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+// Task 3 (multi-WG): per-WG partial dense-grad buffer + deterministic reduce.
+//
+// Instead of every WG accumulating dU/dV/dgw/dgb/dbias DIRECTLY into the shared
+// final grad buffers (which would race / be order-nondeterministic across WGs),
+// each WG accumulates its rows' contributions into a PRIVATE per-WG slot inside
+// a single d_partial buffer (kernarg 60, offset 0x1E0), laid out as:
+//   d_partial[wg * SLOT + (dU | dV | dgw | dgb | dbias)]   contiguous per WG.
+// A later REDUCE phase (after a cross-WG barrier) sums partial[0..NW) in FIXED
+// wg order (0,1,2,...) into the final dU/dV/dgw/dgb/dbias buffers — fixed order
+// = bit-exact reproducibility.  At NW=1 there is one slot and the reduce is an
+// identity copy (acc = partial[0], no further adds), so it stays bit-exact vs
+// the single-WG oracle.  The per-row embed grad (demb) is NOT partialed: each BS
+// row is owned by exactly one WG (disjoint row ranges) so demb scatter-add has
+// no cross-WG overlap and writes directly into the shared demb buffer.
+//
+// Dense-grad slot layout (f32 element counts → byte offsets within one WG slot):
+//   dU    K*D*R = 49152   @ 0x00000   (=0)
+//   dV    K*R*D = 49152   @ 0x30000   (49152*4)
+//   dgw   K*D   = 1536    @ 0x60000   (98304*4)
+//   dgb   K     = 4       @ 0x61800   (99840*4)
+//   dbias D     = 384     @ 0x61810   (99844*4)
+//   SLOT  total = 100228 f32 = 400912 bytes
+static uint64 WZM_PART_DU_OFF    = 0          // bytes within a WG slot
+static uint64 WZM_PART_DV_OFF    = 196608     // 49152*4
+static uint64 WZM_PART_DGW_OFF   = 393216     // 98304*4
+static uint64 WZM_PART_DGB_OFF   = 399360     // 99840*4
+static uint64 WZM_PART_DBIAS_OFF = 399376     // 99844*4
+static uint64 WZM_PART_SLOT      = 400912     // 100228*4 (per-WG slot stride)
+// Element counts (used by the reduce phase striding, mirrors AdamW N gates).
+static uint64 WZM_PART_DU_N    = 49152
+static uint64 WZM_PART_DV_N    = 49152
+static uint64 WZM_PART_DGW_N   = 1536
+static uint64 WZM_PART_DGB_N   = 4
+static uint64 WZM_PART_DBIAS_N = 384
+
+// _wzm_emit_partial_grad_ptr — compute the per-WG partial-grad base address for
+// one dense grad and leave it in the SGPR pair s[78:79] (sdata_pair 39), which
+// is exactly where the Task-5 bwd emitters already expect the grad base.  This
+// REPLACES the old `asm_s_load_b64_off(39, 0, <final_grad_kofs>)`.
+//   base = d_partial + wg_id*WZM_PART_SLOT + within_slot_off
+// d_partial is kernarg 60 @ 0x1E0.  s3 = wg_id_x (stashed in prologue).  At NW=1
+// wg_id=0, so base = d_partial + within_slot_off.  Uses s35 as a scratch scalar
+// (a documented scratch in these emitters) and emits s_add_u32/s_addc_u32 with a
+// 32-bit byte offset (fits for NW<=~10: (NW-1)*400912 + 399376 << 2^32).
+//   Clobbers: s35, s[78:79].  Leaves lgkmcnt drained for the caller.
+fn _wzm_emit_partial_grad_ptr(uint64 within_slot_off) {
+    asm_s_load_b64_off(39, 0, 0x1E0)      // s[78:79] = d_partial (kernarg 60)
+    asm_u32(0xBF89FC07)                   // s_waitcnt lgkmcnt(0)
+    // s35 = wg_id*SLOT + within_slot_off  (single 32-bit byte offset)
+    wzm_s_mul_i32_lit(35, 3, WZM_PART_SLOT)            // s35 = wg_id * SLOT
+    asm_u32((0x80 << 24) | (35 << 16) | (0xFF << 8) | 35)   // s_add_u32 s35, s35, lit
+    asm_u32(within_slot_off & 0xFFFFFFFF)
+    // s[78:79] += s35 (carry into hi).
+    asm_u32((0x80 << 24) | (78 << 16) | (35 << 8) | 78)     // s_add_u32  s78, s78, s35
+    asm_u32((0x82 << 24) | (79 << 16) | (0x80 << 8) | 79)   // s_addc_u32 s79, s79, 0
+}
+
 // ── Task-5 backward helper: InfoNCE re-norm bwd + l2norm_bwd + meanpool_bwd,
 //    fused for one view.  Mirrors std/train.mlr exactly:
 //      infonce_bwd re-norm:  dq[b,d]  = dqa[b,d] - (dqa·q)[b] * q[b,d]
@@ -7788,7 +7846,7 @@ fn _wzm_emit_wzma_bwd_view(uint64 x_saddr, uint64 alpha_saddr,
     asm_u32(0xBFA00000 | db_back)
     uint64 db_end = asm_text_len / 4
     asm_patch_u32(db_exit, 0xBFA20000 | ((db_end - db_exit - 1) & 0xFFFF))
-    asm_s_load_b64_off(39, 0, 0x100)      // s[78:79] = dbias
+    _wzm_emit_partial_grad_ptr(WZM_PART_DBIAS_OFF)   // s[78:79] = partial dbias (per-WG)
     asm_u32(0xBF89FC07)
     wzm_v_shl2_e32(1, 0)                  // d*4
     wzm_gload_b32_saddr(16, 1, 78)        // v16 = dbias[d]
@@ -7923,7 +7981,7 @@ fn _wzm_emit_wzma_bwd_view(uint64 x_saddr, uint64 alpha_saddr,
         asm_u32(0xBF8903F7)
         // dV[k,r,d] += (alpha_k*inter)*dy[d]   off=(k*12288 + r*384 + d)*4
         wzm_v_mul_f32_e32(20, 12 + kk, 19)   // alpha_k*inter
-        asm_s_load_b64_off(39, 0, 0xE8)   // s[78:79] = dV
+        _wzm_emit_partial_grad_ptr(WZM_PART_DV_OFF)   // s[78:79] = partial dV (per-WG)
         asm_u32(0xBF89FC07)
         wzm_s_mov_b32_lit(35, kk * 12288)
         wzm_s_mul_i32_lit(37, 36, 0x180)  // r*384
@@ -7937,7 +7995,7 @@ fn _wzm_emit_wzma_bwd_view(uint64 x_saddr, uint64 alpha_saddr,
         wzm_gstore_b32_saddr(1, 16, 78)
         asm_u32(0xBC7C0000)
         // dU[k,d,r] += dinter*x[d]   off=(k*12288 + d*32 + r)*4
-        asm_s_load_b64_off(39, 0, 0xE0)   // s[78:79] = dU
+        _wzm_emit_partial_grad_ptr(WZM_PART_DU_OFF)   // s[78:79] = partial dU (per-WG)
         asm_u32(0xBF89FC07)
         wzm_s_mov_b32_lit(35, kk * 12288)
         wzm_s_add_u32_ss(35, 35, 36)      // k*12288 + r
@@ -7977,7 +8035,7 @@ fn _wzm_emit_wzma_bwd_view(uint64 x_saddr, uint64 alpha_saddr,
         wzm_v_sub_f32_e32(29, 24 + gbk, 28)   // d_alpha_k - sum_ada
         wzm_v_mul_f32_e32(29, 12 + gbk, 29)   // * alpha_k
         // dgw[k,d] += dgl_k * x[d]    off=(k*384 + d)*4
-        asm_s_load_b64_off(39, 0, 0xF0)   // s[78:79] = dgw
+        _wzm_emit_partial_grad_ptr(WZM_PART_DGW_OFF)   // s[78:79] = partial dgw (per-WG)
         asm_u32(0xBF89FC07)
         wzm_s_mov_b32_lit(35, gbk * 384)
         wzm_v_add_nc_u32_sv(1, 35, 0)
@@ -8018,7 +8076,7 @@ fn _wzm_emit_wzma_bwd_view(uint64 x_saddr, uint64 alpha_saddr,
     asm_u32(0xBE82206A)                   // saveexec s2
     uint64 gb_execz = asm_text_len / 4
     asm_u32(0xBFA50000)                   // execz .Lgb_end
-    asm_s_load_b64_off(39, 0, 0xF8)       // s[78:79] = dgb
+    _wzm_emit_partial_grad_ptr(WZM_PART_DGB_OFF)   // s[78:79] = partial dgb (per-WG)
     asm_u32(0xBF89FC07)
     uint64 gck = 0
     while gck < 4 {
@@ -8098,6 +8156,96 @@ fn _wzm_emit_embed_bwd_view(uint64 ids_saddr, uint64 dx_kofs) {
     asm_patch_u32(eb_execz, 0xBFA50000 | ((eb_e - eb_execz - 1) & 0xFFFF))
     asm_u32(0xBEFE0002)                   // restore exec
     asm_u32(0xBFBD0000)                   // s_barrier
+}
+
+// ── Task 3 helper: deterministic cross-WG reduce of ONE dense grad ────────
+// final[e] = sum_{wg=0..NW-1} d_partial[wg*SLOT + grad_off + e]   for e in 0..N.
+// FIXED summation order (wg = 0,1,2,...,NW-1) → bit-exact reproducibility.  The
+// element space is partitioned across ALL NW*512 threads: each output element
+// is computed by exactly one thread (gid = wg_id*512 + lane, strided by NW*512),
+// and that thread sums all NW partials in order — so the per-element add order
+// is identical regardless of which thread/WG owns it.  At NW=1: total threads
+// = 512, the inner wg-loop runs once → acc = partial[0][e], final[e] = acc
+// (identity copy → bit-exact vs the single-WG oracle).
+//
+// Implementation mirrors _wzm_emit_adamw_param's strided/exec-gated structure
+// so inactive (gid>=N) lanes NEVER issue an OOB global op
+// (feedback_oob_address_pad_lane_wedge).
+//   final_kofs      = kernarg byte offset of the FINAL grad ptr (0xE0..0x100)
+//   within_slot_off = byte offset of this grad inside one WG's partial slot
+//   N               = element count (compile-time literal)
+// Pointers: s[64:65]=final, s[66:67]=d_partial(base, wg=0), s[68:69]=running.
+//   s34=block base, s36=wg thread base.
+//   Clobbers: v16..v19 ; s2,s34,s36,s[64:69].
+fn _wzm_emit_reduce_grad(uint64 final_kofs, uint64 within_slot_off, uint64 N) {
+    uint64 nw = MEGA_TRAIN_NW
+    uint64 total_threads = nw * 512                 // global thread count
+    asm_s_load_b64_off(32, 0, final_kofs)           // s[64:65] = final grad
+    asm_s_load_b64_off(33, 0, 0x1E0)                // s[66:67] = d_partial
+    asm_u32(0xBF89FC07)                             // lgkmcnt(0)
+    // s[66:67] += within_slot_off  → base of grad for wg=0.
+    asm_u32((0x80 << 24) | (66 << 16) | (0xFF << 8) | 66)   // s_add_u32  s66, s66, lit
+    asm_u32(within_slot_off & 0xFFFFFFFF)
+    asm_u32((0x82 << 24) | (67 << 16) | (0x80 << 8) | 67)   // s_addc_u32 s67, s67, 0
+
+    // s36 = wg_id*512 (this WG's global thread base; s3 = wg_id_x).
+    wzm_s_mul_i32_lit(36, 3, 512)
+
+    wzm_s_mov_b32_0(34)                             // s34 = element block base = 0
+    uint64 rd_top = asm_text_len / 4
+    asm_u32(0xBF090000 | (0xFF << 8) | 34)          // s_cmp_ge_u32 s34, N
+    asm_u32(N & 0xFFFFFFFF)
+    uint64 rd_exit = asm_text_len / 4
+    asm_u32(0xBFA20000)                             // s_cbranch_scc1 .Lrd_end (patched)
+
+    // gid = block_base + wg_id*512 + lane.
+    wzm_v_add_nc_u32_sv0(16, 34)                    // v16 = s34 + v0
+    wzm_v_add_nc_u32_sv(16, 36, 16)                 // v16 = v16 + s36 (wg base)
+    // EXEC-gate gid < N : v_cmp_gt_u32 vcc, N(lit), v16 ; saveexec s2.
+    asm_u32(0x7C980000 | (16 << 9) | 0xFF)          // v_cmp_gt_u32_e32 vcc_lo, N, v16
+    asm_u32(N & 0xFFFFFFFF)
+    asm_u32(0xBE82206A)                             // s_and_saveexec_b32 s2, vcc_lo
+    uint64 rd_execz = asm_text_len / 4
+    asm_u32(0xBFA50000)                             // s_cbranch_execz .Lrd_next (patched)
+
+    wzm_v_shl2_e32(17, 16)                          // v17 = gid*4 (byte off)
+
+    // acc = partial[wg=0][gid]  (initialize from FIRST WG; fixed order).
+    wzm_gload_b32_saddr(18, 17, 66)                 // v18 = partial[0][gid]
+    asm_u32(0xBF8903F7)                             // vmcnt(0)
+    // for wg' = 1..NW-1 : acc += partial[wg'][gid].  Walk a SEPARATE running
+    // pointer pair s[68:69] (init = s[66:67] wg=0 base) by +SLOT each iter; the
+    // immutable s[66:67] is left intact for the next block (no restore needed).
+    if nw > 1 {
+        asm_s_mov_b32(68, 66)                       // s68 = s66
+        asm_s_mov_b32(69, 67)                       // s69 = s67
+    }
+    uint64 wgp = 1
+    while wgp < nw {
+        // s[68:69] += SLOT
+        asm_u32((0x80 << 24) | (68 << 16) | (0xFF << 8) | 68)   // s_add_u32  s68, s68, SLOT
+        asm_u32(WZM_PART_SLOT & 0xFFFFFFFF)
+        asm_u32((0x82 << 24) | (69 << 16) | (0x80 << 8) | 69)   // s_addc_u32 s69, s69, 0
+        wzm_gload_b32_saddr(19, 17, 68)             // v19 = partial[wg'][gid]
+        asm_u32(0xBF8903F7)                         // vmcnt(0)
+        wzm_v_add_f32_e32(18, 18, 19)               // acc += partial[wg']
+        wgp = wgp + 1
+    }
+
+    // final[gid] = acc.
+    wzm_gstore_b32_saddr(17, 18, 64)
+    asm_u32(0xBC7C0000)                             // vscnt(0)
+
+    // .Lrd_next: restore exec, block_base += total_threads, loop.
+    uint64 rd_next = asm_text_len / 4
+    asm_patch_u32(rd_execz, 0xBFA50000 | ((rd_next - rd_execz - 1) & 0xFFFF))
+    asm_u32(0xBEFE0002)                             // restore exec (s_mov exec_lo, s2)
+    asm_u32((0x80 << 24) | (34 << 16) | (0xFF << 8) | 34)   // s_add_u32 s34, s34, total
+    asm_u32(total_threads & 0xFFFFFFFF)
+    uint64 rd_back = (rd_top - (asm_text_len / 4) - 1) & 0xFFFF
+    asm_u32(0xBFA00000 | rd_back)                   // s_branch .Lrd_top
+    uint64 rd_end = asm_text_len / 4
+    asm_patch_u32(rd_exit, 0xBFA20000 | ((rd_end - rd_exit - 1) & 0xFFFF))
 }
 
 // ── Task 6 helper: in-kernel AdamW for ONE dense param tensor ─────────────
@@ -9231,11 +9379,30 @@ fn amdgpu_lower_wzma_train_mega(uint64 kname_ptr, uint64 nl) -> uint64 {
     //   passed by-value, computed CPU-side per step (matches std/train.mlr
     //   adamw_step and bp_wzma_gpu_train_v2 launch_adamw exactly).
     // ═══════════════════════════════════════════════════════════════════════
-    // PHASE BOUNDARY 2: backward (all WGs accumulate grads) → AdamW.  NW>1:
-    // cross-WG barrier so all grad contributions are visible before the update.
-    // (Task 3 inserts a per-WG-partial reduce phase between these; the AdamW
-    // update itself is element-wise and splits cleanly across WGs.)
-    _wzm_emit_phase_barrier(2)   // s_barrier — embed_bwd grads visible before AdamW
+    // PHASE BOUNDARY 2: backward (all WGs wrote their PER-WG partial grad slots)
+    // → REDUCE.  NW>1: cross-WG barrier so every WG's partial[wg][·] is visible
+    // before the reduce reads slots 0..NW.  NW=1: plain intra-WG s_barrier.
+    _wzm_emit_phase_barrier(2)
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Task 3: DETERMINISTIC cross-WG grad REDUCE.  For each of the 5 dense grads
+    // (dU,dV,dgw,dgb,dbias): final[e] = sum_{wg=0..NW-1} d_partial[wg*SLOT+off+e]
+    // summed in FIXED wg order (0,1,...,NW-1) → bit-exact.  Element space is
+    // partitioned across all NW*512 threads (one thread per output element); the
+    // per-element add order is identical regardless of owning thread.  At NW=1
+    // this is an identity copy (final[e] = partial[0][e]) → bit-exact vs oracle.
+    //   final grad kernarg offsets: dU 0xE0, dV 0xE8, dgw 0xF0, dgb 0xF8, dbias 0x100
+    // ═══════════════════════════════════════════════════════════════════════
+    _wzm_emit_reduce_grad(0xE0,  WZM_PART_DU_OFF,    WZM_PART_DU_N)
+    _wzm_emit_reduce_grad(0xE8,  WZM_PART_DV_OFF,    WZM_PART_DV_N)
+    _wzm_emit_reduce_grad(0xF0,  WZM_PART_DGW_OFF,   WZM_PART_DGW_N)
+    _wzm_emit_reduce_grad(0xF8,  WZM_PART_DGB_OFF,   WZM_PART_DGB_N)
+    _wzm_emit_reduce_grad(0x100, WZM_PART_DBIAS_OFF, WZM_PART_DBIAS_N)
+
+    // PHASE BOUNDARY 3: reduce → AdamW.  NW>1: cross-WG barrier so all final grad
+    // elements (written across WGs in the reduce) are visible before AdamW reads
+    // them.  NW=1: plain intra-WG s_barrier.
+    _wzm_emit_phase_barrier(3)   // s_barrier — final grads visible before AdamW
 
     // Load the 9 f32 hyperparams (kernargs 50..58, offsets 0x190..0x1D0) into
     // uniform VGPRs v24..v32 (read by every _wzm_emit_adamw_param invocation).
@@ -9273,19 +9440,21 @@ fn amdgpu_lower_wzma_train_mega(uint64 kname_ptr, uint64 nl) -> uint64 {
     //   48 m_bias 49 v_bias                                  (global_buffer ptrs)
     //   50 inv_bc1 51 inv_bc2 52 decay 53 beta1 54 beta2
     //   55 one_m_b1 56 one_m_b2 57 lr   58 eps               (f32 by_value)
-    // Task 2 (multi-WG) adds arg 59 = d_barrier (cross-WG counter, global_buffer
-    //   at offset 0x1D8) ONLY when MEGA_TRAIN_NW>1 — at NW=1 n_args stays 59 so
-    //   the emitted .co (text + metadata) is byte-identical to the single-WG
-    //   oracle / Task 1.
-    uint64 n_args = 59
-    if MEGA_TRAIN_NW > 1 { n_args = 60 }
+    // Task 2 (multi-WG) added arg 59 = d_barrier (cross-WG counter, global_buffer
+    //   at offset 0x1D8).  Task 3 adds arg 60 = d_partial (per-WG dense-grad
+    //   slots, global_buffer at offset 0x1E0).  BOTH slots are ALWAYS present in
+    //   the metadata now (n_args = 61) so d_partial's offset (0x1E0) is FIXED
+    //   regardless of NW — the reduce phase reads 0x1E0 unconditionally.  At NW=1
+    //   the d_barrier ISA load is still elided (only d_partial is consumed), and
+    //   the launcher must populate both slots (d_barrier may be a dummy at NW=1).
+    uint64 n_args = 61
     uint64 args_desc = alloc(n_args * 16)
     uint64 ai = 0
     while ai < n_args {
         uint64 sp = args_desc + ai * 16;       unsafe { *(sp as uint64) = 8 }
         uint64 kp = args_desc + ai * 16 + 8
         // 12,13 = BS,D (by-value) ; 50..58 = AdamW f32 hyperparams (by-value) ;
-        // 59 = d_barrier (global_buffer) ; everything else is a global_buffer ptr.
+        // 59 = d_barrier, 60 = d_partial (global_buffer) ; rest = global_buffer ptr.
         if ai == 12 { unsafe { *(kp as uint64) = AMD_ARG_KIND_BY_VALUE } }
         else if ai == 13 { unsafe { *(kp as uint64) = AMD_ARG_KIND_BY_VALUE } }
         else if ai >= 50 && ai <= 58 { unsafe { *(kp as uint64) = AMD_ARG_KIND_BY_VALUE } }
