@@ -274,6 +274,10 @@ fn main() {
     u64 d_dz2   = 0
     u64 d_dx1   = 0
     u64 d_dx2   = 0
+    // Task 4 (tiled dU): scratch dinter[K,BS,R] materialized by the bwd view so
+    // the dU adjoint can register-accumulate over BS instead of per-bs RMW.
+    // One buffer, reused per view (write→barrier→read within each view).
+    u64 d_dinter = 0
     u64 slot
 
     slot = alloc(8); err = hipMalloc(slot, VOCAB * D * 4);   if err != 0 { die_gpu("mEmb",  err) }; unsafe { *(slot as u64) -> d_emb   }; dealloc(slot)
@@ -315,6 +319,9 @@ fn main() {
     slot = alloc(8); err = hipMalloc(slot, BS * D * 4);      if err != 0 { die_gpu("mDZ2",  err) }; unsafe { *(slot as u64) -> d_dz2   }; dealloc(slot)
     slot = alloc(8); err = hipMalloc(slot, BS * D * 4);      if err != 0 { die_gpu("mDX1",  err) }; unsafe { *(slot as u64) -> d_dx1   }; dealloc(slot)
     slot = alloc(8); err = hipMalloc(slot, BS * D * 4);      if err != 0 { die_gpu("mDX2",  err) }; unsafe { *(slot as u64) -> d_dx2   }; dealloc(slot)
+    // Task 4: scratch dinter[K,BS,R] (kernarg 63) — written then read inside each
+    // bwd view; no host init needed (fully overwritten before read each view).
+    slot = alloc(8); err = hipMalloc(slot, K * BS * R * 4);  if err != 0 { die_gpu("mDINT", err) }; unsafe { *(slot as u64) -> d_dinter }; dealloc(slot)
 
     // Zero the grad accumulators (dU,dV,dgw,dgb,dbias,demb) — kernel does += .
     // (Re-zeroed each step inside the training loop below.)
@@ -432,7 +439,7 @@ fn main() {
     //   unconditionally).  At NW=1 the d_barrier slot is a dummy (never read by
     //   the elided barrier ISA) but its kernarg slot must still exist so
     //   d_partial lands at 0x1E0.
-    u64 NA = 63
+    u64 NA = 64
     u64 p0  = alloc(8); unsafe { *(p0  as u64) = d_ids }
     u64 p1  = alloc(8); unsafe { *(p1  as u64) = d_emb }
     u64 p2  = alloc(8); unsafe { *(p2  as u64) = d_x_out }
@@ -498,6 +505,7 @@ fn main() {
     u64 p60 = alloc(8); unsafe { *(p60 as u64) = d_partial }   // Task 3: per-WG grad partials
     u64 p61 = alloc(8); unsafe { *(p61 as u64) = d_m_emb }     // EMBED-ADAMW: embed m (resident)
     u64 p62 = alloc(8); unsafe { *(p62 as u64) = d_v_emb }     // EMBED-ADAMW: embed v (resident)
+    u64 p63 = alloc(8); unsafe { *(p63 as u64) = d_dinter }    // Task 4: scratch dinter[K,BS,R]
     u64 kp = alloc(NA * 8)
     unsafe { *((kp +   0) as u64) = p0 }
     unsafe { *((kp +   8) as u64) = p1 }
@@ -567,6 +575,9 @@ fn main() {
     // 0x1F0) = d_v_emb — read by the in-kernel embed AdamW phase.
     unsafe { *((kp + 488) as u64) = p61 }
     unsafe { *((kp + 496) as u64) = p62 }
+    // Task 4: slot 63 (offset 504 = 0x1F8) = d_dinter scratch (read+written by the
+    // wzma bwd view's dU register-accumulate phase).
+    unsafe { *((kp + 504) as u64) = p63 }
 
     // ═══════════════════════════════════════════════════════════════════════
     // Task 7: full 50-step training loop + benchmark.
@@ -844,7 +855,7 @@ fn main() {
     dealloc(p40); dealloc(p41); dealloc(p42); dealloc(p43); dealloc(p44); dealloc(p45); dealloc(p46)
     dealloc(p47); dealloc(p48); dealloc(p49); dealloc(p50); dealloc(p51); dealloc(p52); dealloc(p53)
     dealloc(p54); dealloc(p55); dealloc(p56); dealloc(p57); dealloc(p58); dealloc(p59); dealloc(p60)
-    dealloc(p61); dealloc(p62)
+    dealloc(p61); dealloc(p62); dealloc(p63)
     dealloc(kp)
     // ═══════════════════════════════════════════════════════════════════════
     // Task 7 report — full 50-step run + benchmark.
@@ -965,6 +976,8 @@ fn main() {
     // Task 2/3 multi-WG buffers: d_partial (NW * SLOT) + d_barrier (64).
     bytes_vram = bytes_vram + WZMA_MEGA_NW * WZMA_PART_SLOT
     bytes_vram = bytes_vram + 64
+    // Task 4: dinter scratch [K,BS,R].
+    bytes_vram = bytes_vram + K * BS * R * 4
     u64 vram_mib = bytes_vram / (1024 * 1024)
     print_str("VRAM ~")
     u64 vms = fmt_dec(vram_mib); print_str(vms); dealloc(vms)
@@ -983,6 +996,7 @@ fn main() {
     hipFree(d_n1); hipFree(d_n2)
     hipFree(d_dU); hipFree(d_dV); hipFree(d_dgw); hipFree(d_dgb); hipFree(d_dbias); hipFree(d_demb)
     hipFree(d_dv1); hipFree(d_dv2); hipFree(d_dz1); hipFree(d_dz2); hipFree(d_dx1); hipFree(d_dx2)
+    hipFree(d_dinter)
 
     // ── Cleanup (teardown is MANDATORY before every exit path) ─────────────
     hipFree(d_loss)

@@ -7827,7 +7827,7 @@ fn _wzm_emit_renorm_pool_bwd_view(uint64 q_saddr, uint64 dv_kofs,
 //    dbias 0x100.   Clobbers v1,v5-v9,v10-v21,v24-v29 ; s2,s14,s34-39,s[74:79].
 fn _wzm_emit_wzma_bwd_view(uint64 x_saddr, uint64 alpha_saddr,
                            uint64 inter_saddr, uint64 outk_saddr,
-                           uint64 dy_kofs, uint64 dx_kofs) {
+                           uint64 dy_kofs, uint64 dx_kofs, uint64 dinter_kofs) {
     asm_s_load_b64_off(37, 0, dy_kofs)    // s[74:75] = dy (dz)
     asm_s_load_b64_off(38, 0, dx_kofs)    // s[76:77] = dx
     asm_u32(0xBF89FC07)                   // lgkmcnt(0)
@@ -7976,6 +7976,33 @@ fn _wzm_emit_wzma_bwd_view(uint64 x_saddr, uint64 alpha_saddr,
     wzm_v_shl2_e32(1, 0)                 // v1 = g*4 (LDS rel byte offset)
     wzm_ds_store_b32(1, 20, 2048)        // LDS[2048 + g*4] = g[k,r]
     asm_u32(0xBF89FC07)                  // lgkmcnt(0)
+
+    // ── Task 4 (tiled dU): materialize dinter[k,bs,r] = alpha_k·g[k,r] to the
+    // dinter scratch buffer (kernarg dinter_kofs).  Lanes g<128 each own a unique
+    // (k,r) (k=v18=g>>5, r=v21=g&31), so the scatter has NO intra-WG race.  This
+    // lets the dU adjoint below register-accumulate dU[k,d,r]=Σ_bs dinter·x[bs,d]
+    // over BS instead of doing a per-bs global RMW into dU (the old inner-loop
+    // cost).  scratch elem (k,bs,r) = k*BS*R + bs*R + r = k*4096 + bs*32 + r.
+    //   OOB: lanes 128..511 are exec-gated OFF here; max elem (k=3,bs=127,r=31)
+    //   = 3*4096+127*32+31 = 16383 = K*BS*R-1, in-bounds.
+    asm_s_load_b64_off(37, 0, dinter_kofs)   // s[74:75] = dinter scratch base
+    asm_u32(0xBF89FC07)                      // lgkmcnt(0)
+    // alpha[bs,k] elem = bs*K + k = s34*4 + v18.  v16 = (s34*4 + v18)*4 byteoff.
+    wzm_s_lshl2(35, 34)                  // s35 = bs*4 (= bs*K, K=4)
+    wzm_v_add_nc_u32_sv(16, 35, 18)      // v16 = bs*4 + k
+    wzm_v_shl2_e32(16, 16)               // *4
+    wzm_gload_b32_saddr(5, 16, alpha_saddr)  // v5 = alpha[bs,k]  (s[58/60:..])
+    asm_u32(0xBF8903F7)                  // vmcnt(0)
+    wzm_v_mul_f32_e32(5, 5, 20)          // v5 = dinter = alpha_k * g[k,r]
+    // scratch byteoff = (k*4096 + bs*32 + r)*4.  k*4096 = v18<<12 ; bs*32 = s34<<5.
+    asm_v_lshlrev_b32_imm(16, 12, 18)    // v16 = k*4096
+    wzm_s_mul_i32_lit(35, 34, 32)        // s35 = bs*32
+    wzm_v_add_nc_u32_sv(16, 35, 16)      // v16 += bs*32
+    asm_u32((0x25 << 25) | (16 << 17) | (21 << 9) | (0x100 | 16))   // v16 += r (v21)
+    wzm_v_shl2_e32(16, 16)               // *4
+    wzm_gstore_b32_saddr(16, 5, 74)      // dinter_scratch[k,bs,r] = dinter (s[74:75])
+    asm_u32(0xBC7C0000)                  // vscnt(0)
+
     uint64 gg_end = asm_text_len / 4
     asm_patch_u32(gg_execz, 0xBFA50000 | ((gg_end - gg_execz - 1) & 0xFFFF))
     asm_u32(0xBEFE0002)                  // restore full exec
@@ -8049,19 +8076,14 @@ fn _wzm_emit_wzma_bwd_view(uint64 x_saddr, uint64 alpha_saddr,
         wzm_v_add_f32_e32(16, 16, 21)
         wzm_gstore_b32_saddr(1, 16, 78)
         asm_u32(0xBC7C0000)
-        // dU[k,d,r] += dinter*x[d]   off=(k*12288 + d*32 + r)*4
-        _wzm_emit_partial_grad_ptr(WZM_PART_DU_OFF)   // s[78:79] = partial dU (per-WG)
-        asm_u32(0xBF89FC07)
-        wzm_s_mov_b32_lit(35, kk * 12288)
-        wzm_s_add_u32_ss(35, 35, 36)      // k*12288 + r
-        wzm_v_add_nc_u32_sv(1, 35, 8)     // + d*32 (v8)
-        wzm_v_shl2_e32(1, 1)
-        wzm_gload_b32_saddr(16, 1, 78)    // dU[k,d,r]
-        asm_u32(0xBF8903F7)
-        wzm_v_mul_f32_e32(21, 18, 11)     // dinter*x[d]
-        wzm_v_add_f32_e32(16, 16, 21)
-        wzm_gstore_b32_saddr(1, 16, 78)
-        asm_u32(0xBC7C0000)
+        // NOTE (Task 4): dU[k,d,r] += dinter*x[d] is NO LONGER done here.  The old
+        // per-bs global RMW into dU (1 load + 1 store per (bs,k,r)) is replaced by
+        // a register-accumulate dU phase AFTER this per-bs loop (lanes own dU[k,d,r],
+        // accumulate Σ_bs dinter[k,bs,r]·x[bs,d] from the dinter scratch + resident
+        // x, 1 RMW per (k,d,r) instead of per (bs,k,r)).  dinter[k,bs,r] was already
+        // materialized to scratch in the g-block above (= alpha_k·g[k,r]).
+        // dx still uses the in-loop dinter (v18) — it was already register-accumulate
+        // (Σ_{k,r} into v17, 1 store per bs), so it is left untouched.
         // dx[d] += dinter*U[k,d,r]   (U s[10:11]) off=(k*12288 + d*32 + r)*4
         wzm_s_mov_b32_lit(35, kk * 12288)
         wzm_s_add_u32_ss(35, 35, 36)
@@ -8156,7 +8178,98 @@ fn _wzm_emit_wzma_bwd_view(uint64 x_saddr, uint64 alpha_saddr,
     asm_u32(0xBFA00000 | bs_back)
     uint64 bs_end = asm_text_len / 4
     asm_patch_u32(bs_exit, 0xBFA20000 | ((bs_end - bs_exit - 1) & 0xFFFF))
-    asm_u32(0xBFBD0000)                   // s_barrier — dU/dV/dgw/dgb/dx done
+    asm_u32(0xBFBD0000)                   // s_barrier — dV/dgw/dgb/dx done; all
+                                          //   dinter[k,bs,r] scratch stores issued
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Task 4 (tiled dU): dU[k,d,r] += Σ_bs dinter[k,bs,r]·x[bs,d]  (contraction BS)
+    //
+    // The OLD path did a per-bs global RMW into dU inside the per-bs loop (1 load
+    // + 1 store of dU[k,d,r] for EVERY (bs,k,r) — BS_local·K·R RMW passes per WG).
+    // NEW path mirrors the Task-1/3 register-accumulate style: lane d owns the dU
+    // output ROW d; for each (k,r) it accumulates Σ_bs dinter·x[bs,d] in a register
+    // over the WG's bs range (dinter read uniform-broadcast from the scratch the
+    // g-block materialized, x[bs,d] from the resident x buffer — L1-cached across
+    // (k,r)), then does ONE RMW into the per-WG dU partial (K·R passes per WG, vs
+    // BS_local·K·R).  Summation order over bs is sequential 0..BS-1 (matches the
+    // NW=1 oracle which is regenerated against this order).
+    //
+    // dU still ACCUMULATES across the two views + (at NW>1) reduces across WGs:
+    // the per-WG dU partial is +='d (load-add-store) so view-1 builds on view-0;
+    // the launcher zeroes d_partial each step and the reduce sums WG slots.
+    //
+    // ⚠ OOB rule (feedback_oob_address_pad_lane_wedge): the whole phase is exec-
+    // gated d<D, so lanes 384..511 issue NO global op.  Active-lane max offsets:
+    //   x  : (bs=127,d=383) elem 49151 = BS*D-1.
+    //   dinter: (k=3,bs=127,r=31) elem 16383 = K*BS*R-1.
+    //   dU : (k=3,d=383,r=31) elem 49151 = K*D*R-1.  All in-bounds.
+    asm_buffer_gl1_inv()                  // invalidate L1 — see dinter scratch below
+    asm_buffer_gl0_inv()                  // invalidate L0 (dinter written this WG)
+    asm_s_load_b64_off(37, 0, dinter_kofs)   // s[74:75] = dinter scratch base
+    asm_u32(0xBF89FC07)                   // lgkmcnt(0)
+    asm_u32((0x18 << 25) | (8 << 17) | (0 << 9) | (0x80 + 5))   // v8 = d*32 (v_lshlrev_b32 v8,5,v0)
+    asm_u32(0x7C980020)                   // vcc = d<D
+    asm_u32(0xBE82206A)                   // s_and_saveexec_b32 s2, vcc  (gate d<D)
+    uint64 du_execz = asm_text_len / 4
+    asm_u32(0xBFA50000)                   // s_cbranch_execz .Ldu_end (patched)
+
+    uint64 uk = 0
+    while uk < 4 {
+        wzm_s_mov_b32_0(39)               // s39 = r = 0
+        uint64 ur_top = asm_text_len / 4
+        asm_u32(0xBF090000 | (0xA0 << 8) | 39)   // s_cmp_ge_u32 s39, 32  (r>=R)
+        uint64 ur_exit = asm_text_len / 4
+        asm_u32(0xBFA20000)
+        asm_u32(0x7E220280)               // v17 = 0  (acc)
+        // ── bs accumulate: acc += dinter[k,bs,r]·x[bs,d] over WG's bs range ──
+        wzm_train_bs_loop_init(34)        // s34 = bs lo (=0 NW=1) ; s31 = hi (NW>1)
+        uint64 ub_top = asm_text_len / 4
+        asm_u32(0xBF090000 | (wzm_train_bs_bound() << 8) | 34)   // bs >= hi
+        uint64 ub_exit = asm_text_len / 4
+        asm_u32(0xBFA20000)
+        // dinter[k,bs,r] elem = k*4096 + bs*32 + r  (uniform across lanes).
+        wzm_s_mov_b32_lit(35, uk * 4096)  // s35 = k*4096
+        wzm_s_add_u32_ss(35, 35, 39)      // + r
+        wzm_s_mul_i32_lit(36, 34, 32)     // s36 = bs*32
+        wzm_s_add_u32_ss(35, 35, 36)      // s35 = dinter elem
+        wzm_v_mov_s(1, 35)                // v1 = elem
+        wzm_v_shl2_e32(1, 1)              // *4
+        wzm_gload_b32_saddr(11, 1, 74)    // v11 = dinter[k,bs,r]  (s[74:75])
+        // x[bs,d] elem = bs*384 + d ; lane-specific (d = v0).
+        wzm_s_mul_i32_lit(36, 34, 0x180)  // s36 = bs*384
+        wzm_v_add_nc_u32_sv(1, 36, 0)     // v1 = bs*384 + d
+        wzm_v_shl2_e32(1, 1)              // *4
+        wzm_gload_b32_saddr(10, 1, x_saddr)   // v10 = x[bs,d]
+        asm_u32(0xBF8903F7)               // vmcnt(0)
+        asm_v_fma_f32_e64_vvv(17, 11, 10, 17)   // acc += dinter * x[bs,d]
+        wzm_s_add_u32_1(34, 34)           // bs += 1
+        uint64 ub_back = (ub_top - (asm_text_len / 4) - 1) & 0xFFFF
+        asm_u32(0xBFA00000 | ub_back)
+        uint64 ub_end = asm_text_len / 4
+        asm_patch_u32(ub_exit, 0xBFA20000 | ((ub_end - ub_exit - 1) & 0xFFFF))
+        // ── RMW dU partial[k,d,r] += acc   off=(k*12288 + d*32 + r)*4 ──
+        _wzm_emit_partial_grad_ptr(WZM_PART_DU_OFF)   // s[78:79] = partial dU (per-WG)
+        asm_u32(0xBF89FC07)
+        wzm_s_mov_b32_lit(35, uk * 12288) // s35 = k*12288
+        wzm_s_add_u32_ss(35, 35, 39)      // + r
+        wzm_v_add_nc_u32_sv(1, 35, 8)     // + d*32 (v8)
+        wzm_v_shl2_e32(1, 1)              // *4
+        wzm_gload_b32_saddr(16, 1, 78)    // v16 = dU[k,d,r]
+        asm_u32(0xBF8903F7)
+        wzm_v_add_f32_e32(16, 16, 17)     // += acc
+        wzm_gstore_b32_saddr(1, 16, 78)
+        asm_u32(0xBC7C0000)
+        wzm_s_add_u32_1(39, 39)           // r += 1
+        uint64 ur_back = (ur_top - (asm_text_len / 4) - 1) & 0xFFFF
+        asm_u32(0xBFA00000 | ur_back)
+        uint64 ur_end = asm_text_len / 4
+        asm_patch_u32(ur_exit, 0xBFA20000 | ((ur_end - ur_exit - 1) & 0xFFFF))
+        uk = uk + 1
+    }
+    uint64 du_e = asm_text_len / 4
+    asm_patch_u32(du_execz, 0xBFA50000 | ((du_e - du_execz - 1) & 0xFFFF))
+    asm_u32(0xBEFE0002)                   // restore exec
+    asm_u32(0xBFBD0000)                   // s_barrier — dU partial done (per view)
 }
 
 // ── Task-5 backward helper: embed_bwd for one view (scatter-add into demb).
@@ -9584,8 +9697,10 @@ fn amdgpu_lower_wzma_train_mega(uint64 kname_ptr, uint64 nl) -> uint64 {
     //   after the fwd view loop; we re-route per view), alpha/inter/outk saved
     //   per view (s58.., s62.., s66..).  Mirrors std/train.mlr fn wzma_bwd.
     // ═══════════════════════════════════════════════════════════════════════
-    _wzm_emit_wzma_bwd_view(54, 58, 62, 66, 0x120, 0x130)   // view 0
-    _wzm_emit_wzma_bwd_view(56, 60, 64, 68, 0x128, 0x138)   // view 1
+    //   dinter scratch [K,BS,R] = kernarg 63 @ 0x1F8 (shared; each view fully
+    //   writes then reads it within its own call → safe to reuse across views).
+    _wzm_emit_wzma_bwd_view(54, 58, 62, 66, 0x120, 0x130, 0x1F8)   // view 0
+    _wzm_emit_wzma_bwd_view(56, 60, 64, 68, 0x128, 0x138, 0x1F8)   // view 1
 
     // ═══════════════════════════════════════════════════════════════════════
     // B-7: embed_bwd — scatter-add dx into demb[id*D + d].  Per view, lane=d.
@@ -9687,7 +9802,12 @@ fn amdgpu_lower_wzma_train_mega(uint64 kname_ptr, uint64 nl) -> uint64 {
     //   resident embed AdamW moment buffers (global_buffer), so the in-kernel
     //   embed AdamW phase has its m/v on-device — eliminating the per-step embed
     //   D2H/H2D entirely.  n_args = 63.
-    uint64 n_args = 63
+    // Task 4 (tiled dU) adds arg 63 = d_dinter (scratch dinter[K,BS,R],
+    //   global_buffer at offset 0x1F8) so the dU adjoint register-accumulates
+    //   over BS.  Bumping n_args to 64 also widens the kernarg segment to 512 B
+    //   (was 504) — REQUIRED: an s_load at 0x1F8 past a 504-B segment reads
+    //   garbage → OOB global addr → MES page-fault wedge.  n_args = 64.
+    uint64 n_args = 64
     uint64 args_desc = alloc(n_args * 16)
     uint64 ai = 0
     while ai < n_args {
