@@ -1,0 +1,275 @@
+// gemm_accum_smoke — ISOLATED micro-smoke for the native gemm_f32_accum kernel.
+//
+// Purpose: confirm/deny that gemm_f32_accum (emitter
+// amdgpu_lower_gemm_f32_accum_3c in src/format_amdgpu.mlr) is the wedge culprit
+// behind the bwd_uv GEMM-ification.  The plain gemm_f32 works; only the ACCUM
+// variant (C += A·B) had never run outside the abandoned (run-BLOCKED) v2 path.
+//
+// ONE cheap isolated dispatch at the bwd_uv dV shape:
+//   dV[r,d] += inter^T[R,BS] · doutk[BS,D]   →   M=R=32, N=D=384, K=BS=128.
+// C is pre-filled with known NONZERO values (accum must ADD onto them).
+// Compares D2H C against CPU reference C_ref = C_init + A·B.
+//
+// ABI / grid: identical to gemm_f32 (HIP ptr-table, 6 args, grid =
+// tiles_m*tiles_n, block=256) — copied verbatim from launch_gemm_accum in
+// examples/wzma_train_md.mlr / bp_wzma_gpu_train_native.mlr.
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native \
+//       examples/gemm_accum_smoke.mlr -o ~/mlrift_bin/wzma_train/gemm_accum_smoke
+// Run (kfd-safe: hipkfd_teardown on every exit path):
+//   ~/mlrift_bin/wzma_train/gemm_accum_smoke
+
+import "../std/train.mlr"
+import "../std/math_float.mlr"
+import "../std/fmt.mlr"
+import "../std/hip.mlr"
+
+// dV shape from the bwd_uv use.
+static u64 M_DIM = 32       // R
+static u64 N_DIM = 384      // D
+static u64 K_DIM = 128      // BS
+
+fn abs_f32(f32 v) -> f32 {
+    if v < 0.0f { return 0.0f - v }
+    return v
+}
+
+fn die_gpu(u64 msg, u64 code) {
+    print_str(msg)
+    print_str(" err=")
+    u64 s = fmt_dec(code); print_str(s); dealloc(s)
+    print_str("\n")
+    hipkfd_teardown()
+    exit(1)
+}
+
+fn load_co(u64 co_path, u64 fn_name) -> u64 {
+    u64 fd = file_open(co_path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        print_str("Cannot open .co: ")
+        print_str(co_path)
+        print_str("\n")
+        hipkfd_teardown(); exit(1)
+    }
+    u64 sz   = file_size(fd)
+    u64 blob = alloc(sz)
+    file_read(fd, blob, sz)
+    file_close(fd)
+
+    u64 mod_slot = alloc(8)
+    u32 err = hipModuleLoadData(mod_slot, blob)
+    if err != 0 { die_gpu("hipModuleLoadData", err) }
+    u64 mod = 0
+    unsafe { *(mod_slot as u64) -> mod }
+
+    u64 fh_slot = alloc(8)
+    err = hipModuleGetFunction(fh_slot, mod, fn_name)
+    if err != 0 { die_gpu("hipModuleGetFunction", err) }
+    u64 fh = 0
+    unsafe { *(fh_slot as u64) -> fh }
+
+    dealloc(mod_slot)
+    dealloc(fh_slot)
+    return fh
+}
+
+// gemm_f32_accum: C[M,N] += A[M,K_dim] @ B[K_dim,N]  (ACCUMULATE).
+// grid = tiles_m*tiles_n WGs, block=256, 6 args via HIP ptr-table.
+fn launch_gemm_accum(u64 fh, u64 d_a, u64 d_b, u64 d_c, u64 m, u64 n, u64 k_dim) {
+    u64 p0 = alloc(8); unsafe { *(p0 as u64) = d_a }
+    u64 p1 = alloc(8); unsafe { *(p1 as u64) = d_b }
+    u64 p2 = alloc(8); unsafe { *(p2 as u64) = d_c }
+    u64 p3 = alloc(8); unsafe { *(p3 as u64) = m }
+    u64 p4 = alloc(8); unsafe { *(p4 as u64) = n }
+    u64 p5 = alloc(8); unsafe { *(p5 as u64) = k_dim }
+    u64 kp = alloc(6 * 8)
+    unsafe { *(kp        as u64) = p0 }
+    unsafe { *((kp +  8) as u64) = p1 }
+    unsafe { *((kp + 16) as u64) = p2 }
+    unsafe { *((kp + 24) as u64) = p3 }
+    unsafe { *((kp + 32) as u64) = p4 }
+    unsafe { *((kp + 40) as u64) = p5 }
+    u64 tiles_m = (m + 15) / 16
+    u64 tiles_n = (n + 15) / 16
+    u64 grid_u  = tiles_m * tiles_n
+    u32 grid    = grid_u
+    u32 block   = 256
+    u32 err = hipModuleLaunchKernel(fh, grid, 1, 1, block, 1, 1, 0, 0, kp, 0)
+    if err != 0 { die_gpu("launch gemm_accum", err) }
+    dealloc(p0); dealloc(p1); dealloc(p2); dealloc(p3); dealloc(p4); dealloc(p5); dealloc(kp)
+}
+
+fn main() {
+    u64 M = M_DIM
+    u64 N = N_DIM
+    u64 K = K_DIM
+
+    print_str("=== gemm_accum_smoke: M=32 N=384 K=128 (bwd_uv dV shape), C += A.B ===\n")
+
+    u32 err = hipSetDevice(0)
+    if err != 0 { print_str("hipSetDevice failed\n"); exit(1) }
+
+    u64 fh = load_co("/home/pantelis/mlrift_bin/wzma_train/gemm_f32_accum.co", "gemm_f32_accum")
+    print_str("Kernel gemm_f32_accum loaded (native amdgpu).\n")
+
+    // --- Host buffers + known patterns ---
+    u64 nA = M * K          // [M,K]
+    u64 nB = K * N          // [K,N]
+    u64 nC = M * N          // [M,N]
+    u64 hA = alloc(nA * 4)
+    u64 hB = alloc(nB * 4)
+    u64 hC = alloc(nC * 4)     // C init values (also kept as the baseline)
+    u64 hC_dev = alloc(nC * 4) // D2H result
+    u64 hC_ref = alloc(nC * 4) // CPU reference
+
+    // A[m,k] = small deterministic pattern (kept tiny so f32 dot over K=128 is exact-ish)
+    u64 m = 0
+    while m < M {
+        u64 k = 0
+        while k < K {
+            // a = ((m*7 + k*3) mod 13) * 0.01  → range [0, 0.12], 128-term dot ~O(1)
+            u64 v = (m * 7 + k * 3)
+            u64 vm = v - (v / 13) * 13
+            f32 a = f64_to_f32(int_to_f64(vm) * 0.01)
+            unsafe { *((hA + (m * K + k) * 4) as f32) = a }
+            k = k + 1
+        }
+        m = m + 1
+    }
+    // B[k,n] = pattern
+    u64 kk = 0
+    while kk < K {
+        u64 n = 0
+        while n < N {
+            u64 v = (kk * 5 + n * 2)
+            u64 vm = v - (v / 11) * 11
+            f32 b = f64_to_f32(int_to_f64(vm) * 0.01)
+            unsafe { *((hB + (kk * N + n) * 4) as f32) = b }
+            n = n + 1
+        }
+        kk = kk + 1
+    }
+    // C init = known NONZERO pattern (the accumulate must ADD onto this).
+    u64 mi = 0
+    while mi < M {
+        u64 n = 0
+        while n < N {
+            // c0 = ((m + n) mod 17) * 0.5 + 1.0  → nonzero, spread
+            u64 v = (mi + n)
+            u64 vm = v - (v / 17) * 17
+            f32 c0 = f64_to_f32(int_to_f64(vm) * 0.5 + 1.0)
+            unsafe { *((hC + (mi * N + n) * 4) as f32) = c0 }
+            n = n + 1
+        }
+        mi = mi + 1
+    }
+
+    // --- CPU reference: C_ref = C_init + A·B ---
+    m = 0
+    while m < M {
+        u64 n = 0
+        while n < N {
+            f32 acc = 0.0f
+            u64 k = 0
+            while k < K {
+                f32 a = 0.0f; f32 b = 0.0f
+                unsafe { *((hA + (m * K + k) * 4) as f32) -> a }
+                unsafe { *((hB + (k * N + n) * 4) as f32) -> b }
+                acc = acc + a * b
+                k = k + 1
+            }
+            f32 c0 = 0.0f
+            unsafe { *((hC + (m * N + n) * 4) as f32) -> c0 }
+            unsafe { *((hC_ref + (m * N + n) * 4) as f32) = c0 + acc }
+            n = n + 1
+        }
+        m = m + 1
+    }
+
+    // --- GPU buffers ---
+    u64 d_a = 0; u64 d_b = 0; u64 d_c = 0
+    u64 slot
+    slot = alloc(8); err = hipMalloc(slot, nA * 4); if err != 0 { die_gpu("mA", err) }; unsafe { *(slot as u64) -> d_a }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, nB * 4); if err != 0 { die_gpu("mB", err) }; unsafe { *(slot as u64) -> d_b }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, nC * 4); if err != 0 { die_gpu("mC", err) }; unsafe { *(slot as u64) -> d_c }; dealloc(slot)
+
+    err = hipMemcpy(d_a, hA, nA * 4, 1); if err != 0 { die_gpu("H2D A", err) }
+    err = hipMemcpy(d_b, hB, nB * 4, 1); if err != 0 { die_gpu("H2D B", err) }
+    err = hipMemcpy(d_c, hC, nC * 4, 1); if err != 0 { die_gpu("H2D C(init)", err) }
+
+    print_str("Buffers uploaded. Launching ONE gemm_f32_accum dispatch...\n")
+    u64 tm = (M + 15) / 16
+    u64 tn = (N + 15) / 16
+    print_str("  grid = tiles_m*tiles_n = ")
+    u64 sg = fmt_dec(tm * tn); print_str(sg); dealloc(sg)
+    print_str(" (tm="); sg = fmt_dec(tm); print_str(sg); dealloc(sg)
+    print_str(" tn="); sg = fmt_dec(tn); print_str(sg); dealloc(sg)
+    print_str("), block=256\n")
+
+    launch_gemm_accum(fh, d_a, d_b, d_c, M, N, K)
+
+    err = hipDeviceSynchronize()
+    if err != 0 { die_gpu("hipDeviceSynchronize (POST-DISPATCH — likely WEDGE)", err) }
+    print_str("Dispatch returned + sync OK (no wedge at sync).\n")
+
+    err = hipMemcpy(hC_dev, d_c, nC * 4, 2)
+    if err != 0 { die_gpu("D2H C", err) }
+
+    // --- Compare ---
+    f32 max_err = 0.0f
+    u64 worst_idx = 0
+    f32 worst_dev = 0.0f
+    f32 worst_ref = 0.0f
+    u64 i = 0
+    while i < nC {
+        f32 dv = 0.0f; f32 rv = 0.0f
+        unsafe { *((hC_dev + i * 4) as f32) -> dv }
+        unsafe { *((hC_ref + i * 4) as f32) -> rv }
+        f32 e = abs_f32(dv - rv)
+        if e > max_err {
+            max_err = e
+            worst_idx = i
+            worst_dev = dv
+            worst_ref = rv
+        }
+        i = i + 1
+    }
+
+    print_str("max_err = ")
+    u64 se = fmt_f32(max_err, 9); print_str(se); dealloc(se)
+    print_str("\n")
+    print_str("  worst idx="); se = fmt_dec(worst_idx); print_str(se); dealloc(se)
+    print_str("  dev="); se = fmt_f32(worst_dev, 6); print_str(se); dealloc(se)
+    print_str("  ref="); se = fmt_f32(worst_ref, 6); print_str(se); dealloc(se)
+    print_str("\n")
+
+    // Spot-print C[0,0] and a few cells for human sanity
+    f32 c00_dev = 0.0f; f32 c00_ref = 0.0f; f32 c00_init = 0.0f
+    unsafe { *(hC_dev as f32) -> c00_dev }
+    unsafe { *(hC_ref as f32) -> c00_ref }
+    unsafe { *(hC as f32) -> c00_init }
+    print_str("  C[0,0]: init="); se = fmt_f32(c00_init, 6); print_str(se); dealloc(se)
+    print_str(" dev="); se = fmt_f32(c00_dev, 6); print_str(se); dealloc(se)
+    print_str(" ref="); se = fmt_f32(c00_ref, 6); print_str(se); dealloc(se)
+    print_str("\n")
+
+    // f32 dot over K=128 with ~0.01 magnitudes: tolerance generous but tight enough
+    // to catch a missing-accumulate (which would be off by the whole C_init ~1-9).
+    f32 tol = 0.005f
+    if max_err < tol {
+        print_str("accum PASS  (no wedge)\n")
+    } else {
+        print_str("accum FAIL  (ran, numerically WRONG)\n")
+    }
+
+    err = hipFree(d_a); if err != 0 { die_gpu("free A", err) }
+    err = hipFree(d_b); if err != 0 { die_gpu("free B", err) }
+    err = hipFree(d_c); if err != 0 { die_gpu("free C", err) }
+
+    dealloc(hA); dealloc(hB); dealloc(hC); dealloc(hC_dev); dealloc(hC_ref)
+
+    hipkfd_teardown()
+    print_str("teardown OK — done.\n")
+    exit(0)
+}
