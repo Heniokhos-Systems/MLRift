@@ -1,0 +1,224 @@
+import "../std/fmt.mlr"
+import "../std/math_float.mlr"
+import "../std/train.mlr"
+import "../std/time.mlr"
+import "../std/thread.mlr"
+
+static u64 B_DIM = 8
+static u64 S_DIM = 16
+static u64 D_DIM = 384
+static u64 K_DIM = 4
+static u64 R_DIM = 32
+
+fn abs_f32(f32 v) -> f32 { if v < 0.0f { return 0.0f - v } return v }
+
+static u64 g_x_in = 0
+static u64 g_z_out = 0
+static u64 g_U_ptr = 0
+static u64 g_V_ptr = 0
+static u64 g_gw_ptr = 0
+static u64 g_gb_ptr = 0
+static u64 g_bias_ptr = 0
+static u64 g_alpha_ptr = 0
+static u64 g_inter_ptr = 0
+static u64 g_outk_ptr = 0
+static u64 g_K = 0
+static u64 g_R = 0
+static u64 g_D = 0
+static u64 g_S = 0
+static u64 g_w_scratch = 0
+
+fn softmax_inplace_local(u64 ptr, u64 N) {
+    f32 mx = 0.0f
+    unsafe { *(ptr as f32) -> mx }
+    u64 i = 1
+    while i < N {
+        f32 v = 0.0f
+        unsafe { *((ptr + i * 4) as f32) -> v }
+        if v > mx { mx = v }
+        i = i + 1
+    }
+    f32 s = 0.0f
+    i = 0
+    while i < N {
+        f32 v = 0.0f
+        unsafe { *((ptr + i * 4) as f32) -> v }
+        f32 e = expf(v - mx)
+        unsafe { *((ptr + i * 4) as f32) = e }
+        s = s + e
+        i = i + 1
+    }
+    f32 one = 1.0f
+    f32 inv = one / s
+    i = 0
+    while i < N {
+        f32 v = 0.0f
+        unsafe { *((ptr + i * 4) as f32) -> v }
+        unsafe { *((ptr + i * 4) as f32) = v * inv }
+        i = i + 1
+    }
+}
+
+// Scalar reference gemv for comparison
+fn gemv_scalar(u64 out_ptr, u64 U_k_bf16, u64 x_ptr, u64 D, u64 R) {
+    u64 d = 0
+    while d < D {
+        f32 xv = 0.0f
+        unsafe { *((x_ptr + d * 4) as f32) -> xv }
+        u64 r = 0
+        while r < R {
+            // decode bf16 at U_k_bf16[d*R+r]
+            u64 off = (d * R + r) * 2
+            u64 lo = load8(U_k_bf16 + off)
+            u64 hi = load8(U_k_bf16 + off + 1)
+            u64 bits16 = lo | (hi << 8)
+            u64 bits32 = bits16 << 16
+            u32 b32 = bits32
+            u64 scratch = out_ptr + R * 4 + 16  // use end of buffer as scratch
+            unsafe { *(scratch as uint32) = b32 }
+            f32 wv = 0.0f
+            unsafe { *(scratch as f32) -> wv }
+            f32 cur = 0.0f
+            unsafe { *((out_ptr + r * 4) as f32) -> cur }
+            unsafe { *((out_ptr + r * 4) as f32) = cur + xv * wv }
+            r = r + 1
+        }
+        d = d + 1
+    }
+}
+
+// GEMV test: compare gemv_bf16_D384_R32 vs scalar
+fn test_gemv() {
+    u64 D = 384
+    u64 R = 32
+    // Allocate U_k bf16 with identity-like pattern: U[d, r] = (d==r) ? 1.0 : 0.0
+    u64 U_k = alloc(D * R * 2)
+    memset(U_k, 0, D * R * 2)
+    u64 r = 0
+    while r < R {
+        u64 off = (r * R + r) * 2  // U[r, r] = 1.0
+        store8(U_k + off, 0x80)  // bf16 1.0 LE
+        store8(U_k + off + 1, 0x3F)
+        r = r + 1
+    }
+    // x[d] = d+1 as float for first 32 dims, 0 for rest
+    u64 x = alloc(D * 4)
+    memset(x, 0, D * 4)
+    u64 d = 0
+    while d < R {
+        f32 fv = f64_to_f32(int_to_f64(d + 1))
+        unsafe { *((x + d * 4) as f32) = fv }
+        d = d + 1
+    }
+
+    // Gemv version
+    u64 out_gemv = alloc((R + 8) * 4)
+    memset(out_gemv, 0, (R + 8) * 4)
+    u64 xbuf = alloc(16)
+
+    // Call gemv 4-unrolled (inline the asm approach here scaled down)
+    u64 gi = 0
+    while gi < 96 {
+        u64 d0 = gi * 4
+        f32 xv0 = 0.0f; f32 xv1 = 0.0f; f32 xv2 = 0.0f; f32 xv3 = 0.0f
+        unsafe { *((x + d0 * 4) as f32) -> xv0 }
+        unsafe { *((x + (d0+1) * 4) as f32) -> xv1 }
+        unsafe { *((x + (d0+2) * 4) as f32) -> xv2 }
+        unsafe { *((x + (d0+3) * 4) as f32) -> xv3 }
+        unsafe { *(xbuf as f32) = xv0 }
+        unsafe { *((xbuf+4) as f32) = xv1 }
+        unsafe { *((xbuf+8) as f32) = xv2 }
+        unsafe { *((xbuf+12) as f32) = xv3 }
+        u64 U_d0 = U_k + d0 * 64
+        u64 U_d1 = U_d0 + 64
+        u64 U_d2 = U_d1 + 64
+        u64 U_d3 = U_d2 + 64
+        asm {
+            "0x62 0xF2 0x7D 0x48 0x18 0x19"
+            "0x62 0xF1 0x7C 0x48 0x10 0x27"
+            "0x62 0xF1 0x7C 0x48 0x10 0x6F 0x01"
+            "0x62 0xF2 0x7D 0x48 0x33 0x0E"
+            "0x62 0xF1 0x75 0x48 0x72 0xF1 0x10"
+            "0x62 0xF2 0x7D 0x48 0x33 0x56 0x01"
+            "0x62 0xF1 0x6D 0x48 0x72 0xF2 0x10"
+            "0x62 0xF2 0x65 0x48 0xB8 0xE1"
+            "0x62 0xF2 0x65 0x48 0xB8 0xEA"
+            "0x62 0xF1 0x7C 0x48 0x11 0x27"
+            "0x62 0xF1 0x7C 0x48 0x11 0x6F 0x01"
+            "0xC5 0xF8 0x77"
+        } in(out_gemv -> rdi, U_d0 -> rsi, xbuf -> rcx)
+        u64 xbuf1 = xbuf + 4
+        asm {
+            "0x62 0xF2 0x7D 0x48 0x18 0x19"
+            "0x62 0xF1 0x7C 0x48 0x10 0x27"
+            "0x62 0xF1 0x7C 0x48 0x10 0x6F 0x01"
+            "0x62 0xF2 0x7D 0x48 0x33 0x0E"
+            "0x62 0xF1 0x75 0x48 0x72 0xF1 0x10"
+            "0x62 0xF2 0x7D 0x48 0x33 0x56 0x01"
+            "0x62 0xF1 0x6D 0x48 0x72 0xF2 0x10"
+            "0x62 0xF2 0x65 0x48 0xB8 0xE1"
+            "0x62 0xF2 0x65 0x48 0xB8 0xEA"
+            "0x62 0xF1 0x7C 0x48 0x11 0x27"
+            "0x62 0xF1 0x7C 0x48 0x11 0x6F 0x01"
+            "0xC5 0xF8 0x77"
+        } in(out_gemv -> rdi, U_d1 -> rsi, xbuf1 -> rcx)
+        u64 xbuf2 = xbuf + 8
+        asm {
+            "0x62 0xF2 0x7D 0x48 0x18 0x19"
+            "0x62 0xF1 0x7C 0x48 0x10 0x27"
+            "0x62 0xF1 0x7C 0x48 0x10 0x6F 0x01"
+            "0x62 0xF2 0x7D 0x48 0x33 0x0E"
+            "0x62 0xF1 0x75 0x48 0x72 0xF1 0x10"
+            "0x62 0xF2 0x7D 0x48 0x33 0x56 0x01"
+            "0x62 0xF1 0x6D 0x48 0x72 0xF2 0x10"
+            "0x62 0xF2 0x65 0x48 0xB8 0xE1"
+            "0x62 0xF2 0x65 0x48 0xB8 0xEA"
+            "0x62 0xF1 0x7C 0x48 0x11 0x27"
+            "0x62 0xF1 0x7C 0x48 0x11 0x6F 0x01"
+            "0xC5 0xF8 0x77"
+        } in(out_gemv -> rdi, U_d2 -> rsi, xbuf2 -> rcx)
+        u64 xbuf3 = xbuf + 12
+        asm {
+            "0x62 0xF2 0x7D 0x48 0x18 0x19"
+            "0x62 0xF1 0x7C 0x48 0x10 0x27"
+            "0x62 0xF1 0x7C 0x48 0x10 0x6F 0x01"
+            "0x62 0xF2 0x7D 0x48 0x33 0x0E"
+            "0x62 0xF1 0x75 0x48 0x72 0xF1 0x10"
+            "0x62 0xF2 0x7D 0x48 0x33 0x56 0x01"
+            "0x62 0xF1 0x6D 0x48 0x72 0xF2 0x10"
+            "0x62 0xF2 0x65 0x48 0xB8 0xE1"
+            "0x62 0xF2 0x65 0x48 0xB8 0xEA"
+            "0x62 0xF1 0x7C 0x48 0x11 0x27"
+            "0x62 0xF1 0x7C 0x48 0x11 0x6F 0x01"
+            "0xC5 0xF8 0x77"
+        } in(out_gemv -> rdi, U_d3 -> rsi, xbuf3 -> rcx)
+        gi = gi + 1
+    }
+
+    // Scalar reference
+    u64 out_ref = alloc(R * 4 + 64)
+    memset(out_ref, 0, R * 4 + 64)
+    gemv_scalar(out_ref, U_k, x, D, R)
+
+    // Compare
+    print_str("GEMV 4-unroll vs scalar (first 5 of 32):\n")
+    u64 i = 0
+    while i < 5 {
+        f32 vg = 0.0f; f32 vs = 0.0f
+        unsafe { *((out_gemv + i * 4) as f32) -> vg }
+        unsafe { *((out_ref + i * 4) as f32) -> vs }
+        print_str("  ["); u64 s = fmt_dec(i); print_str(s); dealloc(s)
+        print_str("] gemv="); s = fmt_f32(vg, 2); print_str(s); dealloc(s)
+        print_str(" ref="); s = fmt_f32(vs, 2); print_str(s); dealloc(s)
+        f32 diff = vg - vs; if diff < 0.0f { diff = 0.0f - diff }
+        print_str(" diff="); s = fmt_f32(diff, 6); print_str(s); dealloc(s)
+        print_str("\n")
+        i = i + 1
+    }
+    dealloc(U_k); dealloc(x); dealloc(out_gemv); dealloc(out_ref); dealloc(xbuf)
+}
+
+fn main() {
+    test_gemv()
+    exit(0)
+}

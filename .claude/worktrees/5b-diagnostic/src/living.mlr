@@ -1,0 +1,1929 @@
+// MLRift — built on KernRift — Living Compiler
+//
+// Implements the blueprint vision (see docs/LIVING_COMPILER.md) at its
+// current maturity stage: a governed, two-layer analysis that separates
+// stable semantic-core concerns from adaptive surface suggestions.
+//
+// Two layers, explicitly:
+//
+//   SEMANTIC CORE — correctness, safety, structural health. Patterns here
+//     reflect things that can cause wrong behavior or hide real bugs.
+//
+//   ADAPTIVE SURFACE — ergonomic/stylistic improvements. Patterns here
+//     suggest migrating to newer syntax that lowers to the same IR. These
+//     are candidates for an automated migration pass.
+//
+// The blueprint also calls for: a proposal engine, a governance layer,
+// versioned language profiles, and a full migration engine. Those are
+// future work — this file lays the ground rules they will build on.
+//
+// Patterns currently detected
+//
+//   Core:
+//     - unchecked_call       — high fraction of discarded call results
+//     - large_unsafe_ratio   — too many unsafe pointer ops vs total ops
+//     - high_call_density    — complex call graph, hard to audit
+//
+//   Surface:
+//     - legacy_ptr_ops       — unsafe { *(addr as T) -> v } — can migrate
+//                              to load8/16/32/64 or store8/16/32/64
+//     - many_trivial_fns     — many 1-2 statement functions (inline hints)
+
+// ---------------------------------------------------------------------------
+// Telemetry struct (80 bytes, 10 fields × 8)
+// ---------------------------------------------------------------------------
+
+struct Telemetry {
+    uint64 fn_count
+    uint64 extern_count
+    uint64 call_count
+    uint64 unsafe_count
+    uint64 lock_edge_count
+    uint64 irq_fn_count
+    uint64 total_ops
+    uint64 exprstmt_call_count
+    uint64 trivial_fn_count
+    uint64 tail_call_candidates
+    // v2.6 additions — proposal triggers
+    uint64 long_type_count       // count of long-form uint8..int64 tokens
+    uint64 ptrlen_param_count    // count of functions with a (ptr, *_len/*_count) adjacent pair
+    uint64 volatile_op_count     // count of vloadN/vstoreN AST nodes (sequential pattern candidate)
+}
+
+// ---------------------------------------------------------------------------
+// Pattern entry (48 bytes: 6 × 8)
+// ---------------------------------------------------------------------------
+// [0]  id string ptr
+// [8]  title string ptr
+// [16] suggestion string ptr
+// [24] fitness (uint64)
+// [32] signal value (uint64, context-dependent)
+// [40] flags: bit 0 = layer (0 = semantic core, 1 = adaptive surface),
+//             bit 1 = auto-fix available
+
+static uint64 lc_patterns = 0
+static uint64 lc_pattern_count = 0
+
+fn lc_add_pattern(uint64 id, uint64 title, uint64 suggestion, uint64 fitness, uint64 signal_val, uint64 flags) {
+    uint64 entry = lc_patterns + lc_pattern_count * 48
+    unsafe { *(entry as uint64) = id }
+    uint64 e8 = entry + 8
+    unsafe { *(e8 as uint64) = title }
+    uint64 e16 = entry + 16
+    unsafe { *(e16 as uint64) = suggestion }
+    uint64 e24 = entry + 24
+    unsafe { *(e24 as uint64) = fitness }
+    uint64 e32 = entry + 32
+    unsafe { *(e32 as uint64) = signal_val }
+    uint64 e40 = entry + 40
+    unsafe { *(e40 as uint64) = flags }
+    lc_pattern_count = lc_pattern_count + 1
+}
+
+fn lc_get_pattern_id(uint64 idx) -> uint64 {
+    uint64 entry = lc_patterns + idx * 48
+    uint64 val = 0
+    unsafe { *(entry as uint64) -> val }
+    return val
+}
+
+fn lc_get_pattern_title(uint64 idx) -> uint64 {
+    uint64 entry = lc_patterns + idx * 48 + 8
+    uint64 val = 0
+    unsafe { *(entry as uint64) -> val }
+    return val
+}
+
+fn lc_get_pattern_suggestion(uint64 idx) -> uint64 {
+    uint64 entry = lc_patterns + idx * 48 + 16
+    uint64 val = 0
+    unsafe { *(entry as uint64) -> val }
+    return val
+}
+
+fn lc_get_pattern_fitness(uint64 idx) -> uint64 {
+    uint64 entry = lc_patterns + idx * 48 + 24
+    uint64 val = 0
+    unsafe { *(entry as uint64) -> val }
+    return val
+}
+
+fn lc_get_pattern_signal(uint64 idx) -> uint64 {
+    uint64 entry = lc_patterns + idx * 48 + 32
+    uint64 val = 0
+    unsafe { *(entry as uint64) -> val }
+    return val
+}
+
+fn lc_get_pattern_flags(uint64 idx) -> uint64 {
+    uint64 entry = lc_patterns + idx * 48 + 40
+    uint64 val = 0
+    unsafe { *(entry as uint64) -> val }
+    return val
+}
+
+// Layer classification: 0 = semantic core, 1 = adaptive surface
+fn lc_pattern_layer(uint64 idx) -> uint64 {
+    uint64 f = lc_get_pattern_flags(idx)
+    return f & 1
+}
+
+fn lc_pattern_can_fix(uint64 idx) -> uint64 {
+    uint64 f = lc_get_pattern_flags(idx)
+    return (f >> 1) & 1
+}
+
+// ---------------------------------------------------------------------------
+// Telemetry collection
+// ---------------------------------------------------------------------------
+
+fn tel_set(uint64 tel, uint64 field, uint64 val) {
+    uint64 p = tel + field * 8
+    unsafe { *(p as uint64) = val }
+}
+
+fn tel_get(uint64 tel, uint64 field) -> uint64 {
+    uint64 p = tel + field * 8
+    uint64 val = 0
+    unsafe { *(p as uint64) -> val }
+    return val
+}
+
+fn tel_inc(uint64 tel, uint64 field) {
+    uint64 p = tel + field * 8
+    uint64 val = 0
+    unsafe { *(p as uint64) -> val }
+    val = val + 1
+    unsafe { *(p as uint64) = val }
+}
+
+// Return 1 if the given token is a long-form type keyword (uint8..int64),
+// 0 if it's a short alias or something else. Long forms start with 'u' or
+// 'i' and have text length >= 4.
+fn lc_is_long_type_tok(uint64 tok) -> uint64 {
+    uint64 tlen = tok_text_len(tok)
+    if tlen < 4 { return 0 }
+    uint64 tstart = tok_text_start(tok)
+    uint64 sp = cg_source + tstart
+    uint64 c0 = 0
+    unsafe { *(sp as uint8) -> c0 }
+    if c0 != 117 && c0 != 105 { return 0 }  // 'u' or 'i'
+    // Second char: long forms have 'i' (uint*) or a digit (int*)
+    uint64 sp1 = cg_source + tstart + 1
+    uint64 c1 = 0
+    unsafe { *(sp1 as uint8) -> c1 }
+    // u-prefix: uintN — second char 'i', third 'n', fourth 't'
+    if c0 == 117 && c1 == 105 { return 1 }
+    // i-prefix: intN — second char 'n', third 't'
+    if c0 == 105 && c1 == 110 { return 1 }
+    return 0
+}
+
+// Return 1 if param_name (a token) ends in "_len", "_count", or "_size".
+// Used to detect adjacent (ptr, *_len) pairs that could become a slice.
+fn lc_is_len_name(uint64 name_tok) -> uint64 {
+    uint64 nlen = tok_text_len(name_tok)
+    uint64 nstart = tok_text_start(name_tok)
+    if nlen >= 4 {
+        // _len
+        uint64 p1 = cg_source + nstart + nlen - 4
+        uint64 c1 = 0
+        unsafe { *(p1 as uint8) -> c1 }
+        if c1 == 95 {
+            uint64 p2 = cg_source + nstart + nlen - 3
+            uint64 c2 = 0
+            unsafe { *(p2 as uint8) -> c2 }
+            uint64 p3 = cg_source + nstart + nlen - 2
+            uint64 c3 = 0
+            unsafe { *(p3 as uint8) -> c3 }
+            uint64 p4 = cg_source + nstart + nlen - 1
+            uint64 c4 = 0
+            unsafe { *(p4 as uint8) -> c4 }
+            if c2 == 108 && c3 == 101 && c4 == 110 { return 1 }  // "len"
+        }
+    }
+    if nlen >= 5 {
+        // _size
+        uint64 q1 = cg_source + nstart + nlen - 5
+        uint64 qc1 = 0
+        unsafe { *(q1 as uint8) -> qc1 }
+        if qc1 == 95 {
+            uint64 qp = cg_source + nstart + nlen - 4
+            uint64 qpc = 0
+            unsafe { *(qp as uint8) -> qpc }
+            if qpc == 115 { return 1 }  // _s... treat as potential size
+        }
+    }
+    if nlen >= 6 {
+        // _count
+        uint64 r1 = cg_source + nstart + nlen - 6
+        uint64 rc1 = 0
+        unsafe { *(r1 as uint8) -> rc1 }
+        if rc1 == 95 {
+            uint64 rp = cg_source + nstart + nlen - 5
+            uint64 rpc = 0
+            unsafe { *(rp as uint8) -> rpc }
+            if rpc == 99 { return 1 }  // _c... treat as potential count
+        }
+    }
+    return 0
+}
+
+@export
+fn collect_telemetry(uint64 root) -> uint64 {
+    uint64 tel = alloc(128)
+    // Zero fill
+    uint64 i = 0
+    while i < 128 {
+        uint64 p = tel + i
+        uint8 z = 0
+        unsafe { *(p as uint8) = z }
+        i = i + 1
+    }
+
+    // Walk top-level declarations
+    uint32 child = ast_child(root)
+    uint64 wchild = child
+    while wchild != 0 {
+        uint32 ck = ast_kind(wchild)
+
+        if ck == 2 {
+            // FnDecl
+            tel_inc(tel, 0)
+
+            // Scan param list: count long-form types and detect (ptr, _len) pairs
+            uint32 first_param = ast_child(wchild)
+            uint64 wp = first_param
+            uint64 prev_was_ptr_like = 0
+            while wp != 0 {
+                uint32 pk = ast_kind(wp)
+                if pk == 3 {
+                    uint32 ptype_tok = ast_data1(wp)
+                    uint64 wpt = ptype_tok
+                    if lc_is_long_type_tok(wpt) != 0 {
+                        tel_inc(tel, 10)
+                    }
+                    // Pointer-like param: a u64 (short) or uint64 (long) with
+                    // a name that doesn't look like a length. If the next
+                    // param's name ends in _len/_count/_size, count as a
+                    // ptrlen pair.
+                    uint32 pname_tok = ast_data2(wp)
+                    uint64 wpn = pname_tok
+                    if prev_was_ptr_like != 0 && lc_is_len_name(wpn) != 0 {
+                        tel_inc(tel, 11)
+                        prev_was_ptr_like = 0
+                    } else {
+                        // Is this param a plain u64/uint64 that could be a pointer?
+                        if tok_text_eq(wpt, wpt) != 0 {
+                            // (placeholder — actual is-u64 test below)
+                        }
+                        uint64 ptlen = tok_text_len(wpt)
+                        prev_was_ptr_like = 0
+                        if ptlen == 3 {
+                            // "u64"
+                            uint64 tp = cg_source + tok_text_start(wpt)
+                            uint64 tc0 = 0
+                            unsafe { *(tp as uint8) -> tc0 }
+                            if tc0 == 117 { prev_was_ptr_like = 1 }
+                        }
+                        if ptlen == 6 {
+                            // "uint64"
+                            uint64 tp2 = cg_source + tok_text_start(wpt)
+                            uint64 tc2 = 0
+                            unsafe { *(tp2 as uint8) -> tc2 }
+                            if tc2 == 117 { prev_was_ptr_like = 1 }
+                        }
+                    }
+                }
+                uint32 pnxt = ast_next(wp)
+                wp = pnxt
+            }
+
+            // Check if it has a body — no body means extern-like
+            uint32 body = ast_data3(wchild)
+            uint64 wb = body
+            if wb == 0 {
+                tel_inc(tel, 1)
+            } else {
+                // Count statements in body
+                uint64 stmt_count = 0
+                uint32 bchild = ast_child(wb)
+                uint64 wbc = bchild
+                while wbc != 0 {
+                    stmt_count = stmt_count + 1
+                    uint32 bnxt = ast_next(wbc)
+                    wbc = bnxt
+                }
+                if stmt_count <= 2 {
+                    tel_inc(tel, 8)
+                }
+
+                // Count calls, unsafe, etc. in body
+                lc_count_in_block(wb, tel)
+
+                // Check tail call candidate
+                if check_tail_call_candidate(wb) != 0 {
+                    tel_inc(tel, 9)
+                }
+            }
+        }
+
+        uint32 nxt = ast_next(wchild)
+        wchild = nxt
+    }
+
+    // Get lock edge count from analysis module
+    tel_set(tel, 4, lock_edge_count)
+
+    return tel
+}
+
+fn lc_count_in_block(uint64 block_node, uint64 tel) {
+    uint32 child = ast_child(block_node)
+    uint64 wchild = child
+    while wchild != 0 {
+        lc_count_in_stmt(wchild, tel)
+        uint32 nxt = ast_next(wchild)
+        wchild = nxt
+    }
+}
+
+fn lc_count_in_stmt(uint64 node, uint64 tel) {
+    uint32 kind = ast_kind(node)
+    // Count total ops
+    tel_inc(tel, 6)
+
+    // VarDecl: check the declared type for long-form
+    if kind == 10 {
+        uint32 vtype_tok = ast_data1(node)
+        uint64 wvt = vtype_tok
+        if wvt != 0 && lc_is_long_type_tok(wvt) != 0 {
+            tel_inc(tel, 10)
+        }
+    }
+
+    // ExprStmt containing a Call = unchecked call result
+    if kind == 16 {
+        uint32 expr = ast_child(node)
+        uint64 wexpr = expr
+        if wexpr != 0 {
+            uint32 ek = ast_kind(wexpr)
+            if ek == 35 {
+                // Call in ExprStmt — result discarded
+                tel_inc(tel, 2)
+                tel_inc(tel, 7)
+            }
+        }
+    }
+
+    // Count calls in other contexts (not ExprStmt)
+    // We already counted ExprStmt calls above; also count calls in expressions
+    if kind == 12 {
+        // Return — check if child is a call
+        uint32 rexpr = ast_child(node)
+        uint64 wre = rexpr
+        if wre != 0 {
+            uint32 rek = ast_kind(wre)
+            if rek == 35 {
+                tel_inc(tel, 2)
+            }
+        }
+    }
+
+    // Unsafe PtrLoad/PtrStore — legacy syntax that can migrate to load*/store*
+    if kind == 41 || kind == 42 {
+        tel_inc(tel, 3)
+    }
+
+    // Recurse into if/while blocks
+    if kind == 13 {
+        uint32 tb = ast_data1(node)
+        uint64 wtb = tb
+        if wtb != 0 { lc_count_in_block(wtb, tel) }
+        uint32 eb = ast_data2(node)
+        uint64 web = eb
+        if web != 0 { lc_count_in_block(web, tel) }
+    }
+    if kind == 14 {
+        uint32 lb = ast_data1(node)
+        uint64 wlb = lb
+        if wlb != 0 { lc_count_in_block(wlb, tel) }
+    }
+}
+
+fn check_tail_call_candidate(uint64 block_node) -> uint64 {
+    // Find last statement. If it's a return with a call expr, it's a candidate.
+    uint32 child = ast_child(block_node)
+    uint64 wchild = child
+    uint64 last = 0
+    while wchild != 0 {
+        last = wchild
+        uint32 nxt = ast_next(wchild)
+        wchild = nxt
+    }
+    if last != 0 {
+        uint32 lk = ast_kind(last)
+        uint64 wlk = lk
+        if wlk == 12 {
+            uint32 ret_expr = ast_child(last)
+            uint64 wre = ret_expr
+            if wre != 0 {
+                uint32 rek = ast_kind(wre)
+                uint64 wrek = rek
+                if wrek == 35 { return 1 }
+            }
+        }
+    }
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// Pattern detection
+// ---------------------------------------------------------------------------
+// Flag layout: bit 0 = layer (0 core, 1 surface), bit 1 = auto-fix available
+
+@export
+fn detect_patterns(uint64 root, uint64 tel) -> uint64 {
+    lc_patterns = alloc(4096)
+    lc_pattern_count = 0
+
+    uint64 fn_c = tel_get(tel, 0)
+    uint64 ext_c = tel_get(tel, 1)
+    uint64 call_c = tel_get(tel, 2)
+    uint64 unsafe_c = tel_get(tel, 3)
+    uint64 total_ops = tel_get(tel, 6)
+    uint64 exprstmt_c = tel_get(tel, 7)
+    uint64 trivial_c = tel_get(tel, 8)
+
+    // --- SEMANTIC CORE patterns ---
+
+    // large_unsafe_ratio — too many raw unsafe ops vs total ops
+    if total_ops > 0 && unsafe_c * 4 > total_ops {
+        uint64 pct = unsafe_c * 100 / total_ops
+        uint64 fit = 20 + pct
+        if fit > 80 { fit = 80 }
+        lc_add_pattern(
+            "large_unsafe_ratio",
+            "High unsafe operation density",
+            "Consider wrapping repeated unsafe patterns in safe helper functions, or migrate to the load*/store* builtins.",
+            fit,
+            pct,
+            0
+        )
+    }
+
+    // unchecked_call — significant fraction of calls discard their results
+    if call_c > 0 && exprstmt_c * 5 > call_c * 4 && exprstmt_c > 10 {
+        uint64 pct = exprstmt_c * 100 / call_c
+        uint64 fit = 20 + pct / 4
+        if fit > 60 { fit = 60 }
+        lc_add_pattern(
+            "unchecked_call",
+            "Unchecked call results",
+            "Check return values of calls, especially for file I/O and allocation.",
+            fit,
+            pct,
+            0
+        )
+    }
+
+    // high_call_density — complex call graph (> 10 calls per function average)
+    if fn_c > 0 && call_c > fn_c * 10 {
+        uint64 ratio = call_c / fn_c
+        uint64 fit = 20 + ratio * 3
+        if fit > 70 { fit = 70 }
+        lc_add_pattern(
+            "high_call_density",
+            "Complex call graph",
+            "Consider splitting functions with many call sites to improve readability and auditability.",
+            fit,
+            ratio,
+            0
+        )
+    }
+
+    // --- ADAPTIVE SURFACE patterns ---
+
+    // legacy_ptr_ops — raw unsafe { *(addr as T) -> v } / = val syntax
+    // These migrate mechanically to load8/16/32/64 and store8/16/32/64 builtins
+    // which produce identical code but are much easier to read.
+    if unsafe_c > 0 {
+        uint64 fit = 25 + unsafe_c * 2
+        if fit > 60 { fit = 60 }
+        // flags: layer=1 (surface), can_fix=1 (bit 1 = 2)
+        lc_add_pattern(
+            "legacy_ptr_ops",
+            "Legacy unsafe{} pointer syntax",
+            "Migrate `unsafe { *(addr as T) -> dest }` to `dest = loadN(addr)` and `unsafe { *(addr as T) = val }` to `storeN(addr, val)`. Same codegen, much cleaner.",
+            fit,
+            unsafe_c,
+            3
+        )
+    }
+
+    // many_trivial_fns — many 1-2 statement functions suggest inlining
+    if fn_c > 4 && trivial_c * 10 > fn_c * 3 {
+        uint64 fit = 15 + trivial_c * 5
+        if fit > 50 { fit = 50 }
+        lc_add_pattern(
+            "many_trivial_fns",
+            "Many trivial functions",
+            "Consider inlining trivial 1-2 statement functions at call sites.",
+            fit,
+            trivial_c,
+            1
+        )
+    }
+
+    return lc_pattern_count
+}
+
+// ---------------------------------------------------------------------------
+// Fitness scoring (0-100)
+// ---------------------------------------------------------------------------
+// Global fitness = base score with deductions for detected issues.
+// Core-layer issues weigh more than surface-layer suggestions.
+
+@export
+fn compute_fitness(uint64 tel, uint64 patterns, uint64 has_lock_cycles) -> uint64 {
+    uint64 score = 100
+
+    uint64 fn_c = tel_get(tel, 0)
+    uint64 unsafe_c = tel_get(tel, 3)
+    uint64 total_ops = tel_get(tel, 6)
+
+    // No functions: can't score meaningfully
+    if fn_c == 0 { return 50 }
+
+    // Deduct for each detected pattern based on its fitness and layer
+    uint64 i = 0
+    while i < lc_pattern_count {
+        uint64 fit = lc_get_pattern_fitness(i)
+        uint64 layer = lc_pattern_layer(i)
+        // Core issues: bigger deduction (fit/4). Surface: smaller (fit/8).
+        uint64 deduct = fit / 4
+        if layer == 1 { deduct = fit / 8 }
+        if deduct > 15 { deduct = 15 }
+        if score > deduct {
+            score = score - deduct
+        } else {
+            score = 0
+        }
+        i = i + 1
+    }
+
+    // Deduct for lock cycles (if the analysis module reported any)
+    if has_lock_cycles != 0 {
+        if score > 20 { score = score - 20 } else { score = 0 }
+    }
+
+    // Deduct for high unsafe ratio (>10% of all ops)
+    if total_ops > 0 {
+        if unsafe_c * 10 > total_ops {
+            if score > 10 { score = score - 10 } else { score = 0 }
+        }
+    }
+
+    return score
+}
+
+// ---------------------------------------------------------------------------
+// Report helpers
+// ---------------------------------------------------------------------------
+
+fn lc_write_str(uint64 s) {
+    uint64 slen = 0
+    uint64 p = s
+    uint64 c = 0
+    unsafe { *(p as uint8) -> c }
+    while c != 0 {
+        slen = slen + 1
+        p = s + slen
+        unsafe { *(p as uint8) -> c }
+    }
+    write(1, s, slen)
+}
+
+fn lc_write_num(uint64 val) {
+    uint8[32] nb
+    uint64 nl = fmt_uint(nb, val)
+    write(1, nb, nl)
+}
+
+// Print one pattern entry. Numbering index `n` (1-based) is caller-supplied.
+fn lc_print_pattern(uint64 idx, uint64 n) {
+    uint64 msg = "  ["
+    write(1, msg, 3)
+    lc_write_num(n)
+    msg = "] "
+    write(1, msg, 2)
+    lc_write_str(lc_get_pattern_id(idx))
+    msg = "  fitness: "
+    write(1, msg, 11)
+    lc_write_num(lc_get_pattern_fitness(idx))
+    if lc_pattern_can_fix(idx) != 0 {
+        msg = "  (auto-fix available)"
+        write(1, msg, 22)
+    }
+    msg = "\n      title: "
+    write(1, msg, 14)
+    lc_write_str(lc_get_pattern_title(idx))
+    msg = "\n      signal: "
+    write(1, msg, 15)
+    lc_write_num(lc_get_pattern_signal(idx))
+    msg = " occurrence(s)\n      suggestion: "
+    write(1, msg, 33)
+    lc_write_str(lc_get_pattern_suggestion(idx))
+    msg = "\n\n"
+    write(1, msg, 2)
+}
+
+// ---------------------------------------------------------------------------
+// Full report
+// ---------------------------------------------------------------------------
+
+@export
+fn print_living_report(uint64 tel, uint64 patterns, uint64 fitness) {
+    uint64 msg = "=== KernRift Living Compiler Report ===\n"
+    write(1, msg, 40)
+    msg = "    stable semantic core + adaptive surface layer\n"
+    write(1, msg, 51)
+    // Show the active language profile from #lang (if any)
+    uint64 prof = get_lang_profile()
+    if prof == 0 {
+        msg = "    #lang stable        (default — production-safe features only)\n\n"
+        write(1, msg, 68)
+    } else {
+        msg = "    #lang experimental (also allows features under active development)\n\n"
+        write(1, msg, 73)
+    }
+
+    msg = "Telemetry\n"
+    write(1, msg, 10)
+    msg = "  Functions:   "
+    write(1, msg, 15)
+    lc_write_num(tel_get(tel, 0))
+    msg = "\n  Calls:       "
+    write(1, msg, 15)
+    lc_write_num(tel_get(tel, 2))
+    msg = "\n  Unsafe ops:  "
+    write(1, msg, 15)
+    lc_write_num(tel_get(tel, 3))
+    msg = "\n  Total ops:   "
+    write(1, msg, 15)
+    lc_write_num(tel_get(tel, 6))
+    msg = "\n  Patterns:    "
+    write(1, msg, 15)
+    lc_write_num(patterns)
+    msg = "\n\nFitness: "
+    write(1, msg, 10)
+    lc_write_num(fitness)
+    msg = "/100\n\n"
+    write(1, msg, 6)
+
+    if patterns == 0 {
+        msg = "No patterns detected.\n"
+        write(1, msg, 22)
+        return
+    }
+
+    // Count patterns per layer
+    uint64 core_count = 0
+    uint64 surface_count = 0
+    uint64 ci = 0
+    while ci < lc_pattern_count {
+        uint64 layer = lc_pattern_layer(ci)
+        if layer == 0 {
+            core_count = core_count + 1
+        } else {
+            surface_count = surface_count + 1
+        }
+        ci = ci + 1
+    }
+
+    // Core section
+    if core_count > 0 {
+        msg = "--- Semantic Core ("
+        write(1, msg, 19)
+        lc_write_num(core_count)
+        msg = ") ---\n\n"
+        write(1, msg, 7)
+        uint64 n = 0
+        uint64 i = 0
+        while i < lc_pattern_count {
+            if lc_pattern_layer(i) == 0 {
+                n = n + 1
+                lc_print_pattern(i, n)
+            }
+            i = i + 1
+        }
+    }
+
+    // Surface section
+    if surface_count > 0 {
+        msg = "--- Adaptive Surface ("
+        write(1, msg, 22)
+        lc_write_num(surface_count)
+        msg = ") ---\n\n"
+        write(1, msg, 7)
+        uint64 n2 = 0
+        uint64 j = 0
+        while j < lc_pattern_count {
+            if lc_pattern_layer(j) == 1 {
+                n2 = n2 + 1
+                lc_print_pattern(j, n2)
+            }
+            j = j + 1
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CI gating
+// ---------------------------------------------------------------------------
+// Returns 1 if any pattern fitness >= threshold, 0 otherwise
+
+@export
+fn lc_check_ci_gate(uint64 min_fitness) -> uint64 {
+    uint64 i = 0
+    while i < lc_pattern_count {
+        uint64 fit = lc_get_pattern_fitness(i)
+        if fit >= min_fitness {
+            return 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// Filtered report (only patterns >= threshold)
+// ---------------------------------------------------------------------------
+
+@export
+fn print_living_report_filtered(uint64 tel, uint64 patterns, uint64 fitness, uint64 min_fitness) {
+    uint64 msg = "=== KernRift Living Compiler Report ===\n"
+    write(1, msg, 40)
+    msg = "    stable semantic core + adaptive surface layer\n\n"
+    write(1, msg, 52)
+
+    msg = "Telemetry\n"
+    write(1, msg, 10)
+    msg = "  Functions:   "
+    write(1, msg, 15)
+    lc_write_num(tel_get(tel, 0))
+    msg = "\n  Calls:       "
+    write(1, msg, 15)
+    lc_write_num(tel_get(tel, 2))
+    msg = "\n  Unsafe ops:  "
+    write(1, msg, 15)
+    lc_write_num(tel_get(tel, 3))
+    msg = "\n  Total ops:   "
+    write(1, msg, 15)
+    lc_write_num(tel_get(tel, 6))
+    msg = "\n\nFitness: "
+    write(1, msg, 10)
+    lc_write_num(fitness)
+    msg = "/100\n\n"
+    write(1, msg, 6)
+
+    // Count filtered patterns per layer
+    uint64 shown_core = 0
+    uint64 shown_surface = 0
+    uint64 i = 0
+    while i < lc_pattern_count {
+        uint64 fit = lc_get_pattern_fitness(i)
+        if fit >= min_fitness {
+            if lc_pattern_layer(i) == 0 {
+                shown_core = shown_core + 1
+            } else {
+                shown_surface = shown_surface + 1
+            }
+        }
+        i = i + 1
+    }
+
+    uint64 shown = shown_core + shown_surface
+
+    if shown == 0 {
+        msg = "living-compiler: 0 suggestion(s) at fitness >= "
+        write(1, msg, 47)
+        lc_write_num(min_fitness)
+        msg = "\n"
+        write(1, msg, 1)
+        return
+    }
+
+    msg = "living-compiler: "
+    write(1, msg, 17)
+    lc_write_num(shown)
+    msg = " suggestion(s) at fitness >= "
+    write(1, msg, 28)
+    lc_write_num(min_fitness)
+    msg = "\n\n"
+    write(1, msg, 2)
+
+    if shown_core > 0 {
+        msg = "--- Semantic Core ("
+        write(1, msg, 19)
+        lc_write_num(shown_core)
+        msg = ") ---\n\n"
+        write(1, msg, 7)
+        uint64 n = 0
+        uint64 j = 0
+        while j < lc_pattern_count {
+            uint64 fit = lc_get_pattern_fitness(j)
+            if fit >= min_fitness && lc_pattern_layer(j) == 0 {
+                n = n + 1
+                lc_print_pattern(j, n)
+            }
+            j = j + 1
+        }
+    }
+
+    if shown_surface > 0 {
+        msg = "--- Adaptive Surface ("
+        write(1, msg, 22)
+        lc_write_num(shown_surface)
+        msg = ") ---\n\n"
+        write(1, msg, 7)
+        uint64 n2 = 0
+        uint64 k = 0
+        while k < lc_pattern_count {
+            uint64 fit = lc_get_pattern_fitness(k)
+            if fit >= min_fitness && lc_pattern_layer(k) == 1 {
+                n2 = n2 + 1
+                lc_print_pattern(k, n2)
+            }
+            k = k + 1
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Proposal engine + Governance layer
+// ---------------------------------------------------------------------------
+//
+// Proposals are candidate syntax forms generated from observed friction.
+// Each has a lifecycle state (governance layer):
+//   0 = experimental  — opt-in, under active development
+//   1 = stable        — promoted after evaluation, safe for production
+//   2 = deprecated    — replaced by something better, still accepted
+//
+// A proposal table holds the current state. `krc lc --list-proposals`
+// prints it. Triggered proposals also appear inline in the report with
+// their current lifecycle state.
+//
+// The state table is currently hardcoded per compiler version. A future
+// iteration (post-v2.7) will move it to a persistent .kernrift/proposals
+// file so projects can pin their own governance decisions.
+//
+// Proposal entry (56 bytes, 7 × 8):
+//   [0]  name ptr
+//   [8]  state (0/1/2)
+//   [16] trigger description ptr
+//   [24] before snippet ptr
+//   [32] after snippet ptr
+//   [40] rationale ptr
+//   [48] fires_flag (0/1, set by detect_proposals)
+
+static uint64 prop_table = 0
+static uint64 prop_count = 0
+
+fn prop_add(uint64 name, uint64 state, uint64 trigger, uint64 before, uint64 after, uint64 rationale) {
+    uint64 entry = prop_table + prop_count * 56
+    unsafe { *(entry as uint64) = name }
+    uint64 e8 = entry + 8
+    unsafe { *(e8 as uint64) = state }
+    uint64 e16 = entry + 16
+    unsafe { *(e16 as uint64) = trigger }
+    uint64 e24 = entry + 24
+    unsafe { *(e24 as uint64) = before }
+    uint64 e32 = entry + 32
+    unsafe { *(e32 as uint64) = after }
+    uint64 e40 = entry + 40
+    unsafe { *(e40 as uint64) = rationale }
+    uint64 e48 = entry + 48
+    unsafe { *(e48 as uint64) = 0 }
+    prop_count = prop_count + 1
+}
+
+fn prop_get_name(uint64 idx) -> uint64 {
+    uint64 e = prop_table + idx * 56
+    uint64 v = 0
+    unsafe { *(e as uint64) -> v }
+    return v
+}
+fn prop_get_state(uint64 idx) -> uint64 {
+    uint64 e = prop_table + idx * 56 + 8
+    uint64 v = 0
+    unsafe { *(e as uint64) -> v }
+    return v
+}
+fn prop_get_trigger(uint64 idx) -> uint64 {
+    uint64 e = prop_table + idx * 56 + 16
+    uint64 v = 0
+    unsafe { *(e as uint64) -> v }
+    return v
+}
+fn prop_get_before(uint64 idx) -> uint64 {
+    uint64 e = prop_table + idx * 56 + 24
+    uint64 v = 0
+    unsafe { *(e as uint64) -> v }
+    return v
+}
+fn prop_get_after(uint64 idx) -> uint64 {
+    uint64 e = prop_table + idx * 56 + 32
+    uint64 v = 0
+    unsafe { *(e as uint64) -> v }
+    return v
+}
+fn prop_get_rationale(uint64 idx) -> uint64 {
+    uint64 e = prop_table + idx * 56 + 40
+    uint64 v = 0
+    unsafe { *(e as uint64) -> v }
+    return v
+}
+fn prop_get_fires(uint64 idx) -> uint64 {
+    uint64 e = prop_table + idx * 56 + 48
+    uint64 v = 0
+    unsafe { *(e as uint64) -> v }
+    return v
+}
+fn prop_set_fires(uint64 idx, uint64 fires) {
+    uint64 e = prop_table + idx * 56 + 48
+    unsafe { *(e as uint64) = fires }
+}
+
+// Initialize the proposal registry with the current compiler's set of
+// candidate syntax evolutions. This is the governance layer's hardcoded
+// state — future versions will read from a per-project state file.
+@export
+fn init_proposals() {
+    prop_table = alloc(64 * 56)
+    prop_count = 0
+
+    // Proposal: slice_for_buffer_params — stable (already in the language)
+    prop_add(
+        "slice_for_buffer_params",
+        1,  // stable (actually implemented in v2.6)
+        "Functions that take a (ptr, len) pair as separate params",
+        "fn foo(u64 data, u64 len) { ... }",
+        "fn foo([u8] data) { u64 n = data.len; ... }",
+        "Symbolic length makes the buffer's boundary obvious at every use site."
+    )
+
+    // Proposal: device_block_from_mmio — stable (already implemented)
+    prop_add(
+        "device_block_from_mmio",
+        1,  // stable
+        "Three or more volatile ops on addresses at fixed offsets from a common base",
+        "vstore32(0x3F201000 + 0x00, val); vstore32(0x3F201000 + 0x18, flag)",
+        "device UART0 at 0x3F201000 { Data at 0x00 : u32; Flag at 0x18 : u32 }",
+        "A device block is self-documenting and compiler-checked for width mismatches."
+    )
+
+    // Proposal: load_store_builtins — stable (already implemented)
+    prop_add(
+        "load_store_builtins",
+        1,  // stable
+        "unsafe{} blocks wrapping a single pointer load or store",
+        "u32 v = 0; unsafe { *(addr as u32) -> v }",
+        "u32 v = loadN(addr)",
+        "Direct builtins are shorter, clearer, and auto-migratable."
+    )
+
+    // Proposal: short_type_aliases — stable (already implemented)
+    prop_add(
+        "short_type_aliases",
+        1,  // stable
+        "Frequent use of long-form uint32/uint64 type names",
+        "uint64 count = 0; uint32 flags = 1",
+        "u64 count = 0; u32 flags = 1",
+        "Short aliases reduce visual noise without losing precision."
+    )
+
+    // Proposal: versioned_language_profiles — experimental (parser accepts them)
+    prop_add(
+        "versioned_language_profiles",
+        0,  // experimental
+        "Files targeting different language stability guarantees",
+        "(no way to declare which surface features a file depends on)",
+        "#lang stable\n...\n#lang experimental\n...",
+        "Pinned profiles let old files keep compiling while new syntax evolves."
+    )
+
+    // Proposal: tail_call_intrinsic — experimental (not yet implemented)
+    prop_add(
+        "tail_call_intrinsic",
+        0,  // experimental
+        "Recursive calls in tail position in fixed-stack (@noreturn/@naked) contexts",
+        "fn poll(u64 head) { ...; poll(next_head) }",
+        "fn poll(u64 head) { ...; tail_call(poll, next_head) }",
+        "Zero stack growth per iteration — required for infinite polling loops in kernels."
+    )
+
+    // Proposal: extern_fn_decls — experimental (deferred)
+    prop_add(
+        "extern_fn_decls",
+        0,  // experimental
+        "Source depends on external C or assembly symbols",
+        "(not currently possible — asm() or syscall_raw only)",
+        "extern fn platform_barrier()\nextern fn kmalloc(u64 size) -> u64",
+        "Link against existing C runtimes, kernel APIs, or hand-rolled assembly shims."
+    )
+}
+
+// Evaluate which proposals fire against the current telemetry.
+// Returns the number of proposals marked as firing.
+//
+// Language profile gating: proposals in the experimental state only fire
+// when the file has `#lang experimental`. Stable proposals always fire.
+// This is the governance layer's live effect — files pinned to stable
+// don't get pestered about features that are still under evaluation.
+@export
+fn detect_proposals(uint64 tel) -> uint64 {
+    uint64 fired = 0
+    uint64 unsafe_c = tel_get(tel, 3)
+    uint64 fn_c = tel_get(tel, 0)
+    uint64 profile = get_lang_profile()
+    // Clear fire flags first
+    uint64 j = 0
+    while j < prop_count {
+        prop_set_fires(j, 0)
+        j = j + 1
+    }
+    uint64 long_type_c = tel_get(tel, 10)
+    uint64 ptrlen_c = tel_get(tel, 11)
+
+    // load_store_builtins: any legacy unsafe op fires it (stable, always)
+    if unsafe_c > 0 {
+        uint64 i = 0
+        while i < prop_count {
+            uint64 np = prop_get_name(i)
+            if str_eq(np, "load_store_builtins") != 0 {
+                uint64 st = prop_get_state(i)
+                if st == 1 || profile == 1 {
+                    prop_set_fires(i, 1)
+                    fired = fired + 1
+                }
+            }
+            i = i + 1
+        }
+    }
+
+    // short_type_aliases: fires if there are 3+ long-form type uses
+    if long_type_c >= 3 {
+        uint64 i2 = 0
+        while i2 < prop_count {
+            uint64 np2 = prop_get_name(i2)
+            if str_eq(np2, "short_type_aliases") != 0 {
+                prop_set_fires(i2, 1)
+                fired = fired + 1
+            }
+            i2 = i2 + 1
+        }
+    }
+
+    // slice_for_buffer_params: fires if any function has a (ptr, _len/_size/_count) pair
+    if ptrlen_c > 0 {
+        uint64 i3 = 0
+        while i3 < prop_count {
+            uint64 np3 = prop_get_name(i3)
+            if str_eq(np3, "slice_for_buffer_params") != 0 {
+                prop_set_fires(i3, 1)
+                fired = fired + 1
+            }
+            i3 = i3 + 1
+        }
+    }
+    // Under #lang experimental, also surface the experimental-state proposals
+    // as "coming soon" hints so users see what's planned.
+    if profile == 1 {
+        uint64 k = 0
+        while k < prop_count {
+            uint64 st2 = prop_get_state(k)
+            if st2 == 0 && prop_get_fires(k) == 0 {
+                prop_set_fires(k, 1)
+                fired = fired + 1
+            }
+            k = k + 1
+        }
+    }
+    return fired
+}
+
+fn prop_write_state(uint64 state) {
+    if state == 0 {
+        uint64 m = "experimental"
+        write(1, m, 12)
+    }
+    if state == 1 {
+        uint64 m = "stable"
+        write(1, m, 6)
+    }
+    if state == 2 {
+        uint64 m = "deprecated"
+        write(1, m, 10)
+    }
+}
+
+// Set the state of a proposal by name. Returns 1 if found, 0 if not.
+fn prop_set_state_by_name(uint64 name, uint64 state) -> uint64 {
+    uint64 i = 0
+    while i < prop_count {
+        uint64 np = prop_get_name(i)
+        if str_eq(np, name) != 0 {
+            uint64 e = prop_table + i * 56 + 8
+            unsafe { *(e as uint64) = state }
+            return 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// Persistent governance: load overrides from .kernrift/proposals and apply
+// them to the in-memory proposal table. The file format is one line per
+// proposal:
+//
+//   name experimental
+//   name stable
+//   name deprecated
+//
+// Anything else is ignored. Missing file is a no-op.
+@export
+fn load_proposal_overrides() {
+    uint64 fd = file_open(".kernrift/proposals", 0)
+    if fd > 0xFFFFFFFFFFFFF000 { return }
+    uint64 fsize = file_size(fd)
+    if fsize == 0 { file_close(fd); return }
+    uint64 buf = alloc(fsize + 1)
+    file_read(fd, buf, fsize)
+    file_close(fd)
+    uint64 tpn = buf + fsize
+    uint8 nulc = 0
+    unsafe { *(tpn as uint8) = nulc }
+    // Walk the file line by line. For each line, split at the first space.
+    // Left side = name, right side = state keyword.
+    uint64 pos = 0
+    while pos < fsize {
+        uint64 line_start = pos
+        uint64 sp_pos = 0
+        uint64 line_end = pos
+        while line_end < fsize {
+            uint64 lbp = buf + line_end
+            uint64 lc = 0
+            unsafe { *(lbp as uint8) -> lc }
+            if lc == 10 || lc == 0 { break }
+            if lc == 32 && sp_pos == 0 { sp_pos = line_end }
+            line_end = line_end + 1
+        }
+        if sp_pos > line_start {
+            // Null-terminate name
+            uint64 np = buf + sp_pos
+            uint8 zn = 0
+            unsafe { *(np as uint8) = zn }
+            // Skip space
+            uint64 val_start = sp_pos + 1
+            // Null-terminate state value at line_end
+            uint64 vep = buf + line_end
+            uint8 ze = 0
+            unsafe { *(vep as uint8) = ze }
+            uint64 name_ptr = buf + line_start
+            uint64 state_ptr = buf + val_start
+            uint64 st_val = 0
+            if str_eq(state_ptr, "stable") != 0 { st_val = 1 }
+            if str_eq(state_ptr, "experimental") != 0 { st_val = 0 }
+            if str_eq(state_ptr, "deprecated") != 0 { st_val = 2 }
+            prop_set_state_by_name(name_ptr, st_val)
+        }
+        pos = line_end + 1
+    }
+}
+
+// Save a proposal state override to .kernrift/proposals.
+// Simplest approach: replace or append in a freshly-written file.
+// Creates .kernrift/ directory on demand (mkdir via syscall).
+fn save_proposal_override(uint64 name, uint64 new_state) {
+    // Ensure .kernrift directory exists. Ignore failure (likely exists).
+    // x86_64 Linux has `mkdir(path, mode)` at nr 83 (2 args).
+    // arm64 Linux has only `mkdirat(dirfd, path, mode)` at nr 34 (3 args),
+    // where dirfd=AT_FDCWD (-100) means "relative to cwd".
+    u64 aid = get_arch_id()
+    if aid == 2 || aid == 7 {
+        // arm64 Linux / Android — use mkdirat
+        u64 at_fdcwd = 0xFFFFFFFFFFFFFF9C
+        syscall_raw(34, at_fdcwd, ".kernrift", 0x1C0, 0, 0, 0)
+    } else {
+        // x86_64 Linux (and freebsd/macos share mkdir nr 83)
+        syscall_raw(83, ".kernrift", 0x1C0, 0, 0, 0, 0)
+    }
+
+    // Apply the override in memory first
+    prop_set_state_by_name(name, new_state)
+
+    // Rewrite the whole file from prop_table (simple, robust)
+    uint64 out = alloc(4096)
+    uint64 off = 0
+    uint64 i = 0
+    while i < prop_count {
+        uint64 np = prop_get_name(i)
+        uint64 st = prop_get_state(i)
+        // Write name
+        uint64 nl = 0
+        uint64 npw = np
+        uint64 nc = 0
+        unsafe { *(npw as uint8) -> nc }
+        while nc != 0 {
+            uint64 op = out + off + nl
+            uint8 cb = nc
+            unsafe { *(op as uint8) = cb }
+            nl = nl + 1
+            npw = np + nl
+            unsafe { *(npw as uint8) -> nc }
+        }
+        off = off + nl
+        // Write " "
+        uint64 spp = out + off
+        uint8 sp = 32
+        unsafe { *(spp as uint8) = sp }
+        off = off + 1
+        // Write state name
+        uint64 state_str = "experimental"
+        uint64 state_len = 12
+        if st == 1 { state_str = "stable"; state_len = 6 }
+        if st == 2 { state_str = "deprecated"; state_len = 10 }
+        uint64 sj = 0
+        while sj < state_len {
+            uint64 ssp = state_str + sj
+            uint64 ssc = 0
+            unsafe { *(ssp as uint8) -> ssc }
+            uint64 dsp = out + off + sj
+            uint8 dsb = ssc
+            unsafe { *(dsp as uint8) = dsb }
+            sj = sj + 1
+        }
+        off = off + state_len
+        // Write newline
+        uint64 nlp = out + off
+        uint8 nlc = 10
+        unsafe { *(nlp as uint8) = nlc }
+        off = off + 1
+        i = i + 1
+    }
+
+    // Write the buffer back to .kernrift/proposals
+    uint64 fd = file_open(".kernrift/proposals", 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "error: cannot write .kernrift/proposals\n", 40)
+        return
+    }
+    file_write(fd, out, off)
+    file_close(fd)
+}
+
+@export
+fn promote_proposal(uint64 name) {
+    save_proposal_override(name, 1)  // stable
+    write(1, "promoted: ", 10)
+    lc_write_str(name)
+    write(1, " → stable\n", 12)
+}
+
+@export
+fn deprecate_proposal(uint64 name) {
+    save_proposal_override(name, 2)  // deprecated
+    write(1, "deprecated: ", 12)
+    lc_write_str(name)
+    write(1, " → deprecated\n", 16)
+}
+
+@export
+fn reject_proposal(uint64 name) {
+    save_proposal_override(name, 0)  // experimental (rejected from stable)
+    write(1, "reverted: ", 10)
+    lc_write_str(name)
+    write(1, " → experimental\n", 18)
+}
+
+// Print all proposals and their lifecycle state.
+@export
+fn list_proposals() {
+    uint64 msg = "=== KernRift Proposal Registry ===\n"
+    write(1, msg, 35)
+    msg = "  telemetry -> proposals -> fitness -> governance -> migration\n\n"
+    write(1, msg, 64)
+    msg = "Total proposals: "
+    write(1, msg, 17)
+    lc_write_num(prop_count)
+    msg = "\n\n"
+    write(1, msg, 2)
+
+    uint64 i = 0
+    while i < prop_count {
+        msg = "  ["
+        write(1, msg, 3)
+        lc_write_num(i + 1)
+        msg = "] "
+        write(1, msg, 2)
+        lc_write_str(prop_get_name(i))
+        msg = "\n      state:      "
+        write(1, msg, 19)
+        prop_write_state(prop_get_state(i))
+        msg = "\n      trigger:    "
+        write(1, msg, 19)
+        lc_write_str(prop_get_trigger(i))
+        msg = "\n      before:     "
+        write(1, msg, 19)
+        lc_write_str(prop_get_before(i))
+        msg = "\n      after:      "
+        write(1, msg, 19)
+        lc_write_str(prop_get_after(i))
+        msg = "\n      rationale:  "
+        write(1, msg, 19)
+        lc_write_str(prop_get_rationale(i))
+        msg = "\n\n"
+        write(1, msg, 2)
+        i = i + 1
+    }
+
+    // Use lc_write_str to avoid length miscounts on multi-line footers
+    lc_write_str("Governance: the state above is the compiler's baseline.\n")
+    lc_write_str("Per-project overrides live in .kernrift/proposals, managed via:\n")
+    lc_write_str("  krc lc --promote <name>     move a proposal to stable\n")
+    lc_write_str("  krc lc --deprecate <name>   move a proposal to deprecated\n")
+    lc_write_str("  krc lc --reject <name>      revert to experimental\n")
+}
+
+// Print proposals that are firing against the current telemetry (for use
+// inside the regular lc report).
+@export
+fn print_firing_proposals() {
+    uint64 any = 0
+    uint64 i = 0
+    while i < prop_count {
+        if prop_get_fires(i) != 0 { any = 1 }
+        i = i + 1
+    }
+    if any == 0 { return }
+
+    uint64 msg = "--- Proposals triggered by telemetry ---\n\n"
+    write(1, msg, 42)
+    uint64 n = 0
+    uint64 j = 0
+    while j < prop_count {
+        if prop_get_fires(j) != 0 {
+            n = n + 1
+            msg = "  ["
+            write(1, msg, 3)
+            lc_write_num(n)
+            msg = "] "
+            write(1, msg, 2)
+            lc_write_str(prop_get_name(j))
+            msg = "  state: "
+            write(1, msg, 9)
+            prop_write_state(prop_get_state(j))
+            msg = "\n      before: "
+            write(1, msg, 15)
+            lc_write_str(prop_get_before(j))
+            msg = "\n      after:  "
+            write(1, msg, 15)
+            lc_write_str(prop_get_after(j))
+            msg = "\n      why:    "
+            write(1, msg, 15)
+            lc_write_str(prop_get_rationale(j))
+            msg = "\n\n"
+            write(1, msg, 2)
+        }
+        j = j + 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Migration engine (source-to-source rewriter)
+// ---------------------------------------------------------------------------
+//
+// Applies auto-fixes identified by the pattern detection pass. Today this
+// implements a single rewrite:
+//
+//   unsafe { *(addr as T) -> dest }   →   dest = loadN(addr)
+//   unsafe { *(addr as T) = val }      →   storeN(addr, val)
+//
+// The two forms produce identical code at the codegen level, so the
+// rewrite is safe by construction.
+//
+// Scan strategy: byte-level walk over the source. For each occurrence of
+// the literal "unsafe" at a word boundary, parse the following block as a
+// pointer op. If it matches, record the byte span and the replacement
+// text; otherwise leave it alone.
+
+// Check whether source[off..off+len] equals a literal string
+fn mig_text_eq(uint64 source, uint64 off, uint64 src_len_arg, uint64 literal, uint64 lit_len) -> uint64 {
+    if off + lit_len > src_len_arg { return 0 }
+    uint64 i = 0
+    while i < lit_len {
+        uint64 sp = source + off + i
+        uint64 lp = literal + i
+        uint64 sc = 0
+        uint64 lc = 0
+        unsafe { *(sp as uint8) -> sc }
+        unsafe { *(lp as uint8) -> lc }
+        if sc != lc { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// Is this byte a word character (identifier continuation)?
+fn mig_is_word(uint64 c) -> uint64 {
+    if c >= 48 && c <= 57 { return 1 }   // 0-9
+    if c >= 65 && c <= 90 { return 1 }   // A-Z
+    if c >= 97 && c <= 122 { return 1 }  // a-z
+    if c == 95 { return 1 }              // _
+    return 0
+}
+
+// Skip whitespace (space, tab, CR, LF) from pos. Returns new position.
+fn mig_skip_ws(uint64 source, uint64 p, uint64 src_end) -> uint64 {
+    while p < src_end {
+        uint64 sp = source + p
+        uint64 c = 0
+        unsafe { *(sp as uint8) -> c }
+        if c != 32 && c != 9 && c != 13 && c != 10 { return p }
+        p = p + 1
+    }
+    return p
+}
+
+// Read an expression span (up to but not including the matching close delim).
+// Tracks paren depth; stops when we see " as " at depth 0 (within our enclosing parens).
+// Returns the byte position of the first char of ` as ` (or src_end on failure).
+fn mig_find_as(uint64 source, uint64 p, uint64 src_end) -> uint64 {
+    uint64 depth = 0
+    while p + 4 <= src_end {
+        uint64 sp = source + p
+        uint64 c = 0
+        unsafe { *(sp as uint8) -> c }
+        if c == 40 { depth = depth + 1 }
+        if c == 41 {
+            if depth == 0 { return src_end }
+            depth = depth - 1
+        }
+        if depth == 0 && c == 32 {
+            // Check for " as " — space, a, s, space
+            uint64 p1 = source + p + 1
+            uint64 p2 = source + p + 2
+            uint64 p3 = source + p + 3
+            uint64 c1 = 0
+            uint64 c2 = 0
+            uint64 c3 = 0
+            unsafe { *(p1 as uint8) -> c1 }
+            unsafe { *(p2 as uint8) -> c2 }
+            unsafe { *(p3 as uint8) -> c3 }
+            if c1 == 97 && c2 == 115 && c3 == 32 { return p }
+        }
+        p = p + 1
+    }
+    return src_end
+}
+
+// Parse a type keyword starting at `p`, return (width, new_p). Width=0 on failure.
+// Recognizes: u8, u16, u32, u64, uint8, uint16, uint32, uint64,
+//             i8, i16, i32, i64, int8, int16, int32, int64,
+//             byte (=1), addr (=8)
+fn mig_parse_type(uint64 source, uint64 p, uint64 src_end, uint64 width_out) -> uint64 {
+    // Read an identifier word starting at p
+    uint64 start = p
+    while p < src_end {
+        uint64 sp = source + p
+        uint64 c = 0
+        unsafe { *(sp as uint8) -> c }
+        if mig_is_word(c) == 0 { break }
+        p = p + 1
+    }
+    uint64 tlen = p - start
+    if tlen == 0 {
+        unsafe { *(width_out as uint64) = 0 }
+        return p
+    }
+    uint64 w = 0
+    if tlen == 2 {
+        // u8 or i8
+        if mig_text_eq(source, start, src_end, "u8", 2) != 0 { w = 1 }
+        if mig_text_eq(source, start, src_end, "i8", 2) != 0 { w = 1 }
+    }
+    if tlen == 3 {
+        if mig_text_eq(source, start, src_end, "u16", 3) != 0 { w = 2 }
+        if mig_text_eq(source, start, src_end, "u32", 3) != 0 { w = 4 }
+        if mig_text_eq(source, start, src_end, "u64", 3) != 0 { w = 8 }
+        if mig_text_eq(source, start, src_end, "i16", 3) != 0 { w = 2 }
+        if mig_text_eq(source, start, src_end, "i32", 3) != 0 { w = 4 }
+        if mig_text_eq(source, start, src_end, "i64", 3) != 0 { w = 8 }
+    }
+    if tlen == 4 {
+        if mig_text_eq(source, start, src_end, "int8", 4) != 0 { w = 1 }
+        if mig_text_eq(source, start, src_end, "byte", 4) != 0 { w = 1 }
+        if mig_text_eq(source, start, src_end, "addr", 4) != 0 { w = 8 }
+    }
+    if tlen == 5 {
+        if mig_text_eq(source, start, src_end, "uint8", 5) != 0 { w = 1 }
+        if mig_text_eq(source, start, src_end, "int16", 5) != 0 { w = 2 }
+        if mig_text_eq(source, start, src_end, "int32", 5) != 0 { w = 4 }
+        if mig_text_eq(source, start, src_end, "int64", 5) != 0 { w = 8 }
+    }
+    if tlen == 6 {
+        if mig_text_eq(source, start, src_end, "uint16", 6) != 0 { w = 2 }
+        if mig_text_eq(source, start, src_end, "uint32", 6) != 0 { w = 4 }
+        if mig_text_eq(source, start, src_end, "uint64", 6) != 0 { w = 8 }
+    }
+    unsafe { *(width_out as uint64) = w }
+    return p
+}
+
+// Append bytes from `src[src_off..src_off+len]` to `dst[*dst_pos]` and advance dst_pos
+fn mig_append_bytes(uint64 dst, uint64 dst_pos_ptr, uint64 src, uint64 src_off, uint64 len) {
+    uint64 dp = 0
+    unsafe { *(dst_pos_ptr as uint64) -> dp }
+    uint64 i = 0
+    while i < len {
+        uint64 sp = src + src_off + i
+        uint64 c = 0
+        unsafe { *(sp as uint8) -> c }
+        uint64 tp = dst + dp + i
+        uint8 cb = c
+        unsafe { *(tp as uint8) = cb }
+        i = i + 1
+    }
+    dp = dp + len
+    unsafe { *(dst_pos_ptr as uint64) = dp }
+}
+
+// Append a null-terminated literal string
+fn mig_append_str(uint64 dst, uint64 dst_pos_ptr, uint64 s) {
+    uint64 len = 0
+    uint64 p = s
+    uint64 c = 0
+    unsafe { *(p as uint8) -> c }
+    while c != 0 {
+        len = len + 1
+        p = s + len
+        unsafe { *(p as uint8) -> c }
+    }
+    mig_append_bytes(dst, dst_pos_ptr, s, 0, len)
+}
+
+// Append a width suffix (1/2/4/8 → "8"/"16"/"32"/"64")
+fn mig_append_width(uint64 dst, uint64 dst_pos_ptr, uint64 width) {
+    if width == 1 { mig_append_str(dst, dst_pos_ptr, "8") }
+    if width == 2 { mig_append_str(dst, dst_pos_ptr, "16") }
+    if width == 4 { mig_append_str(dst, dst_pos_ptr, "32") }
+    if width == 8 { mig_append_str(dst, dst_pos_ptr, "64") }
+}
+
+// Main migration pass. Scans `source` and builds a rewritten output in `out_buf`.
+// Returns (bytes_written, matches_applied).
+// If dry_run is non-zero, nothing is written, but matches are still counted.
+@export
+fn mig_scan_and_rewrite(uint64 source, uint64 src_size, uint64 out_buf_a, uint64 matches_out) -> uint64 {
+    uint64 sp_pos = 0
+    uint64 dp = 0
+    uint64 last_copied = 0
+    uint64 applied = 0
+
+    while sp_pos < src_size {
+        uint64 bp = source + sp_pos
+        uint64 ch = 0
+        unsafe { *(bp as uint8) -> ch }
+
+        // Look for 'u' or 'i' at a word boundary and try to match a long-form
+        // type name (uint8..int64). If matched, emit the short form alias.
+        if (ch == 117 || ch == 105) && sp_pos + 4 <= src_size {
+            uint64 lprev_ok = 1
+            if sp_pos > 0 {
+                uint64 lpbp = source + sp_pos - 1
+                uint64 lpc = 0
+                unsafe { *(lpbp as uint8) -> lpc }
+                if mig_is_word(lpc) != 0 { lprev_ok = 0 }
+            }
+            if lprev_ok != 0 {
+                uint64 matched_long = 0
+                uint64 short_form = 0
+                uint64 match_len = 0
+                // Try longest matches first to avoid prefix ambiguity
+                if mig_text_eq(source, sp_pos, src_size, "uint64", 6) != 0 {
+                    matched_long = 1; short_form = "u64"; match_len = 6
+                }
+                if matched_long == 0 && mig_text_eq(source, sp_pos, src_size, "uint32", 6) != 0 {
+                    matched_long = 1; short_form = "u32"; match_len = 6
+                }
+                if matched_long == 0 && mig_text_eq(source, sp_pos, src_size, "uint16", 6) != 0 {
+                    matched_long = 1; short_form = "u16"; match_len = 6
+                }
+                if matched_long == 0 && mig_text_eq(source, sp_pos, src_size, "int64", 5) != 0 {
+                    matched_long = 1; short_form = "i64"; match_len = 5
+                }
+                if matched_long == 0 && mig_text_eq(source, sp_pos, src_size, "int32", 5) != 0 {
+                    matched_long = 1; short_form = "i32"; match_len = 5
+                }
+                if matched_long == 0 && mig_text_eq(source, sp_pos, src_size, "int16", 5) != 0 {
+                    matched_long = 1; short_form = "i16"; match_len = 5
+                }
+                if matched_long == 0 && mig_text_eq(source, sp_pos, src_size, "uint8", 5) != 0 {
+                    matched_long = 1; short_form = "u8"; match_len = 5
+                }
+                if matched_long == 0 && mig_text_eq(source, sp_pos, src_size, "int8", 4) != 0 {
+                    matched_long = 1; short_form = "i8"; match_len = 4
+                }
+                if matched_long != 0 {
+                    // Verify the next char is NOT a word character (word boundary)
+                    uint64 nafter = sp_pos + match_len
+                    uint64 nafter_ok = 1
+                    if nafter < src_size {
+                        uint64 nap = source + nafter
+                        uint64 nac = 0
+                        unsafe { *(nap as uint8) -> nac }
+                        if mig_is_word(nac) != 0 { nafter_ok = 0 }
+                    }
+                    if nafter_ok != 0 {
+                        // Copy pre-match bytes
+                        uint64 pre_len = sp_pos - last_copied
+                        uint8[8] dp_bufm
+                        uint64 dpm = dp_bufm
+                        unsafe { *(dpm as uint64) = dp }
+                        mig_append_bytes(out_buf_a, dpm, source, last_copied, pre_len)
+                        // Emit short form
+                        mig_append_str(out_buf_a, dpm, short_form)
+                        unsafe { *(dpm as uint64) -> dp }
+                        last_copied = sp_pos + match_len
+                        sp_pos = sp_pos + match_len
+                        applied = applied + 1
+                        unsafe { *(matches_out as uint64) = applied }
+                        continue
+                    }
+                }
+            }
+        }
+
+        // Look for 'u' and try to match "unsafe" at a word boundary
+        if ch == 117 && sp_pos + 6 <= src_size {
+            // Word-boundary check: previous char must not be a word character
+            uint64 prev_ok = 1
+            if sp_pos > 0 {
+                uint64 pbp = source + sp_pos - 1
+                uint64 pc = 0
+                unsafe { *(pbp as uint8) -> pc }
+                if mig_is_word(pc) != 0 { prev_ok = 0 }
+            }
+            if prev_ok != 0 && mig_text_eq(source, sp_pos, src_size, "unsafe", 6) != 0 {
+                // Next char after "unsafe" must not be a word character
+                uint64 after = sp_pos + 6
+                uint64 after_ok = 1
+                if after < src_size {
+                    uint64 abp = source + after
+                    uint64 ac = 0
+                    unsafe { *(abp as uint8) -> ac }
+                    if mig_is_word(ac) != 0 { after_ok = 0 }
+                }
+                if after_ok != 0 {
+                    // Try to parse an unsafe pointer-op block starting at sp_pos
+                    uint64 mig_start = sp_pos
+                    uint64 p = after
+                    p = mig_skip_ws(source, p, src_size)
+                    // Expect '{'
+                    if p < src_size {
+                        uint64 bp1 = source + p
+                        uint64 c1 = 0
+                        unsafe { *(bp1 as uint8) -> c1 }
+                        if c1 == 123 {
+                            p = p + 1
+                            p = mig_skip_ws(source, p, src_size)
+                            // Expect '*'
+                            if p < src_size {
+                                uint64 bp2 = source + p
+                                uint64 c2 = 0
+                                unsafe { *(bp2 as uint8) -> c2 }
+                                if c2 == 42 {
+                                    p = p + 1
+                                    p = mig_skip_ws(source, p, src_size)
+                                    // Expect '('
+                                    if p < src_size {
+                                        uint64 bp3 = source + p
+                                        uint64 c3 = 0
+                                        unsafe { *(bp3 as uint8) -> c3 }
+                                        if c3 == 40 {
+                                            p = p + 1
+                                            uint64 expr_start = p
+                                            // Find " as " at depth 0
+                                            uint64 as_pos = mig_find_as(source, p, src_size)
+                                            if as_pos != src_size {
+                                                uint64 expr_end = as_pos
+                                                // Trim trailing whitespace from EXPR
+                                                while expr_end > expr_start {
+                                                    uint64 ep = source + expr_end - 1
+                                                    uint64 ec = 0
+                                                    unsafe { *(ep as uint8) -> ec }
+                                                    if ec != 32 && ec != 9 { break }
+                                                    expr_end = expr_end - 1
+                                                }
+                                                p = as_pos + 4  // skip " as "
+                                                p = mig_skip_ws(source, p, src_size)
+                                                uint64 width = 0
+                                                uint64 wp = 0 + 0
+                                                // Actually allocate a local to capture the width
+                                                uint8[8] width_buf
+                                                uint64 wp_addr = width_buf
+                                                p = mig_parse_type(source, p, src_size, wp_addr)
+                                                unsafe { *(wp_addr as uint64) -> width }
+                                                if width != 0 {
+                                                    p = mig_skip_ws(source, p, src_size)
+                                                    // Expect ')'
+                                                    if p < src_size {
+                                                        uint64 bp4 = source + p
+                                                        uint64 c4 = 0
+                                                        unsafe { *(bp4 as uint8) -> c4 }
+                                                        if c4 == 41 {
+                                                            p = p + 1
+                                                            p = mig_skip_ws(source, p, src_size)
+                                                            // Now either "-> DEST" or "= VAL"
+                                                            uint64 is_load = 0
+                                                            uint64 is_store = 0
+                                                            if p + 2 <= src_size {
+                                                                uint64 tp0 = source + p
+                                                                uint64 tp1 = source + p + 1
+                                                                uint64 t0 = 0
+                                                                uint64 t1 = 0
+                                                                unsafe { *(tp0 as uint8) -> t0 }
+                                                                unsafe { *(tp1 as uint8) -> t1 }
+                                                                if t0 == 45 && t1 == 62 {
+                                                                    is_load = 1
+                                                                    p = p + 2
+                                                                }
+                                                                if t0 == 61 && t1 != 61 {
+                                                                    is_store = 1
+                                                                    p = p + 1
+                                                                }
+                                                            }
+                                                            if is_load != 0 || is_store != 0 {
+                                                                p = mig_skip_ws(source, p, src_size)
+                                                                uint64 rhs_start = p
+                                                                // Scan until '}' at depth 0
+                                                                uint64 depth = 0
+                                                                while p < src_size {
+                                                                    uint64 spb = source + p
+                                                                    uint64 sc = 0
+                                                                    unsafe { *(spb as uint8) -> sc }
+                                                                    if sc == 40 { depth = depth + 1 }
+                                                                    if sc == 41 {
+                                                                        if depth > 0 { depth = depth - 1 }
+                                                                    }
+                                                                    if depth == 0 && sc == 125 { break }
+                                                                    p = p + 1
+                                                                }
+                                                                if p < src_size {
+                                                                    uint64 rhs_end = p
+                                                                    // Trim trailing whitespace
+                                                                    while rhs_end > rhs_start {
+                                                                        uint64 rp2 = source + rhs_end - 1
+                                                                        uint64 rc2 = 0
+                                                                        unsafe { *(rp2 as uint8) -> rc2 }
+                                                                        if rc2 != 32 && rc2 != 9 { break }
+                                                                        rhs_end = rhs_end - 1
+                                                                    }
+                                                                    uint64 mig_end = p + 1  // past '}'
+
+                                                                    // Copy pre-match bytes
+                                                                    uint64 pre_len = mig_start - last_copied
+                                                                    uint64 dpr = dp
+                                                                    unsafe { *(matches_out as uint64) -> applied }
+                                                                    uint8[8] dp_buf
+                                                                    uint64 dp_addr = dp_buf
+                                                                    unsafe { *(dp_addr as uint64) = dpr }
+                                                                    mig_append_bytes(out_buf_a, dp_addr, source, last_copied, pre_len)
+                                                                    // Emit the replacement
+                                                                    if is_load != 0 {
+                                                                        // dest = loadN(expr)
+                                                                        mig_append_bytes(out_buf_a, dp_addr, source, rhs_start, rhs_end - rhs_start)
+                                                                        mig_append_str(out_buf_a, dp_addr, " = load")
+                                                                        mig_append_width(out_buf_a, dp_addr, width)
+                                                                        mig_append_str(out_buf_a, dp_addr, "(")
+                                                                        mig_append_bytes(out_buf_a, dp_addr, source, expr_start, expr_end - expr_start)
+                                                                        mig_append_str(out_buf_a, dp_addr, ")")
+                                                                    } else {
+                                                                        // storeN(expr, val)
+                                                                        mig_append_str(out_buf_a, dp_addr, "store")
+                                                                        mig_append_width(out_buf_a, dp_addr, width)
+                                                                        mig_append_str(out_buf_a, dp_addr, "(")
+                                                                        mig_append_bytes(out_buf_a, dp_addr, source, expr_start, expr_end - expr_start)
+                                                                        mig_append_str(out_buf_a, dp_addr, ", ")
+                                                                        mig_append_bytes(out_buf_a, dp_addr, source, rhs_start, rhs_end - rhs_start)
+                                                                        mig_append_str(out_buf_a, dp_addr, ")")
+                                                                    }
+                                                                    unsafe { *(dp_addr as uint64) -> dp }
+                                                                    applied = applied + 1
+                                                                    unsafe { *(matches_out as uint64) = applied }
+                                                                    last_copied = mig_end
+                                                                    sp_pos = mig_end
+                                                                    continue
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        sp_pos = sp_pos + 1
+    }
+
+    // Copy the tail
+    uint64 tail_len = src_size - last_copied
+    uint8[8] dp_buf2
+    uint64 dp_addr2 = dp_buf2
+    unsafe { *(dp_addr2 as uint64) = dp }
+    mig_append_bytes(out_buf_a, dp_addr2, source, last_copied, tail_len)
+    unsafe { *(dp_addr2 as uint64) -> dp }
+    return dp
+}
+
+// Run the migration engine on `input_path`. If dry_run, print the rewritten
+// source and match count to stdout. If not, write back to the file.
+@export
+fn run_migration(uint64 input_path, uint64 dry_run) {
+    uint64 fd = file_open(input_path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "error: cannot open input file\n", 30)
+        exit(1)
+    }
+    uint64 fsize = file_size(fd)
+    uint64 src_buf = alloc(fsize + 1)
+    file_read(fd, src_buf, fsize)
+    file_close(fd)
+    uint64 tp = src_buf + fsize
+    uint8 z = 0
+    unsafe { *(tp as uint8) = z }
+
+    // Worst-case output: every unsafe{} block becomes a slightly longer
+    // form (never more than 2x), so 4x is a safe upper bound.
+    uint64 out_buf_m = alloc(fsize * 4 + 1024)
+    uint64 matches = 0
+    uint8[8] mbuf
+    uint64 m_addr = mbuf
+    unsafe { *(m_addr as uint64) = 0 }
+
+    uint64 new_size = mig_scan_and_rewrite(src_buf, fsize, out_buf_m, m_addr)
+    unsafe { *(m_addr as uint64) -> matches }
+
+    if dry_run != 0 {
+        // Print matches count and the first 1K of the rewritten file
+        write(1, "migration: ", 11)
+        uint8[32] nb
+        uint64 nl = fmt_uint(nb, matches)
+        write(1, nb, nl)
+        write(1, " migration site(s) rewritten\n", 34)
+        write(1, "--- dry-run output preview (first 512 bytes) ---\n", 49)
+        uint64 preview = new_size
+        if preview > 512 { preview = 512 }
+        write(1, out_buf_m, preview)
+        write(1, "\n", 1)
+        return
+    }
+
+    if matches == 0 {
+        write(1, "migration: no sites found\n", 26)
+        return
+    }
+
+    // Write rewritten source back to the same file
+    uint64 ofd = file_open(input_path, 1)
+    if ofd > 0xFFFFFFFFFFFFF000 {
+        write(2, "error: cannot open output file for writing\n", 44)
+        exit(1)
+    }
+    file_write(ofd, out_buf_m, new_size)
+    file_close(ofd)
+
+    write(1, "migration: ", 11)
+    uint8[32] nb2
+    uint64 nl2 = fmt_uint(nb2, matches)
+    write(1, nb2, nl2)
+    write(1, " migration site(s) rewritten in ", 32)
+    uint64 pl = 0
+    uint64 pp = input_path
+    uint64 pc = 0
+    unsafe { *(pp as uint8) -> pc }
+    while pc != 0 {
+        pl = pl + 1
+        pp = input_path + pl
+        unsafe { *(pp as uint8) -> pc }
+    }
+    write(1, input_path, pl)
+    write(1, "\n", 1)
+}

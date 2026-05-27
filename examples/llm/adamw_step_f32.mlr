@@ -1,0 +1,68 @@
+// adamw_step_f32 — per-element AdamW optimizer update (GPU kernel).
+//
+// Per-element update (all arrays length n):
+//   m[i]  = b1*m[i]  + (1-b1)*g[i]
+//   v[i]  = b2*v[i]  + (1-b2)*g[i]^2
+//   w[i]  = w[i]*decay - lr * (m[i]*inv_bc1) / (sqrt(v[i]*inv_bc2) + eps)
+//
+// Parameters:
+//   param_ptr : pointer to weight array (f32*, updated in-place)
+//   grad_ptr  : pointer to gradient array (f32*, read-only)
+//   m_ptr     : pointer to first-moment array (f32*, updated in-place)
+//   v_ptr     : pointer to second-moment array (f32*, updated in-place)
+//   n         : number of elements
+//   inv_bc1   : 1/(1-beta1^t)  bias-correction for m
+//   inv_bc2   : 1/(1-beta2^t)  bias-correction for v
+//   decay     : (1 - weight_decay*lr) pre-multiplied weight decay
+//   b1        : beta1 (e.g. 0.9)
+//   b2        : beta2 (e.g. 0.999)
+//   one_m_b1  : 1-beta1
+//   one_m_b2  : 1-beta2
+//   lr        : learning rate (already bias-corrected if used standalone)
+//   eps       : epsilon (e.g. 1e-8)
+//
+// Grid: ceil(n/256) blocks × 256 threads.
+//
+// Build (GPU kernel .co only):
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native \
+//       examples/llm/adamw_step_f32.mlr -o /tmp/adamw_step_f32
+//
+// The ISA is hand-coded in src/format_amdgpu.mlr:amdgpu_lower_adamw_step_f32().
+// This file serves as the AST source; the kernel body below is a stub that
+// satisfies the parser — the named-dispatch recognizer replaces it with
+// the full ISA before any body analysis.
+
+fn block_idx_x() -> uint64 { return 0 }
+fn tid_local_x() -> uint64 { return 0 }
+
+@kernel
+fn adamw_step_f32(uint64 param_ptr, uint64 grad_ptr, uint64 m_ptr, uint64 v_ptr,
+                  uint64 n,
+                  f32 inv_bc1, f32 inv_bc2, f32 decay,
+                  f32 b1, f32 b2, f32 one_m_b1, f32 one_m_b2,
+                  f32 lr, f32 eps) {
+    uint64 gid = block_idx_x() * 256 + tid_local_x()
+    if gid < n {
+        uint64 off = gid * 4
+        uint64 pp = param_ptr + off
+        uint64 gp = grad_ptr  + off
+        uint64 mp = m_ptr     + off
+        uint64 vp = v_ptr     + off
+        f32 w = 0.0; unsafe { *(pp as f32) -> w }
+        f32 g = 0.0; unsafe { *(gp as f32) -> g }
+        f32 m = 0.0; unsafe { *(mp as f32) -> m }
+        f32 v = 0.0; unsafe { *(vp as f32) -> v }
+        f32 m_new = b1 * m + one_m_b1 * g
+        f32 v_new = b2 * v + one_m_b2 * g * g
+        unsafe { *(mp as f32) = m_new }
+        unsafe { *(vp as f32) = v_new }
+        f32 m_hat = m_new * inv_bc1
+        f32 v_hat = v_new * inv_bc2
+        f32 step  = lr * m_hat
+        unsafe { *(pp as f32) = w * decay - step }
+    }
+}
+
+fn main() {
+    exit(0)
+}

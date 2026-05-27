@@ -1,0 +1,330 @@
+// Diagnostic launcher for N3 LDS GEMM heisenbug.
+// Same as gemm_f32_lds_launch.mlr but prints fail-set details.
+
+import "../../std/hip.mlr"
+
+@dynamic extern fn puts(uint64 s) -> uint32
+@dynamic extern fn write(int32 fd, uint64 buf, uint64 n) -> int64
+@dynamic extern fn exit(uint64 code)
+@dynamic extern fn getenv(uint64 name) -> uint64
+
+static uint64 M_DEF = 256
+static uint64 N_DEF = 256
+static uint64 K_DEF = 256
+
+fn u64_to_ascii_decimal(uint64 val, uint64 buf) -> uint64 {
+    if val == 0 { uint8 z = 48; unsafe { *(buf as uint8) = z }; return 1 }
+    uint64 n = 0
+    uint64 tmp = val
+    while tmp > 0 { n = n + 1; tmp = tmp / 10 }
+    uint64 i = n
+    tmp = val
+    while i > 0 {
+        i = i - 1
+        uint64 d = tmp - (tmp / 10) * 10
+        uint64 p = buf + i
+        uint8 c = d + 48
+        unsafe { *(p as uint8) = c }
+        tmp = tmp / 10
+    }
+    return n
+}
+
+fn print_label_val(uint64 label, uint64 label_len, uint64 val) {
+    uint64 buf = alloc(128)
+    uint64 i = 0
+    while i < label_len {
+        uint64 sp = label + i
+        uint64 c = 0
+        unsafe { *(sp as uint8) -> c }
+        uint64 dp = buf + i
+        uint8 cb = c
+        unsafe { *(dp as uint8) = cb }
+        i = i + 1
+    }
+    uint64 cp = buf + label_len
+    uint8 col = 58; unsafe { *(cp as uint8) = col }
+    uint64 sp2 = buf + label_len + 1
+    uint8 space = 32; unsafe { *(sp2 as uint8) = space }
+    uint64 num_buf = buf + label_len + 2
+    uint64 dlen = u64_to_ascii_decimal(val, num_buf)
+    uint64 nul_p = buf + label_len + 2 + dlen
+    uint8 nul = 0; unsafe { *(nul_p as uint8) = nul }
+    puts(buf)
+}
+
+fn die(uint64 msg, uint64 code) {
+    puts(msg)
+    print_label_val("hipError", 8, code)
+    exit(1)
+}
+
+fn parse_env_count(uint64 name) -> uint64 {
+    uint64 s = getenv(name)
+    if s == 0 { return 0 }
+    uint64 v = 0
+    uint64 i = 0
+    while 1 == 1 {
+        uint64 cp = s + i
+        uint64 c = 0
+        unsafe { *(cp as uint8) -> c }
+        if c == 0 { break }
+        if c >= 48 && c <= 57 { v = v * 10 + (c - 48); i = i + 1; continue }
+        break
+    }
+    return v
+}
+
+fn fill_a(uint64 a_host, uint64 m, uint64 k_dim) {
+    uint64 row = 0
+    while row < m {
+        uint64 col = 0
+        while col < k_dim {
+            uint64 mix = (row * 31 + col * 17 + 7) - ((row * 31 + col * 17 + 7) / 100) * 100
+            f64 vd = int_to_f64(mix) * 0.01
+            f32 v  = f64_to_f32(vd)
+            uint64 p = a_host + (row * k_dim + col) * 4
+            unsafe { *(p as f32) = v }
+            col = col + 1
+        }
+        row = row + 1
+    }
+}
+
+fn fill_b(uint64 b_host, uint64 k_dim, uint64 n) {
+    uint64 row = 0
+    while row < k_dim {
+        uint64 col = 0
+        while col < n {
+            uint64 mix = (row * 13 + col * 7 + 3) - ((row * 13 + col * 7 + 3) / 50) * 50
+            f64 vd = int_to_f64(mix) * 0.02
+            f32 v  = f64_to_f32(vd)
+            uint64 p = b_host + (row * n + col) * 4
+            unsafe { *(p as f32) = v }
+            col = col + 1
+        }
+        row = row + 1
+    }
+}
+
+fn cpu_gemm(uint64 a_host, uint64 b_host, uint64 c_host,
+            uint64 m, uint64 n, uint64 k_dim) {
+    uint64 i = 0
+    while i < m {
+        uint64 j = 0
+        while j < n {
+            f32 sum = 0.0
+            uint64 t = 0
+            while t < k_dim {
+                uint64 ap = a_host + (i * k_dim + t) * 4
+                uint64 bp = b_host + (t * n + j) * 4
+                f32 a = 0.0; unsafe { *(ap as f32) -> a }
+                f32 b = 0.0; unsafe { *(bp as f32) -> b }
+                sum = sum + a * b
+                t = t + 1
+            }
+            uint64 cp = c_host + (i * n + j) * 4
+            unsafe { *(cp as f32) = sum }
+            j = j + 1
+        }
+        i = i + 1
+    }
+}
+
+// Scan the output, print every cell that is NaN, with ty/tx/wg coords.
+fn scan_fails(uint64 got_buf, uint64 m, uint64 n, uint64 max_to_print) {
+    uint64 nan_count = 0
+    uint64 finite_count = 0
+    // Per-tile NaN count: for each (wgy, wgx) tile up to 16x16
+    uint64 tile_counts = alloc(16 * 16 * 8)
+    uint64 zero_init = 0
+    while zero_init < 16 * 16 {
+        uint64 zp = tile_counts + zero_init * 8
+        unsafe { *(zp as uint64) = 0 }
+        zero_init = zero_init + 1
+    }
+    uint64 i = 0
+    uint64 total = m * n
+    uint64 printed = 0
+    while i < total {
+        uint64 gp = got_buf + i * 4
+        uint32 g_bits = 0
+        unsafe { *(gp as uint32) -> g_bits }
+        uint32 abs_bits = g_bits
+        if abs_bits >= 0x80000000 { abs_bits = abs_bits - 0x80000000 }
+        if abs_bits > 0x7F800000 {
+            nan_count = nan_count + 1
+            uint64 row = i / n
+            uint64 col = i - row * n
+            uint64 wgy = row / 16
+            uint64 wgx = col / 16
+            if wgy < 16 && wgx < 16 {
+                uint64 tcp = tile_counts + (wgy * 16 + wgx) * 8
+                uint64 cur = 0
+                unsafe { *(tcp as uint64) -> cur }
+                cur = cur + 1
+                unsafe { *(tcp as uint64) = cur }
+            }
+            if printed < max_to_print {
+                uint64 ty = row - (row / 16) * 16
+                uint64 tx = col - (col / 16) * 16
+                print_label_val("NaN_idx", 7, i)
+                print_label_val("  row",   5, row)
+                print_label_val("  col",   5, col)
+                print_label_val("  wgx",   5, wgx)
+                print_label_val("  wgy",   5, wgy)
+                print_label_val("  ty",    4, ty)
+                print_label_val("  tx",    4, tx)
+                print_label_val("  bits",  6, g_bits)
+                printed = printed + 1
+            }
+        } else {
+            finite_count = finite_count + 1
+        }
+        i = i + 1
+    }
+    print_label_val("nan_count",    9, nan_count)
+    print_label_val("finite_count", 12, finite_count)
+    // Print per-tile NaN counts as a 16x16 grid
+    puts("Per-tile NaN counts (rows = wgy 0..15, cols = wgx 0..15):")
+    uint64 wy = 0
+    while wy < 16 {
+        uint64 row_buf = alloc(256)
+        uint64 bp = row_buf
+        uint64 wx = 0
+        while wx < 16 {
+            uint64 tcp = tile_counts + (wy * 16 + wx) * 8
+            uint64 cnt = 0
+            unsafe { *(tcp as uint64) -> cnt }
+            uint64 dlen = u64_to_ascii_decimal(cnt, bp)
+            bp = bp + dlen
+            uint8 spc = 32; unsafe { *(bp as uint8) = spc }
+            bp = bp + 1
+            wx = wx + 1
+        }
+        uint8 nul = 0; unsafe { *(bp as uint8) = nul }
+        puts(row_buf)
+        wy = wy + 1
+    }
+}
+
+fn main() {
+    uint32 err = hipSetDevice(0)
+    if err != 0 { die("hipSetDevice failed", err) }
+
+    uint64 M = M_DEF
+    uint64 N = N_DEF
+    uint64 K = K_DEF
+    uint64 me = parse_env_count("GEMM_M"); if me != 0 { M = me }
+    uint64 ne = parse_env_count("GEMM_N"); if ne != 0 { N = ne }
+    uint64 ke = parse_env_count("GEMM_K"); if ke != 0 { K = ke }
+
+    uint64 co_path = "/tmp/gemm_f32_lds.co"
+    uint64 fd = file_open(co_path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 { puts("cannot open .co"); exit(1) }
+    uint64 co_size = file_size(fd)
+    uint64 co_blob = alloc(co_size)
+    file_read(fd, co_blob, co_size)
+    file_close(fd)
+
+    uint64 mod_slot = alloc(8)
+    err = hipModuleLoadData(mod_slot, co_blob)
+    if err != 0 { die("LoadData", err) }
+    uint64 mod = 0; unsafe { *(mod_slot as uint64) -> mod }
+
+    uint64 fh_slot = alloc(8)
+    err = hipModuleGetFunction(fh_slot, mod, "gemm_f32_lds")
+    if err != 0 { die("getFn", err) }
+    uint64 fh = 0; unsafe { *(fh_slot as uint64) -> fh }
+
+    uint64 bytes_a = M * K * 4
+    uint64 bytes_b = K * N * 4
+    uint64 bytes_c = M * N * 4
+
+    uint64 d_A = 0; uint64 d_B = 0; uint64 d_C = 0
+    uint64 slot = alloc(8); err = hipMalloc(slot, bytes_a); if err != 0 { die("mA", err) }; unsafe { *(slot as uint64) -> d_A }
+    slot = alloc(8); err = hipMalloc(slot, bytes_b); if err != 0 { die("mB", err) }; unsafe { *(slot as uint64) -> d_B }
+    slot = alloc(8); err = hipMalloc(slot, bytes_c); if err != 0 { die("mC", err) }; unsafe { *(slot as uint64) -> d_C }
+
+    uint64 h_A = alloc(bytes_a); fill_a(h_A, M, K)
+    uint64 h_B = alloc(bytes_b); fill_b(h_B, K, N)
+    err = hipMemcpy(d_A, h_A, bytes_a, 1); if err != 0 { die("H2D A", err) }
+    err = hipMemcpy(d_B, h_B, bytes_b, 1); if err != 0 { die("H2D B", err) }
+    // Fill C with sentinel 0xCAFEBABE so we can see which cells the GPU
+    // didn't write to.
+    uint64 h_sentinel = alloc(bytes_c)
+    uint64 si = 0
+    while si < M * N {
+        uint64 sp = h_sentinel + si * 4
+        uint32 sb = 0xCAFEBABE
+        unsafe { *(sp as uint32) = sb }
+        si = si + 1
+    }
+    // err = hipMemcpy(d_C, h_sentinel, bytes_c, 1); if err != 0 { die("H2D sentinel", err) }
+    // err = hipDeviceSynchronize(); if err != 0 { die("sync after sentinel", err) }
+
+    uint64 tiles_m = (M + 15) / 16
+    uint64 tiles_n = (N + 15) / 16
+    uint32 grid_x  = tiles_n
+    uint32 grid_y  = tiles_m
+    uint32 block_x = 16
+    uint32 block_y = 16
+
+    uint64 k_a = alloc(8); unsafe { *(k_a as uint64) = d_A }
+    uint64 k_b = alloc(8); unsafe { *(k_b as uint64) = d_B }
+    uint64 k_c = alloc(8); unsafe { *(k_c as uint64) = d_C }
+    uint64 k_m = alloc(8); uint64 mv = M; unsafe { *(k_m as uint64) = mv }
+    uint64 k_n = alloc(8); uint64 nv = N; unsafe { *(k_n as uint64) = nv }
+    uint64 k_k = alloc(8); uint64 kv = K; unsafe { *(k_k as uint64) = kv }
+    uint64 kp = alloc(6 * 8)
+    unsafe { *(kp        as uint64) = k_a }
+    unsafe { *((kp +  8) as uint64) = k_b }
+    unsafe { *((kp + 16) as uint64) = k_c }
+    unsafe { *((kp + 24) as uint64) = k_m }
+    unsafe { *((kp + 32) as uint64) = k_n }
+    unsafe { *((kp + 40) as uint64) = k_k }
+
+    err = hipModuleLaunchKernel(fh, grid_x, grid_y, 1, block_x, block_y, 1, 0, 0, kp, 0)
+    if err != 0 { die("launch", err) }
+    err = hipDeviceSynchronize(); if err != 0 { die("sync", err) }
+
+    uint64 h_C = alloc(bytes_c)
+    err = hipMemcpy(h_C, d_C, bytes_c, 2); if err != 0 { die("D2H C", err) }
+
+    print_label_val("M", 1, M)
+    print_label_val("N", 1, N)
+    print_label_val("K", 1, K)
+    // Count cells still containing sentinel (kernel didn't write).
+    uint64 unwritten = 0
+    uint64 ui = 0
+    while ui < M * N {
+        uint64 up = h_C + ui * 4
+        uint32 ub = 0
+        unsafe { *(up as uint32) -> ub }
+        if ub == 0xCAFEBABE { unwritten = unwritten + 1 }
+        ui = ui + 1
+    }
+    print_label_val("unwritten_count", 15, unwritten)
+    // Print first 16 cells that are NOT sentinel (i.e., actually written).
+    uint64 wp = 0
+    uint64 wpc = 0
+    while wp < M * N && wpc < 16 {
+        uint64 wpaddr = h_C + wp * 4
+        uint32 wpv = 0
+        unsafe { *(wpaddr as uint32) -> wpv }
+        if wpv != 0xCAFEBABE {
+            uint64 wrow = wp / N
+            uint64 wcol = wp - wrow * N
+            print_label_val("written_idx",  11, wp)
+            print_label_val("  row",         5, wrow)
+            print_label_val("  col",         5, wcol)
+            print_label_val("  val_bits",   10, wpv)
+            wpc = wpc + 1
+        }
+        wp = wp + 1
+    }
+    scan_fails(h_C, M, N, 4)
+
+    hipFree(d_A); hipFree(d_B); hipFree(d_C)
+    exit(0)
+}

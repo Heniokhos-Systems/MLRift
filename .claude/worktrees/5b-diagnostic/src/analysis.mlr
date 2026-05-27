@@ -1,0 +1,1708 @@
+// MLRift — built on KernRift — Analysis Passes
+//
+// Implements kernel safety checks:
+//   1. Context check (ctx): verify caller/callee context compatibility
+//   2. Effect check (eff): verify declared effects match actual operations
+//   3. Lock graph: detect potential deadlocks via lock ordering
+//   4. Capability check (caps): verify module capability declarations
+//   5. Critical region: no alloc/block inside critical sections
+//   6. Unsafe pointer check: track raw pointer usage
+
+// ---------------------------------------------------------------------------
+// Annotation storage
+// ---------------------------------------------------------------------------
+// Each function can have annotations: @ctx(...), @eff(...), @caps(...)
+// Store as: [fn_tok(4), ann_type(4), ann_data(8)] × 4096
+
+static uint64 ann_table = 0
+static uint64 ann_count = 0
+
+// Semantic validation statics
+static uint64 fn_sig_table = 0
+static uint64 fn_sig_count = 0
+static uint64 sema_errors = 0
+static uint64 sema_source = 0
+static uint64 sema_tok_buf = 0
+
+// Diagnostic collection
+static uint64 diag_table = 0
+static uint64 diag_count = 0
+static uint64 diag_error_count = 0
+static uint64 diag_warn_count = 0
+
+// Annotation types
+// 0 = ctx (context: task, irq, nmi, any)
+// 1 = eff (effect: io, alloc, block, net, fs, none)
+// 2 = caps (capability: mmio, dma, irq, port_io, sched)
+// 3 = export
+
+@export
+fn analysis_init() {
+    ann_table = alloc(4096 * 16)
+    ann_count = 0
+}
+
+fn ann_register(uint64 fn_tok, uint64 ann_type, uint64 ann_data) {
+    uint64 entry = ann_table + ann_count * 16
+    uint32 ft = fn_tok
+    unsafe { *(entry as uint32) = ft }
+    uint64 e4 = entry + 4
+    uint32 atype = ann_type
+    unsafe { *(e4 as uint32) = atype }
+    uint64 e8 = entry + 8
+    unsafe { *(e8 as uint64) = ann_data }
+    ann_count = ann_count + 1
+}
+
+fn ann_lookup(uint64 fn_tok, uint64 ann_type) -> uint64 {
+    uint64 i = 0
+    while i < ann_count {
+        uint64 entry = ann_table + i * 16
+        uint32 stored_fn = 0
+        unsafe { *(entry as uint32) -> stored_fn }
+        uint64 wfn = stored_fn
+        if tok_text_eq(wfn, fn_tok) != 0 {
+            uint64 e4 = entry + 4
+            uint32 stored_type = 0
+            unsafe { *(e4 as uint32) -> stored_type }
+            uint64 wt = stored_type
+            if wt == ann_type {
+                uint64 e8 = entry + 8
+                uint64 data = 0
+                unsafe { *(e8 as uint64) -> data }
+                return data
+            }
+        }
+        i = i + 1
+    }
+    return 0xFFFFFFFF
+}
+
+// ---------------------------------------------------------------------------
+// Context check
+// ---------------------------------------------------------------------------
+// Context hierarchy: nmi > irq > task > any
+// Rule: caller ctx must be subset of callee ctx
+// If a function is @ctx(irq), it cannot call @ctx(task) functions
+// Context values: 0=any, 1=task, 2=irq, 3=nmi
+
+static uint64 ctx_errors = 0
+
+@export
+fn check_ctx(uint64 root) {
+    ctx_errors = 0
+    // Walk all functions, check each call site
+    uint32 child = ast_child(root)
+    uint64 wchild = child
+    while wchild != 0 {
+        uint32 ck = ast_kind(wchild)
+        if ck == 2 {
+            uint32 fn_tok = ast_data1(wchild)
+            uint64 caller_ctx = ann_lookup(fn_tok, 0)
+            if caller_ctx == 0xFFFFFFFF { caller_ctx = 0 }
+            // Walk function body for calls
+            uint32 body = ast_data3(wchild)
+            uint64 wbody = body
+            if wbody != 0 {
+                check_ctx_block(wbody, fn_tok, caller_ctx)
+            }
+        }
+        uint32 nxt = ast_next(wchild)
+        wchild = nxt
+    }
+}
+
+fn check_ctx_block(uint64 block_node, uint64 caller_tok, uint64 caller_ctx) {
+    uint32 child = ast_child(block_node)
+    uint64 wchild = child
+    while wchild != 0 {
+        check_ctx_stmt(wchild, caller_tok, caller_ctx)
+        uint32 nxt = ast_next(wchild)
+        wchild = nxt
+    }
+}
+
+fn check_ctx_stmt(uint64 node, uint64 caller_tok, uint64 caller_ctx) {
+    uint32 kind = ast_kind(node)
+    // Expression statement containing a call
+    if kind == 16 {
+        uint32 expr = ast_child(node)
+        uint64 wexpr = expr
+        check_ctx_expr(wexpr, caller_tok, caller_ctx)
+    }
+    // If statement: check both branches
+    if kind == 13 {
+        uint32 then_body = ast_data1(node)
+        uint64 wt = then_body
+        if wt != 0 { check_ctx_block(wt, caller_tok, caller_ctx) }
+        uint32 else_body = ast_data2(node)
+        uint64 we = else_body
+        if we != 0 {
+            uint32 ek = ast_kind(we)
+            if ek == 13 { check_ctx_stmt(we, caller_tok, caller_ctx) }
+            else { check_ctx_block(we, caller_tok, caller_ctx) }
+        }
+    }
+    // While: check body
+    if kind == 14 {
+        uint32 body = ast_data1(node)
+        uint64 wb = body
+        if wb != 0 { check_ctx_block(wb, caller_tok, caller_ctx) }
+    }
+}
+
+fn check_ctx_expr(uint64 node, uint64 caller_tok, uint64 caller_ctx) {
+    uint32 kind = ast_kind(node)
+    if kind == 35 {
+        // Function call: check callee context
+        uint32 callee_tok = ast_data1(node)
+        uint64 callee_ctx = ann_lookup(callee_tok, 0)
+        if callee_ctx == 0xFFFFFFFF { callee_ctx = 0 }
+        // If caller is in a restricted context (irq/nmi) and callee requires task context
+        if caller_ctx > callee_ctx && callee_ctx != 0 {
+            // Context violation!
+            uint64 msg = "ctx-check: context violation in "
+            write(2, msg, 33)
+            uint64 ts = tok_text_start(caller_tok)
+            uint64 tl = tok_text_len(caller_tok)
+            write(2, cg_source + ts, tl)
+            msg = "\n"
+            write(2, msg, 1)
+            ctx_errors = ctx_errors + 1
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Effect check
+// ---------------------------------------------------------------------------
+// Effects: io=1, alloc=2, block=4, net=8, fs=16
+// Rule: function's actual effects must be subset of declared effects
+
+static uint64 eff_errors = 0
+
+@export
+fn check_effects(uint64 root) {
+    eff_errors = 0
+    uint32 child = ast_child(root)
+    uint64 wchild = child
+    while wchild != 0 {
+        uint32 ck = ast_kind(wchild)
+        if ck == 2 {
+            uint32 fn_tok = ast_data1(wchild)
+            uint64 declared_eff = ann_lookup(fn_tok, 1)
+            if declared_eff == 0xFFFFFFFF { declared_eff = 0xFFFF }
+            // Compute actual effects from body
+            uint32 body = ast_data3(wchild)
+            uint64 wbody = body
+            uint64 actual_eff = 0
+            if wbody != 0 {
+                actual_eff = compute_effects_block(wbody)
+            }
+            // Check: actual must be subset of declared
+            if (actual_eff & ~declared_eff) != 0 {
+                uint64 msg = "eff-check: undeclared effect in "
+                write(2, msg, 33)
+                uint64 ts = tok_text_start(fn_tok)
+                uint64 tl = tok_text_len(fn_tok)
+                write(2, cg_source + ts, tl)
+                msg = "\n"
+                write(2, msg, 1)
+                eff_errors = eff_errors + 1
+            }
+        }
+        uint32 nxt = ast_next(wchild)
+        wchild = nxt
+    }
+}
+
+fn compute_effects_block(uint64 block_node) -> uint64 {
+    uint64 effects = 0
+    uint32 child = ast_child(block_node)
+    uint64 wchild = child
+    while wchild != 0 {
+        effects = effects | compute_effects_stmt(wchild)
+        uint32 nxt = ast_next(wchild)
+        wchild = nxt
+    }
+    return effects
+}
+
+fn compute_effects_stmt(uint64 node) -> uint64 {
+    uint32 kind = ast_kind(node)
+    uint64 effects = 0
+    if kind == 16 {
+        uint32 expr = ast_child(node)
+        uint64 wexpr = expr
+        effects = effects | compute_effects_expr(wexpr)
+    }
+    if kind == 13 {
+        uint32 then_body = ast_data1(node)
+        uint64 wt = then_body
+        if wt != 0 { effects = effects | compute_effects_block(wt) }
+        uint32 else_body = ast_data2(node)
+        uint64 we = else_body
+        if we != 0 { effects = effects | compute_effects_block(we) }
+    }
+    if kind == 14 {
+        uint32 body = ast_data1(node)
+        uint64 wb = body
+        if wb != 0 { effects = effects | compute_effects_block(wb) }
+    }
+    return effects
+}
+
+fn compute_effects_expr(uint64 node) -> uint64 {
+    uint32 kind = ast_kind(node)
+    if kind == 35 {
+        uint32 callee_tok = ast_data1(node)
+        // Check for known effectful builtins
+        if tok_matches(callee_tok, "alloc", 5) != 0 { return 2 }
+        if tok_matches(callee_tok, "write", 5) != 0 { return 1 }
+        if tok_matches(callee_tok, "file_open", 9) != 0 { return 16 }
+        if tok_matches(callee_tok, "file_read", 9) != 0 { return 16 }
+        if tok_matches(callee_tok, "file_write", 10) != 0 { return 16 }
+        // Look up callee's declared effects (transitive)
+        uint64 callee_eff = ann_lookup(callee_tok, 1)
+        if callee_eff != 0xFFFFFFFF { return callee_eff }
+    }
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// Lock graph (deadlock detection)
+// ---------------------------------------------------------------------------
+// Track lock acquire/release patterns
+// Build directed graph: if fn A holds lock X and acquires lock Y, add edge X→Y
+// Detect cycles in the graph
+
+static uint64 lock_edges = 0
+static uint64 lock_edge_count = 0
+
+@export
+fn lock_graph_init() {
+    lock_edges = alloc(1024 * 16)
+    lock_edge_count = 0
+}
+
+fn lock_add_edge(uint64 from_tok, uint64 to_tok) {
+    uint64 entry = lock_edges + lock_edge_count * 16
+    uint32 ft = from_tok
+    unsafe { *(entry as uint32) = ft }
+    uint64 e4 = entry + 4
+    uint32 tt = to_tok
+    unsafe { *(e4 as uint32) = tt }
+    lock_edge_count = lock_edge_count + 1
+}
+
+// Detect cycles using DFS (simplified)
+@export
+fn check_lock_cycles() -> uint64 {
+    // For each lock, do DFS from it. If we revisit it, cycle found.
+    // Simplified: just check for direct A→B and B→A pairs
+    uint64 i = 0
+    while i < lock_edge_count {
+        uint64 entry_i = lock_edges + i * 16
+        uint32 from_i = 0
+        unsafe { *(entry_i as uint32) -> from_i }
+        uint64 ei4 = entry_i + 4
+        uint32 to_i = 0
+        unsafe { *(ei4 as uint32) -> to_i }
+        // Check if reverse edge exists
+        uint64 j = 0
+        while j < lock_edge_count {
+            if j != i {
+                uint64 entry_j = lock_edges + j * 16
+                uint32 from_j = 0
+                unsafe { *(entry_j as uint32) -> from_j }
+                uint64 ej4 = entry_j + 4
+                uint32 to_j = 0
+                unsafe { *(ej4 as uint32) -> to_j }
+                uint64 wfi = from_i
+                uint64 wfj = from_j
+                uint64 wti = to_i
+                uint64 wtj = to_j
+                if tok_text_eq(wfi, wtj) != 0 && tok_text_eq(wti, wfj) != 0 {
+                    uint64 msg = "lock-cycle: potential deadlock between locks\n"
+                    write(2, msg, 42)
+                    return 1
+                }
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// Capability check
+// ---------------------------------------------------------------------------
+// Verify that functions only use capabilities declared in their module
+
+static uint64 cap_errors = 0
+
+@export
+fn check_caps(uint64 root) {
+    cap_errors = 0
+    // Module-level caps would be declared via @caps annotation on the module
+    // For now, just count how many functions use capabilities without declaring them
+    uint32 child = ast_child(root)
+    uint64 wchild = child
+    while wchild != 0 {
+        uint32 ck = ast_kind(wchild)
+        if ck == 2 {
+            uint32 fn_tok = ast_data1(wchild)
+            uint64 fn_caps = ann_lookup(fn_tok, 2)
+            // If function has unsafe blocks but no @caps declaration, warn
+            // (simplified check — full version would track specific capabilities)
+        }
+        uint32 nxt = ast_next(wchild)
+        wchild = nxt
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Critical region check
+// ---------------------------------------------------------------------------
+// Rule: no allocation or blocking operations inside critical sections
+// Critical section = between acquire() and release() calls
+
+@export
+fn check_critical_regions(uint64 root) {
+    // Walk each function looking for acquire/release patterns
+    // Flag any alloc/block calls between them
+    uint32 child = ast_child(root)
+    uint64 wchild = child
+    while wchild != 0 {
+        uint32 ck = ast_kind(wchild)
+        if ck == 2 {
+            uint32 body = ast_data3(wchild)
+            uint64 wbody = body
+            if wbody != 0 {
+                check_critical_block(wbody, 0)
+            }
+        }
+        uint32 nxt = ast_next(wchild)
+        wchild = nxt
+    }
+}
+
+fn check_critical_block(uint64 block_node, uint64 in_critical) -> uint64 {
+    uint64 depth = in_critical
+    uint32 child = ast_child(block_node)
+    uint64 wchild = child
+    while wchild != 0 {
+        depth = check_critical_stmt(wchild, depth)
+        uint32 nxt = ast_next(wchild)
+        wchild = nxt
+    }
+    return depth
+}
+
+fn check_critical_stmt(uint64 node, uint64 depth) -> uint64 {
+    uint32 kind = ast_kind(node)
+    if kind == 16 {
+        uint32 expr = ast_child(node)
+        uint64 wexpr = expr
+        uint32 ek = ast_kind(wexpr)
+        if ek == 35 {
+            uint32 callee_tok = ast_data1(wexpr)
+            if tok_matches(callee_tok, "acquire", 7) != 0 {
+                return depth + 1
+            }
+            if tok_matches(callee_tok, "release", 7) != 0 {
+                if depth > 0 { return depth - 1 }
+                return 0
+            }
+            // Check for forbidden ops inside critical section
+            if depth > 0 {
+                if tok_matches(callee_tok, "alloc", 5) != 0 {
+                    uint64 msg = "critical-region: alloc inside critical section\n"
+                    write(2, msg, 48)
+                }
+            }
+        }
+    }
+    return depth
+}
+
+// ---------------------------------------------------------------------------
+// Run all analysis passes
+// ---------------------------------------------------------------------------
+
+@export
+fn run_analysis(uint64 root) -> uint64 {
+    analysis_init()
+    lock_graph_init()
+    check_ctx(root)
+    check_effects(root)
+    check_caps(root)
+    check_critical_regions(root)
+    uint64 cycle = check_lock_cycles()
+    return ctx_errors + eff_errors + cycle
+}
+
+// ---------------------------------------------------------------------------
+// Semantic validation — arg count, missing return, duplicate function checks
+// ---------------------------------------------------------------------------
+
+fn sema_init(uint64 source, uint64 tok_buf) {
+    fn_sig_table = alloc(4096 * 16)
+    fn_sig_count = 0
+    sema_errors = 0
+    sema_source = source
+    sema_tok_buf = tok_buf
+}
+
+// Token helpers that use sema_tok_buf / sema_source
+
+fn sema_tok_text_start(uint64 tok_idx) -> uint64 {
+    uint64 p = sema_tok_buf + tok_idx * 16 + 4
+    uint32 val = 0
+    unsafe { *(p as uint32) -> val }
+    return val
+}
+
+fn sema_tok_text_len(uint64 tok_idx) -> uint64 {
+    uint64 p = sema_tok_buf + tok_idx * 16 + 8
+    uint32 val = 0
+    unsafe { *(p as uint32) -> val }
+    return val
+}
+
+fn sema_tok_line(uint64 tok_idx) -> uint64 {
+    uint64 p = sema_tok_buf + tok_idx * 16 + 12
+    uint32 val = 0
+    unsafe { *(p as uint32) -> val }
+    return val
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostic collection
+// ---------------------------------------------------------------------------
+
+fn diag_init() {
+    if diag_table == 0 {
+        diag_table = alloc(1024 * 8)
+    }
+    diag_count = 0
+    diag_error_count = 0
+    diag_warn_count = 0
+}
+
+// severity: 0 = error, 1 = warning
+fn diag_emit(uint64 tok_idx, uint64 severity, uint64 msg_id) {
+    if diag_count >= 1024 { return }
+    uint64 entry = diag_table + diag_count * 8
+    uint32 ti = tok_idx
+    unsafe { *(entry as uint32) = ti }
+    uint64 e4 = entry + 4
+    uint8 sev = severity
+    unsafe { *(e4 as uint8) = sev }
+    uint64 e5 = entry + 5
+    uint8 mid = msg_id
+    unsafe { *(e5 as uint8) = mid }
+    diag_count = diag_count + 1
+    if severity == 0 { diag_error_count = diag_error_count + 1 }
+    if severity == 1 { diag_warn_count = diag_warn_count + 1 }
+}
+
+fn diag_msg_text(uint64 msg_id) -> uint64 {
+    if msg_id == 1 { return "undefined variable" }
+    if msg_id == 2 { return "type mismatch" }
+    if msg_id == 3 { return "redefinition of variable in same scope" }
+    if msg_id == 4 { return "unused variable (prefix with _ to suppress)" }
+    if msg_id == 5 { return "unreachable code after return/break/exit" }
+    if msg_id == 6 { return "implicit float-to-int conversion (use f64_to_int)" }
+    if msg_id == 7 { return "implicit int-to-float conversion (use int_to_f64)" }
+    if msg_id == 8 { return "narrowing conversion may lose data" }
+    if msg_id == 9 { return "variable used before initialization" }
+    if msg_id == 10 { return "argument type mismatch" }
+    if msg_id == 11 { return "return type mismatch" }
+    if msg_id == 12 { return "binary operation requires matching types" }
+    if msg_id == 13 { return "comparison requires matching types" }
+    return "unknown diagnostic"
+}
+
+@export
+fn diag_report_all() {
+    uint64 i = 0
+    while i < diag_count {
+        uint64 entry = diag_table + i * 8
+        uint32 ti = 0
+        unsafe { *(entry as uint32) -> ti }
+        uint64 wti = ti
+        uint64 e4 = entry + 4
+        uint8 sev = 0
+        unsafe { *(e4 as uint8) -> sev }
+        uint64 wsev = sev
+        uint64 e5 = entry + 5
+        uint8 mid = 0
+        unsafe { *(e5 as uint8) -> mid }
+        uint64 wmid = mid
+        // Use sema_source for token text access
+        uint64 tstart = sema_tok_text_start(wti)
+        uint64 tlen = sema_tok_text_len(wti)
+        // Print file:line from srcmap
+        uint64 file_path = srcmap_file(tstart)
+        if file_path != 0 { write(2, file_path, str_len(file_path)) }
+        write(2, ":", 1)
+        uint8[24] lbuf
+        uint64 tok_line = sema_tok_line(wti)
+        uint64 llen = fmt_uint(lbuf, tok_line)
+        write(2, lbuf, llen)
+        if wsev == 0 { write(2, ": error: ", 9) }
+        if wsev == 1 { write(2, ": warning: ", 11) }
+        uint64 msg = diag_msg_text(wmid)
+        write(2, msg, str_len(msg))
+        // Append variable name for relevant diagnostics
+        if wmid == 1 || wmid == 3 || wmid == 4 || wmid == 9 {
+            write(2, " '", 2)
+            write(2, sema_source + tstart, tlen)
+            write(2, "'", 1)
+        }
+        write(2, "\n", 1)
+        i = i + 1
+    }
+    // Summary line
+    if diag_count > 0 {
+        write(2, "\n", 1)
+        uint8[24] ebuf
+        uint64 elen = fmt_uint(ebuf, diag_error_count)
+        write(2, ebuf, elen)
+        write(2, " error(s), ", 11)
+        uint64 wlen = fmt_uint(ebuf, diag_warn_count)
+        write(2, ebuf, wlen)
+        write(2, " warning(s)\n", 12)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scope stack and variable tracking (F5 Task 2)
+// ---------------------------------------------------------------------------
+
+// Scope stack: stores first_var_idx at each scope depth
+static uint64 sema_scope_stack = 0
+static uint64 sema_scope_depth = 0
+
+// Variable tracking: [name_tok(4), type_id(2), flags(2)] × 4096
+// flags: bit 0 = initialized, bit 1 = used, bit 2 = is_param
+static uint64 sema_var_table_v = 0
+static uint64 sema_var_count_v = 0
+
+fn sema_scope_init() {
+    if sema_scope_stack == 0 { sema_scope_stack = alloc(64 * 8) }
+    if sema_var_table_v == 0 { sema_var_table_v = alloc(4096 * 8) }
+    sema_scope_depth = 0
+    sema_var_count_v = 0
+}
+
+fn sema_scope_push() {
+    if sema_scope_depth >= 64 { return }
+    uint64 entry = sema_scope_stack + sema_scope_depth * 8
+    uint32 vc = sema_var_count_v
+    unsafe { *(entry as uint32) = vc }
+    sema_scope_depth = sema_scope_depth + 1
+}
+
+fn sema_scope_pop() {
+    if sema_scope_depth == 0 { return }
+    sema_scope_depth = sema_scope_depth - 1
+    uint64 entry = sema_scope_stack + sema_scope_depth * 8
+    uint32 first_var = 0
+    unsafe { *(entry as uint32) -> first_var }
+    uint64 wfirst = first_var
+    // Check for unused variables in the popped scope
+    uint64 vi = wfirst
+    while vi < sema_var_count_v {
+        uint64 ve = sema_var_table_v + vi * 8
+        uint32 name_tok = 0
+        unsafe { *(ve as uint32) -> name_tok }
+        uint64 wname = name_tok
+        uint64 flags_addr = ve + 6
+        uint16 flags = 0
+        unsafe { *(flags_addr as uint16) -> flags }
+        uint64 wflags = flags
+        uint64 used = wflags & 2
+        // Check if name starts with '_' — suppress unused warning
+        uint64 starts_underscore = 0
+        uint64 nstart = sema_tok_text_start(wname)
+        uint64 nch = 0
+        uint64 np = sema_source + nstart
+        unsafe { *(np as uint8) -> nch }
+        if nch == 95 { starts_underscore = 1 }  // '_' = 95
+        if used == 0 && starts_underscore == 0 {
+            diag_emit(wname, 1, 4)  // warning: unused variable
+        }
+        vi = vi + 1
+    }
+    sema_var_count_v = wfirst
+}
+
+fn sema_var_declare(uint64 name_tok, uint64 type_id, uint64 is_param) {
+    // Check for redeclaration in current scope
+    if sema_scope_depth > 0 {
+        uint64 scope_entry = sema_scope_stack + (sema_scope_depth - 1) * 8
+        uint32 scope_first = 0
+        unsafe { *(scope_entry as uint32) -> scope_first }
+        uint64 wfirst = scope_first
+        uint64 vi = wfirst
+        while vi < sema_var_count_v {
+            uint64 ve = sema_var_table_v + vi * 8
+            uint32 existing = 0
+            unsafe { *(ve as uint32) -> existing }
+            uint64 we = existing
+            if sema_tok_matches_tok(we, name_tok) != 0 {
+                diag_emit(name_tok, 0, 3)  // error: redefinition
+                return
+            }
+            vi = vi + 1
+        }
+    }
+    // Register new variable
+    if sema_var_count_v >= 4096 { return }
+    uint64 entry = sema_var_table_v + sema_var_count_v * 8
+    uint32 nt = name_tok
+    unsafe { *(entry as uint32) = nt }
+    uint64 tid_addr = entry + 4
+    uint16 tid = type_id
+    unsafe { *(tid_addr as uint16) = tid }
+    uint64 flags_addr = entry + 6
+    uint16 fl = 0
+    if is_param != 0 { fl = 5 }  // bits 0+2 = initialized + is_param
+    unsafe { *(flags_addr as uint16) = fl }
+    sema_var_count_v = sema_var_count_v + 1
+}
+
+fn sema_var_lookup_v(uint64 name_tok) -> uint64 {
+    // Walk backwards through all variables (inner scopes first)
+    uint64 vi = sema_var_count_v
+    while vi > 0 {
+        vi = vi - 1
+        uint64 ve = sema_var_table_v + vi * 8
+        uint32 stored = 0
+        unsafe { *(ve as uint32) -> stored }
+        uint64 ws = stored
+        if sema_tok_matches_tok(ws, name_tok) != 0 {
+            return vi
+        }
+    }
+    return 0xFFFFFFFF
+}
+
+fn sema_var_mark_used(uint64 var_idx) {
+    uint64 flags_addr = sema_var_table_v + var_idx * 8 + 6
+    uint16 flags = 0
+    unsafe { *(flags_addr as uint16) -> flags }
+    uint16 new_flags = flags | 2
+    unsafe { *(flags_addr as uint16) = new_flags }
+}
+
+fn sema_var_mark_init(uint64 var_idx) {
+    uint64 flags_addr = sema_var_table_v + var_idx * 8 + 6
+    uint16 flags = 0
+    unsafe { *(flags_addr as uint16) -> flags }
+    uint16 new_flags = flags | 1
+    unsafe { *(flags_addr as uint16) = new_flags }
+}
+
+fn sema_var_is_init(uint64 var_idx) -> uint64 {
+    uint64 flags_addr = sema_var_table_v + var_idx * 8 + 6
+    uint16 flags = 0
+    unsafe { *(flags_addr as uint16) -> flags }
+    uint64 wf = flags
+    return wf & 1
+}
+
+fn sema_var_type_id(uint64 var_idx) -> uint64 {
+    uint64 tid_addr = sema_var_table_v + var_idx * 8 + 4
+    uint16 tid = 0
+    unsafe { *(tid_addr as uint16) -> tid }
+    return tid
+}
+
+fn sema_tok_matches_tok(uint64 tok_a, uint64 tok_b) -> uint64 {
+    uint64 a_start = sema_tok_text_start(tok_a)
+    uint64 a_len = sema_tok_text_len(tok_a)
+    uint64 b_start = sema_tok_text_start(tok_b)
+    uint64 b_len = sema_tok_text_len(tok_b)
+    if a_len != b_len { return 0 }
+    uint64 i = 0
+    while i < a_len {
+        uint64 pa = sema_source + a_start + i
+        uint64 pb = sema_source + b_start + i
+        uint64 ca = 0
+        uint64 cb = 0
+        unsafe { *(pa as uint8) -> ca }
+        unsafe { *(pb as uint8) -> cb }
+        if ca != cb { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn sema_tok_to_type_id(uint64 tok) -> uint64 {
+    uint64 tk = sema_tok_kind(tok)
+    if tk == 80 || tk == 84 { return 1 }  // u8/uint8
+    if tk == 81 || tk == 85 { return 2 }  // u16/uint16
+    if tk == 82 || tk == 86 { return 3 }  // u32/uint32
+    if tk == 83 || tk == 87 { return 4 }  // u64/uint64
+    if tk == 94 { return 5 }              // f16
+    if tk == 95 { return 6 }              // f32
+    if tk == 96 { return 7 }              // f64
+    // Check if struct name
+    if tk == 1 {
+        uint64 si = struct_lookup(tok)
+        if si != 0xFFFFFFFF { return 64 + si }
+    }
+    return 4  // default u64
+}
+
+fn sema_tok_kind(uint64 tok_idx) -> uint64 {
+    uint64 p = sema_tok_buf + tok_idx * 16
+    uint32 val = 0
+    unsafe { *(p as uint32) -> val }
+    return val
+}
+
+fn sema_tok_matches(uint64 tok_idx, uint64 target, uint64 target_len) -> uint64 {
+    uint64 tlen = sema_tok_text_len(tok_idx)
+    if tlen != target_len { return 0 }
+    uint64 start = sema_tok_text_start(tok_idx)
+    uint64 i = 0
+    while i < tlen {
+        uint64 sp = sema_source + start + i
+        uint64 sc = 0
+        unsafe { *(sp as uint8) -> sc }
+        uint64 kp = target + i
+        uint64 kc = 0
+        unsafe { *(kp as uint8) -> kc }
+        if sc != kc { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+fn sema_tok_text_eq(uint64 tok_a, uint64 tok_b) -> uint64 {
+    uint64 la = sema_tok_text_len(tok_a)
+    uint64 lb = sema_tok_text_len(tok_b)
+    if la != lb { return 0 }
+    uint64 sa = sema_tok_text_start(tok_a)
+    uint64 sb = sema_tok_text_start(tok_b)
+    uint64 i = 0
+    while i < la {
+        uint64 pa = sema_source + sa + i
+        uint64 pb = sema_source + sb + i
+        uint64 ca = 0
+        uint64 cb = 0
+        unsafe { *(pa as uint8) -> ca }
+        unsafe { *(pb as uint8) -> cb }
+        if ca != cb { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// Register a function signature: name_tok, param_count, has_return
+fn fn_sig_register(uint64 name_tok, uint64 param_count, uint64 has_return) {
+    uint64 entry = fn_sig_table + fn_sig_count * 16
+    uint32 nt = name_tok
+    unsafe { *(entry as uint32) = nt }
+    uint64 e4 = entry + 4
+    uint32 pc = param_count
+    unsafe { *(e4 as uint32) = pc }
+    uint64 e8 = entry + 8
+    uint32 hr = has_return
+    unsafe { *(e8 as uint32) = hr }
+    fn_sig_count = fn_sig_count + 1
+}
+
+// Lookup a function signature by name. Returns param_count or 0xFFFFFFFF if not found.
+fn fn_sig_lookup(uint64 name_tok) -> uint64 {
+    uint64 i = 0
+    while i < fn_sig_count {
+        uint64 entry = fn_sig_table + i * 16
+        uint32 stored_tok = 0
+        unsafe { *(entry as uint32) -> stored_tok }
+        uint64 wst = stored_tok
+        if sema_tok_text_eq(wst, name_tok) != 0 {
+            uint64 e4 = entry + 4
+            uint32 pc = 0
+            unsafe { *(e4 as uint32) -> pc }
+            return pc
+        }
+        i = i + 1
+    }
+    return 0xFFFFFFFF
+}
+
+// Collect function signatures from top-level AST
+fn sema_collect_signatures(uint64 root) {
+    uint32 child = ast_child(root)
+    uint64 wchild = child
+    while wchild != 0 {
+        uint32 ck = ast_kind(wchild)
+        if ck == 2 {
+            // FnDecl: count params
+            uint32 name_tok = ast_data1(wchild)
+            uint64 wname = name_tok
+            uint64 param_count = 0
+            uint32 pchild = ast_child(wchild)
+            uint64 wpchild = pchild
+            while wpchild != 0 {
+                uint32 pk = ast_kind(wpchild)
+                if pk == 3 {
+                    param_count = param_count + 1
+                    // Slice params take 2 positions: ptr + len
+                    uint32 pflag_sp = ast_data4(wpchild)
+                    uint64 wpflag_sp = pflag_sp
+                    if wpflag_sp == 1 { param_count = param_count + 1 }
+                }
+                uint32 pnxt = ast_next(wpchild)
+                wpchild = pnxt
+            }
+            // Check for duplicate. A duplicate is fine when both decls
+            // are @dynamic extern (data4 flag bits 3 + 5 set, i.e. 0x28)
+            // — happens with the --target=amdgpu-native HIP-via-KFD
+            // shim path where std/kfd.mlr declares puts/exit/write/etc.
+            // and a launcher file (legitimately, pre-shim) re-declares
+            // them locally. Both declarations name the same dlopen
+            // symbol so silently dedupe instead of erroring.
+            uint64 existing = fn_sig_lookup(wname)
+            if existing != 0xFFFFFFFF {
+                uint32 cur_flags = ast_data4(wchild)
+                uint64 wcur_flags = cur_flags
+                if (wcur_flags & 0x28) == 0x28 {
+                    // Skip the duplicate @dynamic extern declaration.
+                } else {
+                    report_error_at(wname, "redefinition of function")
+                    sema_errors = sema_errors + 1
+                }
+            } else {
+                uint32 ret_tok = ast_data2(wchild)
+                uint64 has_return = 0
+                if ret_tok != 0 { has_return = 1 }
+                fn_sig_register(wname, param_count, has_return)
+            }
+        }
+        uint32 nxt = ast_next(wchild)
+        wchild = nxt
+    }
+}
+
+// Check if a token refers to a builtin function
+fn is_builtin(uint64 tok_idx) -> uint64 {
+    if sema_tok_matches(tok_idx, "exit", 4) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "print", 5) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "println", 7) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "alloc", 5) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "dealloc", 7) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "write", 5) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "memcpy", 6) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "memset", 6) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "str_len", 7) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "str_eq", 6) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "file_open", 9) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "file_read", 9) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "file_write", 10) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "file_close", 10) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "file_size", 9) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "call_ptr", 8) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "fn_addr", 7) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "bit_get", 7) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "bit_set", 7) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "bit_clear", 9) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "bit_range", 9) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "bit_insert", 10) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "signed_lt", 9) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "signed_gt", 9) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "signed_le", 9) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "signed_ge", 9) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "get_target_os", 13) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "get_arch_id", 11) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "time_ns", 7) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "isb", 3) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "dsb", 3) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "dmb", 3) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "dcache_flush", 12) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "icache_invalidate", 17) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "exec_process", 12) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "exec_process_argv", 17) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "set_executable", 14) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "atomic_load", 11) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "atomic_store", 12) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "atomic_cas", 10) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "atomic_add", 10) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "atomic_sub", 10) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "atomic_and", 10) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "atomic_or", 9) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "atomic_xor", 10) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "get_module_path", 15) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "fmt_uint", 8) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "asm", 3) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "syscall_raw", 11) != 0 { return 1 }
+    // String output (null-terminated, variable pointer safe)
+    if sema_tok_matches(tok_idx, "print_str", 9) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "println_str", 11) != 0 { return 1 }
+    // Easy pointer loads — zero-extended
+    if sema_tok_matches(tok_idx, "load8", 5) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "load16", 6) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "load32", 6) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "load64", 6) != 0 { return 1 }
+    // Easy pointer stores
+    if sema_tok_matches(tok_idx, "store8", 6) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "store16", 7) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "store32", 7) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "store64", 7) != 0 { return 1 }
+    // Volatile loads — with memory barrier
+    if sema_tok_matches(tok_idx, "vload8", 6) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "vload16", 7) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "vload32", 7) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "vload64", 7) != 0 { return 1 }
+    // Volatile stores — with memory barrier
+    if sema_tok_matches(tok_idx, "vstore8", 7) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "vstore16", 8) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "vstore32", 8) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "vstore64", 8) != 0 { return 1 }
+    // GPU mega-kernel cross-WG barrier intrinsic.
+    // mega_barrier(counter_ptr, phase_idx, wg_persist) -> void
+    // Lowered by the AMDGPU emitter to the validated global_atomic_add_u32
+    // + spin-loop ISA sequence.  Not a real function call; no IR_CALL emitted.
+    if sema_tok_matches(tok_idx, "mega_barrier", 12) != 0 { return 1 }
+    return 0
+}
+
+// Return expected argument count for a builtin, or 0xFFFFFFFF for variable-arg builtins
+fn builtin_arg_count(uint64 tok_idx) -> uint64 {
+    // 1-arg builtins
+    if sema_tok_matches(tok_idx, "exit", 4) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "print", 5) != 0 { return 0xFFFFFFFF }
+    if sema_tok_matches(tok_idx, "println", 7) != 0 { return 0xFFFFFFFF }
+    if sema_tok_matches(tok_idx, "print_str", 9) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "println_str", 11) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "load8", 5) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "load16", 6) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "load32", 6) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "load64", 6) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "vload8", 6) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "vload16", 7) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "vload32", 7) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "vload64", 7) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "alloc", 5) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "dealloc", 7) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "str_len", 7) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "file_close", 10) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "file_size", 9) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "fn_addr", 7) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "exec_process", 12) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "set_executable", 14) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "atomic_load", 11) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "dcache_flush", 12) != 0 { return 1 }
+    if sema_tok_matches(tok_idx, "icache_invalidate", 17) != 0 { return 1 }
+    // 2-arg builtins
+    if sema_tok_matches(tok_idx, "exec_process_argv", 17) != 0 { return 2 }
+    if sema_tok_matches(tok_idx, "store8", 6) != 0 { return 2 }
+    if sema_tok_matches(tok_idx, "store16", 7) != 0 { return 2 }
+    if sema_tok_matches(tok_idx, "store32", 7) != 0 { return 2 }
+    if sema_tok_matches(tok_idx, "store64", 7) != 0 { return 2 }
+    if sema_tok_matches(tok_idx, "vstore8", 7) != 0 { return 2 }
+    if sema_tok_matches(tok_idx, "vstore16", 8) != 0 { return 2 }
+    if sema_tok_matches(tok_idx, "vstore32", 8) != 0 { return 2 }
+    if sema_tok_matches(tok_idx, "vstore64", 8) != 0 { return 2 }
+    if sema_tok_matches(tok_idx, "str_eq", 6) != 0 { return 2 }
+    if sema_tok_matches(tok_idx, "file_open", 9) != 0 { return 2 }
+    if sema_tok_matches(tok_idx, "bit_get", 7) != 0 { return 2 }
+    if sema_tok_matches(tok_idx, "bit_set", 7) != 0 { return 2 }
+    if sema_tok_matches(tok_idx, "bit_clear", 9) != 0 { return 2 }
+    if sema_tok_matches(tok_idx, "signed_lt", 9) != 0 { return 2 }
+    if sema_tok_matches(tok_idx, "signed_gt", 9) != 0 { return 2 }
+    if sema_tok_matches(tok_idx, "signed_le", 9) != 0 { return 2 }
+    if sema_tok_matches(tok_idx, "signed_ge", 9) != 0 { return 2 }
+    if sema_tok_matches(tok_idx, "get_module_path", 15) != 0 { return 2 }
+    if sema_tok_matches(tok_idx, "fmt_uint", 8) != 0 { return 2 }
+    if sema_tok_matches(tok_idx, "atomic_store", 12) != 0 { return 2 }
+    if sema_tok_matches(tok_idx, "atomic_add", 10) != 0 { return 2 }
+    if sema_tok_matches(tok_idx, "atomic_sub", 10) != 0 { return 2 }
+    if sema_tok_matches(tok_idx, "atomic_and", 10) != 0 { return 2 }
+    if sema_tok_matches(tok_idx, "atomic_or", 9) != 0 { return 2 }
+    if sema_tok_matches(tok_idx, "atomic_xor", 10) != 0 { return 2 }
+    // 3-arg builtins
+    if sema_tok_matches(tok_idx, "write", 5) != 0 { return 3 }
+    if sema_tok_matches(tok_idx, "memcpy", 6) != 0 { return 3 }
+    if sema_tok_matches(tok_idx, "memset", 6) != 0 { return 3 }
+    if sema_tok_matches(tok_idx, "file_read", 9) != 0 { return 3 }
+    if sema_tok_matches(tok_idx, "file_write", 10) != 0 { return 3 }
+    if sema_tok_matches(tok_idx, "bit_range", 9) != 0 { return 3 }
+    if sema_tok_matches(tok_idx, "atomic_cas", 10) != 0 { return 3 }
+    if sema_tok_matches(tok_idx, "mega_barrier", 12) != 0 { return 3 }
+    // 4-arg builtins
+    if sema_tok_matches(tok_idx, "bit_insert", 10) != 0 { return 4 }
+    // 7-arg builtins
+    if sema_tok_matches(tok_idx, "syscall_raw", 11) != 0 { return 7 }
+    // 0-arg builtins
+    if sema_tok_matches(tok_idx, "get_target_os", 13) != 0 { return 0 }
+    if sema_tok_matches(tok_idx, "get_arch_id", 11) != 0 { return 0 }
+    if sema_tok_matches(tok_idx, "time_ns", 7) != 0 { return 0 }
+    if sema_tok_matches(tok_idx, "isb", 3) != 0 { return 0 }
+    if sema_tok_matches(tok_idx, "dsb", 3) != 0 { return 0 }
+    if sema_tok_matches(tok_idx, "dmb", 3) != 0 { return 0 }
+    // Variable-arg builtins — skip checking
+    if sema_tok_matches(tok_idx, "call_ptr", 8) != 0 { return 0xFFFFFFFF }
+    if sema_tok_matches(tok_idx, "asm", 3) != 0 { return 0xFFFFFFFF }
+    return 0xFFFFFFFF
+}
+
+// Recursively check expressions for call argument count mismatches
+fn sema_check_expr(uint64 node) {
+    if node == 0 { return }
+    uint32 kind = ast_kind(node)
+
+    if kind == 35 {
+        // Call node: data1=callee_tok, child=first_arg
+        uint32 callee_tok = ast_data1(node)
+        uint64 wcallee = callee_tok
+        if is_builtin(wcallee) != 0 {
+            uint64 bexpected = builtin_arg_count(wcallee)
+            if bexpected != 0xFFFFFFFF {
+                // Count actual args
+                uint64 bactual = 0
+                uint32 barg = ast_child(node)
+                uint64 wbarg = barg
+                while wbarg != 0 {
+                    bactual = bactual + 1
+                    uint32 banxt = ast_next(wbarg)
+                    wbarg = banxt
+                }
+                if bactual != bexpected {
+                    report_error_at(wcallee, "wrong number of arguments to builtin")
+                    sema_errors = sema_errors + 1
+                }
+            }
+        } else {
+            uint64 expected = fn_sig_lookup(wcallee)
+            if expected != 0xFFFFFFFF {
+                // Count actual args
+                uint64 actual = 0
+                uint32 arg = ast_child(node)
+                uint64 warg = arg
+                while warg != 0 {
+                    actual = actual + 1
+                    uint32 anxt = ast_next(warg)
+                    warg = anxt
+                }
+                if actual != expected {
+                    report_error_at(wcallee, "wrong number of arguments")
+                    sema_errors = sema_errors + 1
+                }
+            }
+        }
+        // Recurse into call arguments
+        uint32 arg2 = ast_child(node)
+        uint64 warg2 = arg2
+        while warg2 != 0 {
+            sema_check_expr(warg2)
+            uint32 anxt2 = ast_next(warg2)
+            warg2 = anxt2
+        }
+        return
+    }
+
+    // BinOp: child=lhs, data2=rhs_idx
+    if kind == 33 {
+        uint32 lhs = ast_child(node)
+        uint64 wlhs = lhs
+        sema_check_expr(wlhs)
+        uint32 rhs = ast_data2(node)
+        uint64 wrhs = rhs
+        sema_check_expr(wrhs)
+        return
+    }
+
+    // Compare: child=lhs, data2=rhs_idx
+    if kind == 38 {
+        uint32 lhs = ast_child(node)
+        uint64 wlhs = lhs
+        sema_check_expr(wlhs)
+        uint32 rhs = ast_data2(node)
+        uint64 wrhs = rhs
+        sema_check_expr(wrhs)
+        return
+    }
+
+    // UnaryOp: child=operand
+    if kind == 34 {
+        uint32 operand = ast_child(node)
+        uint64 wop = operand
+        sema_check_expr(wop)
+        return
+    }
+
+    // LogicalAnd: child=lhs, data2=rhs_idx (data1=op_tok)
+    if kind == 39 {
+        uint32 lhs = ast_child(node)
+        uint64 wlhs = lhs
+        sema_check_expr(wlhs)
+        uint32 rhs = ast_data2(node)
+        uint64 wrhs = rhs
+        sema_check_expr(wrhs)
+        return
+    }
+
+    // LogicalOr: child=lhs, data2=rhs_idx (data1=op_tok)
+    if kind == 40 {
+        uint32 lhs = ast_child(node)
+        uint64 wlhs = lhs
+        sema_check_expr(wlhs)
+        uint32 rhs = ast_data2(node)
+        uint64 wrhs = rhs
+        sema_check_expr(wrhs)
+        return
+    }
+
+    // Index: child=index_expr (data1=ident_tok)
+    if kind == 37 {
+        uint32 arr_ident_tok = ast_data1(node)
+        uint64 warr_tok = arr_ident_tok
+        uint64 arr_vi = sema_var_lookup_v(warr_tok)
+        if arr_vi != 0xFFFFFFFF { sema_var_mark_used(arr_vi) }
+        uint32 idx_expr = ast_child(node)
+        uint64 widx = idx_expr
+        sema_check_expr(widx)
+        return
+    }
+
+    // Ident: a bare variable reference. Mark the variable used so the
+    // unused-variable warning knows to skip it when its scope ends.
+    // Also check whether the variable has been written yet — a read of
+    // a never-initialized local is almost always a bug. The check is
+    // conservative (linear source-order scan): a variable is "init"
+    // if it had an initializer OR if any assignment to it was seen
+    // earlier in the walk. Writes inside `if`/`match` branches count
+    // unconditionally — so a read gated on the same condition that
+    // writes the variable won't warn, but `if c { x = 5 } exit(x)`
+    // where the read is outside the branch will also be silent. That
+    // is deliberately looser than a full dataflow analysis — false
+    // positives are worse than false negatives for this warning.
+    if kind == 32 {
+        uint32 id_tok = ast_data1(node)
+        uint64 wid_tok = id_tok
+        uint64 vi = sema_var_lookup_v(wid_tok)
+        if vi != 0xFFFFFFFF {
+            if sema_var_is_init(vi) == 0 {
+                // Name starts with '_' opts out, same as unused-var.
+                uint64 nstart = sema_tok_text_start(wid_tok)
+                uint64 nch = 0
+                uint64 np = sema_source + nstart
+                unsafe { *(np as uint8) -> nch }
+                if nch != 95 {
+                    diag_emit(wid_tok, 1, 9)
+                    // Mark init now so repeated reads don't pile up
+                    // diagnostics for the same variable.
+                    sema_var_mark_init(vi)
+                }
+            }
+            sema_var_mark_used(vi)
+        }
+        return
+    }
+
+    // FieldAccess (36): both EnumName.Field (constant access) and
+    // obj.field on a variable. In the variable case the object token is
+    // the base var; mark it used. Walks the object chain so struct
+    // method calls and nested access (p.inner.x) flow through.
+    if kind == 36 {
+        uint32 fa_obj = ast_child(node)
+        uint64 wfa_obj = fa_obj
+        if wfa_obj != 0 { sema_check_expr(wfa_obj) }
+        uint32 fa_obj_tok = ast_data1(node)
+        uint64 wfa_obj_tok = fa_obj_tok
+        if wfa_obj_tok != 0 {
+            uint64 fi = sema_var_lookup_v(wfa_obj_tok)
+            if fi != 0xFFFFFFFF { sema_var_mark_used(fi) }
+        }
+        return
+    }
+
+    // RangePat (52): match-arm `lo .. hi` / `lo ..= hi`. Walk both
+    // bounds so idents / calls inside them count as used.
+    if kind == 52 {
+        uint32 rp_lo = ast_data1(node)
+        uint64 wrp_lo = rp_lo
+        if wrp_lo != 0 { sema_check_expr(wrp_lo) }
+        uint32 rp_hi = ast_data2(node)
+        uint64 wrp_hi = rp_hi
+        if wrp_hi != 0 { sema_check_expr(wrp_hi) }
+        return
+    }
+}
+
+// Check a statement for call argument count mismatches
+fn sema_check_stmt(uint64 node) {
+    if node == 0 { return }
+    uint32 kind = ast_kind(node)
+
+    // ExprStmt: child=expr
+    if kind == 16 {
+        uint32 expr = ast_child(node)
+        uint64 wexpr = expr
+        sema_check_expr(wexpr)
+        return
+    }
+
+    // VarDecl: child=init_expr
+    if kind == 10 {
+        uint32 init = ast_child(node)
+        uint64 winit = init
+        // Decode the declared type here so both the init-expression
+        // checks and the later sema_var_declare call can see it.
+        uint32 vd_type_tok_idx = ast_data1(node)
+        uint64 vd_type_tok = vd_type_tok_idx
+        uint64 decl_type_kind = sema_tok_kind(vd_type_tok)
+        if winit != 0 {
+            sema_check_expr(winit)
+            // Strict bool/int separation: check type tag of initializer
+            uint32 type_tok_idx = ast_data1(node)
+            uint64 wtype_tok = type_tok_idx
+            // Get init expression type tag (data4 for IntLit bool-tagged nodes)
+            uint32 init_kind_raw = ast_kind(winit)
+            uint64 winit_kind = init_kind_raw
+            uint64 init_type_tag = 0
+            // IntLit = 30
+            if winit_kind == 30 {
+                uint32 itag = ast_data4(winit)
+                init_type_tag = itag
+            }
+            // Check if init is a BinOp/Cast (as-cast): skip (data4 == 0 means no tag)
+            if decl_type_kind == 98 && init_type_tag != 98 && init_type_tag != 0 {
+                // decl is bool, init is some other typed literal
+                report_error_at(wtype_tok, "type mismatch: expected bool")
+                sema_errors = sema_errors + 1
+            }
+            if decl_type_kind != 98 && init_type_tag == 98 {
+                // decl is non-bool, init is a bool literal
+                report_error_at(wtype_tok, "type mismatch: bool requires explicit cast")
+                sema_errors = sema_errors + 1
+            }
+            // Strict char/int separation (KwChar = 99)
+            if decl_type_kind == 99 && init_type_tag != 99 && init_type_tag != 0 {
+                // decl is char, init is some other typed literal (e.g. bool)
+                report_error_at(wtype_tok, "type mismatch: expected char")
+                sema_errors = sema_errors + 1
+            }
+            if decl_type_kind != 99 && init_type_tag == 99 {
+                // decl is non-char, init is a char literal
+                report_error_at(wtype_tok, "type mismatch: char requires explicit cast")
+                sema_errors = sema_errors + 1
+            }
+            // Literal-overflow warning: if the initializer is an untagged
+            // IntLit (not a bool/char literal) and the declared type is
+            // narrower than u64, warn when the literal doesn't fit. This
+            // catches the classic `u8 b = 300` foot-gun at compile time.
+            if winit_kind == 30 && init_type_tag == 0 {
+                uint32 lit_tok = ast_data1(winit)
+                uint64 wlit_tok = lit_tok
+                uint64 lit_val = parse_int_token(wlit_tok)
+                uint64 limit = 0
+                if decl_type_kind == 80 || decl_type_kind == 84 { limit = 0x100 }
+                if decl_type_kind == 81 || decl_type_kind == 85 { limit = 0x10000 }
+                if decl_type_kind == 82 || decl_type_kind == 86 { limit = 0x100000000 }
+                if limit != 0 && lit_val >= limit {
+                    report_warn_at(wtype_tok, "literal initializer does not fit the declared type (truncated)")
+                }
+            }
+        }
+        // Register the new variable for unused-variable tracking. We
+        // store the declared type's keyword kind (80 = u8, 81 = u16,
+        // 82 = u32, …) so later Assign checks can re-derive the width
+        // without a second AST lookup. If it has an initializer, also
+        // mark it initialized. Params came in pre-declared in
+        // sema_check_functions.
+        uint32 vd_name_tok = ast_data2(node)
+        uint64 wvd_name = vd_name_tok
+        if wvd_name != 0 {
+            sema_var_declare(wvd_name, decl_type_kind, 0)
+            if winit != 0 && sema_var_count_v > 0 {
+                sema_var_mark_init(sema_var_count_v - 1)
+            }
+        }
+        return
+    }
+
+    // Assign: child=value_expr, data1=target_name_tok
+    if kind == 11 {
+        uint32 val = ast_child(node)
+        uint64 wval = val
+        if wval != 0 { sema_check_expr(wval) }
+        uint32 as_target = ast_data1(node)
+        uint64 was_target = as_target
+        if was_target != 0 {
+            uint64 asv = sema_var_lookup_v(was_target)
+            if asv != 0xFFFFFFFF {
+                sema_var_mark_init(asv)
+                // Literal-overflow warning for assignment, same shape as
+                // in VarDecl. Only fires when the RHS is a bare IntLit
+                // and the declared type is narrower than u64.
+                if wval != 0 {
+                    uint32 rhs_kind_raw = ast_kind(wval)
+                    uint64 rhs_kind = rhs_kind_raw
+                    if rhs_kind == 30 {
+                        uint32 rhs_tag = ast_data4(wval)
+                        uint64 rhs_type_tag = rhs_tag
+                        if rhs_type_tag == 0 {
+                            uint32 lit_tok_a = ast_data1(wval)
+                            uint64 wlit_a = lit_tok_a
+                            uint64 lit_val_a = parse_int_token(wlit_a)
+                            uint64 tgt_kind = sema_var_type_id(asv)
+                            uint64 limit_a = 0
+                            if tgt_kind == 80 || tgt_kind == 84 { limit_a = 0x100 }
+                            if tgt_kind == 81 || tgt_kind == 85 { limit_a = 0x10000 }
+                            if tgt_kind == 82 || tgt_kind == 86 { limit_a = 0x100000000 }
+                            if limit_a != 0 && lit_val_a >= limit_a {
+                                report_warn_at(was_target, "literal assignment does not fit the target type (truncated)")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return
+    }
+
+    // Return: child=first_expr, data3=second_expr, data4=third_expr (for 2/3-tuple returns)
+    if kind == 12 {
+        uint32 expr = ast_child(node)
+        uint64 wexpr = expr
+        if wexpr != 0 { sema_check_expr(wexpr) }
+        uint32 second = ast_data3(node)
+        uint64 wsecond = second
+        if wsecond != 0 { sema_check_expr(wsecond) }
+        uint32 third = ast_data4(node)
+        uint64 wthird = third
+        if wthird != 0 { sema_check_expr(wthird) }
+        return
+    }
+
+    // TupleDestruct: (T1 a, T2 b) = rhs_expr — walk the RHS only; the
+    // two LHS slots are fresh declarations handled entirely in codegen.
+    if kind == 44 {
+        uint32 rhs = ast_child(node)
+        uint64 wrhs = rhs
+        if wrhs != 0 { sema_check_expr(wrhs) }
+        return
+    }
+
+    // TupleDestruct3: (T1 a, T2 b, T3 c) = rhs_expr — same as 2-tuple
+    if kind == 47 {
+        uint32 rhs3 = ast_child(node)
+        uint64 wrhs3 = rhs3
+        if wrhs3 != 0 { sema_check_expr(wrhs3) }
+        return
+    }
+
+    // If: child=condition, data1=then_block, data2=else_block
+    if kind == 13 {
+        uint32 cond = ast_child(node)
+        uint64 wcond = cond
+        sema_check_expr(wcond)
+        uint32 then_blk = ast_data1(node)
+        uint64 wthen = then_blk
+        if wthen != 0 { sema_check_block(wthen) }
+        uint32 else_blk = ast_data2(node)
+        uint64 welse = else_blk
+        if welse != 0 {
+            uint32 ek = ast_kind(welse)
+            if ek == 13 {
+                sema_check_stmt(welse)
+            } else {
+                sema_check_block(welse)
+            }
+        }
+        return
+    }
+
+    // While: child=condition, data1=body
+    if kind == 14 {
+        uint32 cond = ast_child(node)
+        uint64 wcond = cond
+        sema_check_expr(wcond)
+        uint32 body = ast_data1(node)
+        uint64 wbody = body
+        if wbody != 0 { sema_check_block(wbody) }
+        return
+    }
+
+    // Block: child=first_stmt
+    if kind == 15 {
+        sema_check_block(node)
+        return
+    }
+
+    // PtrLoad (41): unsafe { *(addr as TYPE) -> dest_var }.
+    // Walk the address expression and mark the destination as
+    // initialized (the unsafe read gives it a value).
+    if kind == 41 {
+        uint32 pl_addr = ast_child(node)
+        uint64 wpl_addr = pl_addr
+        if wpl_addr != 0 { sema_check_expr(wpl_addr) }
+        uint32 pl_dest = ast_data2(node)
+        uint64 wpl_dest = pl_dest
+        if wpl_dest != 0 {
+            uint64 pli = sema_var_lookup_v(wpl_dest)
+            if pli != 0xFFFFFFFF { sema_var_mark_init(pli) }
+        }
+        return
+    }
+
+    // PtrStore (42): unsafe { *(addr as TYPE) = val }.
+    if kind == 42 {
+        uint32 ps_addr = ast_child(node)
+        uint64 wps_addr = ps_addr
+        if wps_addr != 0 { sema_check_expr(wps_addr) }
+        uint32 ps_val = ast_data2(node)
+        uint64 wps_val = ps_val
+        if wps_val != 0 { sema_check_expr(wps_val) }
+        return
+    }
+
+    // Defer (51): walk the body in a nested scope so variables used
+    // only inside the defer are counted as used.
+    if kind == 51 {
+        uint32 def_body = ast_data1(node)
+        uint64 wdef_body = def_body
+        if wdef_body != 0 { sema_check_block(wdef_body) }
+        return
+    }
+
+    // Match: child=scrutinee, data1=first_arm
+    if kind == 19 {
+        uint32 scrut = ast_child(node)
+        uint64 wscrut = scrut
+        sema_check_expr(wscrut)
+        uint32 arm = ast_data1(node)
+        uint64 warm = arm
+        while warm != 0 {
+            uint32 arm_body = ast_data2(warm)
+            uint64 wab = arm_body
+            if wab != 0 { sema_check_block(wab) }
+            uint32 anxt = ast_next(warm)
+            warm = anxt
+        }
+        return
+    }
+}
+
+// Check all statements in a block
+fn sema_check_block(uint64 block_node) {
+    if block_node == 0 { return }
+    sema_scope_push()
+    uint32 child = ast_child(block_node)
+    uint64 wchild = child
+    while wchild != 0 {
+        sema_check_stmt(wchild)
+        uint32 nxt = ast_next(wchild)
+        wchild = nxt
+    }
+    sema_scope_pop()
+}
+
+// Check all functions' bodies for call argument count mismatches
+fn sema_check_functions(uint64 root) {
+    sema_scope_init()
+    uint32 child = ast_child(root)
+    uint64 wchild = child
+    while wchild != 0 {
+        uint32 ck = ast_kind(wchild)
+        if ck == 2 {
+            // Outer per-function scope that holds the parameter bindings.
+            // sema_check_block will push a second, nested scope for the
+            // body itself — that matches C-family "parameters are in the
+            // enclosing scope" semantics and keeps block locals distinct.
+            sema_scope_push()
+            // Declare params as "used already" so they never trigger the
+            // unused-variable warning — callers dictate signatures.
+            uint32 param = ast_child(wchild)
+            uint64 wparam = param
+            while wparam != 0 {
+                uint32 pname_tok = ast_data2(wparam)
+                uint64 wpname = pname_tok
+                sema_var_declare(wpname, 0, 1)
+                if sema_var_count_v > 0 {
+                    sema_var_mark_used(sema_var_count_v - 1)
+                }
+                uint32 pnxt = ast_next(wparam)
+                wparam = pnxt
+            }
+            uint32 body = ast_data3(wchild)
+            uint64 wbody = body
+            if wbody != 0 { sema_check_block(wbody) }
+            sema_scope_pop()
+        }
+        uint32 nxt = ast_next(wchild)
+        wchild = nxt
+    }
+}
+
+// Check if a block ends with a return statement (recursively through if/else)
+fn block_has_return(uint64 block_node) -> uint64 {
+    if block_node == 0 { return 0 }
+    // Find last statement in block
+    uint32 child = ast_child(block_node)
+    uint64 wchild = child
+    uint64 last = 0
+    while wchild != 0 {
+        last = wchild
+        uint32 nxt = ast_next(wchild)
+        wchild = nxt
+    }
+    if last == 0 { return 0 }
+    uint32 lk = ast_kind(last)
+    if lk == 12 { return 1 }
+    if lk == 13 {
+        // If with else: check both branches
+        uint32 then_blk = ast_data1(last)
+        uint64 wthen = then_blk
+        uint32 else_blk = ast_data2(last)
+        uint64 welse = else_blk
+        if welse == 0 { return 0 }
+        uint64 then_ret = block_has_return(wthen)
+        if then_ret == 0 { return 0 }
+        uint32 ek = ast_kind(welse)
+        if ek == 13 {
+            // else-if chain: check recursively as a statement
+            // Wrap in a virtual check: the if-stmt itself must have return
+            uint32 eif_then = ast_data1(welse)
+            uint64 wet = eif_then
+            uint32 eif_else = ast_data2(welse)
+            uint64 wee = eif_else
+            if wee == 0 { return 0 }
+            uint64 et_ret = block_has_return(wet)
+            if et_ret == 0 { return 0 }
+            // Recurse on the else-if's else
+            uint32 eek = ast_kind(wee)
+            if eek == 13 { return block_has_return(wee) }
+            return block_has_return(wee)
+        }
+        return block_has_return(welse)
+    }
+    return 0
+}
+
+// Check that all functions with return types actually return on all paths.
+// Extern functions (no body) are declarations, not definitions — skip them.
+fn sema_check_returns(uint64 root) {
+    uint32 child = ast_child(root)
+    uint64 wchild = child
+    while wchild != 0 {
+        uint32 ck = ast_kind(wchild)
+        if ck == 2 {
+            uint32 ret_tok = ast_data2(wchild)
+            uint32 body = ast_data3(wchild)
+            uint64 wbody = body
+            if ret_tok != 0 && wbody != 0 {
+                if block_has_return(wbody) == 0 {
+                    uint32 name_tok = ast_data1(wchild)
+                    uint64 wname = name_tok
+                    report_error_at(wname, "function with return type may not return a value on all paths")
+                    sema_errors = sema_errors + 1
+                }
+            }
+        }
+        uint32 nxt = ast_next(wchild)
+        wchild = nxt
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unreachable code detection
+// ---------------------------------------------------------------------------
+// Walk each block's statement list. After a return/break/continue/exit(),
+// any subsequent statement is unreachable. Emit warning (severity 1, msg 5)
+// once per block, then stop scanning that block.
+
+fn sema_ur_block(uint64 block_node) {
+    uint64 terminated = 0
+    uint32 child = ast_child(block_node)
+    uint64 wchild = child
+    while wchild != 0 {
+        if terminated != 0 {
+            // This statement is unreachable
+            uint32 ur_tok = ast_tok(wchild)
+            if ur_tok == 0 { ur_tok = ast_data1(wchild) }
+            if ur_tok == 0 { ur_tok = ast_data2(wchild) }
+            uint64 wur = ur_tok
+            if wur != 0 {
+                diag_emit(wur, 1, 5)
+            }
+            // Only warn once per block
+            break
+        }
+        uint32 sk = ast_kind(wchild)
+        uint64 wsk = sk
+        // Check if this statement terminates the block
+        if wsk == 12 { terminated = 1 }
+        if wsk == 17 { terminated = 1 }
+        if wsk == 18 { terminated = 1 }
+        // Check for exit() call: ExprStmt(16) containing Call(35) to "exit"
+        if wsk == 16 {
+            uint32 expr_child = ast_child(wchild)
+            uint32 expr_kind = ast_kind(expr_child)
+            uint64 wek = expr_kind
+            if wek == 35 {
+                uint32 callee = ast_data1(expr_child)
+                uint64 wcallee = callee
+                if sema_tok_matches(wcallee, "exit", 4) != 0 {
+                    terminated = 1
+                }
+            }
+        }
+        // Recurse into sub-blocks (if/else, while, nested blocks)
+        if wsk == 13 {
+            uint32 then_body = ast_data1(wchild)
+            uint64 wthen = then_body
+            if wthen != 0 { sema_ur_block(wthen) }
+            uint32 else_body = ast_data2(wchild)
+            uint64 welse = else_body
+            if welse != 0 { sema_ur_block(welse) }
+        }
+        if wsk == 14 {
+            uint32 while_body = ast_data1(wchild)
+            uint64 wwbody = while_body
+            if wwbody != 0 { sema_ur_block(wwbody) }
+        }
+        if wsk == 15 {
+            sema_ur_block(wchild)
+        }
+        uint32 nxt = ast_next(wchild)
+        wchild = nxt
+    }
+}
+
+fn sema_check_unreachable(uint64 root) {
+    uint32 child = ast_child(root)
+    uint64 wchild = child
+    while wchild != 0 {
+        uint32 ck = ast_kind(wchild)
+        if ck == 2 {
+            uint32 body = ast_data3(wchild)
+            uint64 wbody = body
+            if wbody != 0 {
+                sema_ur_block(wbody)
+            }
+        }
+        uint32 nxt = ast_next(wchild)
+        wchild = nxt
+    }
+}
+
+// Entry point for semantic validation
+@export
+fn run_semantic_checks(uint64 root, uint64 source, uint64 tok_buf) -> uint64 {
+    sema_init(source, tok_buf)
+    diag_init()
+    sema_collect_signatures(root)
+    sema_check_functions(root)
+    sema_check_returns(root)
+    sema_check_unreachable(root)
+    return sema_errors + diag_error_count
+}

@@ -1,0 +1,129 @@
+// pci_bar_probe.mlr — KFD bypass Step 5a sub-1: minimal MMIO probe.
+//
+// Verifies that we can mmap the GPU's MMIO BAR via the sysfs PCI
+// resource interface (no amdgpu unbind, no vfio). On gfx1100 the
+// RX 7800 XT exposes a 1 MiB MMIO BAR at sysfs index 5
+// (BAR0/2 are VRAM aperture + doorbell respectively).
+//
+// Run as root:
+//   sudo /tmp/pci_bar_probe
+//
+// Success signal: the dword dump shows non-0xFFFFFFFF, non-zero
+// values with structure. All-0xFF means the BAR isn't responding.
+// All-zero means the kernel is intercepting reads.
+//
+// This is diagnostic-only — no writes. Reads of unknown register
+// offsets on gfx1100 are documented as safe in the AMD ISA / RAS
+// docs (any register fault returns 0xFFFFFFFF, no fence is taken).
+
+import "../std/sys.mlr"
+import "../std/io.mlr"
+import "../std/fmt.mlr"
+
+// Linux fcntl.h: O_RDONLY = 0
+// sys/mman.h x86_64: PROT_READ = 1, MAP_SHARED = 1
+//                    MAP_FAILED = (void*)-1 = 0xFFFFFFFFFFFFFFFF
+// BAR5 on gfx1100 = 1 MiB MMIO regs (sysfs resource5)
+
+fn print_hex_pad(u64 v, u64 width_chars) {
+    u64 s = fmt_hex(v)
+    u64 slen = str_len(s)
+    // total chars including "0x" prefix already in s
+    // pad with leading zeros between "0x" and value if shorter than width
+    if slen < width_chars + 2 {
+        print_str("0x")
+        u64 pad = (width_chars + 2) - slen
+        while pad > 0 {
+            print_str("0")
+            pad = pad - 1
+        }
+        // print the value part (skip "0x")
+        u64 vp = s + 2
+        print_str(vp)
+    } else {
+        print_str(s)
+    }
+    dealloc(s)
+}
+
+fn main() {
+    u64 path = "/sys/bus/pci/devices/0000:03:00.0/resource5"
+    u64 bar_size = 1048576
+    print_str("[pci_bar_probe] opening "); print_str(path); print_str("\n")
+    u64 fd = sys_open(path, 0, 0)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        print_str("[pci_bar_probe] open failed (errno-region return = ")
+        u64 hs = fmt_hex(fd); print_str(hs); dealloc(hs)
+        print_str(") — need root? try `sudo /tmp/pci_bar_probe`\n")
+        exit(1)
+    }
+    print_str("[pci_bar_probe] open ok fd="); u64 fs = fmt_hex(fd); print_str(fs); dealloc(fs); print_str("\n")
+
+    // mmap PROT_READ MAP_SHARED — full BAR (1 MiB)
+    u64 addr = sys_mmap(0, bar_size, 1, 1, fd, 0)
+    if addr > 0xFFFFFFFFFFFFF000 {
+        print_str("[pci_bar_probe] mmap failed return = ")
+        u64 hs2 = fmt_hex(addr); print_str(hs2); dealloc(hs2); print_str("\n")
+        sys_close(fd)
+        exit(1)
+    }
+    print_str("[pci_bar_probe] mmap ok at va="); u64 fas = fmt_hex(addr); print_str(fas); dealloc(fas); print_str("\n")
+
+    // Dump first 64 dwords (256 bytes) — enough to see structure
+    // without flooding the terminal. If the mapping is healthy we
+    // expect non-0xFF non-0x00 patterns.
+    print_str("[pci_bar_probe] BAR5+0x000 .. +0x0FF dword dump:\n")
+    u64 i = 0
+    while i < 64 {
+        u64 off = i * 4
+        u64 byte_addr = addr + off
+        u32 dword = 0
+        unsafe { *(byte_addr as uint32) -> dword }
+        u64 dval = dword
+        if (i & 0x7) == 0 {
+            print_str("  +")
+            print_hex_pad(off, 4)
+            print_str(":")
+        }
+        print_str(" ")
+        print_hex_pad(dval, 8)
+        if (i & 0x7) == 0x7 { print_str("\n") }
+        i = i + 1
+    }
+
+    // Sanity scan: count how many of the first 4 KiB dwords are
+    // 0xFFFFFFFF (BAR-not-responding) vs 0x00000000 vs other.
+    u64 cnt_ff = 0
+    u64 cnt_00 = 0
+    u64 cnt_other = 0
+    u64 j = 0
+    while j < 1024 {
+        u64 ba = addr + j * 4
+        u32 d = 0
+        unsafe { *(ba as uint32) -> d }
+        u64 dv = d
+        if dv == 0xFFFFFFFF { cnt_ff = cnt_ff + 1 }
+        else { if dv == 0 { cnt_00 = cnt_00 + 1 } else { cnt_other = cnt_other + 1 } }
+        j = j + 1
+    }
+    print_str("[pci_bar_probe] first 4 KiB scan: 0xFFFFFFFF=")
+    u64 ffs = fmt_hex(cnt_ff); print_str(ffs); dealloc(ffs)
+    print_str(" 0x00000000=")
+    u64 zs = fmt_hex(cnt_00); print_str(zs); dealloc(zs)
+    print_str(" other=")
+    u64 os_ = fmt_hex(cnt_other); print_str(os_); dealloc(os_)
+    print_str("\n")
+
+    if cnt_other == 0 {
+        print_str("[pci_bar_probe] WARNING: no structured data found.\n")
+        print_str("[pci_bar_probe]   all-0xFF means BAR is not responding (wrong index? amdgpu didn't init?)\n")
+        print_str("[pci_bar_probe]   all-0x00 means kernel is intercepting reads (CONFIG_STRICT_DEVMEM?)\n")
+    } else {
+        print_str("[pci_bar_probe] SUCCESS: BAR is responding with structured data.\n")
+        print_str("[pci_bar_probe]   ready to add register-level probes (mmGRBM_STATUS, mmCP_HQD_PQ_*, etc.)\n")
+    }
+
+    sys_munmap(addr, bar_size)
+    sys_close(fd)
+    exit(0)
+}

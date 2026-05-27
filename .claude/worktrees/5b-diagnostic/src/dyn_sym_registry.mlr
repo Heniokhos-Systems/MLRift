@@ -1,0 +1,155 @@
+// MLRift -- built on KernRift -- @dynamic symbol registry (compiler-only)
+//
+// Holds the token-keyed name table populated by parser.kr whenever a
+// `@dynamic extern fn` declaration is seen, plus the lookup helper
+// codegen uses to detect @dynamic calls at Call-emission time.
+//
+// This lives in its own file (and not in src/format_elf_dyn.kr) because
+// dyn_sym_lookup calls into codegen's `tok_text_eq`, which depends on
+// the compiler-wide source/tokens globals. format_elf_dyn is reusable
+// from user programs via `import`; it can't reach those globals. By
+// splitting the registry out, user programs importing format_elf_dyn
+// don't accidentally drag in unresolved compiler-internal references.
+
+static uint64 DYN_SYM_MAX     = 256
+static uint64 dyn_sym_tokens  = 0
+static uint64 dyn_sym_count   = 0
+// Per-symbol ABI kind:
+//   0 = integer SysV ABI (default)
+//   1 = libm float, 1-arg-1-return f32 (xmm0 in / xmm0 out)
+//   2 = libm float, 2-arg-1-return f32 (xmm0 + xmm1 in / xmm0 out)
+// Code paths for kinds 1 and 2 in IR Call lowering are unified — both
+// route every arg through xmm0..xmm7 and read the return from xmm0 —
+// but the kind tag preserves the signature shape for future extensions
+// (mixed int + float args, 3-arg float, etc.). dyn_sym_any_libm()
+// returns 1 for any nonzero kind, so libm.so.6 lands in DT_NEEDED for
+// either flavor.
+static uint64 dyn_sym_abis    = 0
+
+fn dyn_sym_init() {
+    if dyn_sym_tokens == 0 {
+        dyn_sym_tokens = alloc(DYN_SYM_MAX * 4)
+    }
+    if dyn_sym_abis == 0 {
+        dyn_sym_abis = alloc(DYN_SYM_MAX)
+    }
+    dyn_sym_count = 0
+}
+
+@export
+fn dyn_sym_register(uint64 name_tok) -> uint64 {
+    if dyn_sym_tokens == 0 { dyn_sym_init() }
+    if dyn_sym_count >= DYN_SYM_MAX {
+        write(2, "dyn_sym_registry: too many @dynamic symbols (>256)\n", 51)
+        exit(1)
+    }
+    uint64 slot = dyn_sym_tokens + dyn_sym_count * 4
+    uint32 nt32 = name_tok
+    unsafe { *(slot as uint32) = nt32 }
+    // Default ABI kind 0 (integer); parser may override via dyn_sym_set_abi.
+    uint8 zero = 0
+    unsafe { *((dyn_sym_abis + dyn_sym_count) as uint8) = zero }
+    uint64 idx = dyn_sym_count
+    dyn_sym_count = dyn_sym_count + 1
+    return idx
+}
+
+// Mark a registered @dynamic symbol as using the libm float ABI
+// (1-arg-1-return f32, args/return in xmm0). Looked up by token text.
+// Returns 1 on success, 0 if the symbol is not registered.
+@export
+fn dyn_sym_set_abi(uint64 name_tok, uint64 kind) -> uint64 {
+    uint64 idx = dyn_sym_lookup(name_tok)
+    if idx == 0xFFFFFFFF { return 0 }
+    if dyn_sym_abis == 0 { return 0 }
+    uint8 k = kind
+    unsafe { *((dyn_sym_abis + idx) as uint8) = k }
+    return 1
+}
+
+@export
+fn dyn_sym_abi_at(uint64 idx) -> uint64 {
+    if dyn_sym_abis == 0 { return 0 }
+    if idx >= dyn_sym_count { return 0 }
+    uint64 v = 0
+    unsafe { *((dyn_sym_abis + idx) as uint8) -> v }
+    return v
+}
+
+// Returns 1 if any registered @dynamic symbol uses a non-integer ABI
+// (i.e., wants libm.so.6 in DT_NEEDED). Driver consults this when
+// building the lib_list at link time.
+@export
+fn dyn_sym_any_libm() -> uint64 {
+    if dyn_sym_abis == 0 { return 0 }
+    uint64 i = 0
+    while i < dyn_sym_count {
+        uint64 v = 0
+        unsafe { *((dyn_sym_abis + i) as uint8) -> v }
+        if v != 0 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+@export
+fn dyn_sym_count_get() -> uint64 {
+    return dyn_sym_count
+}
+
+@export
+fn dyn_sym_tok_at(uint64 idx) -> uint32 {
+    uint64 p = dyn_sym_tokens + idx * 4
+    uint32 v = 0
+    unsafe { *(p as uint32) -> v }
+    return v
+}
+
+// Search for a token by text equivalence (not by numeric token idx).
+// Returns slot_idx if found, 0xFFFFFFFF otherwise. Codegen calls this
+// at Call lowering to detect @dynamic-shadowed callees.
+@export
+fn dyn_sym_lookup(uint64 name_tok) -> uint64 {
+    uint64 i = 0
+    while i < dyn_sym_count {
+        uint64 slot = dyn_sym_tokens + i * 4
+        uint32 stored = 0
+        unsafe { *(slot as uint32) -> stored }
+        uint64 ws = stored
+        if tok_text_eq(ws, name_tok) != 0 { return i }
+        i = i + 1
+    }
+    return 0xFFFFFFFF
+}
+
+// Returns 1 if any registered @dynamic symbol's name starts with "hip"
+// (case-sensitive). Used by the driver to decide whether
+// libamdhip64.so.7 needs to be added as DT_NEEDED alongside libc.
+// A future session may replace this heuristic with a per-symbol library
+// annotation (e.g. `@dynamic("libamdhip64.so.7") extern fn ...`), but
+// for now every real HIP binding starts with "hip" so the prefix test
+// is accurate and zero-config.
+@export
+fn dyn_sym_any_hip_prefix() -> uint64 {
+    uint64 i = 0
+    while i < dyn_sym_count {
+        uint32 tok = dyn_sym_tok_at(i)
+        uint64 wtok = tok
+        uint64 tl = tok_text_len(wtok)
+        if tl >= 3 {
+            uint64 ts = tok_text_start(wtok)
+            uint64 p0 = cg_source + ts
+            uint64 c0 = 0
+            unsafe { *(p0 as uint8) -> c0 }
+            uint64 c1 = 0
+            unsafe { *((p0 + 1) as uint8) -> c1 }
+            uint64 c2 = 0
+            unsafe { *((p0 + 2) as uint8) -> c2 }
+            if c0 == 104 && c1 == 105 && c2 == 112 {
+                return 1
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}

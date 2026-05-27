@@ -1,0 +1,1273 @@
+// bp_wzma_gpu_train_v2 — SP1b Step 4: close-gap training.
+//
+// vs v1 (bp_wzma_gpu_train_native.mlr, 15.8ms/step):
+//   Fwd syncs:  6 → 2  (batch embed1+U1+V1+embed2 → sync2, then U2+V2 batched)
+//   gate_bwd:   CPU 4.1ms → GPU gate_bwd_bs_f32 + gate_bwd_dgrad_f32
+//   AdamW:      CPU 2.7ms → GPU adamw_step_f32
+//   Weights:    U, V, gw, gb, bias live on GPU; only sparse emb has H2D per step.
+//
+// NO hipcc; --target=amdgpu-native; hipkfd_teardown mandatory.
+// Loss within 1e-2 of bench_ref endpoints (3.059341 / 0.000634).
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --emit-amdgpu-transpose-f32=/tmp/transpose_f32.co /tmp/empty.mlr
+//   ./build/mlrc --arch=x86_64 --emit-amdgpu-embedding-lookup-f32=/tmp/embedding_lookup_f32.co /tmp/empty.mlr
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/gemm_f32.mlr          -o /tmp/gemm_f32_native
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/gemm_f32_accum.mlr    -o /tmp/gemm_f32_accum
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/adamw_step_f32.mlr    -o /tmp/adamw_step_f32
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/gate_bwd_bs_f32.mlr   -o /tmp/gate_bwd_bs_f32
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native examples/llm/gate_bwd_dgrad_f32.mlr -o /tmp/gate_bwd_dgrad_f32
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native \
+//       examples/bp_wzma_gpu_train_v2.mlr -o /tmp/bp_wzma_gpu_train_v2
+//
+// Run:
+//   MLRIFT_AQL_CHAIN=1 /tmp/bp_wzma_gpu_train_v2
+
+import "../std/train.mlr"
+import "../std/math_float.mlr"
+import "../std/fmt.mlr"
+import "../std/time.mlr"
+import "../std/hip.mlr"
+
+// =========================================================================
+// Dims (static constants)
+// =========================================================================
+static u64 B_DIM     = 8
+static u64 S_DIM     = 16
+static u64 D_DIM     = 384
+static u64 K_DIM     = 4
+static u64 R_DIM     = 32
+static u64 VOCAB_DIM = 8192
+static u64 BS_DIM    = 128      // B * S
+static u64 N_STEPS   = 50
+
+// =========================================================================
+// Utility
+// =========================================================================
+fn abs_f32(f32 v) -> f32 {
+    if v < 0.0f { return 0.0f - v }
+    return v
+}
+
+fn die_gpu(u64 msg, u64 code) {
+    print_str(msg)
+    print_str(" err=")
+    u64 s = fmt_dec(code); print_str(s); dealloc(s)
+    print_str("\n")
+    hipkfd_teardown()
+    exit(1)
+}
+
+fn load_co(u64 co_path, u64 fn_name) -> u64 {
+    u64 fd = file_open(co_path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        print_str("Cannot open .co: ")
+        print_str(co_path)
+        print_str("\n")
+        hipkfd_teardown(); exit(1)
+    }
+    u64 sz   = file_size(fd)
+    u64 blob = alloc(sz)
+    file_read(fd, blob, sz)
+    file_close(fd)
+
+    u64 mod_slot = alloc(8)
+    u32 err = hipModuleLoadData(mod_slot, blob)
+    if err != 0 { die_gpu("hipModuleLoadData", err) }
+    u64 mod = 0
+    unsafe { *(mod_slot as u64) -> mod }
+
+    u64 fh_slot = alloc(8)
+    err = hipModuleGetFunction(fh_slot, mod, fn_name)
+    if err != 0 { die_gpu("hipModuleGetFunction", err) }
+    u64 fh = 0
+    unsafe { *(fh_slot as u64) -> fh }
+
+    dealloc(mod_slot)
+    dealloc(fh_slot)
+    return fh
+}
+
+// =========================================================================
+// GPU launch helpers
+// =========================================================================
+
+// gemm_f32: C[M,N] = A[M,K_dim] @ B[K_dim,N]  (overwrite)
+fn launch_gemm(u64 fh, u64 d_a, u64 d_b, u64 d_c, u64 m, u64 n, u64 k_dim) {
+    u64 p0 = alloc(8); unsafe { *(p0 as u64) = d_a }
+    u64 p1 = alloc(8); unsafe { *(p1 as u64) = d_b }
+    u64 p2 = alloc(8); unsafe { *(p2 as u64) = d_c }
+    u64 p3 = alloc(8); unsafe { *(p3 as u64) = m }
+    u64 p4 = alloc(8); unsafe { *(p4 as u64) = n }
+    u64 p5 = alloc(8); unsafe { *(p5 as u64) = k_dim }
+    u64 kp = alloc(6 * 8)
+    unsafe { *(kp        as u64) = p0 }
+    unsafe { *((kp +  8) as u64) = p1 }
+    unsafe { *((kp + 16) as u64) = p2 }
+    unsafe { *((kp + 24) as u64) = p3 }
+    unsafe { *((kp + 32) as u64) = p4 }
+    unsafe { *((kp + 40) as u64) = p5 }
+    u64 tiles_m = (m + 15) / 16
+    u64 tiles_n = (n + 15) / 16
+    u64 grid_u  = tiles_m * tiles_n
+    u32 grid    = grid_u
+    u32 block   = 256
+    u32 err = hipModuleLaunchKernel(fh, grid, 1, 1, block, 1, 1, 0, 0, kp, 0)
+    if err != 0 { die_gpu("launch gemm", err) }
+    dealloc(p0); dealloc(p1); dealloc(p2); dealloc(p3); dealloc(p4); dealloc(p5); dealloc(kp)
+}
+
+// gemm_f32_accum: C[M,N] += A[M,K_dim] @ B[K_dim,N]  (accumulate)
+fn launch_gemm_accum(u64 fh, u64 d_a, u64 d_b, u64 d_c, u64 m, u64 n, u64 k_dim) {
+    u64 p0 = alloc(8); unsafe { *(p0 as u64) = d_a }
+    u64 p1 = alloc(8); unsafe { *(p1 as u64) = d_b }
+    u64 p2 = alloc(8); unsafe { *(p2 as u64) = d_c }
+    u64 p3 = alloc(8); unsafe { *(p3 as u64) = m }
+    u64 p4 = alloc(8); unsafe { *(p4 as u64) = n }
+    u64 p5 = alloc(8); unsafe { *(p5 as u64) = k_dim }
+    u64 kp = alloc(6 * 8)
+    unsafe { *(kp        as u64) = p0 }
+    unsafe { *((kp +  8) as u64) = p1 }
+    unsafe { *((kp + 16) as u64) = p2 }
+    unsafe { *((kp + 24) as u64) = p3 }
+    unsafe { *((kp + 32) as u64) = p4 }
+    unsafe { *((kp + 40) as u64) = p5 }
+    u64 tiles_m = (m + 15) / 16
+    u64 tiles_n = (n + 15) / 16
+    u64 grid_u  = tiles_m * tiles_n
+    u32 grid    = grid_u
+    u32 block   = 256
+    u32 err = hipModuleLaunchKernel(fh, grid, 1, 1, block, 1, 1, 0, 0, kp, 0)
+    if err != 0 { die_gpu("launch gemm_accum", err) }
+    dealloc(p0); dealloc(p1); dealloc(p2); dealloc(p3); dealloc(p4); dealloc(p5); dealloc(kp)
+}
+
+// transpose_f32: out[N,M] = in[M,N]^T
+fn launch_transpose(u64 fh, u64 d_in, u64 d_out, u64 m, u64 n) {
+    u64 p0 = alloc(8); unsafe { *(p0 as u64) = d_in }
+    u64 p1 = alloc(8); unsafe { *(p1 as u64) = d_out }
+    u64 p2 = alloc(8); unsafe { *(p2 as u64) = m }
+    u64 p3 = alloc(8); unsafe { *(p3 as u64) = n }
+    u64 kp = alloc(4 * 8)
+    unsafe { *(kp        as u64) = p0 }
+    unsafe { *((kp +  8) as u64) = p1 }
+    unsafe { *((kp + 16) as u64) = p2 }
+    unsafe { *((kp + 24) as u64) = p3 }
+    u64 tiles_m = (m + 15) / 16
+    u64 tiles_n = (n + 15) / 16
+    u32 grid    = tiles_m * tiles_n
+    u32 block   = 256
+    u32 err = hipModuleLaunchKernel(fh, grid, 1, 1, block, 1, 1, 0, 0, kp, 0)
+    if err != 0 { die_gpu("launch transpose", err) }
+    dealloc(p0); dealloc(p1); dealloc(p2); dealloc(p3); dealloc(kp)
+}
+
+// pointwise_mul_f32: out[i] = a[i] * b[i]  for N elements
+fn launch_pointwise_mul(u64 fh, u64 d_a, u64 d_b, u64 d_out, u64 n) {
+    u64 p0 = alloc(8); unsafe { *(p0 as u64) = d_a }
+    u64 p1 = alloc(8); unsafe { *(p1 as u64) = d_b }
+    u64 p2 = alloc(8); unsafe { *(p2 as u64) = d_out }
+    u64 p3 = alloc(8); unsafe { *(p3 as u64) = n }
+    u64 kp = alloc(4 * 8)
+    unsafe { *(kp        as u64) = p0 }
+    unsafe { *((kp +  8) as u64) = p1 }
+    unsafe { *((kp + 16) as u64) = p2 }
+    unsafe { *((kp + 24) as u64) = p3 }
+    u64 grid_u = (n + 255) / 256
+    u32 grid   = grid_u
+    u32 block  = 256
+    u32 err = hipModuleLaunchKernel(fh, grid, 1, 1, block, 1, 1, 0, 0, kp, 0)
+    if err != 0 { die_gpu("launch pointwise_mul", err) }
+    dealloc(p0); dealloc(p1); dealloc(p2); dealloc(p3); dealloc(kp)
+}
+
+// embedding_lookup_f32: out[SEQ, D] = embed[token_ids[SEQ], D]
+fn launch_embed(u64 fh, u64 d_ids, u64 d_emb, u64 d_out, u64 seq, u64 D) {
+    u64 p0 = alloc(8); unsafe { *(p0 as u64) = d_ids }
+    u64 p1 = alloc(8); unsafe { *(p1 as u64) = d_emb }
+    u64 p2 = alloc(8); unsafe { *(p2 as u64) = d_out }
+    u64 p3 = alloc(8); unsafe { *(p3 as u64) = D }
+    u64 kp = alloc(4 * 8)
+    unsafe { *(kp        as u64) = p0 }
+    unsafe { *((kp +  8) as u64) = p1 }
+    unsafe { *((kp + 16) as u64) = p2 }
+    unsafe { *((kp + 24) as u64) = p3 }
+    u32 grid  = seq
+    u32 block = D
+    u32 err = hipModuleLaunchKernel(fh, grid, 1, 1, block, 1, 1, 0, 0, kp, 0)
+    if err != 0 { die_gpu("launch embed", err) }
+    dealloc(p0); dealloc(p1); dealloc(p2); dealloc(p3); dealloc(kp)
+}
+
+// launch_adamw: launches adamw_step_f32 kernel.
+// step is 1-based; computes bias-correction scalars on CPU.
+fn launch_adamw(u64 fh_adamw, u64 d_param, u64 d_grad, u64 d_m, u64 d_v,
+                u64 n, u64 step, f32 lr, f32 beta1, f32 beta2, f32 eps, f32 wd) {
+    // Compute bias correction scalars on CPU
+    f32 b1p = 1.0f
+    f32 b2p = 1.0f
+    u64 t = 0
+    while t < step {
+        b1p = b1p * beta1
+        b2p = b2p * beta2
+        t = t + 1
+    }
+    f32 one = 1.0f
+    f32 inv_bc1  = one / (one - b1p)
+    f32 inv_bc2  = one / (one - b2p)
+    f32 decay    = one - lr * wd
+    f32 one_m_b1 = one - beta1
+    f32 one_m_b2 = one - beta2
+
+    u64 p0  = alloc(8); unsafe { *(p0  as u64) = d_param }
+    u64 p1  = alloc(8); unsafe { *(p1  as u64) = d_grad }
+    u64 p2  = alloc(8); unsafe { *(p2  as u64) = d_m }
+    u64 p3  = alloc(8); unsafe { *(p3  as u64) = d_v }
+    u64 p4  = alloc(8); unsafe { *(p4  as u64) = n }
+    u64 p5  = alloc(8); unsafe { *(p5  as f32) = inv_bc1 }
+    u64 p6  = alloc(8); unsafe { *(p6  as f32) = inv_bc2 }
+    u64 p7  = alloc(8); unsafe { *(p7  as f32) = decay }
+    u64 p8  = alloc(8); unsafe { *(p8  as f32) = beta1 }
+    u64 p9  = alloc(8); unsafe { *(p9  as f32) = beta2 }
+    u64 p10 = alloc(8); unsafe { *(p10 as f32) = one_m_b1 }
+    u64 p11 = alloc(8); unsafe { *(p11 as f32) = one_m_b2 }
+    u64 p12 = alloc(8); unsafe { *(p12 as f32) = lr }
+    u64 p13 = alloc(8); unsafe { *(p13 as f32) = eps }
+    u64 kp = alloc(14 * 8)
+    unsafe { *(kp         as u64) = p0 }
+    unsafe { *((kp +   8) as u64) = p1 }
+    unsafe { *((kp +  16) as u64) = p2 }
+    unsafe { *((kp +  24) as u64) = p3 }
+    unsafe { *((kp +  32) as u64) = p4 }
+    unsafe { *((kp +  40) as u64) = p5 }
+    unsafe { *((kp +  48) as u64) = p6 }
+    unsafe { *((kp +  56) as u64) = p7 }
+    unsafe { *((kp +  64) as u64) = p8 }
+    unsafe { *((kp +  72) as u64) = p9 }
+    unsafe { *((kp +  80) as u64) = p10 }
+    unsafe { *((kp +  88) as u64) = p11 }
+    unsafe { *((kp +  96) as u64) = p12 }
+    unsafe { *((kp + 104) as u64) = p13 }
+    u64 grid_u = (n + 255) / 256
+    u32 grid   = grid_u
+    u32 block  = 256
+    u32 err = hipModuleLaunchKernel(fh_adamw, grid, 1, 1, block, 1, 1, 0, 0, kp, 0)
+    if err != 0 { die_gpu("launch adamw", err) }
+    dealloc(p0);  dealloc(p1);  dealloc(p2);  dealloc(p3);  dealloc(p4)
+    dealloc(p5);  dealloc(p6);  dealloc(p7);  dealloc(p8);  dealloc(p9)
+    dealloc(p10); dealloc(p11); dealloc(p12); dealloc(p13); dealloc(kp)
+}
+
+// launch_gate_bwd_bs: launches gate_bwd_bs_f32 kernel.
+// outk_ptr must be in [BS, K, D] layout.
+fn launch_gate_bwd_bs(u64 fh_gbwd, u64 d_dy, u64 d_x, u64 d_alpha, u64 d_outk_bskd,
+                      u64 d_gw, u64 d_dx_gate, u64 d_dgl,
+                      u64 BS, u64 D, u64 K) {
+    u64 p0 = alloc(8); unsafe { *(p0 as u64) = d_dy }
+    u64 p1 = alloc(8); unsafe { *(p1 as u64) = d_x }
+    u64 p2 = alloc(8); unsafe { *(p2 as u64) = d_alpha }
+    u64 p3 = alloc(8); unsafe { *(p3 as u64) = d_outk_bskd }
+    u64 p4 = alloc(8); unsafe { *(p4 as u64) = d_gw }
+    u64 p5 = alloc(8); unsafe { *(p5 as u64) = d_dx_gate }
+    u64 p6 = alloc(8); unsafe { *(p6 as u64) = d_dgl }
+    u64 p7 = alloc(8); unsafe { *(p7 as u64) = BS }
+    u64 p8 = alloc(8); unsafe { *(p8 as u64) = D }
+    u64 p9 = alloc(8); unsafe { *(p9 as u64) = K }
+    u64 kp = alloc(10 * 8)
+    unsafe { *(kp        as u64) = p0 }; unsafe { *((kp +  8) as u64) = p1 }
+    unsafe { *((kp + 16) as u64) = p2 }; unsafe { *((kp + 24) as u64) = p3 }
+    unsafe { *((kp + 32) as u64) = p4 }; unsafe { *((kp + 40) as u64) = p5 }
+    unsafe { *((kp + 48) as u64) = p6 }; unsafe { *((kp + 56) as u64) = p7 }
+    unsafe { *((kp + 64) as u64) = p8 }; unsafe { *((kp + 72) as u64) = p9 }
+    u32 grid  = BS
+    u32 block = 512    // gate_bwd_bs_f32 is hardcoded for 512-thread blocks with D=384 padded
+    u32 err = hipModuleLaunchKernel(fh_gbwd, grid, 1, 1, block, 1, 1, 0, 0, kp, 0)
+    if err != 0 { die_gpu("launch gate_bwd_bs", err) }
+    dealloc(p0); dealloc(p1); dealloc(p2); dealloc(p3); dealloc(p4)
+    dealloc(p5); dealloc(p6); dealloc(p7); dealloc(p8); dealloc(p9); dealloc(kp)
+}
+
+// launch_gate_bwd_dgrad: launches gate_bwd_dgrad_f32 kernel.
+fn launch_gate_bwd_dgrad(u64 fh_dgrad, u64 d_x, u64 d_dgl, u64 d_dgw, u64 d_dgb,
+                         u64 BS, u64 D, u64 K) {
+    u64 p0 = alloc(8); unsafe { *(p0 as u64) = d_x }
+    u64 p1 = alloc(8); unsafe { *(p1 as u64) = d_dgl }
+    u64 p2 = alloc(8); unsafe { *(p2 as u64) = d_dgw }
+    u64 p3 = alloc(8); unsafe { *(p3 as u64) = d_dgb }
+    u64 p4 = alloc(8); unsafe { *(p4 as u64) = BS }
+    u64 p5 = alloc(8); unsafe { *(p5 as u64) = D }
+    u64 p6 = alloc(8); unsafe { *(p6 as u64) = K }
+    u64 kp = alloc(7 * 8)
+    unsafe { *(kp        as u64) = p0 }; unsafe { *((kp +  8) as u64) = p1 }
+    unsafe { *((kp + 16) as u64) = p2 }; unsafe { *((kp + 24) as u64) = p3 }
+    unsafe { *((kp + 32) as u64) = p4 }; unsafe { *((kp + 40) as u64) = p5 }
+    unsafe { *((kp + 48) as u64) = p6 }
+    u32 grid  = K
+    u32 block = D
+    u32 err = hipModuleLaunchKernel(fh_dgrad, grid, 1, 1, block, 1, 1, 0, 0, kp, 0)
+    if err != 0 { die_gpu("launch gate_bwd_dgrad", err) }
+    dealloc(p0); dealloc(p1); dealloc(p2); dealloc(p3); dealloc(p4); dealloc(p5); dealloc(p6); dealloc(kp)
+}
+
+// =========================================================================
+// CPU helpers (unchanged from base)
+// =========================================================================
+
+fn cpu_gate_logits(u64 x_ptr, u64 gw_ptr, u64 gb_ptr, u64 alpha, u64 BS, u64 D, u64 K) {
+    u64 pos = 0
+    while pos < BS {
+        u64 x_row = x_ptr + pos * D * 4
+        u64 a_row = alpha + pos * K * 4
+        u64 k = 0
+        while k < K {
+            u64 gw_row = gw_ptr + k * D * 4
+            f32 acc = 0.0f
+            u64 d = 0
+            while d < D {
+                f32 xv = 0.0f; f32 gv = 0.0f
+                unsafe { *((x_row  + d * 4) as f32) -> xv }
+                unsafe { *((gw_row + d * 4) as f32) -> gv }
+                acc = acc + xv * gv
+                d = d + 1
+            }
+            f32 bv = 0.0f
+            unsafe { *((gb_ptr + k * 4) as f32) -> bv }
+            acc = acc + bv
+            unsafe { *((a_row + k * 4) as f32) = acc }
+            k = k + 1
+        }
+        softmax_f32_inplace(a_row, K)
+        pos = pos + 1
+    }
+}
+
+fn cpu_wzma_mix(u64 alpha, u64 outk_kbsd, u64 bias_ptr, u64 z_ptr, u64 BS, u64 D, u64 K) {
+    u64 bs = 0
+    while bs < BS {
+        u64 z_row = z_ptr + bs * D * 4
+        u64 d = 0
+        while d < D {
+            f32 bv = 0.0f
+            unsafe { *((bias_ptr + d * 4) as f32) -> bv }
+            f32 acc = bv
+            u64 k = 0
+            while k < K {
+                f32 a = 0.0f
+                unsafe { *((alpha + (bs * K + k) * 4) as f32) -> a }
+                f32 ov = 0.0f
+                unsafe { *((outk_kbsd + (k * BS + bs) * D * 4 + d * 4) as f32) -> ov }
+                acc = acc + a * ov
+                k = k + 1
+            }
+            unsafe { *((z_row + d * 4) as f32) = acc }
+            d = d + 1
+        }
+        bs = bs + 1
+    }
+}
+
+fn cpu_acc_f32(u64 dst, u64 src, u64 N) {
+    u64 i = 0
+    while i < N {
+        f32 a = 0.0f; f32 b = 0.0f
+        unsafe { *((dst + i * 4) as f32) -> a }
+        unsafe { *((src + i * 4) as f32) -> b }
+        unsafe { *((dst + i * 4) as f32) = a + b }
+        i = i + 1
+    }
+}
+
+fn convert_kbsw_to_bskw(u64 src, u64 dst, u64 K, u64 BS, u64 W) {
+    u64 k = 0
+    while k < K {
+        u64 bs = 0
+        while bs < BS {
+            u64 sp = src + (k * BS + bs) * W * 4
+            u64 dp = dst + (bs * K + k) * W * 4
+            memcpy(dp, sp, W * 4)
+            bs = bs + 1
+        }
+        k = k + 1
+    }
+}
+
+fn zero_rows_f32(u64 buf, u64 ids_u64, u64 n_ids, u64 D) {
+    u64 i = 0
+    while i < n_ids {
+        u64 row = 0; unsafe { *((ids_u64 + i * 8) as u64) -> row }
+        u64 row_ptr = buf + row * D * 4
+        memset(row_ptr, 0, D * 4)
+        i = i + 1
+    }
+}
+
+// =========================================================================
+// GPU backward for one view (batched, minimal-sync version — unchanged).
+// =========================================================================
+
+fn gpu_bwd_view_fast(
+    u64 fh_gemm, u64 fh_gemm_accum, u64 fh_transp,
+    u64 d_x,
+    u64 d_xT,
+    u64 d_int_k_arr,
+    u64 d_U,
+    u64 d_V,
+    u64 d_dU,
+    u64 d_dV,
+    u64 h_dz,
+    u64 h_alpha,
+    u64 BS, u64 D, u64 K, u64 R,
+    u64 h_dx,
+    u64 d_dzk_K,
+    u64 d_intk_sc_K,
+    u64 d_intk_T_K,
+    u64 d_VkT_K,
+    u64 d_dinter_K,
+    u64 d_UkT_K,
+    u64 d_dx_kK,
+    u64 h_intk,
+    u64 h_dzk,
+    u64 h_intk_sc
+) {
+    u32 err = 0
+
+    // ── Phase 1: CPU-side prep ─────────────────────────────────────────────
+    u64 k = 0
+    while k < K {
+        u64 d_intk = 0; unsafe { *((d_int_k_arr + k * 8) as u64) -> d_intk }
+        u64 d_dzk_k     = d_dzk_K    + k * BS * D * 4
+        u64 d_intk_sc_k = d_intk_sc_K + k * BS * R * 4
+
+        err = hipMemcpy(h_intk, d_intk, BS * R * 4, 2)
+        if err != 0 { die_gpu("D2H intk", err) }
+
+        u64 h_alphak = alloc(BS * 4)
+        u64 bi = 0
+        while bi < BS {
+            f32 a = 0.0f
+            unsafe { *((h_alpha + (bi * K + k) * 4) as f32) -> a }
+            unsafe { *((h_alphak + bi * 4) as f32) = a }
+            bi = bi + 1
+        }
+        // cpu_scale_rows inline
+        u64 bs_s = 0
+        while bs_s < BS {
+            f32 s = 0.0f
+            unsafe { *((h_alphak + bs_s * 4) as f32) -> s }
+            u64 in_row  = h_dz  + bs_s * D * 4
+            u64 out_row = h_dzk + bs_s * D * 4
+            u64 d_s = 0
+            while d_s < D {
+                f32 v = 0.0f
+                unsafe { *((in_row + d_s * 4) as f32) -> v }
+                unsafe { *((out_row + d_s * 4) as f32) = v * s }
+                d_s = d_s + 1
+            }
+            bs_s = bs_s + 1
+        }
+        // cpu_scale_rows_r inline
+        u64 bs_r = 0
+        while bs_r < BS {
+            f32 s = 0.0f
+            unsafe { *((h_alphak + bs_r * 4) as f32) -> s }
+            u64 in_row  = h_intk    + bs_r * R * 4
+            u64 out_row = h_intk_sc + bs_r * R * 4
+            u64 r = 0
+            while r < R {
+                f32 v = 0.0f
+                unsafe { *((in_row + r * 4) as f32) -> v }
+                unsafe { *((out_row + r * 4) as f32) = v * s }
+                r = r + 1
+            }
+            bs_r = bs_r + 1
+        }
+        dealloc(h_alphak)
+
+        err = hipMemcpy(d_dzk_k,     h_dzk,    BS * D * 4, 1)
+        if err != 0 { die_gpu("H2D dzk_k", err) }
+        err = hipMemcpy(d_intk_sc_k, h_intk_sc, BS * R * 4, 1)
+        if err != 0 { die_gpu("H2D intk_sc_k", err) }
+
+        k = k + 1
+    }
+
+    // ── Phase 2: GPU burst ─────────────────────────────────────────────────
+    launch_transpose(fh_transp, d_x, d_xT, BS, D)
+
+    k = 0
+    while k < K {
+        u64 d_Uk  = d_U + k * D * R * 4
+        u64 d_Vk  = d_V + k * R * D * 4
+        u64 d_dUk = d_dU + k * D * R * 4
+        u64 d_dVk = d_dV + k * R * D * 4
+
+        u64 d_dzk     = d_dzk_K    + k * BS * D * 4
+        u64 d_intk_sc = d_intk_sc_K + k * BS * R * 4
+        u64 d_intk_T  = d_intk_T_K  + k * R  * BS * 4
+        u64 d_VkT     = d_VkT_K     + k * D  * R  * 4
+        u64 d_dinter  = d_dinter_K  + k * BS * R  * 4
+        u64 d_UkT     = d_UkT_K     + k * R  * D  * 4
+        u64 d_dx_k    = d_dx_kK     + k * BS * D  * 4
+
+        launch_transpose(fh_transp, d_intk_sc, d_intk_T, BS, R)
+        launch_gemm_accum(fh_gemm_accum, d_intk_T, d_dzk, d_dVk, R, D, BS)
+        launch_transpose(fh_transp, d_Vk, d_VkT, R, D)
+        launch_gemm(fh_gemm, d_dzk, d_VkT, d_dinter, BS, R, D)
+        launch_gemm_accum(fh_gemm_accum, d_xT, d_dinter, d_dUk, D, R, BS)
+        launch_transpose(fh_transp, d_Uk, d_UkT, D, R)
+        launch_gemm(fh_gemm, d_dinter, d_UkT, d_dx_k, BS, D, R)
+
+        k = k + 1
+    }
+
+    // ── Phase 3: ONE sync ──────────────────────────────────────────────────
+    err = hipDeviceSynchronize()
+    if err != 0 { die_gpu("sync bwd_view_fast", err) }
+
+    // ── Phase 4: D2H all K dx_k contributions, accumulate into h_dx ───────
+    u64 h_dx_k_tmp = alloc(BS * D * 4)
+    k = 0
+    while k < K {
+        u64 d_dx_k = d_dx_kK + k * BS * D * 4
+        err = hipMemcpy(h_dx_k_tmp, d_dx_k, BS * D * 4, 2)
+        if err != 0 { die_gpu("D2H dx_k", err) }
+        cpu_acc_f32(h_dx, h_dx_k_tmp, BS * D)
+        k = k + 1
+    }
+    dealloc(h_dx_k_tmp)
+}
+
+// =========================================================================
+// main
+// =========================================================================
+fn main() {
+    u64 B     = B_DIM
+    u64 S     = S_DIM
+    u64 D     = D_DIM
+    u64 K     = K_DIM
+    u64 R     = R_DIM
+    u64 VOCAB = VOCAB_DIM
+    u64 BS    = BS_DIM
+    u64 STEPS = N_STEPS
+
+    print_str("=== bp_wzma_gpu_train_v2: fwd-2sync + GPU-AdamW + GPU-gate_bwd ===\n")
+    print_str("B=8 S=16 D=384 K=4 R=32 vocab=8192, 50 steps\n")
+
+    u32 err = hipSetDevice(0)
+    if err != 0 {
+        print_str("hipSetDevice failed\n")
+        exit(1)
+    }
+
+    // Load kernels
+    print_str("Loading kernels...\n")
+    u64 fh_embed        = load_co("/tmp/embedding_lookup_f32.co", "embedding_lookup_f32")
+    u64 fh_gemm         = load_co("/tmp/gemm_f32_native.co",      "gemm_f32")
+    u64 fh_gemm_accum   = load_co("/tmp/gemm_f32_accum.co",       "gemm_f32_accum")
+    u64 fh_transp       = load_co("/tmp/transpose_f32.co",         "transpose_f32")
+    u64 fh_adamw        = load_co("/tmp/adamw_step_f32.co",        "adamw_step_f32")
+    u64 fh_gbwd_bs      = load_co("/tmp/gate_bwd_bs_f32.co",       "gate_bwd_bs_f32")
+    u64 fh_gbwd_dgrad   = load_co("/tmp/gate_bwd_dgrad_f32.co",    "gate_bwd_dgrad_f32")
+    print_str("Kernels: embed, gemm_f32, gemm_f32_accum, transpose_f32, adamw_step_f32, gate_bwd_bs_f32, gate_bwd_dgrad_f32\n")
+
+    // CPU weight buffers (emb on CPU for sparse AdamW; gw/gb/bias CPU-side for gate_logits)
+    u64 emb_ptr  = alloc(VOCAB * D * 4)
+    u64 U_ptr    = alloc(K * D * R * 4)
+    u64 V_ptr    = alloc(K * R * D * 4)
+    u64 gw_ptr   = alloc(K * D * 4)
+    u64 gb_ptr   = alloc(K * 4)
+    u64 bias_ptr = alloc(D * 4)
+
+    // Read bench_init.bin
+    u64 bin_path = "/home/pantelis/Desktop/Projects/Work/MLRiftBench/tools/bench_init.bin"
+    u64 fd = file_open(bin_path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        print_str("Cannot open bench_init.bin\n")
+        hipkfd_teardown(); exit(1)
+    }
+    file_read(fd, emb_ptr,  VOCAB * D * 4)
+    file_read(fd, U_ptr,    K * D * R * 4)
+    file_read(fd, V_ptr,    K * R * D * 4)
+    file_read(fd, gw_ptr,   K * D * 4)
+    file_read(fd, gb_ptr,   K * 4)
+    file_read(fd, bias_ptr, D * 4)
+
+    u64 ids1_i32 = alloc(BS * 4)
+    u64 ids2_i32 = alloc(BS * 4)
+    file_read(fd, ids1_i32, BS * 4)
+    file_read(fd, ids2_i32, BS * 4)
+    file_close(fd)
+
+    // Expand ids to u64 for CPU embed_bwd
+    u64 ids1_u64 = alloc(BS * 8)
+    u64 ids2_u64 = alloc(BS * 8)
+    u64 ii = 0
+    while ii < BS {
+        u64 a1 = ids1_i32 + ii * 4
+        u64 b0 = 0; u64 b1 = 0; u64 b2 = 0; u64 b3 = 0
+        unsafe { *(a1 as u8) -> b0 }
+        unsafe { *((a1 + 1) as u8) -> b1 }
+        unsafe { *((a1 + 2) as u8) -> b2 }
+        unsafe { *((a1 + 3) as u8) -> b3 }
+        u64 id1 = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+        unsafe { *((ids1_u64 + ii * 8) as u64) = id1 }
+
+        u64 a2 = ids2_i32 + ii * 4
+        u64 c0 = 0; u64 c1 = 0; u64 c2 = 0; u64 c3 = 0
+        unsafe { *(a2 as u8) -> c0 }
+        unsafe { *((a2 + 1) as u8) -> c1 }
+        unsafe { *((a2 + 2) as u8) -> c2 }
+        unsafe { *((a2 + 3) as u8) -> c3 }
+        u64 id2 = c0 | (c1 << 8) | (c2 << 16) | (c3 << 24)
+        unsafe { *((ids2_u64 + ii * 8) as u64) = id2 }
+        ii = ii + 1
+    }
+    print_str("Weights loaded from bench_init.bin.\n")
+
+    // Upload weights to GPU (persistent)
+    u64 d_emb  = 0; u64 d_U   = 0; u64 d_V    = 0
+    u64 d_gw   = 0; u64 d_gb  = 0; u64 d_bias  = 0
+    u64 d_ids1 = 0; u64 d_ids2 = 0
+    u64 slot
+
+    slot = alloc(8); err = hipMalloc(slot, VOCAB * D * 4); if err != 0 { die_gpu("mEmb",  err) }; unsafe { *(slot as u64) -> d_emb  }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, K * D * R * 4); if err != 0 { die_gpu("mU",    err) }; unsafe { *(slot as u64) -> d_U    }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, K * R * D * 4); if err != 0 { die_gpu("mV",    err) }; unsafe { *(slot as u64) -> d_V    }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, K * D * 4);     if err != 0 { die_gpu("mGW",   err) }; unsafe { *(slot as u64) -> d_gw   }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, K * 4);         if err != 0 { die_gpu("mGB",   err) }; unsafe { *(slot as u64) -> d_gb   }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, D * 4);         if err != 0 { die_gpu("mBias", err) }; unsafe { *(slot as u64) -> d_bias }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, BS * 4);        if err != 0 { die_gpu("mIds1", err) }; unsafe { *(slot as u64) -> d_ids1 }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, BS * 4);        if err != 0 { die_gpu("mIds2", err) }; unsafe { *(slot as u64) -> d_ids2 }; dealloc(slot)
+
+    err = hipMemcpy(d_emb,  emb_ptr,  VOCAB * D * 4, 1); if err != 0 { die_gpu("H2D emb",  err) }
+    err = hipMemcpy(d_U,    U_ptr,    K * D * R * 4, 1); if err != 0 { die_gpu("H2D U",    err) }
+    err = hipMemcpy(d_V,    V_ptr,    K * R * D * 4, 1); if err != 0 { die_gpu("H2D V",    err) }
+    err = hipMemcpy(d_gw,   gw_ptr,   K * D * 4,     1); if err != 0 { die_gpu("H2D gw",   err) }
+    err = hipMemcpy(d_gb,   gb_ptr,   K * 4,         1); if err != 0 { die_gpu("H2D gb",   err) }
+    err = hipMemcpy(d_bias, bias_ptr, D * 4,         1); if err != 0 { die_gpu("H2D bias", err) }
+    err = hipMemcpy(d_ids1, ids1_i32, BS * 4,        1); if err != 0 { die_gpu("H2D ids1", err) }
+    err = hipMemcpy(d_ids2, ids2_i32, BS * 4,        1); if err != 0 { die_gpu("H2D ids2", err) }
+    print_str("Weights on GPU.\n")
+
+    // CPU moment buffers for embedding (sparse AdamW stays on CPU)
+    u64 m_emb  = alloc(VOCAB * D * 4)
+    u64 v_emb  = alloc(VOCAB * D * 4)
+
+    // ── Persistent GPU scratch (forward) ──────────────────────────────────
+    u64 d_x1 = 0; u64 d_x2 = 0
+    slot = alloc(8); err = hipMallocGTT(slot, BS * D * 4); if err != 0 { die_gpu("mX1", err) }; unsafe { *(slot as u64) -> d_x1 }; dealloc(slot)
+    slot = alloc(8); err = hipMallocGTT(slot, BS * D * 4); if err != 0 { die_gpu("mX2", err) }; unsafe { *(slot as u64) -> d_x2 }; dealloc(slot)
+
+    u64 d_otk1_0 = 0; u64 d_otk1_1 = 0; u64 d_otk1_2 = 0; u64 d_otk1_3 = 0
+    u64 d_otk2_0 = 0; u64 d_otk2_1 = 0; u64 d_otk2_2 = 0; u64 d_otk2_3 = 0
+    slot = alloc(8); err = hipMallocGTT(slot, BS * D * 4); if err != 0 { die_gpu("mO10", err) }; unsafe { *(slot as u64) -> d_otk1_0 }; dealloc(slot)
+    slot = alloc(8); err = hipMallocGTT(slot, BS * D * 4); if err != 0 { die_gpu("mO11", err) }; unsafe { *(slot as u64) -> d_otk1_1 }; dealloc(slot)
+    slot = alloc(8); err = hipMallocGTT(slot, BS * D * 4); if err != 0 { die_gpu("mO12", err) }; unsafe { *(slot as u64) -> d_otk1_2 }; dealloc(slot)
+    slot = alloc(8); err = hipMallocGTT(slot, BS * D * 4); if err != 0 { die_gpu("mO13", err) }; unsafe { *(slot as u64) -> d_otk1_3 }; dealloc(slot)
+    slot = alloc(8); err = hipMallocGTT(slot, BS * D * 4); if err != 0 { die_gpu("mO20", err) }; unsafe { *(slot as u64) -> d_otk2_0 }; dealloc(slot)
+    slot = alloc(8); err = hipMallocGTT(slot, BS * D * 4); if err != 0 { die_gpu("mO21", err) }; unsafe { *(slot as u64) -> d_otk2_1 }; dealloc(slot)
+    slot = alloc(8); err = hipMallocGTT(slot, BS * D * 4); if err != 0 { die_gpu("mO22", err) }; unsafe { *(slot as u64) -> d_otk2_2 }; dealloc(slot)
+    slot = alloc(8); err = hipMallocGTT(slot, BS * D * 4); if err != 0 { die_gpu("mO23", err) }; unsafe { *(slot as u64) -> d_otk2_3 }; dealloc(slot)
+
+    u64 d_int1_0 = 0; u64 d_int1_1 = 0; u64 d_int1_2 = 0; u64 d_int1_3 = 0
+    u64 d_int2_0 = 0; u64 d_int2_1 = 0; u64 d_int2_2 = 0; u64 d_int2_3 = 0
+    slot = alloc(8); err = hipMallocGTT(slot, BS * R * 4); if err != 0 { die_gpu("mI10", err) }; unsafe { *(slot as u64) -> d_int1_0 }; dealloc(slot)
+    slot = alloc(8); err = hipMallocGTT(slot, BS * R * 4); if err != 0 { die_gpu("mI11", err) }; unsafe { *(slot as u64) -> d_int1_1 }; dealloc(slot)
+    slot = alloc(8); err = hipMallocGTT(slot, BS * R * 4); if err != 0 { die_gpu("mI12", err) }; unsafe { *(slot as u64) -> d_int1_2 }; dealloc(slot)
+    slot = alloc(8); err = hipMallocGTT(slot, BS * R * 4); if err != 0 { die_gpu("mI13", err) }; unsafe { *(slot as u64) -> d_int1_3 }; dealloc(slot)
+    slot = alloc(8); err = hipMallocGTT(slot, BS * R * 4); if err != 0 { die_gpu("mI20", err) }; unsafe { *(slot as u64) -> d_int2_0 }; dealloc(slot)
+    slot = alloc(8); err = hipMallocGTT(slot, BS * R * 4); if err != 0 { die_gpu("mI21", err) }; unsafe { *(slot as u64) -> d_int2_1 }; dealloc(slot)
+    slot = alloc(8); err = hipMallocGTT(slot, BS * R * 4); if err != 0 { die_gpu("mI22", err) }; unsafe { *(slot as u64) -> d_int2_2 }; dealloc(slot)
+    slot = alloc(8); err = hipMallocGTT(slot, BS * R * 4); if err != 0 { die_gpu("mI23", err) }; unsafe { *(slot as u64) -> d_int2_3 }; dealloc(slot)
+
+    // Backward GPU scratch — UV backward
+    u64 d_xT        = 0
+    u64 d_dU        = 0
+    u64 d_dV        = 0
+    u64 d_dzk_K     = 0
+    u64 d_intk_sc_K = 0
+    u64 d_intk_T_K  = 0
+    u64 d_VkT_K     = 0
+    u64 d_dinter_K  = 0
+    u64 d_UkT_K     = 0
+    u64 d_dx_kK     = 0
+    slot = alloc(8); err = hipMalloc(slot, D * BS * 4);        if err != 0 { die_gpu("mXT",     err) }; unsafe { *(slot as u64) -> d_xT        }; dealloc(slot)
+    slot = alloc(8); err = hipMallocGTT(slot, K * D * R * 4);  if err != 0 { die_gpu("mDU",     err) }; unsafe { *(slot as u64) -> d_dU        }; dealloc(slot)
+    slot = alloc(8); err = hipMallocGTT(slot, K * R * D * 4);  if err != 0 { die_gpu("mDV",     err) }; unsafe { *(slot as u64) -> d_dV        }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, K * BS * D * 4);    if err != 0 { die_gpu("mDZKK",   err) }; unsafe { *(slot as u64) -> d_dzk_K     }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, K * BS * R * 4);    if err != 0 { die_gpu("mIKSK",   err) }; unsafe { *(slot as u64) -> d_intk_sc_K }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, K * R * BS * 4);    if err != 0 { die_gpu("mIKTK",   err) }; unsafe { *(slot as u64) -> d_intk_T_K  }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, K * D * R * 4);     if err != 0 { die_gpu("mVKTK",   err) }; unsafe { *(slot as u64) -> d_VkT_K     }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, K * BS * R * 4);    if err != 0 { die_gpu("mDINTK",  err) }; unsafe { *(slot as u64) -> d_dinter_K  }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, K * R * D * 4);     if err != 0 { die_gpu("mUKTK",   err) }; unsafe { *(slot as u64) -> d_UkT_K     }; dealloc(slot)
+    slot = alloc(8); err = hipMallocGTT(slot, K * BS * D * 4); if err != 0 { die_gpu("mDXKK",   err) }; unsafe { *(slot as u64) -> d_dx_kK     }; dealloc(slot)
+
+    // GPU AdamW moment buffers for U, V, gw, gb, bias (GPU-resident)
+    u64 d_m_U    = 0; u64 d_v_U    = 0
+    u64 d_m_V    = 0; u64 d_v_V    = 0
+    u64 d_m_gw   = 0; u64 d_v_gw   = 0
+    u64 d_m_gb   = 0; u64 d_v_gb   = 0
+    u64 d_m_bias = 0; u64 d_v_bias = 0
+    slot = alloc(8); err = hipMalloc(slot, K * D * R * 4); if err != 0 { die_gpu("mMU",   err) }; unsafe { *(slot as u64) -> d_m_U    }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, K * D * R * 4); if err != 0 { die_gpu("mVU",   err) }; unsafe { *(slot as u64) -> d_v_U    }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, K * R * D * 4); if err != 0 { die_gpu("mMV",   err) }; unsafe { *(slot as u64) -> d_m_V    }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, K * R * D * 4); if err != 0 { die_gpu("mVV",   err) }; unsafe { *(slot as u64) -> d_v_V    }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, K * D * 4);     if err != 0 { die_gpu("mMGW",  err) }; unsafe { *(slot as u64) -> d_m_gw   }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, K * D * 4);     if err != 0 { die_gpu("mVGW",  err) }; unsafe { *(slot as u64) -> d_v_gw   }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, K * 4);         if err != 0 { die_gpu("mMGB",  err) }; unsafe { *(slot as u64) -> d_m_gb   }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, K * 4);         if err != 0 { die_gpu("mVGB",  err) }; unsafe { *(slot as u64) -> d_v_gb   }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, D * 4);         if err != 0 { die_gpu("mMB",   err) }; unsafe { *(slot as u64) -> d_m_bias }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, D * 4);         if err != 0 { die_gpu("mVB",   err) }; unsafe { *(slot as u64) -> d_v_bias }; dealloc(slot)
+
+    // Gate backward GPU buffers
+    u64 d_dgl1     = 0; u64 d_dgl2     = 0
+    u64 d_dx_gate1 = 0; u64 d_dx_gate2 = 0
+    u64 d_dgw      = 0; u64 d_dgb      = 0; u64 d_dbias_gpu = 0
+    slot = alloc(8); err = hipMalloc(slot, BS * K * 4);    if err != 0 { die_gpu("mDGL1",  err) }; unsafe { *(slot as u64) -> d_dgl1     }; dealloc(slot)
+    slot = alloc(8); err = hipMalloc(slot, BS * K * 4);    if err != 0 { die_gpu("mDGL2",  err) }; unsafe { *(slot as u64) -> d_dgl2     }; dealloc(slot)
+    slot = alloc(8); err = hipMallocGTT(slot, BS * D * 4); if err != 0 { die_gpu("mDXG1",  err) }; unsafe { *(slot as u64) -> d_dx_gate1 }; dealloc(slot)
+    slot = alloc(8); err = hipMallocGTT(slot, BS * D * 4); if err != 0 { die_gpu("mDXG2",  err) }; unsafe { *(slot as u64) -> d_dx_gate2 }; dealloc(slot)
+    slot = alloc(8); err = hipMallocGTT(slot, K * D * 4);  if err != 0 { die_gpu("mDGW",   err) }; unsafe { *(slot as u64) -> d_dgw      }; dealloc(slot)
+    slot = alloc(8); err = hipMallocGTT(slot, K * 4);      if err != 0 { die_gpu("mDGB",   err) }; unsafe { *(slot as u64) -> d_dgb      }; dealloc(slot)
+    slot = alloc(8); err = hipMallocGTT(slot, D * 4);      if err != 0 { die_gpu("mDBIAS", err) }; unsafe { *(slot as u64) -> d_dbias_gpu }; dealloc(slot)
+
+    // outk in [BS,K,D] layout on GPU for gate_bwd
+    u64 d_outk1_bskd = 0; u64 d_outk2_bskd = 0
+    slot = alloc(8); err = hipMallocGTT(slot, BS * K * D * 4); if err != 0 { die_gpu("mO1BSKD", err) }; unsafe { *(slot as u64) -> d_outk1_bskd }; dealloc(slot)
+    slot = alloc(8); err = hipMallocGTT(slot, BS * K * D * 4); if err != 0 { die_gpu("mO2BSKD", err) }; unsafe { *(slot as u64) -> d_outk2_bskd }; dealloc(slot)
+
+    // dz GTT buffers — persistent (avoids hipMallocGTT per step)
+    u64 d_dz1 = 0; u64 d_dz2 = 0
+    slot = alloc(8); err = hipMallocGTT(slot, BS * D * 4); if err != 0 { die_gpu("mDZ1", err) }; unsafe { *(slot as u64) -> d_dz1 }; dealloc(slot)
+    slot = alloc(8); err = hipMallocGTT(slot, BS * D * 4); if err != 0 { die_gpu("mDZ2", err) }; unsafe { *(slot as u64) -> d_dz2 }; dealloc(slot)
+
+    // Alpha GPU buffers (CPU computes gate_logits, then H2D alpha to GPU for gate_bwd)
+    u64 d_alpha1 = 0; u64 d_alpha2 = 0
+    slot = alloc(8); err = hipMallocGTT(slot, BS * K * 4); if err != 0 { die_gpu("mA1", err) }; unsafe { *(slot as u64) -> d_alpha1 }; dealloc(slot)
+    slot = alloc(8); err = hipMallocGTT(slot, BS * K * 4); if err != 0 { die_gpu("mA2", err) }; unsafe { *(slot as u64) -> d_alpha2 }; dealloc(slot)
+
+    // Zero buffer for GPU grad reset
+    u64 h_zero_grad = alloc(K * D * R * 4)
+
+    // Zero-init GPU moment buffers
+    err = hipMemcpy(d_m_U,    h_zero_grad, K * D * R * 4, 1); if err != 0 { die_gpu("zero mU",    err) }
+    err = hipMemcpy(d_v_U,    h_zero_grad, K * D * R * 4, 1); if err != 0 { die_gpu("zero vU",    err) }
+    err = hipMemcpy(d_m_V,    h_zero_grad, K * R * D * 4, 1); if err != 0 { die_gpu("zero mV",    err) }
+    err = hipMemcpy(d_v_V,    h_zero_grad, K * R * D * 4, 1); if err != 0 { die_gpu("zero vV",    err) }
+    err = hipMemcpy(d_m_gw,   h_zero_grad, K * D * 4,     1); if err != 0 { die_gpu("zero mgw",   err) }
+    err = hipMemcpy(d_v_gw,   h_zero_grad, K * D * 4,     1); if err != 0 { die_gpu("zero vgw",   err) }
+    err = hipMemcpy(d_m_gb,   h_zero_grad, K * 4,         1); if err != 0 { die_gpu("zero mgb",   err) }
+    err = hipMemcpy(d_v_gb,   h_zero_grad, K * 4,         1); if err != 0 { die_gpu("zero vgb",   err) }
+    err = hipMemcpy(d_m_bias, h_zero_grad, D * 4,         1); if err != 0 { die_gpu("zero mbias", err) }
+    err = hipMemcpy(d_v_bias, h_zero_grad, D * 4,         1); if err != 0 { die_gpu("zero vbias", err) }
+
+    // CPU scratch
+    u64 h_alpha1     = alloc(BS * K * 4)
+    u64 h_alpha2     = alloc(BS * K * 4)
+    u64 h_x1         = 0
+    u64 h_x2         = 0
+    u64 h_outk1_kbsd = alloc(K * BS * D * 4)
+    u64 h_outk2_kbsd = alloc(K * BS * D * 4)
+    u64 h_outk1_bskd = alloc(BS * K * D * 4)
+    u64 h_outk2_bskd = alloc(BS * K * D * 4)
+    u64 h_z1         = alloc(BS * D * 4)
+    u64 h_z2         = alloc(BS * D * 4)
+    u64 h_q1         = alloc(B * D * 4)
+    u64 h_q2         = alloc(B * D * 4)
+    u64 h_norms1     = alloc(B * 4)
+    u64 h_norms2     = alloc(B * 4)
+    u64 h_demb       = alloc(VOCAB * D * 4)
+    u64 h_dx1        = alloc(BS * D * 4)
+    u64 h_dx2        = alloc(BS * D * 4)
+    // CPU scratch for gpu_bwd_view_fast phase 1
+    u64 h_intk    = alloc(BS * R * 4)
+    u64 h_dzk     = alloc(BS * D * 4)
+    u64 h_intk_sc = alloc(BS * R * 4)
+
+    // AdamW hyperparams
+    f32 lr    = 0.001f
+    f32 beta1 = 0.9f
+    f32 beta2 = 0.999f
+    f32 eps   = 1e-8f
+    f32 wd    = 0.01f
+    f32 tau   = 0.1f
+
+    print_str("Starting 50 training steps (GPU AdamW + GPU gate_bwd + 2-sync fwd)...\n")
+
+    u64 t0_total = time_now()
+    u64 step_sum_ns = 0
+    f32 first_loss  = 0.0f
+    f32 last_loss   = 0.0f
+
+    // Per-phase timing accumulators
+    u64 t_acc_fwd      = 0
+    u64 t_acc_d2h_out  = 0
+    u64 t_acc_cpu_loss = 0
+    u64 t_acc_zero     = 0
+    u64 t_acc_cpu_bwd  = 0
+    u64 t_acc_gpu_bwd  = 0
+    u64 t_acc_gate_bwd = 0
+    u64 t_acc_adamw    = 0
+    u64 t_acc_emb_upd  = 0
+
+    u64 step = 0
+    while step < STEPS {
+        u64 t_step0 = time_now()
+        u64 t_ph0   = t_step0
+
+        // ── FORWARD SYNC 1: embed1 only ────────────────────────────────
+        // Must sync after embed1 to get h_x1 for cpu_gate_logits.
+        launch_embed(fh_embed, d_ids1, d_emb, d_x1, BS, D)
+        err = hipDeviceSynchronize()
+        if err != 0 { die_gpu("sync embed1", err) }
+
+        h_x1 = dev_host_ptr(d_x1)
+        cpu_gate_logits(h_x1, gw_ptr, gb_ptr, h_alpha1, BS, D, K)
+        // H2D alpha1 for GPU gate_bwd (small: BS*K*4 = 2 KB)
+        err = hipMemcpy(d_alpha1, h_alpha1, BS * K * 4, 1)
+        if err != 0 { die_gpu("H2D alpha1", err) }
+
+        // ── BATCH: U1×K, V1×K, embed2 — no intermediate syncs ──────────
+        u64 d_int1_arr = alloc(K * 8)
+        unsafe { *(d_int1_arr        as u64) = d_int1_0 }
+        unsafe { *((d_int1_arr +  8) as u64) = d_int1_1 }
+        unsafe { *((d_int1_arr + 16) as u64) = d_int1_2 }
+        unsafe { *((d_int1_arr + 24) as u64) = d_int1_3 }
+        u64 ka = 0
+        while ka < K {
+            u64 d_Uk   = d_U + ka * D * R * 4
+            u64 d_intk = 0; unsafe { *((d_int1_arr + ka * 8) as u64) -> d_intk }
+            launch_gemm(fh_gemm, d_x1, d_Uk, d_intk, BS, R, D)
+            ka = ka + 1
+        }
+
+        u64 d_otk1_arr = alloc(K * 8)
+        unsafe { *(d_otk1_arr        as u64) = d_otk1_0 }
+        unsafe { *((d_otk1_arr +  8) as u64) = d_otk1_1 }
+        unsafe { *((d_otk1_arr + 16) as u64) = d_otk1_2 }
+        unsafe { *((d_otk1_arr + 24) as u64) = d_otk1_3 }
+        u64 kb = 0
+        while kb < K {
+            u64 d_Vk   = d_V + kb * R * D * 4
+            u64 d_intk = 0; unsafe { *((d_int1_arr  + kb * 8) as u64) -> d_intk }
+            u64 d_otkk = 0; unsafe { *((d_otk1_arr  + kb * 8) as u64) -> d_otkk }
+            launch_gemm(fh_gemm, d_intk, d_Vk, d_otkk, BS, D, R)
+            kb = kb + 1
+        }
+
+        // embed2 in same batch (no sync)
+        launch_embed(fh_embed, d_ids2, d_emb, d_x2, BS, D)
+
+        // ── FORWARD SYNC 2: flush U1+V1+embed2 ─────────────────────────
+        err = hipDeviceSynchronize()
+        if err != 0 { die_gpu("sync fwd2", err) }
+
+        h_x2 = dev_host_ptr(d_x2)
+        cpu_gate_logits(h_x2, gw_ptr, gb_ptr, h_alpha2, BS, D, K)
+        err = hipMemcpy(d_alpha2, h_alpha2, BS * K * 4, 1)
+        if err != 0 { die_gpu("H2D alpha2", err) }
+
+        // ── BATCH: U2×K, V2×K — no sync yet ────────────────────────────
+        u64 d_int2_arr = alloc(K * 8)
+        unsafe { *(d_int2_arr        as u64) = d_int2_0 }
+        unsafe { *((d_int2_arr +  8) as u64) = d_int2_1 }
+        unsafe { *((d_int2_arr + 16) as u64) = d_int2_2 }
+        unsafe { *((d_int2_arr + 24) as u64) = d_int2_3 }
+        u64 kc = 0
+        while kc < K {
+            u64 d_Uk   = d_U + kc * D * R * 4
+            u64 d_intk = 0; unsafe { *((d_int2_arr + kc * 8) as u64) -> d_intk }
+            launch_gemm(fh_gemm, d_x2, d_Uk, d_intk, BS, R, D)
+            kc = kc + 1
+        }
+
+        u64 d_otk2_arr = alloc(K * 8)
+        unsafe { *(d_otk2_arr        as u64) = d_otk2_0 }
+        unsafe { *((d_otk2_arr +  8) as u64) = d_otk2_1 }
+        unsafe { *((d_otk2_arr + 16) as u64) = d_otk2_2 }
+        unsafe { *((d_otk2_arr + 24) as u64) = d_otk2_3 }
+        u64 kd = 0
+        while kd < K {
+            u64 d_Vk   = d_V + kd * R * D * 4
+            u64 d_intk = 0; unsafe { *((d_int2_arr  + kd * 8) as u64) -> d_intk }
+            u64 d_otkk = 0; unsafe { *((d_otk2_arr  + kd * 8) as u64) -> d_otkk }
+            launch_gemm(fh_gemm, d_intk, d_Vk, d_otkk, BS, D, R)
+            kd = kd + 1
+        }
+
+        u64 t_ph1 = time_now()
+        if step >= 1 { t_acc_fwd = t_acc_fwd + (t_ph1 - t_ph0) }
+
+        // ── D2H outk for CPU mix/pool/loss ─────────────────────────────
+        // d_otk1/2 are GTT (system RAM); GTT hipMemcpy kind=2 is a plain CPU
+        // memcpy with NO GPU fence.  Must sync before touching them.
+        err = hipDeviceSynchronize()
+        if err != 0 { die_gpu("sync fwd_v2_complete", err) }
+        u64 ke = 0
+        while ke < K {
+            u64 dk1o = 0; unsafe { *((d_otk1_arr + ke * 8) as u64) -> dk1o }
+            u64 dk2o = 0; unsafe { *((d_otk2_arr + ke * 8) as u64) -> dk2o }
+            err = hipMemcpy(h_outk1_kbsd + ke * BS * D * 4, dk1o, BS * D * 4, 2)
+            if err != 0 { die_gpu("D2H otk1", err) }
+            err = hipMemcpy(h_outk2_kbsd + ke * BS * D * 4, dk2o, BS * D * 4, 2)
+            if err != 0 { die_gpu("D2H otk2", err) }
+            ke = ke + 1
+        }
+        dealloc(d_otk1_arr); dealloc(d_otk2_arr)
+
+        u64 t_ph2 = time_now()
+        if step >= 1 { t_acc_d2h_out = t_acc_d2h_out + (t_ph2 - t_ph1) }
+
+        // ── CPU: mix + pool + norm + loss ───────────────────────────────
+        cpu_wzma_mix(h_alpha1, h_outk1_kbsd, bias_ptr, h_z1, BS, D, K)
+        cpu_wzma_mix(h_alpha2, h_outk2_kbsd, bias_ptr, h_z2, BS, D, K)
+        mean_pool_s_f32(h_z1, h_q1, B, S, D)
+        mean_pool_s_f32(h_z2, h_q2, B, S, D)
+        l2_normalize_f32_save(h_q1, B, D, h_norms1)
+        l2_normalize_f32_save(h_q2, B, D, h_norms2)
+        f32 loss = infonce_f32(h_q1, h_q2, tau, B, D)
+
+        if step == 0 { first_loss = loss }
+        last_loss = loss
+
+        u64 t_ph3 = time_now()
+        if step >= 1 { t_acc_cpu_loss = t_acc_cpu_loss + (t_ph3 - t_ph2) }
+
+        // ── ZERO GPU gradient accumulators (dU, dV via H2D from zeroed CPU buf) ──
+        err = hipMemcpy(d_dU, h_zero_grad, K * D * R * 4, 1)
+        if err != 0 { die_gpu("zero dU", err) }
+        err = hipMemcpy(d_dV, h_zero_grad, K * R * D * 4, 1)
+        if err != 0 { die_gpu("zero dV", err) }
+
+        u64 t_ph3b = time_now()
+        if step >= 1 { t_acc_zero = t_acc_zero + (t_ph3b - t_ph3) }
+
+        // ── CPU: backward from loss to dz1, dz2 ────────────────────────
+        u64 h_dq1 = alloc(B * D * 4)
+        u64 h_dq2 = alloc(B * D * 4)
+        u64 h_dp1 = alloc(B * D * 4)
+        u64 h_dp2 = alloc(B * D * 4)
+        u64 h_dz1 = alloc(BS * D * 4)
+        u64 h_dz2 = alloc(BS * D * 4)
+        infonce_bwd(h_q1, h_q2, tau, B, D, h_dq1, h_dq2)
+        l2norm_bwd(h_dq1, h_q1, h_norms1, B, D, h_dp1)
+        l2norm_bwd(h_dq2, h_q2, h_norms2, B, D, h_dp2)
+        meanpool_bwd(h_dp1, B, S, D, h_dz1)
+        meanpool_bwd(h_dp2, B, S, D, h_dz2)
+        dealloc(h_dq1); dealloc(h_dq2)
+        dealloc(h_dp1); dealloc(h_dp2)
+
+        u64 t_ph4 = time_now()
+        if step >= 1 { t_acc_cpu_bwd = t_acc_cpu_bwd + (t_ph4 - t_ph3b) }
+
+        // ── ZERO CPU embed grad ─────────────────────────────────────────
+        zero_rows_f32(h_demb, ids1_u64, BS, D)
+        zero_rows_f32(h_demb, ids2_u64, BS, D)
+        memset(h_dx1, 0, BS * D * 4)
+        memset(h_dx2, 0, BS * D * 4)
+
+        // ── GPU BACKWARD VIEW 1 (batched: all K, one sync inside) ──────
+        gpu_bwd_view_fast(
+            fh_gemm, fh_gemm_accum, fh_transp,
+            d_x1, d_xT,
+            d_int1_arr,
+            d_U, d_V, d_dU, d_dV,
+            h_dz1, h_alpha1,
+            BS, D, K, R,
+            h_dx1,
+            d_dzk_K, d_intk_sc_K, d_intk_T_K, d_VkT_K,
+            d_dinter_K, d_UkT_K, d_dx_kK,
+            h_intk, h_dzk, h_intk_sc
+        )
+
+        // ── GPU BACKWARD VIEW 2 (batched: all K, one sync inside) ──────
+        gpu_bwd_view_fast(
+            fh_gemm, fh_gemm_accum, fh_transp,
+            d_x2, d_xT,
+            d_int2_arr,
+            d_U, d_V, d_dU, d_dV,
+            h_dz2, h_alpha2,
+            BS, D, K, R,
+            h_dx2,
+            d_dzk_K, d_intk_sc_K, d_intk_T_K, d_VkT_K,
+            d_dinter_K, d_UkT_K, d_dx_kK,
+            h_intk, h_dzk, h_intk_sc
+        )
+
+        dealloc(d_int1_arr); dealloc(d_int2_arr)
+
+        u64 t_ph5 = time_now()
+        if step >= 1 { t_acc_gpu_bwd = t_acc_gpu_bwd + (t_ph5 - t_ph4) }
+
+        // ── GPU gate backward ───────────────────────────────────────────
+        // Assemble outk in [BS,K,D] on CPU then H2D (CPU layout kernel).
+        convert_kbsw_to_bskw(h_outk1_kbsd, h_outk1_bskd, K, BS, D)
+        convert_kbsw_to_bskw(h_outk2_kbsd, h_outk2_bskd, K, BS, D)
+        err = hipMemcpy(d_outk1_bskd, h_outk1_bskd, BS * K * D * 4, 1)
+        if err != 0 { die_gpu("H2D otk1_bskd", err) }
+        err = hipMemcpy(d_outk2_bskd, h_outk2_bskd, BS * K * D * 4, 1)
+        if err != 0 { die_gpu("H2D otk2_bskd", err) }
+
+        // H2D dz1, dz2 for gate_bwd (BS*D*4 = 192 KB each)
+        // d_dz1/d_dz2 are persistent GTT buffers allocated pre-loop.
+        err = hipMemcpy(d_dz1, h_dz1, BS * D * 4, 1)
+        if err != 0 { die_gpu("H2D dz1", err) }
+        err = hipMemcpy(d_dz2, h_dz2, BS * D * 4, 1)
+        if err != 0 { die_gpu("H2D dz2", err) }
+
+        // Zero GPU gate grad accumulators
+        err = hipMemcpy(d_dgw,      h_zero_grad, K * D * 4, 1)
+        if err != 0 { die_gpu("zero dgw", err) }
+        err = hipMemcpy(d_dgb,      h_zero_grad, K * 4,     1)
+        if err != 0 { die_gpu("zero dgb", err) }
+        err = hipMemcpy(d_dbias_gpu, h_zero_grad, D * 4,    1)
+        if err != 0 { die_gpu("zero dbias", err) }
+
+        // GPU gate backward — view 1
+        launch_gate_bwd_bs(fh_gbwd_bs, d_dz1, d_x1, d_alpha1, d_outk1_bskd,
+                           d_gw, d_dx_gate1, d_dgl1, BS, D, K)
+        launch_gate_bwd_dgrad(fh_gbwd_dgrad, d_x1, d_dgl1, d_dgw, d_dgb, BS, D, K)
+
+        // GPU gate backward — view 2 (accumulates into same d_dgw, d_dgb)
+        launch_gate_bwd_bs(fh_gbwd_bs, d_dz2, d_x2, d_alpha2, d_outk2_bskd,
+                           d_gw, d_dx_gate2, d_dgl2, BS, D, K)
+        launch_gate_bwd_dgrad(fh_gbwd_dgrad, d_x2, d_dgl2, d_dgw, d_dgb, BS, D, K)
+
+        // Sync gate backward
+        err = hipDeviceSynchronize()
+        if err != 0 { die_gpu("sync gate_bwd", err) }
+
+        // Compute dbias on CPU: dbias[d] = sum_bs( dz1[bs,d] + dz2[bs,d] )
+        // gate_bwd kernels do NOT compute dbias (see kernel comment), so we do it here.
+        u64 h_dbias_tmp = alloc(D * 4)
+        memset(h_dbias_tmp, 0, D * 4)
+        u64 dbs = 0
+        while dbs < BS {
+            u64 d_idx = 0
+            while d_idx < D {
+                f32 v1 = 0.0f
+                unsafe { *((h_dz1 + (dbs * D + d_idx) * 4) as f32) -> v1 }
+                f32 v2 = 0.0f
+                unsafe { *((h_dz2 + (dbs * D + d_idx) * 4) as f32) -> v2 }
+                f32 cur = 0.0f
+                unsafe { *((h_dbias_tmp + d_idx * 4) as f32) -> cur }
+                unsafe { *((h_dbias_tmp + d_idx * 4) as f32) = cur + v1 + v2 }
+                d_idx = d_idx + 1
+            }
+            dbs = dbs + 1
+        }
+        err = hipMemcpy(d_dbias_gpu, h_dbias_tmp, D * 4, 1)
+        if err != 0 { die_gpu("H2D dbias", err) }
+        dealloc(h_dbias_tmp)
+
+        // D2H dx_gate (GTT — zero-copy via host ptr) + combine with UV dx
+        u64 h_dx_gate1 = dev_host_ptr(d_dx_gate1)
+        u64 h_dx_gate2 = dev_host_ptr(d_dx_gate2)
+        cpu_acc_f32(h_dx1, h_dx_gate1, BS * D)
+        cpu_acc_f32(h_dx2, h_dx_gate2, BS * D)
+
+        // embed_bwd using combined (UV + gate) dx
+        embed_bwd(h_dx1, ids1_u64, B, S, D, h_demb)
+        embed_bwd(h_dx2, ids2_u64, B, S, D, h_demb)
+
+        dealloc(h_dz1); dealloc(h_dz2)
+
+        u64 t_ph6 = time_now()
+        if step >= 1 { t_acc_gate_bwd = t_acc_gate_bwd + (t_ph6 - t_ph5) }
+
+        // ── GPU AdamW for U, V, gw, gb, bias ───────────────────────────
+        // d_dU, d_dV are GTT (valid after gpu_bwd_view_fast sync).
+        // d_dgw, d_dgb, d_dbias_gpu are GTT (valid after gate_bwd sync).
+        u64 step1 = step + 1
+
+        launch_adamw(fh_adamw, d_U,    d_dU,        d_m_U,    d_v_U,    K * D * R, step1, lr, beta1, beta2, eps, wd)
+        launch_adamw(fh_adamw, d_V,    d_dV,        d_m_V,    d_v_V,    K * R * D, step1, lr, beta1, beta2, eps, wd)
+        launch_adamw(fh_adamw, d_gw,   d_dgw,       d_m_gw,   d_v_gw,   K * D,     step1, lr, beta1, beta2, eps, wd)
+        launch_adamw(fh_adamw, d_gb,   d_dgb,       d_m_gb,   d_v_gb,   K,         step1, lr, beta1, beta2, eps, wd)
+        launch_adamw(fh_adamw, d_bias, d_dbias_gpu, d_m_bias, d_v_bias, D,         step1, lr, beta1, beta2, eps, wd)
+
+        // Sync AdamW (GPU weights updated in-place — no H2D needed for U/V/gw/gb/bias)
+        err = hipDeviceSynchronize()
+        if err != 0 { die_gpu("sync adamw", err) }
+
+        // D2H gw, gb, bias back to CPU for next-step cpu_gate_logits + cpu_wzma_mix
+        // (gw, gb needed for gate_logits; bias needed for wzma_mix)
+        err = hipMemcpy(gw_ptr,   d_gw,   K * D * 4, 2); if err != 0 { die_gpu("D2H gw_upd",   err) }
+        err = hipMemcpy(gb_ptr,   d_gb,   K * 4,     2); if err != 0 { die_gpu("D2H gb_upd",   err) }
+        err = hipMemcpy(bias_ptr, d_bias, D * 4,     2); if err != 0 { die_gpu("D2H bias_upd", err) }
+
+        u64 t_ph7 = time_now()
+        if step >= 1 { t_acc_adamw = t_acc_adamw + (t_ph7 - t_ph6) }
+
+        // ── Sparse embedding AdamW (CPU) + sparse H2D ──────────────────
+        u64 uniq    = alloc(2 * BS * 8)
+        u64 n_uniq  = 0
+        u64 all_ids = alloc(2 * BS * 8)
+        u64 ai = 0
+        while ai < BS {
+            u64 id1 = 0; unsafe { *((ids1_u64 + ai * 8) as u64) -> id1 }
+            u64 id2 = 0; unsafe { *((ids2_u64 + ai * 8) as u64) -> id2 }
+            unsafe { *((all_ids + ai * 8)        as u64) = id1 }
+            unsafe { *((all_ids + (BS + ai) * 8) as u64) = id2 }
+            ai = ai + 1
+        }
+        u64 gi = 0
+        while gi < 2 * BS {
+            u64 cand = 0; unsafe { *((all_ids + gi * 8) as u64) -> cand }
+            u64 found = 0
+            u64 ui = 0
+            while ui < n_uniq {
+                u64 existing = 0; unsafe { *((uniq + ui * 8) as u64) -> existing }
+                if existing == cand { found = 1 }
+                ui = ui + 1
+            }
+            if found == 0 {
+                unsafe { *((uniq + n_uniq * 8) as u64) = cand }
+                n_uniq = n_uniq + 1
+            }
+            gi = gi + 1
+        }
+        dealloc(all_ids)
+        u64 uii = 0
+        while uii < n_uniq {
+            u64 row = 0; unsafe { *((uniq + uii * 8) as u64) -> row }
+            adamw_step(emb_ptr + row * D * 4, h_demb + row * D * 4,
+                       m_emb + row * D * 4, v_emb + row * D * 4,
+                       D, step1, lr, beta1, beta2, eps, wd)
+            // Sparse H2D for updated emb rows
+            err = hipMemcpy(d_emb + row * D * 4, emb_ptr + row * D * 4, D * 4, 1)
+            if err != 0 { die_gpu("H2D emb_row", err) }
+            uii = uii + 1
+        }
+        dealloc(uniq)
+
+        u64 t_step1 = time_now()
+        if step >= 1 {
+            t_acc_emb_upd = t_acc_emb_upd + (t_step1 - t_ph7)
+            step_sum_ns = step_sum_ns + (t_step1 - t_step0)
+        }
+        if step == 0 { step_sum_ns = 0 }
+
+        if step == 0 {
+            print_str("loss[0]:  ")
+            u64 ss2 = fmt_f32(loss, 8); print_str(ss2); dealloc(ss2); print_str("\n")
+        }
+        if step == 9 {
+            print_str("loss[9]:  ")
+            u64 ss2 = fmt_f32(loss, 8); print_str(ss2); dealloc(ss2); print_str("\n")
+        }
+        if step == 19 {
+            print_str("loss[19]: ")
+            u64 ss2 = fmt_f32(loss, 8); print_str(ss2); dealloc(ss2); print_str("\n")
+        }
+        if step == 29 {
+            print_str("loss[29]: ")
+            u64 ss2 = fmt_f32(loss, 8); print_str(ss2); dealloc(ss2); print_str("\n")
+        }
+        if step == 39 {
+            print_str("loss[39]: ")
+            u64 ss2 = fmt_f32(loss, 8); print_str(ss2); dealloc(ss2); print_str("\n")
+        }
+        if step == 49 {
+            print_str("loss[49]: ")
+            u64 ss2 = fmt_f32(loss, 8); print_str(ss2); dealloc(ss2); print_str("\n")
+        }
+
+        step = step + 1
+    }
+
+    u64 t1_total = time_now()
+    u64 total_ns = t1_total - t0_total
+    f32 total_ms = f64_to_f32(int_to_f64(total_ns) / 1000000.0)
+    f32 avg_ms   = 0.0f
+    if STEPS > 1 {
+        avg_ms = f64_to_f32(int_to_f64(step_sum_ns) / (1000000.0 * int_to_f64(STEPS - 1)))
+    }
+
+    print_str("\n=== Results ===\n")
+    print_str("loss[0]  (ref 3.059341): ")
+    u64 ss = fmt_f32(first_loss, 8); print_str(ss); dealloc(ss); print_str("\n")
+    print_str("loss[49] (ref 0.000634): ")
+    ss = fmt_f32(last_loss, 8); print_str(ss); dealloc(ss); print_str("\n")
+    print_str("total_ms:                ")
+    ss = fmt_f32(total_ms, 3); print_str(ss); dealloc(ss); print_str("\n")
+    print_str("avg_ms_per_step (1..49): ")
+    ss = fmt_f32(avg_ms, 3); print_str(ss); dealloc(ss); print_str("\n")
+    print_str("PyTorch GPU baseline:    1.62ms/step\n")
+    print_str("hipcc-free:              YES\n")
+
+    f32 tol = 0.01f
+    f32 d0  = abs_f32(first_loss - 3.059341f)
+    f32 d49 = abs_f32(last_loss  - 0.000634f)
+    if d0 > tol {
+        print_str("FAIL: loss[0] diff=")
+        ss = fmt_f32(d0, 8); print_str(ss); dealloc(ss); print_str(" > 1e-2\n")
+        hipkfd_teardown(); exit(1)
+    }
+    if d49 > tol {
+        print_str("FAIL: loss[49] diff=")
+        ss = fmt_f32(d49, 8); print_str(ss); dealloc(ss); print_str(" > 1e-2\n")
+        hipkfd_teardown(); exit(1)
+    }
+    print_str("PASS: both endpoint losses within 1e-2 of cpu_losses[]\n")
+
+    // Sync timing diagnostics
+    u64 nsync     = hipkfd_get_sync_count()
+    u64 sync_ns   = hipkfd_get_sync_total_ns()
+    u64 sync_busy = hipkfd_get_sync_busy_calls()
+    f32 sync_ms   = f64_to_f32(int_to_f64(sync_ns) / 1000000.0)
+    print_str("hipDeviceSynchronize calls:    ")
+    ss = fmt_dec(nsync); print_str(ss); dealloc(ss); print_str("\n")
+    print_str("sync_busy (actually waited):   ")
+    ss = fmt_dec(sync_busy); print_str(ss); dealloc(ss); print_str("\n")
+    print_str("total time in syncs (ms):      ")
+    ss = fmt_f32(sync_ms, 1); print_str(ss); dealloc(ss); print_str("\n")
+
+    // Per-phase breakdown
+    u64 ph_denom = STEPS - 1
+    f32 ph_ms_fwd      = f64_to_f32(int_to_f64(t_acc_fwd)      / (1000000.0 * int_to_f64(ph_denom)))
+    f32 ph_ms_d2h_out  = f64_to_f32(int_to_f64(t_acc_d2h_out)  / (1000000.0 * int_to_f64(ph_denom)))
+    f32 ph_ms_cpu_loss = f64_to_f32(int_to_f64(t_acc_cpu_loss)  / (1000000.0 * int_to_f64(ph_denom)))
+    f32 ph_ms_zero     = f64_to_f32(int_to_f64(t_acc_zero)      / (1000000.0 * int_to_f64(ph_denom)))
+    f32 ph_ms_cpu_bwd  = f64_to_f32(int_to_f64(t_acc_cpu_bwd)   / (1000000.0 * int_to_f64(ph_denom)))
+    f32 ph_ms_gpu_bwd  = f64_to_f32(int_to_f64(t_acc_gpu_bwd)   / (1000000.0 * int_to_f64(ph_denom)))
+    f32 ph_ms_gate_bwd = f64_to_f32(int_to_f64(t_acc_gate_bwd)  / (1000000.0 * int_to_f64(ph_denom)))
+    f32 ph_ms_adamw    = f64_to_f32(int_to_f64(t_acc_adamw)      / (1000000.0 * int_to_f64(ph_denom)))
+    f32 ph_ms_emb_upd  = f64_to_f32(int_to_f64(t_acc_emb_upd)   / (1000000.0 * int_to_f64(ph_denom)))
+    print_str("\n=== Per-phase breakdown (avg ms/step, steps 1..49) ===\n")
+    print_str("fwd (embed1+sync+U1V1+embed2+sync2+U2V2):  "); ss = fmt_f32(ph_ms_fwd,      3); print_str(ss); dealloc(ss); print_str(" ms\n")
+    print_str("D2H outk (8 calls, GTT):                   "); ss = fmt_f32(ph_ms_d2h_out,  3); print_str(ss); dealloc(ss); print_str(" ms\n")
+    print_str("CPU mix+pool+loss:                          "); ss = fmt_f32(ph_ms_cpu_loss, 3); print_str(ss); dealloc(ss); print_str(" ms\n")
+    print_str("zero dU+dV H2D:                            "); ss = fmt_f32(ph_ms_zero,     3); print_str(ss); dealloc(ss); print_str(" ms\n")
+    print_str("CPU infonce_bwd->dz:                       "); ss = fmt_f32(ph_ms_cpu_bwd,  3); print_str(ss); dealloc(ss); print_str(" ms\n")
+    print_str("GPU bwd UV (2 views):                      "); ss = fmt_f32(ph_ms_gpu_bwd,  3); print_str(ss); dealloc(ss); print_str(" ms\n")
+    print_str("GPU gate_bwd+convert+H2D+sync:             "); ss = fmt_f32(ph_ms_gate_bwd, 3); print_str(ss); dealloc(ss); print_str(" ms\n")
+    print_str("GPU AdamW+sync+D2H gw/gb/bias:             "); ss = fmt_f32(ph_ms_adamw,    3); print_str(ss); dealloc(ss); print_str(" ms\n")
+    print_str("sparse emb AdamW+H2D:                      "); ss = fmt_f32(ph_ms_emb_upd,  3); print_str(ss); dealloc(ss); print_str(" ms\n")
+
+    // GPU cleanup
+    hipFree(d_emb); hipFree(d_U); hipFree(d_V)
+    hipFree(d_gw); hipFree(d_gb); hipFree(d_bias)
+    hipFree(d_ids1); hipFree(d_ids2)
+    hipFree(d_x1); hipFree(d_x2)
+    hipFree(d_otk1_0); hipFree(d_otk1_1); hipFree(d_otk1_2); hipFree(d_otk1_3)
+    hipFree(d_otk2_0); hipFree(d_otk2_1); hipFree(d_otk2_2); hipFree(d_otk2_3)
+    hipFree(d_int1_0); hipFree(d_int1_1); hipFree(d_int1_2); hipFree(d_int1_3)
+    hipFree(d_int2_0); hipFree(d_int2_1); hipFree(d_int2_2); hipFree(d_int2_3)
+    hipFree(d_xT)
+    hipFree(d_dU); hipFree(d_dV)
+    hipFree(d_dzk_K); hipFree(d_intk_sc_K); hipFree(d_intk_T_K); hipFree(d_VkT_K)
+    hipFree(d_dinter_K); hipFree(d_UkT_K); hipFree(d_dx_kK)
+    hipFree(d_m_U); hipFree(d_v_U); hipFree(d_m_V); hipFree(d_v_V)
+    hipFree(d_m_gw); hipFree(d_v_gw); hipFree(d_m_gb); hipFree(d_v_gb)
+    hipFree(d_m_bias); hipFree(d_v_bias)
+    hipFree(d_dgl1); hipFree(d_dgl2)
+    hipFree(d_dx_gate1); hipFree(d_dx_gate2)
+    hipFree(d_dgw); hipFree(d_dgb); hipFree(d_dbias_gpu)
+    hipFree(d_outk1_bskd); hipFree(d_outk2_bskd)
+    hipFree(d_dz1); hipFree(d_dz2)
+    hipFree(d_alpha1); hipFree(d_alpha2)
+
+    hipkfd_teardown()
+    exit(0)
+}

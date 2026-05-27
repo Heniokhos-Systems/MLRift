@@ -1,0 +1,344 @@
+// MLRift — built on KernRift — Mach-O output format
+//
+// x86_64: Uses LC_UNIXTHREAD for direct kernel entry (no dyld dependency).
+// ARM64:  Uses LC_UNIXTHREAD for direct kernel entry (no dyld dependency).
+// On Apple Silicon, binaries must be ad-hoc signed with codesign -s -
+
+// Emit Mach-O x86_64 executable header
+@export
+fn emit_macho_headers_x64(uint64 code_size) -> uint64 {
+    uint64 header_size = 4096
+
+    // Mach-O header (32 bytes)
+    emit_u32_le(0xFEEDFACF)
+    emit_u32_le(0x01000007)       // X86_64
+    emit_u32_le(0x00000003)
+    emit_u32_le(0x00000002)       // MH_EXECUTE
+    emit_u32_le(3)                // ncmds
+    emit_u32_le(72 + 72 + 184)   // sizeofcmds = 328
+    emit_u32_le(0x00000001)       // flags (NOUNDEFS)
+    emit_u32_le(0)
+
+    // __PAGEZERO
+    emit_u32_le(0x19); emit_u32_le(72)
+    emit_byte(95); emit_byte(95); emit_byte(80); emit_byte(65)
+    emit_byte(71); emit_byte(69); emit_byte(90); emit_byte(69)
+    emit_byte(82); emit_byte(79); emit_byte(0); emit_byte(0)
+    emit_byte(0); emit_byte(0); emit_byte(0); emit_byte(0)
+    emit_u64_le(0); emit_u64_le(0x100000000)
+    emit_u64_le(0); emit_u64_le(0)
+    emit_u32_le(0); emit_u32_le(0); emit_u32_le(0); emit_u32_le(0)
+
+    // __TEXT (RWX for statics)
+    emit_u32_le(0x19); emit_u32_le(72)
+    emit_byte(95); emit_byte(95); emit_byte(84); emit_byte(69)
+    emit_byte(88); emit_byte(84); emit_byte(0); emit_byte(0)
+    emit_byte(0); emit_byte(0); emit_byte(0); emit_byte(0)
+    emit_byte(0); emit_byte(0); emit_byte(0); emit_byte(0)
+    emit_u64_le(0x100000000)
+    emit_u64_le(0)                // vmsize (patched)
+    emit_u64_le(0)
+    emit_u64_le(0)                // filesize (patched)
+    emit_u32_le(7); emit_u32_le(7)
+    emit_u32_le(0); emit_u32_le(0)
+
+    // LC_UNIXTHREAD — x86_64 thread state (184 bytes)
+    emit_u32_le(5)                // cmd = LC_UNIXTHREAD
+    emit_u32_le(184)
+    emit_u32_le(4)                // flavor = x86_THREAD_STATE64
+    emit_u32_le(42)               // count
+    // 21 uint64 registers: rax..gs, rip at index 16
+    uint64 ri = 0
+    while ri < 21 {
+        if ri == 16 {
+            emit_u64_le(0x100000000 + header_size)  // rip (patched)
+        } else {
+            emit_u64_le(0)
+        }
+        ri = ri + 1
+    }
+
+    while out_len < header_size { emit_byte(0) }
+    return header_size
+}
+
+// Emit Mach-O AArch64 executable header — LC_MAIN + libSystem layout.
+//
+// macOS 14 arm64 refuses LC_UNIXTHREAD binaries. Needs the full dyld path:
+// LC_LOAD_DYLINKER + LC_LOAD_DYLIB libSystem + LC_MAIN + LC_SYMTAB +
+// LC_DYLD_CHAINED_FIXUPS + LC_BUILD_VERSION + LC_UUID. Our code still uses
+// direct svc 0x80 for exit; libSystem is just listed so dyld loads us via
+// the trusted boot path.
+//
+// Load command layout:
+//   [32]   __PAGEZERO       (72)  → 104
+//   [104]  __TEXT + section (152) → 256
+//   [256]  __DATA           (72)  → 328
+//   [328]  __LINKEDIT       (72)  → 400
+//   [400]  CHAINED_FIXUPS   (16)  → 416
+//   [416]  LC_SYMTAB        (24)  → 440
+//   [440]  LC_DYSYMTAB      (80)  → 520
+//   [520]  LC_LOAD_DYLINKER (32)  → 552
+//   [552]  LC_UUID          (24)  → 576
+//   [576]  LC_BUILD_VERSION (24)  → 600
+//   [600]  LC_MAIN          (24)  → 624
+//   [624]  LC_LOAD_DYLIB    (56)  → 680
+// sizeofcmds = 648, ncmds = 12
+@export
+fn emit_macho_headers_a64(uint64 code_size) -> uint64 {
+    uint64 header_size = 16384
+
+    // Mach-O header (32 bytes)
+    emit_u32_le(0xFEEDFACF)
+    emit_u32_le(0x0100000C)       // ARM64
+    emit_u32_le(0x00000000)
+    emit_u32_le(0x00000002)       // MH_EXECUTE
+    emit_u32_le(12)               // ncmds
+    emit_u32_le(648)              // sizeofcmds
+    emit_u32_le(0x00200085)       // NOUNDEFS|DYLDLINK|TWOLEVEL|PIE
+    emit_u32_le(0)
+
+    // __PAGEZERO (72 bytes, offset 32)
+    emit_u32_le(0x19); emit_u32_le(72)
+    emit_byte(95); emit_byte(95); emit_byte(80); emit_byte(65)
+    emit_byte(71); emit_byte(69); emit_byte(90); emit_byte(69)
+    emit_byte(82); emit_byte(79); emit_byte(0); emit_byte(0)
+    emit_byte(0); emit_byte(0); emit_byte(0); emit_byte(0)
+    emit_u64_le(0); emit_u64_le(0x100000000)
+    emit_u64_le(0); emit_u64_le(0)
+    emit_u32_le(0); emit_u32_le(0); emit_u32_le(0); emit_u32_le(0)
+
+    // __TEXT segment (152 bytes = 72 header + 80 section, offset 104) — RX
+    emit_u32_le(0x19); emit_u32_le(152)
+    emit_byte(95); emit_byte(95); emit_byte(84); emit_byte(69)
+    emit_byte(88); emit_byte(84); emit_byte(0); emit_byte(0)
+    emit_byte(0); emit_byte(0); emit_byte(0); emit_byte(0)
+    emit_byte(0); emit_byte(0); emit_byte(0); emit_byte(0)
+    emit_u64_le(0x100000000)
+    emit_u64_le(0)                // vmsize (patched at 136)
+    emit_u64_le(0)
+    emit_u64_le(0)                // filesize (patched at 152)
+    emit_u32_le(5); emit_u32_le(5)  // maxprot=RX, initprot=RX
+    emit_u32_le(1); emit_u32_le(0)  // nsects=1, flags=0
+
+    // __text section within __TEXT (80 bytes, offset 176)
+    // sectname "__text"
+    emit_byte(95); emit_byte(95); emit_byte(116); emit_byte(101)
+    emit_byte(120); emit_byte(116); emit_byte(0); emit_byte(0)
+    emit_byte(0); emit_byte(0); emit_byte(0); emit_byte(0)
+    emit_byte(0); emit_byte(0); emit_byte(0); emit_byte(0)
+    // segname "__TEXT"
+    emit_byte(95); emit_byte(95); emit_byte(84); emit_byte(69)
+    emit_byte(88); emit_byte(84); emit_byte(0); emit_byte(0)
+    emit_byte(0); emit_byte(0); emit_byte(0); emit_byte(0)
+    emit_byte(0); emit_byte(0); emit_byte(0); emit_byte(0)
+    emit_u64_le(0x100000000 + header_size)  // addr (patched at 208)
+    emit_u64_le(0)                            // size (patched at 216)
+    emit_u32_le(header_size)                  // offset (patched at 224)
+    emit_u32_le(2)                            // align = 2^2 = 4 bytes
+    emit_u32_le(0)                            // reloff
+    emit_u32_le(0)                            // nreloc
+    emit_u32_le(0x80000400)                   // flags: S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS
+    emit_u32_le(0); emit_u32_le(0); emit_u32_le(0) // reserved
+
+    // __DATA (72 bytes, offset 256) — RW statics
+    emit_u32_le(0x19); emit_u32_le(72)
+    emit_byte(95); emit_byte(95); emit_byte(68); emit_byte(65)
+    emit_byte(84); emit_byte(65); emit_byte(0); emit_byte(0)
+    emit_byte(0); emit_byte(0); emit_byte(0); emit_byte(0)
+    emit_byte(0); emit_byte(0); emit_byte(0); emit_byte(0)
+    emit_u64_le(0)                // vmaddr (patched at 280)
+    emit_u64_le(0)                // vmsize (patched at 288)
+    emit_u64_le(0)                // fileoff (patched at 296)
+    emit_u64_le(0)                // filesize (patched at 304)
+    emit_u32_le(3); emit_u32_le(3)  // maxprot=RW, initprot=RW
+    emit_u32_le(0); emit_u32_le(0)
+
+    // __LINKEDIT (72 bytes, offset 328) — for codesign
+    emit_u32_le(0x19); emit_u32_le(72)
+    emit_byte(95); emit_byte(95); emit_byte(76); emit_byte(73)
+    emit_byte(78); emit_byte(75); emit_byte(69); emit_byte(68)
+    emit_byte(73); emit_byte(84); emit_byte(0); emit_byte(0)
+    emit_byte(0); emit_byte(0); emit_byte(0); emit_byte(0)
+    emit_u64_le(0)                // vmaddr (patched at 352)
+    emit_u64_le(0)                // vmsize (patched at 360)
+    emit_u64_le(0)                // fileoff (patched at 368)
+    emit_u64_le(0)                // filesize (patched at 376)
+    emit_u32_le(1); emit_u32_le(1)  // maxprot=R, initprot=R
+    emit_u32_le(0); emit_u32_le(0)
+
+    // LC_DYLD_CHAINED_FIXUPS (16 bytes, offset 400)
+    emit_u32_le(0x80000034)
+    emit_u32_le(16)
+    emit_u32_le(0)                // dataoff (patched at 408)
+    emit_u32_le(0)                // datasize (patched at 412)
+
+    // LC_SYMTAB (24 bytes, offset 416)
+    emit_u32_le(2)
+    emit_u32_le(24)
+    emit_u32_le(0)                // symoff (patched at 424)
+    emit_u32_le(0)                // nsyms (patched at 428)
+    emit_u32_le(0)                // stroff (patched at 432)
+    emit_u32_le(0)                // strsize (patched at 436)
+
+    // LC_DYSYMTAB (80 bytes, offset 440)
+    emit_u32_le(0xB)
+    emit_u32_le(80)
+    emit_u32_le(0); emit_u32_le(0)  // ilocalsym, nlocalsym
+    emit_u32_le(0); emit_u32_le(0)  // iextdefsym, nextdefsym (patched at 460)
+    emit_u32_le(0); emit_u32_le(0)  // iundefsym (patched at 464), nundefsym
+    emit_u32_le(0); emit_u32_le(0); emit_u32_le(0); emit_u32_le(0)
+    emit_u32_le(0); emit_u32_le(0); emit_u32_le(0); emit_u32_le(0)
+    emit_u32_le(0); emit_u32_le(0); emit_u32_le(0); emit_u32_le(0)
+
+    // LC_LOAD_DYLINKER (32 bytes, offset 520)
+    emit_u32_le(0xE)
+    emit_u32_le(32)
+    emit_u32_le(12)               // name offset
+    emit_byte(47); emit_byte(117); emit_byte(115); emit_byte(114)
+    emit_byte(47); emit_byte(108); emit_byte(105); emit_byte(98)
+    emit_byte(47); emit_byte(100); emit_byte(121); emit_byte(108)
+    emit_byte(100); emit_byte(0)
+    emit_byte(0); emit_byte(0); emit_byte(0); emit_byte(0); emit_byte(0); emit_byte(0)
+
+    // LC_UUID (24 bytes, offset 552)
+    emit_u32_le(0x1B)
+    emit_u32_le(24)
+    emit_byte(0x4B); emit_byte(0x52); emit_byte(0x4E); emit_byte(0x52)
+    emit_byte(0x49); emit_byte(0x46); emit_byte(0x54); emit_byte(0x00)
+    emit_byte(0xA6); emit_byte(0x4B); emit_byte(0x00); emit_byte(0x01)
+    emit_byte(0x02); emit_byte(0x03); emit_byte(0x04); emit_byte(0x05)
+
+    // LC_BUILD_VERSION (24 bytes, offset 576)
+    emit_u32_le(0x32)
+    emit_u32_le(24)
+    emit_u32_le(1)
+    emit_u32_le(0x000B0000)
+    emit_u32_le(0x000B0000)
+    emit_u32_le(0)
+
+    // LC_MAIN (24 bytes, offset 600)
+    emit_u32_le(0x80000028)
+    emit_u32_le(24)
+    emit_u64_le(0)                // entryoff (patched at 608)
+    emit_u64_le(0)                // stacksize
+
+    // LC_LOAD_DYLIB /usr/lib/libSystem.B.dylib (56 bytes, offset 624)
+    emit_u32_le(0xC)
+    emit_u32_le(56)
+    emit_u32_le(24)
+    emit_u32_le(2)
+    emit_u32_le(0x051C7802)
+    emit_u32_le(0x00010000)
+    emit_byte(47); emit_byte(117); emit_byte(115); emit_byte(114)
+    emit_byte(47); emit_byte(108); emit_byte(105); emit_byte(98)
+    emit_byte(47); emit_byte(108); emit_byte(105); emit_byte(98)
+    emit_byte(83); emit_byte(121); emit_byte(115); emit_byte(116)
+    emit_byte(101); emit_byte(109); emit_byte(46); emit_byte(66)
+    emit_byte(46); emit_byte(100); emit_byte(121); emit_byte(108)
+    emit_byte(105); emit_byte(98); emit_byte(0); emit_byte(0)
+    emit_byte(0); emit_byte(0); emit_byte(0); emit_byte(0)
+
+    while out_len < header_size { emit_byte(0) }
+    return header_size
+}
+
+
+// Emit arm64 __LINKEDIT content (chained fixups + symtab + strtab) and patch
+// the LC_DYLD_CHAINED_FIXUPS, LC_SYMTAB, LC_DYSYMTAB, LC_MAIN header fields.
+// Keeps emit-site count low via a loop to sidestep a krc 2.6.1 codegen
+// issue where enough individual emit_byte calls in one function trigger a
+// memory corruption.
+@export
+fn emit_macho_linkedit_a64(uint64 linkedit_off, uint64 main_file_off) {
+    // Chained fixups: 48 zero bytes with a few fields set.
+    // header (32) + starts (4 seg_count = 0) + 4 pad + 4 imports + 4 symbols
+    uint64 off = linkedit_off
+    // 48 bytes of zero
+    uint64 zi = 0
+    while zi < 48 {
+        emit_byte(0)
+        zi = zi + 1
+    }
+    // Now write non-zero fields by patching:
+    //   [off+0]  fixups_version  = 0 (already)
+    //   [off+4]  starts_offset   = 32
+    //   [off+8]  imports_offset  = 40
+    //   [off+12] symbols_offset  = 48
+    //   [off+20] imports_format  = 1
+    patch_u32(off + 4, 32)
+    patch_u32(off + 8, 40)
+    patch_u32(off + 12, 48)
+    patch_u32(off + 20, 1)
+    patch_u32(408, off & 0xFFFFFFFF)
+    patch_u32(412, 48)
+
+    // Symbol table: 16 bytes for _main.
+    uint64 sym_off = codegen_output_len()
+    uint64 si = 0
+    while si < 16 {
+        emit_byte(0)
+        si = si + 1
+    }
+    patch_u32(sym_off + 0, 1)                        // n_strx
+    // n_type = 0x0F at sym_off+4 (byte)
+    uint64 ntp = sym_off + 4
+    uint8 nt = 0x0F
+    unsafe { *(out_buf + ntp as uint8) = nt }
+    // n_sect = 1 at sym_off+5
+    uint64 nsp = sym_off + 5
+    uint8 ns = 1
+    unsafe { *(out_buf + nsp as uint8) = ns }
+    // n_value (u64 at sym_off+8)
+    uint64 nvp = sym_off + 8
+    uint64 nv = 0x100000000 + main_file_off
+    patch_u32(nvp, nv & 0xFFFFFFFF)
+    patch_u32(nvp + 4, (nv >> 32) & 0xFFFFFFFF)
+    patch_u32(424, sym_off & 0xFFFFFFFF)
+    patch_u32(428, 1)
+
+    // String table: "\0_main\0" padded to 8.
+    uint64 strt = codegen_output_len()
+    uint64 ii = 0
+    while ii < 8 {
+        emit_byte(0)
+        ii = ii + 1
+    }
+    // Write 5 chars at offset 1: _main
+    uint64 p1 = strt + 1
+    uint8 c95 = 95
+    unsafe { *(out_buf + p1 as uint8) = c95 }
+    uint64 p2 = strt + 2
+    uint8 c109 = 109
+    unsafe { *(out_buf + p2 as uint8) = c109 }
+    uint64 p3 = strt + 3
+    uint8 c97 = 97
+    unsafe { *(out_buf + p3 as uint8) = c97 }
+    uint64 p4 = strt + 4
+    uint8 c105 = 105
+    unsafe { *(out_buf + p4 as uint8) = c105 }
+    uint64 p5 = strt + 5
+    uint8 c110 = 110
+    unsafe { *(out_buf + p5 as uint8) = c110 }
+    patch_u32(432, strt & 0xFFFFFFFF)
+    patch_u32(436, 8)
+
+    // DYSYMTAB: nextdefsym=1, iundefsym=1
+    patch_u32(460, 1)
+    patch_u32(464, 1)
+
+    // LC_MAIN entryoff
+    patch_u32(608, main_file_off & 0xFFFFFFFF)
+    patch_u32(612, (main_file_off >> 32) & 0xFFFFFFFF)
+}
+
+// Patch offsets (new arm64 layout):
+// __TEXT vmsize=136, filesize=152
+// __text size=216
+// __DATA vmaddr=280, vmsize=288, fileoff=296, filesize=304
+// __LINKEDIT vmaddr=352, vmsize=360, fileoff=368, filesize=376
+// DYLD_CHAINED_FIXUPS dataoff=408, datasize=412
+// LC_SYMTAB symoff=424, nsyms=428, stroff=432, strsize=436
+// LC_DYSYMTAB nextdefsym=460, iundefsym=464
+// LC_MAIN entryoff=608 (u64)
+// x86_64 LC_UNIXTHREAD rip at 176+16+16*8 = 320

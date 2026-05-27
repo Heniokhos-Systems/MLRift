@@ -1,0 +1,2797 @@
+// MLRift -- built on KernRift -- AArch64 IR backend
+//
+// Emits ARM64 machine code from the shared SSA IR infrastructure (ir.kr).
+// Uses the graph-colouring register allocator with 10 callee-saved registers
+// (x19-x28) and the emit_a64_* instruction helpers from codegen_aarch64.kr.
+//
+// Frame layout (growing downward):
+//   [old SP]
+//     x29, x30          (STP, 16 bytes)
+//     x19-x28           (5 STP pairs, 80 bytes)
+//     spill slots        (ir_spill_count * 8 bytes, 16-aligned)
+//   [new SP]
+
+// Scratchpad offset within frame: a permanent 32-byte area reserved in the
+// prologue for mid-function temp buffers (fmt_uint digits, timespec, argv, etc).
+// Avoids dynamic SP shifts that would invalidate spill slot addresses.
+static uint64 ir_a64_scratch_off = 0
+
+// ADD Xd, SP, Xm  (extended register form, needed because register 31
+// in the standard ADD encoding means XZR, not SP)
+fn ir_a64_add_sp_reg(uint64 rd, uint64 rm) {
+    // ADD Xd, SP, Xm, UXTX #0: 0x8B206000 | (Xm << 16) | (31 << 5) | Xd
+    uint64 insn = 0x8B206000 | (rm << 16) | (31 << 5) | rd
+    emit_a64(insn)
+}
+
+// STP Xt1, Xt2, [SP, #off]  — store-pair of two 64-bit regs at one
+// 8-byte-aligned offset. Halves prologue size (one insn per pair vs
+// two STRs). Offset must be multiple of 8 in range 0..504 for the
+// unsigned form we use here.
+fn ir_a64_stp_sp(uint64 rt1, uint64 rt2, uint64 off) {
+    uint64 imm7 = (off / 8) & 0x7F
+    uint64 insn = 0xA9000000 | (imm7 << 15) | (rt2 << 10) | (31 << 5) | rt1
+    emit_a64(insn)
+}
+
+// LDP Xt1, Xt2, [SP, #off]
+fn ir_a64_ldp_sp(uint64 rt1, uint64 rt2, uint64 off) {
+    uint64 imm7 = (off / 8) & 0x7F
+    uint64 insn = 0xA9400000 | (imm7 << 15) | (rt2 << 10) | (31 << 5) | rt1
+    emit_a64(insn)
+}
+
+// ---------------------------------------------------------------------------
+// Register allocator setup for ARM64
+// ---------------------------------------------------------------------------
+
+fn ir_regalloc_init_arm64() {
+    // Allocate or reuse the phys_regs table (10 entries for ARM64; x86's
+    // ir_regalloc_init now also allocates 10 so the buffer is reusable).
+    IR_NUM_REGS = 10
+    if ir_phys_regs == 0 { ir_phys_regs = alloc(10 * 8) }
+    uint64 p0 = ir_phys_regs
+    unsafe { *(p0 as uint64) = 19 }       // color 0 -> x19
+    uint64 p1 = ir_phys_regs + 8
+    unsafe { *(p1 as uint64) = 20 }       // color 1 -> x20
+    uint64 p2 = ir_phys_regs + 16
+    unsafe { *(p2 as uint64) = 21 }       // color 2 -> x21
+    uint64 p3 = ir_phys_regs + 24
+    unsafe { *(p3 as uint64) = 22 }       // color 3 -> x22
+    uint64 p4 = ir_phys_regs + 32
+    unsafe { *(p4 as uint64) = 23 }       // color 4 -> x23
+    uint64 p5 = ir_phys_regs + 40
+    unsafe { *(p5 as uint64) = 24 }       // color 5 -> x24
+    uint64 p6 = ir_phys_regs + 48
+    unsafe { *(p6 as uint64) = 25 }       // color 6 -> x25
+    uint64 p7 = ir_phys_regs + 56
+    unsafe { *(p7 as uint64) = 26 }       // color 7 -> x26
+    uint64 p8 = ir_phys_regs + 64
+    unsafe { *(p8 as uint64) = 27 }       // color 8 -> x27
+    uint64 p9 = ir_phys_regs + 72
+    unsafe { *(p9 as uint64) = 28 }       // color 9 -> x28
+}
+
+// ---------------------------------------------------------------------------
+// ARM64 spill helpers
+// ---------------------------------------------------------------------------
+
+// Number of bytes reserved at the BOTTOM of every function's stack
+// frame to hold overflow-call-arguments (args 9+ under AAPCS64). With
+// this space pre-reserved the SP-at-BL already points at the arg slots
+// (callee reads `[SP + callee_frame + (idx-8)*8]` and finds our
+// values), so we never SUB SP around a call — SUB would invalidate
+// every spill offset we need to read between the overflow args.
+// 128 = 16 slots, more than any call in the compiler today needs.
+static uint64 IR_A64_OVERFLOW_RESERVE = 128
+
+// Compute the spill slot offset for a spilled vreg. Spill slots live
+// above the overflow-arg reservation so they remain addressable at a
+// stable offset across calls.
+fn ir_a64_spill_offset(uint64 vreg) -> uint64 {
+    uint64 slot = vreg - IR_NUM_REGS - 1
+    return IR_A64_OVERFLOW_RESERVE + slot * 8
+}
+
+// Peephole tracking for spill-reload elision (same pattern as the x86
+// backend uses in ir.kr). If the last bytes emitted were exactly
+// `store_spill reg, vreg` and the very next emission would be
+// `load_spill reg, vreg` (same reg + same vreg, no bytes in between),
+// the reload is redundant — the value is still in the register.
+static uint64 ir_a64_last_spill_vreg = 0xFFFFFFFF
+static uint64 ir_a64_last_spill_reg = 0xFFFFFFFF
+static uint64 ir_a64_last_spill_end = 0xFFFFFFFFFFFFFFFF
+
+@export
+fn ir_a64_peephole_reset() {
+    ir_a64_last_spill_vreg = 0xFFFFFFFF
+    ir_a64_last_spill_reg = 0xFFFFFFFF
+    ir_a64_last_spill_end = 0xFFFFFFFFFFFFFFFF
+}
+
+// Load a spilled vreg into scratch register (x9 or x10).
+// ARM64 LDR Xt,[Xn,#imm] uses a 12-bit scaled field: max offset = 4095*8 = 32760.
+// For larger offsets, use a scratch register to form the address.
+fn ir_a64_load_spill(uint64 scratch, uint64 vreg) {
+    // Peephole: if the prior emission was `store_spill scratch, vreg`
+    // and nothing's been emitted since, the value is still in scratch.
+    if vreg == ir_a64_last_spill_vreg && scratch == ir_a64_last_spill_reg && out_len == ir_a64_last_spill_end {
+        ir_a64_last_spill_end = 0xFFFFFFFFFFFFFFFF   // one-shot
+        return
+    }
+    uint64 off = ir_a64_spill_offset(vreg)
+    ir_a64_ldr_sp(scratch, off)
+}
+
+// Store a register to the spill slot for vreg.
+fn ir_a64_emit_store_spill(uint64 reg, uint64 vreg) {
+    uint64 off = ir_a64_spill_offset(vreg)
+    ir_a64_str_sp(reg, off)
+    ir_a64_last_spill_vreg = vreg
+    ir_a64_last_spill_reg = reg
+    ir_a64_last_spill_end = out_len
+}
+
+// Large-offset-safe LDR/STR from SP.
+// ARM64 LDR Xt,[Xn,#imm] max offset = 4095*8 = 32760 bytes.
+// For larger offsets, compute address in x11 first.
+fn ir_a64_ldr_sp(uint64 rt, uint64 off) {
+    if off <= 32760 {
+        emit_a64_ldr(rt, 31, off)
+    } else {
+        emit_a64_mov_imm(11, off)
+        ir_a64_add_sp_reg(11, 11)
+        emit_a64_ldr(rt, 11, 0)
+    }
+}
+
+fn ir_a64_str_sp(uint64 rt, uint64 off) {
+    if off <= 32760 {
+        emit_a64_str(rt, 31, off)
+    } else {
+        emit_a64_mov_imm(11, off)
+        ir_a64_add_sp_reg(11, 11)
+        emit_a64_str(rt, 11, 0)
+    }
+}
+
+// Resolve a vreg to a physical register. If spilled, load into scratch (9 or 10).
+fn ir_a64_resolve_src(uint64 vreg, uint64 scratch) -> uint64 {
+    if vreg == 0 { return scratch }
+    uint64 phys = ir_get_phys_reg(vreg)
+    if phys != 0xFFFFFFFF { return phys }
+    ir_a64_load_spill(scratch, vreg)
+    return scratch
+}
+
+// ---------------------------------------------------------------------------
+// ARM64 syscall number mapping
+// ---------------------------------------------------------------------------
+// The IR uses x86_64 Linux abstract syscall numbers. Map to ARM64 Linux.
+
+fn ir_a64_syscall_nr(uint64 abstract_nr) -> uint64 {
+    if target_os == 1 {
+        // macOS ARM64: same numbers as macOS x86_64 (with 0x2000000 prefix removed,
+        // macOS ARM64 uses the raw Darwin numbers directly)
+        if abstract_nr == 231 { return 1 }    // exit_group -> exit(1)
+        if abstract_nr == 1 { return 4 }      // write -> 4
+        if abstract_nr == 0 { return 3 }      // read -> 3
+        if abstract_nr == 2 { return 5 }      // open -> 5
+        if abstract_nr == 3 { return 6 }      // close -> 6
+        if abstract_nr == 8 { return 199 }    // lseek -> 199
+        if abstract_nr == 9 { return 197 }    // mmap -> 197
+        if abstract_nr == 11 { return 73 }    // munmap -> 73
+        if abstract_nr == 59 { return 59 }    // execve -> 59
+        if abstract_nr == 228 { return 228 }  // clock_gettime
+        if abstract_nr == 15 { return 15 }    // chmod
+        if abstract_nr == 90 { return 15 }    // fchmod -> chmod
+        if abstract_nr == 257 { return 5 }    // openat -> open
+        return abstract_nr
+    }
+    // Linux (0) and Android (3): ARM64 Linux syscall numbers
+    if abstract_nr == 231 { return 93 }    // exit_group -> exit (93)
+    if abstract_nr == 1 { return 64 }      // write -> 64
+    if abstract_nr == 0 { return 63 }      // read -> 63
+    if abstract_nr == 2 { return 56 }      // open -> openat (56)
+    if abstract_nr == 3 { return 57 }      // close -> 57
+    if abstract_nr == 8 { return 62 }      // lseek -> 62
+    if abstract_nr == 9 { return 222 }     // mmap -> 222
+    if abstract_nr == 11 { return 215 }    // munmap -> 215
+    if abstract_nr == 59 { return 221 }    // execve -> 221
+    if abstract_nr == 228 { return 113 }   // clock_gettime -> 113
+    if abstract_nr == 15 { return 53 }     // chmod -> fchmodat (53)
+    if abstract_nr == 90 { return 53 }     // fchmod -> fchmodat (53)
+    if abstract_nr == 257 { return 56 }    // openat -> 56
+    return abstract_nr
+}
+
+// ---------------------------------------------------------------------------
+// ARM64 Windows syscall emitter (IAT-based)
+// ---------------------------------------------------------------------------
+
+fn ir_emit_arm64_win_syscall(uint64 abstract_nr, uint64 dest_v, uint64 dst_r) {
+    if abstract_nr == 231 {
+        // exit(code): ExitProcess(x0=exit_code)
+        // IR_ARG already placed exit code in x0, no shuffling needed
+        emit_a64_win_call_iat(0)
+        return
+    }
+
+    if abstract_nr == 1 {
+        // write(fd, buf, len): IR_ARG placed fd=x0, buf=x1, len=x2
+        // If fd <= 2, convert via GetStdHandle; otherwise fd is already a handle.
+        // Save buf and len across GetStdHandle call
+        emit_a64_mov(11, 1)               // x11 = buf (save)
+        emit_a64_mov(12, 2)               // x12 = len (save)
+        // Check if fd <= 2: CMP x0, #2; B.HI skip_getstdhandle
+        emit_a64_mov_imm(9, 2)
+        emit_a64_cmp(0, 9)
+        // B.HI +8 insns: skip NEG(1)+MOVZ(1)+SUB(1)+IAT(3)+B(1) = 7 insns, land on NOP at +8
+        emit_a64(0x54000108)              // B.HI +8 insns (32 bytes)
+        // GetStdHandle: x0 = -(fd + 10)
+        emit_a64_neg(0, 0)
+        emit_a64_mov_imm(9, 10)
+        emit_a64_sub(0, 0, 9)
+        emit_a64_win_call_iat(1)          // GetStdHandle -> x0 = handle
+        emit_a64(0x14000002)              // B +2 (skip NOP, land on common path)
+        // skip_getstdhandle: fd > 2, x0 already holds the native handle
+        emit_a64(0xD503201F)              // NOP (landing pad for B.HI)
+        // WriteFile(handle=x0, buf=x1, len=x2, &written=x3, overlapped=x4=NULL).
+        // MSDN: lpNumberOfBytesWritten may be NULL only when lpOverlapped is
+        // non-NULL. We do synchronous writes, so a real scratch slot is
+        // required. Allocate 16 bytes on the stack for alignment, pre-zero
+        // the DWORD slot, and point x3 at it; the value isn't read back
+        // because write() ignores its return count for now.
+        emit_a64_sub_sp_imm(16)           // sub sp, sp, #16
+        emit_a64_mov_imm(9, 0)
+        emit_a64(0xF90003E9)              // str x9, [sp]   — pre-zero
+        emit_a64(0x910003E3)              // add x3, sp, #0 (&written)
+        emit_a64_mov_imm(4, 0)            // x4 = NULL (overlapped)
+        emit_a64_mov(2, 12)               // x2 = len
+        emit_a64_mov(1, 11)               // x1 = buf
+        emit_a64_win_call_iat(2)          // WriteFile
+        emit_a64_add_sp_imm(16)           // add sp, sp, #16
+    }
+
+    if abstract_nr == 0 {
+        // read(fd, buf, len): IR_ARG placed fd=x0, buf=x1, len=x2
+        // If fd <= 2, convert via GetStdHandle.
+        emit_a64_mov(11, 1)               // x11 = buf (save)
+        emit_a64_mov(12, 2)               // x12 = len (save)
+        emit_a64_mov_imm(9, 2)
+        emit_a64_cmp(0, 9)
+        // B.HI +8 insns: skip NEG(1)+MOVZ(1)+SUB(1)+IAT(3)+B(1) = 7 insns, land on NOP at +8
+        emit_a64(0x54000108)              // B.HI +8 insns (32 bytes)
+        // GetStdHandle: x0 = -(fd + 10)
+        emit_a64_neg(0, 0)
+        emit_a64_mov_imm(9, 10)
+        emit_a64_sub(0, 0, 9)
+        emit_a64_win_call_iat(1)          // GetStdHandle -> x0 = handle
+        emit_a64(0x14000002)              // B +2 (skip NOP, land on common path)
+        emit_a64(0xD503201F)              // NOP (landing pad for B.HI)
+        // ReadFile(handle=x0, buf=x1, len=x2, &bytesRead=x3, overlapped=x4=NULL).
+        // The 4th arg MUST be a real DWORD*: ReadFile returns BOOL in x0, and
+        // without an out-slot we'd hand that BOOL back as file_read's byte
+        // count (which made the CI test read 1 instead of 8 on ARM64 Windows).
+        // Use [sp,#0] as an aligned 8-byte scratch slot for the DWORD.
+        emit_a64_sub_sp_imm(16)           // sub sp, sp, #16
+        emit_a64_mov_imm(9, 0)
+        emit_a64(0xF90003E9)              // str x9, [sp]   — pre-zero the slot
+        emit_a64(0x910003E3)              // add x3, sp, #0 (&bytesRead)
+        emit_a64_mov_imm(4, 0)            // x4 = NULL (overlapped)
+        emit_a64_mov(2, 12)               // x2 = len
+        emit_a64_mov(1, 11)               // x1 = buf
+        emit_a64_win_call_iat(4)          // ReadFile
+        emit_a64(0xB94003E0)              // ldr w0, [sp]   — bytesRead (zero-extends)
+        emit_a64_add_sp_imm(16)           // add sp, sp, #16
+    }
+
+    if abstract_nr == 2 {
+        // open(path, flags): IR_ARG placed path=x0, flags=x1
+        // CreateFileA(path, access, share, security, disposition, flags, template)
+        // Save path and flags
+        emit_a64_mov(11, 0)               // x11 = path
+        emit_a64_mov(12, 1)               // x12 = flags (0=read, nonzero=write)
+        // Compute access: if flags==0 -> GENERIC_READ (0x80000000), else GENERIC_WRITE (0x40000000)
+        emit_a64_mov_imm(1, 0x80000000)   // default: GENERIC_READ (2 insns: MOVZ+MOVK)
+        emit_a64_cbz(12, 12)              // if flags==0, skip GENERIC_WRITE (2 insns = 8 bytes)
+        emit_a64_mov_imm(1, 0x40000000)   // GENERIC_WRITE (2 insns: MOVZ+MOVK)
+        // x2 = FILE_SHARE_READ = 1
+        emit_a64_mov_imm(2, 1)
+        // x3 = NULL (security)
+        emit_a64_mov_imm(3, 0)
+        // x4 = disposition: if flags==0 -> OPEN_EXISTING(3), else CREATE_ALWAYS(2)
+        emit_a64_mov_imm(4, 3)            // default: OPEN_EXISTING (1 insn)
+        emit_a64_cbz(12, 8)               // if flags==0, skip CREATE_ALWAYS (1 insn = 4 bytes)
+        emit_a64_mov_imm(4, 2)            // CREATE_ALWAYS (1 insn)
+        // x5 = FILE_ATTRIBUTE_NORMAL = 0x80
+        emit_a64_mov_imm(5, 0x80)
+        // x6 = NULL (template)
+        emit_a64_mov_imm(6, 0)
+        // x0 = path
+        emit_a64_mov(0, 11)
+        emit_a64_win_call_iat(3)          // CreateFileA
+    }
+
+    if abstract_nr == 3 {
+        // close(fd): CloseHandle(x0=handle)
+        // IR_ARG already placed handle in x0
+        emit_a64_win_call_iat(5)          // CloseHandle
+    }
+
+    if abstract_nr == 8 {
+        // lseek(fd, offset, whence): GetFileSizeEx(handle, &size)
+        // Used by file_size() builtin. SEEK_SET rewind return is unused, so this is safe.
+        // IR_ARG: x0=handle, x1=offset, x2=whence
+        // Allocate 16 bytes on scratchpad for output
+        emit_a64_add_imm(11, 31, ir_a64_scratch_off)
+        // Zero the output area
+        emit_a64_mov_imm(9, 0)
+        emit_a64_str(9, 11, 0)
+        // x1 = &output (X11)
+        emit_a64_mov(1, 11)
+        // x0 = handle (already in place)
+        emit_a64_win_call_iat(8)          // GetFileSizeEx
+        // x11 is caller-saved (x0..x18) and is clobbered by the IAT call.
+        // Recompute it from SP before loading the result — otherwise the
+        // ldr dereferences whatever GetFileSizeEx left in x11 and the
+        // process segfaults deep inside compile() the moment anyone calls
+        // file_size() on Windows ARM64.
+        emit_a64_add_imm(11, 31, ir_a64_scratch_off)
+        // Load size from [X11]
+        emit_a64_ldr(0, 11, 0)
+    }
+
+    // Move result to dest
+    if dst_r != 0xFFFFFFFF && dst_r != 0 {
+        emit_a64_mov(dst_r, 0)
+    }
+    if dst_r == 0xFFFFFFFF {
+        ir_a64_emit_store_spill(0, dest_v)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-instruction emitter
+// ---------------------------------------------------------------------------
+
+fn ir_emit_arm64_insn(uint64 ii) {
+    uint64 op = ir_insn_opcode(ii)
+    uint64 dest_v = ir_insn_dest(ii)
+    uint64 s1_v = ir_insn_src1(ii)
+    uint64 s2_v = ir_insn_src2(ii)
+    uint64 imm = ir_insn_imm(ii)
+
+    // DWARF line-table recording — see ir.kr's ir_emit_x86_insn.
+    uint64 ir_src_tok = ir_insn_src_tok_at(ii)
+    if ir_src_tok != 0 { line_table_record(ir_src_tok) }
+
+    uint64 dst_r = ir_get_phys_reg(dest_v)
+
+    // ----- IR_STR_CONST (79): dst = lea string data -----
+    if op == 79 {
+        uint64 str_offset = imm
+        // emit_a64_static_lea puts address in x0
+        // Record string fixup
+        if str_fixup_count >= 4096 {
+            write(2, "error: str_fixups overflow (max 4096)\n", 38)
+            exit(1)
+        }
+        uint64 fentry = str_fixups + str_fixup_count * 8
+        uint32 cp = out_len
+        unsafe { *(fentry as uint32) = cp }
+        uint64 fe4 = fentry + 4
+        uint32 so = str_offset
+        unsafe { *(fe4 as uint32) = so }
+        str_fixup_count = str_fixup_count + 1
+        // ADRP + ADD sequence (patched by static fixup resolver)
+        emit_a64(0x90000010)    // ADRP X16, #0
+        emit_a64(0x91000200)    // ADD X0, X16, #0
+        if dst_r != 0xFFFFFFFF {
+            emit_a64_mov(dst_r, 0)
+        } else {
+            ir_a64_emit_store_spill(0, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_CONST (1): dst = imm64 -----
+    if op == 1 {
+        if dst_r != 0xFFFFFFFF {
+            emit_a64_mov_imm(dst_r, imm)
+        } else {
+            emit_a64_mov_imm(9, imm)
+            ir_a64_emit_store_spill(9, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_ADD (2) -----
+    if op == 2 {
+        uint64 a_reg = ir_a64_resolve_src(s1_v, 9)
+        uint64 b_reg = ir_a64_resolve_src(s2_v, 10)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = 9 }
+        emit_a64_add(d, a_reg, b_reg)
+        if dst_r == 0xFFFFFFFF {
+            ir_a64_emit_store_spill(9, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_SUB (3) -----
+    if op == 3 {
+        uint64 a_reg = ir_a64_resolve_src(s1_v, 9)
+        uint64 b_reg = ir_a64_resolve_src(s2_v, 10)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = 9 }
+        emit_a64_sub(d, a_reg, b_reg)
+        if dst_r == 0xFFFFFFFF {
+            ir_a64_emit_store_spill(9, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_MUL (4) -----
+    if op == 4 {
+        uint64 a_reg = ir_a64_resolve_src(s1_v, 9)
+        uint64 b_reg = ir_a64_resolve_src(s2_v, 10)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = 9 }
+        emit_a64_mul(d, a_reg, b_reg)
+        if dst_r == 0xFFFFFFFF {
+            ir_a64_emit_store_spill(9, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_DIV (5) -----
+    if op == 5 {
+        uint64 a_reg = ir_a64_resolve_src(s1_v, 9)
+        uint64 b_reg = ir_a64_resolve_src(s2_v, 10)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = 9 }
+        // Debug-mode div-by-zero trap: ARM64 UDIV silently returns 0
+        // for b==0 (no CPU trap), unlike x86 DIV which #DE's. Emit an
+        // explicit exit(1) guard so programs behave the same under
+        // --debug on both architectures.
+        if debug_mode != 0 {
+            uint64 dz_cbnz = out_len
+            emit_a64(0xB5000000 | (b_reg & 0x1F))   // CBNZ xB, skip — patched below
+            emit_a64_mov_imm(0, 1)
+            emit_a64_mov_imm(8, 93)                  // exit syscall
+            emit_a64_svc()
+            uint64 dz_delta = (out_len - dz_cbnz) / 4
+            patch_u32(dz_cbnz, 0xB5000000 | ((dz_delta & 0x7FFFF) << 5) | (b_reg & 0x1F))
+        }
+        emit_a64_udiv(d, a_reg, b_reg)
+        if dst_r == 0xFFFFFFFF {
+            ir_a64_emit_store_spill(9, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_MOD (6): dst = src1 % src2 = src1 - (src1/src2)*src2 -----
+    if op == 6 {
+        uint64 a_reg = ir_a64_resolve_src(s1_v, 9)
+        uint64 b_reg = ir_a64_resolve_src(s2_v, 10)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = 9 }
+        if debug_mode != 0 {
+            uint64 dz_cbnz = out_len
+            emit_a64(0xB5000000 | (b_reg & 0x1F))
+            emit_a64_mov_imm(0, 1)
+            emit_a64_mov_imm(8, 93)
+            emit_a64_svc()
+            uint64 dz_delta = (out_len - dz_cbnz) / 4
+            patch_u32(dz_cbnz, 0xB5000000 | ((dz_delta & 0x7FFFF) << 5) | (b_reg & 0x1F))
+        }
+        // x11 = a / b
+        emit_a64_udiv(11, a_reg, b_reg)
+        // d = a - x11 * b (MSUB d, x11, b, a)
+        emit_a64_msub(d, 11, b_reg, a_reg)
+        if dst_r == 0xFFFFFFFF {
+            ir_a64_emit_store_spill(9, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_AND (7) -----
+    if op == 7 {
+        uint64 a_reg = ir_a64_resolve_src(s1_v, 9)
+        uint64 b_reg = ir_a64_resolve_src(s2_v, 10)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = 9 }
+        emit_a64_and(d, a_reg, b_reg)
+        if dst_r == 0xFFFFFFFF {
+            ir_a64_emit_store_spill(9, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_OR (8) -----
+    if op == 8 {
+        uint64 a_reg = ir_a64_resolve_src(s1_v, 9)
+        uint64 b_reg = ir_a64_resolve_src(s2_v, 10)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = 9 }
+        emit_a64_orr(d, a_reg, b_reg)
+        if dst_r == 0xFFFFFFFF {
+            ir_a64_emit_store_spill(9, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_XOR (9) -----
+    if op == 9 {
+        uint64 a_reg = ir_a64_resolve_src(s1_v, 9)
+        uint64 b_reg = ir_a64_resolve_src(s2_v, 10)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = 9 }
+        emit_a64_eor(d, a_reg, b_reg)
+        if dst_r == 0xFFFFFFFF {
+            ir_a64_emit_store_spill(9, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_SHL (10) -----
+    if op == 10 {
+        uint64 a_reg = ir_a64_resolve_src(s1_v, 9)
+        uint64 b_reg = ir_a64_resolve_src(s2_v, 10)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = 9 }
+        emit_a64_lsl(d, a_reg, b_reg)
+        if dst_r == 0xFFFFFFFF {
+            ir_a64_emit_store_spill(9, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_SHR (11) — logical (zero-fill) -----
+    if op == 11 {
+        uint64 a_reg = ir_a64_resolve_src(s1_v, 9)
+        uint64 b_reg = ir_a64_resolve_src(s2_v, 10)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = 9 }
+        emit_a64_lsr(d, a_reg, b_reg)
+        if dst_r == 0xFFFFFFFF {
+            ir_a64_emit_store_spill(9, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_SAR (134) — arithmetic (sign-fill) -----
+    if op == 134 {
+        uint64 a_reg = ir_a64_resolve_src(s1_v, 9)
+        uint64 b_reg = ir_a64_resolve_src(s2_v, 10)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = 9 }
+        emit_a64_asr(d, a_reg, b_reg)
+        if dst_r == 0xFFFFFFFF {
+            ir_a64_emit_store_spill(9, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_NEG (12) -----
+    if op == 12 {
+        uint64 a_reg = ir_a64_resolve_src(s1_v, 9)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = 9 }
+        emit_a64_neg(d, a_reg)
+        if dst_r == 0xFFFFFFFF {
+            ir_a64_emit_store_spill(9, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_NOT (13) -----
+    if op == 13 {
+        uint64 a_reg = ir_a64_resolve_src(s1_v, 9)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = 9 }
+        emit_a64_mvn(d, a_reg)
+        if dst_r == 0xFFFFFFFF {
+            ir_a64_emit_store_spill(9, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_CMP_EQ (14) through IR_CMP_GE (19) -----
+    if op >= 14 && op <= 19 {
+        uint64 a_reg = ir_a64_resolve_src(s1_v, 9)
+        uint64 b_reg = ir_a64_resolve_src(s2_v, 10)
+        emit_a64_cmp(a_reg, b_reg)
+        // ARM64 condition codes for unsigned comparisons:
+        // EQ=0, NE=1, LO(CC)=3, LS=9, HI=8, HS(CS)=2
+        uint64 cond = 0
+        if op == 14 { cond = 0 }   // EQ
+        if op == 15 { cond = 1 }   // NE
+        if op == 16 { cond = 3 }   // LO (unsigned <)
+        if op == 17 { cond = 9 }   // LS (unsigned <=)
+        if op == 18 { cond = 8 }   // HI (unsigned >)
+        if op == 19 { cond = 2 }   // HS (unsigned >=)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = 9 }
+        emit_a64_cset(d, cond)
+        if dst_r == 0xFFFFFFFF {
+            ir_a64_emit_store_spill(9, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_SDIV (132): signed 64-bit divide -----
+    if op == 132 {
+        uint64 a_reg = ir_a64_resolve_src(s1_v, 9)
+        uint64 b_reg = ir_a64_resolve_src(s2_v, 10)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = 9 }
+        if debug_mode != 0 {
+            uint64 dz_cbnz = out_len
+            emit_a64(0xB5000000 | (b_reg & 0x1F))
+            emit_a64_mov_imm(0, 1)
+            emit_a64_mov_imm(8, 93)
+            emit_a64_svc()
+            uint64 dz_delta = (out_len - dz_cbnz) / 4
+            patch_u32(dz_cbnz, 0xB5000000 | ((dz_delta & 0x7FFFF) << 5) | (b_reg & 0x1F))
+        }
+        emit_a64_sdiv(d, a_reg, b_reg)
+        if dst_r == 0xFFFFFFFF {
+            ir_a64_emit_store_spill(9, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_SMOD (133): signed remainder via sdiv + msub -----
+    if op == 133 {
+        uint64 a_reg = ir_a64_resolve_src(s1_v, 9)
+        uint64 b_reg = ir_a64_resolve_src(s2_v, 10)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = 9 }
+        if debug_mode != 0 {
+            uint64 dz_cbnz = out_len
+            emit_a64(0xB5000000 | (b_reg & 0x1F))
+            emit_a64_mov_imm(0, 1)
+            emit_a64_mov_imm(8, 93)
+            emit_a64_svc()
+            uint64 dz_delta = (out_len - dz_cbnz) / 4
+            patch_u32(dz_cbnz, 0xB5000000 | ((dz_delta & 0x7FFFF) << 5) | (b_reg & 0x1F))
+        }
+        emit_a64_sdiv(11, a_reg, b_reg)
+        emit_a64_msub(d, 11, b_reg, a_reg)
+        if dst_r == 0xFFFFFFFF {
+            ir_a64_emit_store_spill(9, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_SCMP_LT (120) through IR_SCMP_GE (123) -----
+    if op >= 120 && op <= 123 {
+        uint64 a_reg = ir_a64_resolve_src(s1_v, 9)
+        uint64 b_reg = ir_a64_resolve_src(s2_v, 10)
+        emit_a64_cmp(a_reg, b_reg)
+        // Signed condition codes: LT=11, LE=13, GT=12, GE=10
+        uint64 cond = 0
+        if op == 120 { cond = 11 }  // LT
+        if op == 121 { cond = 13 }  // LE
+        if op == 122 { cond = 12 }  // GT
+        if op == 123 { cond = 10 }  // GE
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = 9 }
+        emit_a64_cset(d, cond)
+        if dst_r == 0xFFFFFFFF {
+            ir_a64_emit_store_spill(9, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_LOAD (30): dest = *(src1), width in imm -----
+    if op == 30 {
+        uint64 addr_reg = ir_a64_resolve_src(s1_v, 10)
+        if imm == 0 && s2_v != 0 { imm = s2_v }
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = 9 }
+        if imm == 8 {
+            emit_a64_ldr(d, addr_reg, 0)
+        } else if imm == 4 {
+            emit_a64_ldr32(d, addr_reg, 0)
+        } else if imm == 2 {
+            emit_a64_ldrh(d, addr_reg, 0)
+        } else {
+            emit_a64_ldrb(d, addr_reg, 0)
+        }
+        if dst_r == 0xFFFFFFFF {
+            ir_a64_emit_store_spill(9, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_STORE (31): *(src1) = src2, width in dest_v -----
+    if op == 31 {
+        uint64 addr_reg = ir_a64_resolve_src(s1_v, 9)
+        uint64 val_reg = ir_a64_resolve_src(s2_v, 10)
+        uint64 width = dest_v
+        if width == 8 {
+            emit_a64_str(val_reg, addr_reg, 0)
+        } else if width == 4 {
+            emit_a64_str32(val_reg, addr_reg, 0)
+        } else if width == 2 {
+            emit_a64_strh(val_reg, addr_reg, 0)
+        } else {
+            emit_a64_strb(val_reg, addr_reg, 0)
+        }
+        return
+    }
+
+    // ----- IR_STACK_ADDR (32): compute address of stack slot -----
+    if op == 32 {
+        // imm = offset from frame base (spill area start)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = 9 }
+        emit_a64_add_imm(d, 31, imm)
+        if dst_r == 0xFFFFFFFF {
+            ir_a64_emit_store_spill(9, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_COPY (61) -----
+    if op == 61 {
+        if s1_v != 0 {
+            uint64 src_reg = ir_a64_resolve_src(s1_v, 9)
+            if dst_r != 0xFFFFFFFF {
+                emit_a64_mov(dst_r, src_reg)
+            } else {
+                if src_reg != 9 { emit_a64_mov(9, src_reg) }
+                ir_a64_emit_store_spill(9, dest_v)
+            }
+        } else {
+            // Param init: imm = param index
+            // AAPCS64: x0-x7 for first 8 params
+            if imm < 8 {
+                uint64 pr = imm
+                if dst_r != 0xFFFFFFFF {
+                    emit_a64_mov(dst_r, pr)
+                } else {
+                    emit_a64_mov(9, pr)
+                    ir_a64_emit_store_spill(9, dest_v)
+                }
+            } else if imm >= 100 {
+                // ASM output: read from physical register (imm - 100)
+                uint64 phys_src = imm - 100
+                if dst_r != 0xFFFFFFFF {
+                    emit_a64_mov(dst_r, phys_src)
+                } else {
+                    emit_a64_mov(9, phys_src)
+                    ir_a64_emit_store_spill(9, dest_v)
+                }
+            } else {
+                // Overflow param (8+): load from caller stack frame
+                // After prologue: [SP + frame_size] = saved regs start
+                // caller stack args at [SP + frame_size + (imm-8)*8]
+                uint64 overflow_off = ir_frame_size + (imm - 8) * 8
+                uint64 d = dst_r
+                if d == 0xFFFFFFFF { d = 9 }
+                ir_a64_ldr_sp(d, overflow_off)
+                if dst_r == 0xFFFFFFFF {
+                    ir_a64_emit_store_spill(9, dest_v)
+                }
+            }
+        }
+        return
+    }
+
+    // ----- IR_RET (42): move result to x0 then branch to epilogue -----
+    if op == 42 {
+        uint64 ret_r = ir_a64_resolve_src(s1_v, 9)
+        if ret_r != 0 { emit_a64_mov(0, ret_r) }
+        // B to epilogue (patched later)
+        uint64 rfp = ir_ret_fixups + ir_ret_fixup_count * 4
+        uint32 rpo = out_len
+        unsafe { *(rfp as uint32) = rpo }
+        ir_ret_fixup_count = ir_ret_fixup_count + 1
+        emit_a64(0x14000000)    // B #0 (placeholder)
+        return
+    }
+
+    // ----- IR_RET_VOID (43): branch to epilogue -----
+    if op == 43 {
+        uint64 rfp = ir_ret_fixups + ir_ret_fixup_count * 4
+        uint32 rpo = out_len
+        unsafe { *(rfp as uint32) = rpo }
+        ir_ret_fixup_count = ir_ret_fixup_count + 1
+        emit_a64(0x14000000)    // B #0 (placeholder)
+        return
+    }
+
+    // ----- IR_ARG (51): move value to argument register x0-x7 -----
+    if op == 51 {
+        // AAPCS64: x0-x7 for first 8 arguments
+        if imm < 8 {
+            uint64 target = imm
+            uint64 src_reg = ir_a64_resolve_src(s1_v, 9)
+            emit_a64_mov(target, src_reg)
+        } else if imm >= 100 {
+            // Direct register target (ASM I/O constraints)
+            uint64 phys_target = imm - 100
+            uint64 src_reg = ir_a64_resolve_src(s1_v, 9)
+            emit_a64_mov(phys_target, src_reg)
+        } else {
+            // Overflow arg (AAPCS64: the 9th+ parameter). The caller's
+            // frame already reserves IR_A64_OVERFLOW_RESERVE bytes at
+            // the bottom, so SP at the upcoming BL will sit exactly on
+            // top of those slots — no SUB/ADD needed. Just STR the
+            // arg value at [SP + (imm-8)*8].
+            uint64 oi = imm - 8
+            if oi < 16 {
+                uint64 src_reg = ir_a64_resolve_src(s1_v, 9)
+                ir_a64_str_sp(src_reg, oi * 8)
+            }
+        }
+        return
+    }
+
+    // ----- IR_CALL (50): bl with fixup -----
+    if op == 50 {
+        // Overflow args (>8 args) were already written to [SP + oi*8]
+        // by IR_ARG — the caller's bottom-of-frame overflow reserve
+        // lines them up with the callee's arg-9 slot.
+        uint64 call_patch = out_len
+        emit_a64(0x94000000)    // BL #0 (placeholder)
+        // Record fixup: imm holds the callee token
+        uint64 fentry = fixup_table + fixup_count * 8
+        uint32 fo = call_patch
+        unsafe { *(fentry as uint32) = fo }
+        uint64 fe4 = fentry + 4
+        uint32 ct = imm
+        unsafe { *(fe4 as uint32) = ct }
+        fixup_count = fixup_count + 1
+        ir_overflow_arg_count = 0
+        // Result in x0
+        if dst_r != 0xFFFFFFFF && dst_r != 0 {
+            emit_a64_mov(dst_r, 0)
+        }
+        if dst_r == 0xFFFFFFFF {
+            ir_a64_emit_store_spill(0, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_SYSCALL (52) -----
+    if op == 52 {
+        if target_os == 2 {
+            ir_emit_arm64_win_syscall(imm, dest_v, dst_r)
+            return
+        }
+        // ARM64 Linux/Android: open(2) → openat(56) needs arg shift
+        // IR_ARG sets x0=path, x1=flags, x2=mode
+        // openat needs x0=AT_FDCWD(-100), x1=path, x2=flags, x3=mode
+        if imm == 2 && target_os != 1 {
+            emit_a64_mov(3, 2)          // x3 = mode (was x2)
+            emit_a64_mov(2, 1)          // x2 = flags (was x1)
+            emit_a64_mov(1, 0)          // x1 = path (was x0)
+            emit_a64_mov_imm(0, 0xFFFFFFFFFFFFFF9C)  // x0 = AT_FDCWD (-100)
+        }
+        // Map abstract syscall number to ARM64 number
+        uint64 real_nr = ir_a64_syscall_nr(imm)
+        emit_a64_syscall_nr(real_nr)
+        emit_a64_svc()
+        // Result in x0
+        if dst_r != 0xFFFFFFFF && dst_r != 0 {
+            emit_a64_mov(dst_r, 0)
+        }
+        if dst_r == 0xFFFFFFFF {
+            ir_a64_emit_store_spill(0, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_ALLOC (70): inline mmap / VirtualAlloc -----
+    if op == 70 {
+        // src1 = size vreg (if != 0), or imm = constant size
+        uint64 size_reg = 0
+        if s1_v != 0 {
+            size_reg = ir_a64_resolve_src(s1_v, 9)
+        } else {
+            emit_a64_mov_imm(9, imm)
+            size_reg = 9
+        }
+        // Save original size in x11 (scratch)
+        emit_a64_mov(11, size_reg)
+        if target_os == 2 {
+            // Windows ARM64: VirtualAlloc(NULL, size+8, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE)
+            emit_a64_mov_imm(0, 0)
+            emit_a64_add_imm(1, size_reg, 8)
+            emit_a64_mov_imm(2, 0x3000)
+            emit_a64_mov_imm(3, 4)
+            emit_a64_win_call_iat(6)
+            // x0 = raw ptr. Store header: [x0] = original size (x11)
+            emit_a64_str(11, 0, 0)
+            // x0 = x0 + 8 (return ptr past header)
+            emit_a64_add_imm(0, 0, 8)
+        } else {
+            // AAPCS64 mmap: x0=addr, x1=len, x2=prot, x3=flags, x4=fd, x5=offset
+            // x0 = 0 (addr)
+            emit_a64_mov_imm(0, 0)
+            // x1 = size + 8
+            emit_a64_add_imm(1, size_reg, 8)
+            // x2 = PROT_READ|PROT_WRITE = 3
+            emit_a64_mov_imm(2, 3)
+            // x3 = MAP_PRIVATE|MAP_ANON — 0x22 on Linux, 0x1002 on macOS. The
+            // old hardcoded 0x22 made every mmap on macOS ARM64 return an
+            // invalid pointer, which is what SIGSEGV'd the alloc/fileio tests
+            // and every self-compile on native arm64 macOS CI.
+            uint64 a64_mmap_flags = 0x22
+            if target_os == 1 { a64_mmap_flags = 0x1002 }
+            emit_a64_mov_imm(3, a64_mmap_flags)
+            // x4 = -1 (fd)
+            emit_a64_mov_imm(4, 0xFFFFFFFFFFFFFFFF)
+            // x5 = 0 (offset)
+            emit_a64_mov_imm(5, 0)
+            // syscall (mmap)
+            uint64 mmap_nr = ir_a64_syscall_nr(9)
+            emit_a64_syscall_nr(mmap_nr)
+            emit_a64_svc()
+            // x0 = raw ptr. Store header: [x0] = original size (x11)
+            emit_a64_str(11, 0, 0)
+            // x0 = x0 + 8 (return ptr past header)
+            emit_a64_add_imm(0, 0, 8)
+        }
+        if dst_r != 0xFFFFFFFF && dst_r != 0 {
+            emit_a64_mov(dst_r, 0)
+        }
+        if dst_r == 0xFFFFFFFF {
+            ir_a64_emit_store_spill(0, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_DEALLOC (71): inline munmap / VirtualFree -----
+    if op == 71 {
+        uint64 ptr_reg = ir_a64_resolve_src(s1_v, 9)
+        if target_os == 2 {
+            // Windows ARM64: VirtualFree(ptr-8, 0, MEM_RELEASE=0x8000)
+            emit_a64_mov_imm(10, 8)
+            emit_a64_sub(0, ptr_reg, 10)
+            emit_a64_mov_imm(1, 0)
+            emit_a64_mov_imm(2, 0x8000)
+            emit_a64_win_call_iat(13)
+        } else {
+            // x0 = ptr - 8 (real base)
+            emit_a64_mov_imm(10, 8)
+            emit_a64_sub(0, ptr_reg, 10)
+            // x1 = *(x0) + 8 (total length)
+            emit_a64_ldr(1, 0, 0)
+            emit_a64_add_imm(1, 1, 8)
+            // munmap syscall
+            uint64 munmap_nr = ir_a64_syscall_nr(11)
+            emit_a64_syscall_nr(munmap_nr)
+            emit_a64_svc()
+        }
+        return
+    }
+
+    // ----- IR_MEMCPY (72): byte copy loop -----
+    if op == 72 {
+        uint64 mc_dst = ir_a64_resolve_src(s1_v, 9)
+        uint64 mc_src = ir_a64_resolve_src(s2_v, 10)
+        // Resolve len from imm (stored as vreg index)
+        uint64 mc_len_vreg = imm
+        uint64 mc_len = 0
+        if mc_len_vreg > 0 && mc_len_vreg < ir_vreg_next {
+            mc_len = ir_get_phys_reg(mc_len_vreg)
+            if mc_len == 0xFFFFFFFF {
+                ir_a64_load_spill(11, mc_len_vreg)
+                mc_len = 11
+            }
+        }
+        // x0 = dst, x1 = src, x2 = len
+        emit_a64_mov(0, mc_dst)
+        emit_a64_mov(1, mc_src)
+        emit_a64_mov(2, mc_len)
+        // Save dst for return value
+        emit_a64_mov(11, mc_dst)
+        // Loop: CBZ x2, done; LDRB w3, [x1], #1; STRB w3, [x0], #1; SUB x2, x2, #1; B loop
+        uint64 mc_loop = out_len
+        // CBZ x2, done (skip 4 instructions = 16 bytes)
+        emit_a64_cbz(2, 20)
+        // LDRB w3, [x1], #1 (post-index byte load)
+        emit_a64(0x38401423)
+        // STRB w3, [x0], #1 (post-index byte store)
+        emit_a64(0x38001403)
+        // SUB x2, x2, #1
+        emit_a64(0xD1000442)
+        // B loop
+        uint64 mc_back = mc_loop - out_len
+        emit_a64(0x14000000 | ((mc_back / 4) & 0x3FFFFFF))
+        // Return original dst
+        if dst_r != 0xFFFFFFFF {
+            emit_a64_mov(dst_r, 11)
+        } else {
+            emit_a64_mov(9, 11)
+            ir_a64_emit_store_spill(9, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_STRLEN (73): byte scan loop -----
+    if op == 73 {
+        uint64 sl_str = ir_a64_resolve_src(s1_v, 9)
+        // x0 = str (current ptr), x1 = str (start)
+        emit_a64_mov(0, sl_str)
+        emit_a64_mov(1, sl_str)
+        // Loop: LDRB w2, [x0]; CBZ w2, done; ADD x0, x0, #1; B loop
+        uint64 sl_loop = out_len
+        emit_a64_ldrb(2, 0, 0)
+        // CBZ w2, done (skip 2 insns = 8 bytes) -- use 32-bit CBZ for byte register
+        emit_a64(0x34000062)    // CBZ w2, +3 insns (12 bytes)
+        emit_a64_add_imm(0, 0, 1)
+        uint64 sl_back = sl_loop - out_len
+        emit_a64(0x14000000 | ((sl_back / 4) & 0x3FFFFFF))
+        // done: length = x0 - x1
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = 9 }
+        emit_a64_sub(d, 0, 1)
+        if dst_r == 0xFFFFFFFF {
+            ir_a64_emit_store_spill(9, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_FMT_UINT (74): format uint to buffer -----
+    if op == 74 {
+        uint64 fu_buf = ir_a64_resolve_src(s1_v, 9)
+        uint64 fu_val = ir_a64_resolve_src(s2_v, 10)
+        // x0 = buf, x1 = val, x2 = digit count, x3 = divisor (10)
+        emit_a64_mov(0, fu_buf)
+        emit_a64_mov(1, fu_val)
+        emit_a64_mov_imm(2, 0)
+        emit_a64_mov_imm(3, 10)
+        // Use the permanent 32-byte scratchpad in the frame (no SP shift)
+        // x12 = SP + ir_a64_scratch_off (digit area base)
+        emit_a64_mov_imm(12, ir_a64_scratch_off)
+        ir_a64_add_sp_reg(12, 12)
+
+        // Digit extraction loop: divide by 10, store remainder + '0'
+        uint64 fu_loop = out_len
+        emit_a64_udiv(4, 1, 3)       // x4 = val / 10
+        emit_a64_msub(5, 4, 3, 1)    // x5 = val - (val/10)*10 = remainder
+        emit_a64_add_imm(5, 5, 48)   // x5 += '0'
+        // Store digit byte at [x12 + x2]
+        // STRB w5, [x12, x2]
+        emit_a64(0x38226985)
+        // x2++
+        emit_a64_add_imm(2, 2, 1)
+        // val = quotient
+        emit_a64_mov(1, 4)
+        // CBNZ x1, loop
+        uint64 fu_back = fu_loop - out_len
+        emit_a64(0xB5000000 | (((fu_back / 4) & 0x7FFFF) << 5) | 1)
+
+        // Copy digits in reverse order to output buffer
+        // x6 = digit count (save)
+        emit_a64_mov(6, 2)
+        // Copy loop: x2 = remaining, x0 = output ptr
+        uint64 fu_copy = out_len
+        // CBZ x2, done
+        emit_a64_cbz(2, 20)
+        // x2--
+        emit_a64(0xD1000442)    // SUB x2, x2, #1
+        // LDRB w5, [x12, x2]
+        emit_a64(0x38626985)
+        // STRB w5, [x0], #1
+        emit_a64(0x38001405)
+        // B copy_loop
+        uint64 fu_copy_back = fu_copy - out_len
+        emit_a64(0x14000000 | ((fu_copy_back / 4) & 0x3FFFFFF))
+
+        // Restore stack (removed, using static scratchpad)
+        // emit_a64_add_sp_imm(32)
+
+        // Return digit count (x6)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = 9 }
+        emit_a64_mov(d, 6)
+        if dst_r == 0xFFFFFFFF {
+            ir_a64_emit_store_spill(9, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_STR_EQ (75): byte-by-byte string compare -----
+    if op == 75 {
+        uint64 se_a = ir_a64_resolve_src(s1_v, 9)
+        uint64 se_b = ir_a64_resolve_src(s2_v, 10)
+        emit_a64_mov(0, se_a)
+        emit_a64_mov(1, se_b)
+        // Loop: LDRB w2, [x0]; LDRB w3, [x1]; CMP w2, w3; B.NE not_equal;
+        //       CBZ w2, equal; ADD x0,x0,1; ADD x1,x1,1; B loop
+        uint64 se_loop = out_len
+        emit_a64_ldrb(2, 0, 0)
+        emit_a64_ldrb(3, 1, 0)
+        // CMP w2, w3 (32-bit) — SUBS WZR, w2, w3 so flags are set but w2
+        // is preserved. The old encoding used Rd=w2, which destroyed w2
+        // whenever the bytes matched (SUBS w2,w2,w3 = 0), making the
+        // subsequent CBZ w2 *always* treat equal-byte positions as
+        // end-of-string and return 1 (equal) immediately. Classic case:
+        // str_eq("ab","a") returned 1 because the first match byte 'a'
+        // got subtracted into 0 and CBZ fired on the synthesized zero.
+        emit_a64(0x6B03005F)
+        // B.NE not_equal (+5 insns). imm19 field sits at [23:5], so the
+        // instruction-count goes in bits 9:5 for small offsets — 5 << 5 = 0xA0.
+        // The old constants here (0x54000141, 0x34000102) had imm19 shifted by
+        // 6 instead of 5, doubling every branch offset and falling off the end
+        // of the comparator — that made str_eq return the first byte instead
+        // of a 0/1 result.
+        emit_a64(0x540000A1)    // B.NE +5
+        // CBZ w2, equal (+6 insns) — need 6 to hop over the back-edge
+        // branch AND the not_equal path's MOVZ+B pair.
+        emit_a64(0x340000C2)    // CBZ w2, +6
+        emit_a64_add_imm(0, 0, 1)
+        emit_a64_add_imm(1, 1, 1)
+        uint64 se_back = se_loop - out_len
+        emit_a64(0x14000000 | ((se_back / 4) & 0x3FFFFFF))
+        // not_equal: result = 0
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = 9 }
+        emit_a64_mov_imm(d, 0)
+        // B done (+2 insns = 8 bytes)
+        emit_a64(0x14000002)
+        // equal: result = 1
+        emit_a64_mov_imm(d, 1)
+        // done:
+        if dst_r == 0xFFFFFFFF {
+            ir_a64_emit_store_spill(9, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_MEMSET (76): byte fill loop -----
+    if op == 76 {
+        uint64 ms_dst = ir_a64_resolve_src(s1_v, 9)
+        uint64 ms_val = ir_a64_resolve_src(s2_v, 10)
+        uint64 ms_len_vreg = imm
+        uint64 ms_len = 0
+        if ms_len_vreg > 0 && ms_len_vreg < ir_vreg_next {
+            ms_len = ir_get_phys_reg(ms_len_vreg)
+            if ms_len == 0xFFFFFFFF {
+                ir_a64_load_spill(11, ms_len_vreg)
+                ms_len = 11
+            }
+        }
+        // x0 = dst, x1 = val, x2 = len
+        emit_a64_mov(0, ms_dst)
+        emit_a64_mov(1, ms_val)
+        emit_a64_mov(2, ms_len)
+        // Save dst for return
+        emit_a64_mov(11, ms_dst)
+        // Loop: CBZ x2, done; STRB w1, [x0], #1; SUB x2, x2, #1; B loop
+        uint64 ms_loop = out_len
+        emit_a64_cbz(2, 16)
+        // STRB w1, [x0], #1 (post-index)
+        emit_a64(0x38001401)
+        emit_a64(0xD1000442)    // SUB x2, x2, #1
+        uint64 ms_back = ms_loop - out_len
+        emit_a64(0x14000000 | ((ms_back / 4) & 0x3FFFFFF))
+        // Return original dst
+        if dst_r != 0xFFFFFFFF {
+            emit_a64_mov(dst_r, 11)
+        } else {
+            emit_a64_mov(9, 11)
+            ir_a64_emit_store_spill(9, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_STATIC_LOAD (77) -----
+    if op == 77 {
+        emit_a64_static_load(imm)
+        if dst_r != 0xFFFFFFFF {
+            emit_a64_mov(dst_r, 0)
+        } else {
+            ir_a64_emit_store_spill(0, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_STATIC_STORE (78) -----
+    if op == 78 {
+        uint64 ss_r = ir_a64_resolve_src(s1_v, 9)
+        emit_a64_mov(0, ss_r)
+        emit_a64_static_store(imm)
+        return
+    }
+
+    // ----- IR_STATIC_ADDR (84) -----
+    if op == 84 {
+        emit_a64_static_lea(imm)
+        if dst_r != 0xFFFFFFFF {
+            emit_a64_mov(dst_r, 0)
+        } else {
+            ir_a64_emit_store_spill(0, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_EXTRACT_RDX (80) / IR_EXTRACT_R8 (81) -----
+    // ARM64: second/third return values in x1/x2 (AAPCS64)
+    if op == 80 {
+        if dst_r != 0xFFFFFFFF {
+            emit_a64_mov(dst_r, 1)
+        } else {
+            ir_a64_emit_store_spill(1, dest_v)
+        }
+        return
+    }
+    if op == 81 {
+        if dst_r != 0xFFFFFFFF {
+            emit_a64_mov(dst_r, 2)
+        } else {
+            ir_a64_emit_store_spill(2, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_RET2 (82): return (src1, src2) in x0, x1 -----
+    if op == 82 {
+        uint64 r2_src = ir_a64_resolve_src(s2_v, 10)
+        emit_a64_mov(1, r2_src)
+        uint64 r1_src = ir_a64_resolve_src(s1_v, 9)
+        if r1_src != 0 { emit_a64_mov(0, r1_src) }
+        uint64 rfp82 = ir_ret_fixups + ir_ret_fixup_count * 4
+        uint32 rpo82 = out_len
+        unsafe { *(rfp82 as uint32) = rpo82 }
+        ir_ret_fixup_count = ir_ret_fixup_count + 1
+        emit_a64(0x14000000)
+        return
+    }
+
+    // ----- IR_RET3 (83): return (src1, src2, imm-vreg) in x0, x1, x2 -----
+    if op == 83 {
+        uint64 r3_vreg = imm
+        uint64 r3_src = 0
+        if r3_vreg > 0 && r3_vreg < ir_vreg_next {
+            r3_src = ir_get_phys_reg(r3_vreg)
+            if r3_src == 0xFFFFFFFF {
+                ir_a64_load_spill(11, r3_vreg)
+                r3_src = 11
+            }
+        }
+        emit_a64_mov(2, r3_src)
+        uint64 r2_src83 = ir_a64_resolve_src(s2_v, 10)
+        emit_a64_mov(1, r2_src83)
+        uint64 r1_src83 = ir_a64_resolve_src(s1_v, 9)
+        if r1_src83 != 0 { emit_a64_mov(0, r1_src83) }
+        uint64 rfp83 = ir_ret_fixups + ir_ret_fixup_count * 4
+        uint32 rpo83 = out_len
+        unsafe { *(rfp83 as uint32) = rpo83 }
+        ir_ret_fixup_count = ir_ret_fixup_count + 1
+        emit_a64(0x14000000)
+        return
+    }
+
+    // ----- IR_SYSCALL_RAW (85) -----
+    if op == 85 {
+        // src1 = nr vreg, args already in x0-x5
+        uint64 nr_r = ir_a64_resolve_src(s1_v, 9)
+        emit_a64_mov(8, nr_r)
+        emit_a64_svc()
+        if dst_r != 0xFFFFFFFF && dst_r != 0 {
+            emit_a64_mov(dst_r, 0)
+        }
+        if dst_r == 0xFFFFFFFF {
+            ir_a64_emit_store_spill(0, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_FN_ADDR (86) -----
+    if op == 86 {
+        // ADRP + ADD, patched by fnaddr fixup resolver
+        if fnaddr_fixup_count < 1024 {
+            uint64 fentry_fa = fnaddr_fixup_table + fnaddr_fixup_count * 8
+            uint32 fa_off = out_len
+            unsafe { *(fentry_fa as uint32) = fa_off }
+            uint64 fe4_fa = fentry_fa + 4
+            uint32 fa_tok = imm
+            unsafe { *(fe4_fa as uint32) = fa_tok }
+            fnaddr_fixup_count = fnaddr_fixup_count + 1
+        }
+        emit_a64(0x90000010)    // ADRP X16, #0
+        emit_a64(0x91000200)    // ADD X0, X16, #0
+        if dst_r != 0xFFFFFFFF {
+            emit_a64_mov(dst_r, 0)
+        } else {
+            ir_a64_emit_store_spill(0, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_CALL_IND (87): indirect call through function pointer -----
+    if op == 87 {
+        uint64 ptr_r = ir_a64_resolve_src(s1_v, 9)
+        emit_a64_blr(ptr_r)
+        if dst_r != 0xFFFFFFFF && dst_r != 0 {
+            emit_a64_mov(dst_r, 0)
+        }
+        if dst_r == 0xFFFFFFFF {
+            ir_a64_emit_store_spill(0, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_MEMCMP (88) -----
+    if op == 88 {
+        uint64 mc_a = ir_a64_resolve_src(s1_v, 9)
+        uint64 mc_b = ir_a64_resolve_src(s2_v, 10)
+        emit_a64_mov(0, mc_a)
+        emit_a64_mov(1, mc_b)
+        emit_a64_mov_imm(2, imm)
+        // Result = 1 (assume equal)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = 9 }
+        emit_a64_mov_imm(d, 1)
+        // Loop: CBZ x2, done; LDRB w3,[x0],#1; LDRB w4,[x1],#1; CMP w3,w4; B.NE ne; SUB x2,x2,#1; B loop
+        uint64 mc_loop = out_len
+        emit_a64_cbz(2, 28)
+        emit_a64(0x38401403)    // LDRB w3, [x0], #1
+        emit_a64(0x38401424)    // LDRB w4, [x1], #1
+        // CMP w3, w4 (SUBS WZR, w3, w4). Old constant 0x6B040063 had
+        // Rd=w3, so it overwrote w3 with the subtraction result — same
+        // shape as the str_eq bug. Must be Rd=WZR(31) to preserve the
+        // bytes for the loop-exit path (not strictly needed here since
+        // we don't reuse w3 after CMP, but keep it faithful to `CMP`).
+        emit_a64(0x6B04007F)    // CMP w3, w4
+        // B.NE not_equal (+4 insns) — want to land on the MOVZ d,0
+        // at position (+4). Old encoding 0x54000061 set imm19=3 which
+        // dropped us onto the unconditional `B done` and skipped the
+        // MOVZ d=0, so memcmp always returned the pre-loop value 1
+        // (thus == true for every non-equal struct).
+        emit_a64(0x54000081)    // B.NE +4
+        emit_a64(0xD1000442)    // SUB x2, x2, #1
+        uint64 mc_back = mc_loop - out_len
+        emit_a64(0x14000000 | ((mc_back / 4) & 0x3FFFFFF))
+        // B done (+2)
+        emit_a64(0x14000002)
+        // not_equal:
+        emit_a64_mov_imm(d, 0)
+        // done:
+        if dst_r == 0xFFFFFFFF {
+            ir_a64_emit_store_spill(9, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_PHI (60): no-op (handled by regalloc) -----
+
+    // ----- IR_ATOMIC_STORE (90): stlr Xt, [Xn] (store-release) -----
+    if op == 90 {
+        uint64 ptr_r = ir_a64_resolve_src(s1_v, 9)
+        uint64 val_r = ir_a64_resolve_src(s2_v, 10)
+        // STLR Xt, [Xn]: 0xC89FFC00 | (Xn << 5) | Xt
+        uint64 stlr = 0xC89FFC00 | (ptr_r << 5) | val_r
+        emit_a64(stlr)
+        return
+    }
+
+    // ----- IR_ATOMIC_LOAD (91): ldar Xt, [Xn] (load-acquire) -----
+    if op == 91 {
+        uint64 ptr_r = ir_a64_resolve_src(s1_v, 9)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = 9 }
+        // LDAR Xt, [Xn]: 0xC8DFFC00 | (Xn << 5) | Xt
+        uint64 ldar = 0xC8DFFC00 | (ptr_r << 5) | d
+        emit_a64(ldar)
+        if dst_r == 0xFFFFFFFF {
+            ir_a64_emit_store_spill(9, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_ATOMIC_ADD (92): ldaxr/add/stlxr retry loop -----
+    if op == 92 {
+        uint64 ptr_r = ir_a64_resolve_src(s1_v, 10)
+        uint64 val_r = ir_a64_resolve_src(s2_v, 11)
+        // retry:
+        uint64 aa_retry = out_len
+        // LDAXR x9, [ptr_r] — x9 holds the OLD value (what we must return)
+        emit_a64(0xC85FFC00 | (ptr_r << 5) | 9)
+        // Compute new value in x13. x86's `xadd` returns the pre-add value;
+        // the old code wrote the new value into x9 and returned that,
+        // flipping the semantic (atomic_add(40,10) returned 50 instead of 40).
+        emit_a64_add(13, 9, val_r)
+        // STLXR w12, x13, [ptr_r] — store the NEW value back
+        emit_a64(0xC800FC00 | (12 << 16) | (ptr_r << 5) | 13)
+        // CBNZ w12, retry (32-bit CBNZ for status register)
+        uint64 aa_back = aa_retry - out_len
+        emit_a64(0x35000000 | (((aa_back / 4) & 0x7FFFF) << 5) | 12)
+        // x9 still holds the old value — that's the return.
+        if dst_r != 0xFFFFFFFF {
+            emit_a64_mov(dst_r, 9)
+        } else {
+            ir_a64_emit_store_spill(9, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_ATOMIC_CAS (93): ldaxr/cmp/b.ne/stlxr retry loop -----
+    if op == 93 {
+        uint64 ptr_r = ir_a64_resolve_src(s1_v, 10)
+        uint64 exp_r = ir_a64_resolve_src(s2_v, 11)
+        // desired is in imm (vreg index)
+        uint64 des_r = 0
+        if imm > 0 && imm < ir_vreg_next {
+            des_r = ir_get_phys_reg(imm)
+            if des_r == 0xFFFFFFFF {
+                ir_a64_load_spill(13, imm)
+                des_r = 13
+            }
+        }
+        // retry:
+        uint64 cas_retry = out_len
+        // LDAXR x9, [ptr_r]                                    (+0)
+        emit_a64(0xC85FFC00 | (ptr_r << 5) | 9)
+        // CMP x9, exp_r (SUBS xzr, x9, exp_r)                  (+1)
+        emit_a64_cmp(9, exp_r)
+        // B.NE fail — need +5 insns (STLXR, CBNZ, MOVZ d=1,
+        // B done, then FAIL = MOVZ d=0). imm19=5 → 0x540000A1.
+        // The old constant 0x54000061 encoded imm19=3, which landed
+        // exactly on "Success: MOVZ d=1" — so CAS always reported
+        // success, even when the compare mismatched.
+        emit_a64(0x540000A1)                                    // (+2)
+        // STLXR w12, des_r, [ptr_r]                            (+3)
+        emit_a64(0xC800FC00 | (12 << 16) | (ptr_r << 5) | des_r)
+        // CBNZ w12, retry                                      (+4)
+        uint64 cas_back = cas_retry - out_len
+        emit_a64(0x35000000 | (((cas_back / 4) & 0x7FFFF) << 5) | 12)
+        // Success: result = 1                                  (+5)
+        uint64 cas_d = dst_r
+        if cas_d == 0xFFFFFFFF { cas_d = 9 }
+        emit_a64_mov_imm(cas_d, 1)
+        // B done (+2 insns = 8 bytes)                          (+6)
+        emit_a64(0x14000002)
+        // fail: result = 0                                     (+7)
+        emit_a64_mov_imm(cas_d, 0)
+        // done:                                                (+8)
+        if dst_r == 0xFFFFFFFF {
+            ir_a64_emit_store_spill(9, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_VSTORE (94): volatile store — stlr on ARM64 -----
+    if op == 94 {
+        uint64 addr_reg = ir_a64_resolve_src(s1_v, 9)
+        uint64 val_reg = ir_a64_resolve_src(s2_v, 10)
+        // STLR Xt, [Xn]: 0xC89FFC00 | (Xn << 5) | Xt
+        uint64 vs = 0xC89FFC00 | (addr_reg << 5) | val_reg
+        emit_a64(vs)
+        return
+    }
+
+    // ----- IR_VLOAD (95): volatile load — ldar on ARM64 -----
+    if op == 95 {
+        uint64 addr_reg = ir_a64_resolve_src(s1_v, 9)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = 9 }
+        // LDAR Xt, [Xn]: 0xC8DFFC00 | (Xn << 5) | Xt
+        uint64 vl = 0xC8DFFC00 | (addr_reg << 5) | d
+        emit_a64(vl)
+        if dst_r == 0xFFFFFFFF {
+            ir_a64_emit_store_spill(9, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_ASM_BLOCK (96): inline asm passthrough -----
+    if op == 96 {
+        uint64 asm_node = s1_v
+        uint32 single_tok = ast_data1(asm_node)
+        uint64 ws = single_tok
+        if ws != 0 {
+            asm_emit_a64(ws)
+        }
+        uint32 child_str = ast_child(asm_node)
+        uint64 wcs = child_str
+        while wcs != 0 {
+            uint32 stk = ast_data1(wcs)
+            uint64 wstk = stk
+            asm_emit_a64(wstk)
+            uint32 nxt = ast_next(wcs)
+            wcs = nxt
+        }
+        return
+    }
+
+    // ----- IR_ATOMIC_SUB (109): ldaxr/sub/stlxr retry loop -----
+    // Returns the OLD value (mirrors x86's xadd-based lowering).
+    if op == 109 {
+        uint64 ptr_r = ir_a64_resolve_src(s1_v, 10)
+        uint64 val_r = ir_a64_resolve_src(s2_v, 11)
+        uint64 as_retry = out_len
+        emit_a64(0xC85FFC00 | (ptr_r << 5) | 9)       // LDAXR x9 (= old)
+        emit_a64_sub(13, 9, val_r)                    // x13 = new
+        emit_a64(0xC800FC00 | (12 << 16) | (ptr_r << 5) | 13)  // STLXR w12, x13
+        uint64 as_back = as_retry - out_len
+        emit_a64(0x35000000 | (((as_back / 4) & 0x7FFFF) << 5) | 12)
+        if dst_r != 0xFFFFFFFF {
+            emit_a64_mov(dst_r, 9)
+        } else {
+            ir_a64_emit_store_spill(9, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_ATOMIC_AND (110): ldaxr/and/stlxr retry loop — returns OLD -----
+    if op == 110 {
+        uint64 ptr_r = ir_a64_resolve_src(s1_v, 10)
+        uint64 val_r = ir_a64_resolve_src(s2_v, 11)
+        uint64 aand_retry = out_len
+        emit_a64(0xC85FFC00 | (ptr_r << 5) | 9)       // LDAXR x9 (= old)
+        emit_a64_and(13, 9, val_r)                    // x13 = new
+        emit_a64(0xC800FC00 | (12 << 16) | (ptr_r << 5) | 13)
+        uint64 aand_back = aand_retry - out_len
+        emit_a64(0x35000000 | (((aand_back / 4) & 0x7FFFF) << 5) | 12)
+        if dst_r != 0xFFFFFFFF {
+            emit_a64_mov(dst_r, 9)
+        } else {
+            ir_a64_emit_store_spill(9, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_ATOMIC_OR (111): ldaxr/orr/stlxr retry loop — returns OLD -----
+    if op == 111 {
+        uint64 ptr_r = ir_a64_resolve_src(s1_v, 10)
+        uint64 val_r = ir_a64_resolve_src(s2_v, 11)
+        uint64 aor_retry = out_len
+        emit_a64(0xC85FFC00 | (ptr_r << 5) | 9)       // LDAXR x9 (= old)
+        emit_a64_orr(13, 9, val_r)                    // x13 = new
+        emit_a64(0xC800FC00 | (12 << 16) | (ptr_r << 5) | 13)
+        uint64 aor_back = aor_retry - out_len
+        emit_a64(0x35000000 | (((aor_back / 4) & 0x7FFFF) << 5) | 12)
+        if dst_r != 0xFFFFFFFF {
+            emit_a64_mov(dst_r, 9)
+        } else {
+            ir_a64_emit_store_spill(9, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_ATOMIC_XOR (112): ldaxr/eor/stlxr retry loop — returns OLD -----
+    if op == 112 {
+        uint64 ptr_r = ir_a64_resolve_src(s1_v, 10)
+        uint64 val_r = ir_a64_resolve_src(s2_v, 11)
+        uint64 axor_retry = out_len
+        emit_a64(0xC85FFC00 | (ptr_r << 5) | 9)       // LDAXR x9 (= old)
+        emit_a64_eor(13, 9, val_r)                    // x13 = new
+        emit_a64(0xC800FC00 | (12 << 16) | (ptr_r << 5) | 13)
+        uint64 axor_back = axor_retry - out_len
+        emit_a64(0x35000000 | (((axor_back / 4) & 0x7FFFF) << 5) | 12)
+        if dst_r != 0xFFFFFFFF {
+            emit_a64_mov(dst_r, 9)
+        } else {
+            ir_a64_emit_store_spill(9, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_EXEC (113): execve on Linux/macOS, CreateProcessA on Windows -----
+    if op == 113 {
+        uint64 path_r = ir_a64_resolve_src(s1_v, 9)
+        if target_os == 2 {
+            // Windows ARM64: CreateProcessA + WaitForSingleObject + ExitProcess
+            // SP shift is safe — ExitProcess never returns.
+            emit_a64_sub_sp_imm(0xD0)
+            // Zero STARTUPINFOA+PI area: memset [sp+0x40], 0, 128
+            emit_a64_mov_imm(9, 0)
+            uint64 zi = 0
+            while zi < 16 {
+                emit_a64_str(9, 31, 0x40 + zi * 8)
+                zi = zi + 1
+            }
+            // STARTUPINFOA.cb = 104 (at sp+0x40)
+            emit_a64_mov_imm(9, 104)
+            emit_a64_str32(9, 31, 0x40)
+            // CreateProcessA(path, NULL, NULL, NULL, 0, 0, NULL, NULL, &si, &pi)
+            // x0 = path (lpApplicationName)
+            emit_a64_mov(0, path_r)
+            // x1 = NULL (lpCommandLine)
+            emit_a64_mov_imm(1, 0)
+            // x2 = NULL, x3 = NULL
+            emit_a64_mov_imm(2, 0)
+            emit_a64_mov_imm(3, 0)
+            // x4 = 0 (bInheritHandles)
+            emit_a64_mov_imm(4, 0)
+            // x5 = 0 (dwCreationFlags)
+            emit_a64_mov_imm(5, 0)
+            // x6 = NULL (lpEnvironment)
+            emit_a64_mov_imm(6, 0)
+            // x7 = NULL (lpCurrentDirectory)
+            emit_a64_mov_imm(7, 0)
+            // [sp+0x00] = &si (lpStartupInfo, 9th arg on stack for ARM64)
+            emit_a64_add_imm(9, 31, 0x40)
+            emit_a64_str(9, 31, 0)
+            // [sp+0x08] = &pi (lpProcessInformation, 10th arg)
+            emit_a64_add_imm(9, 31, 0xA8)
+            emit_a64_str(9, 31, 8)
+            emit_a64_win_call_iat(9)   // CreateProcessA
+            // WaitForSingleObject(hProcess=[sp+0xA8], INFINITE=-1)
+            emit_a64_ldr(0, 31, 0xA8)
+            emit_a64_mov_imm(1, 0xFFFFFFFF)
+            emit_a64_win_call_iat(10)  // WaitForSingleObject
+            // GetExitCodeProcess(hProcess, &exitCode)
+            emit_a64_ldr(0, 31, 0xA8)
+            emit_a64_add_imm(1, 31, 0x20)
+            emit_a64_win_call_iat(11)  // GetExitCodeProcess (slot 11 on ARM64?)
+            // ExitProcess(exitCode)
+            emit_a64_ldr32(0, 31, 0x20)
+            emit_a64_add_sp_imm(0xD0)
+            emit_a64_win_call_iat(0)   // ExitProcess
+            return
+        }
+        // Linux/macOS: execve
+        // Build argv on scratchpad: [path, NULL] = 16 bytes
+        emit_a64_add_imm(11, 31, ir_a64_scratch_off)
+        emit_a64_str(path_r, 11, 0)      // argv[0] = path
+        emit_a64_mov_imm(10, 0)
+        emit_a64_str(10, 11, 8)           // argv[1] = NULL
+        // x0 = path
+        emit_a64_mov(0, path_r)
+        // x1 = argv (X11)
+        emit_a64_mov(1, 11)
+        // x2 = envp: try cli_envp static, else NULL
+        uint64 envp_off = static_lookup_by_name("cli_envp", 8)
+        if envp_off != 0xFFFFFFFF {
+            emit_a64_static_load(envp_off)
+            emit_a64_mov(2, 0)
+            emit_a64_mov(0, path_r)       // restore x0 (clobbered by static_load)
+        } else {
+            emit_a64_mov_imm(2, 0)
+        }
+        // syscall execve
+        uint64 execve_nr = ir_a64_syscall_nr(59)
+        emit_a64_syscall_nr(execve_nr)
+        emit_a64_svc()
+        // execve failed (only reached on error) — no SP restore needed (scratchpad)
+        // Save errno to exec_errno if defined
+        uint64 errno_off = static_lookup_by_name("exec_errno", 10)
+        if errno_off != 0xFFFFFFFF {
+            emit_a64_static_store(errno_off)
+        }
+        if dst_r != 0xFFFFFFFF && dst_r != 0 {
+            emit_a64_mov(dst_r, 0)
+        }
+        if dst_r == 0xFFFFFFFF {
+            ir_a64_emit_store_spill(0, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_EXEC_ARGV (114): execve on Linux/macOS, CreateProcessA on Windows -----
+    if op == 114 {
+        uint64 path_r = ir_a64_resolve_src(s1_v, 9)
+        uint64 argv_r = ir_a64_resolve_src(s2_v, 10)
+        if target_os == 2 {
+            // Windows ARM64: build quoted cmdline from argv and pass as
+            // lpCommandLine. Frame extends the existing 0xD0 layout by
+            // 0x400 for the cmdline buffer at sp+0xD0.
+            // Stash path & argv in x19/x20 BEFORE sub sp — regalloc scratch
+            // regs would be clobbered by the zero-init and cmdline loop.
+            emit_a64_mov(19, path_r)
+            emit_a64_mov(20, argv_r)
+            emit_a64_sub_sp_imm(0x4D0)
+            emit_a64_mov_imm(9, 0)
+            uint64 zi2 = 0
+            while zi2 < 16 {
+                emit_a64_str(9, 31, 0x40 + zi2 * 8)
+                zi2 = zi2 + 1
+            }
+            emit_a64_mov_imm(9, 104)
+            emit_a64_str32(9, 31, 0x40)
+            // ---- Build space-separated cmdline at sp+0xD0 ----
+            // No quoting — our child parser splits on 0x20 without
+            // stripping quotes (src/main.kr:21 win_init_args).
+            // x9 = write ptr, x20 = argv walk, x10 = arg*, x11 = byte
+            emit_a64_add_imm(9, 31, 0xD0)
+            // L_outer (+0): ldr x10,[x20]; cbz x10,L_done (+48)
+            emit_a64_ldr(10, 20, 0)
+            emit_a64_cbz(10, 48)
+            // L_inner (+8): ldrb w11,[x10]; cbz x11,L_end_copy (+20)
+            emit_a64_ldrb(11, 10, 0)
+            emit_a64_cbz(11, 20)
+            emit_a64_strb(11, 9, 0)
+            emit_a64_add_imm(10, 10, 1)
+            emit_a64_add_imm(9, 9, 1)
+            emit_a64(0x17FFFFFB)                // b L_inner (-20)
+            // L_end_copy (+32): space + advance
+            emit_a64_mov_imm(11, 0x20)
+            emit_a64_strb(11, 9, 0)
+            emit_a64_add_imm(9, 9, 1)
+            emit_a64_add_imm(20, 20, 8)
+            emit_a64(0x17FFFFF4)                // b L_outer (-48)
+            // L_done (+52): null-terminate
+            emit_a64_strb(31, 9, 0)
+            // ---- CreateProcessA ----
+            emit_a64_mov(0, 19)                 // x0 = path
+            emit_a64_add_imm(1, 31, 0xD0)       // x1 = cmdline
+            emit_a64_mov_imm(2, 0)
+            emit_a64_mov_imm(3, 0)
+            emit_a64_mov_imm(4, 0)
+            emit_a64_mov_imm(5, 0)
+            emit_a64_mov_imm(6, 0)
+            emit_a64_mov_imm(7, 0)
+            emit_a64_add_imm(9, 31, 0x40)
+            emit_a64_str(9, 31, 0)
+            emit_a64_add_imm(9, 31, 0xA8)
+            emit_a64_str(9, 31, 8)
+            emit_a64_win_call_iat(9)
+            emit_a64_ldr(0, 31, 0xA8)
+            emit_a64_mov_imm(1, 0xFFFFFFFF)
+            emit_a64_win_call_iat(10)
+            emit_a64_ldr(0, 31, 0xA8)
+            emit_a64_add_imm(1, 31, 0x20)
+            emit_a64_win_call_iat(11)
+            emit_a64_ldr32(0, 31, 0x20)
+            emit_a64_add_sp_imm(0x4D0)
+            emit_a64_win_call_iat(0)
+            return
+        }
+        // Linux/macOS: execve
+        // x0 = path
+        emit_a64_mov(0, path_r)
+        // x1 = argv
+        emit_a64_mov(1, argv_r)
+        // x2 = envp
+        uint64 envp_off_a = static_lookup_by_name("cli_envp", 8)
+        if envp_off_a != 0xFFFFFFFF {
+            emit_a64_static_load(envp_off_a)
+            emit_a64_mov(2, 0)
+            emit_a64_mov(0, path_r)       // restore x0
+        } else {
+            emit_a64_mov_imm(2, 0)
+        }
+        // syscall execve
+        uint64 execve_nr_a = ir_a64_syscall_nr(59)
+        emit_a64_syscall_nr(execve_nr_a)
+        emit_a64_svc()
+        // Save errno
+        uint64 errno_off_a = static_lookup_by_name("exec_errno", 10)
+        if errno_off_a != 0xFFFFFFFF {
+            emit_a64_static_store(errno_off_a)
+        }
+        if dst_r != 0xFFFFFFFF && dst_r != 0 {
+            emit_a64_mov(dst_r, 0)
+        }
+        if dst_r == 0xFFFFFFFF {
+            ir_a64_emit_store_spill(0, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_SET_EXEC (115): chmod(path, 0755) -----
+    if op == 115 {
+        uint64 path_r = ir_a64_resolve_src(s1_v, 9)
+        if target_os == 0 || target_os == 3 {
+            // Linux/Android: fchmodat(AT_FDCWD=-100, path, 0755, 0)
+            emit_a64_mov_imm(0, 0xFFFFFFFFFFFFFF9C)  // AT_FDCWD = -100
+            emit_a64_mov(1, path_r)
+            emit_a64_mov_imm(2, 0x1ED)               // 0755 octal
+            emit_a64_mov_imm(3, 0)                    // flags = 0
+            uint64 chmod_nr = ir_a64_syscall_nr(90)
+            emit_a64_syscall_nr(chmod_nr)
+            emit_a64_svc()
+        } else if target_os == 1 {
+            // macOS: chmod(path, 0755) — syscall 15
+            emit_a64_mov(0, path_r)
+            emit_a64_mov_imm(1, 0x1ED)
+            uint64 chmod_nr_m = ir_a64_syscall_nr(15)
+            emit_a64_syscall_nr(chmod_nr_m)
+            emit_a64_svc()
+        }
+        return
+    }
+
+    // ----- IR_TIME_NS (119): clock_gettime -> nanoseconds -----
+    if op == 119 {
+        if target_os == 0 || target_os == 3 {
+            // Linux / Android arm64: clock_gettime(CLOCK_MONOTONIC=1, &ts)
+            // via syscall 113. Returns {tv_sec, tv_nsec} into a 16-byte
+            // scratchpad slot.
+            emit_a64_mov_imm(1, ir_a64_scratch_off)
+            ir_a64_add_sp_reg(1, 1)
+            emit_a64_mov_imm(0, 1)
+            uint64 cgt_nr = ir_a64_syscall_nr(228)
+            emit_a64_syscall_nr(cgt_nr)
+            emit_a64_svc()
+            emit_a64_mov_imm(11, ir_a64_scratch_off)
+            ir_a64_add_sp_reg(11, 11)
+            emit_a64_ldr(9, 11, 0)
+            emit_a64_ldr(10, 11, 8)
+            emit_a64_mov_imm(11, 1000000000)
+            emit_a64_mul(9, 9, 11)
+            emit_a64_add(0, 9, 10)
+        } else if target_os == 1 {
+            // macOS arm64: gettimeofday(&tv, NULL), x16=116, svc #0x80.
+            // timeval = { tv_sec: i64, tv_usec: i64 }. Matches the
+            // legacy codegen at src/codegen_aarch64.kr:3539. Without
+            // this, the IR path was issuing clock_gettime-as-Linux
+            // syscall 228 on Darwin, which is an invalid syscall that
+            // silently returned 0 in x0 — so every time_ns() on
+            // native arm64 macOS came back zero and the compiler's
+            // '(X.XX ms)' self-timer stayed hidden.
+            emit_a64_mov_imm(0, ir_a64_scratch_off)
+            ir_a64_add_sp_reg(0, 0)
+            emit_a64_mov_imm(1, 0)
+            emit_a64_mov_imm(16, 116)
+            emit_a64_svc()
+            emit_a64_mov_imm(11, ir_a64_scratch_off)
+            ir_a64_add_sp_reg(11, 11)
+            emit_a64_ldr(9, 11, 0)
+            emit_a64_ldr(10, 11, 8)
+            emit_a64_mov_imm(11, 1000000000)
+            emit_a64_mul(9, 9, 11)
+            emit_a64_mov_imm(11, 1000)
+            emit_a64_mul(10, 10, 11)
+            emit_a64_add(0, 9, 10)
+        } else if target_os == 2 {
+            // Windows arm64: QueryPerformanceFrequency(&freq),
+            // QueryPerformanceCounter(&counter), then counter * 1e9 / freq
+            // computed as (counter / freq) * 1e9 + ((counter % freq) * 1e9) / freq
+            // so the multiplication can't overflow uint64 (counter on a
+            // box with ~29 days of uptime × 1e9 already wraps).
+            // Reserve 16 bytes on the scratchpad for the two qwords that
+            // QueryPerformance* writes. Same layout the legacy codegen
+            // uses — ir_a64_scratch_off points past the spill slots.
+            emit_a64_mov_imm(1, ir_a64_scratch_off)
+            ir_a64_add_sp_reg(1, 1)               // x1 = &scratch
+            emit_a64_mov(0, 1)                    // x0 = &scratch (freq)
+            emit_a64_win_call_iat(15)             // QueryPerformanceFrequency
+            emit_a64_mov_imm(1, ir_a64_scratch_off + 8)
+            ir_a64_add_sp_reg(1, 1)               // x1 = &scratch+8
+            emit_a64_mov(0, 1)                    // x0 = &scratch+8 (counter)
+            emit_a64_win_call_iat(14)             // QueryPerformanceCounter
+            // x11 = &scratch, reload after the IAT clobber (same pattern
+            // that bit us in daa1689's file_size fix).
+            emit_a64_mov_imm(11, ir_a64_scratch_off)
+            ir_a64_add_sp_reg(11, 11)
+            emit_a64_ldr(12, 11, 0)               // x12 = freq
+            emit_a64_ldr(13, 11, 8)               // x13 = counter
+            emit_a64_udiv(9, 13, 12)              // x9  = counter / freq (secs)
+            emit_a64_msub(10, 9, 12, 13)          // x10 = counter - secs*freq (frac)
+            emit_a64_mov_imm(14, 1000000000)
+            emit_a64_mul(9, 9, 14)                // x9  = secs * 1e9
+            emit_a64_mul(10, 10, 14)              // x10 = frac * 1e9
+            emit_a64_udiv(10, 10, 12)             // x10 = frac*1e9 / freq
+            emit_a64_add(0, 9, 10)                // x0  = secs*1e9 + frac*1e9/freq
+        } else {
+            emit_a64_mov_imm(0, 0)
+        }
+        if dst_r != 0xFFFFFFFF && dst_r != 0 {
+            emit_a64_mov(dst_r, 0)
+        }
+        if dst_r == 0xFFFFFFFF {
+            ir_a64_emit_store_spill(0, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_ISB (126): instruction-sync barrier -----
+    // Use after writing new code to RAM to make sure the subsequent
+    // instruction fetches see the writes. ARM64 I-cache is not
+    // kept coherent with D-cache automatically (unlike x86).
+    if op == 126 {
+        emit_a64(0xD5033FDF)   // ISB
+        return
+    }
+
+    // ----- IR_DCACHE_FLUSH (127): clean + invalidate one D-cache line to PoC -----
+    // Emits: DC CIVAC, Xt ; DSB ISH ; ISB. Safe for post-DMA and
+    // pre-handoff uses. Requires EL1+ on real hardware; user-space
+    // code on Linux will fault with SIGILL unless the kernel emulates.
+    if op == 127 {
+        uint64 a_reg = ir_a64_resolve_src(s1_v, 9)
+        emit_a64(0xD50B7E20 | a_reg)  // DC CIVAC, Xa
+        emit_a64(0xD5033B9F)          // DSB ISH
+        emit_a64(0xD5033FDF)          // ISB
+        return
+    }
+
+    // ----- IR_ICACHE_INV (128): invalidate one I-cache line by VA to PoU -----
+    // Emits: IC IVAU, Xt ; DSB ISH ; ISB. Use after writing new code
+    // into RAM. IC IVAU is available at EL0.
+    if op == 128 {
+        uint64 a_reg = ir_a64_resolve_src(s1_v, 9)
+        emit_a64(0xD50B7520 | a_reg)  // IC IVAU, Xa
+        emit_a64(0xD5033B9F)          // DSB ISH
+        emit_a64(0xD5033FDF)          // ISB
+        return
+    }
+
+    // ----- IR_DSB (129): DSB SY — full-system data-sync barrier -----
+    if op == 129 {
+        emit_a64(0xD5033F9F)
+        return
+    }
+
+    // ----- IR_DMB (130): DMB ISH — inner-shareable data-memory barrier -----
+    if op == 130 {
+        emit_a64(0xD5033BBF)
+        return
+    }
+
+    // ----- IR_ARR_CHECK (131): trap if idx (s1_v) >= count (imm) -----
+    // Emits: MOVZ x9, count ; CMP idx, x9 ; B.LO +<trap> ; trap ; ok:
+    // Windows ARM64 uses ExitProcess via IAT which doesn't fit this
+    // short-sequence pattern; fall back to no-check there.
+    if op == 131 {
+        if target_os == 2 { return }                      // Windows — skip
+        uint64 idx_r = ir_a64_resolve_src(s1_v, 9)
+        // Put count in x10 so idx can stay in its register.
+        emit_a64_mov_imm(10, imm)
+        emit_a64_cmp(idx_r, 10)
+        // Compute trap length in instructions.
+        //   Linux / Android: MOVZ x0 + MOVZ x8 + SVC #0 = 3 insns.
+        //   macOS:           MOVZ x0 + MOVZ x16 + SVC #0 = 3 insns.
+        // B.LO +3 insns (skip trap). Encoding: 0x54 | (3<<5) | 3.
+        emit_a64(0x54000063)
+        emit_a64_mov_imm(0, 1)
+        if target_os == 1 {
+            emit_a64_mov_imm(16, 1)                        // macOS: exit = 1 via x16
+        } else {
+            emit_a64_mov_imm(8, 93)                        // Linux/Android: exit = 93 via x8
+        }
+        emit_a64(0xD4000001)                               // SVC #0
+        return
+    }
+
+    // ----- IR_FADD (20), IR_FSUB (21), IR_FMUL (22), IR_FDIV (23) -----
+    if op >= 20 && op <= 23 {
+        uint64 a = ir_a64_resolve_src(s1_v, 9)
+        uint64 b = ir_a64_resolve_src(s2_v, 10)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = 9 }
+        uint64 fk = imm
+        if fk == 2 {
+            // f32: fmov s0, wA; fmov s1, wB; op s0, s0, s1; fmov wDst, s0
+            emit_a64(0x1E270000 | (a << 5) | 0)       // fmov s0, wA
+            emit_a64(0x1E270000 | (b << 5) | 1)       // fmov s1, wB
+            if op == 20 { emit_a64(0x1E202800 | (1 << 16) | (0 << 5) | 0) }  // fadd s0, s0, s1
+            if op == 21 { emit_a64(0x1E203800 | (1 << 16) | (0 << 5) | 0) }  // fsub s0, s0, s1
+            if op == 22 { emit_a64(0x1E200800 | (1 << 16) | (0 << 5) | 0) }  // fmul s0, s0, s1
+            if op == 23 { emit_a64(0x1E201800 | (1 << 16) | (0 << 5) | 0) }  // fdiv s0, s0, s1
+            emit_a64(0x1E260000 | (0 << 5) | d)       // fmov wDst, s0
+        } else {
+            // f64: fmov d0, xA; fmov d1, xB; op d0, d0, d1; fmov xDst, d0
+            emit_a64(0x9E670000 | (a << 5) | 0)       // fmov d0, xA
+            emit_a64(0x9E670000 | (b << 5) | 1)       // fmov d1, xB
+            if op == 20 { emit_a64(0x1E602800 | (1 << 16) | (0 << 5) | 0) }  // fadd d0, d0, d1
+            if op == 21 { emit_a64(0x1E603800 | (1 << 16) | (0 << 5) | 0) }  // fsub d0, d0, d1
+            if op == 22 { emit_a64(0x1E600800 | (1 << 16) | (0 << 5) | 0) }  // fmul d0, d0, d1
+            if op == 23 { emit_a64(0x1E601800 | (1 << 16) | (0 << 5) | 0) }  // fdiv d0, d0, d1
+            emit_a64(0x9E660000 | (0 << 5) | d)       // fmov xDst, d0
+        }
+        if dst_r == 0xFFFFFFFF { ir_a64_emit_store_spill(9, dest_v) }
+        return
+    }
+
+    // ----- Float comparisons: IR_FCMP_EQ (24), IR_FCMP_LT (25), IR_FCMP_NE (99),
+    //       IR_FCMP_LE (100), IR_FCMP_GT (101), IR_FCMP_GE (102) -----
+    if op == 24 || op == 25 || op == 99 || op == 100 || op == 101 || op == 102 {
+        uint64 a = ir_a64_resolve_src(s1_v, 9)
+        uint64 b = ir_a64_resolve_src(s2_v, 10)
+        uint64 fk = imm
+        if fk == 2 {
+            emit_a64(0x1E270000 | (a << 5) | 0)       // fmov s0, wA
+            emit_a64(0x1E270000 | (b << 5) | 1)       // fmov s1, wB
+            emit_a64(0x1E202000 | (1 << 16) | (0 << 5))  // fcmp s0, s1
+        } else {
+            emit_a64(0x9E670000 | (a << 5) | 0)       // fmov d0, xA
+            emit_a64(0x9E670000 | (b << 5) | 1)       // fmov d1, xB
+            emit_a64(0x1E602000 | (1 << 16) | (0 << 5))  // fcmp d0, d1
+        }
+        // ARM64 float condition codes after fcmp:
+        // EQ: cond=0, NE: cond=1, LT: cond=11, LE: cond=13, GT: cond=12, GE: cond=10
+        uint64 cond = 0
+        if op == 24 { cond = 0 }   // EQ
+        if op == 99 { cond = 1 }   // NE
+        if op == 25 { cond = 11 }  // LT
+        if op == 100 { cond = 13 } // LE
+        if op == 101 { cond = 12 } // GT
+        if op == 102 { cond = 10 } // GE
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = 9 }
+        emit_a64_cset(d, cond)
+        if dst_r == 0xFFFFFFFF { ir_a64_emit_store_spill(9, dest_v) }
+        return
+    }
+
+    // ----- IR_ITOF (26): int64 to f64 -----
+    if op == 26 {
+        uint64 a = ir_a64_resolve_src(s1_v, 9)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = 9 }
+        emit_a64(0x9E620000 | (a << 5) | 0)           // scvtf d0, xA
+        emit_a64(0x9E660000 | (0 << 5) | d)           // fmov xDst, d0
+        if dst_r == 0xFFFFFFFF { ir_a64_emit_store_spill(9, dest_v) }
+        return
+    }
+
+    // ----- IR_FTOI (27): f64 to int64 (truncating) -----
+    if op == 27 {
+        uint64 a = ir_a64_resolve_src(s1_v, 9)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = 9 }
+        emit_a64(0x9E670000 | (a << 5) | 0)           // fmov d0, xA
+        emit_a64(0x9E780000 | (0 << 5) | d)           // fcvtzs xDst, d0
+        if dst_r == 0xFFFFFFFF { ir_a64_emit_store_spill(9, dest_v) }
+        return
+    }
+
+    // ----- IR_FSQRT (97): f64 square root -----
+    if op == 97 {
+        uint64 a = ir_a64_resolve_src(s1_v, 9)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = 9 }
+        emit_a64(0x9E670000 | (a << 5) | 0)           // fmov d0, xA
+        emit_a64(0x1E61C000 | (0 << 5) | 0)           // fsqrt d0, d0
+        emit_a64(0x9E660000 | (0 << 5) | d)           // fmov xDst, d0
+        if dst_r == 0xFFFFFFFF { ir_a64_emit_store_spill(9, dest_v) }
+        return
+    }
+
+    // ----- IR_FFMA (98): fused multiply-add: a*b + c -----
+    if op == 98 {
+        uint64 a = ir_a64_resolve_src(s1_v, 9)
+        uint64 b = ir_a64_resolve_src(s2_v, 10)
+        uint64 c_vreg = imm
+        uint64 c = 9
+        if c_vreg > 0 && c_vreg < ir_vreg_next {
+            c = ir_a64_resolve_src(c_vreg, 11)
+        }
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = 9 }
+        // fmov d0, xA; fmov d1, xB; fmul d0, d0, d1
+        emit_a64(0x9E670000 | (a << 5) | 0)
+        emit_a64(0x9E670000 | (b << 5) | 1)
+        emit_a64(0x1E600800 | (1 << 16) | (0 << 5) | 0)  // fmul d0, d0, d1
+        // fmov d1, xC; fadd d0, d0, d1
+        emit_a64(0x9E670000 | (c << 5) | 1)
+        emit_a64(0x1E602800 | (1 << 16) | (0 << 5) | 0)  // fadd d0, d0, d1
+        emit_a64(0x9E660000 | (0 << 5) | d)               // fmov xDst, d0
+        if dst_r == 0xFFFFFFFF { ir_a64_emit_store_spill(9, dest_v) }
+        return
+    }
+
+    // ----- IR_F32TOF64 (103): f32 to f64 -----
+    if op == 103 {
+        uint64 a = ir_a64_resolve_src(s1_v, 9)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = 9 }
+        emit_a64(0x1E270000 | (a << 5) | 0)           // fmov s0, wA
+        emit_a64(0x1E22C000 | (0 << 5) | 0)           // fcvt d0, s0
+        emit_a64(0x9E660000 | (0 << 5) | d)           // fmov xDst, d0
+        if dst_r == 0xFFFFFFFF { ir_a64_emit_store_spill(9, dest_v) }
+        return
+    }
+
+    // ----- IR_F64TOF32 (104): f64 to f32 -----
+    if op == 104 {
+        uint64 a = ir_a64_resolve_src(s1_v, 9)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = 9 }
+        emit_a64(0x9E670000 | (a << 5) | 0)           // fmov d0, xA
+        emit_a64(0x1E624000 | (0 << 5) | 0)           // fcvt s0, d0
+        emit_a64(0x1E260000 | (0 << 5) | d)           // fmov wDst, s0
+        if dst_r == 0xFFFFFFFF { ir_a64_emit_store_spill(9, dest_v) }
+        return
+    }
+
+    // ----- IR_F32TOF16 (105): software f32-to-f16 bit conversion -----
+    if op == 105 {
+        uint64 a = ir_a64_resolve_src(s1_v, 9)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = 9 }
+        // f32 bits in GPR, extract sign/exp/mantissa using integer ops
+        // x10 = a (save f32 bits)
+        emit_a64_mov(10, a)
+        // sign: x11 = a >> 16; x11 = x11 & 0x8000
+        emit_a64_mov(11, a)
+        emit_a64_mov_imm(12, 16)
+        emit_a64_lsr(11, 11, 12)
+        emit_a64_mov_imm(12, 0x8000)
+        emit_a64_and(11, 11, 12)
+        // exp: x12 = a >> 23; x12 = x12 & 0xFF; x12 = x12 - 112; x12 = x12 & 0x1F; x12 = x12 << 10
+        emit_a64_mov(12, 10)
+        emit_a64_mov_imm(13, 23)
+        emit_a64_lsr(12, 12, 13)
+        emit_a64_mov_imm(13, 0xFF)
+        emit_a64_and(12, 12, 13)
+        emit_a64_mov_imm(13, 112)
+        emit_a64_sub(12, 12, 13)
+        emit_a64_mov_imm(13, 0x1F)
+        emit_a64_and(12, 12, 13)
+        emit_a64_mov_imm(13, 10)
+        emit_a64_lsl(12, 12, 13)
+        // sign | exp
+        emit_a64_orr(11, 11, 12)
+        // mantissa: x12 = a >> 13; x12 = x12 & 0x3FF
+        emit_a64_mov(12, 10)
+        emit_a64_mov_imm(13, 13)
+        emit_a64_lsr(12, 12, 13)
+        emit_a64_mov_imm(13, 0x3FF)
+        emit_a64_and(12, 12, 13)
+        // result = sign | exp | mantissa
+        emit_a64_orr(d, 11, 12)
+        if dst_r == 0xFFFFFFFF { ir_a64_emit_store_spill(9, dest_v) }
+        return
+    }
+
+    // ----- IR_F16TOF32 (106): software f16-to-f32 bit conversion -----
+    if op == 106 {
+        uint64 a = ir_a64_resolve_src(s1_v, 9)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = 9 }
+        // f16 bits in GPR (lower 16 bits), expand to f32 bit pattern
+        // x10 = a (save f16 bits)
+        emit_a64_mov(10, a)
+        // sign: x11 = a << 16; x11 = x11 & 0x80000000
+        emit_a64_mov(11, a)
+        emit_a64_mov_imm(12, 16)
+        emit_a64_lsl(11, 11, 12)
+        emit_a64_mov_imm(12, 0x80000000)
+        emit_a64_and(11, 11, 12)
+        // exp: x12 = a >> 10; x12 = x12 & 0x1F; x12 = x12 + 112; x12 = x12 << 23
+        emit_a64_mov(12, 10)
+        emit_a64_mov_imm(13, 10)
+        emit_a64_lsr(12, 12, 13)
+        emit_a64_mov_imm(13, 0x1F)
+        emit_a64_and(12, 12, 13)
+        emit_a64_add_imm(12, 12, 112)
+        emit_a64_mov_imm(13, 23)
+        emit_a64_lsl(12, 12, 13)
+        // sign | exp
+        emit_a64_orr(11, 11, 12)
+        // mantissa: x12 = a & 0x3FF; x12 = x12 << 13
+        emit_a64_mov_imm(12, 0x3FF)
+        emit_a64_and(12, 10, 12)
+        emit_a64_mov_imm(13, 13)
+        emit_a64_lsl(12, 12, 13)
+        // result = sign | exp | mantissa
+        emit_a64_orr(d, 11, 12)
+        if dst_r == 0xFFFFFFFF { ir_a64_emit_store_spill(9, dest_v) }
+        return
+    }
+
+    // ----- IR_ITOF32 (107): int64 to f32 -----
+    if op == 107 {
+        uint64 a = ir_a64_resolve_src(s1_v, 9)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = 9 }
+        // SCVTF Sd, Xn (sf=1, type=00) — encode 0x9E220000. The old
+        // constant 0x1E620000 decoded to SCVTF Dd, Wn (double destination,
+        // 32-bit source), so a 64-bit int turned into a *double*, then
+        // FMOV w, s read the low 32 bits of the double bit-pattern —
+        // always garbage that rounded to 0 on the round-trip.
+        emit_a64(0x9E220000 | (a << 5) | 0)           // scvtf s0, xA
+        emit_a64(0x1E260000 | (0 << 5) | d)           // fmov wDst, s0
+        if dst_r == 0xFFFFFFFF { ir_a64_emit_store_spill(9, dest_v) }
+        return
+    }
+
+    // ----- IR_FTOI32 (108): f32 to int64 (truncating) -----
+    if op == 108 {
+        uint64 a = ir_a64_resolve_src(s1_v, 9)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = 9 }
+        emit_a64(0x1E270000 | (a << 5) | 0)           // fmov s0, wA
+        // FCVTZS Xd, Sn (sf=1, type=00, rmode=11, opcode=000) — encode
+        // 0x9E380000. Old constant 0x1E380000 was FCVTZS Wd which did
+        // a 32-bit result write that zeroed the upper half of Xd; this
+        // was only correct by accident for small values.
+        emit_a64(0x9E380000 | (0 << 5) | d)           // fcvtzs xDst, s0
+        if dst_r == 0xFFFFFFFF { ir_a64_emit_store_spill(9, dest_v) }
+        return
+    }
+
+    // ----- IR_FSQRT32 (118): f32 square root -----
+    if op == 118 {
+        uint64 a = ir_a64_resolve_src(s1_v, 9)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = 9 }
+        emit_a64(0x1E270000 | (a << 5) | 0)           // fmov s0, wA
+        emit_a64(0x1E21C000 | (0 << 5) | 0)           // fsqrt s0, s0
+        emit_a64(0x1E260000 | (0 << 5) | d)           // fmov wDst, s0
+        if dst_r == 0xFFFFFFFF { ir_a64_emit_store_spill(9, dest_v) }
+        return
+    }
+
+    // ----- IR_FMT_BOOL (124): format bool as "true"/"false" -----
+    // src1=buf, src2=val, dest=length
+    if op == 124 {
+        uint64 fb_buf = ir_a64_resolve_src(s1_v, 9)
+        uint64 fb_val = ir_a64_resolve_src(s2_v, 10)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = 9 }
+        // x13 = buf write ptr, x14 = val
+        emit_a64_mov(13, fb_buf)
+        emit_a64_mov(14, fb_val)
+        // CBZ x14, false_path (5 true_path insns=20 bytes; false_path at CBZ_PC+24)
+        emit_a64_cbz(14, 24)
+        // true_path: store 'true' (0x65757274 LE) as 32-bit, then len=4, branch done
+        emit_a64_mov_imm(11, 0x65757274)   // 2 insns: MOVZ+MOVK
+        emit_a64_str32(11, 13, 0)          // STR W11, [X13]
+        emit_a64_mov_imm(d, 4)             // len = 4 (1 insn)
+        emit_a64_b(28)                     // B done (6 false_path insns=24 bytes; done at B_PC+28)
+        // false_path: store 'fals' (0x736C6166 LE) then 'e' (0x65), len=5
+        emit_a64_mov_imm(11, 0x736C6166)   // 2 insns: MOVZ+MOVK
+        emit_a64_str32(11, 13, 0)          // STR W11, [X13]
+        emit_a64_mov_imm(11, 0x65)         // 'e' = 101 (1 insn)
+        emit_a64_strb(11, 13, 4)           // STRB W11, [X13, #4]
+        emit_a64_mov_imm(d, 5)             // len = 5 (1 insn)
+        // done:
+        if dst_r == 0xFFFFFFFF { ir_a64_emit_store_spill(9, dest_v) }
+        return
+    }
+
+    // ----- IR_FMT_F64 (125): format f64 as "[sign][int].[6frac]" -----
+    // src1=buf, src2=f64-bits, dest=length
+    // Registers: x9=buf_ptr, x10=len, x11=temp/int_part, x12=digit_scratch,
+    //            x13=divisor10, x14=digit_count/pad, x15=saved_count
+    // Float: d0=working_val, d1=constant, d2=saved abs_val
+    if op == 125 {
+        uint64 ff_buf  = ir_a64_resolve_src(s1_v, 9)
+        uint64 ff_val  = ir_a64_resolve_src(s2_v, 10)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = 9 }
+
+        // Set x9 = buf (safe, ff_val might be in x10 — do NOT set x10 yet)
+        emit_a64_mov(9, ff_buf)
+
+        // Load f64 bits into d0: fmov d0, ff_val (before possibly clobbering ff_val)
+        emit_a64(0x9E670000 | (ff_val << 5) | 0)   // fmov d0, ff_val
+
+        // Extract bits back to x11 for sign check: fmov x11, d0
+        emit_a64(0x9E660000 | (0 << 5) | 11)        // fmov x11, d0
+
+        // Now safe to set x10 = len = 0 (ff_val bits are in x11 and d0)
+        emit_a64_mov_imm(10, 0)
+
+        // Sign check via bit 63 of x11: TST x11, sign_mask
+        // Load sign mask 0x8000000000000000 into x13 (2 insns: MOVZ+MOVK)
+        emit_a64_mov_imm(13, 0x8000000000000000)    // 2 insns; x13 reused as divisor10 later
+        // ANDS XZR, x11, x13 — sets flags; ZR==1 means non-negative
+        emit_a64(0xEA000000 | (13 << 16) | (11 << 5) | 31)  // TST x11, x13
+        // B.EQ .ff_pos (cond=0=EQ, non-negative → skip neg path)
+        // neg path = FNEG(1)+mov_imm_minus(1)+strb(1)+add9(1)+add10(1) = 5 insns=20 bytes
+        // .ff_pos is at B_PC + 4 + 20 = B_PC + 24
+        emit_a64_bcond(0, 24)                       // B.EQ .ff_pos
+        // Negative: negate d0, write '-', update x9 and x10
+        emit_a64(0x1E614000)                        // FNEG d0, d0
+        emit_a64_mov_imm(11, 0x2D)                  // '-' = 45 (1 insn)
+        emit_a64_strb(11, 9, 0)                     // STRB W11, [X9]
+        emit_a64_add_imm(9, 9, 1)                   // x9++
+        emit_a64_add_imm(10, 10, 1)                 // x10++
+        // .ff_pos: check for big value
+        // Load 1e18 = 0x4DE0B6B3A7640000 into x11, fmov d1, x11 (4+1=5 insns)
+        emit_a64_mov_imm(11, 0x43ABC16D674EC800)    // 1e18 IEEE bits; 4 insns
+        emit_a64(0x9E670000 | (11 << 5) | 1)        // fmov d1, x11
+        // FCMP d0, d1
+        emit_a64(0x1E602000 | (1 << 16) | (0 << 5)) // fcmp d0, d1
+        // B.HS .ff_big (cond=2=HS=C set): val>=1e18 or NaN → big. PATCH LATER.
+        emit_a64_bcond(2, 0)                        // placeholder; patched below
+        uint64 ff_bhs_off = out_len - 4
+
+        // .ff_normal path starts here
+        // Integer part: FCVTZS x11, d0 (truncate to int)
+        emit_a64(0x9E780000 | (0 << 5) | 11)        // fcvtzs x11, d0
+        // Save abs_val in d2: FMOV d2, d0 (1E604002)
+        emit_a64(0x1E604000 | (0 << 5) | 2)         // fmov d2, d0
+
+        // Setup integer formatting: x12=digit_scratch, x13=10, x14=0
+        emit_a64_mov_imm(12, ir_a64_scratch_off)
+        ir_a64_add_sp_reg(12, 12)
+        emit_a64_mov_imm(13, 10)
+        emit_a64_mov_imm(14, 0)
+
+        // Digit extraction loop: divide by 10, store remainder+0x30 at [x12+x14]
+        uint64 ff_uint_loop = out_len
+        emit_a64_udiv(4, 11, 13)                    // x4 = x11 / 10
+        emit_a64_msub(5, 4, 13, 11)                 // x5 = x11 - x4*10 (digit)
+        emit_a64_add_imm(5, 5, 48)                  // x5 += '0'
+        // STRB W5, [X12, X14] — register offset (unscaled)
+        emit_a64(0x38206800 | (14 << 16) | (12 << 5) | 5)
+        emit_a64_add_imm(14, 14, 1)
+        emit_a64_mov(11, 4)
+        uint64 ff_uint_back = ff_uint_loop - out_len
+        emit_a64(0xB5000000 | (((ff_uint_back / 4) & 0x7FFFF) << 5) | 11)  // CBNZ x11, loop
+
+        // Reverse copy to [x9]: x15 = digit count
+        emit_a64_mov(15, 14)
+        uint64 ff_copy_loop = out_len
+        emit_a64_cbz(14, 20)                        // CBZ x14, copy_done (5 insns=20 bytes)
+        emit_a64(0xD1000400 | (14 << 5) | 14)       // SUB x14, x14, #1
+        emit_a64(0x38606800 | (14 << 16) | (12 << 5) | 5)  // LDRB W5, [X12, X14]
+        emit_a64(0x38001525)                        // STRB W5, [X9], #1 (post-index x9)
+        uint64 ff_copy_back = ff_copy_loop - out_len
+        emit_a64(0x14000000 | ((ff_copy_back / 4) & 0x3FFFFFF))  // B copy_loop
+        // copy_done:
+        emit_a64_add(10, 10, 15)                    // x10 += int_len (x15)
+
+        // Write '.' at [x9], then x9++, x10++
+        emit_a64_mov_imm(11, 0x2E)
+        emit_a64_strb(11, 9, 0)
+        emit_a64_add_imm(9, 9, 1)
+        emit_a64_add_imm(10, 10, 1)
+
+        // Recompute frac: fcvtzs x11, d2 → scvtf d1, x11 → fsub d0, d2, d1
+        emit_a64(0x9E780000 | (2 << 5) | 11)        // fcvtzs x11, d2
+        emit_a64(0x9E620000 | (11 << 5) | 1)        // scvtf d1, x11
+        emit_a64(0x1E603800 | (1 << 16) | (2 << 5) | 0)  // fsub d0, d2, d1
+
+        // Multiply by 1e6, truncate to int → frac_int in x11
+        emit_a64_mov_imm(11, 0x412E848000000000)    // 1e6 IEEE bits; 4 insns
+        emit_a64(0x9E670000 | (11 << 5) | 1)        // fmov d1, x11
+        emit_a64(0x1E600800 | (1 << 16) | (0 << 5) | 0)  // fmul d0, d0, d1
+        emit_a64(0x9E780000 | (0 << 5) | 11)        // fcvtzs x11, d0  → frac_int
+
+        // Count digits in x11: x4=working, x14=count
+        emit_a64_mov(4, 11)
+        emit_a64_mov_imm(14, 0)
+        emit_a64_cbz(4, 24)                         // CBZ x4, .ff_fz (5 insns+B = 24 bytes to .ff_fz)
+        uint64 ff_cnt_loop = out_len
+        emit_a64_udiv(5, 4, 13)
+        emit_a64_add_imm(14, 14, 1)
+        emit_a64_mov(4, 5)
+        uint64 ff_cnt_back = ff_cnt_loop - out_len
+        emit_a64(0xB5000000 | (((ff_cnt_back / 4) & 0x7FFFF) << 5) | 4)  // CBNZ x4, cnt_loop
+        emit_a64_b(8)                               // B .ff_have_digits (skip .ff_fz = 1 insn = 8 bytes from B)
+        // .ff_fz: frac_int=0 → digit_count=1
+        emit_a64_mov_imm(14, 1)                     // 1 insn
+        // .ff_have_digits: pad = 6 - x14 (always 0..5; no need for neg check since count ∈ 1..6)
+        emit_a64_mov_imm(15, 6)
+        emit_a64_sub(15, 15, 14)                    // x15 = pad
+        // Pad zero loop. Body = 5 insns (mov+strb+add+sub+b). Use x3 as
+        // the byte-constant scratch rather than x11: x11 holds frac_int
+        // and is re-read by the fi_loop below. The earlier version used
+        // `mov_imm x11, 48` which clobbered frac_int with the ASCII code
+        // 0x30, so fi_loop then decomposed 48 into "84" — visible in
+        // `println(1.0)` as "1.000004" (the trailing '8' got sliced off
+        // by the `write(len)` call but the '4' landed). Also DO NOT
+        // `add x10, x10, 1` here; the final `add x10, x10, 6` below
+        // already accounts for every fraction byte.
+        uint64 ff_pad_loop = out_len
+        emit_a64_cbz(15, 24)                        // CBZ x15, pad_done (6 insns=24 bytes)
+        emit_a64_mov_imm(3, 0x30)                   // x3 = '0'
+        emit_a64_strb(3, 9, 0)
+        emit_a64_add_imm(9, 9, 1)
+        emit_a64(0xD1000400 | (15 << 5) | 15)       // SUB x15, x15, #1
+        uint64 ff_pad_back = ff_pad_loop - out_len
+        emit_a64(0x14000000 | ((ff_pad_back / 4) & 0x3FFFFFF))  // B pad_loop
+        // pad_done:
+
+        // Format frac_int (x11) into [x9]: digit extract + reverse copy
+        emit_a64_mov_imm(14, 0)
+        uint64 ff_fi_loop = out_len
+        emit_a64_udiv(4, 11, 13)
+        emit_a64_msub(5, 4, 13, 11)
+        emit_a64_add_imm(5, 5, 48)
+        emit_a64(0x38206800 | (14 << 16) | (12 << 5) | 5)
+        emit_a64_add_imm(14, 14, 1)
+        emit_a64_mov(11, 4)
+        uint64 ff_fi_back = ff_fi_loop - out_len
+        emit_a64(0xB5000000 | (((ff_fi_back / 4) & 0x7FFFF) << 5) | 11)  // CBNZ x11, fi_loop
+
+        uint64 ff_fi_copy = out_len
+        emit_a64_cbz(14, 20)                        // CBZ x14, fi_done (5 insns=20 bytes)
+        emit_a64(0xD1000400 | (14 << 5) | 14)       // SUB x14, x14, #1
+        emit_a64(0x38606800 | (14 << 16) | (12 << 5) | 5)  // LDRB W5, [X12, X14]
+        emit_a64(0x38001525)                        // STRB W5, [X9], #1
+        uint64 ff_fi_back2 = ff_fi_copy - out_len
+        emit_a64(0x14000000 | ((ff_fi_back2 / 4) & 0x3FFFFFF))
+        // fi_done: x10 += 6 (pad + frac digits always total 6)
+        emit_a64_add_imm(10, 10, 6)
+
+        // Jump over big path: big path = 7 insns × 4 = 28 bytes, then .ff_end
+        // B at PC, big path at PC+4 (7 insns=28 bytes), ff_end at PC+32
+        emit_a64_b(32)                              // B .ff_end
+
+        // .ff_big: patch B.HS, then write "big", add 3 to len
+        uint64 ff_big = out_len
+        uint64 ff_bhs_disp = ff_big - ff_bhs_off
+        uint64 ff_bhs_p = out_buf + ff_bhs_off
+        uint64 ff_bhs_rel19 = (ff_bhs_disp / 4) & 0x7FFFF
+        uint64 ff_bhs_insn = 0x54000002 | (ff_bhs_rel19 << 5)  // B.HS, cond=2
+        uint32 ff_bhs_insn32 = ff_bhs_insn
+        unsafe { *(ff_bhs_p as uint32) = ff_bhs_insn32 }
+        // Write 'b', 'i', 'g'
+        emit_a64_mov_imm(11, 0x62)
+        emit_a64_strb(11, 9, 0)
+        emit_a64_mov_imm(11, 0x69)
+        emit_a64_strb(11, 9, 1)
+        emit_a64_mov_imm(11, 0x67)
+        emit_a64_strb(11, 9, 2)
+        emit_a64_add_imm(10, 10, 3)
+        // .ff_end:
+        emit_a64_mov(d, 10)
+        if dst_r == 0xFFFFFFFF { ir_a64_emit_store_spill(9, dest_v) }
+        return
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Function-level emitter
+// ---------------------------------------------------------------------------
+
+@export
+fn ir_emit_arm64_function(uint64 fn_node) {
+    // Check for @naked attribute
+    uint32 ann_flags = ast_data4(fn_node)
+    uint64 is_naked = ann_flags & 2
+
+    // Extern declarations: skip codegen (see ir_emit_x86_function).
+    uint64 is_extern_ir_a = ann_flags & 8
+    if is_extern_ir_a != 0 { return }
+
+    // 1. Lower AST to IR
+    ir_lower_function(fn_node)
+
+    // 1a. Optimize
+    if ir_opt_level > 0 {
+        ir_optimize()
+    }
+
+    // 2. Compute liveness
+    ir_compute_liveness()
+
+    // 3. Set up ARM64 register allocator (10 regs)
+    uint64 saved_num_regs = IR_NUM_REGS
+    IR_NUM_REGS = 10
+    ir_regalloc_init_arm64()
+    ir_graph_color()
+
+    // 4. Compute spill count
+    ir_spill_count = 0
+    if ir_vreg_next > IR_NUM_REGS + 1 {
+        ir_spill_count = ir_vreg_next - IR_NUM_REGS - 1
+    }
+
+    // 4a. Snapshot the function's var map for DWARF (if -g)
+    ir_snapshot_debug_vars()
+
+    // NOTE: IR_NUM_REGS must stay at 10 through emission — ir_get_phys_reg()
+    // uses it to distinguish colors from spills. Restore AFTER emission completes.
+
+    // 5. Compute frame size
+    // Callee-saved area: x29/x30 (16) + x19-x28 (80) = 96 bytes
+    uint64 callee_save_size = 96
+    uint64 spill_size = ir_spill_count * 8
+    // 32-byte scratchpad for mid-function temp buffers (fmt_uint digits,
+    // clock_gettime timespec, execve argv, etc). Using a fixed offset avoids
+    // dynamic SP shifts that invalidate spill slot addresses.
+    uint64 scratch_size = 32
+    // Total frame = spill + scratch + callee save, must be 16-aligned
+    // Layout from SP upward:
+    //   [SP + 0 .. IR_A64_OVERFLOW_RESERVE)  — stack slots for outgoing calls' args 9+
+    //   [spills ...]
+    //   [scratchpad ...]
+    //   [saved callee regs]
+    // With the overflow reserve at the bottom, the caller can STR
+    // outgoing args to [SP + offset] without any SUB — the callee
+    // reads [SP + callee_frame + (idx-8)*8] = caller's arg slots.
+    uint64 total_frame = IR_A64_OVERFLOW_RESERVE + spill_size + scratch_size + callee_save_size
+    if (total_frame & 15) != 0 { total_frame = total_frame + 16 - (total_frame & 15) }
+    if is_naked != 0 { total_frame = 0 }
+
+    ir_frame_size = total_frame
+    // Scratchpad sits right after spill slots (which start at the overflow reserve).
+    ir_a64_scratch_off = IR_A64_OVERFLOW_RESERVE + spill_size
+
+    // 5a. For main(): set up argc/argv BEFORE prologue
+    uint32 fn_name_tok = ast_data1(fn_node)
+    if tok_matches(fn_name_tok, "main", 4) != 0 && freestanding == 0 && target_os != 2 {
+        if target_os == 1 {
+            // macOS Mach-O: _main receives argc in x0, argv in x1 as function params
+            uint64 argc_off_m = static_lookup_by_name("cli_argc", 8)
+            if argc_off_m != 0xFFFFFFFF {
+                emit_a64_static_store(argc_off_m)  // store x0 (argc)
+            }
+            emit_a64_mov(0, 1)  // x0 = argv (x1)
+            uint64 argv_off_m = static_lookup_by_name("cli_argv", 8)
+            if argv_off_m != 0xFFFFFFFF {
+                emit_a64_static_store(argv_off_m)  // store x0 (was x1 = argv)
+            }
+        } else {
+            // Linux/Android ELF: argc/argv on stack. [SP]=argc, [SP+8]=&argv[0]
+            emit_a64_ldr(0, 31, 0)
+            uint64 argc_off = static_lookup_by_name("cli_argc", 8)
+            if argc_off != 0xFFFFFFFF {
+                emit_a64_static_store(argc_off)
+            }
+            emit_a64_add_imm(0, 31, 8)
+            uint64 argv_off = static_lookup_by_name("cli_argv", 8)
+            if argv_off != 0xFFFFFFFF {
+                emit_a64_static_store(argv_off)
+            }
+        }
+        // envp: Linux/Android = sp + 8 + (argc+1)*8; macOS = argv + (argc+1)*8.
+        // The legacy codegen populates this; the IR path was silently leaving
+        // cli_envp at 0, so exec_process() forwarded envp=NULL — fine on plain
+        // Linux but breaks Android bionic which needs at least LD_* vars to
+        // start the child process.
+        uint64 envp_off_main = static_lookup_by_name("cli_envp", 8)
+        if envp_off_main != 0xFFFFFFFF {
+            if target_os == 1 {
+                uint64 argc_off_env = static_lookup_by_name("cli_argc", 8)
+                if argc_off_env != 0xFFFFFFFF { emit_a64_static_load(argc_off_env) }
+                emit_a64_mov(9, 0)
+                emit_a64_add_imm(9, 9, 1)
+                emit_a64_mov_imm(10, 8)
+                emit_a64_mul(9, 9, 10)
+                uint64 argv_off_env = static_lookup_by_name("cli_argv", 8)
+                if argv_off_env != 0xFFFFFFFF { emit_a64_static_load(argv_off_env) }
+                emit_a64_add(0, 0, 9)
+            } else {
+                emit_a64_ldr(9, 31, 0)
+                emit_a64_add_imm(9, 9, 1)
+                emit_a64_mov_imm(10, 8)
+                emit_a64_mul(9, 9, 10)
+                emit_a64_add_imm(0, 31, 8)
+                emit_a64_add(0, 0, 9)
+            }
+            emit_a64_static_store(envp_off_main)
+        }
+    }
+    if tok_matches(fn_name_tok, "main", 4) != 0 && freestanding == 0 && target_os == 2 {
+        // Windows ARM64: GetCommandLineA via IAT
+        emit_a64_win_call_iat(7)
+        uint64 argv_off_w = static_lookup_by_name("cli_argv", 8)
+        if argv_off_w != 0xFFFFFFFF {
+            emit_a64_static_store(argv_off_w)
+        }
+        emit_a64_mov_imm(0, 0xFFFFFFFF)
+        uint64 argc_off_w = static_lookup_by_name("cli_argc", 8)
+        if argc_off_w != 0xFFFFFFFF {
+            emit_a64_static_store(argc_off_w)
+        }
+    }
+
+    // 6. Emit prologue (skip for @naked)
+    if is_naked == 0 {
+        // SUB SP, SP, #total_frame
+        emit_a64_sub_sp_imm(total_frame)
+        // Save FP/LR and callee-saved regs after spill+scratch area.
+        // Pair them with STP — halves the instruction count vs per-reg
+        // STRs. STP's offset is imm7 scaled by 8, capped at 504; fall
+        // back to individual STR for large frames to stay correct.
+        uint64 cs_base = IR_A64_OVERFLOW_RESERVE + spill_size + scratch_size
+        uint64 fp_off = cs_base + 80
+        if fp_off + 8 <= 504 {
+            ir_a64_stp_sp(19, 20, cs_base)
+            ir_a64_stp_sp(21, 22, cs_base + 16)
+            ir_a64_stp_sp(23, 24, cs_base + 32)
+            ir_a64_stp_sp(25, 26, cs_base + 48)
+            ir_a64_stp_sp(27, 28, cs_base + 64)
+            ir_a64_stp_sp(29, 30, fp_off)
+        } else {
+            ir_a64_str_sp(29, fp_off)
+            ir_a64_str_sp(30, fp_off + 8)
+            ir_a64_str_sp(19, cs_base)
+            ir_a64_str_sp(20, cs_base + 8)
+            ir_a64_str_sp(21, cs_base + 16)
+            ir_a64_str_sp(22, cs_base + 24)
+            ir_a64_str_sp(23, cs_base + 32)
+            ir_a64_str_sp(24, cs_base + 40)
+            ir_a64_str_sp(25, cs_base + 48)
+            ir_a64_str_sp(26, cs_base + 56)
+            ir_a64_str_sp(27, cs_base + 64)
+            ir_a64_str_sp(28, cs_base + 72)
+        }
+    }
+
+    // 7. Allocate branch/return fixup tracking
+    //    Buffers are reused across functions — only re-alloc if a function
+    //    needs more capacity than previously allocated. Without this guard
+    //    every emitted function leaked ~52 KB.
+    uint64 bo_need = ir_bb_count
+    if bo_need < 4096 { bo_need = 4096 }
+    if bo_need > ir_block_offsets_cap {
+        if ir_block_offsets != 0 { dealloc(ir_block_offsets) }
+        ir_block_offsets = alloc(bo_need * 8)
+        ir_block_offsets_cap = bo_need
+    }
+    uint64 br_need = ir_bb_count * 4
+    if br_need < 2048 { br_need = 2048 }
+    if br_need > ir_br_fixups_cap {
+        if ir_br_fixups != 0 { dealloc(ir_br_fixups) }
+        ir_br_fixups = alloc(br_need * 8)
+        ir_br_fixups_cap = br_need
+    }
+    uint64 ret_need = ir_bb_count
+    if ret_need < 1024 { ret_need = 1024 }
+    if ret_need > ir_ret_fixups_cap {
+        if ir_ret_fixups != 0 { dealloc(ir_ret_fixups) }
+        ir_ret_fixups = alloc(ret_need * 4)
+        ir_ret_fixups_cap = ret_need
+    }
+    ir_br_fixup_count = 0
+    ir_ret_fixup_count = 0
+
+    // 8. Emit all basic blocks
+    uint64 bi = 0
+    while bi < ir_bb_count {
+        // Record this block's code offset
+        uint64 bop = ir_block_offsets + bi * 8
+        unsafe { *(bop as uint64) = out_len }
+        // Reset the spill-reload peephole at every BB boundary so a
+        // branch target never lands mid-pattern.
+        ir_a64_peephole_reset()
+
+        // Emit non-terminator instructions
+        uint64 ii = ir_bb_first_insn(bi)
+        while ii != 0xFFFFFFFF {
+            uint64 iop = ir_insn_opcode(ii)
+            if iop != 40 && iop != 41 {
+                ir_emit_arm64_insn(ii)
+            }
+            ii = ir_insn_next(ii)
+        }
+
+        // Emit block terminator
+        uint64 last = ir_bb_last_insn(bi)
+        if last != 0xFFFFFFFF {
+            uint64 last_op = ir_insn_opcode(last)
+            if last_op == 40 {
+                // IR_BR: unconditional branch to target_bb
+                uint64 target = ir_insn_imm(last)
+                if target != bi + 1 {
+                    // Record fixup [patch_offset, target_bb]
+                    uint64 fp = ir_br_fixups + ir_br_fixup_count * 8
+                    uint32 po = out_len
+                    unsafe { *(fp as uint32) = po }
+                    uint64 fp4 = fp + 4
+                    uint32 tb = target
+                    unsafe { *(fp4 as uint32) = tb }
+                    ir_br_fixup_count = ir_br_fixup_count + 1
+                    emit_a64(0x14000000)    // B #0 (placeholder)
+                }
+            }
+            if last_op == 41 {
+                // IR_BR_COND: cbnz cond_vreg, true_target; fallthrough or B false_target
+                uint64 cond_v = ir_insn_src1(last)
+                uint64 cond_r = ir_a64_resolve_src(cond_v, 9)
+                uint64 target_true = ir_insn_imm(last)
+                // Record fixup for CBNZ -> true target
+                // We encode type=1 (CBNZ) in high bit of target_bb
+                uint64 fp = ir_br_fixups + ir_br_fixup_count * 8
+                uint32 po = out_len
+                unsafe { *(fp as uint32) = po }
+                uint64 fp4 = fp + 4
+                // Encode: bit 31 = 1 for CBNZ, bits 0-30 = target_bb, store cond_r in the insn
+                uint32 tb = target_true | 0x80000000
+                unsafe { *(fp4 as uint32) = tb }
+                ir_br_fixup_count = ir_br_fixup_count + 1
+                // CBNZ cond_r, #0 (placeholder)
+                emit_a64(0xB5000000 | cond_r)
+                // Emit B to false target if not fall-through
+                uint64 target_false = ir_bb_succ0(bi)
+                if target_false != 0xFFFFFFFF && target_false != bi + 1 {
+                    uint64 fp2 = ir_br_fixups + ir_br_fixup_count * 8
+                    uint32 po2 = out_len
+                    unsafe { *(fp2 as uint32) = po2 }
+                    uint64 fp24 = fp2 + 4
+                    uint32 tb2 = target_false
+                    unsafe { *(fp24 as uint32) = tb2 }
+                    ir_br_fixup_count = ir_br_fixup_count + 1
+                    emit_a64(0x14000000)    // B #0 (placeholder)
+                }
+            }
+        }
+
+        bi = bi + 1
+    }
+
+    // 9. Patch branch fixups
+    uint64 fi = 0
+    while fi < ir_br_fixup_count {
+        uint64 fp = ir_br_fixups + fi * 8
+        uint32 patch_off = 0
+        unsafe { *(fp as uint32) -> patch_off }
+        uint64 fp4 = fp + 4
+        uint32 target_bb_raw = 0
+        unsafe { *(fp4 as uint32) -> target_bb_raw }
+        uint64 wraw = target_bb_raw
+        uint64 is_cbnz = wraw & 0x80000000
+        uint64 wtb = wraw & 0x7FFFFFFF
+        // Get target block offset
+        uint64 tbp = ir_block_offsets + wtb * 8
+        uint64 target_off = 0
+        unsafe { *(tbp as uint64) -> target_off }
+        uint64 wpo = patch_off
+        uint64 disp = target_off - wpo
+        uint64 rel = disp / 4
+        if is_cbnz != 0 {
+            // Patch CBNZ: read existing instruction to get Rt
+            uint64 insn_addr = out_buf + wpo
+            uint32 old_insn = 0
+            unsafe { *(insn_addr as uint32) -> old_insn }
+            uint64 wo = old_insn
+            uint64 rt = wo & 0x1F
+            uint64 new_insn = 0xB5000000 | ((rel & 0x7FFFF) << 5) | rt
+            patch_u32(wpo, new_insn)
+        } else {
+            // Patch B
+            uint64 new_insn = 0x14000000 | (rel & 0x3FFFFFF)
+            patch_u32(wpo, new_insn)
+        }
+        fi = fi + 1
+    }
+
+    // 10. Patch return fixups — all point to epilogue
+    uint64 epilogue_off = out_len
+    uint64 ri2 = 0
+    while ri2 < ir_ret_fixup_count {
+        uint64 rfp = ir_ret_fixups + ri2 * 4
+        uint32 rpatch = 0
+        unsafe { *(rfp as uint32) -> rpatch }
+        uint64 wrp = rpatch
+        uint64 rdisp = epilogue_off - wrp
+        uint64 rrel = rdisp / 4
+        uint64 new_insn = 0x14000000 | (rrel & 0x3FFFFFF)
+        patch_u32(wrp, new_insn)
+        ri2 = ri2 + 1
+    }
+
+    // 11. Epilogue (skip for @naked)
+    if is_naked == 0 {
+        // For main(): auto-insert exit(x0) syscall. Without this, returning
+        // from main() jumps to an undefined LR -> segfault. x0 already
+        // holds main's return value; only zero it for void main so
+        // fall-through still produces exit(0).
+        if tok_matches(fn_name_tok, "main", 4) != 0 && freestanding == 0 {
+            uint32 ret_type_tok_a64 = ast_data2(fn_node)
+            if ret_type_tok_a64 == 0 {
+                emit_a64_mov_imm(0, 0)
+            }
+            if target_os == 2 {
+                emit_a64_win_call_iat(0)
+            } else {
+                if target_os == 1 { emit_a64_syscall_nr(1) } else { emit_a64_syscall_nr(93) }
+                emit_a64_svc()
+            }
+        }
+        // Restore callee-saved registers. Mirror the prologue: LDP
+        // pairs when the frame fits, individual LDRs otherwise.
+        uint64 cs_base_e = IR_A64_OVERFLOW_RESERVE + spill_size + scratch_size
+        uint64 fp_off_e = cs_base_e + 80
+        if fp_off_e + 8 <= 504 {
+            ir_a64_ldp_sp(19, 20, cs_base_e)
+            ir_a64_ldp_sp(21, 22, cs_base_e + 16)
+            ir_a64_ldp_sp(23, 24, cs_base_e + 32)
+            ir_a64_ldp_sp(25, 26, cs_base_e + 48)
+            ir_a64_ldp_sp(27, 28, cs_base_e + 64)
+            ir_a64_ldp_sp(29, 30, fp_off_e)
+        } else {
+            ir_a64_ldr_sp(19, cs_base_e)
+            ir_a64_ldr_sp(20, cs_base_e + 8)
+            ir_a64_ldr_sp(21, cs_base_e + 16)
+            ir_a64_ldr_sp(22, cs_base_e + 24)
+            ir_a64_ldr_sp(23, cs_base_e + 32)
+            ir_a64_ldr_sp(24, cs_base_e + 40)
+            ir_a64_ldr_sp(25, cs_base_e + 48)
+            ir_a64_ldr_sp(26, cs_base_e + 56)
+            ir_a64_ldr_sp(27, cs_base_e + 64)
+            ir_a64_ldr_sp(28, cs_base_e + 72)
+            ir_a64_ldr_sp(29, fp_off_e)
+            ir_a64_ldr_sp(30, fp_off_e + 8)
+        }
+        // ADD SP, SP, #total_frame
+        emit_a64_add_sp_imm(total_frame)
+        // RET
+        emit_a64_ret()
+    }
+
+    // Restore IR_NUM_REGS for x86_64 functions compiled later
+    IR_NUM_REGS = saved_num_regs
+}

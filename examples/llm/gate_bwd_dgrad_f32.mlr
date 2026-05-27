@@ -1,0 +1,57 @@
+// gate_bwd_dgrad_f32 — second pass of 2-kernel gate backward.
+//
+// Computes dgw[K,D] += sum_bs dgl[bs,k]*x[bs,d]
+//          dgb[K]   += sum_bs dgl[bs,k]   (thread d=0 only)
+//
+// Uses dgl[BS,K] produced by gate_bwd_bs_f32 first pass.
+// Non-atomic (sequential reduce over BS in each thread).
+// Accumulates INTO existing dgw/dgb (does += for both views).
+//
+// Grid: K blocks × D threads (K=4, D=384).
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native \
+//       examples/llm/gate_bwd_dgrad_f32.mlr -o /tmp/gate_bwd_dgrad_f32
+
+fn block_idx_x() -> uint64 { return 0 }
+fn tid_local_x() -> uint64 { return 0 }
+
+@kernel
+fn gate_bwd_dgrad_f32(
+    uint64 x_ptr,
+    uint64 dgl_ptr,
+    uint64 dgw_ptr,
+    uint64 dgb_ptr,
+    uint64 BS, uint64 D, uint64 K
+) {
+    uint64 k = block_idx_x()
+    uint64 d = tid_local_x()
+    if k < K {
+        if d < D {
+            f32 acc_dgw = 0.0
+            f32 acc_dgb = 0.0
+            uint64 bs = 0
+            while bs < BS {
+                f32 dgl_k = 0.0
+                unsafe { *((dgl_ptr + (bs * K + k) * 4) as f32) -> dgl_k }
+                f32 xv = 0.0
+                unsafe { *((x_ptr + (bs * D + d) * 4) as f32) -> xv }
+                acc_dgw = acc_dgw + dgl_k * xv
+                acc_dgb = acc_dgb + dgl_k
+                bs = bs + 1
+            }
+            // Accumulate += into dgw (all D threads do their column)
+            f32 cur_dgw = 0.0
+            unsafe { *((dgw_ptr + (k * D + d) * 4) as f32) -> cur_dgw }
+            unsafe { *((dgw_ptr + (k * D + d) * 4) as f32) = cur_dgw + acc_dgw }
+            // Accumulate += into dgb (thread d=0 only to avoid D-fold multiply)
+            if d == 0 {
+                f32 cur_dgb = 0.0
+                unsafe { *((dgb_ptr + k * 4) as f32) -> cur_dgb }
+                unsafe { *((dgb_ptr + k * 4) as f32) = cur_dgb + acc_dgb }
+            }
+        }
+    }
+}
+
+fn main() { exit(0) }

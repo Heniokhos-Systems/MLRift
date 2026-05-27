@@ -1,0 +1,112 @@
+// gate_bwd_bs_f32 — per-bs gate backward (one block per bs, D threads).
+//
+// First pass of 2-kernel gate backward for WZMALinear.
+// Computes dx_gate[BS,D] and dgl[BS,K] (for second-pass dgw/dgb accumulation).
+//
+// For each bs row:
+//   d_alpha[k] = dot(dy[bs,:], outk[k][bs,:])  (LDS reduce over D threads)
+//   sum_ada    = sum_k alpha[k] * d_alpha[k]
+//   dgl[bs,k]  = alpha[k] * (d_alpha[k] - sum_ada)
+//   dx_gate[bs,d] = sum_k dgl[bs,k] * gw[k,d]
+//
+// Notes:
+//   - Atomic-free: dx_gate has no conflicts (each (bs,d) written once).
+//   - dgl[bs,k] written only by thread d=0 (no conflict).
+//   - dbias computed CPU-side (D=384 elements, negligible cost).
+//   - outk layout expected: [BS, K, D] contiguous.
+//
+// Grid: BS blocks × D threads (D=384 ≤ 1024 max block size).
+//
+// Build:
+//   ./build/mlrc --arch=x86_64 --target=amdgpu-native \
+//       examples/llm/gate_bwd_bs_f32.mlr -o /tmp/gate_bwd_bs_f32
+
+fn block_idx_x() -> uint64 { return 0 }
+fn tid_local_x() -> uint64 { return 0 }
+fn lds_reduce_sum_f32(f32 x) -> f32 { return x }
+
+@kernel
+fn gate_bwd_bs_f32(
+    uint64 dy_ptr,
+    uint64 x_ptr,
+    uint64 alpha_ptr,
+    uint64 outk_ptr,
+    uint64 gw_ptr,
+    uint64 dx_gate_ptr,
+    uint64 dgl_ptr,
+    uint64 BS, uint64 D, uint64 K
+) {
+    uint64 bs = block_idx_x()
+    uint64 d  = tid_local_x()
+    if bs < BS {
+        if d < D {
+            uint64 dy_base    = dy_ptr    + bs * D * 4
+            uint64 x_base     = x_ptr     + bs * D * 4
+            uint64 alpha_base = alpha_ptr + bs * K * 4
+
+            f32 dyv = 0.0
+            unsafe { *((dy_base + d * 4) as f32) -> dyv }
+
+            // d_alpha[k] = dot(dy[bs,:], outk[k][bs,:]) — LDS reduce across D
+            f32 da0 = 0.0
+            f32 da1 = 0.0
+            f32 da2 = 0.0
+            f32 da3 = 0.0
+            uint64 ok0_base = outk_ptr + (bs * K + 0) * D * 4
+            uint64 ok1_base = outk_ptr + (bs * K + 1) * D * 4
+            uint64 ok2_base = outk_ptr + (bs * K + 2) * D * 4
+            uint64 ok3_base = outk_ptr + (bs * K + 3) * D * 4
+            f32 ok0 = 0.0
+            f32 ok1 = 0.0
+            f32 ok2 = 0.0
+            f32 ok3 = 0.0
+            unsafe { *((ok0_base + d * 4) as f32) -> ok0 }
+            unsafe { *((ok1_base + d * 4) as f32) -> ok1 }
+            unsafe { *((ok2_base + d * 4) as f32) -> ok2 }
+            unsafe { *((ok3_base + d * 4) as f32) -> ok3 }
+            da0 = lds_reduce_sum_f32(dyv * ok0)
+            da1 = lds_reduce_sum_f32(dyv * ok1)
+            da2 = lds_reduce_sum_f32(dyv * ok2)
+            da3 = lds_reduce_sum_f32(dyv * ok3)
+
+            // alpha[k] from GPU buffer
+            f32 a0 = 0.0
+            f32 a1 = 0.0
+            f32 a2 = 0.0
+            f32 a3 = 0.0
+            unsafe { *((alpha_base + 0 * 4) as f32) -> a0 }
+            unsafe { *((alpha_base + 1 * 4) as f32) -> a1 }
+            unsafe { *((alpha_base + 2 * 4) as f32) -> a2 }
+            unsafe { *((alpha_base + 3 * 4) as f32) -> a3 }
+            f32 sum_ada = a0 * da0 + a1 * da1 + a2 * da2 + a3 * da3
+
+            // dgl[bs,k] = alpha[k] * (da[k] - sum_ada)
+            f32 dgl0 = a0 * (da0 - sum_ada)
+            f32 dgl1 = a1 * (da1 - sum_ada)
+            f32 dgl2 = a2 * (da2 - sum_ada)
+            f32 dgl3 = a3 * (da3 - sum_ada)
+
+            // dx_gate[bs,d] = sum_k dgl[k] * gw[k,d]
+            f32 gw0 = 0.0
+            f32 gw1 = 0.0
+            f32 gw2 = 0.0
+            f32 gw3 = 0.0
+            unsafe { *((gw_ptr + (0 * D + d) * 4) as f32) -> gw0 }
+            unsafe { *((gw_ptr + (1 * D + d) * 4) as f32) -> gw1 }
+            unsafe { *((gw_ptr + (2 * D + d) * 4) as f32) -> gw2 }
+            unsafe { *((gw_ptr + (3 * D + d) * 4) as f32) -> gw3 }
+            f32 dx_g = dgl0 * gw0 + dgl1 * gw1 + dgl2 * gw2 + dgl3 * gw3
+            unsafe { *((dx_gate_ptr + (bs * D + d) * 4) as f32) = dx_g }
+
+            // dgl[bs,k] written by thread d=0 only (no conflict with other threads)
+            if d == 0 {
+                unsafe { *((dgl_ptr + (bs * K + 0) * 4) as f32) = dgl0 }
+                unsafe { *((dgl_ptr + (bs * K + 1) * 4) as f32) = dgl1 }
+                unsafe { *((dgl_ptr + (bs * K + 2) * 4) as f32) = dgl2 }
+                unsafe { *((dgl_ptr + (bs * K + 3) * 4) as f32) = dgl3 }
+            }
+        }
+    }
+}
+
+fn main() { exit(0) }
