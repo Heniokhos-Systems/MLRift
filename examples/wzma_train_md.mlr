@@ -28,19 +28,16 @@
 //
 // Loss: each step within 1e-2 of bench_ref.json.  Grads ≤1e-3 vs oracle_grads.bin.
 //
-// STATUS (2026-05-27): forward + InfoNCE GREEN (loss[0]=3.059341 bit-exact).
-// Backward is RUN-BLOCKED: the first bwd_uv view-prep dispatch, gate_bwd_bs_f32,
-// HANGS the WG (hipDeviceSynchronize 5 s timeout; 1 packet outstanding, NOT ring
-// back-pressure — only 6 dispatches/sync here, well under the 64-slot ring).
-// Pinpointed via per-dispatch sync probe: "VP0 pre gate_bwd_bs" prints, then the
-// kernel never retires.  gate_bwd_bs_f32 is the ONE backward kernel the isolated
-// bwd_uv_smoke (examples/bwd_uv_smoke.mlr) never exercised — its 3-packet view-
-// prep covered only dbias-gemm_accum + 2 transposes, NOT gate_bwd_bs/_dgrad/repack.
-// Root cause is inside the gate_bwd_bs_f32 cross-wave 512-lane LDS reduce
-// (_emit_lds_reduce_tree_512 in src/format_amdgpu.mlr) — needs a dedicated fix.
-// The AQL-ring syncs (per-bank + view-prep) ARE in place and are correct; they
-// were not the wedge cause.  The GPU is NOT firmware-wedged — the hang is a
-// per-process kernel spin our 5 s watchdog catches; the queue is reclaimed at exit.
+// STATUS (2026-05-28): FULL STEP GREEN + deterministic.  loss[0]=3.059341,
+// loss[49]=0.000634 (both bit-exact vs bench_ref); step-0 grads max|err|=4e-7
+// vs oracle (n_nan_inf=0); ~6.9 ms/step (beats native 17.6, matches megakernel
+// 6.9).  Two optimizations landed this session:
+//   OPT A — bwd_uv (#1 cost) dispatch/sync fan-out cut: weight transposes
+//     V_kT/U_kT hoisted to a once-per-step prologue (view-invariant) and per-bank
+//     scratch slots let all 4 banks issue back-to-back with ONE sync/view (was
+//     1 sync/bank).  76 dispatches/10 syncs → 60/3.  bwd_uv 2.62 → 2.36 ms/step.
+//   OPT B — d_grads/d_demb per-step zero moved back ONTO the GPU via the now-fixed
+//     fill_step (global-id addressing); reclaims the ~0.65 ms/step H2D memset.
 //
 // Build (--target=amdgpu-native):
 //   ./build/mlrc --target=amdgpu-native examples/wzma_train_md.mlr \
@@ -581,10 +578,15 @@ fn main() {
     u64 d_inter_kr = gpu_malloc(K * BS * R * 4, "mInterKR")   // [K,BS,R]
     u64 d_alphaT   = gpu_malloc(K * BS * 4,     "mAlphaT")    // alpha^T [K,BS] → row k = alpha[:,k]
     u64 d_xT       = gpu_malloc(D * BS * 4,     "mXT")        // x^T [D,BS]
-    u64 d_interT   = gpu_malloc(R * BS * 4,     "mInterT")    // inter_k^T [R,BS] (reused per k)
-    u64 d_VkT      = gpu_malloc(D * R * 4,      "mVkT")       // V_k^T [D,R] (reused per k)
-    u64 d_UkT      = gpu_malloc(R * D * 4,      "mUkT")       // U_k^T [R,D] (reused per k)
-    u64 d_dinter   = gpu_malloc(BS * R * 4,     "mDinter")    // dinter_k [BS,R] (reused per k)
+    // OPT A: per-bank scratch slots (K× the old single-reuse slots) so all 4 banks'
+    // GEMM dispatches can be issued back-to-back and driver-synced ONCE per view
+    // (was 1 sync/bank = 8 syncs/step in the bank loops; now 2).  The weight
+    // transposes V_kT/U_kT depend only on the weights (not the view) so they are
+    // computed ONCE per step into these per-bank slots (was redone per view).
+    u64 d_interT   = gpu_malloc(K * R * BS * 4, "mInterT")    // inter_k^T [K,R,BS]
+    u64 d_VkT      = gpu_malloc(K * D * R * 4,  "mVkT")       // V_k^T [K,D,R]  (per step)
+    u64 d_UkT      = gpu_malloc(K * R * D * 4,  "mUkT")       // U_k^T [K,R,D]  (per step)
+    u64 d_dinter   = gpu_malloc(K * BS * R * 4, "mDinter")    // dinter_k [K,BS,R]
     u64 d_dgl1     = gpu_malloc(BS * K * 4,     "mDgl1");  u64 d_dgl2 = gpu_malloc(BS * K * 4, "mDgl2")
     u64 d_ones_bs  = gpu_malloc(BS * 4,         "mOnesBS")   // [1,BS] all-ones for dbias gemm
 
@@ -726,19 +728,16 @@ fn main() {
         // the GEMM backward (gemm_f32_accum + gate_bwd dgrad scatter into them
         // across both views/banks), so they MUST start at 0 each step.
         //
-        // NOTE: the device-side grid-fill (launch_fill / fill_step) is BROKEN for
-        // buffers larger than one workgroup — the fill_step ISA addresses
-        // buf[tid_local] with NO workgroup offset (see emit_amdgpu_fill_step_blob
-        // in src/format_amdgpu.mlr: store addr = v0*8, v0 = workitem id only), so
-        // every WG writes the same first `block` elements and the tail is left
-        // UNINITIALIZED.  With the GEMM-ified backward that surfaced as ~80% of
-        // d_grads being NaN/inf garbage.  Reverted to a correct H2D memset from the
-        // host zero buffer (zbig is VOCAB*D*4, covers both).  Costs ~0.8 ms/step of
-        // PCIe staging — correctness over the GPU-fill optimization until fill_step
-        // is given a global-id address.
+        // GPU-side grid-fill (launch_fill / fill_step): the emitter now addresses
+        // buf[wg_id_x*bdim + tid] (global flat id) with an OOB gid<n gate, so a
+        // multi-WG grid zeroes the WHOLE buffer (was single-block-only / tail-garbage
+        // before the emit fix in src/format_amdgpu.mlr emit_amdgpu_fill_step_blob).
+        // Treats the buffer as f64 elems (n_f32/2, value=0.0 → all-zero bytes).  No
+        // PCIe H2D staging — the GPU writes its own scratch (reclaims the ~0.65 ms/
+        // step the H2D memset cost).  PART_N=100228 and VOCAB*D=3145728 are both even.
         t0 = time_now()
-        err = hipMemcpy(d_grads, zbig, PART_N * 4,    1); if err != 0 { die_gpu("zero grads", err) }
-        err = hipMemcpy(d_demb,  zbig, VOCAB * D * 4, 1); if err != 0 { die_gpu("zero demb", err) }
+        launch_fill(fh_fill, d_grads, PART_N)
+        launch_fill(fh_fill, d_demb,  VOCAB * D)
         sync_or_die("sync gpu-zero"); t1 = time_now(); ns_zero = ns_zero + (t1 - t0)
 
         // ════════════════ BACKWARD — build shared 63-arg kernarg block ═══════
@@ -852,7 +851,27 @@ fn main() {
         //   dV_k[r,d]     += inter_k^T[R,BS] · doutk_k[BS,D]       (gemm_accum, raw inter)
         //   dU_k[d,r]     += x^T[D,BS] · dinter_k[BS,R]            (gemm_accum)
         //   dx[bs,d]      += dinter_k[BS,R] · U_k^T[R,D]           (gemm_accum into dx_gate)
+        //
+        // OPT A — dispatch/sync fan-out cut.  The OLD loop synced after EVERY bank
+        // (8 syncs/step in the inner loops) and re-transposed each WEIGHT matrix
+        // (V_k, U_k) once PER VIEW even though weights are view-invariant.  Now:
+        //   (1) the K weight transposes V_k→V_kT and U_k→U_kT run ONCE per step in
+        //       a prologue (8 dispatches → 1 sync), written into per-bank slots;
+        //   (2) each bank uses its OWN dinter/interT scratch slot so all 4 banks'
+        //       remaining 6 dispatches issue back-to-back and are driver-synced
+        //       ONCE per view (24 packets < 64 ring slots).  The AQL queue is
+        //       in-order so the dx[bs,d] += accumulation across banks (same buffer)
+        //       and every read-after-write stays correct without per-bank fences.
+        // Net: 76 dispatches/10 syncs  →  60 dispatches/3 syncs per step.
         t0 = time_now()
+        // ── Prologue: transpose all K weight matrices ONCE (view-invariant) ──
+        u64 kt = 0
+        while kt < K {
+            launch_transpose(fh_transp, d_V + kt*R*D*4, d_VkT + kt*D*R*4, R, D)  // V_k[R,D]→[D,R]
+            launch_transpose(fh_transp, d_U + kt*D*R*4, d_UkT + kt*R*D*4, D, R)  // U_k[D,R]→[R,D]
+            kt = kt + 1
+        }
+        sync_or_die("sync bwd_uv weight-T")
         u64 vw = 0
         while vw < 2 {
             u64 d_xv   = d_x1;  u64 d_av  = d_a1;  u64 d_iv = d_i1;  u64 d_ov = d_o1
@@ -880,32 +899,32 @@ fn main() {
             sync_or_die("sync bwd_uv view-prep")
             u64 kk = 0
             while kk < K {
-                u64 d_Uk  = d_U + kk*D*R*4
-                u64 d_Vk  = d_V + kk*R*D*4
                 u64 d_dUk = d_dU + kk*D*R*4
                 u64 d_dVk = d_dV + kk*R*D*4
-                u64 d_intk   = d_inter_kr + kk*BS*R*4          // raw inter_k [BS,R]
-                u64 d_doutk_k = d_doutk   + kk*BS*D*4          // doutk_k [BS,D]
-                u64 d_alphak = d_alphaT   + kk*BS*4            // alpha_k [BS]
+                u64 d_intk    = d_inter_kr + kk*BS*R*4         // raw inter_k [BS,R]
+                u64 d_doutk_k = d_doutk    + kk*BS*D*4         // doutk_k [BS,D]
+                u64 d_alphak  = d_alphaT   + kk*BS*4           // alpha_k [BS]
+                u64 d_VkT_k   = d_VkT      + kk*D*R*4          // V_k^T [D,R] (prologue)
+                u64 d_UkT_k   = d_UkT      + kk*R*D*4          // U_k^T [R,D] (prologue)
+                u64 d_interT_k = d_interT  + kk*R*BS*4         // inter_k^T [R,BS] (per-bank)
+                u64 d_dinter_k = d_dinter  + kk*BS*R*4         // dinter_k [BS,R] (per-bank)
                 // doutk_k = alpha_k · dz   (α applied ONCE here)
                 launch_row_scale(fh_rscale, d_dzv, d_alphak, d_doutk_k, BS*D, D)
-                // dinter_k[BS,R] = doutk_k[BS,D] · V_k^T[D,R]
-                launch_transpose(fh_transp, d_Vk, d_VkT, R, D)        // V_k[R,D]→[D,R]
-                launch_gemm(fh_gemm, d_doutk_k, d_VkT, d_dinter, BS, R, D)
+                // dinter_k[BS,R] = doutk_k[BS,D] · V_k^T[D,R]   (V_kT from prologue)
+                launch_gemm(fh_gemm, d_doutk_k, d_VkT_k, d_dinter_k, BS, R, D)
                 // dV_k[R,D] += inter_k^T[R,BS] · doutk_k[BS,D]
-                launch_transpose(fh_transp, d_intk, d_interT, BS, R)  // inter_k[BS,R]→[R,BS]
-                launch_gemm_accum(fh_gaccum, d_interT, d_doutk_k, d_dVk, R, D, BS)
+                launch_transpose(fh_transp, d_intk, d_interT_k, BS, R) // inter_k[BS,R]→[R,BS]
+                launch_gemm_accum(fh_gaccum, d_interT_k, d_doutk_k, d_dVk, R, D, BS)
                 // dU_k[D,R] += x^T[D,BS] · dinter_k[BS,R]
-                launch_gemm_accum(fh_gaccum, d_xT, d_dinter, d_dUk, D, R, BS)
-                // dx[BS,D] += dinter_k[BS,R] · U_k^T[R,D]  (accumulate onto dx_gate)
-                launch_transpose(fh_transp, d_Uk, d_UkT, D, R)        // U_k[D,R]→[R,D]
-                launch_gemm_accum(fh_gaccum, d_dinter, d_UkT, d_dxv, BS, D, R)
-                // Sync per bank (8 packets) — bounds ring depth AND fences the
-                // shared scratch (d_dinter/d_VkT/d_interT/d_UkT) before reuse by
-                // the next bank.  This IS the driver-sync between GEMM dispatches.
-                sync_or_die("sync bwd_uv bank")
+                launch_gemm_accum(fh_gaccum, d_xT, d_dinter_k, d_dUk, D, R, BS)
+                // dx[BS,D] += dinter_k[BS,R] · U_k^T[R,D]  (accumulate onto dx_gate;
+                // U_kT from prologue; in-order queue serializes the cross-bank +=)
+                launch_gemm_accum(fh_gaccum, d_dinter_k, d_UkT_k, d_dxv, BS, D, R)
                 kk = kk + 1
             }
+            // ONE sync after all 4 banks (24 packets) — bounds ring depth; the
+            // per-bank scratch slots removed the inter-bank reuse hazard.
+            sync_or_die("sync bwd_uv banks")
             vw = vw + 1
         }
         t1 = time_now(); ns_buv = ns_buv + (t1 - t0)

@@ -5799,15 +5799,21 @@ fn emit_amdgpu_relax_step_blob(uint64 out_path) -> uint64 {
 }
 
 // ---------------------------------------------------------------------------
-// B4 fill_step: per-lane constant fill. buf[tid] = value.
-// Semantics matches examples/gpu_stage13_full.mlr:65-72.
+// B4 fill_step: flat grid-strideless constant fill. buf[gid] = value, gid<n.
 //
-// Launch: block_x = N, grid_x = 1. Guard via tid < n.
+// Multi-WG correct: addresses buf[wg_id_x*bdim + tid] (the GLOBAL flat id),
+// NOT buf[tid].  The earlier single-WG-only form (store addr = tid*8, no
+// workgroup offset) meant every WG re-wrote the first `block` elements and the
+// tail was left uninitialized — fine at grid=1, garbage for any grid>1 (the
+// wzma_train_md per-step d_grads/d_demb GPU-zero hit exactly this).  Now each
+// lane owns one global element and OOB lanes (gid>=n) are masked off, so the
+// kernel is a normal flat grid.  Launch: grid_x = ceil(n/bdim), block_x = bdim.
 //
-// Kernargs (3 entries, 24 bytes):
+// Kernargs (4 entries, 32 bytes):
 //   [0x00] buf_ptr  (f64*)
-//   [0x08] n        (u64 by-value)
+//   [0x08] n        (u64 by-value)   total f64 element count
 //   [0x10] value    (f64 by-value)
+//   [0x18] bdim     (u64 by-value)   block_x (lanes per WG)
 @export
 fn emit_amdgpu_fill_step_blob(uint64 out_path) -> uint64 {
     uint64 kname = "fill_step"
@@ -5818,14 +5824,19 @@ fn emit_amdgpu_fill_step_blob(uint64 out_path) -> uint64 {
     asm_s_load_b64(1, 0)                            // s[2:3] buf_ptr
     asm_s_load_b64_off(2, 0, 0x08)                  // s[4:5] n
     asm_s_load_b64_off(3, 0, 0x10)                  // s[6:7] value
+    asm_s_load_b64_off(4, 0, 0x18)                  // s[8:9] bdim
     asm_s_waitcnt_lgkmcnt_zero()
 
-    // tid < n guard.
-    asm_v_cmp_gt_u32_sgpr_vgpr(4, 0)                // vcc_lo = (s4 > v0)
+    // gid = wg_id_x(s15) * bdim(s8) + tid(v0)   (u24 mad; gid < 2^24 always)
+    asm_v_mad_u32_u24(1, 15, 8, 0)                  // v1 = s15*s8 + v0
+    asm_s_delay_alu(0x01)
+
+    // gid < n guard  (vcc_lo = s4 > v1).
+    asm_v_cmp_gt_u32_sgpr_vgpr(4, 1)                // vcc_lo = (s4 > v1)
     asm_s_and_saveexec_b32_vcc_lo(46)
 
-    // v2 = tid * 8.
-    asm_v_lshlrev_b32_imm(2, 3, 0)
+    // v2 = gid * 8  (byte offset).
+    asm_v_lshlrev_b32_imm(2, 3, 1)
     asm_s_delay_alu(0x01)
 
     // Broadcast value → v[4:5].
@@ -5844,22 +5855,24 @@ fn emit_amdgpu_fill_step_blob(uint64 out_path) -> uint64 {
     uint64 rsrc3 = 0x00000030
     uint64 props = 0x0408
 
-    uint64[6] args_desc
+    uint64[8] args_desc
     uint64 p0s = args_desc + 0;   unsafe { *(p0s as uint64) = 8 }
     uint64 p0k = args_desc + 8;   unsafe { *(p0k as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
     uint64 p1s = args_desc + 16;  unsafe { *(p1s as uint64) = 8 }
     uint64 p1k = args_desc + 24;  unsafe { *(p1k as uint64) = AMD_ARG_KIND_BY_VALUE }
     uint64 p2s = args_desc + 32;  unsafe { *(p2s as uint64) = 8 }
     uint64 p2k = args_desc + 40;  unsafe { *(p2k as uint64) = AMD_ARG_KIND_BY_VALUE }
+    uint64 p3s = args_desc + 48;  unsafe { *(p3s as uint64) = 8 }
+    uint64 p3k = args_desc + 56;  unsafe { *(p3k as uint64) = AMD_ARG_KIND_BY_VALUE }
 
     uint64 size = emit_amdgpu_code_object(kname, klen,
                                            asm_text_buf, asm_text_len,
-                                           24,      // kernarg_size (3 × 8)
+                                           32,      // kernarg_size (4 × 8)
                                            8,       // kernarg_align
                                            48,      // sgpr_count
                                            8,       // vgpr_count
                                            rsrc1, rsrc2, rsrc3, props,
-                                           args_desc, 3)
+                                           args_desc, 4)
 
     uint64 fd = file_open(out_path, 1)
     if fd > 0xFFFFFFFFFFFFF000 {
