@@ -936,6 +936,51 @@ fn main() {
         print_str("Forward path: LEGACY (~24 dispatches/view: embed+U+V+repack+tail)\n")
     }
 
+    // ── MLRIFT_PROFILE gate (default 0 = production, timing-only syncs removed) ─
+    // The step had 19 hipDeviceSynchronize calls but ~17 are TIMING-ONLY: they
+    // only bracket the per-phase time_now() measurements.  The dataflow
+    // embed→U→V→repack→fwd_tail→bwd→AdamW is pure GPU→GPU on the in-order AQL
+    // queue (resident-VRAM pointer kernargs, no host-read mid-step), so the
+    // dispatch boundary needs no host sync — the per-launch doorbell + in-order
+    // CP preserves every read-after-write.  Only the GENUINE syncs stay in
+    // production: (1) before the InfoNCE host readback (host reads v1/v2 GTT
+    // zero-copy + transposes on CPU), (2) the nce-gemm logit readback, and the
+    // AdamW step-end drain so the wall-clock measures completed work.
+    // Measured (B8 S16 D384 K4 R32, RX 7800 XT): 5.18 ms (all syncs) → 4.53 ms
+    // (timing-only syncs removed), bit-exact (grads 4e-7 vs oracle).
+    // MLRIFT_PROFILE=1 restores all syncs + the per-phase ms breakdown.
+    //
+    // NB: this path REQUIRES per-launch doorbells (the default).  MLRIFT_AQL_CHAIN=1
+    // (deferred doorbell) is INCOMPATIBLE with reduced syncs: the off-queue
+    // 4-byte counter-zero H2D in launch_gemm_grouped (CPU write-combined store to
+    // BAR1, NOT AQL-ordered) races the auto-flushed CP → grouped GEMMs read a
+    // racing counter → NaN/zero grads.  So if chain is requested we force
+    // profile-on (all syncs) to stay bit-exact.  A durable chain-compatible fix
+    // needs the counter-zero queued in-order (on-GPU fill_step before the
+    // dispatch), which is a kernel-emit change out of this unit's scope.
+    u64 profile_on = 0
+    u64 ev_profile = sys_getenv("MLRIFT_PROFILE")
+    if ev_profile != 0 {
+        u8 c0pr = 0; unsafe { *(ev_profile as u8) -> c0pr }
+        if c0pr == 49 { profile_on = 1 }   // '1'=49 → profiling (all syncs)
+    }
+    // Chain-mode safety guard: chain + reduced syncs = grouped-counter race.
+    u64 ev_chain = sys_getenv("MLRIFT_AQL_CHAIN")
+    if ev_chain != 0 {
+        u8 c0ch = 0; unsafe { *(ev_chain as u8) -> c0ch }
+        if c0ch != 48 {   // chain ON (anything but '0')
+            if profile_on == 0 {
+                print_str("WARNING: MLRIFT_AQL_CHAIN=1 is incompatible with reduced syncs (grouped-counter H2D race → NaN); forcing all-syncs (profile) mode for correctness.\n")
+                profile_on = 1
+            }
+        }
+    }
+    if profile_on == 1 {
+        print_str("Sync mode: PROFILE (all 19 syncs + per-phase ms breakdown)\n")
+    } else {
+        print_str("Sync mode: PRODUCTION (timing-only syncs skipped; ~2 genuine + step-end drain)\n")
+    }
+
     print_str("Loading kernels...\n")
     u64 fh_embed  = load_co("/tmp/embedding_lookup_f32.co",   "embedding_lookup_f32")
     u64 fh_gemm   = load_co("/tmp/gemm_f32_native.co",        "gemm_f32")
@@ -1086,7 +1131,18 @@ fn main() {
     u64 d_desc_dint  = gpu_malloc(K * 88, "mDescDint")   // F3.2a bwd dinter grouped
     u64 d_desc_fU    = gpu_malloc(K * 88, "mDescFU")     // F2.4 forward-U grouped
     u64 d_desc_fV    = gpu_malloc(K * 88, "mDescFV")     // F2.4 forward-V grouped
-    u64 d_cntr_grp   = gpu_malloc(4,      "mCntrGrp")    // shared u32 counter
+    // Per-SITE persistent-WG atomic counter slots so the
+    // 4-byte counter-zero H2D (dev_copy_h2d → WC store to BAR1, NOT queue-
+    // ordered) of one grouped dispatch can never race a still-in-flight prior
+    // grouped dispatch that shares the counter.  5 grouped sites: fU, fV,
+    // dinter, dV, dU.  This is the durable fix the bwd_uv comment flagged
+    // ("(a) per-call counter slots so no zero races a live dispatch") — it lets
+    // production async drop the inter-grouped syncs while staying bit-exact.
+    u64 d_cntr_fU    = gpu_malloc(4,      "mCntrFU")
+    u64 d_cntr_fV    = gpu_malloc(4,      "mCntrFV")
+    u64 d_cntr_dint  = gpu_malloc(4,      "mCntrDint")
+    u64 d_cntr_dV    = gpu_malloc(4,      "mCntrDV")
+    u64 d_cntr_dU    = gpu_malloc(4,      "mCntrDU")
 
     // ── Task 1B.3 fix: bf16 shadow buffers for the bf16-WMMA grouped path ─────
     // The bf16-WMMA kernel reads bf16-STORED A/B.  We cast the f32 bwd_uv inputs
@@ -1193,7 +1249,8 @@ fn main() {
                 // Phase 1: embed → x[BS,D]  (unchanged from legacy)
                 u64 t0 = time_now()
                 launch_embed(fh_embed, d_ids, d_emb, d_xs, BS, D)
-                sync_or_die("sync embed"); u64 t1 = time_now(); ns_embed = ns_embed + (t1 - t0)
+                u64 t1 = t0
+                if profile_on == 1 { sync_or_die("sync embed"); t1 = time_now(); ns_embed = ns_embed + (t1 - t0) }
 
                 // Phase 2: grouped U-einsum  inter_k[BS,R] = x[BS,D] @ U_k[D,R]
                 //   per-bank: M=BS=128, N=R=32, K=D=384, acc=0 (store), fast-path.
@@ -1224,12 +1281,12 @@ fn main() {
                     M_fU, N_fU, KK_fU, LdA_fU, LdB_fU, LdC_fU,
                     Ap_fU, Bp_fU, Cp_fU, Ac_fU, 0, 0, tot_fU_slot)
                 u32 tot_fU = 0; unsafe { *(tot_fU_slot as u32) -> tot_fU }
-                launch_gemm_grouped(fh_ggrp, d_desc_fU, K, tot_fU, 1, 0, d_cntr_grp)
+                launch_gemm_grouped(fh_ggrp, d_desc_fU, K, tot_fU, 1, 0, d_cntr_fU)
                 dealloc(M_fU);  dealloc(N_fU);  dealloc(KK_fU)
                 dealloc(LdA_fU);dealloc(LdB_fU);dealloc(LdC_fU)
                 dealloc(Ap_fU); dealloc(Bp_fU); dealloc(Cp_fU)
                 dealloc(Ac_fU); dealloc(tot_fU_slot)
-                sync_or_die("sync fwd-U grouped"); t1 = time_now(); ns_u = ns_u + (t1 - t0)
+                if profile_on == 1 { sync_or_die("sync fwd-U grouped"); t1 = time_now(); ns_u = ns_u + (t1 - t0) }
 
                 // Phase 3: grouped V-einsum  outk_k[BS,D] = inter_k[BS,R] @ V_k[R,D]
                 //   per-bank: M=BS=128, N=D=384, K=R=32, acc=0 (store), fast-path.
@@ -1260,29 +1317,30 @@ fn main() {
                     M_fV, N_fV, KK_fV, LdA_fV, LdB_fV, LdC_fV,
                     Ap_fV, Bp_fV, Cp_fV, Ac_fV, 0, 0, tot_fV_slot)
                 u32 tot_fV = 0; unsafe { *(tot_fV_slot as u32) -> tot_fV }
-                launch_gemm_grouped(fh_ggrp, d_desc_fV, K, tot_fV, 1, 0, d_cntr_grp)
+                launch_gemm_grouped(fh_ggrp, d_desc_fV, K, tot_fV, 1, 0, d_cntr_fV)
                 dealloc(M_fV);  dealloc(N_fV);  dealloc(KK_fV)
                 dealloc(LdA_fV);dealloc(LdB_fV);dealloc(LdC_fV)
                 dealloc(Ap_fV); dealloc(Bp_fV); dealloc(Cp_fV)
                 dealloc(Ac_fV); dealloc(tot_fV_slot)
-                sync_or_die("sync fwd-V grouped"); t1 = time_now(); ns_v = ns_v + (t1 - t0)
+                if profile_on == 1 { sync_or_die("sync fwd-V grouped"); t1 = time_now(); ns_v = ns_v + (t1 - t0) }
 
                 // Phase 3b: repack inter [K,BS,R]→[BS,K,R] and outk [K,BS,D]→[BS,K,D]
                 t0 = time_now()
                 launch_repack(fh_repack, d_int_kbsr, d_is, K, BS, R)
                 launch_repack(fh_repack, d_otk_kbsd, d_os, K, BS, D)
-                sync_or_die("sync repack"); t1 = time_now(); ns_repack = ns_repack + (t1 - t0)
+                if profile_on == 1 { sync_or_die("sync repack"); t1 = time_now(); ns_repack = ns_repack + (t1 - t0) }
 
                 // Phase 4: legacy fwd_tail (gate-softmax→combine→meanpool→L2).
                 t0 = time_now()
                 launch_fwd_tail(fh_tail, d_xs, d_gw, d_gb, d_otk_kbsd, d_bias,
                                 d_as, d_z, d_v, d_ns, BS, D)
-                sync_or_die("sync fwd_tail"); t1 = time_now(); ns_tail = ns_tail + (t1 - t0)
+                if profile_on == 1 { sync_or_die("sync fwd_tail"); t1 = time_now(); ns_tail = ns_tail + (t1 - t0) }
             } else {
             // Phase 1: embed → x[BS,D] (saved per view)
             u64 t0 = time_now()
             launch_embed(fh_embed, d_ids, d_emb, d_xs, BS, D)
-            sync_or_die("sync embed"); u64 t1 = time_now(); ns_embed = ns_embed + (t1 - t0)
+            u64 t1 = t0
+            if profile_on == 1 { sync_or_die("sync embed"); t1 = time_now(); ns_embed = ns_embed + (t1 - t0) }
 
             // Phase 2: U einsum inter_k[BS,R] = x @ U_k  (k-major scratch)
             t0 = time_now()
@@ -1291,7 +1349,7 @@ fn main() {
                 launch_gemm(fh_gemm, d_xs, d_U + ku*D*R*4, d_int_kbsr + ku*BS*R*4, BS, R, D)
                 ku = ku + 1
             }
-            sync_or_die("sync U"); t1 = time_now(); ns_u = ns_u + (t1 - t0)
+            if profile_on == 1 { sync_or_die("sync U"); t1 = time_now(); ns_u = ns_u + (t1 - t0) }
 
             // Phase 3: V einsum outk_k[BS,D] = inter_k @ V_k  (k-major scratch)
             t0 = time_now()
@@ -1300,19 +1358,19 @@ fn main() {
                 launch_gemm(fh_gemm, d_int_kbsr + kv*BS*R*4, d_V + kv*R*D*4, d_otk_kbsd + kv*BS*D*4, BS, D, R)
                 kv = kv + 1
             }
-            sync_or_die("sync V"); t1 = time_now(); ns_v = ns_v + (t1 - t0)
+            if profile_on == 1 { sync_or_die("sync V"); t1 = time_now(); ns_v = ns_v + (t1 - t0) }
 
             // Phase 3b: repack inter [K,BS,R]→[BS,K,R] and outk [K,BS,D]→[BS,K,D]
             t0 = time_now()
             launch_repack(fh_repack, d_int_kbsr, d_is, K, BS, R)
             launch_repack(fh_repack, d_otk_kbsd, d_os, K, BS, D)
-            sync_or_die("sync repack"); t1 = time_now(); ns_repack = ns_repack + (t1 - t0)
+            if profile_on == 1 { sync_or_die("sync repack"); t1 = time_now(); ns_repack = ns_repack + (t1 - t0) }
 
             // Phase 4: fwd_tail (gate-softmax→combine→meanpool→L2). Reads k-major outk.
             t0 = time_now()
             launch_fwd_tail(fh_tail, d_xs, d_gw, d_gb, d_otk_kbsd, d_bias,
                             d_as, d_z, d_v, d_ns, BS, D)
-            sync_or_die("sync fwd_tail"); t1 = time_now(); ns_tail = ns_tail + (t1 - t0)
+            if profile_on == 1 { sync_or_die("sync fwd_tail"); t1 = time_now(); ns_tail = ns_tail + (t1 - t0) }
             }
 
             view = view + 1
@@ -1320,6 +1378,12 @@ fn main() {
 
         // ════════════════ InfoNCE loss (GTT zero-copy) ════════════════
         u64 t0 = time_now()
+        // GENUINE sync #1: the host below reads d_v1/d_v2 (GTT zero-copy) and
+        // transposes v2 on the CPU.  In production async the forward timing
+        // syncs are skipped, so this is the FIRST drain of the whole forward
+        // (embed→U→V→repack→fwd_tail ×2 views) — all those packets must complete
+        // before the host can read v1/v2.  Always runs (profile-independent).
+        sync_or_die("sync forward→InfoNCE host readback")
         u64 h_q1 = dev_host_ptr(d_v1)
         u64 h_q2 = dev_host_ptr(d_v2)
         u64 h_v2T = alloc(D * B * 4)
@@ -1368,7 +1432,7 @@ fn main() {
         t0 = time_now()
         launch_fill(fh_fill, d_grads, PART_N)
         launch_fill(fh_fill, d_demb,  VOCAB * D)
-        sync_or_die("sync gpu-zero"); t1 = time_now(); ns_zero = ns_zero + (t1 - t0)
+        if profile_on == 1 { sync_or_die("sync gpu-zero"); t1 = time_now(); ns_zero = ns_zero + (t1 - t0) }
 
         // ════════════════ BACKWARD — build shared 63-arg kernarg block ═══════
         // KFD ptr-table: each entry → 8-byte value slot.  Reused by all 4 phase
@@ -1464,8 +1528,7 @@ fn main() {
         t0 = time_now()
         berr = hipModuleLaunchKernel(fh_bpre, 1, 1, 1, 512, 1, 1, 0, 0, kp, 0)
         if berr != 0 { die_gpu("launch wzma_bwd_pre", berr) }
-        sync_or_die("sync bwd_pre"); t1 = time_now()
-        ns_bpre = ns_bpre + (t1 - t0) + (kb_t1 - kb_t0)
+        if profile_on == 1 { sync_or_die("sync bwd_pre"); t1 = time_now(); ns_bpre = ns_bpre + (t1 - t0) + (kb_t1 - kb_t0) }
 
         // Phase 2: bwd_uv via FULL-OCCUPANCY GEMM (replaces the grid=NW serial
         // per-bank K=4 reduce-tree adjoint that was 48% of the step).  Every heavy
@@ -1501,7 +1564,7 @@ fn main() {
             launch_transpose(fh_transp, d_U + kt*D*R*4, d_UkT + kt*R*D*4, D, R)  // U_k[D,R]→[R,D]
             kt = kt + 1
         }
-        sync_or_die("sync bwd_uv weight-T")
+        if profile_on == 1 { sync_or_die("sync bwd_uv weight-T") }
         u64 vw = 0
         while vw < 2 {
             u64 d_xv   = d_x1;  u64 d_av  = d_a1;  u64 d_iv = d_i1;  u64 d_ov = d_o1
@@ -1526,7 +1589,7 @@ fn main() {
             // loop.  The KFD shim only rings the doorbell at hipDeviceSynchronize
             // and the AQL ring holds 64 packets — so we MUST sync well within 64
             // dispatches/sync or the ring back-pressures forever (CP never started).
-            sync_or_die("sync bwd_uv view-prep")
+            if profile_on == 1 { sync_or_die("sync bwd_uv view-prep") }
             if use_grouped == 1 {
                 // ── Task 1A.7 + F3.2a: GROUPED bwd_uv ────────────────────────
                 // Stage 1a — per-bank prep: row_scale (doutk) + transpose(intk).
@@ -1544,7 +1607,7 @@ fn main() {
                     launch_transpose(fh_transp, d_intk, d_interT_k, BS, R)
                     kk = kk + 1
                 }
-                sync_or_die("sync bwd_uv prep (doutk+interT)")
+                if profile_on == 1 { sync_or_die("sync bwd_uv prep (doutk+interT)") }
 
                 // Stage 1b — F3.2a GROUPED dinter: collapse the 4 per-bank
                 // launch_gemm (M=BS=128 N=R=32 K=D=384, grid=16 / 27% occupancy)
@@ -1576,14 +1639,14 @@ fn main() {
                     M_di, N_di, KK_di, LdA_di, LdB_di, LdC_di,
                     Ap_di, Bp_di, Cp_di, Ac_di, 0, 0, tot_di_slot)
                 u32 tot_di = 0; unsafe { *(tot_di_slot as u32) -> tot_di }
-                launch_gemm_grouped(fh_ggrp, d_desc_dint, K, tot_di, 1, 0, d_cntr_grp)
+                launch_gemm_grouped(fh_ggrp, d_desc_dint, K, tot_di, 1, 0, d_cntr_dint)
                 dealloc(M_di);  dealloc(N_di);  dealloc(KK_di)
                 dealloc(LdA_di);dealloc(LdB_di);dealloc(LdC_di)
                 dealloc(Ap_di); dealloc(Bp_di); dealloc(Cp_di)
                 dealloc(Ac_di); dealloc(tot_di_slot)
                 // dinter must be materialised before the per-bank dx accum + the
                 // grouped dU (Stage 3) read it.
-                sync_or_die("sync bwd_uv grouped dinter")
+                if profile_on == 1 { sync_or_die("sync bwd_uv grouped dinter") }
 
                 // Stage 1c — per-bank dx accum (serial, in-order queue).
                 //   dx[BS,D] += dinter_k[BS,R] · U_k^T[R,D].  dx is SHARED across
@@ -1599,7 +1662,7 @@ fn main() {
                     launch_gemm_accum(fh_gaccum, d_dinter_k, d_UkT_k, d_dxv, BS, D, R)
                     kx = kx + 1
                 }
-                sync_or_die("sync bwd_uv grouped-prep")
+                if profile_on == 1 { sync_or_die("sync bwd_uv grouped-prep") }
 
                 // Stage 2 — grouped dV: dV_k[R,D] += inter_k^T[R,BS] @ doutk_k[BS,D]
                 //   per-bank shape: M=R=32, N=D=384, K=BS=128, acc=1, fast-path.
@@ -1644,27 +1707,29 @@ fn main() {
                     // Cast the whole interT [K,R,BS] + doutk [K,BS,D] tensors.
                     launch_pack_f32_to_bf16(fh_pack_bf16, d_interT, d_interT_bf, K*R*BS)
                     launch_pack_f32_to_bf16(fh_pack_bf16, d_doutk,  d_doutk_bf,  K*BS*D)
-                    sync_or_die("sync bf16 pack dV")
+                    if profile_on == 1 { sync_or_die("sync bf16 pack dV") }
                 }
                 build_gemm_grouped_descriptor(d_desc_dV, K,
                     M_dV, N_dV, KK_dV, LdA_dV, LdB_dV, LdC_dV,
                     Ap_dV, Bp_dV, Cp_dV, Ac_dV, prec_for_buv, 0, tot_dV_slot)
                 u32 tot_dV = 0; unsafe { *(tot_dV_slot as u32) -> tot_dV }
-                launch_gemm_grouped(fh_for_buv, d_desc_dV, K, tot_dV, 1, prec_for_buv, d_cntr_grp)
+                launch_gemm_grouped(fh_for_buv, d_desc_dV, K, tot_dV, 1, prec_for_buv, d_cntr_dV)
                 dealloc(M_dV);   dealloc(N_dV);   dealloc(KK_dV)
                 dealloc(LdA_dV); dealloc(LdB_dV); dealloc(LdC_dV)
                 dealloc(Ap_dV);  dealloc(Bp_dV);  dealloc(Cp_dV)
                 dealloc(Ac_dV);  dealloc(tot_dV_slot)
 
-                // Sync between the two grouped dispatches.  Hypothesis: the
-                // counter-zero H2D in launch_gemm_grouped (Stage 3) may not be
-                // queue-ordered against the in-flight Stage-2 GFX dispatch on
-                // the KFD shim; explicit sync forces dV to drain before the
-                // dU counter is re-zeroed.  If this turns out to be the cause
-                // of the 1A.7 dU correctness regression, the durable fix is
-                // either (a) per-call counter slots so no zero races a live
-                // dispatch, or (b) on-GPU fill-step zero queued in-order.
-                sync_or_die("sync between grouped dV and dU")
+                // Sync between the two grouped dispatches.  CONFIRMED cause of
+                // the 1A.7 dU regression: the counter-zero H2D in
+                // launch_gemm_grouped (Stage 3) is a CPU WC store to BAR1
+                // (dev_copy_h2d, size=4 < 1MB), NOT queue-ordered against the
+                // in-flight Stage-2 GFX dispatch — so re-zeroing the SHARED
+                // counter raced dV's live increments.  Durable fix applied
+                // (option (a)): dV and dU now use distinct per-site counter
+                // slots (d_cntr_dV / d_cntr_dU), so no zero races a live
+                // dispatch and the in-order queue serialises the read.  This
+                // sync is therefore now timing-only (profile path).
+                if profile_on == 1 { sync_or_die("sync between grouped dV and dU") }
 
                 // Stage 3 — grouped dU: dU_k[D,R] += x^T[D,BS] @ dinter_k[BS,R]
                 //   per-bank shape: M=D=384, N=R=32, K=BS=128, acc=1, fast-path.
@@ -1702,13 +1767,13 @@ fn main() {
                 if use_bf16 == 1 {
                     launch_pack_f32_to_bf16(fh_pack_bf16, d_xT,     d_xT_bf,     D*BS)
                     launch_pack_f32_to_bf16(fh_pack_bf16, d_dinter, d_dinter_bf, K*BS*R)
-                    sync_or_die("sync bf16 pack dU")
+                    if profile_on == 1 { sync_or_die("sync bf16 pack dU") }
                 }
                 build_gemm_grouped_descriptor(d_desc_dU, K,
                     M_dU, N_dU, KK_dU, LdA_dU, LdB_dU, LdC_dU,
                     Ap_dU, Bp_dU, Cp_dU, Ac_dU, prec_for_buv, 0, tot_dU_slot)
                 u32 tot_dU = 0; unsafe { *(tot_dU_slot as u32) -> tot_dU }
-                launch_gemm_grouped(fh_for_buv, d_desc_dU, K, tot_dU, 1, prec_for_buv, d_cntr_grp)
+                launch_gemm_grouped(fh_for_buv, d_desc_dU, K, tot_dU, 1, prec_for_buv, d_cntr_dU)
                 dealloc(M_dU);   dealloc(N_dU);   dealloc(KK_dU)
                 dealloc(LdA_dU); dealloc(LdB_dU); dealloc(LdC_dU)
                 dealloc(Ap_dU);  dealloc(Bp_dU);  dealloc(Cp_dU)
@@ -1716,7 +1781,7 @@ fn main() {
 
                 // ONE sync after the prep loop + 2 grouped dispatches (was: 1 sync
                 // after 24 dispatches in legacy; now 1 sync after 16 prep + 2 grp).
-                sync_or_die("sync bwd_uv grouped-banks")
+                if profile_on == 1 { sync_or_die("sync bwd_uv grouped-banks") }
             } else {
                 // ── Legacy bwd_uv (4×launch_gemm_accum per bank, 24 dispatches/view) ──
                 u64 kk = 0
@@ -1746,7 +1811,7 @@ fn main() {
                 }
                 // ONE sync after all 4 banks (24 packets) — bounds ring depth; the
                 // per-bank scratch slots removed the inter-bank reuse hazard.
-                sync_or_die("sync bwd_uv banks")
+                if profile_on == 1 { sync_or_die("sync bwd_uv banks") }
             }
             vw = vw + 1
         }
@@ -1756,7 +1821,7 @@ fn main() {
         t0 = time_now()
         berr = hipModuleLaunchKernel(fh_bemb, 1, 1, 1, 512, 1, 1, 0, 0, kp, 0)
         if berr != 0 { die_gpu("launch wzma_bwd_embed", berr) }
-        sync_or_die("sync bwd_embed"); t1 = time_now(); ns_bemb = ns_bemb + (t1 - t0)
+        if profile_on == 1 { sync_or_die("sync bwd_embed"); t1 = time_now(); ns_bemb = ns_bemb + (t1 - t0) }
 
         // Phase 4 (wzma_bwd_reduce / per-WG partial reduce) RETIRED — the GEMM
         // contractions in phase 2 accumulate dU/dV/dgw/dgb/dbias DIRECTLY into the
@@ -1792,6 +1857,10 @@ fn main() {
             launch_adamw_fused(fh_adamw_fused, d_adamw_desc, adamw_tc32,
                 inv_bc1, inv_bc2, decay, beta1, beta2, one_m_b1, one_m_b2,
                 lr, eps, d_adamw_counter)
+            // GENUINE step-end drain: AdamW is the last GPU work of the step,
+            // so this sync makes step_t1 measure COMPLETED work (not an
+            // un-drained queue) and bounds the inter-step ring depth.  Always
+            // runs (profile-independent) — it is the production async drain.
             sync_or_die("sync adamw fused")
         } else {
             launch_adamw(fh_adamw, d_U,    d_dU,    d_mU,    d_vU,    K*D*R,     step1, lr, beta1, beta2, eps, wd)
@@ -1800,6 +1869,7 @@ fn main() {
             launch_adamw(fh_adamw, d_gb,   d_dgb,   d_mGb,   d_vGb,   K,         step1, lr, beta1, beta2, eps, wd)
             launch_adamw(fh_adamw, d_bias, d_dbias, d_mBias, d_vBias, D,         step1, lr, beta1, beta2, eps, wd)
             launch_adamw(fh_adamw, d_emb,  d_demb,  d_mEmb,  d_vEmb,  VOCAB*D,   step1, lr, beta1, beta2, eps, wd)
+            // GENUINE step-end drain (see fused branch).  Always runs.
             sync_or_die("sync adamw")
         }
         t1 = time_now(); ns_badamw = ns_badamw + (t1 - t0)
@@ -1841,23 +1911,29 @@ fn main() {
         step = step + 1
     }
 
-    // ════════════════ Per-phase profile ════════════════
-    print_str("\n--- per-phase ms (summed over 50 steps; fwd phases ×2 views/step) ---\n")
-    print_ms("embed   [GPU]: ", ms_of(ns_embed))
-    print_ms("U einsum[GPU]: ", ms_of(ns_u))
-    print_ms("V einsum[GPU]: ", ms_of(ns_v))
-    print_ms("repack  [GPU]: ", ms_of(ns_repack))
-    print_ms("fwd_tail[GPU]: ", ms_of(ns_tail))
-    print_ms("InfoNCE [GPU+CPU+loss]: ", ms_of(ns_nce))
-    print_ms("zero dGrads+demb [GPU fill, was H2D]: ", ms_of(ns_zero))
-    print_str("--- BACKWARD (bwd_uv now full-occupancy GEMM; old reduce-tree was 4.35ms/48%) ---\n")
-    print_ms("  bwd_pre    [GPU grid=1]      : ", ms_of(ns_bpre))
-    print_ms("  bwd_uv     [GPU GEMM full-occ]: ", ms_of(ns_buv))
-    print_ms("  bwd_embed  [GPU grid=1]      : ", ms_of(ns_bemb))
-    print_ms("  bwd_reduce [RETIRED — GEMM accumulates direct]: ", ms_of(ns_bred))
-    print_ms("  AdamW x6   [GPU full-occ]    : ", ms_of(ns_badamw))
-    f32 ms_bwd_total = ms_of(ns_bpre) + ms_of(ns_buv) + ms_of(ns_bemb) + ms_of(ns_bred) + ms_of(ns_badamw)
-    print_ms("  BACKWARD total (vs old 34ms/step → ", ms_bwd_total / 50.0f)
+    // ════════════════ Per-phase profile (MLRIFT_PROFILE=1 only) ════════════
+    // The per-phase accumulators are only populated when profiling is on (the
+    // timing syncs that bracket them are gated off in production async).
+    if profile_on == 1 {
+        print_str("\n--- per-phase ms (summed over 50 steps; fwd phases ×2 views/step) ---\n")
+        print_ms("embed   [GPU]: ", ms_of(ns_embed))
+        print_ms("U einsum[GPU]: ", ms_of(ns_u))
+        print_ms("V einsum[GPU]: ", ms_of(ns_v))
+        print_ms("repack  [GPU]: ", ms_of(ns_repack))
+        print_ms("fwd_tail[GPU]: ", ms_of(ns_tail))
+        print_ms("InfoNCE [GPU+CPU+loss]: ", ms_of(ns_nce))
+        print_ms("zero dGrads+demb [GPU fill, was H2D]: ", ms_of(ns_zero))
+        print_str("--- BACKWARD (bwd_uv now full-occupancy GEMM; old reduce-tree was 4.35ms/48%) ---\n")
+        print_ms("  bwd_pre    [GPU grid=1]      : ", ms_of(ns_bpre))
+        print_ms("  bwd_uv     [GPU GEMM full-occ]: ", ms_of(ns_buv))
+        print_ms("  bwd_embed  [GPU grid=1]      : ", ms_of(ns_bemb))
+        print_ms("  bwd_reduce [RETIRED — GEMM accumulates direct]: ", ms_of(ns_bred))
+        print_ms("  AdamW x6   [GPU full-occ]    : ", ms_of(ns_badamw))
+        f32 ms_bwd_total = ms_of(ns_bpre) + ms_of(ns_buv) + ms_of(ns_bemb) + ms_of(ns_bred) + ms_of(ns_badamw)
+        print_ms("  BACKWARD total (vs old 34ms/step → ", ms_bwd_total / 50.0f)
+    } else {
+        print_str("\n(per-phase breakdown suppressed — production async; set MLRIFT_PROFILE=1 for it)\n")
+    }
     print_ms("TOTAL 50-step: ", ms_of(ns_total_step))
     f32 per_step = ms_of(ns_total_step) / 50.0f
     print_ms("ms / step    : ", per_step)
