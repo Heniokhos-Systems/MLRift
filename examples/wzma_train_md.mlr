@@ -423,10 +423,22 @@ fn launch_gemm_grouped(u64 fh, u64 d_desc, u32 b_batch, u32 total_tiles,
     unsafe { *((kp + 24) as u64) = p3 }
     unsafe { *((kp + 32) as u64) = p4 }
     unsafe { *((kp + 40) as u64) = p5 }
-    // 3) Launch persistent-WG grid: 240 WGs * 256 lanes = 61440 lanes
-    //    (gfx1100: 60 CUs * 4 waves per CU; one WG per wave at LDS=2 KiB).
+    // 3) Launch persistent-WG grid: 240 WGs.
+    //    block size is PRECISION-DEPENDENT:
+    //      f32  (precision_mode=0): 256 lanes/WG — the LDS-tiled f32 body uses
+    //        an 8-wave WG with a cross-wave LDS broadcast + s_barrier of the
+    //        per-iteration tile_id (see _emit_gemm_f32_grouped_body §2a/2b).
+    //      bf16 (precision_mode=1): 32 lanes/WG — the WMMA body is SINGLE-WAVE
+    //        by construction (one v_wmma per 16×16 tile, 32 lanes = full wave).
+    //        Its §2a does the lane-0 atomic + s_readfirstlane broadcast WITHIN
+    //        one wave only — NO cross-wave LDS broadcast / barrier.  Launching it
+    //        at block=256 leaves waves 1..7 with an UNINITIALIZED tile_id → they
+    //        derive a garbage group_idx → garbage descriptor ptr → GFXHUB fault
+    //        on the first A/B load (the 1B.3 bug#2 wedge: faults on a read before
+    //        any C-store, grads all-zero).  Match the block to the kernel.
     u32 grid  = 240
     u32 block = 256
+    if precision_mode == 1 { block = 32 }
     u32 err = hipModuleLaunchKernel(fh, grid, 1, 1, block, 1, 1, 0, 0, kp, 0)
     if err != 0 { die_gpu("launch gemm_grouped", err) }
     dealloc(p0); dealloc(p1); dealloc(p2); dealloc(p3); dealloc(p4); dealloc(p5); dealloc(kp)
@@ -696,31 +708,25 @@ fn main() {
     // BACK to f32 to keep CI / downstream tooling unable to silently wedge
     // the GPU.  Set MLRIFT_BWD_UV_PRECISION=bf16_force to actually attempt
     // the bf16 path (developer-only, expects the wedge until the residual fix).
+    // 1B.3 bug#2 FIXED: bf16 is now a first-class opt-in.  Both
+    //   MLRIFT_BWD_UV_PRECISION=bf16  and  =bf16_force
+    // activate the bf16-WMMA grouped path.  The residual wedge was NOT a kernel
+    // bug — the bf16-WMMA grouped body is verified correct at every bwd_uv axis
+    // (fast-path divmod + acc=1 + dV/dU non-square shapes; see the 4-shape smoke
+    // matrix in examples/gemm_grouped_smoke.mlr).  The wedge was a launch-config
+    // mismatch: launch_gemm_grouped launched the SINGLE-WAVE bf16 kernel at
+    // block=256, leaving waves 1..7 with an uninitialized tile_id → garbage
+    // descriptor ptr → GFXHUB fault.  Fixed by block=32 for precision_mode=1.
     u64 use_bf16 = 0
     u64 ev_prec = sys_getenv("MLRIFT_BWD_UV_PRECISION")
     if ev_prec != 0 {
         u8 c0p = 0; unsafe { *(ev_prec as u8) -> c0p }
-        u8 c4p = 0; unsafe { *((ev_prec + 4) as u8) -> c4p }
-        u8 c5p = 0; unsafe { *((ev_prec + 5) as u8) -> c5p }
-        // 'b'=98 'f'=102; "bf16_force" → 'b''f''1''6''_''f''o'... so c4p='_'=95, c5p='f'=102
-        if c0p == 98 {
-            if c4p == 95 {
-                if c5p == 102 { use_bf16 = 1 }
-            }
-        }
+        // any value beginning with 'b' (bf16 / bf16_force) selects the bf16 path.
+        if c0p == 98 { use_bf16 = 1 }   // 'b'=98
     }
     if use_bf16 == 1 {
-        print_str("bwd_uv precision: bf16_force (DEVELOPER OVERRIDE — 1B.3 found bf16 wedges at\n")
-        print_str("  real bwd_uv shapes via GFXHUB pagefault; MODE1-reset recoverable but UNSAFE)\n")
+        print_str("bwd_uv precision: bf16-WMMA (1B.3 — grouped tensor-core path, block=32)\n")
     } else {
-        if ev_prec != 0 {
-            u8 c0w = 0; unsafe { *(ev_prec as u8) -> c0w }
-            if c0w == 98 {
-                print_str("bwd_uv precision: bf16 REQUESTED but DISABLED in 1B.3 (kernel wedges\n")
-                print_str("  at bwd_uv shapes — see comment + memory project_batched_gemm_1b3_bf16_disabled).\n")
-                print_str("  Falling back to f32.  Use MLRIFT_BWD_UV_PRECISION=bf16_force to override.\n")
-            }
-        }
         print_str("bwd_uv precision: f32 (default)\n")
     }
 
