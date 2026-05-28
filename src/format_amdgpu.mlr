@@ -8810,6 +8810,119 @@ fn emit_amdgpu_gemm_f32_lds_blob(uint64 out_path) -> uint64 {
 // v0 is 32, 64, …, 224 respectively).  s_and_saveexec restricts EXEC to that
 // single lane for the atomic; s_or_b32 restores after.  s_barrier then makes
 // all 8 waves observe LDS[0]'s post-store value.
+
+// ─── 1A.5 panel-load helpers (used by _emit_gemm_f32_grouped_body) ───
+//
+// Both helpers ASSUME the caller has already set:
+//   s9   = kt_base_K       (= K-tile starting K-element index)
+//   s11  = lds_dest_off    (= 0 or 0x800; chooses the destination LDS buffer)
+//   v19  = lane_n & 3      (predicate input, hoisted above the K-loop)
+// And the per-lane VGPRs v3 (lane_n), v4 (lane_m), v5 (lane LDS offset),
+// v7 (global_m), v8 (global_n) live as set in section 4f.
+//
+// _emit_grouped_panel_load_b128_full emits the FULL panel-load + ds_store
+// + barrier sequence (used by the 1A.5b prologue: load tile 0 to LDS[buf0]
+// before the pipelined main loop).  Sync: s_barrier + buffer_gl0_inv at end.
+//
+// _emit_grouped_panel_load_b128_phase_a emits ONLY the issue side: address
+// compute, OOB-clamp, narrow EXEC, b128 VMEM loads to v[20:27], restore
+// EXEC.  No wait, no ds_store — those happen later in Phase B (in the
+// pipelined main-loop body, after the compute on the previous tile).
+
+// ── Common: emit v_addr_a (v11), v_addr_b (v12), OOB-clamp via cndmask,
+// saveexec to s_save_sgpr, and the two b128 loads.  Does NOT wait or
+// restore EXEC.  Used by both helpers.
+//
+//   s_save_sgpr — saved-EXEC scratch SGPR (s11 in 1A.5a, s8 in 1A.5b's
+//   loop because s11 is in use as lds_dest_off).
+fn _emit_grouped_panel_load_b128_addr_and_load(uint64 s_save_sgpr) {
+    //   v11 = v7 * s19 (lda) — VOP3 v_mul_lo_u32.
+    asm_u32_arch(0xD72C000B, 0xD569000B); asm_u32(0x00002707)
+    //   v11 = s9 + v11
+    asm_u32(0x4A161609)
+    //   v11 = v11 + v3
+    asm_u32(0x4A16070B)
+    //   v11 *= 4 (byte offset)
+    asm_u32_arch(0x30161682, 0x34161682)
+
+    //   v12 = s9 + v4
+    asm_u32(0x4A180809)
+    //   v12 *= s20 (ldb)
+    asm_u32_arch(0xD72C000C, 0xD569000C); asm_u32(0x0000290C)
+    //   v12 = v12 + v8
+    asm_u32(0x4A18110C)
+    //   v12 *= 4
+    asm_u32_arch(0x30181882, 0x34181882)
+
+    //   Predicate vcc_lo = (v19 == 0).  v19 set by caller (= lane_n & 3).
+    asm_v_cmp_eq_u32_imm_vgpr(0, 19)
+    //   v_cndmask_b32 v11, 0, v11, vcc_lo  (clamp inactive lanes' addr to 0)
+    asm_u32(0x02161680)
+    //   v_cndmask_b32 v12, 0, v12, vcc_lo
+    asm_u32(0x02181880)
+
+    //   Narrow EXEC to active lanes (lane_n & 3 == 0 ⇒ 64 of 256 lanes).
+    asm_s_and_saveexec_b32_vcc_lo(s_save_sgpr)
+    //   gfx11 VALU → VMEM hazard guard before the b128 load reads v11/v12.
+    asm_s_delay_alu(0x01)
+
+    //   global_load_b128 v[20:23], v11, s[22:23]   (4 f32 A panel slice)
+    //     word1 = 0xDC5E0000 (b128 op = 0x17 + SEG = GLOBAL).
+    //     word2 = (vdst=20<<24)|(saddr=22<<16)|(0)|(vaddr=11) = 0x1416000B.
+    asm_u32(0xDC5E0000); asm_u32(0x1416000B)
+    //   global_load_b128 v[24:27], v12, s[24:25]   (4 f32 B panel slice)
+    asm_u32(0xDC5E0000); asm_u32(0x1818000C)
+}
+
+// Phase-A only: address + b128 load + restore EXEC.  Does NOT wait or
+// ds_store.  Used by the pipelined main-loop prefetch.
+fn _emit_grouped_panel_load_b128_phase_a() {
+    // Use s8 as the saved-EXEC SGPR (s11 holds lds_dest_off across the
+    // pipeline window).
+    _emit_grouped_panel_load_b128_addr_and_load(8)
+    // Restore EXEC = old (saved in s8) so the inner reduce can run on
+    // all 256 lanes.  s_or_b32 exec_lo, exec_lo, s8 = 0x8C7E087E.
+    asm_u32(0x8C7E087E)
+}
+
+// Full panel-load: Phase A + Phase B inline.  Used by the prologue.
+// Issues the b128 loads, waits, ds_stores all 8 f32 to LDS[v5+s11+offset],
+// restores EXEC, and emits the cross-wave barrier.
+fn _emit_grouped_panel_load_b128_full() {
+    // s_save scratch = s11 in the prologue (lds_dest_off = 0, so reusing
+    // s11 as both load_off and saveexec is OK — after the restore the
+    // load_off field is no longer needed for THIS panel-load call).
+    //
+    // But cleanly, for the prologue we still use s11 as load_off / scratch
+    // (caller set it to 0).  We s_and_saveexec into s8 and restore from s8.
+    //
+    // First compute v13 = s11 + v5 (= v5 when s11=0).  We could skip this
+    // when s11=0, but emitting the v_add unconditionally keeps the
+    // prologue and main-loop ds_store machinery uniform (same vaddr=v13).
+    //
+    //   v_add_nc_u32 v13, s11, v5  →  (0x4A<<24)|(13<<17)|(5<<9)|11 = 0x4A1A0A0B
+    asm_u32(0x4A1A0A0B)
+
+    _emit_grouped_panel_load_b128_addr_and_load(8)
+    asm_s_waitcnt_vmcnt_zero()
+
+    //   8x ds_store_b32 with vaddr=v13, offsets 0/4/8/12/0x400/0x404/0x408/0x40C.
+    asm_u32(0xD8340000); asm_u32(0x0000140D)         // A[0] → LDS[v13+0]
+    asm_u32(0xD8340004); asm_u32(0x0000150D)         // A[1]
+    asm_u32(0xD8340008); asm_u32(0x0000160D)         // A[2]
+    asm_u32(0xD834000C); asm_u32(0x0000170D)         // A[3]
+    asm_u32(0xD8340400); asm_u32(0x0000180D)         // B[0]
+    asm_u32(0xD8340404); asm_u32(0x0000190D)         // B[1]
+    asm_u32(0xD8340408); asm_u32(0x00001A0D)         // B[2]
+    asm_u32(0xD834040C); asm_u32(0x00001B0D)         // B[3]
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    //   Restore EXEC = s8.
+    asm_u32(0x8C7E087E)
+    asm_u32_arch(0xBFBD0000, 0xBF8A0000)             // s_barrier
+    asm_buffer_gl0_inv()
+}
+
 fn _emit_gemm_f32_grouped_body(uint64 args_desc) {
     asm_init()
 
@@ -9109,105 +9222,125 @@ fn _emit_gemm_f32_grouped_body(uint64 args_desc) {
     //   v6 = v_acc = 0  (per-lane f32 accumulator).
     asm_v_mov_b32_inline_u(6, 0)
 
-    // ── 4g. K-loop setup.
-    //   s31 = K_tiles_count = K (s18) >> 4
-    asm_u32_arch(0x851F8412, 0x901F8412)             // s_lshr_b32 s31, s18, 4
-    //   s12 = kt counter = 0
-    asm_u32_arch(0xBE8C0080, 0xBE8C0380)
-    //   .LK_loop:
-    uint64 k_loop_idx = asm_text_len / 4
-
-    //   s9 = kt_base_K = s12 * 16  (scalar; advances by 16 per K iter)
-    //   sdst=9 → byte2 = 0x09 (top bit 0 since s_lshl_b32 op-low-bit = 0).
-    //   ssrc1 = inline 4 = 0x84.  ssrc0 = s12 = 0x0C.  word = 0x84_09_84_0C.
-    asm_u32_arch(0x8409840C, 0x8F09840C)             // s_lshl_b32 s9, s12, 4
-
-    //   Cooperative load A: lane reads A[global_m, kt_base + lane_n].
-    //     a_off (elements) = v7 * lda + (s9 + v3) = v7*s19 + s9 + v3
+    // ── 4g. K-loop with software-pipelined double-buffered LDS (1A.5b).
     //
-    //   v11 = v7 * s19 (lda)   VOP3 v_mul_lo_u32 gfx11 op=0x12C → 0xD72C; gfx10 op=0xA9 → 0xD569.
-    //     Matches single-GEMM line 8680 except src0=v7, src1=s19 (the operand order in VOP3
-    //     is src0, src1, src2; here we want v_mul_lo_u32 v11, v7, s19).
-    //     word1 = (0xD72C<<16) | (vdst=11<<0) wait — VOP3 layout:
-    //       word1 = 0xD7000000 | (op<<16) | (clamp_etc) | (vdst&0xFF)
-    //       For op=0x12C: 0xD7000000 + (0x12C<<16) = 0xD7000000 + 0x12C0000 = 0xD92C0000?
-    //     Actually VOP3 op field is 10 bits at [25:16]: 0x12C → bits 25:16 = 0x12C.
-    //       word1 = (0x35<<26 — VOP3 prefix) ... hmm.  Let me match single-GEMM line 8680
-    //       which produces `v_mul_lo_u32 v8, v3, s14`: word1=0xD72C0008, word2=0x00001D03.
-    //       Decode: word1 [31:26]=0x35 (VOP3 prefix), [25:16]=0x12C (op), [15:8]=0 (clamp/abs),
-    //               [7:0]=vdst=8.  word2 [31:30]=00, [29:27]=000, [26:23]=mods?,
-    //               [40:32 wait word2]: src2_mod=0, src2=0, neg=0, src1, src0...
-    //   For my v_mul_lo_u32 v11, v7, s19:
-    //     word1 = 0xD72C0000 | 11 = 0xD72C000B
-    //     word2 = (src1=s19<<9 ... wait VOP3 packs src0 [8:0], src1 [17:9], src2 [26:18])
-    //       src0=v7 → 0x107 (VGPR encoding), src1=s19 → 19, src2=0.  word2 = (19<<9)|0x107 = 0x2600 | 0x107 = 0x2707.
-    //       But single-GEMM uses 0x00001D03 for v_mul_lo_u32 v8, v3, s14: src0=v3=0x103, src1=s14=14 → (14<<9)|0x103 = 0x1C00|0x103 = 0x1D03. ✓
-    //     For mine: (19<<9)|0x107 = 0x2600|0x107 = 0x2707.  So word2 = 0x00002707.
-    asm_u32_arch(0xD72C000B, 0xD569000B); asm_u32(0x00002707)
-    //   v_add_nc_u32 v11, s9, v11   (stable VOP2 prefix 0x4A, op=0x25)
-    //     vdst=11, src1=v11=11, src0=s9=9. word = (0x4A<<24)|(11<<17)|(11<<9)|9 = 0x4A161609
-    asm_u32(0x4A161609)
-    //   v_add_nc_u32 v11, v11, v3   word = (0x4A<<24)|(11<<17)|(3<<9)|0x10B = 0x4A16070B
-    asm_u32(0x4A16070B)
-    //   v_lshlrev_b32 v11, 2, v11   (v11 *= 4 to get byte offset)
-    //     src0=2=0x82, src1=v11=11, vdst=11. word=(0x18<<25)|(11<<17)|(11<<9)|0x82 = 0x30161682
-    asm_u32_arch(0x30161682, 0x34161682)
+    //   1A.5a kept the 1A.4 single-buffered loop shape: each K-tile iteration
+    //   did { panel-load → s_barrier → inner-reduce → s_barrier }.  The inner
+    //   reduce stalls waiting for the panel-load's VMEM (s_waitcnt vmcnt(0)).
+    //
+    //   1A.5b double-buffers the LDS so the panel-load for tile (kk+1) runs
+    //   in parallel with the inner reduce for tile (kk).  Two LDS buffers:
+    //     buf0: A at LDS[0..0x3FF],     B at LDS[0x400..0x7FF]
+    //     buf1: A at LDS[0x800..0xBFF], B at LDS[0xC00..0xFFF]
+    //   Total 4 KiB (was 2 KiB) — fits in the 16 KiB allocation, no rsrc2
+    //   bump needed.
+    //
+    //   Pipeline structure (K_tiles=4 for K=64,TK=16 → loop runs 3 times):
+    //     [prologue]                 load tile 0 → buf0 (s11=0)
+    //     loop kk=0..K_tiles-2:
+    //         Phase-A prefetch       load tile (kk+1) → buf((kk+1)&1)
+    //                                (VMEM issued, exec restored, NOT waited)
+    //         compute                inner-reduce on tile kk from buf(kk&1)
+    //         Phase-B commit         wait VMEM, ds_store prefetched data,
+    //                                s_barrier, restore exec
+    //     [epilogue]                 inner-reduce on tile (K_tiles-1) from
+    //                                buf((K_tiles-1)&1)
+    //
+    //   Buffer selection: kk-th compute reads LDS at (kk & 1) << 11; the
+    //   prefetch writes to ((kk+1) & 1) << 11.  Adds two SGPR shifts per
+    //   iter for the offset compute.
+    //
+    //   Hoisted state (set once before the loop):
+    //     s31 = K_tiles_count = K (s18) >> 4
+    //     v19 = lane_n & 3   (predicate input for the load mask; reused
+    //                         post-K-loop as the C-store address scratch)
+    //
+    //   Register conventions (1A.5b additions over 1A.5a):
+    //     s8  scratch — "next K-iter to load" (s12 + 1)
+    //     s11 scratch — saved-EXEC for the VMEM/DS-store window
+    //                   AND — LDS dest-buffer-offset for the panel-load
+    //                         (re-used after the saveexec/restore window)
+    //     s15 scratch — compute-buffer LDS offset
+    //     v13 LDS dest vaddr = v5 + s11 (== lane LDS slot offset by buf)
+    //     v[20:23] / v[24:27] — b128 data quads (A / B), live across compute
 
-    //   OOB-clamp pad-lane guard: v_addr_a (v11) is now per-lane.  For the
-    //   same-shape fast path (M/N multiples of 16, K multiple of 16), every
-    //   lane has an in-bounds address — no clamp needed.  But we still need
-    //   the s_delay_alu hazard guard before the VMEM consumer.
-    asm_s_delay_alu(0x01)
+    //   s31 = K_tiles_count = K (s18) >> 4
+    asm_u32_arch(0x851F8412, 0x901F8412)
+    //   Hoist v19 = v0 & 3 to outside the loop (predicate input survives the
+    //   entire K-loop; gets overwritten by the C-store in section 4h).
+    asm_u32(0x36260083)                              // v_and_b32 v19, 3, v0
 
-    //   global_load_b32 v13, v11, s[22:23]   saddr-form: word1=0xDC520000,
-    //     word2 = (vdst=13<<24)|(saddr=22<<16)|(data=0<<8)|(vaddr=11) = 0x0D16000B.
-    //     gfx11 only — gfx10 saddr-form encoding is not exercised here; we keep
-    //     the same word so this kernel builds (but won't run correctly) on gfx10.
-    asm_u32(0xDC520000); asm_u32(0x0D16000B)
+    // ── 4g.PROLOGUE: load tile 0 into buf0 (LDS offset 0).
+    //   s12 (K-loop counter) starts at 0 and remains 0 here.
+    asm_u32_arch(0xBE8C0080, 0xBE8C0380)             // s_mov_b32 s12, 0
+    //   s11 = 0 (lds_dest_off = buf0).  inline 0 = 0x80.
+    //   s_mov_b32 s11, 0  →  SOP1 op s_mov_b32=0x00 (gfx11). Reference
+    //   0xBE940080 = s_mov_b32 s20, 0; for s11: 0xBE8B0080.
+    asm_u32_arch(0xBE8B0080, 0xBE8B0380)
+    //   s9  = kt_base_K = 0
+    asm_u32_arch(0xBE890080, 0xBE890380)             // s_mov_b32 s9, 0
+    _emit_grouped_panel_load_b128_full()
+    //   After prologue: tile 0's A+B are in LDS[buf0]. Sync barrier here so
+    //   the loop's first compute sees the prologue's ds_store completed
+    //   across all 8 waves.
 
-    //   Cooperative load B: lane reads B[kt_base + lane_m, global_n].
-    //     b_off (elements) = (s9 + v4) * ldb + v8  = (s9+v4)*s20 + v8
-    //   v12 = s9 + v4   (per-lane row in B's row space)
-    //     v_add_nc_u32 v12, s9, v4   word = (0x4A<<24)|(12<<17)|(4<<9)|9 = 0x4A180809
-    asm_u32(0x4A180809)
-    //   v12 = v12 * s20 (ldb)   VOP3 v_mul_lo_u32
-    //     word2 = (s20<<9)|(v12=0x10C) = (20<<9)|0x10C = 0x2800|0x10C = 0x290C
-    asm_u32_arch(0xD72C000C, 0xD569000C); asm_u32(0x0000290C)
-    //   v_add_nc_u32 v12, v12, v8   word = (0x4A<<24)|(12<<17)|(8<<9)|0x10C = 0x4A18110C
-    asm_u32(0x4A18110C)
-    //   v_lshlrev_b32 v12, 2, v12
-    asm_u32_arch(0x30181882, 0x34181882)
-    asm_s_delay_alu(0x01)
-    //   global_load_b32 v14, v12, s[24:25]   word2 = (14<<24)|(24<<16)|0|12 = 0x0E18000C
-    asm_u32(0xDC520000); asm_u32(0x0E18000C)
+    // ── 4g.MAIN LOOP: pipelined prefetch + compute.
+    //   Runs (K_tiles - 1) iterations.  Each iter:
+    //     - Phase A (Phase-A): prefetch tile (s12+1) into the OPPOSITE buffer.
+    //         Address compute, OOB-clamp, b128 loads (NO wait — VMEM in flight).
+    //     - Compute: inner-reduce on tile s12 from buf(s12 & 1).
+    //     - Phase B: wait VMEM, ds_store prefetched data into LDS, barrier.
+    //
+    //   We branch over the main loop entirely if K_tiles == 1 (no pipeline
+    //   work, prologue already loaded the only tile).  Done with
+    //     s_cmp_lt_u32 1, s31  ; SCC=1 iff K_tiles > 1
+    //     s_cbranch_scc0 .Lepilogue
+    //
+    //   Inline `s_cmp_lt_u32 1, s31` — SOPC op=0x0A (gfx11), inline 1 in ssrc0:
+    //     word = (0xBF<<24)|(0x0A<<16)|(0x1F<<8)|0x81 = 0xBF0A1F81
+    //   ssrc0=inline 1=0x81, ssrc1=s31=0x1F. SCC=1 iff 1 < s31 ⇔ K_tiles > 1.
+    asm_u32(0xBF0A1F81)
+    uint64 main_skip_idx = asm_text_len / 4
+    //   s_cbranch_scc0 .Lepilogue (gfx11 op=0x21 → 0xBFA10000;
+    //   gfx10 op=0x04 → 0xBF840000).  Skips the main loop when K_tiles ≤ 1.
+    asm_u32_arch(0xBFA10000, 0xBF840000)             // s_cbranch_scc0 .Lepilogue (patched)
 
-    //   Wait for both loads, then store A+B into LDS.
-    asm_s_waitcnt_vmcnt_zero()
-    //   ds_store_b32 v5, v13  (offset0=0; this stores A into LDS[v5])
-    //     word1 = 0xD8340000, word2 = (vdata=13<<8)|(vaddr=5) = 0x00000D05.
-    asm_u32(0xD8340000); asm_u32(0x00000D05)
-    //   ds_store_b32 v5, v14, offset:0x400 (stores B into LDS[v5 + 0x400])
-    asm_u32(0xD8340400); asm_u32(0x00000E05)
-    asm_s_waitcnt_lgkmcnt_zero()
-    //   s_barrier — sync all 8 waves so every lane sees LDS A+B panels.
-    asm_u32_arch(0xBFBD0000, 0xBF8A0000)
-    //   buffer_gl0_inv (matches single-GEMM order: barrier THEN gl0_inv)
-    asm_buffer_gl0_inv()
+    uint64 pipe_loop_top = asm_text_len / 4
 
-    //   Inner reduce — Copies single-GEMM's inner reduce sequence but uses s13
-    //   (scratch) as the inner kk counter instead of s20.  CRITICAL: single-GEMM
-    //   has s20 free (its kernarg only goes up to s15), so it uses s20 as the
-    //   counter.  Grouped-GEMM's descriptor load puts ldb at s20 — using s20 as
-    //   the inner counter overwrites ldb, silently corrupting B-vaddr computation
-    //   for K-tile 1+ (root cause of the multi-tile × multi-K-tile bug at 1A.4).
-    //   s13 is free here (only used earlier as scratch for desc-offset arithmetic).
-    //   Uses v15/v16 as advancing LDS pointers, v9/v10 as load destinations, v6
-    //   as the per-lane accumulator.
+    //   s8 = next K-iter to load = s12 + 1.
+    //   s_add_u32 s8, s12, 1   →  byte2=0x08 (sdst), byte1=0x81 (inline 1), byte0=s12=0x0C.
+    //   word = 0x80_08_81_0C = 0x8008810C.
+    asm_u32(0x8008810C)
+
+    //   Phase A — prefetch tile s8 into buf(s8 & 1).
+    //     s9 = s8 * 16  (kt_base_K for the prefetch)
+    //     s11 = (s8 & 1) << 11  (lds_dest_off for the prefetch buffer)
+    asm_u32_arch(0x84098408, 0x8F098408)             // s_lshl_b32 s9, s8, 4
+    //     s_and_b32 s11, s8, 1  →  word per derivation above: 0x8B0B8108.
+    //       (0x2<<30)|(0x16<<23)|(11<<16)|(0x81<<8)|8 = 0x80000000|0x0B000000|0xB0000|0x8100|0x08 = 0x8B0B8108.
+    asm_u32(0x8B0B8108)
+    //     s_lshl_b32 s11, s11, 11  →  inline 11 = 0x8B.
+    //       (0x2<<30)|(0x08<<23)|(11<<16)|(0x8B<<8)|11 = 0x84_0B_8B_0B = 0x840B8B0B.
+    asm_u32_arch(0x840B8B0B, 0x8F0B8B0B)
+
+    //   Emit panel-load Phase A (compute v_addrs, b128 loads to v[20:27],
+    //   restore EXEC) — but DO NOT wait+ds_store.  ds_store deferred to
+    //   Phase B after the compute.
+    _emit_grouped_panel_load_b128_phase_a()
+
+    //   Compute — inner reduce on tile s12 from buf(s12 & 1).
+    //     s15 = (s12 & 1) << 11  (compute_off)
+    //     v15 = s15 + v17  (LDS_A base for this lane in buf(s12&1))
+    //     v16 = s15 + v18  (LDS_B base — v18 already has +0x400 baked in)
+    asm_u32(0x8B0F810C)                              // s_and_b32 s15, s12, 1
+    asm_u32_arch(0x840F8B0F, 0x8F0F8B0F)             // s_lshl_b32 s15, s15, 11
+    //   v_add_nc_u32 v15, s15, v17  →  (0x4A<<24)|(15<<17)|(17<<9)|15 = 0x4A1E220F
+    asm_u32(0x4A1E220F)
+    //   v_add_nc_u32 v16, s15, v18  →  (0x4A<<24)|(16<<17)|(18<<9)|15 = 0x4A20240F
+    asm_u32(0x4A20240F)
     asm_u32_arch(0xBE8D0080, 0xBE8D0380)             // s_mov_b32 s13, 0
-    asm_u32     (0x7E1E0311)                          // v_mov_b32 v15, v17
-    asm_u32     (0x7E200312)                          // v_mov_b32 v16, v18
-    uint64 inner_top_idx = asm_text_len / 4
-    asm_u32_arch(0xBF870002, 0xBF800000)             // s_delay_alu (gfx11) / s_nop 0 (gfx10)
+    uint64 inner_top_main = asm_text_len / 4
+    asm_u32_arch(0xBF870002, 0xBF800000)             // s_delay_alu / s_nop 0
     asm_u32     (0xD8D80000); asm_u32(0x0900000F)    // ds_load_b32 v9, v15
     asm_u32     (0xD8D80000); asm_u32(0x0A000010)    // ds_load_b32 v10, v16
     asm_s_waitcnt_lgkmcnt_zero()
@@ -9216,26 +9349,105 @@ fn _emit_gemm_f32_grouped_body(uint64 args_desc) {
     asm_u32     (0xD5250010); asm_u32(0x00018110)    // v_add_nc_u32_e64 v16, v16, 64
     asm_u32     (0x800D810D)                          // s_add_u32 s13, s13, 1
     asm_u32     (0xBF0A900D)                          // s_cmp_lt_u32 s13, 16
-    //   s_cbranch_scc1 back to inner_top.  simm = inner_top_idx - (current+1).
-    uint64 inner_back_at = asm_text_len / 4
-    uint64 inner_back_simm = inner_top_idx - (inner_back_at + 1)
-    asm_u32_arch(0xBFA20000 | (inner_back_simm & 0xFFFF),
-                 0xBF850000 | (inner_back_simm & 0xFFFF))
+    uint64 inner_back_main = asm_text_len / 4
+    uint64 inner_back_simm_m = inner_top_main - (inner_back_main + 1)
+    asm_u32_arch(0xBFA20000 | (inner_back_simm_m & 0xFFFF),
+                 0xBF850000 | (inner_back_simm_m & 0xFFFF))
 
-    //   End-of-K-tile sync: barrier so next iter's ds_store doesn't race with
-    //   any lane still mid-ds_load.
+    //   Phase B — commit prefetched data to LDS.
+    //     Recompute s11 from s8 (was clobbered by inner-reduce's use of s13? no,
+    //     s13 is inner counter; s11 untouched.  But to be cautious about future
+    //     edits, recompute.  Actually s11 wasn't touched by inner-reduce; reuse.)
+    //
+    //     v13 = s11 + v5  (LDS vaddr offset by buffer)
+    //     v_add_nc_u32 v13, s11, v5  →  (0x4A<<24)|(13<<17)|(5<<9)|11 = 0x4A1A0A0B
+    asm_u32(0x4A1A0A0B)
+    asm_s_waitcnt_vmcnt_zero()
+
+    //   Re-narrow EXEC for the ds_store of prefetched data.  vcc_lo still
+    //   holds the load mask from Phase A.
+    //   Re-derive vcc_lo = (v19 == 0) defensively; v19 was hoisted and is
+    //   stable.  Then saveexec.
+    asm_v_cmp_eq_u32_imm_vgpr(0, 19)
+    asm_s_and_saveexec_b32_vcc_lo(8)                 // s8 := old EXEC; exec &= vcc_lo
+    asm_s_delay_alu(0x01)
+
+    //   8x ds_store_b32 with vaddr=v13, offsets 0/4/8/12/0x400/0x404/0x408/0x40C.
+    //   word2 layout: (vdata<<8)|(vaddr=v13=13) = (N<<8)|0x0D = N*256+13.
+    asm_u32(0xD8340000); asm_u32(0x0000140D)         // A[0] → LDS[v13+0]
+    asm_u32(0xD8340004); asm_u32(0x0000150D)         // A[1]
+    asm_u32(0xD8340008); asm_u32(0x0000160D)         // A[2]
+    asm_u32(0xD834000C); asm_u32(0x0000170D)         // A[3]
+    asm_u32(0xD8340400); asm_u32(0x0000180D)         // B[0]
+    asm_u32(0xD8340404); asm_u32(0x0000190D)         // B[1]
+    asm_u32(0xD8340408); asm_u32(0x00001A0D)         // B[2]
+    asm_u32(0xD834040C); asm_u32(0x00001B0D)         // B[3]
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    //   Restore EXEC = s8 (saved old EXEC).
+    //   s_or_b32 exec_lo, exec_lo, s8  →  0x8C7E087E.
+    asm_u32(0x8C7E087E)
     asm_u32_arch(0xBFBD0000, 0xBF8A0000)             // s_barrier
     asm_buffer_gl0_inv()
 
-    //   Advance kt counter; loop if more K tiles remain.
+    //   s12 += 1; loop if s12 + 1 < K_tiles (= s12 < K_tiles - 1).
+    //   Termination condition: we want s12 to reach K_tiles - 1 BEFORE the
+    //   epilogue runs.  So the loop runs while (s12 + 1 < K_tiles).
+    //   After s_add s12 += 1, check s12 + 1 < K_tiles via s_add s8 = s12+1
+    //   then s_cmp_lt_u32 s8, s31.
+    //
+    //   (Equivalent to: compute s8 = s12 + 1 above; we have s8 already.
+    //   But that s8 was for the PREVIOUS iter's prefetch; we need to
+    //   recompute after the increment.)
     asm_u32(0x800C810C)                               // s_add_u32 s12, s12, 1
-    asm_u32(0xBF0A1F0C)                               // s_cmp_lt_u32 s12, s31
-    //   s_cbranch_scc1 back to .LK_loop.
-    uint64 k_back_at = asm_text_len / 4
-    uint64 k_back_simm = k_loop_idx - (k_back_at + 1)
-    asm_u32_arch(0xBFA20000 | (k_back_simm & 0xFFFF),
-                 0xBF850000 | (k_back_simm & 0xFFFF))
-    // End of K-loop.  v6 holds the per-lane accumulated dot product.
+    asm_u32(0x8008810C)                               // s_add_u32 s8, s12, 1
+    asm_u32(0xBF0A1F08)                               // s_cmp_lt_u32 s8, s31
+    uint64 pipe_back_at = asm_text_len / 4
+    uint64 pipe_back_simm = pipe_loop_top - (pipe_back_at + 1)
+    asm_u32_arch(0xBFA20000 | (pipe_back_simm & 0xFFFF),
+                 0xBF850000 | (pipe_back_simm & 0xFFFF))
+
+    // ── 4g.EPILOGUE: compute on the final tile (s12 = K_tiles - 1).
+    //   The prefetch in the last loop iter put tile (K_tiles - 1) in
+    //   buf((K_tiles - 1) & 1).  Inner-reduce on that buffer.
+    //
+    //   For K_tiles=1 (skipped main loop), s12=0 and prologue put tile 0
+    //   in buf0; epilogue computes on buf0.  Same form.
+
+    //   Patch the s_cbranch_scc0 from before the main loop to land here.
+    uint64 main_after_idx = asm_text_len / 4
+    uint64 main_skip_simm = main_after_idx - main_skip_idx - 1
+    uint64 main_sccbr_top = 0xBFA10000
+    if _is_gfx10() != 0 { main_sccbr_top = 0xBF840000 }
+    asm_patch_u32(main_skip_idx, main_sccbr_top | (main_skip_simm & 0xFFFF))
+
+    //   Compute s15 = (s12 & 1) << 11, then v15/v16 = s15 + v17/v18.
+    asm_u32(0x8B0F810C)                              // s_and_b32 s15, s12, 1
+    asm_u32_arch(0x840F8B0F, 0x8F0F8B0F)             // s_lshl_b32 s15, s15, 11
+    asm_u32(0x4A1E220F)                              // v_add_nc_u32 v15, s15, v17
+    asm_u32(0x4A20240F)                              // v_add_nc_u32 v16, s15, v18
+    asm_u32_arch(0xBE8D0080, 0xBE8D0380)             // s_mov_b32 s13, 0
+    uint64 inner_top_epi = asm_text_len / 4
+    asm_u32_arch(0xBF870002, 0xBF800000)             // s_delay_alu / s_nop 0
+    asm_u32     (0xD8D80000); asm_u32(0x0900000F)    // ds_load_b32 v9, v15
+    asm_u32     (0xD8D80000); asm_u32(0x0A000010)    // ds_load_b32 v10, v16
+    asm_s_waitcnt_lgkmcnt_zero()
+    asm_u32     (0x560C1509)                          // v_fmac_f32 v6, v9, v10
+    asm_u32     (0xD525000F); asm_u32(0x0001090F)    // v_add_nc_u32_e64 v15, v15, 4
+    asm_u32     (0xD5250010); asm_u32(0x00018110)    // v_add_nc_u32_e64 v16, v16, 64
+    asm_u32     (0x800D810D)                          // s_add_u32 s13, s13, 1
+    asm_u32     (0xBF0A900D)                          // s_cmp_lt_u32 s13, 16
+    uint64 inner_back_epi = asm_text_len / 4
+    uint64 inner_back_simm_e = inner_top_epi - (inner_back_epi + 1)
+    asm_u32_arch(0xBFA20000 | (inner_back_simm_e & 0xFFFF),
+                 0xBF850000 | (inner_back_simm_e & 0xFFFF))
+
+    //   End-of-K-region barrier — ensure all 8 waves' inner-reduce loads
+    //   are done before we touch C (no shared LDS across persistent-WG
+    //   iterations, but a defensive sync mirrors the 1A.5a structure).
+    asm_u32_arch(0xBFBD0000, 0xBF8A0000)             // s_barrier
+    asm_buffer_gl0_inv()
+    // End of K-region.  v6 holds the per-lane accumulated dot product.
 
     // ── 4h. Store v6 to C[global_m, global_n].
     //   c_off (elements) = v7 * ldc + v8 = v7*s21 + v8
@@ -9319,28 +9531,30 @@ fn emit_amdgpu_gemm_f32_grouped_blob(uint64 out_path) -> uint64 {
     // KD plumbing — matches production module-emit values for f32 GEMMs on
     // gfx1100 (rsrc1=0xE0AF0001 enables FP32 denormal handling + 1 user-VGPR;
     // rsrc2=0x9E sets USER_SGPR=15 with WG_ID_X in s15; props=0x0408 selects
-    // KERNARG_SEGMENT_PTR + WAVEFRONT_SIZE32).  LDS=16384 budgets for the
-    // tile_id broadcast slot (LDS[0..3]) + A panel (LDS[0..0x3FF]) + B panel
-    // (LDS[0x400..0x7FF]) — total 2 KiB used out of 16 KiB; 1A.5 will add
-    // double-buffering and lift usage to ~4 KiB.
+    // KERNARG_SEGMENT_PTR + WAVEFRONT_SIZE32).  LDS=16384 budgets:
+    //   tile_id broadcast slot LDS[0..3]
+    //   buf0 — A panel LDS[0..0x3FF], B panel LDS[0x400..0x7FF]   (2 KiB)
+    //   buf1 — A panel LDS[0x800..0xBFF], B panel LDS[0xC00..0xFFF] (2 KiB)
+    // Total 4 KiB used out of 16 KiB (1A.5b double-buffer; 1A.5a/1A.4 only
+    // used buf0).
     //
     // n_args=6, kernarg_size=48 (six 8-byte shim slots).  sgpr_count=32,
-    // vgpr_count=24 — covers the 1A.4 register footprint (kernel uses s0..s31
-    // and v0..v20 in worst case).
+    // vgpr_count=32 — covers the 1A.5b register footprint (kernel uses
+    // s0..s31 and v0..v27 in worst case; v[20:23]+v[24:27] are the b128
+    // panel-load destination quads, v13 is the LDS-vaddr scratch added by
+    // 1A.5b's double-buffer toggle).
     //
-    // rsrc1 bumped from 0xE0AF0001 (16/16) → 0xE0AF0082 (32/24) to actually
-    // back the register footprint at HW level (the granulated fields in rsrc1
-    // are what the HW honours; the .sgpr_count/.vgpr_count metadata strings
-    // are documentation only):
-    //   bits [5:0] (GRANULATED_WORKITEM_VGPR_COUNT) = 2  → (2+1)*8 = 24 VGPRs
-    //   bits [9:6] (GRANULATED_WAVEFRONT_SGPR_COUNT) = 2 → 16 + 2*8 = 32 SGPRs
-    // The 1A.3 sentinel only used v0..v3 and s0..s17 so 0xE0AF0001 (16/16)
-    // happened to work (under-allocated VGPRs but the few in use stayed in
-    // bank 0).  1A.4's full inner GEMM body needs the larger allocation.
+    // rsrc1 = 0xE0AF0083 (was 0xE0AF0082 for 1A.4):
+    //   bits [5:0] (GRANULATED_WORKITEM_VGPR_COUNT) = 3  → (3+1)*8 = 32 VGPRs
+    //   bits [9:6] (GRANULATED_WAVEFRONT_SGPR_COUNT) = 2  → 16 + 2*8 = 32 SGPRs
+    // Without bumping VGPR granulation, the b128 quads v[20:27] alias into
+    // un-allocated VGPR banks → the kernel runs but reads/writes garbage in
+    // those VGPRs (silent miscompare, no fault).  Repeat of the 1A.4 pattern
+    // where 0xE0AF0001 → near-uninitialised output until bumped to 0xE0AF0082.
     uint64 size = emit_amdgpu_code_object_lds("gemm_f32_grouped", 16,
                                                asm_text_buf, asm_text_len,
-                                               48, 8, 32, 24,
-                                               0xE0AF0082, 0x0000009E, 0x00000010, 0x0408,
+                                               48, 8, 32, 32,
+                                               0xE0AF0083, 0x0000009E, 0x00000010, 0x0408,
                                                args_desc, 6,
                                                16384)
 

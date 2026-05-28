@@ -36,6 +36,7 @@ import "../std/train.mlr"
 import "../std/math_float.mlr"
 import "../std/fmt.mlr"
 import "../std/hip.mlr"
+import "../std/time.mlr"
 
 fn die_gpu_smoke(u64 msg, u64 code) {
     print_str(msg); print_str(" err=")
@@ -274,12 +275,41 @@ fn main() {
     unsafe { *((kp + 24) as u64) = p3 }
     unsafe { *((kp + 32) as u64) = p4 }
     unsafe { *((kp + 40) as u64) = p5 }
-    //   3) Dispatch: 240 WGs × 256 lanes (full gfx1100 occupancy at LDS=2 KiB).
-    u32 lerr = hipModuleLaunchKernel(fh, 240, 1, 1, 256, 1, 1,
-                                     0, 0, kp, 0)
-    if lerr != 0 { die_gpu_smoke("launch gemm_f32_grouped", lerr) }
-    u32 serr = hipDeviceSynchronize()
-    if serr != 0 { die_gpu_smoke("hipDeviceSynchronize", serr) }
+    //   3) Dispatch: 240 WGs × 256 lanes (full gfx1100 occupancy at LDS=2 KiB
+    //      pre-1A.5; 4 KiB post-1A.5b double-buffer).  Wall-time measurement
+    //      brackets launch + sync; KFD-shim sync is busy-poll on a GTT-resident
+    //      completion signal so the elapsed time is dispatch + GPU runtime +
+    //      poll latency (~100 µs floor) — sufficient resolution to detect
+    //      ≥10 % perf deltas at the 1A.5a/b sub-step granularity.
+    //
+    //      We run the dispatch N_ITERS times and report min (most-stable since
+    //      thermal effects can only ADD time to dispatch).  Best run wins.
+    u64 N_ITERS    = 5
+    u64 best_ns    = 0xFFFFFFFFFFFFFFFF
+    u64 ii         = 0
+    while ii < N_ITERS {
+        // Re-zero the persistent counter every iter (atomic_inc is one-way).
+        u64 ziter = alloc(4); unsafe { *(ziter as u32) = 0 }
+        u32 czerr = hipMemcpy(d_counter, ziter, 4, 1)
+        if czerr != 0 { die_gpu_smoke("H2D counter re-zero", czerr) }
+        dealloc(ziter)
+
+        u64 t_start = time_now()
+        u32 lerr_i = hipModuleLaunchKernel(fh, 240, 1, 1, 256, 1, 1,
+                                           0, 0, kp, 0)
+        if lerr_i != 0 { die_gpu_smoke("launch gemm_f32_grouped", lerr_i) }
+        u32 serr_i = hipDeviceSynchronize()
+        if serr_i != 0 { die_gpu_smoke("hipDeviceSynchronize", serr_i) }
+        u64 t_end   = time_now()
+        u64 elapsed = t_end - t_start
+        if elapsed < best_ns { best_ns = elapsed }
+        ii = ii + 1
+    }
+    print_str("  best dispatch ns=")
+    u64 sbest = fmt_dec(best_ns); print_str(sbest); dealloc(sbest)
+    print_str(" (min over ")
+    u64 sN = fmt_dec(N_ITERS); print_str(sN); dealloc(sN)
+    print_str(" iters)\n")
     dealloc(p0); dealloc(p1); dealloc(p2); dealloc(p3); dealloc(p4); dealloc(p5); dealloc(kp)
 
     // ── D2H both C buffers.
