@@ -209,6 +209,66 @@ fn launch_fwd_tail(u64 fh, u64 d_x, u64 d_gw, u64 d_gb, u64 d_otk,
     dealloc(kp)
 }
 
+// wzma_fwd_mega (F2): fused forward — embed → U-einsum → softmax-gate → V-einsum →
+//   combine → mean-pool → L2-norm for ONE view, in a single persistent-WG dispatch.
+//   Grid=(8,1,1) one WG per b-group (B=8), block=256.  Repack is eliminated: inter
+//   and outk are written bs-major ([BS,K,R]/[BS,K,D]) directly, matching the legacy
+//   d_i*/d_o* activation layout the backward consumes.  Kernarg order MUST match
+//   _emit_wzma_fwd_mega_body's s_load offsets (0x00..0x78):
+//     0 emb 1 ids 2 U 3 V 4 gw 5 gb 6 bias 7 x_out 8 alpha 9 inter 10 outk
+//     11 out(z) 12 v 13 norms 14 BS(by-val) 15 D(by-val)
+fn launch_wzma_fwd_mega(u64 fh, u64 d_emb, u64 d_ids, u64 d_U, u64 d_V,
+                        u64 d_gw, u64 d_gb, u64 d_bias, u64 d_xout, u64 d_alpha,
+                        u64 d_inter, u64 d_outk, u64 d_z, u64 d_v, u64 d_norms,
+                        u64 BS, u64 D) {
+    u64 p0  = alloc(8); unsafe { *(p0  as u64) = d_emb }
+    u64 p1  = alloc(8); unsafe { *(p1  as u64) = d_ids }
+    u64 p2  = alloc(8); unsafe { *(p2  as u64) = d_U }
+    u64 p3  = alloc(8); unsafe { *(p3  as u64) = d_V }
+    u64 p4  = alloc(8); unsafe { *(p4  as u64) = d_gw }
+    u64 p5  = alloc(8); unsafe { *(p5  as u64) = d_gb }
+    u64 p6  = alloc(8); unsafe { *(p6  as u64) = d_bias }
+    u64 p7  = alloc(8); unsafe { *(p7  as u64) = d_xout }
+    u64 p8  = alloc(8); unsafe { *(p8  as u64) = d_alpha }
+    u64 p9  = alloc(8); unsafe { *(p9  as u64) = d_inter }
+    u64 pA  = alloc(8); unsafe { *(pA  as u64) = d_outk }
+    u64 pB  = alloc(8); unsafe { *(pB  as u64) = d_z }
+    u64 pC  = alloc(8); unsafe { *(pC  as u64) = d_v }
+    u64 pD  = alloc(8); unsafe { *(pD  as u64) = d_norms }
+    u64 pE  = alloc(8); unsafe { *(pE  as u64) = BS }
+    u64 pF  = alloc(8); unsafe { *(pF  as u64) = D }
+    u64 kp = alloc(16 * 8)
+    unsafe { *(kp         as u64) = p0 }
+    unsafe { *((kp +   8) as u64) = p1 }
+    unsafe { *((kp +  16) as u64) = p2 }
+    unsafe { *((kp +  24) as u64) = p3 }
+    unsafe { *((kp +  32) as u64) = p4 }
+    unsafe { *((kp +  40) as u64) = p5 }
+    unsafe { *((kp +  48) as u64) = p6 }
+    unsafe { *((kp +  56) as u64) = p7 }
+    unsafe { *((kp +  64) as u64) = p8 }
+    unsafe { *((kp +  72) as u64) = p9 }
+    unsafe { *((kp +  80) as u64) = pA }
+    unsafe { *((kp +  88) as u64) = pB }
+    unsafe { *((kp +  96) as u64) = pC }
+    unsafe { *((kp + 104) as u64) = pD }
+    unsafe { *((kp + 112) as u64) = pE }
+    unsafe { *((kp + 120) as u64) = pF }
+    // block=512: the body's lane indexing (v0=d, D=384>256) and the 512-wide
+    // _emit_lds_reduce_tree_512 (first stride folds lanes 256..511) REQUIRE 512
+    // threads — same as the megakernel forward / fwd_tail this ISA was lifted
+    // from.  block=256 leaves d in [256,384) uncomputed and reads unwritten LDS
+    // in the reduce → NaN.  (The emitter header says 256; the ISA is 512-wide.)
+    u32 grid  = 8
+    u32 block = 512
+    u32 err = hipModuleLaunchKernel(fh, grid, 1, 1, block, 1, 1, 0, 0, kp, 0)
+    if err != 0 { die_gpu("launch fwd_mega", err) }
+    dealloc(p0); dealloc(p1); dealloc(p2); dealloc(p3); dealloc(p4)
+    dealloc(p5); dealloc(p6); dealloc(p7); dealloc(p8); dealloc(p9)
+    dealloc(pA); dealloc(pB); dealloc(pC); dealloc(pD); dealloc(pE); dealloc(pF)
+    dealloc(kp)
+}
+
 // repack_abw_to_baw_f32: in[A,B,W] (a-major) → out[B,A,W] (b-major).  Grid=A*B, block=W.
 fn launch_repack(u64 fh, u64 d_in, u64 d_out, u64 A, u64 Bm, u64 W) {
     u64 p0 = alloc(8); unsafe { *(p0 as u64) = d_in }
@@ -853,10 +913,29 @@ fn main() {
         print_str("AdamW path: LEGACY (6 standalone full-occupancy dispatches)\n")
     }
 
+    // ── F2.3: MLRIFT_FUSE_FWD knob ─────────────────────────────────────────
+    // MLRIFT_FUSE_FWD=1 routes the ~24-dispatch forward (embed + U×4 + V×4 +
+    // 2×repack + fwd_tail, per view) through ONE persistent-WG wzma_fwd_mega
+    // dispatch per view (grid=8, one WG per b-group).  Repack is eliminated;
+    // inter/outk are written bs-major directly.  Validated ≤1e-3 vs oracle
+    // (fusing reorders summation, so not byte-identical).  Default 0 (legacy).
+    u64 use_fuse_fwd = 0
+    u64 ev_fuse_fwd = sys_getenv("MLRIFT_FUSE_FWD")
+    if ev_fuse_fwd != 0 {
+        u8 c0ff = 0; unsafe { *(ev_fuse_fwd as u8) -> c0ff }
+        if c0ff == 49 { use_fuse_fwd = 1 }   // '1'=49
+    }
+    if use_fuse_fwd == 1 {
+        print_str("Forward path: FUSED (F2 — 1 persistent-WG dispatch/view, repack eliminated)\n")
+    } else {
+        print_str("Forward path: LEGACY (~24 dispatches/view: embed+U+V+repack+tail)\n")
+    }
+
     print_str("Loading kernels...\n")
     u64 fh_embed  = load_co("/tmp/embedding_lookup_f32.co",   "embedding_lookup_f32")
     u64 fh_gemm   = load_co("/tmp/gemm_f32_native.co",        "gemm_f32")
     u64 fh_tail   = load_co("/tmp/wzma_fwd_tail.co",          "wzma_fwd_tail")
+    u64 fh_fwd_mega = load_co("/tmp/wzma_fwd_mega.co",        "wzma_fwd_mega")  // F2
     u64 fh_repack = load_co("/tmp/repack_abw_to_baw_f32.co",  "repack_abw_to_baw_f32")
     // ── Multi-dispatch full-occupancy BACKWARD phase kernels ───────────────
     u64 fh_bpre   = load_co("/tmp/wzma_bwd_pre.co",           "wzma_bwd_pre")
@@ -1092,6 +1171,17 @@ fn main() {
                 d_xs = d_x2; d_as = d_a2; d_is = d_i2; d_os = d_o2; d_ns = d_n2
             }
 
+            if use_fuse_fwd == 1 {
+                // F2: fused forward — one persistent-WG dispatch produces x, alpha,
+                // inter (bs-major [BS,K,R]), outk (bs-major [BS,K,D]), z, v, norms —
+                // exactly the activation layout the backward consumes.  Repack gone.
+                u64 tf = time_now()
+                launch_wzma_fwd_mega(fh_fwd_mega, d_emb, d_ids, d_U, d_V,
+                                     d_gw, d_gb, d_bias, d_xs, d_as,
+                                     d_is, d_os, d_z, d_v, d_ns, BS, D)
+                sync_or_die("sync fwd mega")
+                u64 tf1 = time_now(); ns_tail = ns_tail + (tf1 - tf)
+            } else {
             // Phase 1: embed → x[BS,D] (saved per view)
             u64 t0 = time_now()
             launch_embed(fh_embed, d_ids, d_emb, d_xs, BS, D)
@@ -1126,6 +1216,7 @@ fn main() {
             launch_fwd_tail(fh_tail, d_xs, d_gw, d_gb, d_otk_kbsd, d_bias,
                             d_as, d_z, d_v, d_ns, BS, D)
             sync_or_die("sync fwd_tail"); t1 = time_now(); ns_tail = ns_tail + (t1 - t0)
+            }
 
             view = view + 1
         }
