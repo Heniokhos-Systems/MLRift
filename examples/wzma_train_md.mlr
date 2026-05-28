@@ -627,6 +627,23 @@ fn main() {
     u32 err = hipSetDevice(0)
     if err != 0 { print_str("hipSetDevice failed\n"); exit(1) }
 
+    // ── Task 1A.7: env knob to A/B the bwd_uv path ───────────────────────────
+    // MLRIFT_BWD_UV_GROUPED=1 (default) routes the 8 sequential dV/dU
+    // accumulations through 2 same-shape grouped-GEMM dispatches (1 per view).
+    // Set MLRIFT_BWD_UV_GROUPED=0 to fall back to the legacy 4×launch_gemm_accum
+    // per view (8 dispatches total).  Used to validate no-regression vs oracle.
+    u64 use_grouped = 1
+    u64 ev_grouped = sys_getenv("MLRIFT_BWD_UV_GROUPED")
+    if ev_grouped != 0 {
+        u8 c0g = 0; unsafe { *(ev_grouped as u8) -> c0g }
+        if c0g == 48 { use_grouped = 0 }   // '0' (ASCII 48) → legacy
+    }
+    if use_grouped == 1 {
+        print_str("bwd_uv path: GROUPED (1A.7 — 2 dispatches via launch_gemm_grouped)\n")
+    } else {
+        print_str("bwd_uv path: LEGACY (8 dispatches via launch_gemm_accum)\n")
+    }
+
     print_str("Loading kernels...\n")
     u64 fh_embed  = load_co("/tmp/embedding_lookup_f32.co",   "embedding_lookup_f32")
     u64 fh_gemm   = load_co("/tmp/gemm_f32_native.co",        "gemm_f32")
@@ -640,6 +657,11 @@ fn main() {
     u64 fh_adamw  = load_co("/tmp/adamw_step_f32.co",         "adamw_step_f32")
     // ── GEMM-based bwd_uv replacement (full-occupancy contractions) ─────────
     u64 fh_gaccum = load_co("/tmp/gemm_f32_accum.co",         "gemm_f32_accum")
+    // ── Task 1A.7: grouped-GEMM .co (Phase 1A.3–1A.6) — fused-launch path ───
+    // gemm_f32_grouped fans persistent-WG dispatch across an arbitrary B_batch
+    // descriptor table; we use it in same-shape fast-path mode for the dV/dU
+    // contractions (1 dispatch per view per shape) instead of 4× gemm_f32_accum.
+    u64 fh_ggrp   = load_co("/tmp/gemm_f32_grouped.co",       "gemm_f32_grouped")
     u64 fh_transp = load_co("/tmp/transpose_f32.co",          "transpose_f32")
     u64 fh_rscale = load_co("/tmp/row_scale_f32.co",          "row_scale_f32")
     u64 fh_gbs    = load_co("/tmp/gate_bwd_bs_f32.co",        "gate_bwd_bs_f32")
@@ -747,6 +769,17 @@ fn main() {
     u64 d_dinter   = gpu_malloc(K * BS * R * 4, "mDinter")    // dinter_k [K,BS,R]
     u64 d_dgl1     = gpu_malloc(BS * K * 4,     "mDgl1");  u64 d_dgl2 = gpu_malloc(BS * K * 4, "mDgl2")
     u64 d_ones_bs  = gpu_malloc(BS * 4,         "mOnesBS")   // [1,BS] all-ones for dbias gemm
+
+    // ── Task 1A.7: grouped-GEMM descriptor + counter scratch (reused per step) ─
+    // Each group is 88 bytes; we issue 2 dispatches per view, each with B=K=4
+    // groups, but the dV-group descriptor is identical across views (only the
+    // C-pointer differs by view via d_dVk; A=interT, B=doutk both per-view).
+    // We allocate one 4×88 = 352-byte slab per call site (dV + dU = 2 slabs) and
+    // re-pack each step.  Counter is one u32; the launcher zeroes it via H2D each
+    // call.  Lifetime = full training run (no per-step gpu_malloc/free).
+    u64 d_desc_dV    = gpu_malloc(K * 88, "mDescDV")
+    u64 d_desc_dU    = gpu_malloc(K * 88, "mDescDU")
+    u64 d_cntr_grp   = gpu_malloc(4,      "mCntrGrp")    // shared u32 counter
 
     // ── AdamW moment buffers (zero-init once) ──────────────────────────────
     u64 d_mU=gpu_malloc(K*D*R*4,"mMU"); u64 d_vU=gpu_malloc(K*D*R*4,"mVU")
@@ -1055,34 +1088,150 @@ fn main() {
             // and the AQL ring holds 64 packets — so we MUST sync well within 64
             // dispatches/sync or the ring back-pressures forever (CP never started).
             sync_or_die("sync bwd_uv view-prep")
-            u64 kk = 0
-            while kk < K {
-                u64 d_dUk = d_dU + kk*D*R*4
-                u64 d_dVk = d_dV + kk*R*D*4
-                u64 d_intk    = d_inter_kr + kk*BS*R*4         // raw inter_k [BS,R]
-                u64 d_doutk_k = d_doutk    + kk*BS*D*4         // doutk_k [BS,D]
-                u64 d_alphak  = d_alphaT   + kk*BS*4           // alpha_k [BS]
-                u64 d_VkT_k   = d_VkT      + kk*D*R*4          // V_k^T [D,R] (prologue)
-                u64 d_UkT_k   = d_UkT      + kk*R*D*4          // U_k^T [R,D] (prologue)
-                u64 d_interT_k = d_interT  + kk*R*BS*4         // inter_k^T [R,BS] (per-bank)
-                u64 d_dinter_k = d_dinter  + kk*BS*R*4         // dinter_k [BS,R] (per-bank)
-                // doutk_k = alpha_k · dz   (α applied ONCE here)
-                launch_row_scale(fh_rscale, d_dzv, d_alphak, d_doutk_k, BS*D, D)
-                // dinter_k[BS,R] = doutk_k[BS,D] · V_k^T[D,R]   (V_kT from prologue)
-                launch_gemm(fh_gemm, d_doutk_k, d_VkT_k, d_dinter_k, BS, R, D)
-                // dV_k[R,D] += inter_k^T[R,BS] · doutk_k[BS,D]
-                launch_transpose(fh_transp, d_intk, d_interT_k, BS, R) // inter_k[BS,R]→[R,BS]
-                launch_gemm_accum(fh_gaccum, d_interT_k, d_doutk_k, d_dVk, R, D, BS)
-                // dU_k[D,R] += x^T[D,BS] · dinter_k[BS,R]
-                launch_gemm_accum(fh_gaccum, d_xT, d_dinter_k, d_dUk, D, R, BS)
-                // dx[BS,D] += dinter_k[BS,R] · U_k^T[R,D]  (accumulate onto dx_gate;
-                // U_kT from prologue; in-order queue serializes the cross-bank +=)
-                launch_gemm_accum(fh_gaccum, d_dinter_k, d_UkT_k, d_dxv, BS, D, R)
-                kk = kk + 1
+            if use_grouped == 1 {
+                // ── Task 1A.7: GROUPED bwd_uv ────────────────────────────────
+                // Stage 1 — per-bank "prep + dx" loop: row_scale + dinter-gemm +
+                // transpose(intk) + dx-accum.  Same per-bank ops as legacy minus
+                // the dV/dU accumulations (those are moved to the 2 grouped
+                // dispatches below).  16 dispatches/view (was 24).
+                u64 kk = 0
+                while kk < K {
+                    u64 d_dxv_off  = d_dxv                          // dx[BS,D] (shared)
+                    u64 d_intk     = d_inter_kr + kk*BS*R*4         // raw inter_k [BS,R]
+                    u64 d_doutk_k  = d_doutk    + kk*BS*D*4         // doutk_k [BS,D]
+                    u64 d_alphak   = d_alphaT   + kk*BS*4           // alpha_k [BS]
+                    u64 d_VkT_k    = d_VkT      + kk*D*R*4          // V_k^T [D,R]
+                    u64 d_UkT_k    = d_UkT      + kk*R*D*4          // U_k^T [R,D]
+                    u64 d_interT_k = d_interT   + kk*R*BS*4         // inter_k^T [R,BS]
+                    u64 d_dinter_k = d_dinter   + kk*BS*R*4         // dinter_k [BS,R]
+                    // doutk_k = alpha_k · dz   (α applied ONCE here)
+                    launch_row_scale(fh_rscale, d_dzv, d_alphak, d_doutk_k, BS*D, D)
+                    // dinter_k[BS,R] = doutk_k[BS,D] · V_k^T[D,R]
+                    launch_gemm(fh_gemm, d_doutk_k, d_VkT_k, d_dinter_k, BS, R, D)
+                    // inter_k[BS,R] → inter_k^T[R,BS] (consumed by grouped dV below)
+                    launch_transpose(fh_transp, d_intk, d_interT_k, BS, R)
+                    // dx[BS,D] += dinter_k[BS,R] · U_k^T[R,D]  (in-order serial += OK)
+                    launch_gemm_accum(fh_gaccum, d_dinter_k, d_UkT_k, d_dxv_off, BS, D, R)
+                    kk = kk + 1
+                }
+                // Sync to ensure interT_k + doutk_k + dinter_k are all materialised
+                // before the grouped dispatches read them (the grouped kernel is a
+                // separate hipModuleLaunchKernel and the in-order AQL queue makes
+                // this redundant in principle, but we sync here to match the legacy
+                // path's per-view sync boundary for fair timing).
+                sync_or_die("sync bwd_uv grouped-prep")
+
+                // Stage 2 — grouped dV: dV_k[R,D] += inter_k^T[R,BS] @ doutk_k[BS,D]
+                //   per-bank shape: M=R=32, N=D=384, K=BS=128, acc=1, fast-path.
+                //   A_ptr[k] = d_interT + k*R*BS*4   B_ptr[k] = d_doutk + k*BS*D*4
+                //   C_ptr[k] = d_dV     + k*R*D*4   lda=BS  ldb=D  ldc=D
+                u64 M_dV   = alloc(K*4);  u64 N_dV   = alloc(K*4);  u64 KK_dV  = alloc(K*4)
+                u64 LdA_dV = alloc(K*4);  u64 LdB_dV = alloc(K*4);  u64 LdC_dV = alloc(K*4)
+                u64 Ap_dV  = alloc(K*8);  u64 Bp_dV  = alloc(K*8);  u64 Cp_dV  = alloc(K*8)
+                u64 Ac_dV  = alloc(K*4)
+                u64 kdv = 0
+                while kdv < K {
+                    unsafe { *((M_dV   + kdv*4) as u32) = R }
+                    unsafe { *((N_dV   + kdv*4) as u32) = D }
+                    unsafe { *((KK_dV  + kdv*4) as u32) = BS }
+                    unsafe { *((LdA_dV + kdv*4) as u32) = BS }   // A=interT [R,BS] row-major lda=K=BS
+                    unsafe { *((LdB_dV + kdv*4) as u32) = D }    // B=doutk [BS,D] row-major ldb=N=D
+                    unsafe { *((LdC_dV + kdv*4) as u32) = D }    // C=dV    [R,D]  row-major ldc=N=D
+                    unsafe { *((Ap_dV  + kdv*8) as u64) = d_interT + kdv*R*BS*4 }
+                    unsafe { *((Bp_dV  + kdv*8) as u64) = d_doutk  + kdv*BS*D*4 }
+                    unsafe { *((Cp_dV  + kdv*8) as u64) = d_dV     + kdv*R*D*4 }
+                    unsafe { *((Ac_dV  + kdv*4) as u32) = 1 }    // accumulate
+                    kdv = kdv + 1
+                }
+                u64 tot_dV_slot = alloc(4); unsafe { *(tot_dV_slot as u32) = 0 }
+                build_gemm_grouped_descriptor(d_desc_dV, K,
+                    M_dV, N_dV, KK_dV, LdA_dV, LdB_dV, LdC_dV,
+                    Ap_dV, Bp_dV, Cp_dV, Ac_dV, 0, tot_dV_slot)
+                u32 tot_dV = 0; unsafe { *(tot_dV_slot as u32) -> tot_dV }
+                launch_gemm_grouped(fh_ggrp, d_desc_dV, K, tot_dV, 1, 0, d_cntr_grp)
+                dealloc(M_dV);   dealloc(N_dV);   dealloc(KK_dV)
+                dealloc(LdA_dV); dealloc(LdB_dV); dealloc(LdC_dV)
+                dealloc(Ap_dV);  dealloc(Bp_dV);  dealloc(Cp_dV)
+                dealloc(Ac_dV);  dealloc(tot_dV_slot)
+
+                // Sync between the two grouped dispatches.  Hypothesis: the
+                // counter-zero H2D in launch_gemm_grouped (Stage 3) may not be
+                // queue-ordered against the in-flight Stage-2 GFX dispatch on
+                // the KFD shim; explicit sync forces dV to drain before the
+                // dU counter is re-zeroed.  If this turns out to be the cause
+                // of the 1A.7 dU correctness regression, the durable fix is
+                // either (a) per-call counter slots so no zero races a live
+                // dispatch, or (b) on-GPU fill-step zero queued in-order.
+                sync_or_die("sync between grouped dV and dU")
+
+                // Stage 3 — grouped dU: dU_k[D,R] += x^T[D,BS] @ dinter_k[BS,R]
+                //   per-bank shape: M=D=384, N=R=32, K=BS=128, acc=1, fast-path.
+                //   A_ptr[k] = d_xT (BROADCAST — shared across all 4 banks)
+                //   B_ptr[k] = d_dinter + k*BS*R*4   C_ptr[k] = d_dU + k*D*R*4
+                //   lda=BS  ldb=R  ldc=R
+                u64 M_dU   = alloc(K*4);  u64 N_dU   = alloc(K*4);  u64 KK_dU  = alloc(K*4)
+                u64 LdA_dU = alloc(K*4);  u64 LdB_dU = alloc(K*4);  u64 LdC_dU = alloc(K*4)
+                u64 Ap_dU  = alloc(K*8);  u64 Bp_dU  = alloc(K*8);  u64 Cp_dU  = alloc(K*8)
+                u64 Ac_dU  = alloc(K*4)
+                u64 kdu = 0
+                while kdu < K {
+                    unsafe { *((M_dU   + kdu*4) as u32) = D }
+                    unsafe { *((N_dU   + kdu*4) as u32) = R }
+                    unsafe { *((KK_dU  + kdu*4) as u32) = BS }
+                    unsafe { *((LdA_dU + kdu*4) as u32) = BS }   // A=xT [D,BS] row-major lda=K=BS
+                    unsafe { *((LdB_dU + kdu*4) as u32) = R }    // B=dinter [BS,R] ldb=N=R
+                    unsafe { *((LdC_dU + kdu*4) as u32) = R }    // C=dU [D,R] ldc=N=R
+                    unsafe { *((Ap_dU  + kdu*8) as u64) = d_xT }                  // broadcast
+                    unsafe { *((Bp_dU  + kdu*8) as u64) = d_dinter + kdu*BS*R*4 }
+                    unsafe { *((Cp_dU  + kdu*8) as u64) = d_dU     + kdu*D*R*4 }
+                    unsafe { *((Ac_dU  + kdu*4) as u32) = 1 }
+                    kdu = kdu + 1
+                }
+                u64 tot_dU_slot = alloc(4); unsafe { *(tot_dU_slot as u32) = 0 }
+                build_gemm_grouped_descriptor(d_desc_dU, K,
+                    M_dU, N_dU, KK_dU, LdA_dU, LdB_dU, LdC_dU,
+                    Ap_dU, Bp_dU, Cp_dU, Ac_dU, 0, tot_dU_slot)
+                u32 tot_dU = 0; unsafe { *(tot_dU_slot as u32) -> tot_dU }
+                launch_gemm_grouped(fh_ggrp, d_desc_dU, K, tot_dU, 1, 0, d_cntr_grp)
+                dealloc(M_dU);   dealloc(N_dU);   dealloc(KK_dU)
+                dealloc(LdA_dU); dealloc(LdB_dU); dealloc(LdC_dU)
+                dealloc(Ap_dU);  dealloc(Bp_dU);  dealloc(Cp_dU)
+                dealloc(Ac_dU);  dealloc(tot_dU_slot)
+
+                // ONE sync after the prep loop + 2 grouped dispatches (was: 1 sync
+                // after 24 dispatches in legacy; now 1 sync after 16 prep + 2 grp).
+                sync_or_die("sync bwd_uv grouped-banks")
+            } else {
+                // ── Legacy bwd_uv (4×launch_gemm_accum per bank, 24 dispatches/view) ──
+                u64 kk = 0
+                while kk < K {
+                    u64 d_dUk = d_dU + kk*D*R*4
+                    u64 d_dVk = d_dV + kk*R*D*4
+                    u64 d_intk    = d_inter_kr + kk*BS*R*4         // raw inter_k [BS,R]
+                    u64 d_doutk_k = d_doutk    + kk*BS*D*4         // doutk_k [BS,D]
+                    u64 d_alphak  = d_alphaT   + kk*BS*4           // alpha_k [BS]
+                    u64 d_VkT_k   = d_VkT      + kk*D*R*4          // V_k^T [D,R] (prologue)
+                    u64 d_UkT_k   = d_UkT      + kk*R*D*4          // U_k^T [R,D] (prologue)
+                    u64 d_interT_k = d_interT  + kk*R*BS*4         // inter_k^T [R,BS] (per-bank)
+                    u64 d_dinter_k = d_dinter  + kk*BS*R*4         // dinter_k [BS,R] (per-bank)
+                    // doutk_k = alpha_k · dz   (α applied ONCE here)
+                    launch_row_scale(fh_rscale, d_dzv, d_alphak, d_doutk_k, BS*D, D)
+                    // dinter_k[BS,R] = doutk_k[BS,D] · V_k^T[D,R]   (V_kT from prologue)
+                    launch_gemm(fh_gemm, d_doutk_k, d_VkT_k, d_dinter_k, BS, R, D)
+                    // dV_k[R,D] += inter_k^T[R,BS] · doutk_k[BS,D]
+                    launch_transpose(fh_transp, d_intk, d_interT_k, BS, R) // inter_k[BS,R]→[R,BS]
+                    launch_gemm_accum(fh_gaccum, d_interT_k, d_doutk_k, d_dVk, R, D, BS)
+                    // dU_k[D,R] += x^T[D,BS] · dinter_k[BS,R]
+                    launch_gemm_accum(fh_gaccum, d_xT, d_dinter_k, d_dUk, D, R, BS)
+                    // dx[BS,D] += dinter_k[BS,R] · U_k^T[R,D]  (accumulate onto dx_gate;
+                    // U_kT from prologue; in-order queue serializes the cross-bank +=)
+                    launch_gemm_accum(fh_gaccum, d_dinter_k, d_UkT_k, d_dxv, BS, D, R)
+                    kk = kk + 1
+                }
+                // ONE sync after all 4 banks (24 packets) — bounds ring depth; the
+                // per-bank scratch slots removed the inter-bank reuse hazard.
+                sync_or_die("sync bwd_uv banks")
             }
-            // ONE sync after all 4 banks (24 packets) — bounds ring depth; the
-            // per-bank scratch slots removed the inter-bank reuse hazard.
-            sync_or_die("sync bwd_uv banks")
             vw = vw + 1
         }
         t1 = time_now(); ns_buv = ns_buv + (t1 - t0)
@@ -1173,7 +1322,27 @@ fn ref_loss(u64 step) -> f32 {
 }
 
 // validate dU|dV|dgw|dgb|dbias (100228 f32) vs oracle_grads.bin (tol 1e-3).
+// Task 1A.7: MLRIFT_DUMP_GRADS=/path writes the step-0 grads (D2H) to <path>
+// for A/B comparison (legacy vs grouped) when the on-disk oracle is stale.
 fn validate_grads(u64 d_partial, u64 PART_N) {
+    // 1A.7 grad-dump hook (runs before the oracle compare).
+    u64 dump_env = sys_getenv("MLRIFT_DUMP_GRADS")
+    if dump_env != 0 {
+        u8 c0d = 0; unsafe { *(dump_env as u8) -> c0d }
+        if c0d != 0 {
+            u64 dbuf = alloc(PART_N * 4)
+            u32 de = hipMemcpy(dbuf, d_partial, PART_N * 4, 2)
+            if de == 0 {
+                u64 dfd = file_open(dump_env, 1)
+                if dfd <= 0xFFFFFFFFFFFFF000 {
+                    file_write(dfd, dbuf, PART_N * 4)
+                    file_close(dfd)
+                    print_str("step-0 grads dumped to "); print_str(dump_env); print_str("\n")
+                }
+            }
+            dealloc(dbuf)
+        }
+    }
     u64 opath = "/home/pantelis/mlrift_bin/wzma_train/oracle_grads.bin"
     u64 ofd = file_open(opath, 0)
     if ofd > 0xFFFFFFFFFFFFF000 { print_str("(oracle_grads.bin not found; skip grad check)\n"); return }
