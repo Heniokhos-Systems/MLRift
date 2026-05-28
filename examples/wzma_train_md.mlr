@@ -255,6 +255,161 @@ fn launch_gemm_accum(u64 fh, u64 d_a, u64 d_b, u64 d_c, u64 m, u64 n, u64 k_dim)
     dealloc(p0); dealloc(p1); dealloc(p2); dealloc(p3); dealloc(p4); dealloc(p5); dealloc(kp)
 }
 
+// ----------------------------------------------------------------------------
+// Task 1A.2 — Grouped-GEMM descriptor packer + launch wrapper (CPU-side ONLY).
+// ----------------------------------------------------------------------------
+// build_gemm_grouped_descriptor packs a B_batch-long array of 88-byte group
+// descriptors into a caller-supplied VRAM region.  Phase 1A consumers will
+// hand this VRAM pointer to gemm_f32_grouped.co (Tasks 1A.3/1A.4); the kernel
+// reads each descriptor with a single LDS-staged structured load and dispatches
+// the same TM=TN=TK=16 / RM=RN=1 / block=256 traversal that gemm_f32_accum.co
+// already uses (audit: TM=TN=16 = byte-equality target for Task 1A.4).
+//
+// Per-group layout (88 bytes total, MUST match the kernel-side struct in
+// src/format_amdgpu_megakernel.mlr that Task 1A.3 lands):
+//     off  size  field
+//      0   u32   M
+//      4   u32   N
+//      8   u32   K
+//     12   u32   lda
+//     16   u32   ldb
+//     20   u32   ldc
+//     24   u64   A_ptr
+//     32   u64   B_ptr
+//     40   u64   C_ptr
+//     48   u32   acc_flag       (0 = store, 1 = C += A@B)
+//     52   u32   precision      (Phase 1A = 0 always; bf16-WMMA = 1 in 1B)
+//     56   u32   splitK         (Phase 1A = 1 always)
+//     60   u32   tile_count     (= ceil(M/16) * ceil(N/16))
+//     64   u32   tile_prefix    (running sum of tile_count up to this group)
+//     68..87 u32x5 pad          (zeroed for forward-compat / cacheline align)
+//
+// Inputs are host-side u32/u64 arrays addressed as raw u64 byte pointers (the
+// existing MLRift idiom; no `u32*` syntax in this file).  M/N/K/lda/ldb/ldc/
+// acc_flag are stride-4 u32 arrays; A_ptr/B_ptr/C_ptr are stride-8 u64 arrays.
+// Pass tile_count_out=0 / total_tiles_out=0 to skip optional outputs.
+fn build_gemm_grouped_descriptor(
+    u64 d_desc,
+    u32 b_batch,
+    u64 M_arr, u64 N_arr, u64 K_arr,
+    u64 lda_arr, u64 ldb_arr, u64 ldc_arr,
+    u64 A_ptr_arr, u64 B_ptr_arr, u64 C_ptr_arr,
+    u64 acc_flag_arr,
+    u64 tile_count_out,
+    u64 total_tiles_out
+) {
+    u64 b64 = b_batch
+    u64 nbytes = b64 * 88
+    u64 host_buf = alloc(nbytes)
+    u32 total_tiles = 0
+    u64 g = 0
+    while g < b64 {
+        u64 base = host_buf + g * 88
+        u32 m_g   = 0; unsafe { *((M_arr   + g * 4) as u32) -> m_g }
+        u32 n_g   = 0; unsafe { *((N_arr   + g * 4) as u32) -> n_g }
+        u32 k_g   = 0; unsafe { *((K_arr   + g * 4) as u32) -> k_g }
+        u32 lda_g = 0; unsafe { *((lda_arr + g * 4) as u32) -> lda_g }
+        u32 ldb_g = 0; unsafe { *((ldb_arr + g * 4) as u32) -> ldb_g }
+        u32 ldc_g = 0; unsafe { *((ldc_arr + g * 4) as u32) -> ldc_g }
+        u64 a_g   = 0; unsafe { *((A_ptr_arr + g * 8) as u64) -> a_g }
+        u64 b_g   = 0; unsafe { *((B_ptr_arr + g * 8) as u64) -> b_g }
+        u64 c_g   = 0; unsafe { *((C_ptr_arr + g * 8) as u64) -> c_g }
+        u32 acc_g = 0; unsafe { *((acc_flag_arr + g * 4) as u32) -> acc_g }
+        // Tile-count math uses TM=TN=16 (audit-confirmed for gemm_f32_accum
+        // traversal — Task 1A.4 byte-equality target).  Ceiling division so
+        // partial-tile lanes are correctly bounded under the OOB-pad clamp.
+        u64 m64 = m_g
+        u64 n64 = n_g
+        u64 tiles_m = (m64 + 15) / 16
+        u64 tiles_n = (n64 + 15) / 16
+        u32 tc_g = tiles_m * tiles_n
+        u32 tp_g = total_tiles
+        unsafe { *((base +  0) as u32) = m_g }
+        unsafe { *((base +  4) as u32) = n_g }
+        unsafe { *((base +  8) as u32) = k_g }
+        unsafe { *((base + 12) as u32) = lda_g }
+        unsafe { *((base + 16) as u32) = ldb_g }
+        unsafe { *((base + 20) as u32) = ldc_g }
+        unsafe { *((base + 24) as u64) = a_g }
+        unsafe { *((base + 32) as u64) = b_g }
+        unsafe { *((base + 40) as u64) = c_g }
+        unsafe { *((base + 48) as u32) = acc_g }
+        unsafe { *((base + 52) as u32) = 0 }   // precision = 0 (f32, Phase 1A)
+        unsafe { *((base + 56) as u32) = 1 }   // splitK    = 1 (Phase 1A)
+        unsafe { *((base + 60) as u32) = tc_g }
+        unsafe { *((base + 64) as u32) = tp_g }
+        unsafe { *((base + 68) as u32) = 0 }   // pad[0]
+        unsafe { *((base + 72) as u32) = 0 }   // pad[1]
+        unsafe { *((base + 76) as u32) = 0 }   // pad[2]
+        unsafe { *((base + 80) as u32) = 0 }   // pad[3]
+        unsafe { *((base + 84) as u32) = 0 }   // pad[4]
+        if tile_count_out != 0 {
+            unsafe { *((tile_count_out + g * 4) as u32) = tc_g }
+        }
+        total_tiles = total_tiles + tc_g
+        g = g + 1
+    }
+    if total_tiles_out != 0 {
+        unsafe { *(total_tiles_out as u32) = total_tiles }
+    }
+    // H2D the packed descriptor array in one copy (direction 1 = H2D).
+    u32 err = hipMemcpy(d_desc, host_buf, nbytes, 1)
+    if err != 0 { die_gpu("H2D gemm_grouped desc", err) }
+    dealloc(host_buf)
+}
+
+// launch_gemm_grouped: dispatch gemm_f32_grouped.co (Tasks 1A.3/1A.4) over a
+// previously-packed descriptor array.  Persistent-WG layout — every WG ID is
+// dynamically remapped to a (group, tile_m, tile_n) triple via the descriptor
+// table + atomic global counter (d_global_counter, u32 in VRAM).  Grid is a
+// FIXED 240 WGs on gfx1100 (60 CUs * 4 waves per CU * 1 WG per wave = full
+// occupancy at LDS=2 KiB / 256 lanes); block stays 256 to match the audit-
+// confirmed single-GEMM lane layout (v0 = N-col within tile, v1 = M-row).
+//
+// Kernarg ABI (32 bytes total, KFD ptr-table — each slot is a pointer-to-value):
+//     idx  size  field
+//      0   u64   d_desc            (VRAM descriptor base)
+//      1   u32   b_batch           (number of groups)
+//      2   u32   total_tiles       (sum of all groups' tile_count)
+//      3   u32   fast_path_flag    (1 = uniform M,N,K,splitK -> skip prefix
+//                                   search, divide directly; 0 = binary-search
+//                                   tile_prefix in the descriptor table)
+//      4   u32   precision_mode    (0 = f32 / Phase 1A; 1 = bf16-WMMA / 1B)
+//      5   u64   d_global_counter  (VRAM u32; this fn zeroes it before launch)
+//
+// This function zeroes d_global_counter via a 4-byte H2D (cheap, one-shot;
+// the per-step on-GPU fill_step path is not warranted for a single u32).
+fn launch_gemm_grouped(u64 fh, u64 d_desc, u32 b_batch, u32 total_tiles,
+                       u32 fast_path_flag, u32 precision_mode,
+                       u64 d_global_counter) {
+    // 1) Zero the persistent-WG global atomic counter (u32 = 0 H2D).
+    u64 zslot = alloc(4); unsafe { *(zslot as u32) = 0 }
+    u32 zerr = hipMemcpy(d_global_counter, zslot, 4, 1)
+    if zerr != 0 { die_gpu("H2D gemm_grouped counter zero", zerr) }
+    dealloc(zslot)
+    // 2) Pack kernargs (KFD ptr-table ABI — each arg gets its own value slot).
+    u64 p0 = alloc(8); unsafe { *(p0 as u64) = d_desc }
+    u64 p1 = alloc(8); unsafe { *(p1 as u64) = b_batch }
+    u64 p2 = alloc(8); unsafe { *(p2 as u64) = total_tiles }
+    u64 p3 = alloc(8); unsafe { *(p3 as u64) = fast_path_flag }
+    u64 p4 = alloc(8); unsafe { *(p4 as u64) = precision_mode }
+    u64 p5 = alloc(8); unsafe { *(p5 as u64) = d_global_counter }
+    u64 kp = alloc(6 * 8)
+    unsafe { *(kp        as u64) = p0 }
+    unsafe { *((kp +  8) as u64) = p1 }
+    unsafe { *((kp + 16) as u64) = p2 }
+    unsafe { *((kp + 24) as u64) = p3 }
+    unsafe { *((kp + 32) as u64) = p4 }
+    unsafe { *((kp + 40) as u64) = p5 }
+    // 3) Launch persistent-WG grid: 240 WGs * 256 lanes = 61440 lanes
+    //    (gfx1100: 60 CUs * 4 waves per CU; one WG per wave at LDS=2 KiB).
+    u32 grid  = 240
+    u32 block = 256
+    u32 err = hipModuleLaunchKernel(fh, grid, 1, 1, block, 1, 1, 0, 0, kp, 0)
+    if err != 0 { die_gpu("launch gemm_grouped", err) }
+    dealloc(p0); dealloc(p1); dealloc(p2); dealloc(p3); dealloc(p4); dealloc(p5); dealloc(kp)
+}
+
 // transpose_f32: out[N,M] = transpose(in[M,N]).  16x16 LDS tiles, 256 lanes.
 fn launch_transpose(u64 fh, u64 d_in, u64 d_out, u64 m, u64 n) {
     u64 p0 = alloc(8); unsafe { *(p0 as u64) = d_in }
