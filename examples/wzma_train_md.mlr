@@ -295,6 +295,7 @@ fn build_gemm_grouped_descriptor(
     u64 lda_arr, u64 ldb_arr, u64 ldc_arr,
     u64 A_ptr_arr, u64 B_ptr_arr, u64 C_ptr_arr,
     u64 acc_flag_arr,
+    u32 precision,
     u64 tile_count_out,
     u64 total_tiles_out
 ) {
@@ -334,7 +335,7 @@ fn build_gemm_grouped_descriptor(
         unsafe { *((base + 32) as u64) = b_g }
         unsafe { *((base + 40) as u64) = c_g }
         unsafe { *((base + 48) as u32) = acc_g }
-        unsafe { *((base + 52) as u32) = 0 }   // precision = 0 (f32, Phase 1A)
+        unsafe { *((base + 52) as u32) = precision }   // 0=f32 (Phase 1A); 1=bf16-WMMA (1B.3)
         unsafe { *((base + 56) as u32) = 1 }   // splitK    = 1 (Phase 1A)
         unsafe { *((base + 60) as u32) = tc_g }
         unsafe { *((base + 64) as u32) = tp_g }
@@ -644,29 +645,49 @@ fn main() {
         print_str("bwd_uv path: LEGACY (8 dispatches via launch_gemm_accum)\n")
     }
 
-    // ── Task 1B.2: env knob to opt into bf16-WMMA grouped GEMM ──────────────
+    // ── Task 1B.3: bf16-WMMA grouped GEMM wired into bwd_uv hot-path ─────────
     // MLRIFT_BWD_UV_PRECISION=f32 (default) routes through gemm_f32_grouped.co
-    // (block=256, sw-pipelined LDS-tiled f32 FMA).
-    // MLRIFT_BWD_UV_PRECISION=bf16 loads gemm_bf16_grouped.co (block=32,
-    // v_wmma_f32_16x16x16_bf16) but the bf16 cast pre-step is NOT yet wired
-    // into the bwd_uv hot path (substantial host/GPU plumbing — landing in
-    // 1B.3).  For 1B.2 the env knob exists to keep the launcher ABI stable
-    // for downstream tooling; using bf16 currently warns and falls back to
-    // the f32 path.  The WMMA kernel itself is correctness-validated via
-    // examples/gemm_grouped_smoke.mlr's smoke_bf16_B2 (max_abs ≤ 1e-3 vs
-    // bf16-quantized CPU reference).
+    // (block=256, sw-pipelined LDS-tiled f32 FMA; max_abs ≤ 4.17e-7 vs oracle).
+    //
+    // 1B.3 status (2026-05-28): the bf16 path is WIRED (descriptor + fh swap
+    // plumbing complete) but DISABLED BY DEFAULT after the bf16 kernel was
+    // shown to GFXHUB-page-fault at bwd_uv real shapes (M=32 N=384 K=128 dV
+    // and M=384 N=32 K=128 dU, B=4 groups).  Step-0 grads max_abs=1.30 vs
+    // oracle (gate 1e-3 — FAIL by 1300×) before the GPU wedged on the second
+    // dispatch; MODE1 auto-reset recovered cleanly.  The 1B.2 smoke (B=2,
+    // small tiles) didn't catch this — classic OOB pad-lane signature only
+    // surfaced at production shapes.  Re-enabling bf16 is a one-line change
+    // here once the WMMA emitter is fixed; the launcher wiring stays.
+    //
+    // For now MLRIFT_BWD_UV_PRECISION=bf16 prints a strong warning and FALLS
+    // BACK to f32 to keep CI / downstream tooling unable to silently wedge
+    // the GPU.  Set MLRIFT_BWD_UV_PRECISION=bf16_force to actually attempt
+    // the bf16 path (developer-only, expects the wedge).
     u64 use_bf16 = 0
     u64 ev_prec = sys_getenv("MLRIFT_BWD_UV_PRECISION")
     if ev_prec != 0 {
         u8 c0p = 0; unsafe { *(ev_prec as u8) -> c0p }
-        u8 c1p = 0; unsafe { *((ev_prec + 1) as u8) -> c1p }
-        // 'b' = 98, 'f' = 102 — recognize "bf16"
-        if c0p == 98 { use_bf16 = 1 }
+        u8 c4p = 0; unsafe { *((ev_prec + 4) as u8) -> c4p }
+        u8 c5p = 0; unsafe { *((ev_prec + 5) as u8) -> c5p }
+        // 'b'=98 'f'=102; "bf16_force" → 'b''f''1''6''_''f''o'... so c4p='_'=95, c5p='f'=102
+        if c0p == 98 {
+            if c4p == 95 {
+                if c5p == 102 { use_bf16 = 1 }
+            }
+        }
     }
     if use_bf16 == 1 {
-        print_str("bwd_uv precision: bf16 REQUESTED — 1B.2 ships WMMA kernel + smoke;\n")
-        print_str("  bwd_uv cast plumbing lands in 1B.3.  Continuing with f32 path.\n")
+        print_str("bwd_uv precision: bf16_force (DEVELOPER OVERRIDE — 1B.3 found bf16 wedges at\n")
+        print_str("  real bwd_uv shapes via GFXHUB pagefault; MODE1-reset recoverable but UNSAFE)\n")
     } else {
+        if ev_prec != 0 {
+            u8 c0w = 0; unsafe { *(ev_prec as u8) -> c0w }
+            if c0w == 98 {
+                print_str("bwd_uv precision: bf16 REQUESTED but DISABLED in 1B.3 (kernel wedges\n")
+                print_str("  at bwd_uv shapes — see comment + memory project_batched_gemm_1b3_bf16_disabled).\n")
+                print_str("  Falling back to f32.  Use MLRIFT_BWD_UV_PRECISION=bf16_force to override.\n")
+            }
+        }
         print_str("bwd_uv precision: f32 (default)\n")
     }
 
@@ -688,6 +709,11 @@ fn main() {
     // descriptor table; we use it in same-shape fast-path mode for the dV/dU
     // contractions (1 dispatch per view per shape) instead of 4× gemm_f32_accum.
     u64 fh_ggrp   = load_co("/tmp/gemm_f32_grouped.co",       "gemm_f32_grouped")
+    // ── Task 1B.3: bf16-WMMA grouped .co (Phase 1B.1/1B.2) — opt-in path ───
+    // Loaded alongside the f32 kernel; the bwd_uv code-path picks via the
+    // MLRIFT_BWD_UV_PRECISION env knob.  Same kernarg ABI as fh_ggrp; differs
+    // only in the descriptor's precision field (0 → f32, 1 → bf16-WMMA).
+    u64 fh_bf16_grouped = load_co("/tmp/gemm_bf16_grouped.co", "gemm_bf16_grouped")
     u64 fh_transp = load_co("/tmp/transpose_f32.co",          "transpose_f32")
     u64 fh_rscale = load_co("/tmp/row_scale_f32.co",          "row_scale_f32")
     u64 fh_gbs    = load_co("/tmp/gate_bwd_bs_f32.co",        "gate_bwd_bs_f32")
@@ -1170,11 +1196,21 @@ fn main() {
                     kdv = kdv + 1
                 }
                 u64 tot_dV_slot = alloc(4); unsafe { *(tot_dV_slot as u32) = 0 }
+                // 1B.3: route through bf16-WMMA when MLRIFT_BWD_UV_PRECISION=bf16.
+                // Both kernels share the same descriptor layout + kernarg ABI;
+                // only the `precision` descriptor field (offset 52) and the
+                // kernel file-handle differ.
+                u64 fh_for_buv = fh_ggrp
+                u32 prec_for_buv = 0
+                if use_bf16 == 1 {
+                    fh_for_buv = fh_bf16_grouped
+                    prec_for_buv = 1
+                }
                 build_gemm_grouped_descriptor(d_desc_dV, K,
                     M_dV, N_dV, KK_dV, LdA_dV, LdB_dV, LdC_dV,
-                    Ap_dV, Bp_dV, Cp_dV, Ac_dV, 0, tot_dV_slot)
+                    Ap_dV, Bp_dV, Cp_dV, Ac_dV, prec_for_buv, 0, tot_dV_slot)
                 u32 tot_dV = 0; unsafe { *(tot_dV_slot as u32) -> tot_dV }
-                launch_gemm_grouped(fh_ggrp, d_desc_dV, K, tot_dV, 1, 0, d_cntr_grp)
+                launch_gemm_grouped(fh_for_buv, d_desc_dV, K, tot_dV, 1, prec_for_buv, d_cntr_grp)
                 dealloc(M_dV);   dealloc(N_dV);   dealloc(KK_dV)
                 dealloc(LdA_dV); dealloc(LdB_dV); dealloc(LdC_dV)
                 dealloc(Ap_dV);  dealloc(Bp_dV);  dealloc(Cp_dV)
@@ -1214,11 +1250,12 @@ fn main() {
                     kdu = kdu + 1
                 }
                 u64 tot_dU_slot = alloc(4); unsafe { *(tot_dU_slot as u32) = 0 }
+                // 1B.3: reuse fh_for_buv + prec_for_buv selected for dV above.
                 build_gemm_grouped_descriptor(d_desc_dU, K,
                     M_dU, N_dU, KK_dU, LdA_dU, LdB_dU, LdC_dU,
-                    Ap_dU, Bp_dU, Cp_dU, Ac_dU, 0, tot_dU_slot)
+                    Ap_dU, Bp_dU, Cp_dU, Ac_dU, prec_for_buv, 0, tot_dU_slot)
                 u32 tot_dU = 0; unsafe { *(tot_dU_slot as u32) -> tot_dU }
-                launch_gemm_grouped(fh_ggrp, d_desc_dU, K, tot_dU, 1, 0, d_cntr_grp)
+                launch_gemm_grouped(fh_for_buv, d_desc_dU, K, tot_dU, 1, prec_for_buv, d_cntr_grp)
                 dealloc(M_dU);   dealloc(N_dU);   dealloc(KK_dU)
                 dealloc(LdA_dU); dealloc(LdB_dU); dealloc(LdC_dU)
                 dealloc(Ap_dU);  dealloc(Bp_dU);  dealloc(Cp_dU)
