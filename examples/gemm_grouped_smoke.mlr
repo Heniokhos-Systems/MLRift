@@ -1,15 +1,21 @@
 // gemm_grouped_smoke.mlr — isolated correctness for the grouped GEMM emitter.
 //
-// Phase 1A: skeleton only; real smokes wired in Tasks 1A.3+.  This file
-// currently does NOT dispatch any GPU kernel and does NOT call hipkfd.
-// Subsequent tasks will:
-//   - 1A.3: add fixed-N same-shape grouped dispatch CPU-reference setup.
-//   - 1A.4: drive the new emitter and compare D2H vs CPU triple-loop.
-//   - 1A.5: add mixed-shape group with shape-table.
-//   - 1A.6: byte-equality gate against `gemm_f32_accum` for bwd_uv group.
+// Task 1A.3: persistent-WG visitor + descriptor-load sentinel.  This smoke
+// dispatches /tmp/gemm_f32_grouped.co (built via
+// `./build/mlrc --emit-amdgpu-gemm-f32-grouped-v2=/tmp/gemm_f32_grouped.co`)
+// over a B=2 descriptor where each group's `tile_count=1`, so total_tiles=2.
+//
+// The sentinel kernel body writes the resolved `group_idx` (u32) into the
+// first 4 bytes of each group's C-buffer.  Two persistent-WGs race on the
+// global atomic counter and end up with `{tile_id} == {0, 1}` in some order.
+// We D2H both C[0] values and assert that exactly one is 0 and one is 1.
+//
+// Tasks 1A.4 / 1A.5 / 1A.6 will replace the sentinel body with real LDS-tiled
+// inner GEMM math, b128 + sw-pipeline, and heterogeneous prefix-search.
 //
 // Build:
-//   ./build/mlrc --arch=x86_64 --target=amdgpu-native \
+//   ./build/mlrc --emit-amdgpu-gemm-f32-grouped-v2=/tmp/gemm_f32_grouped.co
+//   ./build/mlrc --target=amdgpu-native \
 //       examples/gemm_grouped_smoke.mlr -o ~/mlrift_bin/wzma_train/gemm_grouped_smoke
 // Run:
 //   ~/mlrift_bin/wzma_train/gemm_grouped_smoke
@@ -19,8 +25,186 @@ import "../std/math_float.mlr"
 import "../std/fmt.mlr"
 import "../std/hip.mlr"
 
+fn die_gpu_smoke(u64 msg, u64 code) {
+    print_str(msg); print_str(" err=")
+    u64 s = fmt_dec(code); print_str(s); dealloc(s); print_str("\n")
+    hipkfd_teardown(); exit(1)
+}
+
+fn load_co_smoke(u64 co_path, u64 fn_name) -> u64 {
+    u64 fd = file_open(co_path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        print_str("Cannot open .co: "); print_str(co_path); print_str("\n")
+        hipkfd_teardown(); exit(1)
+    }
+    u64 sz   = file_size(fd)
+    u64 blob = alloc(sz)
+    file_read(fd, blob, sz)
+    file_close(fd)
+    u64 mod_slot = alloc(8)
+    u32 err = hipModuleLoadData(mod_slot, blob)
+    if err != 0 { die_gpu_smoke("hipModuleLoadData", err) }
+    u64 mod = 0; unsafe { *(mod_slot as u64) -> mod }
+    u64 fh_slot = alloc(8)
+    err = hipModuleGetFunction(fh_slot, mod, fn_name)
+    if err != 0 { die_gpu_smoke("hipModuleGetFunction", err) }
+    u64 fh = 0; unsafe { *(fh_slot as u64) -> fh }
+    dealloc(mod_slot); dealloc(fh_slot)
+    return fh
+}
+
+fn gpu_malloc_smoke(u64 nbytes, u64 tag) -> u64 {
+    u64 slot = alloc(8)
+    u32 err = hipMalloc(slot, nbytes)
+    if err != 0 { die_gpu_smoke(tag, err) }
+    u64 p = 0; unsafe { *(slot as u64) -> p }
+    dealloc(slot)
+    return p
+}
+
 fn main() {
-    print_str("gemm_grouped_smoke - Phase 1A scaffold (no GPU dispatch yet)\n")
-    print_str("  TM=16 TN=16 TK=16, RM=RN=1, block=256, grid=tiles_m*tiles_n (1D)\n")
-    print_str("  Same-shape fast path will be wired in Task 1A.4.\n")
+    print_str("gemm_grouped_smoke (Task 1A.3) — persistent-WG + descriptor sentinel\n")
+
+    // ── Device init ─────────────────────────────────────────────────────────
+    u32 sd_err = hipSetDevice(0)
+    if sd_err != 0 { die_gpu_smoke("hipSetDevice", sd_err) }
+
+    // ── Load grouped sentinel .co ──────────────────────────────────────────
+    u64 fh = load_co_smoke("/tmp/gemm_f32_grouped.co", "gemm_f32_grouped")
+
+    // ── Allocate VRAM:
+    //   2 × 4-byte C buffers (one per group),
+    //   1 × 176-byte descriptor table (2 × 88 bytes),
+    //   1 × 4-byte global atomic counter.
+    u64 d_c0      = gpu_malloc_smoke(4,   "d_c0")
+    u64 d_c1      = gpu_malloc_smoke(4,   "d_c1")
+    u64 d_desc    = gpu_malloc_smoke(176, "d_desc")
+    u64 d_counter = gpu_malloc_smoke(4,   "d_counter")
+
+    // Pre-zero C buffers so any residual data is visible vs the sentinel
+    // write (sentinel writes group_idx ∈ {0, 1}; pre-zero → if no write
+    // landed, we'd see 0/0 instead of {0, 1}).  Note: c0 must NOT be 0
+    // by default — set to a sentinel to distinguish "no write" from
+    // "wrote group_idx=0".  Use 0xDEADBEEF.
+    u64 zinit = alloc(4); unsafe { *(zinit as u32) = 0xDEADBEEF }
+    u32 zerr0 = hipMemcpy(d_c0, zinit, 4, 1)
+    if zerr0 != 0 { die_gpu_smoke("H2D c0 init", zerr0) }
+    u32 zerr1 = hipMemcpy(d_c1, zinit, 4, 1)
+    if zerr1 != 0 { die_gpu_smoke("H2D c1 init", zerr1) }
+    dealloc(zinit)
+
+    // ── Build the B=2 descriptor on the host, H2D one copy ─────────────────
+    // Each group: M=1, N=1, K=0 (trivial dimensions; sentinel body doesn't
+    // touch A/B at all).  tile_count = ceil(1/16) * ceil(1/16) = 1 each;
+    // tile_prefix = {0, 1}; total_tiles = 2.
+    u64 host_desc = alloc(176)
+    // Zero everything first.
+    u64 zi = 0
+    while zi < 176 {
+        u64 zp = host_desc + zi
+        u8 zb = 0
+        unsafe { *(zp as u8) = zb }
+        zi = zi + 1
+    }
+    // Group 0 at offset 0:
+    //   M=1 N=1 K=0  lda=1 ldb=1 ldc=1
+    //   A_ptr=0 B_ptr=0 C_ptr=d_c0
+    //   acc_flag=0 precision=0 splitK=1 tile_count=1 tile_prefix=0
+    unsafe { *((host_desc +  0) as u32) = 1 }   // M
+    unsafe { *((host_desc +  4) as u32) = 1 }   // N
+    unsafe { *((host_desc +  8) as u32) = 0 }   // K
+    unsafe { *((host_desc + 12) as u32) = 1 }   // lda
+    unsafe { *((host_desc + 16) as u32) = 1 }   // ldb
+    unsafe { *((host_desc + 20) as u32) = 1 }   // ldc
+    unsafe { *((host_desc + 24) as u64) = 0 }   // A_ptr
+    unsafe { *((host_desc + 32) as u64) = 0 }   // B_ptr
+    unsafe { *((host_desc + 40) as u64) = d_c0 }   // C_ptr
+    unsafe { *((host_desc + 48) as u32) = 0 }   // acc_flag
+    unsafe { *((host_desc + 52) as u32) = 0 }   // precision
+    unsafe { *((host_desc + 56) as u32) = 1 }   // splitK
+    unsafe { *((host_desc + 60) as u32) = 1 }   // tile_count
+    unsafe { *((host_desc + 64) as u32) = 0 }   // tile_prefix
+    // Group 1 at offset 88: same shape, C_ptr=d_c1, tile_prefix=1.
+    unsafe { *((host_desc +  88) as u32) = 1 }   // M
+    unsafe { *((host_desc +  92) as u32) = 1 }   // N
+    unsafe { *((host_desc +  96) as u32) = 0 }   // K
+    unsafe { *((host_desc + 100) as u32) = 1 }   // lda
+    unsafe { *((host_desc + 104) as u32) = 1 }   // ldb
+    unsafe { *((host_desc + 108) as u32) = 1 }   // ldc
+    unsafe { *((host_desc + 112) as u64) = 0 }   // A_ptr
+    unsafe { *((host_desc + 120) as u64) = 0 }   // B_ptr
+    unsafe { *((host_desc + 128) as u64) = d_c1 }   // C_ptr
+    unsafe { *((host_desc + 136) as u32) = 0 }   // acc_flag
+    unsafe { *((host_desc + 140) as u32) = 0 }   // precision
+    unsafe { *((host_desc + 144) as u32) = 1 }   // splitK
+    unsafe { *((host_desc + 148) as u32) = 1 }   // tile_count
+    unsafe { *((host_desc + 152) as u32) = 1 }   // tile_prefix
+
+    u32 derr = hipMemcpy(d_desc, host_desc, 176, 1)
+    if derr != 0 { die_gpu_smoke("H2D desc", derr) }
+    dealloc(host_desc)
+
+    // ── Inline launch (parallels examples/wzma_train_md.mlr launch_gemm_grouped) ──
+    // 1) Zero the persistent-WG counter.
+    u64 zslot = alloc(4); unsafe { *(zslot as u32) = 0 }
+    u32 cerr = hipMemcpy(d_counter, zslot, 4, 1)
+    if cerr != 0 { die_gpu_smoke("H2D counter zero", cerr) }
+    dealloc(zslot)
+    // 2) Kernarg pointer table (6 slots × 8 bytes = 48 bytes).
+    u64 p0 = alloc(8); unsafe { *(p0 as u64) = d_desc }
+    u64 p1 = alloc(8); unsafe { *(p1 as u64) = 2 }            // b_batch = 2
+    u64 p2 = alloc(8); unsafe { *(p2 as u64) = 2 }            // total_tiles = 2
+    u64 p3 = alloc(8); unsafe { *(p3 as u64) = 1 }            // fast_path_flag = 1
+    u64 p4 = alloc(8); unsafe { *(p4 as u64) = 0 }            // precision_mode = 0
+    u64 p5 = alloc(8); unsafe { *(p5 as u64) = d_counter }
+    u64 kp = alloc(6 * 8)
+    unsafe { *(kp        as u64) = p0 }
+    unsafe { *((kp +  8) as u64) = p1 }
+    unsafe { *((kp + 16) as u64) = p2 }
+    unsafe { *((kp + 24) as u64) = p3 }
+    unsafe { *((kp + 32) as u64) = p4 }
+    unsafe { *((kp + 40) as u64) = p5 }
+    // 3) Dispatch: grid=(240,1,1), block=(256,1,1) — matches launch_gemm_grouped.
+    //    240 WGs is full gfx1100 occupancy; only 2 of them do useful work
+    //    (one per group), the other 238 hit the s10 >= total_tiles exit.
+    u32 lerr = hipModuleLaunchKernel(fh, 240, 1, 1, 256, 1, 1,
+                                     0, 0, kp, 0)
+    if lerr != 0 { die_gpu_smoke("launch gemm_f32_grouped", lerr) }
+    u32 serr = hipDeviceSynchronize()
+    if serr != 0 { die_gpu_smoke("hipDeviceSynchronize", serr) }
+    dealloc(p0); dealloc(p1); dealloc(p2); dealloc(p3); dealloc(p4); dealloc(p5); dealloc(kp)
+
+    // ── D2H readback ────────────────────────────────────────────────────────
+    u64 h_c0 = alloc(4)
+    u64 h_c1 = alloc(4)
+    u32 r0 = hipMemcpy(h_c0, d_c0, 4, 2)
+    if r0 != 0 { die_gpu_smoke("D2H c0", r0) }
+    u32 r1 = hipMemcpy(h_c1, d_c1, 4, 2)
+    if r1 != 0 { die_gpu_smoke("D2H c1", r1) }
+    u32 c0 = 0; unsafe { *(h_c0 as u32) -> c0 }
+    u32 c1 = 0; unsafe { *(h_c1 as u32) -> c1 }
+
+    print_str("  c0=")
+    u64 c0_s = fmt_dec(c0); print_str(c0_s); dealloc(c0_s)
+    print_str("  c1=")
+    u64 c1_s = fmt_dec(c1); print_str(c1_s); dealloc(c1_s)
+    print_str("\n")
+
+    // ── Assertion: {c0, c1} == {0, 1} in some order ────────────────────────
+    u32 ok = 0
+    if c0 == 0 {
+        if c1 == 1 { ok = 1 }
+    } else {
+        if c0 == 1 {
+            if c1 == 0 { ok = 1 }
+        }
+    }
+    dealloc(h_c0); dealloc(h_c1)
+
+    if ok == 0 {
+        print_str("FAIL: expected {0,1} in some order, got c0/c1 above\n")
+        hipkfd_teardown(); exit(1)
+    }
+    print_str("PASS: persistent-WG visitor + descriptor load sentinel OK\n")
+    hipkfd_teardown()
 }

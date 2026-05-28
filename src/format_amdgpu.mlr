@@ -8767,6 +8767,298 @@ fn emit_amdgpu_gemm_f32_lds_blob(uint64 out_path) -> uint64 {
 }
 
 
+// ─── 1A.3: gemm_f32_grouped sentinel — persistent-WG visitor + descriptor load.
+//
+// Goal of this sentinel emitter: prove the persistent-WG dispatch + atomic-counter
+// visitor + per-group descriptor load wiring works END-TO-END before wiring real
+// GEMM math in 1A.4.  Each resolved (group_idx, local_m, local_n) tile body simply
+// stores `group_idx` (u32) into the first 4 bytes of that group's C-buffer.
+// Verifies: kernarg load, persistent dispatch, atomic_inc+broadcast, descriptor
+// table address arithmetic (×88), global_store_b32.
+//
+// Kernarg ABI (matches launch_gemm_grouped in examples/wzma_train_md.mlr; the
+// KFD shim writes one value per 8-byte slot regardless of declared arg size):
+//   slot 0  off  0  u64   d_desc            → s[2:3]
+//   slot 1  off  8  u32   b_batch           → s4 (unused in sentinel)
+//   slot 2  off 16  u32   total_tiles       → s5
+//   slot 3  off 24  u32   fast_path_flag    → unused in sentinel
+//   slot 4  off 32  u32   precision_mode    → unused in sentinel
+//   slot 5  off 40  u64   d_global_counter  → s[6:7]
+//
+// Register conventions in this emitter:
+//   s[0:1]   = kernarg_segment_ptr (system-set; USER_SGPR=15)
+//   s[2:3]   = d_desc base
+//   s4       = b_batch (loaded but not consumed by sentinel)
+//   s5       = total_tiles
+//   s[6:7]   = d_global_counter
+//   s8       = saved_exec scratch (atomic block + store block, reused)
+//   s10      = tile_id / group_idx (uniform across the WG after LDS broadcast)
+//   s[12:13] = scratch for desc-offset arithmetic
+//   s[14:15] = per-group descriptor address (= d_desc + group_idx*88)
+//   s[16:17] = per-group C_ptr (loaded from descriptor[40..47])
+//   v0       = thread_id_x (system-set, lane id within WG)
+//   v1       = scratch (vaddr offset = 0 for global ops)
+//   v2       = atomic value (vdata=1 on input, prev counter on output) / scratch
+//   v3       = group_idx as vgpr for the global_store
+//
+// LDS layout (16 KiB reserved — most stays unused at sentinel; 1A.4+ panels will
+// occupy it).  Bytes [0..3] hold the wave-0-broadcast tile_id slot:
+//   LDS[0..3] = tile_id (written by lane-0-of-wave-0 after atomic; read by all
+//               waves after s_barrier so all waves see the same group_idx).
+//
+// Lane-0-of-wave-0: v0 == 0 holds only in wave 0 (in waves 1..7, the smallest
+// v0 is 32, 64, …, 224 respectively).  s_and_saveexec restricts EXEC to that
+// single lane for the atomic; s_or_b32 restores after.  s_barrier then makes
+// all 8 waves observe LDS[0]'s post-store value.
+fn _emit_gemm_f32_grouped_body(uint64 args_desc) {
+    asm_init()
+
+    // ── 1. Kernarg load.  Three SMEM loads at offsets 0 / 16 / 40.
+    //   s_load_b64 s[2:3], s[0:1], 0     ; d_desc       → sdata_pair=1, sbase=0
+    //   s_load_b32 s4,    s[0:1], 8      ; b_batch      → sdata_pair=2 (s4/2)
+    //   s_load_b32 s5,    s[0:1], 16     ; total_tiles  → sdata_pair=2 isn't right
+    //     SMEM b32 must dst an even-sgpr; sdata_pair=N → dest = s[2N].  For s4
+    //     pair=2, for s6 pair=3.  total_tiles to s5 isn't aligned; bump to:
+    //   s_load_b32 s5  uses sdata_pair=2 with bit 0 set in the 6-bit field?  No
+    //     — gfx11 SMEM b32 ALWAYS lands at even sgpr.  Workaround: load total_tiles
+    //     to s6 (pair=3), and load b_batch into s4 separately.  But we don't need
+    //     b_batch at all in the sentinel, so skip it: only load total_tiles → s6
+    //     and d_global_counter → s[8:9] (pair=4).
+    //   Final plan (and matches the s10/scratch budget above):
+    //     s_load_b64 s[2:3],  s[0:1],  0   (d_desc)
+    //     s_load_b32 s6,      s[0:1], 16   (total_tiles)
+    //     s_load_b64 s[8:9],  s[0:1], 40   (d_global_counter)  -- but s8 is used
+    //       as the saveexec scratch.  Shift counter to s[6:7] and total_tiles
+    //       to s4 (sdata_pair=2).
+    //   Adjusted final register plan:
+    //     s_load_b64 s[2:3],  s[0:1],  0    sdata_pair=1, sbase=0, off=0   (d_desc)
+    //     s_load_b32 s4,      s[0:1], 16    sdata_pair=2, sbase=0, off=16  (total_tiles)
+    //     s_load_b64 s[6:7],  s[0:1], 40    sdata_pair=3, sbase=0, off=40  (d_counter)
+    asm_s_load_b64(1, 0)                              // s[2:3] = d_desc (off=0)
+    asm_s_load_b32(2, 0, 16)                          // s4 = total_tiles
+    asm_s_load_b64_off(3, 0, 40)                      // s[6:7] = d_global_counter
+    asm_s_waitcnt_lgkmcnt_zero()                       // wait SMEM
+
+    // ── 2. Persistent-WG visitor top.  Capture loop_top dword index for the
+    //    back-branch at the end of the body.
+    uint64 loop_top_idx = asm_text_len / 4
+
+    // ── 2a. Lane-0-of-wave-0 atomic_inc on d_global_counter.
+    //
+    // OOB-clamp pad-lane guard: initialize v1 (vaddr offset) and v2 (atomic
+    // addend) in ALL 256 lanes BEFORE masking EXEC to lane 0.  gfx11's
+    // address-coalescing unit computes per-lane addresses for inactive lanes
+    // too; if v1 is left uninitialized in lanes 1..255 it carries stale data
+    // → garbage VMEM address → page fault → MES wedge.
+    // Ref: feedback_oob_address_pad_lane_wedge.md  ("clamp the address, not
+    // just gate the store").
+    //   v_mov_b32 v1, 0       ; vaddr=0 in every lane (global op uses saddr+0)
+    asm_v_mov_b32_inline_u(1, 0)
+    //   v_mov_b32 v2, 1       ; addend value in every lane (lane-0 will use it,
+    //                           inactive lanes contribute nothing to the atomic)
+    asm_v_mov_b32_inline_u(2, 1)
+    //   s_delay_alu instid0(VALU_DEP_1) — honor gfx11 VALU→VMEM hazard before
+    //   the upcoming global_atomic_add reads v1/v2.
+    asm_s_delay_alu(0x01)
+
+    //   v_cmp_eq_u32_e32 vcc_lo, 0, v0    ; mask: lanes where tid==0 (only wave 0
+    //                                       lane 0 matches in an 8-wave WG)
+    asm_v_cmp_eq_u32_imm_vgpr(0, 0)
+    //   s_and_saveexec_b32 s8, vcc_lo     ; s8 = old exec; exec &= vcc_lo
+    asm_s_and_saveexec_b32_vcc_lo(8)
+    //   s_cbranch_execz +N → exit_atomic  (skips atomic for waves 1..7)
+    //   We patch the simm16 once we know how many dwords the atomic body is.
+    uint64 atomic_skip_idx = asm_text_len / 4
+    asm_s_cbranch_execz(0)                             // patched below
+
+    //   ── lane-0 atomic path (v1/v2 already initialized above in ALL lanes) ──
+    //   global_atomic_add_u32 v2, v1, v2, s[6:7] glc   ; v2 ← *(s[6:7]); *(s[6:7]) += 1
+    //   word1 = 0xDCD64000 (op=0x36 atomic_add_u32, GLC=1 ⇒ bit14)
+    //   word2 = (vdst<<24)|(saddr<<16)|(vdata<<8)|vaddr = (2<<24)|(6<<16)|(2<<8)|1
+    asm_u32(0xDCD64000)
+    asm_u32(0x02060201)
+    //   s_waitcnt vmcnt(0)
+    asm_s_waitcnt_vmcnt_zero()
+    //   buffer_gl0_inv  (so subsequent reads — none here — see latest data)
+    asm_buffer_gl0_inv()
+    //   v_readfirstlane_b32 s10, v2   ; broadcast lane-0 result to scalar
+    asm_v_readfirstlane_b32(10, 2)
+    //   ds_store_b32 v1, v2, offset:0    ; LDS[0] = tile_id   (vaddr=v1=0; vdata=v2)
+    asm_u32(0xD8340000)
+    asm_u32(0x00000201)                                // (vdata=2)<<8 | vaddr=1
+
+    //   Patch the cbranch_execz forward simm16: target dword is current PC +1.
+    //   simm = current_dword - (atomic_skip_idx + 1).
+    uint64 after_atomic_idx = asm_text_len / 4
+    uint64 atomic_skip_simm = after_atomic_idx - atomic_skip_idx - 1
+    asm_patch_u32(atomic_skip_idx,
+                  0xBFA50000 | (atomic_skip_simm & 0xFFFF))   // s_cbranch_execz (op 0x25)
+
+    // ── 2b. Restore EXEC for all 8 waves, then s_barrier so every wave sees the
+    //    LDS[0] write done by wave-0 lane-0.
+    //   s_or_b32 exec_lo, exec_lo, s8       SOP2 op=0x0C → 0x8C prefix
+    asm_u32(0x8C7E087E)
+    //   s_barrier (gfx11 op 0x3D / gfx10 op 0x0A)
+    asm_u32_arch(0xBFBD0000, 0xBF8A0000)
+    //   ds_load_b32 v2, v1, offset:0   ; all 256 lanes read LDS[0] into v2
+    //   word1 = 0xD8D80000, word2 = (vdst<<24)|vaddr = (2<<24)|1
+    asm_u32(0xD8D80000)
+    asm_u32(0x02000001)
+    //   s_waitcnt lgkmcnt(0)
+    asm_s_waitcnt_lgkmcnt_zero()
+    //   v_readfirstlane_b32 s10, v2   ; uniform now (every wave has same LDS[0])
+    asm_v_readfirstlane_b32(10, 2)
+
+    // ── 3. Exit condition: if (s10 >= s4 total_tiles) → s_endpgm.
+    //   s_cmp_ge_u32 s10, s4       SOPC op=0x09 → 0xBF prefix
+    asm_u32(0xBF09040A)
+    //   s_cbranch_scc1 .Lend (forward, patched below)
+    uint64 cbranch_end_idx = asm_text_len / 4
+    asm_u32_arch(0xBFA20000, 0xBF850000)               // s_cbranch_scc1 patched
+
+    // ── 4. Sentinel body: derive group_idx, load this group's C_ptr from the
+    //    descriptor table, store group_idx into C[0].
+    //
+    // 4a. group_idx = tile_id (sentinel uses tile_count=1 per group, so
+    //     tile_id == group_idx directly).  s10 already holds it.
+    //
+    // 4b. desc_offset_bytes = s10 * 88 = s10*64 + s10*16 + s10*8.
+    //     Use s12 / s13 as scratch.
+    //       s_lshl_b32 s12, s10, 6   ; s12 = s10*64
+    //       s_lshl_b32 s13, s10, 4   ; s13 = s10*16
+    //       s_add_u32  s12, s12, s13 ; s12 = s10*80
+    //       s_lshl_b32 s13, s10, 3   ; s13 = s10*8
+    //       s_add_u32  s12, s12, s13 ; s12 = s10*88
+    //   SOP2 prefix s_lshl_b32 = 0x84; src1=0x80+shift, src0=ssrc, sdst=field.
+    //   s_lshl_b32 s12, s10, 6 → (0x84<<24)|(12<<16)|(0x86<<8)|10 = 0x840C860A
+    asm_u32(0x840C860A)
+    //   s_lshl_b32 s13, s10, 4 → (0x84<<24)|(13<<16)|(0x84<<8)|10 = 0x840D840A
+    asm_u32(0x840D840A)
+    //   s_add_u32 s12, s12, s13 → SOP2 op=0x00 (0x80 prefix); (0x80<<24)|(12<<16)|(13<<8)|12
+    asm_u32(0x800C0D0C)
+    //   s_lshl_b32 s13, s10, 3 → (0x84<<24)|(13<<16)|(0x83<<8)|10 = 0x840D830A
+    asm_u32(0x840D830A)
+    //   s_add_u32 s12, s12, s13
+    asm_u32(0x800C0D0C)
+
+    // 4c. desc_addr (s[14:15]) = d_desc (s[2:3]) + desc_offset (s12, zero-extended).
+    //       s_add_u32  s14, s2, s12     ; low
+    //       s_addc_u32 s15, s3, 0       ; high (with carry from above)
+    //   s_add_u32: (0x80<<24)|(14<<16)|(12<<8)|2 = 0x800E0C02
+    asm_u32(0x800E0C02)
+    //   s_addc_u32: SOP2 op=0x04 → 0x82 prefix; (0x82<<24)|(15<<16)|(0x80<<8)|3
+    //     = 0x820F8003   (src1=0x80 = inline-const 0).  Adds SCC carry from
+    //     the preceding s_add_u32, giving full 64-bit base+offset arithmetic.
+    asm_u32(0x820F8003)
+
+    // 4d. SMEM load: s[16:17] = *(desc_addr + 40)  — C_ptr lives at offset 40.
+    //   s_load_b64 sdata_pair=8 (s16/2), sbase_pair=7 (s14/2), imm_off=40.
+    asm_s_load_b64_off(8, 7, 40)
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // ── 5. Lane-0-of-wave-0 store of group_idx (s10) into C_ptr[0..3].
+    //   Lane-0 mask again — keeps the store single-issue.
+    //
+    // OOB-clamp pad-lane guard: hoist v_mov_b32 v3, s10 (data) and
+    // v_mov_b32 v1, 0 (vaddr offset) OUT of the lane-0 EXEC mask so all 256
+    // lanes have safe values before global_store_b32 fires.  gfx11 coalescer
+    // reads inactive lanes' v1 for address computation — uninitialized v1
+    // would page-fault.
+    //   v_mov_b32 v3, s10     ; data to store = group_idx (every lane)
+    //   VOP1 v_mov_b32 vdst, src0 where src0=SGPR_N encodes as N (0..127).
+    asm_v_mov_b32(3, 10)
+    //   v_mov_b32 v1, 0       ; vaddr=0 (every lane)
+    asm_v_mov_b32_inline_u(1, 0)
+    //   s_delay_alu instid0(VALU_DEP_1) — VALU→VMEM hazard guard before store.
+    asm_s_delay_alu(0x01)
+
+    asm_v_cmp_eq_u32_imm_vgpr(0, 0)
+    asm_s_and_saveexec_b32_vcc_lo(8)                   // reuse s8 for saved exec
+    uint64 store_skip_idx = asm_text_len / 4
+    asm_s_cbranch_execz(0)                             // patched below
+
+    //   (v3/v1 already initialized above in ALL lanes; only lane-0 EXECUTES)
+    //   global_store_b32 v1, v3, s[16:17]   ; *(s[16:17] + v1) = v3
+    asm_global_store_b32(1, 3, 16)
+    //   s_waitcnt_vscnt null, 0   ; drain the store
+    asm_s_waitcnt_vscnt_zero()
+
+    // Patch the store-skip cbranch.
+    uint64 after_store_idx = asm_text_len / 4
+    uint64 store_skip_simm = after_store_idx - store_skip_idx - 1
+    asm_patch_u32(store_skip_idx,
+                  0xBFA50000 | (store_skip_simm & 0xFFFF))
+
+    //   s_or_b32 exec_lo, exec_lo, s8   ; restore exec for all waves
+    asm_u32(0x8C7E087E)
+
+    // ── 6. Back-branch to loop_top: s_branch with negative simm16.
+    //   PC after this branch = current+1; target = loop_top_idx.
+    uint64 s_branch_at = asm_text_len / 4
+    uint64 back_simm   = loop_top_idx - (s_branch_at + 1)
+    asm_s_branch(back_simm & 0xFFFF)
+
+    // ── 7. .Lend — patch the forward cbranch_scc1 simm16 here.
+    //   s_endpgm
+    asm_s_endpgm()
+
+    //   simm = end_dword - (cbranch_end_idx + 1).  end_dword = the s_endpgm.
+    uint64 end_idx = asm_text_len / 4 - 1               // dword index of s_endpgm
+    uint64 sccbr_top = 0xBFA20000
+    if _is_gfx10() != 0 { sccbr_top = 0xBF850000 }
+    uint64 fwd_simm = end_idx - (cbranch_end_idx + 1)
+    asm_patch_u32(cbranch_end_idx, sccbr_top | (fwd_simm & 0xFFFF))
+
+    // ── 8. args descriptor (6 args; matches launch_gemm_grouped kernarg ABI).
+    //   All shim slots are 8 bytes wide; declare sizes accordingly so the
+    //   AMDHSA metadata matches the on-wire kernarg blob.
+    uint64 a0  = args_desc + 0;   unsafe { *(a0  as uint64) = 8 }
+    uint64 a1  = args_desc + 8;   unsafe { *(a1  as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a2  = args_desc + 16;  unsafe { *(a2  as uint64) = 8 }
+    uint64 a3  = args_desc + 24;  unsafe { *(a3  as uint64) = AMD_ARG_KIND_BY_VALUE }
+    uint64 a4  = args_desc + 32;  unsafe { *(a4  as uint64) = 8 }
+    uint64 a5  = args_desc + 40;  unsafe { *(a5  as uint64) = AMD_ARG_KIND_BY_VALUE }
+    uint64 a6  = args_desc + 48;  unsafe { *(a6  as uint64) = 8 }
+    uint64 a7  = args_desc + 56;  unsafe { *(a7  as uint64) = AMD_ARG_KIND_BY_VALUE }
+    uint64 a8  = args_desc + 64;  unsafe { *(a8  as uint64) = 8 }
+    uint64 a9  = args_desc + 72;  unsafe { *(a9  as uint64) = AMD_ARG_KIND_BY_VALUE }
+    uint64 a10 = args_desc + 80;  unsafe { *(a10 as uint64) = 8 }
+    uint64 a11 = args_desc + 88;  unsafe { *(a11 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+}
+
+@export
+fn emit_amdgpu_gemm_f32_grouped_blob(uint64 out_path) -> uint64 {
+    uint64[12] args_desc
+    _emit_gemm_f32_grouped_body(args_desc)
+
+    // KD plumbing — matches production module-emit values for f32 GEMMs on
+    // gfx1100 (rsrc1=0xE0AF0001 enables FP32 denormal handling + 1 user-VGPR;
+    // rsrc2=0x9E sets USER_SGPR=15 with WG_ID_X in s15; props=0x0408 selects
+    // KERNARG_SEGMENT_PTR + WAVEFRONT_SIZE32).  LDS=16384 budgets for the
+    // 64×16 A/B double-buffered panels Task 1A.4 will land — sentinel only
+    // touches LDS[0..3] for the tile_id broadcast slot.
+    //
+    // n_args=6, kernarg_size=48 (six 8-byte shim slots).  sgpr_count=18,
+    // vgpr_count=4 — sized to cover the register footprint above with a
+    // small safety margin (every emitted SGPR is ≤17, every VGPR ≤3).
+    uint64 size = emit_amdgpu_code_object_lds("gemm_f32_grouped", 16,
+                                               asm_text_buf, asm_text_len,
+                                               48, 8, 18, 4,
+                                               0xE0AF0001, 0x0000009E, 0x00000010, 0x0408,
+                                               args_desc, 6,
+                                               16384)
+
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_gemm_f32_grouped_blob: cannot open output\n", 54)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
+
 
 // LLM Phase A milestone 4 — gemm f16 storage, f32 accum, native-emit.
 // Identical structure to N3 (16x16 LDS-tiled, 2-D dispatch) except:
