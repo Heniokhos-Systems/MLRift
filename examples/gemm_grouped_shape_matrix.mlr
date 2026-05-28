@@ -1,0 +1,560 @@
+// gemm_grouped_shape_matrix.mlr — Task 1A.8 shape coverage matrix harness.
+//
+// Drives the grouped GEMM emitter (`/tmp/gemm_f32_grouped.co` —
+// `gemm_f32_grouped`) over 50 (B, M, N, K, mode) combinations in a SINGLE
+// process to catch shape-edge bugs that the targeted 1A.4–1A.7 smokes can't
+// reach.  Gate per row: max-abs vs CPU f32 reference ≤ 1e-5 (FMA-vs-CPU
+// floor established by 1A.4's smoke; do NOT downgrade if rows fail —
+// caller exits nonzero and the gate-runner reports BLOCKED).
+//
+// Matrix:
+//   B      ∈ {1, 2, 4, 8, 16}                              (5)
+//   shape  ∈ {(32,384,128), (384,32,128), (64,64,2048),
+//             (128,128,128), (256,256,256)}                (5 base (M,N,K))
+//   mode   ∈ {homogeneous, heterogeneous}                  (2)
+//                                                          → 50 rows
+//
+// For homogeneous mode all B groups have the same (M, N, K); fast_path_flag=1.
+// For heterogeneous mode the first half of groups gets (M, N, K) and the
+// second half gets (N, M, K) (transposed shape — actually different); for
+// B=1 there is only one group so heterogeneous == homogeneous (labelled
+// "heterogeneous" in the CSV for completeness).  fast_path_flag=0 in
+// heterogeneous mode whenever B≥2; B=1 het still uses fast_path_flag=0 so
+// the prefix-search visitor is exercised even at the singleton boundary.
+//
+// CSV (written to /home/pantelis/mlrift_bin/wzma_train/grouped_shape_matrix.csv):
+//   B,M,N,K,mode,max_abs,total_tiles,ms_min_of_3
+//
+// Per row: 3 dispatches back-to-back; ms_min_of_3 records the min ms over
+// the 3 trials.  CPU reference + comparison runs ONCE (after the first
+// dispatch) — re-running it 3× would dominate harness wall-time without
+// adding coverage.  All 3 dispatches go through hipDeviceSynchronize to
+// order the counter-zero copy (1A.7 finding: inter-dispatch ordering bug).
+//
+// Build:
+//   ./build/mlrc --emit-amdgpu-gemm-f32-grouped-v2=/tmp/gemm_f32_grouped.co
+//   ./build/mlrc --target=amdgpu-native \
+//       examples/gemm_grouped_shape_matrix.mlr \
+//       -o /home/pantelis/mlrift_bin/wzma_train/gemm_grouped_shape_matrix
+// Run:
+//   /home/pantelis/mlrift_bin/wzma_train/gemm_grouped_shape_matrix
+
+import "../std/train.mlr"
+import "../std/math_float.mlr"
+import "../std/fmt.mlr"
+import "../std/hip.mlr"
+import "../std/time.mlr"
+
+// ─── Common helpers (parallel gemm_grouped_smoke.mlr) ─────────────────────
+
+fn die_gpu_mat(u64 msg, u64 code) {
+    print_str(msg); print_str(" err=")
+    u64 s = fmt_dec(code); print_str(s); dealloc(s); print_str("\n")
+    hipkfd_teardown(); exit(1)
+}
+
+fn load_co_mat(u64 co_path, u64 fn_name) -> u64 {
+    u64 fd = file_open(co_path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        print_str("Cannot open .co: "); print_str(co_path); print_str("\n")
+        hipkfd_teardown(); exit(1)
+    }
+    u64 sz   = file_size(fd)
+    u64 blob = alloc(sz)
+    file_read(fd, blob, sz)
+    file_close(fd)
+    u64 mod_slot = alloc(8)
+    u32 err = hipModuleLoadData(mod_slot, blob)
+    if err != 0 { die_gpu_mat("hipModuleLoadData", err) }
+    u64 mod = 0; unsafe { *(mod_slot as u64) -> mod }
+    u64 fh_slot = alloc(8)
+    err = hipModuleGetFunction(fh_slot, mod, fn_name)
+    if err != 0 { die_gpu_mat("hipModuleGetFunction", err) }
+    u64 fh = 0; unsafe { *(fh_slot as u64) -> fh }
+    dealloc(mod_slot); dealloc(fh_slot)
+    return fh
+}
+
+fn gpu_malloc_mat(u64 nbytes, u64 tag) -> u64 {
+    u64 slot = alloc(8)
+    u32 err = hipMalloc(slot, nbytes)
+    if err != 0 { die_gpu_mat(tag, err) }
+    u64 p = 0; unsafe { *(slot as u64) -> p }
+    dealloc(slot)
+    return p
+}
+
+fn gpu_free_mat(u64 p) {
+    if p != 0 { hipFree(p) }
+}
+
+// Deterministic A/B fill (per-group salt → groups produce distinct C).
+fn fill_matrix_mat(u64 host, u32 rows, u32 cols, u32 salt) {
+    u32 i = 0
+    while i < rows {
+        u32 j = 0
+        while j < cols {
+            u64 mix64 = i * 31 + j * 17 + salt + 7
+            u64 modv  = mix64 - (mix64 / 100) * 100
+            f64 vd    = int_to_f64(modv) * 0.01
+            f32 v     = f64_to_f32(vd)
+            u64 p     = host + (i * cols + j) * 4
+            unsafe { *(p as f32) = v }
+            j = j + 1
+        }
+        i = i + 1
+    }
+}
+
+// CPU reference: C[M,N] = A[M,K] @ B[K,N], row-major, ijk loop.
+fn cpu_gemm_ref_mat(u64 a_host, u64 b_host, u64 c_host,
+                    u32 m, u32 n, u32 k,
+                    u32 lda, u32 ldb, u32 ldc) {
+    u32 i = 0
+    while i < m {
+        u32 j = 0
+        while j < n {
+            f32 sum = 0.0f
+            u32 kk = 0
+            while kk < k {
+                u64 ap = a_host + (i * lda + kk) * 4
+                u64 bp = b_host + (kk * ldb + j) * 4
+                f32 a  = 0.0f; unsafe { *(ap as f32) -> a }
+                f32 b  = 0.0f; unsafe { *(bp as f32) -> b }
+                sum = sum + a * b
+                kk = kk + 1
+            }
+            u64 cp = c_host + (i * ldc + j) * 4
+            unsafe { *(cp as f32) = sum }
+            j = j + 1
+        }
+        i = i + 1
+    }
+}
+
+// Max-abs diff returned as both an f32 AND a bit-classify u32.  Caller
+// uses the bits to detect NaN / Inf (see fmt_f32_safe below).
+fn max_abs_diff_f32_mat(u64 ref_buf, u64 got_buf, u32 n_elem) -> f32 {
+    f32 max_abs = 0.0f
+    u32 i = 0
+    while i < n_elem {
+        u64 rp = ref_buf + i * 4
+        u64 gp = got_buf + i * 4
+        f32 r  = 0.0f; unsafe { *(rp as f32) -> r }
+        f32 g  = 0.0f; unsafe { *(gp as f32) -> g }
+        f32 d  = g - r
+        if d < 0.0f { d = 0.0f - d }
+        if d > max_abs { max_abs = d }
+        i = i + 1
+    }
+    return max_abs
+}
+
+// NaN/Inf-safe formatter.  `x != x` doesn't detect NaN under MLRift's
+// fcmp semantics ([[fcmp-ne-nan-bug]] memory), so bit-classify via store+
+// reload as u32 — gives the IEEE-754 layout regardless of NaN payload.
+//
+// Returns a freshly-alloc'd C-string:  "NaN" | "inf" | "-inf" | "<decimal>"
+// Caller must dealloc.
+fn fmt_f32_safe(f32 val) -> u64 {
+    u64 slot = alloc(4)
+    unsafe { *(slot as f32) = val }
+    u32 bits = 0; unsafe { *(slot as u32) -> bits }
+    dealloc(slot)
+    u32 exp_field = (bits >> 23) & 0xFF
+    u32 mant      = bits & 0x7FFFFF
+    if exp_field == 0xFF {
+        if mant != 0 {
+            // NaN
+            u64 r = alloc(4); store8(r, 78); store8(r + 1, 97)
+            store8(r + 2, 78); store8(r + 3, 0); return r
+        }
+        u32 sign = bits >> 31
+        if sign != 0 {
+            u64 r = alloc(5); store8(r, 45); store8(r + 1, 105)
+            store8(r + 2, 110); store8(r + 3, 102); store8(r + 4, 0); return r
+        }
+        u64 r = alloc(4); store8(r, 105); store8(r + 1, 110)
+        store8(r + 2, 102); store8(r + 3, 0); return r
+    }
+    // Finite — fmt_f32 with 7 decimals is safe.
+    return fmt_f32(val, 7)
+}
+
+// ms helper (ns → ms with f32 precision).
+fn ms_of_mat(u64 ns) -> f32 { return f64_to_f32(int_to_f64(ns) / 1000000.0) }
+
+// Bytes append helper: write a C-string (null-terminated) to fd.
+fn fd_write_str(u64 fd, u64 s) {
+    u64 len = str_len(s)
+    file_write(fd, s, len)
+}
+
+// ─── Single-row driver ────────────────────────────────────────────────────
+//
+// Runs ONE shape-row of the matrix:
+//   - per-group VRAM alloc + H2D
+//   - descriptor build + H2D
+//   - 3 grouped dispatches (with hipDeviceSynchronize between each)
+//   - D2H + CPU reference + max-abs per group; row max = max over all groups
+//   - VRAM free
+//
+// Writes one CSV row to `fd`.  Returns 0 on PASS (max_abs ≤ 1e-5), 1 on
+// FAIL.  Does NOT call exit() — caller decides termination policy after
+// all rows are attempted (we want partial-progress visibility).
+fn run_one_row(u64 fd_csv, u64 fh, u32 b_batch, u64 M_arr, u64 N_arr, u64 K_arr,
+               u32 fast_path_flag, u64 mode_str_ptr,
+               u32 b_label, u32 m_label, u32 n_label, u32 k_label) -> u32 {
+
+    // 1) Per-group VRAM + host-side mirror allocations.
+    //    Tile-count math: tiles = ceil(M/16) * ceil(N/16).
+    u64 d_desc    = gpu_malloc_mat(b_batch * 88, "d_desc row")
+    u64 d_counter = gpu_malloc_mat(4,            "d_counter row")
+    u64 host_desc = alloc(b_batch * 88)
+    u64 zi = 0
+    while zi < b_batch * 88 {
+        u64 zp = host_desc + zi
+        u8 zb = 0
+        unsafe { *(zp as u8) = zb }
+        zi = zi + 1
+    }
+
+    // Per-group pointer + size tables (so we can free them at the end).
+    u64 d_a_arr  = alloc(b_batch * 8)
+    u64 d_b_arr  = alloc(b_batch * 8)
+    u64 d_c_arr  = alloc(b_batch * 8)
+    u64 h_a_arr  = alloc(b_batch * 8)
+    u64 h_b_arr  = alloc(b_batch * 8)
+    u64 h_cref_arr = alloc(b_batch * 8)
+    u64 h_cgpu_arr = alloc(b_batch * 8)
+    u64 bytes_c_arr = alloc(b_batch * 8)
+
+    u32 total_tiles = 0
+    u32 gi = 0
+    while gi < b_batch {
+        u32 Mg = 0; unsafe { *((M_arr + gi * 4) as u32) -> Mg }
+        u32 Ng = 0; unsafe { *((N_arr + gi * 4) as u32) -> Ng }
+        u32 Kg = 0; unsafe { *((K_arr + gi * 4) as u32) -> Kg }
+        u32 lda = Kg; u32 ldb = Ng; u32 ldc = Ng
+
+        u64 bytes_a = Mg * Kg * 4
+        u64 bytes_b = Kg * Ng * 4
+        u64 bytes_c = Mg * Ng * 4
+
+        u64 d_a = gpu_malloc_mat(bytes_a, "d_a g")
+        u64 d_b = gpu_malloc_mat(bytes_b, "d_b g")
+        u64 d_c = gpu_malloc_mat(bytes_c, "d_c g")
+
+        u64 h_a = alloc(bytes_a); fill_matrix_mat(h_a, Mg, Kg, 100 + gi * 13 + b_label * 1009)
+        u64 h_b = alloc(bytes_b); fill_matrix_mat(h_b, Kg, Ng, 200 + gi * 17 + b_label * 2003)
+
+        u32 e_a = hipMemcpy(d_a, h_a, bytes_a, 1)
+        if e_a != 0 { die_gpu_mat("H2D a g", e_a) }
+        u32 e_b = hipMemcpy(d_b, h_b, bytes_b, 1)
+        if e_b != 0 { die_gpu_mat("H2D b g", e_b) }
+
+        // Pre-fill C with 0xDEADBEEF so a missing write surfaces as a huge max_abs.
+        u64 c_pad = alloc(bytes_c)
+        u32 pi = 0
+        u32 nC = Mg * Ng
+        while pi < nC {
+            u64 pp = c_pad + pi * 4
+            u32 db = 0xDEADBEEF
+            unsafe { *(pp as u32) = db }
+            pi = pi + 1
+        }
+        u32 e_pc = hipMemcpy(d_c, c_pad, bytes_c, 1)
+        if e_pc != 0 { die_gpu_mat("H2D c pad g", e_pc) }
+        dealloc(c_pad)
+
+        // Tile-count math: ceil(M/16) * ceil(N/16).
+        u64 Mg64 = Mg
+        u64 Ng64 = Ng
+        u64 tiles_m = (Mg64 + 15) / 16
+        u64 tiles_n = (Ng64 + 15) / 16
+        u32 tc_g = tiles_m * tiles_n
+        u32 tp_g = total_tiles
+
+        u64 base = host_desc + gi * 88
+        unsafe { *((base +  0) as u32) = Mg }
+        unsafe { *((base +  4) as u32) = Ng }
+        unsafe { *((base +  8) as u32) = Kg }
+        unsafe { *((base + 12) as u32) = lda }
+        unsafe { *((base + 16) as u32) = ldb }
+        unsafe { *((base + 20) as u32) = ldc }
+        unsafe { *((base + 24) as u64) = d_a }
+        unsafe { *((base + 32) as u64) = d_b }
+        unsafe { *((base + 40) as u64) = d_c }
+        unsafe { *((base + 48) as u32) = 0 }     // acc_flag
+        unsafe { *((base + 52) as u32) = 0 }     // precision (f32)
+        unsafe { *((base + 56) as u32) = 1 }     // splitK
+        unsafe { *((base + 60) as u32) = tc_g }  // tile_count
+        unsafe { *((base + 64) as u32) = tp_g }  // tile_prefix
+
+        total_tiles = total_tiles + tc_g
+
+        // Stash pointers + sizes for D2H / dealloc later.
+        unsafe { *((d_a_arr + gi * 8)  as u64) = d_a }
+        unsafe { *((d_b_arr + gi * 8)  as u64) = d_b }
+        unsafe { *((d_c_arr + gi * 8)  as u64) = d_c }
+        unsafe { *((h_a_arr + gi * 8)  as u64) = h_a }
+        unsafe { *((h_b_arr + gi * 8)  as u64) = h_b }
+        unsafe { *((bytes_c_arr + gi * 8) as u64) = bytes_c }
+
+        gi = gi + 1
+    }
+
+    // H2D descriptor.
+    u32 derr = hipMemcpy(d_desc, host_desc, b_batch * 88, 1)
+    if derr != 0 { die_gpu_mat("H2D desc row", derr) }
+    dealloc(host_desc)
+
+    // Pack kernarg ptr table (6 slots × 8 bytes).
+    u64 p0 = alloc(8); unsafe { *(p0 as u64) = d_desc }
+    u64 p1 = alloc(8); unsafe { *(p1 as u64) = b_batch }
+    u64 p2 = alloc(8); unsafe { *(p2 as u64) = total_tiles }
+    u64 p3 = alloc(8); unsafe { *(p3 as u64) = fast_path_flag }
+    u64 p4 = alloc(8); unsafe { *(p4 as u64) = 0 }            // precision f32
+    u64 p5 = alloc(8); unsafe { *(p5 as u64) = d_counter }
+    u64 kp = alloc(6 * 8)
+    unsafe { *(kp        as u64) = p0 }
+    unsafe { *((kp +  8) as u64) = p1 }
+    unsafe { *((kp + 16) as u64) = p2 }
+    unsafe { *((kp + 24) as u64) = p3 }
+    unsafe { *((kp + 32) as u64) = p4 }
+    unsafe { *((kp + 40) as u64) = p5 }
+
+    // 3 dispatches → record min wall-time (filters cold-cache + noise).
+    // CRITICAL (1A.7 finding): the counter-zero H2D is NOT ordered against
+    // in-flight prior dispatches under KFD-shim — must hipDeviceSynchronize
+    // before each re-zero or the counter may wrap to a stale value.
+    u64 N_ITERS = 3
+    u64 best_ns = 0xFFFFFFFFFFFFFFFF
+    u64 it = 0
+    while it < N_ITERS {
+        // Sync before re-zero so the prior dispatch is fully retired
+        // (1A.7 ordering fix: hipMemcpy from a tiny host buffer to d_counter
+        // does NOT serialize against the in-flight grid in the KFD shim).
+        u32 serr_pre = hipDeviceSynchronize()
+        if serr_pre != 0 { die_gpu_mat("hipDeviceSync pre-rezero", serr_pre) }
+
+        u64 zslot = alloc(4); unsafe { *(zslot as u32) = 0 }
+        u32 czerr = hipMemcpy(d_counter, zslot, 4, 1)
+        if czerr != 0 { die_gpu_mat("H2D counter rezero row", czerr) }
+        dealloc(zslot)
+
+        u64 t_start = time_now()
+        u32 lerr = hipModuleLaunchKernel(fh, 240, 1, 1, 256, 1, 1, 0, 0, kp, 0)
+        if lerr != 0 { die_gpu_mat("launch gemm_f32_grouped row", lerr) }
+        u32 serr_post = hipDeviceSynchronize()
+        if serr_post != 0 { die_gpu_mat("hipDeviceSync post-launch", serr_post) }
+        u64 t_end = time_now()
+
+        u64 elapsed = t_end - t_start
+        if elapsed < best_ns { best_ns = elapsed }
+        it = it + 1
+    }
+
+    dealloc(p0); dealloc(p1); dealloc(p2); dealloc(p3); dealloc(p4); dealloc(p5); dealloc(kp)
+
+    // D2H each group's C buffer and compute CPU reference + max-abs per
+    // group.  Row-wide max-abs is the max over all groups.
+    f32 row_max_abs = 0.0f
+    gi = 0
+    while gi < b_batch {
+        u32 Mg = 0; unsafe { *((M_arr + gi * 4) as u32) -> Mg }
+        u32 Ng = 0; unsafe { *((N_arr + gi * 4) as u32) -> Ng }
+        u32 Kg = 0; unsafe { *((K_arr + gi * 4) as u32) -> Kg }
+        u32 lda = Kg; u32 ldb = Ng; u32 ldc = Ng
+
+        u64 bytes_c = 0; unsafe { *((bytes_c_arr + gi * 8) as u64) -> bytes_c }
+        u64 d_c = 0;     unsafe { *((d_c_arr + gi * 8) as u64) -> d_c }
+        u64 h_a = 0;     unsafe { *((h_a_arr + gi * 8) as u64) -> h_a }
+        u64 h_b = 0;     unsafe { *((h_b_arr + gi * 8) as u64) -> h_b }
+
+        u64 h_c_gpu = alloc(bytes_c)
+        u32 e_d2h = hipMemcpy(h_c_gpu, d_c, bytes_c, 2)
+        if e_d2h != 0 { die_gpu_mat("D2H c row", e_d2h) }
+        u64 h_c_ref = alloc(bytes_c)
+        cpu_gemm_ref_mat(h_a, h_b, h_c_ref, Mg, Ng, Kg, lda, ldb, ldc)
+        f32 g_max = max_abs_diff_f32_mat(h_c_ref, h_c_gpu, Mg * Ng)
+        if g_max > row_max_abs { row_max_abs = g_max }
+        dealloc(h_c_gpu); dealloc(h_c_ref)
+        gi = gi + 1
+    }
+
+    // Free per-group VRAM + host buffers.
+    gi = 0
+    while gi < b_batch {
+        u64 d_a = 0; unsafe { *((d_a_arr + gi * 8) as u64) -> d_a }
+        u64 d_b = 0; unsafe { *((d_b_arr + gi * 8) as u64) -> d_b }
+        u64 d_c = 0; unsafe { *((d_c_arr + gi * 8) as u64) -> d_c }
+        u64 h_a = 0; unsafe { *((h_a_arr + gi * 8) as u64) -> h_a }
+        u64 h_b = 0; unsafe { *((h_b_arr + gi * 8) as u64) -> h_b }
+        gpu_free_mat(d_a); gpu_free_mat(d_b); gpu_free_mat(d_c)
+        dealloc(h_a); dealloc(h_b)
+        gi = gi + 1
+    }
+    dealloc(d_a_arr); dealloc(d_b_arr); dealloc(d_c_arr)
+    dealloc(h_a_arr); dealloc(h_b_arr); dealloc(h_cref_arr); dealloc(h_cgpu_arr)
+    dealloc(bytes_c_arr)
+    gpu_free_mat(d_desc); gpu_free_mat(d_counter)
+
+    // ── Write CSV row ──────────────────────────────────────────────────
+    // Columns: B,M,N,K,mode,max_abs,total_tiles,ms_min_of_3
+    // B/M/N/K are the user-facing labels (NOT per-group values, which can
+    // differ in heterogeneous mode — the "shape" column shows the base
+    // (M,N,K) from the matrix definition; per-group transposes are
+    // implicit in `mode`).
+    u64 sB  = fmt_dec(b_label);        fd_write_str(fd_csv, sB);  dealloc(sB)
+    file_write(fd_csv, ",", 1)
+    u64 sM  = fmt_dec(m_label);        fd_write_str(fd_csv, sM);  dealloc(sM)
+    file_write(fd_csv, ",", 1)
+    u64 sN  = fmt_dec(n_label);        fd_write_str(fd_csv, sN);  dealloc(sN)
+    file_write(fd_csv, ",", 1)
+    u64 sK  = fmt_dec(k_label);        fd_write_str(fd_csv, sK);  dealloc(sK)
+    file_write(fd_csv, ",", 1)
+    fd_write_str(fd_csv, mode_str_ptr)
+    file_write(fd_csv, ",", 1)
+    u64 sX  = fmt_f32_safe(row_max_abs); fd_write_str(fd_csv, sX); dealloc(sX)
+    file_write(fd_csv, ",", 1)
+    u64 sT  = fmt_dec(total_tiles);    fd_write_str(fd_csv, sT);  dealloc(sT)
+    file_write(fd_csv, ",", 1)
+    f32 ms_min = ms_of_mat(best_ns)
+    u64 sMs = fmt_f32(ms_min, 4);      fd_write_str(fd_csv, sMs); dealloc(sMs)
+    file_write(fd_csv, "\n", 1)
+
+    // ── Console echo (for tail -f visibility during the ~7-8 min run) ───
+    print_str("  row B="); u64 cB = fmt_dec(b_label); print_str(cB); dealloc(cB)
+    print_str(" M=");      u64 cM = fmt_dec(m_label); print_str(cM); dealloc(cM)
+    print_str(" N=");      u64 cN = fmt_dec(n_label); print_str(cN); dealloc(cN)
+    print_str(" K=");      u64 cK = fmt_dec(k_label); print_str(cK); dealloc(cK)
+    print_str(" mode=");   print_str(mode_str_ptr)
+    print_str(" max_abs="); u64 cX = fmt_f32_safe(row_max_abs); print_str(cX); dealloc(cX)
+    print_str(" tiles=");   u64 cT = fmt_dec(total_tiles); print_str(cT); dealloc(cT)
+    print_str(" ms=");      u64 cMs = fmt_f32(ms_min, 4); print_str(cMs); dealloc(cMs)
+    print_str("\n")
+
+    // Gate: 1e-5 = 0x3727C5AC.  Compare via bit-equivalent f32.
+    f32 thresh = 0.00001f
+    if row_max_abs > thresh { return 1 }
+    return 0
+}
+
+// ─── main ─────────────────────────────────────────────────────────────────
+
+fn main() {
+    print_str("gemm_grouped_shape_matrix — Task 1A.8 (50 rows)\n")
+
+    // Device init.
+    u32 sd_err = hipSetDevice(0)
+    if sd_err != 0 { die_gpu_mat("hipSetDevice", sd_err) }
+
+    // Load grouped .co.
+    u64 fh = load_co_mat("/tmp/gemm_f32_grouped.co", "gemm_f32_grouped")
+
+    // Open CSV (overwrite).
+    u64 csv_path = "/home/pantelis/mlrift_bin/wzma_train/grouped_shape_matrix.csv"
+    u64 fd_csv = file_open(csv_path, 1)
+    if fd_csv > 0xFFFFFFFFFFFFF000 {
+        print_str("Cannot create CSV: "); print_str(csv_path); print_str("\n")
+        hipkfd_teardown(); exit(1)
+    }
+    u64 hdr = "B,M,N,K,mode,max_abs,total_tiles,ms_min_of_3\n"
+    fd_write_str(fd_csv, hdr)
+
+    // Matrix.  Heap-allocated u32 arrays — MLRift's stack-array syntax is
+    // `u32[5] name` but heap form is simpler for indexed init below.
+    u64 Bs      = alloc(5 * 4)
+    u64 shapesM = alloc(5 * 4)
+    u64 shapesN = alloc(5 * 4)
+    u64 shapesK = alloc(5 * 4)
+    unsafe { *((Bs + 0 * 4) as u32) = 1 }
+    unsafe { *((Bs + 1 * 4) as u32) = 2 }
+    unsafe { *((Bs + 2 * 4) as u32) = 4 }
+    unsafe { *((Bs + 3 * 4) as u32) = 8 }
+    unsafe { *((Bs + 4 * 4) as u32) = 16 }
+    // 5 base shapes:  (M, N, K)
+    unsafe { *((shapesM + 0 * 4) as u32) =  32 }; unsafe { *((shapesN + 0 * 4) as u32) = 384 }; unsafe { *((shapesK + 0 * 4) as u32) =  128 }
+    unsafe { *((shapesM + 1 * 4) as u32) = 384 }; unsafe { *((shapesN + 1 * 4) as u32) =  32 }; unsafe { *((shapesK + 1 * 4) as u32) =  128 }
+    unsafe { *((shapesM + 2 * 4) as u32) =  64 }; unsafe { *((shapesN + 2 * 4) as u32) =  64 }; unsafe { *((shapesK + 2 * 4) as u32) = 2048 }
+    unsafe { *((shapesM + 3 * 4) as u32) = 128 }; unsafe { *((shapesN + 3 * 4) as u32) = 128 }; unsafe { *((shapesK + 3 * 4) as u32) =  128 }
+    unsafe { *((shapesM + 4 * 4) as u32) = 256 }; unsafe { *((shapesN + 4 * 4) as u32) = 256 }; unsafe { *((shapesK + 4 * 4) as u32) =  256 }
+
+    u64 mode_homo = "homogeneous"
+    u64 mode_het  = "heterogeneous"
+
+    u32 fail_count = 0
+    u32 row_count  = 0
+
+    u32 bi = 0
+    while bi < 5 {
+        u32 B = 0; unsafe { *((Bs + bi * 4) as u32) -> B }
+        u32 si = 0
+        while si < 5 {
+            u32 M_lab = 0; unsafe { *((shapesM + si * 4) as u32) -> M_lab }
+            u32 N_lab = 0; unsafe { *((shapesN + si * 4) as u32) -> N_lab }
+            u32 K_lab = 0; unsafe { *((shapesK + si * 4) as u32) -> K_lab }
+
+            // Allocate per-group M/N/K arrays (4-byte u32 stride).
+            u64 M_arr = alloc(B * 4)
+            u64 N_arr = alloc(B * 4)
+            u64 K_arr = alloc(B * 4)
+
+            // mode_idx=0 homogeneous, mode_idx=1 heterogeneous
+            u32 mode_idx = 0
+            while mode_idx < 2 {
+                // Build per-group shape array.
+                u32 gi2 = 0
+                while gi2 < B {
+                    u32 use_M = M_lab; u32 use_N = N_lab; u32 use_K = K_lab
+                    if mode_idx == 1 {
+                        // Heterogeneous: first half = (M,N,K); second half = (N,M,K).
+                        u32 half = B / 2
+                        if gi2 >= half {
+                            use_M = N_lab; use_N = M_lab   // swap M↔N
+                        }
+                    }
+                    unsafe { *((M_arr + gi2 * 4) as u32) = use_M }
+                    unsafe { *((N_arr + gi2 * 4) as u32) = use_N }
+                    unsafe { *((K_arr + gi2 * 4) as u32) = use_K }
+                    gi2 = gi2 + 1
+                }
+
+                // fast_path_flag: 1 if homogeneous, 0 if heterogeneous.
+                // (B=1 het is still labelled "heterogeneous" + flag=0 to
+                // exercise the prefix-search visitor at the singleton edge.)
+                u32 fpf = 1
+                u64 mode_ptr = mode_homo
+                if mode_idx == 1 { fpf = 0; mode_ptr = mode_het }
+
+                u32 r = run_one_row(fd_csv, fh, B, M_arr, N_arr, K_arr,
+                                    fpf, mode_ptr, B, M_lab, N_lab, K_lab)
+                if r != 0 { fail_count = fail_count + 1 }
+                row_count = row_count + 1
+
+                mode_idx = mode_idx + 1
+            }
+
+            dealloc(M_arr); dealloc(N_arr); dealloc(K_arr)
+            si = si + 1
+        }
+        bi = bi + 1
+    }
+
+    file_close(fd_csv)
+    dealloc(Bs); dealloc(shapesM); dealloc(shapesN); dealloc(shapesK)
+
+    print_str("\nshape-matrix complete: rows=")
+    u64 sR = fmt_dec(row_count); print_str(sR); dealloc(sR)
+    print_str(" fails=")
+    u64 sF = fmt_dec(fail_count); print_str(sF); dealloc(sF)
+    print_str("\n")
+
+    if fail_count != 0 {
+        print_str("OVERALL: FAIL — some rows exceed the 1e-5 FMA-vs-CPU floor\n")
+        hipkfd_teardown(); exit(1)
+    }
+    print_str("OVERALL: PASS — all 50 rows within FMA-precision floor\n")
+    hipkfd_teardown()
+}

@@ -9024,8 +9024,13 @@ fn _emit_gemm_f32_grouped_body(uint64 args_desc) {
     asm_buffer_gl0_inv()
     //   v_readfirstlane_b32 s10, v2   ; broadcast lane-0 result to scalar
     asm_v_readfirstlane_b32(10, 2)
-    //   ds_store_b32 v1, v2, offset:0    ; LDS[0] = tile_id   (vaddr=v1=0; vdata=v2)
-    asm_u32(0xD8340000)
+    //   ds_store_b32 v1, v2, offset:16368  ; LDS[16368] = tile_id (vaddr=v1=0; vdata=v2)
+    //   1A.8 fix: broadcast slot moved off LDS[0] — Phase-B A-panel reuses LDS[0]
+    //   during the K-loop, so persistent-WG iteration N+1 would race with the
+    //   prior tile's stale A-panel residue at the same address. 16368 = 0x3FF0,
+    //   16-byte aligned, safely past A/B-panel + double-buffer (16384-byte LDS
+    //   allocation). Offset encoding: WORD1[15:0] = 0x3FF0 → 0xD8343FF0.
+    asm_u32(0xD8343FF0)
     asm_u32(0x00000201)                                // (vdata=2)<<8 | vaddr=1
 
     //   Patch the cbranch_execz forward simm16: target dword is current PC +1.
@@ -9036,18 +9041,25 @@ fn _emit_gemm_f32_grouped_body(uint64 args_desc) {
                   0xBFA50000 | (atomic_skip_simm & 0xFFFF))   // s_cbranch_execz (op 0x25)
 
     // ── 2b. Restore EXEC for all 8 waves, then s_barrier so every wave sees the
-    //    LDS[0] write done by wave-0 lane-0.
+    //    LDS[16368] write done by wave-0 lane-0.
     //   s_or_b32 exec_lo, exec_lo, s8       SOP2 op=0x0C → 0x8C prefix
     asm_u32(0x8C7E087E)
+    //   1A.8 fix: s_waitcnt lgkmcnt(0) BEFORE s_barrier. RDNA3 s_barrier syncs
+    //   execution but NOT LDS — the ds_store above must drain to LDS before
+    //   other waves observe it via ds_load. Matches project convention used at
+    //   lines 2890, 2974, 3076, 3168, etc.
+    asm_s_waitcnt_lgkmcnt_zero()
     //   s_barrier (gfx11 op 0x3D / gfx10 op 0x0A)
     asm_u32_arch(0xBFBD0000, 0xBF8A0000)
-    //   ds_load_b32 v2, v1, offset:0   ; all 256 lanes read LDS[0] into v2
-    //   word1 = 0xD8D80000, word2 = (vdst<<24)|vaddr = (2<<24)|1
-    asm_u32(0xD8D80000)
+    //   ds_load_b32 v2, v1, offset:16368  ; all 256 lanes read LDS[16368] into v2
+    //   1A.8 fix: matches the broadcast store offset above (avoids LDS[0]
+    //   collision with Phase-B A-panel residue across persistent-WG iterations).
+    //   word1 = 0xD8D83FF0 (offset:16368), word2 = (vdst<<24)|vaddr = (2<<24)|1
+    asm_u32(0xD8D83FF0)
     asm_u32(0x02000001)
     //   s_waitcnt lgkmcnt(0)
     asm_s_waitcnt_lgkmcnt_zero()
-    //   v_readfirstlane_b32 s10, v2   ; uniform now (every wave has same LDS[0])
+    //   v_readfirstlane_b32 s10, v2   ; uniform now (every wave has same LDS[16368])
     asm_v_readfirstlane_b32(10, 2)
 
     // ── 3. Exit condition: if (s10 >= s4 total_tiles) → s_endpgm.
