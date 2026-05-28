@@ -21662,8 +21662,14 @@ fn _emit_adamw_fused_body(uint64 args_desc) {
     asm_s_waitcnt_vmcnt_zero()
     asm_buffer_gl0_inv()
     asm_v_readfirstlane_b32(10, 2)                     // s10 = chunk_id (lane-0)
-    //   ds_store_b32 v1, v2, offset:16368   ; LDS[16368] = chunk_id
-    asm_u32(0xD8343FF0)
+    //   ds_store_b32 v1, v2, offset:0   ; LDS[0] = chunk_id
+    //   F1.4 fix: the broadcast slot MUST be within this kernel's reserved LDS
+    //   (group_segment_fixed_size=64).  The original used offset:16368 (copied
+    //   from gemm_f32_grouped, which reserves 16384 B) — OOB for a 64-B LDS, so
+    //   the lane-0 store + all-lane load hit inconsistent LDS → garbage chunk_id
+    //   broadcast → every WG resolved the wrong (block,local_chunk) → params
+    //   never updated (loss frozen) + a stray OOB global addr → MES wedge.
+    asm_u32(0xD8340000)
     asm_u32(0x00000201)
 
     //   Patch the cbranch_execz forward simm16.
@@ -21675,8 +21681,8 @@ fn _emit_adamw_fused_body(uint64 args_desc) {
     asm_u32(0x8C7E087E)                                // s_or_b32 exec_lo, exec_lo, s8
     asm_s_waitcnt_lgkmcnt_zero()                       // drain LDS before barrier
     asm_u32_arch(0xBFBD0000, 0xBF8A0000)               // s_barrier
-    //   ds_load_b32 v2, v1, offset:16368
-    asm_u32(0xD8D83FF0)
+    //   ds_load_b32 v2, v1, offset:0   (F1.4 fix: match the 64-B LDS reservation)
+    asm_u32(0xD8D80000)
     asm_u32(0x02000001)
     asm_s_waitcnt_lgkmcnt_zero()
     asm_v_readfirstlane_b32(10, 2)                     // s10 = chunk_id (uniform)
@@ -21737,14 +21743,36 @@ fn _emit_adamw_fused_body(uint64 args_desc) {
     asm_u32(0x808A090A)
     //   s[14:15] now = resolved block's desc addr.
 
+    //   F1.4 fix: chunk_base = local_chunk << 8 MUST be computed BEFORE the b256
+    //   block-pointer load below, because s_load_b256 s[4:11] OVERWRITES s10/s11
+    //   (the v_ptr lands in s[10:11]).  Stashing chunk_base in scratch s33 here
+    //   preserves it across the clobber.  (The original emit did the shift AFTER
+    //   the b256 load → read a clobbered s10 → garbage local_i → all-lanes masked
+    //   (params never updated, loss frozen) + a stray OOB SQC fault → MES wedge.)
+    //   s_lshl_b32 s33, s10, 8   SOP2 gfx11 op 0x08: 0x84 | (0x21<<16) | (0x88<<8) | 0x0A
+    //     = 0x8421880A.  gfx10 op 0x1E → 0x8F21880A.
+    asm_u32_arch(0x8421880A, 0x8F21880A)
+
     // ── 5. Load block pointers + n_elems from the descriptor at s[14:15].
-    //   s_load_b256 s[4:11], s[14:15], 0   loads bytes 0..31 = the four u64
-    //   pointers: s[4:5]=param, s[6:7]=grad, s[8:9]=m, s[10:11]=v.  (b256 = 8
-    //   dwords = exactly the 4 pointers; n_elems at offset 32 is NOT covered
-    //   and is loaded separately below.)
-    //   sdata_pair=2 (→ s4), sbase_pair=7 (→ s[14:15]).  SMEM b256 op=0x03.
-    //   word1 = (0x3D<<26)|(0x03<<18)|(2<<7)|7 = 0xF40C0107.  off 0 → 0xF8000000.
-    asm_u32(0xF40C0107); asm_u32(0xF8000000)
+    //   The four u64 pointers occupy bytes 0..31: s[4:5]=param, s[6:7]=grad,
+    //   s[8:9]=m, s[10:11]=v.  NOTE: this clobbers s10/s11 — chunk_base was
+    //   already saved to s33 above.
+    //
+    //   F1.4 fix: load as TWO s_load_b128 (16-byte access) instead of one
+    //   s_load_b256 (32-byte access).  The descriptor stride is 48 bytes, so the
+    //   per-block base s[14:15] = d_desc + block*48 is 16-byte aligned but NOT
+    //   32-byte aligned for odd blocks (V@+48, gate_b@+144, embed@+240).  RDNA3
+    //   s_load_b256 requires a 32-byte-aligned address → those blocks read a
+    //   MISALIGNED descriptor → garbage pointers (low dword zeroed) → global
+    //   loads/stores at aperture-base+offset → GFXHUB page fault → MES wedge.
+    //   Two b128 loads (each 16-byte aligned: base+0 and base+16, both multiples
+    //   of 16 for a 48-byte stride) read the pointers correctly.
+    //   s_load_b128 s[4:7],  s[14:15], 0   (param,grad).  SMEM b128 op=0x02.
+    //     word1 = (0x3D<<26)|(0x02<<18)|(sdata=2<<7)|sbase=7 = 0xF4080107.
+    asm_u32(0xF4080107); asm_u32(0xF8000000)
+    //   s_load_b128 s[8:11], s[14:15], 16  (m,v).  sdata_pair=4 (→ s8), off=16.
+    //     word1 = (0x3D<<26)|(0x02<<18)|(4<<7)|7 = 0xF4080207.  off16 → 0xF8000010.
+    asm_u32(0xF4080207); asm_u32(0xF8000010)
     asm_s_waitcnt_lgkmcnt_zero()
     //   Load n_elems (off 32) into s32.  b32 must target an even SGPR; s32 is
     //   a free high scratch (counter is in s[12:13], total_chunks in s16, desc
@@ -21754,17 +21782,21 @@ fn _emit_adamw_fused_body(uint64 args_desc) {
     asm_s_waitcnt_lgkmcnt_zero()
 
     // ── 6. Per-lane element index + tail guard.
-    //   local_i = local_chunk*256 + tid.   chunk_base = s10 << 8.
-    //   s_lshl_b32 s33, s10, 8   SOP2 gfx11 op 0x08: 0x84 | (0x21<<16) | (0x88<<8) | 0x0A
-    //     = 0x8421880A.  gfx10 op 0x1E → 0x8F21880A.
-    asm_u32_arch(0x8421880A, 0x8F21880A)
+    //   local_i = local_chunk*256 + tid.   chunk_base (= local_chunk<<8) is in s33.
     //   v3 = s33 + v0   (per-lane global local_i)
     //     v_add_nc_u32 v3, s33, v0  → (0x4A<<24)|(3<<17)|(0<<9)|33 = 0x4A060021
     asm_u32(0x4A060021)
     //   tail guard: vcc = (n_elems(s32) > local_i(v3))
     asm_v_cmp_gt_u32_sgpr_vgpr(32, 3)
-    //   s_and_saveexec_b32 s8, vcc_lo   ; mask out tail lanes (local_i>=n_elems)
-    asm_s_and_saveexec_b32_vcc_lo(8)
+    //   s_and_saveexec_b32 s32, vcc_lo  ; mask out tail lanes (local_i>=n_elems)
+    //   F1.4 fix: the saved-EXEC scratch MUST NOT be s8 — s[8:9] holds m_ptr
+    //   (loaded by the b128 above) and is consumed by the m-store below.  Using
+    //   s8 clobbered m_ptr's low dword with the EXEC bitmask → the m/v/param
+    //   stores wrote to (m_ptr_high<<32 | exec_mask) ≈ aperture_base+small →
+    //   GFXHUB page fault → MES wedge (params never committed, loss frozen).
+    //   s32 (n_elems) is free after the guard compare above and is dead by the
+    //   next loop iteration, so it is a safe home for the saved EXEC mask.
+    asm_s_and_saveexec_b32_vcc_lo(32)
     uint64 tail_skip_idx = asm_text_len / 4
     asm_s_cbranch_execz(0)                             // skip math if no lane in range
 
@@ -21832,7 +21864,9 @@ fn _emit_adamw_fused_body(uint64 args_desc) {
     asm_patch_u32(tail_skip_idx, 0xBFA50000 | (tail_skip_simm & 0xFFFF))
 
     // ── 9. Restore EXEC for all lanes, then back-edge to the visitor top.
-    asm_u32(0x8C7E087E)                                // s_or_b32 exec_lo, exec_lo, s8
+    //   s_or_b32 exec_lo, exec_lo, s32  (paired with the s32 saveexec above;
+    //   0x8C7E087E with ssrc1 s8→s32(0x20) = 0x8C7E207E).
+    asm_u32(0x8C7E207E)                                // s_or_b32 exec_lo, exec_lo, s32
     uint64 loop_back_at = asm_text_len / 4
     uint64 loop_back_simm = loop_top_idx - (loop_back_at + 1)
     asm_s_branch(loop_back_simm & 0xFFFF)
@@ -21853,23 +21887,30 @@ fn _emit_adamw_fused_body(uint64 args_desc) {
     uint64 b3  = args_desc + 24;  unsafe { *(b3  as uint64) = AMD_ARG_KIND_BY_VALUE }        // total_chunks
     uint64 b4  = args_desc + 32;  unsafe { *(b4  as uint64) = 8 }
     uint64 b5  = args_desc + 40;  unsafe { *(b5  as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }  // d_global_counter
-    uint64 b6  = args_desc + 48;  unsafe { *(b6  as uint64) = 4 }
+    // NOTE: the BY_VALUE scalars MUST declare size 8 (not 4) so the HSA kernarg
+    // packer lays them out at 8-byte-spaced offsets (0,8,16,...,88), matching the
+    // kernel's HARD-CODED s_load offsets (s18@0x18, s20@0x20, ... lr/eps b64@0x50)
+    // AND the KFD-shim ptr-table ABI (one 8-byte value slot per arg).  Declaring
+    // size 4 packed them at 4-byte offsets (inv_bc2@28 vs kernel-read 32, etc.),
+    // mis-feeding every hyperparam past inv_bc1 → garbage AdamW math + GFXHUB
+    // fault.  This mirrors gemm_f32_grouped, whose u32 BY_VALUE args are size 8.
+    uint64 b6  = args_desc + 48;  unsafe { *(b6  as uint64) = 8 }
     uint64 b7  = args_desc + 56;  unsafe { *(b7  as uint64) = AMD_ARG_KIND_BY_VALUE }        // inv_bc1
-    uint64 b8  = args_desc + 64;  unsafe { *(b8  as uint64) = 4 }
+    uint64 b8  = args_desc + 64;  unsafe { *(b8  as uint64) = 8 }
     uint64 b9  = args_desc + 72;  unsafe { *(b9  as uint64) = AMD_ARG_KIND_BY_VALUE }        // inv_bc2
-    uint64 b10 = args_desc + 80;  unsafe { *(b10 as uint64) = 4 }
+    uint64 b10 = args_desc + 80;  unsafe { *(b10 as uint64) = 8 }
     uint64 b11 = args_desc + 88;  unsafe { *(b11 as uint64) = AMD_ARG_KIND_BY_VALUE }        // decay
-    uint64 b12 = args_desc + 96;  unsafe { *(b12 as uint64) = 4 }
+    uint64 b12 = args_desc + 96;  unsafe { *(b12 as uint64) = 8 }
     uint64 b13 = args_desc + 104; unsafe { *(b13 as uint64) = AMD_ARG_KIND_BY_VALUE }        // beta1
-    uint64 b14 = args_desc + 112; unsafe { *(b14 as uint64) = 4 }
+    uint64 b14 = args_desc + 112; unsafe { *(b14 as uint64) = 8 }
     uint64 b15 = args_desc + 120; unsafe { *(b15 as uint64) = AMD_ARG_KIND_BY_VALUE }        // beta2
-    uint64 b16 = args_desc + 128; unsafe { *(b16 as uint64) = 4 }
+    uint64 b16 = args_desc + 128; unsafe { *(b16 as uint64) = 8 }
     uint64 b17 = args_desc + 136; unsafe { *(b17 as uint64) = AMD_ARG_KIND_BY_VALUE }        // one_m_b1
-    uint64 b18 = args_desc + 144; unsafe { *(b18 as uint64) = 4 }
+    uint64 b18 = args_desc + 144; unsafe { *(b18 as uint64) = 8 }
     uint64 b19 = args_desc + 152; unsafe { *(b19 as uint64) = AMD_ARG_KIND_BY_VALUE }        // one_m_b2
-    uint64 b20 = args_desc + 160; unsafe { *(b20 as uint64) = 4 }
+    uint64 b20 = args_desc + 160; unsafe { *(b20 as uint64) = 8 }
     uint64 b21 = args_desc + 168; unsafe { *(b21 as uint64) = AMD_ARG_KIND_BY_VALUE }        // lr
-    uint64 b22 = args_desc + 176; unsafe { *(b22 as uint64) = 4 }
+    uint64 b22 = args_desc + 176; unsafe { *(b22 as uint64) = 8 }
     uint64 b23 = args_desc + 184; unsafe { *(b23 as uint64) = AMD_ARG_KIND_BY_VALUE }        // eps
 }
 

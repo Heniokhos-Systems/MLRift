@@ -635,6 +635,111 @@ fn launch_adamw(u64 fh, u64 d_param, u64 d_grad, u64 d_m, u64 d_v, u64 n,
     dealloc(p10); dealloc(p11); dealloc(p12); dealloc(p13); dealloc(kp)
 }
 
+// ── F1.3: fused AdamW descriptor builder + launcher ─────────────────────────
+// build_adamw_descriptor packs the 6-block 288-byte descriptor table (48 bytes
+// per block, layout: +0 u64 param, +8 u64 grad, +16 u64 m, +24 u64 v, +32 u32
+// n_elems, +36 u32 chunk_count, +40 u32 chunk_prefix, +44 u32 pad) into a host
+// scratch buffer, then H2D's it to d_desc.  A "chunk" = 256 elements that stay
+// WITHIN one block; chunk_count = ceil(n/256); chunk_prefix = running sum of
+// chunk_count over prior blocks.  Returns total_chunks (sum of chunk_count) —
+// the value the kernel's atomic counter counts up to.  Block ORDER matches the
+// 6 legacy launch_adamw calls (U, V, gate_w, gate_b, bias, embed) so the dump
+// layout + descriptor are consistent.
+fn build_adamw_descriptor(u64 d_desc,
+        u64 pU, u64 gU, u64 mU, u64 vU, u64 nU,
+        u64 pV, u64 gV, u64 mV, u64 vV, u64 nV,
+        u64 pGw, u64 gGw, u64 mGw, u64 vGw, u64 nGw,
+        u64 pGb, u64 gGb, u64 mGb, u64 vGb, u64 nGb,
+        u64 pBias, u64 gBias, u64 mBias, u64 vBias, u64 nBias,
+        u64 pEmb, u64 gEmb, u64 mEmb, u64 vEmb, u64 nEmb) -> u64 {
+    u64 host = alloc(288)
+    // local arrays of the 6 blocks' fields (index 0..5 = U,V,gw,gb,bias,embed)
+    u64[6] pa; u64[6] ga; u64[6] ma; u64[6] va; u64[6] na
+    pa[0]=pU;   ga[0]=gU;   ma[0]=mU;   va[0]=vU;   na[0]=nU
+    pa[1]=pV;   ga[1]=gV;   ma[1]=mV;   va[1]=vV;   na[1]=nV
+    pa[2]=pGw;  ga[2]=gGw;  ma[2]=mGw;  va[2]=vGw;  na[2]=nGw
+    pa[3]=pGb;  ga[3]=gGb;  ma[3]=mGb;  va[3]=vGb;  na[3]=nGb
+    pa[4]=pBias;ga[4]=gBias;ma[4]=mBias;va[4]=vBias;na[4]=nBias
+    pa[5]=pEmb; ga[5]=gEmb; ma[5]=mEmb; va[5]=vEmb; na[5]=nEmb
+    u64 prefix = 0
+    u64 bi = 0
+    while bi < 6 {
+        u64 base = host + bi * 48
+        u64 n    = na[bi]
+        u64 cc   = (n + 255) / 256          // chunk_count = ceil(n/256)
+        u32 n32  = n
+        u32 cc32 = cc
+        u32 pf32 = prefix
+        unsafe { *((base +  0) as u64) = pa[bi] }
+        unsafe { *((base +  8) as u64) = ga[bi] }
+        unsafe { *((base + 16) as u64) = ma[bi] }
+        unsafe { *((base + 24) as u64) = va[bi] }
+        unsafe { *((base + 32) as u32) = n32 }
+        unsafe { *((base + 36) as u32) = cc32 }
+        unsafe { *((base + 40) as u32) = pf32 }
+        unsafe { *((base + 44) as u32) = 0 }
+        prefix = prefix + cc
+        bi = bi + 1
+    }
+    u32 herr = hipMemcpy(d_desc, host, 288, 1)
+    if herr != 0 { die_gpu("H2D adamw fused descriptor", herr) }
+    dealloc(host)
+    return prefix   // total_chunks
+}
+
+// launch_adamw_fused: ONE persistent-WG dispatch (grid=240, block=256) over the
+// 6-block descriptor.  Kernarg ABI (13 slots × 8 bytes = 104-byte segment),
+// matching emit_amdgpu_adamw_fused_blob:
+//   +0  u64 d_desc           +8  u32 total_chunks   +16 u64 d_global_counter
+//   +24 f32 inv_bc1          +32 f32 inv_bc2        +40 f32 decay
+//   +48 f32 beta1            +56 f32 beta2          +64 f32 one_m_b1
+//   +72 f32 one_m_b2         +80 f32 lr             +88 f32 eps
+// The 7 derived bias-correction scalars are computed by the caller with the
+// IDENTICAL f32 recurrence launch_adamw uses (byte-identity crux).
+fn launch_adamw_fused(u64 fh, u64 d_desc, u32 total_chunks,
+        f32 inv_bc1, f32 inv_bc2, f32 decay,
+        f32 beta1, f32 beta2, f32 one_m_b1, f32 one_m_b2,
+        f32 lr, f32 eps, u64 d_counter) {
+    // 1) zero the persistent-WG global atomic counter (u32=0 H2D).
+    u64 zslot = alloc(4); unsafe { *(zslot as u32) = 0 }
+    u32 zerr = hipMemcpy(d_counter, zslot, 4, 1)
+    if zerr != 0 { die_gpu("H2D adamw fused counter zero", zerr) }
+    dealloc(zslot)
+    // 2) pack kernargs (KFD ptr-table ABI — one value slot per arg).
+    u64 p0  = alloc(8); unsafe { *(p0  as u64) = d_desc }
+    u64 p1  = alloc(8); unsafe { *(p1  as u64) = total_chunks }
+    u64 p2  = alloc(8); unsafe { *(p2  as u64) = d_counter }
+    u64 p3  = alloc(8); unsafe { *(p3  as f32) = inv_bc1 }
+    u64 p4  = alloc(8); unsafe { *(p4  as f32) = inv_bc2 }
+    u64 p5  = alloc(8); unsafe { *(p5  as f32) = decay }
+    u64 p6  = alloc(8); unsafe { *(p6  as f32) = beta1 }
+    u64 p7  = alloc(8); unsafe { *(p7  as f32) = beta2 }
+    u64 p8  = alloc(8); unsafe { *(p8  as f32) = one_m_b1 }
+    u64 p9  = alloc(8); unsafe { *(p9  as f32) = one_m_b2 }
+    u64 p10 = alloc(8); unsafe { *(p10 as f32) = lr }
+    u64 p11 = alloc(8); unsafe { *(p11 as f32) = eps }
+    u64 kp  = alloc(12 * 8)
+    unsafe { *(kp        as u64) = p0 }
+    unsafe { *((kp +  8) as u64) = p1 }
+    unsafe { *((kp + 16) as u64) = p2 }
+    unsafe { *((kp + 24) as u64) = p3 }
+    unsafe { *((kp + 32) as u64) = p4 }
+    unsafe { *((kp + 40) as u64) = p5 }
+    unsafe { *((kp + 48) as u64) = p6 }
+    unsafe { *((kp + 56) as u64) = p7 }
+    unsafe { *((kp + 64) as u64) = p8 }
+    unsafe { *((kp + 72) as u64) = p9 }
+    unsafe { *((kp + 80) as u64) = p10 }
+    unsafe { *((kp + 88) as u64) = p11 }
+    u32 grid  = 240
+    u32 block = 256
+    u32 err = hipModuleLaunchKernel(fh, grid, 1, 1, block, 1, 1, 0, 0, kp, 0)
+    if err != 0 { die_gpu("launch adamw fused", err) }
+    dealloc(p0); dealloc(p1); dealloc(p2); dealloc(p3); dealloc(p4); dealloc(p5)
+    dealloc(p6); dealloc(p7); dealloc(p8); dealloc(p9); dealloc(p10); dealloc(p11)
+    dealloc(kp)
+}
+
 fn ms_of(u64 ns) -> f32 { return f64_to_f32(int_to_f64(ns) / 1000000.0) }
 
 fn print_ms(u64 label, f32 ms) {
@@ -730,6 +835,24 @@ fn main() {
         print_str("bwd_uv precision: f32 (default)\n")
     }
 
+    // ── F1.3: MLRIFT_FUSE_ADAMW knob ───────────────────────────────────────
+    // MLRIFT_FUSE_ADAMW=1 routes the 6 standalone adamw_step_f32 dispatches
+    // through ONE persistent-WG adamw_fused dispatch (6-block descriptor + a
+    // global atomic-counter work distributor).  Byte-identical to the legacy
+    // path (same per-element AdamW VALU, same host-side bias-correction).
+    // Default 0 (legacy 6-dispatch).
+    u64 use_fuse_adamw = 0
+    u64 ev_fuse = sys_getenv("MLRIFT_FUSE_ADAMW")
+    if ev_fuse != 0 {
+        u8 c0f = 0; unsafe { *(ev_fuse as u8) -> c0f }
+        if c0f == 49 { use_fuse_adamw = 1 }   // '1'=49
+    }
+    if use_fuse_adamw == 1 {
+        print_str("AdamW path: FUSED (F1 — 1 persistent-WG dispatch over 6 blocks)\n")
+    } else {
+        print_str("AdamW path: LEGACY (6 standalone full-occupancy dispatches)\n")
+    }
+
     print_str("Loading kernels...\n")
     u64 fh_embed  = load_co("/tmp/embedding_lookup_f32.co",   "embedding_lookup_f32")
     u64 fh_gemm   = load_co("/tmp/gemm_f32_native.co",        "gemm_f32")
@@ -741,6 +864,8 @@ fn main() {
     u64 fh_bemb   = load_co("/tmp/wzma_bwd_embed.co",         "wzma_bwd_embed")
     u64 fh_bred   = load_co("/tmp/wzma_bwd_reduce.co",        "wzma_bwd_reduce")
     u64 fh_adamw  = load_co("/tmp/adamw_step_f32.co",         "adamw_step_f32")
+    // ── F1.3: fused-AdamW .co (one persistent-WG dispatch over 6 blocks) ────
+    u64 fh_adamw_fused = load_co("/tmp/adamw_fused.co",       "adamw_fused")
     // ── GEMM-based bwd_uv replacement (full-occupancy contractions) ─────────
     u64 fh_gaccum = load_co("/tmp/gemm_f32_accum.co",         "gemm_f32_accum")
     // ── Task 1A.7: grouped-GEMM .co (Phase 1A.3–1A.6) — fused-launch path ───
@@ -915,6 +1040,26 @@ fn main() {
     dealloc(zones)
 
     print_str("Buffers allocated + moments/demb zero-init.\n")
+
+    // ── F1.3: fused-AdamW descriptor + atomic counter (resident) ───────────
+    // The param/grad/m/v pointers + n_elems are stable across the step loop, so
+    // build the 288-byte descriptor ONCE here (block order: U,V,gw,gb,bias,emb,
+    // matching the 6 legacy launch_adamw calls + the param-dump layout).  The
+    // bias-correction scalars change each step and are recomputed in the loop.
+    u64 d_adamw_desc    = gpu_malloc(288, "mAdamwDesc")
+    u64 d_adamw_counter = gpu_malloc(4,   "mAdamwCounter")
+    u64 adamw_total_chunks = build_adamw_descriptor(d_adamw_desc,
+        d_U,    d_dU,    d_mU,    d_vU,    K*D*R,
+        d_V,    d_dV,    d_mV,    d_vV,    K*R*D,
+        d_gw,   d_dgw,   d_mGw,   d_vGw,   K*D,
+        d_gb,   d_dgb,   d_mGb,   d_vGb,   K,
+        d_bias, d_dbias, d_mBias, d_vBias, D,
+        d_emb,  d_demb,  d_mEmb,  d_vEmb,  VOCAB*D)
+    u32 adamw_tc32 = adamw_total_chunks
+    if use_fuse_adamw == 1 {
+        print_str("fused AdamW: total_chunks="); u64 tcs = fmt_dec(adamw_total_chunks)
+        print_str(tcs); dealloc(tcs); print_str("\n")
+    }
 
     // ── AdamW hyperparams ──────────────────────────────────────────────────
     f32 lr = 0.001f
@@ -1399,18 +1544,69 @@ fn main() {
             validate_grads(d_grads, PART_N)
         }
 
-        // ════════════════ AdamW — 6 standalone full-occupancy dispatches ═════
+        // ════════════════ AdamW — 6 standalone dispatches OR 1 fused ═════════
         // 5 dense (U,V,gw,gb,bias) + embed.  Bit-identical decoupled-wd math to
         // the in-kernel AdamW.  step1 = step+1 (1-based bias correction).
         t0 = time_now()
         u64 step1 = step + 1
-        launch_adamw(fh_adamw, d_U,    d_dU,    d_mU,    d_vU,    K*D*R,     step1, lr, beta1, beta2, eps, wd)
-        launch_adamw(fh_adamw, d_V,    d_dV,    d_mV,    d_vV,    K*R*D,     step1, lr, beta1, beta2, eps, wd)
-        launch_adamw(fh_adamw, d_gw,   d_dgw,   d_mGw,   d_vGw,   K*D,       step1, lr, beta1, beta2, eps, wd)
-        launch_adamw(fh_adamw, d_gb,   d_dgb,   d_mGb,   d_vGb,   K,         step1, lr, beta1, beta2, eps, wd)
-        launch_adamw(fh_adamw, d_bias, d_dbias, d_mBias, d_vBias, D,         step1, lr, beta1, beta2, eps, wd)
-        launch_adamw(fh_adamw, d_emb,  d_demb,  d_mEmb,  d_vEmb,  VOCAB*D,   step1, lr, beta1, beta2, eps, wd)
-        sync_or_die("sync adamw"); t1 = time_now(); ns_badamw = ns_badamw + (t1 - t0)
+        if use_fuse_adamw == 1 {
+            // F1: ONE persistent-WG dispatch.  Replicate launch_adamw's exact
+            // host-side f32 bias-correction recurrence ONCE (shared across all 6
+            // blocks → kernarg header, not per-block) — byte-identity crux.
+            f32 b1p = 1.0f; f32 b2p = 1.0f; u64 bt = 0
+            while bt < step1 { b1p = b1p * beta1; b2p = b2p * beta2; bt = bt + 1 }
+            f32 inv_bc1  = one / (one - b1p)
+            f32 inv_bc2  = one / (one - b2p)
+            f32 decay    = one - lr * wd
+            f32 one_m_b1 = one - beta1
+            f32 one_m_b2 = one - beta2
+            launch_adamw_fused(fh_adamw_fused, d_adamw_desc, adamw_tc32,
+                inv_bc1, inv_bc2, decay, beta1, beta2, one_m_b1, one_m_b2,
+                lr, eps, d_adamw_counter)
+            sync_or_die("sync adamw fused")
+        } else {
+            launch_adamw(fh_adamw, d_U,    d_dU,    d_mU,    d_vU,    K*D*R,     step1, lr, beta1, beta2, eps, wd)
+            launch_adamw(fh_adamw, d_V,    d_dV,    d_mV,    d_vV,    K*R*D,     step1, lr, beta1, beta2, eps, wd)
+            launch_adamw(fh_adamw, d_gw,   d_dgw,   d_mGw,   d_vGw,   K*D,       step1, lr, beta1, beta2, eps, wd)
+            launch_adamw(fh_adamw, d_gb,   d_dgb,   d_mGb,   d_vGb,   K,         step1, lr, beta1, beta2, eps, wd)
+            launch_adamw(fh_adamw, d_bias, d_dbias, d_mBias, d_vBias, D,         step1, lr, beta1, beta2, eps, wd)
+            launch_adamw(fh_adamw, d_emb,  d_demb,  d_mEmb,  d_vEmb,  VOCAB*D,   step1, lr, beta1, beta2, eps, wd)
+            sync_or_die("sync adamw")
+        }
+        t1 = time_now(); ns_badamw = ns_badamw + (t1 - t0)
+
+        // ── F1.3b: MLRIFT_DUMP_PARAMS=/path — dump the 6 post-AdamW param blocks
+        // contiguously (U, V, gate_w, gate_b, bias, embed) to <path> after step
+        // 0's AdamW phase.  Used by the F1 byte-identity check (fused vs legacy).
+        // Same layout for both paths.
+        if step == 0 {
+            u64 pdump_env = sys_getenv("MLRIFT_DUMP_PARAMS")
+            if pdump_env != 0 {
+                u8 c0pd = 0; unsafe { *(pdump_env as u8) -> c0pd }
+                if c0pd != 0 {
+                    u64 nU=K*D*R; u64 nV=K*R*D; u64 nGw=K*D; u64 nGb=K; u64 nBias=D; u64 nEmb=VOCAB*D
+                    u64 PN = nU + nV + nGw + nGb + nBias + nEmb
+                    u64 pbuf = alloc(PN * 4)
+                    u32 pe = 0
+                    u64 off = 0
+                    pe = hipMemcpy(pbuf + off*4, d_U,    nU*4,   2); off = off + nU
+                    if pe == 0 { pe = hipMemcpy(pbuf + off*4, d_V,    nV*4,   2) } off = off + nV
+                    if pe == 0 { pe = hipMemcpy(pbuf + off*4, d_gw,   nGw*4,  2) } off = off + nGw
+                    if pe == 0 { pe = hipMemcpy(pbuf + off*4, d_gb,   nGb*4,  2) } off = off + nGb
+                    if pe == 0 { pe = hipMemcpy(pbuf + off*4, d_bias, nBias*4,2) } off = off + nBias
+                    if pe == 0 { pe = hipMemcpy(pbuf + off*4, d_emb,  nEmb*4, 2) }
+                    if pe == 0 {
+                        u64 pfd = file_open(pdump_env, 1)
+                        if pfd <= 0xFFFFFFFFFFFFF000 {
+                            file_write(pfd, pbuf, PN * 4)
+                            file_close(pfd)
+                            print_str("step-0 params dumped to "); print_str(pdump_env); print_str("\n")
+                        }
+                    } else { print_str("(param D2H failed; skip param dump)\n") }
+                    dealloc(pbuf)
+                }
+            }
+        }
 
         u64 step_t1 = time_now(); ns_total_step = ns_total_step + (step_t1 - step_t0)
         step = step + 1
