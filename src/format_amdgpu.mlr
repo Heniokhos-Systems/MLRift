@@ -8916,100 +8916,380 @@ fn _emit_gemm_f32_grouped_body(uint64 args_desc) {
     uint64 cbranch_end_idx = asm_text_len / 4
     asm_u32_arch(0xBFA20000, 0xBF850000)               // s_cbranch_scc1 patched
 
-    // ── 4. Sentinel body: derive group_idx, load this group's C_ptr from the
-    //    descriptor table, store group_idx into C[0].
+    // ── 4. Real GEMM body (Task 1A.4): same-shape fast-path group resolution,
+    //    full descriptor load, LDS-tiled inner GEMM math (TM=TN=TK=16, RM=RN=1).
     //
-    // 4a. group_idx = tile_id (sentinel uses tile_count=1 per group, so
-    //     tile_id == group_idx directly).  s10 already holds it.
-    //
-    // 4b. desc_offset_bytes = s10 * 88 = s10*64 + s10*16 + s10*8.
-    //     Use s12 / s13 as scratch.
-    //       s_lshl_b32 s12, s10, 6   ; s12 = s10*64
-    //       s_lshl_b32 s13, s10, 4   ; s13 = s10*16
-    //       s_add_u32  s12, s12, s13 ; s12 = s10*80
-    //       s_lshl_b32 s13, s10, 3   ; s13 = s10*8
-    //       s_add_u32  s12, s12, s13 ; s12 = s10*88
-    //   SOP2 prefix s_lshl_b32 = 0x84; src1=0x80+shift, src0=ssrc, sdst=field.
-    //   s_lshl_b32 s12, s10, 6 → (0x84<<24)|(12<<16)|(0x86<<8)|10 = 0x840C860A
-    asm_u32(0x840C860A)
-    //   s_lshl_b32 s13, s10, 4 → (0x84<<24)|(13<<16)|(0x84<<8)|10 = 0x840D840A
-    asm_u32(0x840D840A)
-    //   s_add_u32 s12, s12, s13 → SOP2 op=0x00 (0x80 prefix); (0x80<<24)|(12<<16)|(13<<8)|12
+    // After section 2/3, s10 = tile_id (uniform), s4 = total_tiles.  We now:
+    //   4a. Read group 0's tile_count from descriptor[60] into s8.  Same-shape
+    //       fast-path assumes every group has tile_count == s8.
+    //   4b. Subtract-loop decompose: s10 / s8 = group_idx (→ s11),
+    //       s10 mod s8 = local_tile_id (→ s10).  Implementation: while
+    //       (s10 >= s8) { s10 -= s8; s11 += 1; }.
+    //   4c. desc_addr (s[14:15]) = d_desc (s[2:3]) + s11*88.
+    //   4d. SMEM load: 11 descriptor fields (M, N, K, lda, ldb, ldc, A_ptr,
+    //       B_ptr, C_ptr, acc_flag) into s[16:28] via three b128 + one b32.
+    //   4e. Decompose local_tile_id into (local_m, local_n) by subtract-loop
+    //       against tiles_n (= N >> 4 since M/N are multiples of 16 in same-
+    //       shape fast-path).  Result: s30 = local_n, s11 reused = local_m.
+    //   4f. Compute lane-coords from v0: v3 = lane_n = v0 & 0xF;
+    //       v4 = lane_m = (v0 >> 4) & 0xF.
+    //   4g. K-loop: each iteration loads A panel + B panel into LDS (256 lanes
+    //       cooperative), barrier, 16-iter inner reduce into v_acc (v6),
+    //       barrier, advance kt_base.
+    //   4h. Store v_acc to C[global_m, global_n] respecting acc_flag.
+
+    // ── 4a. Load group-0 tile_count_per_group into s8.
+    //   SMEM b32 sdata_pair=4 → dest s8, sbase_pair=1 → s[2:3], imm_off=60.
+    asm_s_load_b32(4, 1, 60)
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // ── 4b. Subtract-loop divide: s10 / s8 → quotient s11, remainder s10.
+    //   s_mov_b32 s11, 0
+    asm_u32_arch(0xBE8B0080, 0xBE8B0380)
+    //   .Ldiv_loop:
+    uint64 div_loop_idx = asm_text_len / 4
+    //   s_cmp_lt_u32 s10, s8     ; SCC = (s10 < s8)
+    asm_u32(0xBF0A080A)
+    //   s_cbranch_scc1 +3        ; if SCC, jump out of loop
+    asm_u32_arch(0xBFA20003, 0xBF850003)
+    //   s_sub_u32 s10, s10, s8   ; SOP2 op=0x01 (gfx11).  Encoding: top byte 0x80
+    //     (since op high bits 0b000000), byte2 = 0x80 | sdst (since op low bit = 1).
+    //     For sdst=10: byte2 = 0x8A.  byte1 = ssrc1 = s8 = 0x08.  byte0 = s10 = 0x0A.
+    //     word = 0x80_8A_08_0A = 0x808A080A.
+    asm_u32(0x808A080A)
+    //   s_add_u32 s11, s11, 1    ; SOP2 op=0x00 (gfx11).  Top byte 0x80, byte2 top bit 0.
+    //     byte2 = sdst = 0x0B, byte1 = inline 1 = 0x81, byte0 = s11 = 0x0B.
+    //     word = 0x800B810B.
+    asm_u32(0x800B810B)
+    //   s_branch -5 (back to .Ldiv_loop)
+    uint64 div_back_at = asm_text_len / 4
+    uint64 div_back_simm = div_loop_idx - (div_back_at + 1)
+    asm_s_branch(div_back_simm & 0xFFFF)
+    // Now: s10 = local_tile_id, s11 = group_idx.
+
+    // ── 4c. desc_offset_bytes = s11 * 88 = s11*64 + s11*16 + s11*8.
+    //   s_lshl_b32 s12, s11, 6 → (0x84<<24)|(12<<16)|(0x86<<8)|11 = 0x840C860B
+    asm_u32_arch(0x840C860B, 0x8F0C860B)
+    //   s_lshl_b32 s13, s11, 4 → 0x840D840B
+    asm_u32_arch(0x840D840B, 0x8F0D840B)
+    //   s_add_u32 s12, s12, s13
     asm_u32(0x800C0D0C)
-    //   s_lshl_b32 s13, s10, 3 → (0x84<<24)|(13<<16)|(0x83<<8)|10 = 0x840D830A
-    asm_u32(0x840D830A)
+    //   s_lshl_b32 s13, s11, 3 → 0x840D830B
+    asm_u32_arch(0x840D830B, 0x8F0D830B)
     //   s_add_u32 s12, s12, s13
     asm_u32(0x800C0D0C)
 
-    // 4c. desc_addr (s[14:15]) = d_desc (s[2:3]) + desc_offset (s12, zero-extended).
-    //       s_add_u32  s14, s2, s12     ; low
-    //       s_addc_u32 s15, s3, 0       ; high (with carry from above)
-    //   s_add_u32: (0x80<<24)|(14<<16)|(12<<8)|2 = 0x800E0C02
+    // 4c (cont). desc_addr (s[14:15]) = s[2:3] + s12.
+    //   s_add_u32 s14, s2, s12
     asm_u32(0x800E0C02)
-    //   s_addc_u32: SOP2 op=0x04 → 0x82 prefix; (0x82<<24)|(15<<16)|(0x80<<8)|3
-    //     = 0x820F8003   (src1=0x80 = inline-const 0).  Adds SCC carry from
-    //     the preceding s_add_u32, giving full 64-bit base+offset arithmetic.
+    //   s_addc_u32 s15, s3, 0
     asm_u32(0x820F8003)
 
-    // 4d. SMEM load: s[16:17] = *(desc_addr + 40)  — C_ptr lives at offset 40.
-    //   s_load_b64 sdata_pair=8 (s16/2), sbase_pair=7 (s14/2), imm_off=40.
-    asm_s_load_b64_off(8, 7, 40)
+    // ── 4d. Load full descriptor from s[14:15]+0..51 into s[16:28].
+    //   Three b128 loads cover bytes 0..47:
+    //     s[16:19] = (M,N,K,lda)        from off  0   sdata_pair=8,  sbase_pair=7
+    //     s[20:23] = (ldb,ldc,A_lo,A_hi) from off 16   sdata_pair=10, sbase_pair=7
+    //     s[24:27] = (B_lo,B_hi,C_lo,C_hi) from off 32 sdata_pair=12, sbase_pair=7
+    //   One b32 load for acc_flag at off 48:
+    //     s28 = acc_flag               from off 48   sdata_pair=14, sbase_pair=7
+    //   SMEM b128 encoding: word1 = (0x3D<<26)|(0x02<<18)|(sdata<<7)|sbase;
+    //                       word2 = (0x7C<<25)|imm_off.
+    //   For sdata=8, sbase=7: word1 = 0xF4080407.  Off 0 → 0xF8000000.
+    asm_u32(0xF4080407); asm_u32(0xF8000000)         // s_load_b128 s[16:19], s[14:15], 0
+    //   sdata=10, sbase=7: word1 = 0xF4080507.  Off 16 → 0xF8000010.
+    asm_u32(0xF4080507); asm_u32(0xF8000010)         // s_load_b128 s[20:23], s[14:15], 16
+    //   sdata=12, sbase=7: word1 = 0xF4080607.  Off 32 → 0xF8000020.
+    asm_u32(0xF4080607); asm_u32(0xF8000020)         // s_load_b128 s[24:27], s[14:15], 32
+    //   b32 sdata=14, sbase=7, off 48: word1 = (0x3D<<26)|(0x00<<18)|(14<<7)|7 = 0xF4000707.
+    asm_u32(0xF4000707); asm_u32(0xF8000030)         // s_load_b32 s28, s[14:15], 48
     asm_s_waitcnt_lgkmcnt_zero()
+    // Now: s16=M, s17=N, s18=K, s19=lda, s20=ldb, s21=ldc,
+    //      s[22:23]=A_ptr, s[24:25]=B_ptr, s[26:27]=C_ptr, s28=acc_flag.
 
-    // ── 5. Lane-0-of-wave-0 store of group_idx (s10) into C_ptr[0..3].
-    //   Lane-0 mask again — keeps the store single-issue.
+    // ── 4e. Decompose local_tile_id (s10) into (local_m, local_n) via
+    //   subtract-loop against tiles_n = N >> 4.
+    //   s_lshr_b32 s8, s17, 4   ; s8 = tiles_n  (reuse s8 since tile_count_per_group no longer needed)
+    asm_u32_arch(0x85088411, 0x90088411)
+    //   s_mov_b32 s30, 0        ; s30 = local_n counter? No, want s30=local_n FINAL.
+    //   Actually we want quotient = local_m (s30 final = local_m*16 via shift),
+    //   remainder = local_n.  Subtract-loop semantics: while (s10 >= s8) {
+    //     s10 -= s8; s_quot += 1; }
+    //   After loop: s_quot = local_m, s10 = local_n.
+    //   Store quotient in s29 (we'll multiply by 16 later for the row origin).
+    //   s_mov_b32 s29, 0
+    asm_u32_arch(0xBE9D0080, 0xBE9D0380)
+    //   .Lmn_loop:
+    uint64 mn_loop_idx = asm_text_len / 4
+    //   s_cmp_lt_u32 s10, s8
+    asm_u32(0xBF0A080A)
+    //   s_cbranch_scc1 +3
+    asm_u32_arch(0xBFA20003, 0xBF850003)
+    //   s_sub_u32 s10, s10, s8  (top byte 0x80, byte2 = 0x80|sdst = 0x8A)
+    asm_u32(0x808A080A)
+    //   s_add_u32 s29, s29, 1   → 0x801D811D
+    asm_u32(0x801D811D)
+    //   s_branch -5
+    uint64 mn_back_at = asm_text_len / 4
+    uint64 mn_back_simm = mn_loop_idx - (mn_back_at + 1)
+    asm_s_branch(mn_back_simm & 0xFFFF)
+    // Now: s29 = local_m, s10 = local_n.
+
+    // s30 = local_n  (save s10 to s30 since s10 will be re-broadcast next iter).
+    //   s_mov_b32 s30, s10
+    asm_u32_arch(0xBE9E000A, 0xBE9E030A)
+
+    // Compute scalar tile origins:
+    //   s29 = local_m * 16  (overwrite — was just local_m, becomes the m-origin)
+    //   s30 = local_n * 16
+    //   SOP2 s_lshl_b32: op=0x08 gfx11 (top byte 0x84, byte2 top bit = 0).
+    //   For sdst=29: byte2 = 0x1D.  ssrc1 = inline 4 = 0x84.  ssrc0 = s29 = 0x1D.
+    //   word = 0x84_1D_84_1D = 0x841D841D.  gfx10 op=0x1E → top byte 0x8F.
+    asm_u32_arch(0x841D841D, 0x8F1D841D)             // s_lshl_b32 s29, s29, 4
+    asm_u32_arch(0x841E841E, 0x8F1E841E)             // s_lshl_b32 s30, s30, 4
+
+    // ── 4f. Per-lane coords from v0 (linear tid 0..255 for block=(256,1,1)).
+    //   v3 = lane_n = v0 & 0xF
+    //     VOP2 v_and_b32 v3, 15, v0: op=0x1B, vdst=3, src0=0x8F (inline 15), src1=v0(=0).
+    //     word = (0x1B<<25)|(3<<17)|(0<<9)|0x8F = 0x3606008F
+    asm_u32(0x3606008F)
+    //   v4 = lane_m = (v0 >> 4) & 0xF  →  but we can just shift right by 4 since
+    //   v0 ∈ [0,255] and the top 4 bits of an 8-bit value are exactly the
+    //   "lane_m" field.  v_lshrrev_b32 v4, 4, v0.
+    //     gfx11: op=0x19 (byte3 = 0x32).  vdst=4, src1=v0, src0=inline 4 = 0x84.
+    //     byte3 = 0x32, byte2 = (vdst[6..0]=0000100 << 1) | 0 = 0x08,
+    //     byte1 = (v0[6..0]=0 << 1) | 0 = 0x00, byte0 = 0x84.  word = 0x32080084.
+    //     gfx10: op=0x16 → byte3 = 0x2C.  word = 0x2C080084.
+    asm_u32_arch(0x32080084, 0x2C080084)
+
+    // ── 4f (cont). Precompute per-lane LDS offsets + global_m / global_n.
+    //   v5 = (v4*16 + v3) * 4   (cooperative-load LDS offset for both A and B panels;
+    //        A panel starts at LDS[0], B panel at LDS[0x400]).
+    //     v_lshlrev_b32 v5, 4, v4   gfx11:(0x30<<24)|(5<<17)|(0x84<<9)|(0x100|4) = 0x300A0884...
+    //     Actually: VOP2 op=0x14 (0x28 prefix gfx11? wait lshlrev is op=0x18 like lshrrev).
+    //     Single-GEMM line 8668: 0x300A0284 gfx11 / 0x340A0284 gfx10.  Decode:
+    //       0x300A0284 = (0x18<<25)|(5<<17)|(1<<9)|0x84 — but src1=v1=1, src0=4 inline.
+    //     For my case I want src1=v4: word = (0x18<<25)|(5<<17)|(4<<9)|0x84
+    //                                       = 0x30000000|0xA0000|0x800|0x84 = 0x300A0884
+    //     gfx10: same low bits, op encodes differently — actually gfx10 has v_lshlrev_b32 at 0x1A
+    //     so prefix 0x34: 0x340A0884.
+    asm_u32_arch(0x300A0884, 0x340A0884)             // v_lshlrev_b32 v5, 4, v4
+    //   v_add_nc_u32 v5, v5, v3   (stable: 0x4A<<24 prefix, op=0x25)
+    //     word = (0x4A<<24)|(5<<17)|(3<<9)|(0x100|5) = 0x4A0A0705
+    //     But VOP2 src0 for VGPR uses 0x100+N; v5 → 0x105.  src1 also VGPR-only at bits [16:9].
+    //     Actually VOP2 src1 field is 8 bits and ONLY accepts VGPRs (0..255 raw).
+    //     src1=v3 → 3.  vdst=5 → bits [24:17]=5.
+    //     word = (0x4A<<24)|(5<<17)|(3<<9)|0x105 = 0x4A0A0705 |0x100 → 0x4A0A0705 is wrong.
+    //     Let me redo: 0x4A=0100_1010, so (0x4A<<24) = 0x4A000000.  vdst=5 → 5<<17 = 0xA0000.
+    //     src1=3 → 3<<9 = 0x600.  src0=v5 → 0x105.  Sum = 0x4A0A0705.
+    asm_u32(0x4A0A0705)
+    //   v_lshlrev_b32 v5, 2, v5   gfx11 op 0x18 (0x30 prefix), src0=2 inline = 0x82.
+    //     word = (0x18<<25)|(5<<17)|(5<<9)|0x82 = 0x300A0A82  (matches single-GEMM line 8670)
+    asm_u32_arch(0x300A0A82, 0x340A0A82)             // v_lshlrev_b32 v5, 2, v5
+
+    //   v17 = v4 * 64  (inner-reduce A LDS base = LDS_A[lane_m, 0] in dwords scaled)
+    //     v_lshlrev_b32 v17, 6, v4   src0=6 inline = 0x86, src1=v4=4, vdst=17.
+    //     word = (0x18<<25)|(17<<17)|(4<<9)|0x86 = 0x30220886  (single-GEMM line 8671 uses v1
+    //     instead of v4 because in its ABI v1 holds lane_m; we use v4)
+    asm_u32_arch(0x30220886, 0x34220886)             // v_lshlrev_b32 v17, 6, v4
+
+    //   v18 = v3 * 4 + 0x400   (inner-reduce B LDS base = LDS_B[0, lane_n] starting at 0x400)
+    //     v_lshlrev_b32 v18, 2, v3   src0=2=0x82, src1=v3=3, vdst=18.
+    //     word = (0x18<<25)|(18<<17)|(3<<9)|0x82 = 0x30240682
+    asm_u32_arch(0x30240682, 0x34240682)             // v_lshlrev_b32 v18, 2, v3
+    //   v_add_nc_u32_e64 v18, v18, 0x400   (VOP3 stable: matches single-GEMM line 8673)
+    asm_u32(0xD5250012); asm_u32(0x0001FF12); asm_u32(0x00000400)
+
+    //   v7 = global_m = s29 + lane_m (v4)
+    //     v_add_nc_u32 v7, s29, v4  → (0x4A<<24)|(7<<17)|(4<<9)|29 = 0x4A0E081D
+    asm_u32(0x4A0E081D)
+    //   v8 = global_n = s30 + lane_n (v3)
+    //     v_add_nc_u32 v8, s30, v3  → (0x4A<<24)|(8<<17)|(3<<9)|30 = 0x4A10061E
+    asm_u32(0x4A10061E)
+
+    //   v6 = v_acc = 0  (per-lane f32 accumulator).
+    asm_v_mov_b32_inline_u(6, 0)
+
+    // ── 4g. K-loop setup.
+    //   s31 = K_tiles_count = K (s18) >> 4
+    asm_u32_arch(0x851F8412, 0x901F8412)             // s_lshr_b32 s31, s18, 4
+    //   s12 = kt counter = 0
+    asm_u32_arch(0xBE8C0080, 0xBE8C0380)
+    //   .LK_loop:
+    uint64 k_loop_idx = asm_text_len / 4
+
+    //   s9 = kt_base_K = s12 * 16  (scalar; advances by 16 per K iter)
+    //   sdst=9 → byte2 = 0x09 (top bit 0 since s_lshl_b32 op-low-bit = 0).
+    //   ssrc1 = inline 4 = 0x84.  ssrc0 = s12 = 0x0C.  word = 0x84_09_84_0C.
+    asm_u32_arch(0x8409840C, 0x8F09840C)             // s_lshl_b32 s9, s12, 4
+
+    //   Cooperative load A: lane reads A[global_m, kt_base + lane_n].
+    //     a_off (elements) = v7 * lda + (s9 + v3) = v7*s19 + s9 + v3
     //
-    // OOB-clamp pad-lane guard: hoist v_mov_b32 v3, s10 (data) and
-    // v_mov_b32 v1, 0 (vaddr offset) OUT of the lane-0 EXEC mask so all 256
-    // lanes have safe values before global_store_b32 fires.  gfx11 coalescer
-    // reads inactive lanes' v1 for address computation — uninitialized v1
-    // would page-fault.
-    //   v_mov_b32 v3, s10     ; data to store = group_idx (every lane)
-    //   VOP1 v_mov_b32 vdst, src0 where src0=SGPR_N encodes as N (0..127).
-    asm_v_mov_b32(3, 10)
-    //   v_mov_b32 v1, 0       ; vaddr=0 (every lane)
-    asm_v_mov_b32_inline_u(1, 0)
-    //   s_delay_alu instid0(VALU_DEP_1) — VALU→VMEM hazard guard before store.
+    //   v11 = v7 * s19 (lda)   VOP3 v_mul_lo_u32 gfx11 op=0x12C → 0xD72C; gfx10 op=0xA9 → 0xD569.
+    //     Matches single-GEMM line 8680 except src0=v7, src1=s19 (the operand order in VOP3
+    //     is src0, src1, src2; here we want v_mul_lo_u32 v11, v7, s19).
+    //     word1 = (0xD72C<<16) | (vdst=11<<0) wait — VOP3 layout:
+    //       word1 = 0xD7000000 | (op<<16) | (clamp_etc) | (vdst&0xFF)
+    //       For op=0x12C: 0xD7000000 + (0x12C<<16) = 0xD7000000 + 0x12C0000 = 0xD92C0000?
+    //     Actually VOP3 op field is 10 bits at [25:16]: 0x12C → bits 25:16 = 0x12C.
+    //       word1 = (0x35<<26 — VOP3 prefix) ... hmm.  Let me match single-GEMM line 8680
+    //       which produces `v_mul_lo_u32 v8, v3, s14`: word1=0xD72C0008, word2=0x00001D03.
+    //       Decode: word1 [31:26]=0x35 (VOP3 prefix), [25:16]=0x12C (op), [15:8]=0 (clamp/abs),
+    //               [7:0]=vdst=8.  word2 [31:30]=00, [29:27]=000, [26:23]=mods?,
+    //               [40:32 wait word2]: src2_mod=0, src2=0, neg=0, src1, src0...
+    //   For my v_mul_lo_u32 v11, v7, s19:
+    //     word1 = 0xD72C0000 | 11 = 0xD72C000B
+    //     word2 = (src1=s19<<9 ... wait VOP3 packs src0 [8:0], src1 [17:9], src2 [26:18])
+    //       src0=v7 → 0x107 (VGPR encoding), src1=s19 → 19, src2=0.  word2 = (19<<9)|0x107 = 0x2600 | 0x107 = 0x2707.
+    //       But single-GEMM uses 0x00001D03 for v_mul_lo_u32 v8, v3, s14: src0=v3=0x103, src1=s14=14 → (14<<9)|0x103 = 0x1C00|0x103 = 0x1D03. ✓
+    //     For mine: (19<<9)|0x107 = 0x2600|0x107 = 0x2707.  So word2 = 0x00002707.
+    asm_u32_arch(0xD72C000B, 0xD569000B); asm_u32(0x00002707)
+    //   v_add_nc_u32 v11, s9, v11   (stable VOP2 prefix 0x4A, op=0x25)
+    //     vdst=11, src1=v11=11, src0=s9=9. word = (0x4A<<24)|(11<<17)|(11<<9)|9 = 0x4A161609
+    asm_u32(0x4A161609)
+    //   v_add_nc_u32 v11, v11, v3   word = (0x4A<<24)|(11<<17)|(3<<9)|0x10B = 0x4A16070B
+    asm_u32(0x4A16070B)
+    //   v_lshlrev_b32 v11, 2, v11   (v11 *= 4 to get byte offset)
+    //     src0=2=0x82, src1=v11=11, vdst=11. word=(0x18<<25)|(11<<17)|(11<<9)|0x82 = 0x30161682
+    asm_u32_arch(0x30161682, 0x34161682)
+
+    //   OOB-clamp pad-lane guard: v_addr_a (v11) is now per-lane.  For the
+    //   same-shape fast path (M/N multiples of 16, K multiple of 16), every
+    //   lane has an in-bounds address — no clamp needed.  But we still need
+    //   the s_delay_alu hazard guard before the VMEM consumer.
     asm_s_delay_alu(0x01)
 
-    asm_v_cmp_eq_u32_imm_vgpr(0, 0)
-    asm_s_and_saveexec_b32_vcc_lo(8)                   // reuse s8 for saved exec
-    uint64 store_skip_idx = asm_text_len / 4
-    asm_s_cbranch_execz(0)                             // patched below
+    //   global_load_b32 v13, v11, s[22:23]   saddr-form: word1=0xDC520000,
+    //     word2 = (vdst=13<<24)|(saddr=22<<16)|(data=0<<8)|(vaddr=11) = 0x0D16000B.
+    //     gfx11 only — gfx10 saddr-form encoding is not exercised here; we keep
+    //     the same word so this kernel builds (but won't run correctly) on gfx10.
+    asm_u32(0xDC520000); asm_u32(0x0D16000B)
 
-    //   (v3/v1 already initialized above in ALL lanes; only lane-0 EXECUTES)
-    //   global_store_b32 v1, v3, s[16:17]   ; *(s[16:17] + v1) = v3
-    asm_global_store_b32(1, 3, 16)
-    //   s_waitcnt_vscnt null, 0   ; drain the store
+    //   Cooperative load B: lane reads B[kt_base + lane_m, global_n].
+    //     b_off (elements) = (s9 + v4) * ldb + v8  = (s9+v4)*s20 + v8
+    //   v12 = s9 + v4   (per-lane row in B's row space)
+    //     v_add_nc_u32 v12, s9, v4   word = (0x4A<<24)|(12<<17)|(4<<9)|9 = 0x4A180809
+    asm_u32(0x4A180809)
+    //   v12 = v12 * s20 (ldb)   VOP3 v_mul_lo_u32
+    //     word2 = (s20<<9)|(v12=0x10C) = (20<<9)|0x10C = 0x2800|0x10C = 0x290C
+    asm_u32_arch(0xD72C000C, 0xD569000C); asm_u32(0x0000290C)
+    //   v_add_nc_u32 v12, v12, v8   word = (0x4A<<24)|(12<<17)|(8<<9)|0x10C = 0x4A18110C
+    asm_u32(0x4A18110C)
+    //   v_lshlrev_b32 v12, 2, v12
+    asm_u32_arch(0x30181882, 0x34181882)
+    asm_s_delay_alu(0x01)
+    //   global_load_b32 v14, v12, s[24:25]   word2 = (14<<24)|(24<<16)|0|12 = 0x0E18000C
+    asm_u32(0xDC520000); asm_u32(0x0E18000C)
+
+    //   Wait for both loads, then store A+B into LDS.
+    asm_s_waitcnt_vmcnt_zero()
+    //   ds_store_b32 v5, v13  (offset0=0; this stores A into LDS[v5])
+    //     word1 = 0xD8340000, word2 = (vdata=13<<8)|(vaddr=5) = 0x00000D05.
+    asm_u32(0xD8340000); asm_u32(0x00000D05)
+    //   ds_store_b32 v5, v14, offset:0x400 (stores B into LDS[v5 + 0x400])
+    asm_u32(0xD8340400); asm_u32(0x00000E05)
+    asm_s_waitcnt_lgkmcnt_zero()
+    //   s_barrier — sync all 8 waves so every lane sees LDS A+B panels.
+    asm_u32_arch(0xBFBD0000, 0xBF8A0000)
+    //   buffer_gl0_inv (matches single-GEMM order: barrier THEN gl0_inv)
+    asm_buffer_gl0_inv()
+
+    //   Inner reduce — COPY single-GEMM's inner reduce VERBATIM (lines 8703-8721)
+    //   for f32 op-order byte-equality.  Uses s20 as inner kk counter, v15/v16
+    //   as advancing LDS pointers, v9/v10 as load destinations, v6 as the
+    //   per-lane accumulator.
+    asm_u32_arch(0xBE940080, 0xBE940380)             // s_mov_b32 s20, 0
+    asm_u32     (0x7E1E0311)                          // v_mov_b32 v15, v17
+    asm_u32     (0x7E200312)                          // v_mov_b32 v16, v18
+    uint64 inner_top_idx = asm_text_len / 4
+    asm_u32_arch(0xBF870002, 0xBF800000)             // s_delay_alu (gfx11) / s_nop 0 (gfx10)
+    asm_u32     (0xD8D80000); asm_u32(0x0900000F)    // ds_load_b32 v9, v15
+    asm_u32     (0xD8D80000); asm_u32(0x0A000010)    // ds_load_b32 v10, v16
+    asm_s_waitcnt_lgkmcnt_zero()
+    asm_u32     (0x560C1509)                          // v_fmac_f32 v6, v9, v10
+    asm_u32     (0xD525000F); asm_u32(0x0001090F)    // v_add_nc_u32_e64 v15, v15, 4
+    asm_u32     (0xD5250010); asm_u32(0x00018110)    // v_add_nc_u32_e64 v16, v16, 64
+    asm_u32     (0x80148114)                          // s_add_u32 s20, s20, 1
+    asm_u32     (0xBF0A9014)                          // s_cmp_lt_u32 s20, 16
+    //   s_cbranch_scc1 back to inner_top.  simm = inner_top_idx - (current+1).
+    uint64 inner_back_at = asm_text_len / 4
+    uint64 inner_back_simm = inner_top_idx - (inner_back_at + 1)
+    asm_u32_arch(0xBFA20000 | (inner_back_simm & 0xFFFF),
+                 0xBF850000 | (inner_back_simm & 0xFFFF))
+
+    //   End-of-K-tile sync: barrier so next iter's ds_store doesn't race with
+    //   any lane still mid-ds_load.
+    asm_u32_arch(0xBFBD0000, 0xBF8A0000)             // s_barrier
+    asm_buffer_gl0_inv()
+
+    //   Advance kt counter; loop if more K tiles remain.
+    asm_u32(0x800C810C)                               // s_add_u32 s12, s12, 1
+    asm_u32(0xBF0A1F0C)                               // s_cmp_lt_u32 s12, s31
+    //   s_cbranch_scc1 back to .LK_loop.
+    uint64 k_back_at = asm_text_len / 4
+    uint64 k_back_simm = k_loop_idx - (k_back_at + 1)
+    asm_u32_arch(0xBFA20000 | (k_back_simm & 0xFFFF),
+                 0xBF850000 | (k_back_simm & 0xFFFF))
+    // End of K-loop.  v6 holds the per-lane accumulated dot product.
+
+    // ── 4h. Store v6 to C[global_m, global_n].
+    //   c_off (elements) = v7 * ldc + v8 = v7*s21 + v8
+    //   v19 = v7 * s21   VOP3 v_mul_lo_u32 v19, v7, s21
+    //     word1 = 0xD72C0013, word2 = (s21<<9)|(v7=0x107) = (21<<9)|0x107 = 0x2A00|0x107 = 0x2B07.
+    asm_u32_arch(0xD72C0013, 0xD5690013); asm_u32(0x00002B07)
+    //   v_add_nc_u32 v19, v19, v8   word = (0x4A<<24)|(19<<17)|(8<<9)|0x113 = 0x4A261113
+    asm_u32(0x4A261113)
+    //   v_lshlrev_b32 v19, 2, v19  (byte offset)
+    asm_u32_arch(0x30262682, 0x34262682)
+    asm_s_delay_alu(0x01)
+
+    //   acc_flag handling: if s28 == 0, straight store; else load C, add, store.
+    //     s_cmp_eq_u32 s28, 0   SOPC op=0x06 (gfx11) — actually s_cmp_eq_u32 is op=0x06.
+    //       Prefix 0xBF, op=0x06 → 0xBF06 in top word: word = (0xBF<<24)|(0x06<<16)|(0x80<<8)|28
+    //                                                       = 0xBF06801C
+    //     Inline-const 0 = 0x80 in src1 field.
+    asm_u32(0xBF06801C)
+    //   s_cbranch_scc1 .Lstore_only  (skip load+add if acc_flag==0)
+    uint64 acc_skip_idx = asm_text_len / 4
+    asm_u32_arch(0xBFA20000, 0xBF850000)             // patched below
+
+    //   acc_flag=1 path: load existing C, add to v6.
+    //   global_load_b32 v20, v19, s[26:27]   word2 = (20<<24)|(26<<16)|0|19 = 0x141A0013
+    asm_u32(0xDC520000); asm_u32(0x141A0013)
+    asm_s_waitcnt_vmcnt_zero()
+    //   v_add_f32 v6, v6, v20   VOP2 op=0x03 → prefix 0x06.
+    //     word = (0x06<<24)|(6<<17)|(20<<9)|(0x106) = 0x060C2906
+    //     But VOP2 v_add_f32 src1 is VGPR-only at [16:9], and src0 supports SGPR/VGPR/imm at [8:0].
+    //     vdst=6, src1=v20=20, src0=v6=0x106.
+    //     word = (0x06<<24)|(6<<17)|(20<<9)|0x106 = 0x060C2906
+    asm_u32(0x060C2906)
+
+    //   Patch acc_skip_idx so the branch target is here (after load+add).
+    uint64 acc_after_idx = asm_text_len / 4
+    uint64 acc_skip_simm = acc_after_idx - acc_skip_idx - 1
+    uint64 acc_sccbr_top = 0xBFA20000
+    if _is_gfx10() != 0 { acc_sccbr_top = 0xBF850000 }
+    asm_patch_u32(acc_skip_idx, acc_sccbr_top | (acc_skip_simm & 0xFFFF))
+
+    //   .Lstore_only:  unconditional store of v6 to C.
+    asm_s_delay_alu(0x01)
+    asm_global_store_b32(19, 6, 26)                  // global_store_b32 v19, v6, s[26:27]
     asm_s_waitcnt_vscnt_zero()
 
-    // Patch the store-skip cbranch.
-    uint64 after_store_idx = asm_text_len / 4
-    uint64 store_skip_simm = after_store_idx - store_skip_idx - 1
-    asm_patch_u32(store_skip_idx,
-                  0xBFA50000 | (store_skip_simm & 0xFFFF))
-
-    //   s_or_b32 exec_lo, exec_lo, s8   ; restore exec for all waves
-    asm_u32(0x8C7E087E)
-
-    // ── 6. Back-branch to loop_top: s_branch with negative simm16.
-    //   PC after this branch = current+1; target = loop_top_idx.
+    // ── 5. Back-branch to loop_top: s_branch with negative simm16.
     uint64 s_branch_at = asm_text_len / 4
     uint64 back_simm   = loop_top_idx - (s_branch_at + 1)
     asm_s_branch(back_simm & 0xFFFF)
 
-    // ── 7. .Lend — patch the forward cbranch_scc1 simm16 here.
-    //   s_endpgm
+    // ── 6. .Lend — patch the forward cbranch_scc1 (section 3) simm16 here.
     asm_s_endpgm()
-
-    //   simm = end_dword - (cbranch_end_idx + 1).  end_dword = the s_endpgm.
-    uint64 end_idx = asm_text_len / 4 - 1               // dword index of s_endpgm
+    uint64 end_idx = asm_text_len / 4 - 1
     uint64 sccbr_top = 0xBFA20000
     if _is_gfx10() != 0 { sccbr_top = 0xBF850000 }
     uint64 fwd_simm = end_idx - (cbranch_end_idx + 1)
     asm_patch_u32(cbranch_end_idx, sccbr_top | (fwd_simm & 0xFFFF))
 
-    // ── 8. args descriptor (6 args; matches launch_gemm_grouped kernarg ABI).
+    // ── 7. args descriptor (6 args; matches launch_gemm_grouped kernarg ABI).
     //   All shim slots are 8 bytes wide; declare sizes accordingly so the
     //   AMDHSA metadata matches the on-wire kernarg blob.
     uint64 a0  = args_desc + 0;   unsafe { *(a0  as uint64) = 8 }
@@ -9035,16 +9315,27 @@ fn emit_amdgpu_gemm_f32_grouped_blob(uint64 out_path) -> uint64 {
     // gfx1100 (rsrc1=0xE0AF0001 enables FP32 denormal handling + 1 user-VGPR;
     // rsrc2=0x9E sets USER_SGPR=15 with WG_ID_X in s15; props=0x0408 selects
     // KERNARG_SEGMENT_PTR + WAVEFRONT_SIZE32).  LDS=16384 budgets for the
-    // 64×16 A/B double-buffered panels Task 1A.4 will land — sentinel only
-    // touches LDS[0..3] for the tile_id broadcast slot.
+    // tile_id broadcast slot (LDS[0..3]) + A panel (LDS[0..0x3FF]) + B panel
+    // (LDS[0x400..0x7FF]) — total 2 KiB used out of 16 KiB; 1A.5 will add
+    // double-buffering and lift usage to ~4 KiB.
     //
-    // n_args=6, kernarg_size=48 (six 8-byte shim slots).  sgpr_count=18,
-    // vgpr_count=4 — sized to cover the register footprint above with a
-    // small safety margin (every emitted SGPR is ≤17, every VGPR ≤3).
+    // n_args=6, kernarg_size=48 (six 8-byte shim slots).  sgpr_count=32,
+    // vgpr_count=24 — covers the 1A.4 register footprint (kernel uses s0..s31
+    // and v0..v20 in worst case).
+    //
+    // rsrc1 bumped from 0xE0AF0001 (16/16) → 0xE0AF0082 (32/24) to actually
+    // back the register footprint at HW level (the granulated fields in rsrc1
+    // are what the HW honours; the .sgpr_count/.vgpr_count metadata strings
+    // are documentation only):
+    //   bits [5:0] (GRANULATED_WORKITEM_VGPR_COUNT) = 2  → (2+1)*8 = 24 VGPRs
+    //   bits [9:6] (GRANULATED_WAVEFRONT_SGPR_COUNT) = 2 → 16 + 2*8 = 32 SGPRs
+    // The 1A.3 sentinel only used v0..v3 and s0..s17 so 0xE0AF0001 (16/16)
+    // happened to work (under-allocated VGPRs but the few in use stayed in
+    // bank 0).  1A.4's full inner GEMM body needs the larger allocation.
     uint64 size = emit_amdgpu_code_object_lds("gemm_f32_grouped", 16,
                                                asm_text_buf, asm_text_len,
-                                               48, 8, 18, 4,
-                                               0xE0AF0001, 0x0000009E, 0x00000010, 0x0408,
+                                               48, 8, 32, 24,
+                                               0xE0AF0082, 0x0000009E, 0x00000010, 0x0408,
                                                args_desc, 6,
                                                16384)
 
