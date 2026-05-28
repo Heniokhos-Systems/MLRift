@@ -1083,6 +1083,7 @@ fn main() {
     // call.  Lifetime = full training run (no per-step gpu_malloc/free).
     u64 d_desc_dV    = gpu_malloc(K * 88, "mDescDV")
     u64 d_desc_dU    = gpu_malloc(K * 88, "mDescDU")
+    u64 d_desc_dint  = gpu_malloc(K * 88, "mDescDint")   // F3.2a bwd dinter grouped
     u64 d_desc_fU    = gpu_malloc(K * 88, "mDescFU")     // F2.4 forward-U grouped
     u64 d_desc_fV    = gpu_malloc(K * 88, "mDescFV")     // F2.4 forward-V grouped
     u64 d_cntr_grp   = gpu_malloc(4,      "mCntrGrp")    // shared u32 counter
@@ -1527,36 +1528,77 @@ fn main() {
             // dispatches/sync or the ring back-pressures forever (CP never started).
             sync_or_die("sync bwd_uv view-prep")
             if use_grouped == 1 {
-                // ── Task 1A.7: GROUPED bwd_uv ────────────────────────────────
-                // Stage 1 — per-bank "prep + dx" loop: row_scale + dinter-gemm +
-                // transpose(intk) + dx-accum.  Same per-bank ops as legacy minus
-                // the dV/dU accumulations (those are moved to the 2 grouped
-                // dispatches below).  16 dispatches/view (was 24).
+                // ── Task 1A.7 + F3.2a: GROUPED bwd_uv ────────────────────────
+                // Stage 1a — per-bank prep: row_scale (doutk) + transpose(intk).
+                //   These feed the grouped dinter (Stage 1b) and the grouped dV
+                //   (Stage 2).  No GEMM here — both heavy contractions are grouped.
                 u64 kk = 0
                 while kk < K {
-                    u64 d_dxv_off  = d_dxv                          // dx[BS,D] (shared)
                     u64 d_intk     = d_inter_kr + kk*BS*R*4         // raw inter_k [BS,R]
                     u64 d_doutk_k  = d_doutk    + kk*BS*D*4         // doutk_k [BS,D]
                     u64 d_alphak   = d_alphaT   + kk*BS*4           // alpha_k [BS]
-                    u64 d_VkT_k    = d_VkT      + kk*D*R*4          // V_k^T [D,R]
-                    u64 d_UkT_k    = d_UkT      + kk*R*D*4          // U_k^T [R,D]
                     u64 d_interT_k = d_interT   + kk*R*BS*4         // inter_k^T [R,BS]
-                    u64 d_dinter_k = d_dinter   + kk*BS*R*4         // dinter_k [BS,R]
                     // doutk_k = alpha_k · dz   (α applied ONCE here)
                     launch_row_scale(fh_rscale, d_dzv, d_alphak, d_doutk_k, BS*D, D)
-                    // dinter_k[BS,R] = doutk_k[BS,D] · V_k^T[D,R]
-                    launch_gemm(fh_gemm, d_doutk_k, d_VkT_k, d_dinter_k, BS, R, D)
                     // inter_k[BS,R] → inter_k^T[R,BS] (consumed by grouped dV below)
                     launch_transpose(fh_transp, d_intk, d_interT_k, BS, R)
-                    // dx[BS,D] += dinter_k[BS,R] · U_k^T[R,D]  (in-order serial += OK)
-                    launch_gemm_accum(fh_gaccum, d_dinter_k, d_UkT_k, d_dxv_off, BS, D, R)
                     kk = kk + 1
                 }
-                // Sync to ensure interT_k + doutk_k + dinter_k are all materialised
-                // before the grouped dispatches read them (the grouped kernel is a
-                // separate hipModuleLaunchKernel and the in-order AQL queue makes
-                // this redundant in principle, but we sync here to match the legacy
-                // path's per-view sync boundary for fair timing).
+                sync_or_die("sync bwd_uv prep (doutk+interT)")
+
+                // Stage 1b — F3.2a GROUPED dinter: collapse the 4 per-bank
+                // launch_gemm (M=BS=128 N=R=32 K=D=384, grid=16 / 27% occupancy)
+                // into ONE full-occupancy persistent-WG grouped dispatch.
+                //   per-bank: M=BS=128, N=R=32, K=D=384, acc=0 (store), fast-path.
+                //   A_ptr[k] = d_doutk + k*BS*D*4   B_ptr[k] = d_VkT + k*D*R*4
+                //   C_ptr[k] = d_dinter + k*BS*R*4
+                //   lda=D (A=doutk[BS,D])  ldb=R (B=V_kT[D,R])  ldc=R (C=dinter[BS,R])
+                u64 M_di  = alloc(K*4);  u64 N_di  = alloc(K*4);  u64 KK_di = alloc(K*4)
+                u64 LdA_di= alloc(K*4);  u64 LdB_di= alloc(K*4);  u64 LdC_di= alloc(K*4)
+                u64 Ap_di = alloc(K*8);  u64 Bp_di = alloc(K*8);  u64 Cp_di = alloc(K*8)
+                u64 Ac_di = alloc(K*4)
+                u64 kdi = 0
+                while kdi < K {
+                    unsafe { *((M_di  + kdi*4) as u32) = BS }
+                    unsafe { *((N_di  + kdi*4) as u32) = R }
+                    unsafe { *((KK_di + kdi*4) as u32) = D }
+                    unsafe { *((LdA_di+ kdi*4) as u32) = D }    // A=doutk [BS,D] lda=K=D
+                    unsafe { *((LdB_di+ kdi*4) as u32) = R }    // B=V_kT  [D,R]  ldb=N=R
+                    unsafe { *((LdC_di+ kdi*4) as u32) = R }    // C=dinter[BS,R] ldc=N=R
+                    unsafe { *((Ap_di + kdi*8) as u64) = d_doutk + kdi*BS*D*4 }
+                    unsafe { *((Bp_di + kdi*8) as u64) = d_VkT   + kdi*D*R*4 }
+                    unsafe { *((Cp_di + kdi*8) as u64) = d_dinter + kdi*BS*R*4 }
+                    unsafe { *((Ac_di + kdi*4) as u32) = 0 }    // store
+                    kdi = kdi + 1
+                }
+                u64 tot_di_slot = alloc(4); unsafe { *(tot_di_slot as u32) = 0 }
+                build_gemm_grouped_descriptor(d_desc_dint, K,
+                    M_di, N_di, KK_di, LdA_di, LdB_di, LdC_di,
+                    Ap_di, Bp_di, Cp_di, Ac_di, 0, 0, tot_di_slot)
+                u32 tot_di = 0; unsafe { *(tot_di_slot as u32) -> tot_di }
+                launch_gemm_grouped(fh_ggrp, d_desc_dint, K, tot_di, 1, 0, d_cntr_grp)
+                dealloc(M_di);  dealloc(N_di);  dealloc(KK_di)
+                dealloc(LdA_di);dealloc(LdB_di);dealloc(LdC_di)
+                dealloc(Ap_di); dealloc(Bp_di); dealloc(Cp_di)
+                dealloc(Ac_di); dealloc(tot_di_slot)
+                // dinter must be materialised before the per-bank dx accum + the
+                // grouped dU (Stage 3) read it.
+                sync_or_die("sync bwd_uv grouped dinter")
+
+                // Stage 1c — per-bank dx accum (serial, in-order queue).
+                //   dx[BS,D] += dinter_k[BS,R] · U_k^T[R,D].  dx is SHARED across
+                //   the 4 banks AND already holds the gate-bwd contribution
+                //   (launch_gate_bwd_bs wrote it pre-loop), so the in-order serial
+                //   += is the correct, bit-exact reduction.  Kept un-grouped in
+                //   F3.2a (grouping needs per-bank scratch + an add-into reduce;
+                //   deferred to F3.2b — dinter alone is the under-occupied win).
+                u64 kx = 0
+                while kx < K {
+                    u64 d_dinter_k = d_dinter + kx*BS*R*4           // dinter_k [BS,R]
+                    u64 d_UkT_k    = d_UkT    + kx*R*D*4            // U_k^T [R,D]
+                    launch_gemm_accum(fh_gaccum, d_dinter_k, d_UkT_k, d_dxv, BS, D, R)
+                    kx = kx + 1
+                }
                 sync_or_die("sync bwd_uv grouped-prep")
 
                 // Stage 2 — grouped dV: dV_k[R,D] += inter_k^T[R,BS] @ doutk_k[BS,D]
