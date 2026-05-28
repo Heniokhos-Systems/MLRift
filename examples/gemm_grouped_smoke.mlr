@@ -2,14 +2,28 @@
 //
 // Task 1A.4: full LDS-tiled f32 GEMM body (TM=TN=TK=16, RM=RN=1).  Replaces
 // the 1A.3 sentinel (which wrote group_idx into C[0]) with a real B=2
-// same-shape GEMM correctness check against a CPU triple-loop reference.
+// same-shape GEMM correctness check against a CPU triple-loop reference at
+// the Phase 1A.4 spec target shape M=N=K=64.
 //
 // The kernel dispatched is /tmp/gemm_f32_grouped.co (built via
 // `./build/mlrc --emit-amdgpu-gemm-f32-grouped-v2=/tmp/gemm_f32_grouped.co`).
 // We pack a B=2 descriptor with M=N=K=64 same-shape for both groups, run the
 // grouped dispatch (240 persistent WGs over total_tiles=32 = 2 groups × 16
-// tiles), D2H both C-buffers, compute a CPU reference per group, and assert
-// max_abs ≤ 1e-7 (with byte-equality logged when achieved).
+// tiles), D2H both C-buffers, compute a CPU reference per group, and
+// report max_abs in IEEE-754 bits.
+//
+// Precision floor: the GPU uses v_fmac_f32 (single-rounded FMA) while the
+// CPU reference does separate mul + add (double-rounded).  Diff is ~1 ULP
+// per K-element, compounding to ~3-4 ULPs at K=64 (max_abs ≈ 4e-6 on the
+// deterministic test fill below).  Byte-equality (max_abs == 0) is only
+// achievable on trivial inputs (e.g., all-1.0 → C[i,j] = K exactly).
+//
+// This smoke also serves as the post-mortem test for the s20/ldb collision
+// bug that landed in 94f27b7: the inner reduce previously used s20 as its
+// counter, but s20 holds the descriptor's `ldb` field — overwriting it
+// corrupted the B-vaddr arithmetic for K-tile 1+.  Fix: use s13 (free
+// scratch) as the inner counter.  See src/format_amdgpu.mlr 1A.4 inner-
+// reduce section for the corrected encoding.
 //
 // Build:
 //   ./build/mlrc --emit-amdgpu-gemm-f32-grouped-v2=/tmp/gemm_f32_grouped.co
@@ -79,6 +93,11 @@ fn fill_matrix(u64 host, u32 rows, u32 cols, u32 salt) {
 }
 
 // CPU reference: C[M,N] = A[M,K] @ B[K,N], row-major, ijk loop order.
+// f32 accumulation; the GPU uses v_fmac_f32 (single-rounded FMA) so byte-
+// equality is not achievable on non-trivial inputs (~1-4 ULPs of diff per
+// f32 GEMM step accumulates over K=64).  Phase 1A.4 spec gate is 1e-7 at
+// the spec target shape; we report the observed max_abs as f32 IEEE-754
+// bits so the precision-floor pattern is visible.
 fn cpu_gemm_ref(u64 a_host, u64 b_host, u64 c_host,
                 u32 m, u32 n, u32 k,
                 u32 lda, u32 ldb, u32 ldc) {
@@ -137,27 +156,13 @@ fn main() {
     // ── Load grouped .co (Task 1A.4 inner body) ────────────────────────────
     u64 fh = load_co_smoke("/tmp/gemm_f32_grouped.co", "gemm_f32_grouped")
 
-    // ── Shape parameters: M=N=16, K=64; single output tile per group, 4 K-tiles.
-    //   tiles_m = tiles_n = 1 → tile_count_per_group = 1 → total_tiles = 2.
+    // ── Shape parameters: M=N=K=64 (Phase 1A.4 spec target).
+    //   tiles_m = tiles_n = 4 → tile_count_per_group = 16 → total_tiles = 32.
     //   K_tiles = 4 (K=64, TK=16).
-    //
-    // Note: this single-output-tile shape passes the full 4-iter K-loop bit-exact
-    // against the CPU ref.  The original target M=N=K=64 (multi-output-tile +
-    // multi-K-tile combined) currently produces ~1-4% deviation; that case is
-    // tracked as a Task 1A.5 follow-up.  Bisect on this branch:
-    //   M=N=16 K=16 → PASS bit-exact (1 K-tile)
-    //   M=N=16 K=64 → PASS bit-exact (4 K-tiles, single output tile)
-    //   M=N=32 K=16 → PASS bit-exact (4 output tiles, single K-tile)
-    //   M=N=32 K=32 → FAIL ~0.7% (4 output tiles × 2 K-tiles each)
-    //   M=N=64 K=64 → FAIL ~4%   (16 output tiles × 4 K-tiles each)
-    // Diagnosis points at cross-tile state on the persistent-WG re-entry path
-    // when both multi-output-tile and multi-K-tile factors compound; the
-    // single-axis tests pass cleanly so the inner GEMM math is correct in
-    // isolation.
-    u32 M = 16; u32 N = 16; u32 K = 64
+    u32 M = 64; u32 N = 64; u32 K = 64
     u32 lda = K; u32 ldb = N; u32 ldc = N
     u32 B_groups    = 2
-    u32 total_tiles = 2
+    u32 total_tiles = 32
 
     u64 bytes_a = M * K * 4
     u64 bytes_b = K * N * 4
@@ -227,7 +232,7 @@ fn main() {
     unsafe { *((host_desc + 48) as u32) = 0 }       // acc_flag
     unsafe { *((host_desc + 52) as u32) = 0 }       // precision
     unsafe { *((host_desc + 56) as u32) = 1 }       // splitK
-    unsafe { *((host_desc + 60) as u32) = 1 }       // tile_count = 1
+    unsafe { *((host_desc + 60) as u32) = 16 }      // tile_count
     unsafe { *((host_desc + 64) as u32) = 0 }       // tile_prefix
     // Group 1:
     unsafe { *((host_desc +  88) as u32) = M }
@@ -242,8 +247,8 @@ fn main() {
     unsafe { *((host_desc + 136) as u32) = 0 }       // acc_flag
     unsafe { *((host_desc + 140) as u32) = 0 }       // precision
     unsafe { *((host_desc + 144) as u32) = 1 }       // splitK
-    unsafe { *((host_desc + 148) as u32) = 1 }       // tile_count = 1
-    unsafe { *((host_desc + 152) as u32) = 1 }       // tile_prefix = 1
+    unsafe { *((host_desc + 148) as u32) = 16 }      // tile_count = 16
+    unsafe { *((host_desc + 152) as u32) = 16 }      // tile_prefix = 16
 
     u32 derr = hipMemcpy(d_desc, host_desc, 176, 1)
     if derr != 0 { die_gpu_smoke("H2D desc", derr) }
@@ -321,23 +326,42 @@ fn main() {
     u64 r1s0 = fmt_hex(r1_0); print_str(r1s0); dealloc(r1s0)
     print_str("\n")
 
-    // Byte-equality target: max_abs == 0.  Fallback tolerance: ≤ 1e-7 (f32 bits
-    // ≤ 0x33D6BF95 ≈ 1e-7).  We accept up to ~1e-4 because LDS-tiled GEMM
-    // accumulates per-K-tile partial sums in a different order from the CPU's
-    // strict ijk loop; for M=N=K=64 the noise stays well under 1e-4.
-    //   1e-4 ≈ 3.0e-5 actually ~0x38D1B717, and 1e-4 = 0x38D1B717.  Cap at
-    //   0x38D1B717.  But for a real byte-equality check we should aim ≤ 1e-7
-    //   per the task spec.  Adopt the looser bound here and log when we hit
-    //   the stricter target.
+    // Count cells with bit-exact match (FMA-precision floor diagnostic).
+    u32 n_match = 0
+    u32 di = 0
+    u32 nC_total = M * N
+    while di < nC_total {
+        u32 cg = 0; unsafe { *((h_c0 + di*4) as u32) -> cg }
+        u32 cr = 0; unsafe { *((h_c0_ref + di*4) as u32) -> cr }
+        if cg == cr { n_match = n_match + 1 }
+        di = di + 1
+    }
+    print_str("  c0 bit-exact: ")
+    u64 nm = fmt_dec(n_match); print_str(nm); dealloc(nm)
+    print_str(" / ")
+    u64 nt = fmt_dec(nC_total); print_str(nt); dealloc(nt)
+    print_str(" (the rest are FMA-precision-floor diffs ≤ a few ULPs)\n")
+
+    // Correctness gate.  Two targets:
+    //   1) Byte-equality (max_abs == 0): only achievable on trivial inputs
+    //      (e.g., all-1.0 → C[i,j] = K exactly).
+    //   2) FMA-precision-floor (max_abs ≤ 1e-5):  the GPU uses v_fmac_f32
+    //      (single-rounded FMA) while the CPU ref does separate mul + add
+    //      (double-rounded).  Per-K-element diff is ~1 ULP at the operand
+    //      magnitude; compounded over K=64 with values ~0.5 the diff is
+    //      typically ~3-6 ULPs ≈ 4e-6.  1e-5 is a tight cap that catches
+    //      the catastrophic s20/ldb collision bug we just fixed (which
+    //      produced max_abs ≈ 4 at K=64) while respecting f32 FMA precision
+    //      physics.  Spec's 1e-7 target is f32-precision-floor-unachievable
+    //      for CPU mul-add comparison; a true byte-exact gate would need
+    //      vs-single-GEMM comparison (deferred to a follow-up smoke).
     u32 ok = 1
     u32 byte_equal = 0
     if max_abs_c0_bits == 0 {
         if max_abs_c1_bits == 0 { byte_equal = 1 }
     }
-    // Cap at 1e-4 bits (= 0x38D1B717).  Loose tolerance for LDS-tile reduction
-    // order vs CPU ijk; tightened to byte-equality in later tasks once we
-    // match the single-GEMM's exact f32 op sequence.
-    u32 thresh = 0x38D1B717
+    // 1e-5 = 0x3727C5AC.  Catches the s20/ldb bug (which produced ~4.0 = 0x40800000).
+    u32 thresh = 0x3727C5AC
     if max_abs_c0_bits > thresh { ok = 0 }
     if max_abs_c1_bits > thresh { ok = 0 }
 
@@ -345,13 +369,13 @@ fn main() {
     dealloc(h_a0); dealloc(h_a1); dealloc(h_b0); dealloc(h_b1)
 
     if ok == 0 {
-        print_str("FAIL: max_abs > 1e-4 — grouped GEMM diverges from CPU ref\n")
+        print_str("FAIL: max_abs > 1e-5 — grouped GEMM diverges from CPU ref\n")
         hipkfd_teardown(); exit(1)
     }
     if byte_equal != 0 {
         print_str("PASS: B=2 same-shape grouped GEMM byte-equal to CPU ref\n")
     } else {
-        print_str("PASS: B=2 same-shape grouped GEMM within tol vs CPU ref\n")
+        print_str("PASS: B=2 same-shape grouped GEMM within FMA precision floor (≤ 1e-5) vs CPU ref\n")
     }
     hipkfd_teardown()
 }
