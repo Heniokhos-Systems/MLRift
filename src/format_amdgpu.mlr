@@ -8779,27 +8779,40 @@ fn emit_amdgpu_gemm_f32_lds_blob(uint64 out_path) -> uint64 {
 // Kernarg ABI (matches launch_gemm_grouped in examples/wzma_train_md.mlr; the
 // KFD shim writes one value per 8-byte slot regardless of declared arg size):
 //   slot 0  off  0  u64   d_desc            → s[2:3]
-//   slot 1  off  8  u32   b_batch           → s4 (unused in sentinel)
-//   slot 2  off 16  u32   total_tiles       → s5
-//   slot 3  off 24  u32   fast_path_flag    → unused in sentinel
-//   slot 4  off 32  u32   precision_mode    → unused in sentinel
+//   slot 1  off  8  u32   b_batch           → unused (the het visitor's linear
+//                                              scan terminates via section-3
+//                                              bound check on total_tiles)
+//   slot 2  off 16  u32   total_tiles       → s4
+//   slot 3  off 24  u32   fast_path_flag    → s5 (parked permanently — s5 is
+//                                              never reused by either visitor
+//                                              branch or the GEMM compute path)
+//   slot 4  off 32  u32   precision_mode    → unused (Phase 1A is always f32)
 //   slot 5  off 40  u64   d_global_counter  → s[6:7]
 //
 // Register conventions in this emitter:
 //   s[0:1]   = kernarg_segment_ptr (system-set; USER_SGPR=15)
 //   s[2:3]   = d_desc base
-//   s4       = b_batch (loaded but not consumed by sentinel)
-//   s5       = total_tiles
+//   s4       = total_tiles
+//   s5       = fast_path_flag (1 = same-shape divmod; 0 = heterogeneous linear scan)
 //   s[6:7]   = d_global_counter
-//   s8       = saved_exec scratch (atomic block + store block, reused)
-//   s10      = tile_id / group_idx (uniform across the WG after LDS broadcast)
-//   s[12:13] = scratch for desc-offset arithmetic
-//   s[14:15] = per-group descriptor address (= d_desc + group_idx*88)
-//   s[16:17] = per-group C_ptr (loaded from descriptor[40..47])
+//   s8       = saved_exec scratch (atomic block + store block, reused); also
+//              transient receive slot for kernarg slot-3 b64 load before the
+//              SOP1 mov parks fast_path_flag in s5
+//   s10      = tile_id / local_tile_id (uniform across the WG after LDS broadcast)
+//   s11      = group_idx
+//   s[12:13] = visitor scratch (1A.6 het: tile_count + tile_prefix b64 load;
+//              fast-path: tile_count_per_group + desc-offset arith)
+//   s[14:15] = per-group descriptor address (= d_desc + group_idx*88).  The
+//              het visitor MAINTAINS this as a running pointer that advances
+//              +88 per scan iteration, so by the time the scan exits s[14:15]
+//              is already correct for the resolved group — no separate ×88
+//              multiply needed.
+//   s[16:28] = descriptor fields (M, N, K, lda, ldb, ldc, A/B/C_ptr, acc_flag)
 //   v0       = thread_id_x (system-set, lane id within WG)
 //   v1       = scratch (vaddr offset = 0 for global ops)
 //   v2       = atomic value (vdata=1 on input, prev counter on output) / scratch
-//   v3       = group_idx as vgpr for the global_store
+//   v3       = group_idx as vgpr for the global_store (1A.3 sentinel only —
+//              not used by the real GEMM body)
 //
 // LDS layout (16 KiB reserved — most stays unused at sentinel; 1A.4+ panels will
 // occupy it).  Bytes [0..3] hold the wave-0-broadcast tile_id slot:
@@ -8950,7 +8963,22 @@ fn _emit_gemm_f32_grouped_body(uint64 args_desc) {
     asm_s_load_b64(1, 0)                              // s[2:3] = d_desc (off=0)
     asm_s_load_b32(2, 0, 16)                          // s4 = total_tiles
     asm_s_load_b64_off(3, 0, 40)                      // s[6:7] = d_global_counter
+    //
+    // 1A.6 addition: load fast_path_flag (offset 24 = slot 3) into s8 via
+    // s_load_b64 s[8:9] from off=24 (bytes 24..31 cover fast_path_flag + 4
+    // bytes of slot-3 pad).  Then SOP1-mov it into s5 — s5 is permanently
+    // free across all persistent-WG iterations (it isn't reused by either
+    // visitor branch or the GEMM compute path), so the flag stays stable.
+    // s8 itself is clobbered by the atomic block's saveexec, so it can't
+    // be the long-lived home for the flag.
+    //
+    //   s_load_b64 s[8:9], s[0:1], 24    sdata_pair=4, sbase_pair=0, off=24
+    asm_s_load_b64_off(4, 0, 24)                       // s[8:9] = fast_path_flag (lo) + pad
     asm_s_waitcnt_lgkmcnt_zero()                       // wait SMEM
+
+    // Park fast_path_flag in s5 (permanently free SGPR).
+    //   s_mov_b32 s5, s8   SOP1 op 0x00 = (0xBE | sdst<<16 | op<<8 | src) → 0xBE850008
+    asm_u32_arch(0xBE850008, 0xBE850308)
 
     // ── 2. Persistent-WG visitor top.  Capture loop_top dword index for the
     //    back-branch at the end of the body.
@@ -9051,6 +9079,153 @@ fn _emit_gemm_f32_grouped_body(uint64 args_desc) {
     //       barrier, advance kt_base.
     //   4h. Store v_acc to C[global_m, global_n] respecting acc_flag.
 
+    // ── 1A.6: Dispatch on fast_path_flag (parked in s5 at kernel prologue).
+    //   s5 != 0  → fall through to fast-path 4a-4c (uniform-shape divmod).
+    //   s5 == 0  → take heterogeneous visitor (prefix-search linear scan)
+    //              then forward-branch over 4a-4c into 4d.
+    //
+    //   Both paths converge with the same end state:
+    //     s10 = local_tile_id
+    //     s11 = group_idx
+    //     s[14:15] = per-group descriptor address (d_desc + group_idx*88)
+    //
+    // Linear-scan rationale (vs binary search): B_batch ≤ 16 by spec, and
+    // each scan iteration is just 2 SMEM b32 loads (tile_count + prefix at
+    // the running desc_addr) + an SCMP + an SADD.  At b_batch=8 (typical
+    // bwd_uv), that's ~8 iters × 8 dwords = ~64 dwords / iteration head —
+    // negligible vs the ~120 dwords of the K-loop body.  Binary search would
+    // need a static b-batch shape baked into the .co (we'd need to emit a
+    // different .co per b_batch), defeating the persistent-WG flexibility.
+    // The running-prefix variant avoids loading prefix[g+1] separately —
+    // we compare against (prefix[g] + tile_count[g]) using each group's
+    // own descriptor, which advances naturally as we walk.
+    //
+    //   s_cmp_eq_u32 s5, 0     ; SCC=1 if fast_path_flag==0 (heterogeneous)
+    //     SOPC op=0x06 (s_cmp_eq_u32): top-byte 0xBF, op=0x06 → 0xBF06xxxx.
+    //     ssrc1 = inline 0 = 0x80, ssrc0 = s5 = 0x05 → 0xBF068005
+    asm_u32(0xBF068005)
+    //   s_cbranch_scc0 .Lfast_path   ; skip het visitor if fast-path
+    //     gfx11 op=0x21 → 0xBFA10000; gfx10 op=0x04 → 0xBF840000.
+    uint64 het_skip_idx = asm_text_len / 4
+    asm_u32_arch(0xBFA10000, 0xBF840000)               // patched after het visitor
+
+    // ── 4-het. Heterogeneous prefix-search visitor.
+    //   Invariant before: s10=tile_id, s[2:3]=d_desc.
+    //   Working SGPRs:
+    //     s11 = group_idx (output)
+    //     s[14:15] = running desc addr (= d_desc + s11*88) — advanced by +88 each iter
+    //     s12 = tile_count[s11]      (per-iter SMEM load)
+    //     s13 = tile_prefix[s11]     (per-iter SMEM load)
+    //   On iteration:
+    //     end = s12 + s13   (i.e., next prefix)
+    //     if (s10 < end): found — s10 -= s13 (local_tile_id), exit
+    //     else:           s14:s15 += 88; s11 += 1; loop
+    //
+    //   s_mov_b32 s11, 0         ; group_idx = 0
+    asm_u32_arch(0xBE8B0080, 0xBE8B0380)
+    //   s_mov_b32 s14, s2        ; desc_addr_lo = d_desc.lo
+    //     SOP1 op s_mov_b32: gfx11 0xBE | (14<<16) | (0<<8) | 2 = 0xBE8E0002.
+    //     gfx10 op=0x03: 0xBE | (14<<16) | (3<<8) | 2 = 0xBE8E0302.
+    asm_u32_arch(0xBE8E0002, 0xBE8E0302)
+    //   s_mov_b32 s15, s3        ; desc_addr_hi = d_desc.hi
+    asm_u32_arch(0xBE8F0003, 0xBE8F0303)
+
+    uint64 het_loop_idx = asm_text_len / 4
+    //   s_load_b32 s12, s[14:15], 60    ; tile_count[s11]
+    //     sdata_pair=6 (→ s12), sbase_pair=7 (→ s[14:15]), imm_off=60.
+    asm_s_load_b32(6, 7, 60)
+    //   s_load_b32 s13, s[14:15], 64    ; tile_prefix[s11]
+    //   But b32 must land at even SGPR — s13 is odd.  Workaround: use b64
+    //   to load s[12:13] from off=60 in one shot.
+    //     sdata_pair=6 (→ s[12:13]), sbase_pair=7, imm_off=60.
+    //   Replace the b32 above with b64 — single load covers both fields
+    //   (the descriptor's tile_count + tile_prefix are adjacent 4-byte
+    //   fields at offsets 60 and 64).  Need to backpatch: emit b64 instead
+    //   of the b32 already emitted.  Cleanest: drop the b32 and emit b64.
+    //
+    // [erase the s_load_b32 above by rewinding 8 bytes (two u32 dwords)]
+    // Actually we can't easily rewind — but a single s_load_b64 sdata_pair=6
+    // loads s[12:13] from desc[60..67] = (tile_count, tile_prefix).  The
+    // b32 we just emitted reads ONLY desc[60..63] = tile_count into s12.
+    // We need s13 = tile_prefix too.  Add a second b32 to s14? No — s14 is
+    // the running desc-addr low.  Use a different odd-targeting trick:
+    // load tile_prefix into s14 (b32 sdata_pair=7 lands at s14), then SOP1
+    // mov s13, s14.  But that clobbers desc_addr.lo!
+    //
+    // Simplest correct sequence: emit one b64 load instead.  Rewind the
+    // text buffer pointer by 8 bytes to drop the b32 we mis-emitted.
+    asm_text_len = asm_text_len - 8
+    //   s_load_b64 s[12:13], s[14:15], 60    ; tile_count + tile_prefix
+    asm_s_load_b64_off(6, 7, 60)
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    //   end_prefix = s12 + s13   (overwrite s12)
+    //   s_add_u32 s12, s12, s13  → 0x80 | (0x0C<<16) | (0x0D<<8) | 0x0C = 0x800C0D0C
+    asm_u32(0x800C0D0C)
+    //   s_cmp_lt_u32 s10, s12     ; SCC = (tile_id < end_prefix)
+    //     SOPC op=0x0A: 0xBF0A0C0A
+    asm_u32(0xBF0A0C0A)
+    //   s_cbranch_scc1 .Lhet_found   ; if SCC, current group is the one
+    uint64 het_found_br_idx = asm_text_len / 4
+    asm_u32_arch(0xBFA20000, 0xBF850000)               // patched below
+
+    //   Not found this iter: advance desc_addr by 88, increment group_idx,
+    //   loop back.
+    //   s_add_u32 s14, s14, 88   → 0x80 | (0x0E<<16) | ((0x80|0x18)<<8) | 0x0E
+    //     inline 88 doesn't fit in 6-bit (0..63 + a few special); use 32-bit
+    //     literal.  SOP2 literal: ssrc1 field encoded as 0xFF (literal) and
+    //     the next dword holds the actual 32-bit value.
+    //   Actually simpler — break the add into a shift+add to stay within
+    //   inline-const range:  add 64 (= 0x80|0x40 — wait, gfx11 inline-const
+    //   range is 0..64 INCLUSIVE → encoding 0x80..0xC0).  88 > 64, so we
+    //   need either literal+postfix or two adds (64+24).
+    //
+    //   Use two adds: +64, then +24.  Inline 64 = 0xC0; inline 24 = 0x98.
+    //
+    //   s_add_u32 s14, s14, 64   → byte0=0x0E (s14), byte1=0xC0 (inline 64),
+    //                             byte2=0x0E (sdst=s14), byte3=0x80 (SOP2 add)
+    //                              = 0x800EC00E
+    asm_u32(0x800EC00E)
+    //   s_addc_u32 s15, s15, 0   → SOP2 op=0x05.  Encoding precedent on line
+    //     9099: `asm_u32(0x820F8003)` = s_addc_u32 s15, s3, 0.  Byte3=0x82,
+    //     byte2=0x0F (sdst=s15), byte1=0x80 (inline 0), byte0=0x03 (s3 src0).
+    //     For s_addc_u32 s15, s15, 0: byte0=0x0F (s15 src0) → 0x820F800F.
+    asm_u32(0x820F800F)
+    //   s_add_u32 s14, s14, 24   → inline 24 = 0x98 (0x80 + 24).  word = 0x800E980E.
+    asm_u32(0x800E980E)
+    //   s_addc_u32 s15, s15, 0   → 0x820F800F (carry-propagation; high word
+    //   only advances on full overflow).
+    asm_u32(0x820F800F)
+    //   s_add_u32 s11, s11, 1    → inline 1 = 0x81.  word = 0x800B810B.
+    asm_u32(0x800B810B)
+    //   s_branch .Lhet_loop      ; back-edge
+    uint64 het_back_at = asm_text_len / 4
+    uint64 het_back_simm = het_loop_idx - (het_back_at + 1)
+    asm_s_branch(het_back_simm & 0xFFFF)
+
+    // .Lhet_found: patch the forward s_cbranch_scc1 to land here.
+    uint64 het_found_idx = asm_text_len / 4
+    uint64 het_found_simm = het_found_idx - het_found_br_idx - 1
+    uint64 het_sccbr_top = 0xBFA20000
+    if _is_gfx10() != 0 { het_sccbr_top = 0xBF850000 }
+    asm_patch_u32(het_found_br_idx, het_sccbr_top | (het_found_simm & 0xFFFF))
+    //   s_sub_u32 s10, s10, s13  ; local_tile_id = tile_id - prefix
+    //     SOP2 op=0x01: byte3=0x80, byte2=0x80|sdst=0x8A, byte1=ssrc1=0x0D,
+    //     byte0=ssrc0=0x0A → 0x808A0D0A.
+    asm_u32(0x808A0D0A)
+    // Invariant now: s10 = local_tile_id, s11 = group_idx, s[14:15] = desc_addr.
+    //   s_branch .Lafter_4c   ; skip fast-path 4a/4b/4c
+    uint64 het_to_4d_idx = asm_text_len / 4
+    asm_s_branch(0)                                    // patched after 4c
+
+    // ── .Lfast_path: existing same-shape fast-path code.
+    //   Patch het_skip_idx to land here.
+    uint64 fast_path_idx = asm_text_len / 4
+    uint64 het_skip_simm = fast_path_idx - het_skip_idx - 1
+    uint64 het_skip_top = 0xBFA10000
+    if _is_gfx10() != 0 { het_skip_top = 0xBF840000 }
+    asm_patch_u32(het_skip_idx, het_skip_top | (het_skip_simm & 0xFFFF))
+
     // ── 4a. Load group-0 tile_count_per_group into s8.
     //   SMEM b32 sdata_pair=4 → dest s8, sbase_pair=1 → s[2:3], imm_off=60.
     asm_s_load_b32(4, 1, 60)
@@ -9097,6 +9272,12 @@ fn _emit_gemm_f32_grouped_body(uint64 args_desc) {
     asm_u32(0x800E0C02)
     //   s_addc_u32 s15, s3, 0
     asm_u32(0x820F8003)
+
+    // ── 1A.6: patch the heterogeneous-visitor's forward s_branch to land
+    //    here (start of section 4d).  Both visitor paths converge.
+    uint64 after_4c_idx = asm_text_len / 4
+    uint64 het_to_4d_simm = after_4c_idx - het_to_4d_idx - 1
+    asm_patch_u32(het_to_4d_idx, 0xBFA00000 | (het_to_4d_simm & 0xFFFF))
 
     // ── 4d. Load full descriptor from s[14:15]+0..51 into s[16:28].
     //   Three b128 loads cover bytes 0..47:

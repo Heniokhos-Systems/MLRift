@@ -1,29 +1,31 @@
 // gemm_grouped_smoke.mlr — isolated correctness for the grouped GEMM emitter.
 //
-// Task 1A.4: full LDS-tiled f32 GEMM body (TM=TN=TK=16, RM=RN=1).  Replaces
-// the 1A.3 sentinel (which wrote group_idx into C[0]) with a real B=2
-// same-shape GEMM correctness check against a CPU triple-loop reference at
-// the Phase 1A.4 spec target shape M=N=K=64.
+// Two smokes, both gated at the same FMA-precision floor (max_abs ≤ 1e-5)
+// against a CPU f32 reference:
+//
+//   1) smoke_same_shape_B2 (Tasks 1A.4 / 1A.5 gate, retained verbatim)
+//      B=2 same-shape GEMM at M=N=K=64.  Drives the fast-path divmod
+//      visitor (fast_path_flag=1).  Persists as the byte-equality probe
+//      for the b128 vec-load + sw-pipelined K-loop landed in 1A.5.
+//
+//   2) smoke_heterogeneous_B2 (Task 1A.6 gate — new)
+//      B=2 GEMM with DIFFERENT shapes per group:
+//         Group 0: M=32, N=64, K=64  (tile_count=8,  tile_prefix=0)
+//         Group 1: M=64, N=32, K=64  (tile_count=8,  tile_prefix=8)
+//      total_tiles=16, fast_path_flag=0.  Exercises the heterogeneous
+//      prefix-search linear scan inside the visitor.
 //
 // The kernel dispatched is /tmp/gemm_f32_grouped.co (built via
 // `./build/mlrc --emit-amdgpu-gemm-f32-grouped-v2=/tmp/gemm_f32_grouped.co`).
-// We pack a B=2 descriptor with M=N=K=64 same-shape for both groups, run the
-// grouped dispatch (240 persistent WGs over total_tiles=32 = 2 groups × 16
-// tiles), D2H both C-buffers, compute a CPU reference per group, and
-// report max_abs in IEEE-754 bits.
+// We pack a B=2 descriptor per smoke, run the grouped dispatch (240 persistent
+// WGs over total_tiles), D2H each C-buffer, compute a CPU reference per
+// group, and report max_abs in IEEE-754 bits.
 //
 // Precision floor: the GPU uses v_fmac_f32 (single-rounded FMA) while the
 // CPU reference does separate mul + add (double-rounded).  Diff is ~1 ULP
 // per K-element, compounding to ~3-4 ULPs at K=64 (max_abs ≈ 4e-6 on the
 // deterministic test fill below).  Byte-equality (max_abs == 0) is only
 // achievable on trivial inputs (e.g., all-1.0 → C[i,j] = K exactly).
-//
-// This smoke also serves as the post-mortem test for the s20/ldb collision
-// bug that landed in 94f27b7: the inner reduce previously used s20 as its
-// counter, but s20 holds the descriptor's `ldb` field — overwriting it
-// corrupted the B-vaddr arithmetic for K-tile 1+.  Fix: use s13 (free
-// scratch) as the inner counter.  See src/format_amdgpu.mlr 1A.4 inner-
-// reduce section for the corrected encoding.
 //
 // Build:
 //   ./build/mlrc --emit-amdgpu-gemm-f32-grouped-v2=/tmp/gemm_f32_grouped.co
@@ -147,17 +149,15 @@ fn max_abs_diff_bits(u64 ref_buf, u64 got_buf, u32 n_elem) -> u32 {
     return bits
 }
 
-fn main() {
-    print_str("gemm_grouped_smoke (Task 1A.4) — B=2 same-shape GEMM vs CPU ref\n")
+// ─── Smoke 1: B=2 same-shape (Tasks 1A.4 / 1A.5 gate, retained verbatim) ──
+//
+// Returns 0 on PASS, nonzero on FAIL.  Caller decides termination policy
+// (we run multiple smokes and want both to be attempted even if one fails;
+// but we do exit on any FAIL to match the prior single-smoke gate behavior).
+fn smoke_same_shape_B2(u64 fh) -> u32 {
+    print_str("smoke_same_shape_B2 — fast_path_flag=1 (Tasks 1A.4/1A.5 gate)\n")
 
-    // ── Device init ─────────────────────────────────────────────────────────
-    u32 sd_err = hipSetDevice(0)
-    if sd_err != 0 { die_gpu_smoke("hipSetDevice", sd_err) }
-
-    // ── Load grouped .co (Task 1A.4 inner body) ────────────────────────────
-    u64 fh = load_co_smoke("/tmp/gemm_f32_grouped.co", "gemm_f32_grouped")
-
-    // ── Shape parameters: M=N=K=64 (Phase 1A.4 spec target).
+    // Shape parameters: M=N=K=64 (Phase 1A.4 spec target).
     //   tiles_m = tiles_n = 4 → tile_count_per_group = 16 → total_tiles = 32.
     //   K_tiles = 4 (K=64, TK=16).
     u32 M = 64; u32 N = 64; u32 K = 64
@@ -169,7 +169,7 @@ fn main() {
     u64 bytes_b = K * N * 4
     u64 bytes_c = M * N * 4
 
-    // ── VRAM allocations.
+    // VRAM allocations.
     u64 d_a0      = gpu_malloc_smoke(bytes_a, "d_a0")
     u64 d_a1      = gpu_malloc_smoke(bytes_a, "d_a1")
     u64 d_b0      = gpu_malloc_smoke(bytes_b, "d_b0")
@@ -179,13 +179,13 @@ fn main() {
     u64 d_desc    = gpu_malloc_smoke(176,     "d_desc")
     u64 d_counter = gpu_malloc_smoke(4,       "d_counter")
 
-    // ── Host-side A/B fills with distinct salts so per-batch outputs differ.
+    // Host-side A/B fills with distinct salts so per-batch outputs differ.
     u64 h_a0 = alloc(bytes_a); fill_matrix(h_a0, M, K, 0)
     u64 h_a1 = alloc(bytes_a); fill_matrix(h_a1, M, K, 1000)
     u64 h_b0 = alloc(bytes_b); fill_matrix(h_b0, K, N, 5000)
     u64 h_b1 = alloc(bytes_b); fill_matrix(h_b1, K, N, 7777)
 
-    // ── H2D A0/A1/B0/B1.
+    // H2D A0/A1/B0/B1.
     u32 err_a0 = hipMemcpy(d_a0, h_a0, bytes_a, 1)
     if err_a0 != 0 { die_gpu_smoke("H2D a0", err_a0) }
     u32 err_a1 = hipMemcpy(d_a1, h_a1, bytes_a, 1)
@@ -195,7 +195,7 @@ fn main() {
     u32 err_b1 = hipMemcpy(d_b1, h_b1, bytes_b, 1)
     if err_b1 != 0 { die_gpu_smoke("H2D b1", err_b1) }
 
-    // ── Pre-fill C buffers with 0xDEADBEEF so a missing write shows up.
+    // Pre-fill C buffers with 0xDEADBEEF so a missing write shows up.
     u64 c_pad = alloc(bytes_c)
     u32 pi    = 0
     u32 nC    = M * N
@@ -211,7 +211,7 @@ fn main() {
     if err_pc1 != 0 { die_gpu_smoke("H2D c1 pad", err_pc1) }
     dealloc(c_pad)
 
-    // ── Pack the descriptor on host, then H2D.
+    // Pack the descriptor on host, then H2D.
     u64 host_desc = alloc(176)
     u64 zi = 0
     while zi < 176 {
@@ -252,14 +252,14 @@ fn main() {
     unsafe { *((host_desc + 152) as u32) = 16 }      // tile_prefix = 16
 
     u32 derr = hipMemcpy(d_desc, host_desc, 176, 1)
-    if derr != 0 { die_gpu_smoke("H2D desc", derr) }
+    if derr != 0 { die_gpu_smoke("H2D desc (same-shape)", derr) }
     dealloc(host_desc)
 
-    // ── Inline launch (parallels examples/wzma_train_md.mlr launch_gemm_grouped).
+    // Inline launch (parallels examples/wzma_train_md.mlr launch_gemm_grouped).
     //   1) Zero the persistent-WG counter.
     u64 zslot = alloc(4); unsafe { *(zslot as u32) = 0 }
     u32 cerr = hipMemcpy(d_counter, zslot, 4, 1)
-    if cerr != 0 { die_gpu_smoke("H2D counter zero", cerr) }
+    if cerr != 0 { die_gpu_smoke("H2D counter zero (same-shape)", cerr) }
     dealloc(zslot)
     //   2) Pack kernarg ptr table (6 slots × 8 bytes = 48 bytes).
     u64 p0 = alloc(8); unsafe { *(p0 as u64) = d_desc }
@@ -275,31 +275,22 @@ fn main() {
     unsafe { *((kp + 24) as u64) = p3 }
     unsafe { *((kp + 32) as u64) = p4 }
     unsafe { *((kp + 40) as u64) = p5 }
-    //   3) Dispatch: 240 WGs × 256 lanes (full gfx1100 occupancy at LDS=2 KiB
-    //      pre-1A.5; 4 KiB post-1A.5b double-buffer).  Wall-time measurement
-    //      brackets launch + sync; KFD-shim sync is busy-poll on a GTT-resident
-    //      completion signal so the elapsed time is dispatch + GPU runtime +
-    //      poll latency (~100 µs floor) — sufficient resolution to detect
-    //      ≥10 % perf deltas at the 1A.5a/b sub-step granularity.
-    //
-    //      We run the dispatch N_ITERS times and report min (most-stable since
-    //      thermal effects can only ADD time to dispatch).  Best run wins.
+    //   3) Dispatch: 240 WGs × 256 lanes.
     u64 N_ITERS    = 5
     u64 best_ns    = 0xFFFFFFFFFFFFFFFF
     u64 ii         = 0
     while ii < N_ITERS {
-        // Re-zero the persistent counter every iter (atomic_inc is one-way).
         u64 ziter = alloc(4); unsafe { *(ziter as u32) = 0 }
         u32 czerr = hipMemcpy(d_counter, ziter, 4, 1)
-        if czerr != 0 { die_gpu_smoke("H2D counter re-zero", czerr) }
+        if czerr != 0 { die_gpu_smoke("H2D counter re-zero (same-shape)", czerr) }
         dealloc(ziter)
 
         u64 t_start = time_now()
         u32 lerr_i = hipModuleLaunchKernel(fh, 240, 1, 1, 256, 1, 1,
                                            0, 0, kp, 0)
-        if lerr_i != 0 { die_gpu_smoke("launch gemm_f32_grouped", lerr_i) }
+        if lerr_i != 0 { die_gpu_smoke("launch gemm_f32_grouped (same-shape)", lerr_i) }
         u32 serr_i = hipDeviceSynchronize()
-        if serr_i != 0 { die_gpu_smoke("hipDeviceSynchronize", serr_i) }
+        if serr_i != 0 { die_gpu_smoke("hipDeviceSynchronize (same-shape)", serr_i) }
         u64 t_end   = time_now()
         u64 elapsed = t_end - t_start
         if elapsed < best_ns { best_ns = elapsed }
@@ -312,22 +303,21 @@ fn main() {
     print_str(" iters)\n")
     dealloc(p0); dealloc(p1); dealloc(p2); dealloc(p3); dealloc(p4); dealloc(p5); dealloc(kp)
 
-    // ── D2H both C buffers.
+    // D2H both C buffers.
     u64 h_c0 = alloc(bytes_c)
     u64 h_c1 = alloc(bytes_c)
     u32 r0 = hipMemcpy(h_c0, d_c0, bytes_c, 2)
-    if r0 != 0 { die_gpu_smoke("D2H c0", r0) }
+    if r0 != 0 { die_gpu_smoke("D2H c0 (same-shape)", r0) }
     u32 r1 = hipMemcpy(h_c1, d_c1, bytes_c, 2)
-    if r1 != 0 { die_gpu_smoke("D2H c1", r1) }
+    if r1 != 0 { die_gpu_smoke("D2H c1 (same-shape)", r1) }
 
-    // ── CPU reference for both groups.
+    // CPU reference for both groups.
     u64 h_c0_ref = alloc(bytes_c)
     u64 h_c1_ref = alloc(bytes_c)
     cpu_gemm_ref(h_a0, h_b0, h_c0_ref, M, N, K, lda, ldb, ldc)
     cpu_gemm_ref(h_a1, h_b1, h_c1_ref, M, N, K, lda, ldb, ldc)
 
-    // ── Compare against CPU ref (raw bits printed as hex; std/fmt.mlr has no
-    //    f32 formatter so we report IEEE-754 bit patterns instead).
+    // Compare against CPU ref.
     u32 max_abs_c0_bits = max_abs_diff_bits(h_c0_ref, h_c0, M * N)
     u32 max_abs_c1_bits = max_abs_diff_bits(h_c1_ref, h_c1, M * N)
 
@@ -335,19 +325,216 @@ fn main() {
     u64 s0 = fmt_hex(max_abs_c0_bits); print_str(s0); dealloc(s0)
     print_str("  c1 bits=")
     u64 s1 = fmt_hex(max_abs_c1_bits); print_str(s1); dealloc(s1)
+    print_str("\n")
+
+    dealloc(h_c0); dealloc(h_c1); dealloc(h_c0_ref); dealloc(h_c1_ref)
+    dealloc(h_a0); dealloc(h_a1); dealloc(h_b0); dealloc(h_b1)
+
+    // 1e-5 = 0x3727C5AC.  Catches the s20/ldb collision bug (which produced
+    // max_abs ≈ 4.0 = 0x40800000).
+    u32 thresh = 0x3727C5AC
+    u32 ok = 1
+    if max_abs_c0_bits > thresh { ok = 0 }
+    if max_abs_c1_bits > thresh { ok = 0 }
+
+    if ok == 0 {
+        print_str("FAIL (same-shape): max_abs > 1e-5 — grouped GEMM diverges from CPU ref\n")
+        return 1
+    }
+    print_str("PASS (same-shape): B=2 grouped GEMM within FMA precision floor vs CPU ref\n")
+    return 0
+}
+
+// ─── Smoke 2: B=2 heterogeneous (Task 1A.6 gate — new) ────────────────────
+//
+// Group 0: M=32, N=64, K=64  →  tile_count=2*4=8, tile_prefix=0
+// Group 1: M=64, N=32, K=64  →  tile_count=4*2=8, tile_prefix=8
+// total_tiles=16, fast_path_flag=0.
+//
+// Exercises the heterogeneous prefix-search linear scan: tile_ids 0..7 must
+// resolve to group 0 (32-row, 64-col C output), tile_ids 8..15 to group 1
+// (64-row, 32-col C output).  Both C outputs sized differently — same
+// kernel, two distinct tile shapes routed via the visitor.
+fn smoke_heterogeneous_B2(u64 fh) -> u32 {
+    print_str("smoke_heterogeneous_B2 — fast_path_flag=0 (Task 1A.6 gate)\n")
+
+    // Group 0 shapes.
+    u32 M0 = 32; u32 N0 = 64; u32 K0 = 64
+    u32 lda0 = K0; u32 ldb0 = N0; u32 ldc0 = N0
+    // Group 1 shapes.
+    u32 M1 = 64; u32 N1 = 32; u32 K1 = 64
+    u32 lda1 = K1; u32 ldb1 = N1; u32 ldc1 = N1
+
+    u32 B_groups    = 2
+    u32 total_tiles = 16        // 8 + 8
+
+    u64 bytes_a0 = M0 * K0 * 4   // 32*64*4 = 8192
+    u64 bytes_b0 = K0 * N0 * 4   // 64*64*4 = 16384
+    u64 bytes_c0 = M0 * N0 * 4   // 32*64*4 = 8192
+    u64 bytes_a1 = M1 * K1 * 4   // 64*64*4 = 16384
+    u64 bytes_b1 = K1 * N1 * 4   // 64*32*4 = 8192
+    u64 bytes_c1 = M1 * N1 * 4   // 64*32*4 = 8192
+
+    // VRAM allocations — distinct sizes per group.
+    u64 d_a0      = gpu_malloc_smoke(bytes_a0, "d_a0 het")
+    u64 d_a1      = gpu_malloc_smoke(bytes_a1, "d_a1 het")
+    u64 d_b0      = gpu_malloc_smoke(bytes_b0, "d_b0 het")
+    u64 d_b1      = gpu_malloc_smoke(bytes_b1, "d_b1 het")
+    u64 d_c0      = gpu_malloc_smoke(bytes_c0, "d_c0 het")
+    u64 d_c1      = gpu_malloc_smoke(bytes_c1, "d_c1 het")
+    u64 d_desc    = gpu_malloc_smoke(176,      "d_desc het")
+    u64 d_counter = gpu_malloc_smoke(4,        "d_counter het")
+
+    // Host-side A/B fills — different salts than smoke 1 so any data
+    // bleed-through (e.g., d_a0 reused with stale contents) would surface.
+    u64 h_a0 = alloc(bytes_a0); fill_matrix(h_a0, M0, K0, 222)
+    u64 h_a1 = alloc(bytes_a1); fill_matrix(h_a1, M1, K1, 3333)
+    u64 h_b0 = alloc(bytes_b0); fill_matrix(h_b0, K0, N0, 44444)
+    u64 h_b1 = alloc(bytes_b1); fill_matrix(h_b1, K1, N1, 55555)
+
+    // H2D A0/A1/B0/B1.
+    u32 e_a0 = hipMemcpy(d_a0, h_a0, bytes_a0, 1)
+    if e_a0 != 0 { die_gpu_smoke("H2D a0 het", e_a0) }
+    u32 e_a1 = hipMemcpy(d_a1, h_a1, bytes_a1, 1)
+    if e_a1 != 0 { die_gpu_smoke("H2D a1 het", e_a1) }
+    u32 e_b0 = hipMemcpy(d_b0, h_b0, bytes_b0, 1)
+    if e_b0 != 0 { die_gpu_smoke("H2D b0 het", e_b0) }
+    u32 e_b1 = hipMemcpy(d_b1, h_b1, bytes_b1, 1)
+    if e_b1 != 0 { die_gpu_smoke("H2D b1 het", e_b1) }
+
+    // Pre-fill C buffers with 0xDEADBEEF — distinct sentinel so a missing
+    // het visitor write (e.g., group 1 never reached) surfaces as max_abs
+    // ≈ NaN or huge magnitude.
+    u64 c_pad0 = alloc(bytes_c0)
+    u32 pi0 = 0
+    u32 nC0 = M0 * N0
+    while pi0 < nC0 {
+        u64 pp = c_pad0 + pi0 * 4
+        u32 db = 0xDEADBEEF
+        unsafe { *(pp as u32) = db }
+        pi0 = pi0 + 1
+    }
+    u32 epc0 = hipMemcpy(d_c0, c_pad0, bytes_c0, 1)
+    if epc0 != 0 { die_gpu_smoke("H2D c0 pad het", epc0) }
+    dealloc(c_pad0)
+
+    u64 c_pad1 = alloc(bytes_c1)
+    u32 pi1 = 0
+    u32 nC1 = M1 * N1
+    while pi1 < nC1 {
+        u64 pp = c_pad1 + pi1 * 4
+        u32 db = 0xDEADBEEF
+        unsafe { *(pp as u32) = db }
+        pi1 = pi1 + 1
+    }
+    u32 epc1 = hipMemcpy(d_c1, c_pad1, bytes_c1, 1)
+    if epc1 != 0 { die_gpu_smoke("H2D c1 pad het", epc1) }
+    dealloc(c_pad1)
+
+    // Pack the descriptor on host, then H2D.
+    u64 host_desc = alloc(176)
+    u64 zi = 0
+    while zi < 176 {
+        u64 zp = host_desc + zi
+        u8 zb = 0
+        unsafe { *(zp as u8) = zb }
+        zi = zi + 1
+    }
+    // Group 0: M=32 N=64 K=64.
+    unsafe { *((host_desc +  0) as u32) = M0 }
+    unsafe { *((host_desc +  4) as u32) = N0 }
+    unsafe { *((host_desc +  8) as u32) = K0 }
+    unsafe { *((host_desc + 12) as u32) = lda0 }
+    unsafe { *((host_desc + 16) as u32) = ldb0 }
+    unsafe { *((host_desc + 20) as u32) = ldc0 }
+    unsafe { *((host_desc + 24) as u64) = d_a0 }
+    unsafe { *((host_desc + 32) as u64) = d_b0 }
+    unsafe { *((host_desc + 40) as u64) = d_c0 }
+    unsafe { *((host_desc + 48) as u32) = 0 }     // acc_flag
+    unsafe { *((host_desc + 52) as u32) = 0 }     // precision
+    unsafe { *((host_desc + 56) as u32) = 1 }     // splitK
+    unsafe { *((host_desc + 60) as u32) = 8 }     // tile_count = 2*4
+    unsafe { *((host_desc + 64) as u32) = 0 }     // tile_prefix
+    // Group 1: M=64 N=32 K=64.
+    unsafe { *((host_desc +  88) as u32) = M1 }
+    unsafe { *((host_desc +  92) as u32) = N1 }
+    unsafe { *((host_desc +  96) as u32) = K1 }
+    unsafe { *((host_desc + 100) as u32) = lda1 }
+    unsafe { *((host_desc + 104) as u32) = ldb1 }
+    unsafe { *((host_desc + 108) as u32) = ldc1 }
+    unsafe { *((host_desc + 112) as u64) = d_a1 }
+    unsafe { *((host_desc + 120) as u64) = d_b1 }
+    unsafe { *((host_desc + 128) as u64) = d_c1 }
+    unsafe { *((host_desc + 136) as u32) = 0 }     // acc_flag
+    unsafe { *((host_desc + 140) as u32) = 0 }     // precision
+    unsafe { *((host_desc + 144) as u32) = 1 }     // splitK
+    unsafe { *((host_desc + 148) as u32) = 8 }     // tile_count = 4*2
+    unsafe { *((host_desc + 152) as u32) = 8 }     // tile_prefix = 8
+
+    u32 derr = hipMemcpy(d_desc, host_desc, 176, 1)
+    if derr != 0 { die_gpu_smoke("H2D desc het", derr) }
+    dealloc(host_desc)
+
+    // Inline launch.
+    //   1) Zero the persistent-WG counter.
+    u64 zslot = alloc(4); unsafe { *(zslot as u32) = 0 }
+    u32 cerr = hipMemcpy(d_counter, zslot, 4, 1)
+    if cerr != 0 { die_gpu_smoke("H2D counter zero het", cerr) }
+    dealloc(zslot)
+    //   2) Pack kernarg ptr table.  Key change from smoke 1: fast_path_flag=0.
+    u64 p0 = alloc(8); unsafe { *(p0 as u64) = d_desc }
+    u64 p1 = alloc(8); unsafe { *(p1 as u64) = B_groups }
+    u64 p2 = alloc(8); unsafe { *(p2 as u64) = total_tiles }
+    u64 p3 = alloc(8); unsafe { *(p3 as u64) = 0 }            // fast_path_flag = 0
+    u64 p4 = alloc(8); unsafe { *(p4 as u64) = 0 }            // precision_mode
+    u64 p5 = alloc(8); unsafe { *(p5 as u64) = d_counter }
+    u64 kp = alloc(6 * 8)
+    unsafe { *(kp        as u64) = p0 }
+    unsafe { *((kp +  8) as u64) = p1 }
+    unsafe { *((kp + 16) as u64) = p2 }
+    unsafe { *((kp + 24) as u64) = p3 }
+    unsafe { *((kp + 32) as u64) = p4 }
+    unsafe { *((kp + 40) as u64) = p5 }
+    //   3) Dispatch.
+    u64 t_start = time_now()
+    u32 lerr = hipModuleLaunchKernel(fh, 240, 1, 1, 256, 1, 1, 0, 0, kp, 0)
+    if lerr != 0 { die_gpu_smoke("launch gemm_f32_grouped (het)", lerr) }
+    u32 serr = hipDeviceSynchronize()
+    if serr != 0 { die_gpu_smoke("hipDeviceSynchronize (het)", serr) }
+    u64 t_end = time_now()
+    u64 elapsed = t_end - t_start
+    print_str("  dispatch ns=")
+    u64 sd = fmt_dec(elapsed); print_str(sd); dealloc(sd); print_str("\n")
+    dealloc(p0); dealloc(p1); dealloc(p2); dealloc(p3); dealloc(p4); dealloc(p5); dealloc(kp)
+
+    // D2H both C buffers.
+    u64 h_c0 = alloc(bytes_c0)
+    u64 h_c1 = alloc(bytes_c1)
+    u32 r0 = hipMemcpy(h_c0, d_c0, bytes_c0, 2)
+    if r0 != 0 { die_gpu_smoke("D2H c0 het", r0) }
+    u32 r1 = hipMemcpy(h_c1, d_c1, bytes_c1, 2)
+    if r1 != 0 { die_gpu_smoke("D2H c1 het", r1) }
+
+    // CPU reference per group.
+    u64 h_c0_ref = alloc(bytes_c0)
+    u64 h_c1_ref = alloc(bytes_c1)
+    cpu_gemm_ref(h_a0, h_b0, h_c0_ref, M0, N0, K0, lda0, ldb0, ldc0)
+    cpu_gemm_ref(h_a1, h_b1, h_c1_ref, M1, N1, K1, lda1, ldb1, ldc1)
+
+    // Compare.  Group 0 has M0*N0=2048 cells; group 1 has M1*N1=2048 cells.
+    u32 max_abs_c0_bits = max_abs_diff_bits(h_c0_ref, h_c0, M0 * N0)
+    u32 max_abs_c1_bits = max_abs_diff_bits(h_c1_ref, h_c1, M1 * N1)
+
+    print_str("  max_abs c0 (32x64) bits=")
+    u64 s0 = fmt_hex(max_abs_c0_bits); print_str(s0); dealloc(s0)
+    print_str("  c1 (64x32) bits=")
+    u64 s1 = fmt_hex(max_abs_c1_bits); print_str(s1); dealloc(s1)
     print_str("\n  c0[0]=")
     u32 c0_0 = 0; unsafe { *(h_c0 as u32) -> c0_0 }
     u64 cs0 = fmt_hex(c0_0); print_str(cs0); dealloc(cs0)
     print_str(" ref[0]=")
     u32 r0_0 = 0; unsafe { *(h_c0_ref as u32) -> r0_0 }
     u64 rs0 = fmt_hex(r0_0); print_str(rs0); dealloc(rs0)
-    u32 last_idx = M * N - 1
-    print_str("\n  c0[last]=")
-    u32 c0_e = 0; unsafe { *((h_c0 + last_idx*4) as u32) -> c0_e }
-    u64 cse = fmt_hex(c0_e); print_str(cse); dealloc(cse)
-    print_str(" ref[last]=")
-    u32 r0_e = 0; unsafe { *((h_c0_ref + last_idx*4) as u32) -> r0_e }
-    u64 rse = fmt_hex(r0_e); print_str(rse); dealloc(rse)
     print_str("\n  c1[0]=")
     u32 c1_0 = 0; unsafe { *(h_c1 as u32) -> c1_0 }
     u64 c1s0 = fmt_hex(c1_0); print_str(c1s0); dealloc(c1s0)
@@ -356,56 +543,48 @@ fn main() {
     u64 r1s0 = fmt_hex(r1_0); print_str(r1s0); dealloc(r1s0)
     print_str("\n")
 
-    // Count cells with bit-exact match (FMA-precision floor diagnostic).
-    u32 n_match = 0
-    u32 di = 0
-    u32 nC_total = M * N
-    while di < nC_total {
-        u32 cg = 0; unsafe { *((h_c0 + di*4) as u32) -> cg }
-        u32 cr = 0; unsafe { *((h_c0_ref + di*4) as u32) -> cr }
-        if cg == cr { n_match = n_match + 1 }
-        di = di + 1
-    }
-    print_str("  c0 bit-exact: ")
-    u64 nm = fmt_dec(n_match); print_str(nm); dealloc(nm)
-    print_str(" / ")
-    u64 nt = fmt_dec(nC_total); print_str(nt); dealloc(nt)
-    print_str(" (the rest are FMA-precision-floor diffs ≤ a few ULPs)\n")
-
-    // Correctness gate.  Two targets:
-    //   1) Byte-equality (max_abs == 0): only achievable on trivial inputs
-    //      (e.g., all-1.0 → C[i,j] = K exactly).
-    //   2) FMA-precision-floor (max_abs ≤ 1e-5):  the GPU uses v_fmac_f32
-    //      (single-rounded FMA) while the CPU ref does separate mul + add
-    //      (double-rounded).  Per-K-element diff is ~1 ULP at the operand
-    //      magnitude; compounded over K=64 with values ~0.5 the diff is
-    //      typically ~3-6 ULPs ≈ 4e-6.  1e-5 is a tight cap that catches
-    //      the catastrophic s20/ldb collision bug we just fixed (which
-    //      produced max_abs ≈ 4 at K=64) while respecting f32 FMA precision
-    //      physics.  Spec's 1e-7 target is f32-precision-floor-unachievable
-    //      for CPU mul-add comparison; a true byte-exact gate would need
-    //      vs-single-GEMM comparison (deferred to a follow-up smoke).
-    u32 ok = 1
-    u32 byte_equal = 0
-    if max_abs_c0_bits == 0 {
-        if max_abs_c1_bits == 0 { byte_equal = 1 }
-    }
-    // 1e-5 = 0x3727C5AC.  Catches the s20/ldb bug (which produced ~4.0 = 0x40800000).
-    u32 thresh = 0x3727C5AC
-    if max_abs_c0_bits > thresh { ok = 0 }
-    if max_abs_c1_bits > thresh { ok = 0 }
-
     dealloc(h_c0); dealloc(h_c1); dealloc(h_c0_ref); dealloc(h_c1_ref)
     dealloc(h_a0); dealloc(h_a1); dealloc(h_b0); dealloc(h_b1)
 
+    // Tolerance gate — same FMA-precision floor as smoke 1 (≤ 1e-5).  A
+    // catastrophic visitor failure (e.g., group_idx always 0, both C
+    // outputs computed against group-0 A/B) would surface as max_abs
+    // ≫ 1e-5 because group 1's salt differs from group 0's so the wrong-
+    // group product is far from the right-group reference.
+    u32 thresh = 0x3727C5AC      // 1e-5 IEEE bits
+    u32 ok = 1
+    if max_abs_c0_bits > thresh { ok = 0 }
+    if max_abs_c1_bits > thresh { ok = 0 }
+
     if ok == 0 {
-        print_str("FAIL: max_abs > 1e-5 — grouped GEMM diverges from CPU ref\n")
+        print_str("FAIL (heterogeneous): max_abs > 1e-5 — het visitor wrong\n")
+        return 1
+    }
+    print_str("PASS (heterogeneous): B=2 het GEMM (M0=32 N0=64 / M1=64 N1=32) within FMA floor\n")
+    return 0
+}
+
+fn main() {
+    print_str("gemm_grouped_smoke — same-shape (1A.4/1A.5) + heterogeneous (1A.6)\n")
+
+    // Device init.
+    u32 sd_err = hipSetDevice(0)
+    if sd_err != 0 { die_gpu_smoke("hipSetDevice", sd_err) }
+
+    // Load grouped .co once; both smokes share the same kernel handle.
+    u64 fh = load_co_smoke("/tmp/gemm_f32_grouped.co", "gemm_f32_grouped")
+
+    u32 r_same = smoke_same_shape_B2(fh)
+    u32 r_het  = smoke_heterogeneous_B2(fh)
+
+    if r_same != 0 {
+        print_str("OVERALL: FAIL (same-shape regression — 1A.6 broke fast-path)\n")
         hipkfd_teardown(); exit(1)
     }
-    if byte_equal != 0 {
-        print_str("PASS: B=2 same-shape grouped GEMM byte-equal to CPU ref\n")
-    } else {
-        print_str("PASS: B=2 same-shape grouped GEMM within FMA precision floor (≤ 1e-5) vs CPU ref\n")
+    if r_het != 0 {
+        print_str("OVERALL: FAIL (heterogeneous smoke failed — 1A.6 visitor bug)\n")
+        hipkfd_teardown(); exit(1)
     }
+    print_str("OVERALL: PASS (both smokes within FMA-precision floor)\n")
     hipkfd_teardown()
 }
