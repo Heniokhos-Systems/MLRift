@@ -21583,7 +21583,8 @@ fn amdgpu_lower_adamw_step_f32(uint64 kname_ptr, uint64 nl) -> uint64 {
 //   +64  f32 one_m_b1         → s28
 //   +72  f32 one_m_b2         → s30
 //   +80  f32 lr               → s34
-//   +88  f32 eps              → s35
+//   +88  f32 eps              → s36  (was s35 via a b64 that only covered lr's
+//                               8-byte slot → eps read as 0; now its own b32)
 //
 // Hyperparam SGPR homes match the LEGACY adamw_step_f32 kernel so the inner
 // math words copy verbatim:  s18=inv_bc1, s20=inv_bc2, s22=decay, s24=b1,
@@ -21631,10 +21632,19 @@ fn _emit_adamw_fused_body(uint64 args_desc) {
     asm_s_load_b32(14, 0, 64)
     //   s_load_b32 s30, s[0:1], 72         (one_m_b2; sdata_pair=15)
     asm_s_load_b32(15, 0, 72)
-    //   lr (off 80) + eps (off 88) → s[34:35] in one b64 load.  (A b32 for eps
-    //   alone can't target the odd s35; the b64 covers both adjacent slots.)
-    //   sdata_pair=17 (→ s[34:35]), sbase_pair=0, off=80.
-    asm_s_load_b64_off(17, 0, 80)
+    //   lr (off 80) → s34, eps (off 88) → s36.  TWO b32 loads.
+    //   F1.4 fix: the prior single `s_load_b64 s[34:35], 80` read kernarg bytes
+    //   [80:88) — that is lr's WHOLE 8-byte shim slot (lr in the low dword, 0 in
+    //   the high dword).  So s34=lr (ok) but s35=0, NOT eps.  eps lives at the
+    //   NEXT slot (off 88).  With eps=0 the inner math's denom = sqrt(v_hat)+eps
+    //   lost its floor: for a zero-gradient element sqrt(v_hat)=0 → denom=0 →
+    //   v_rcp_f32(0)=+inf → step = lr*m_hat*inf = lr*0*inf = NaN (the ~3M embed
+    //   zero-grad NaNs); for nonzero-grad elements denom was off by eps → a ULP
+    //   drift in EVERY block (the U/V/... finite diffs).  Load eps from off 88
+    //   into s36 (even → valid b32 target) and re-encode the eps ref s35→s36.
+    //   sdata_pair=17 (→ s34), sdata_pair=18 (→ s36); sbase_pair=0.
+    asm_s_load_b32(17, 0, 80)
+    asm_s_load_b32(18, 0, 88)
     asm_s_waitcnt_lgkmcnt_zero()
 
     // ── 2. Persistent-WG visitor top.
@@ -21837,13 +21847,13 @@ fn _emit_adamw_fused_body(uint64 args_desc) {
     //   v_hat = v_new * inv_bc2 ; sqrt(v_hat)
     asm_u32(0x10262214)   // v_mul_f32_e32 v19, s20, v17
     asm_u32(0x7E266713)   // v_sqrt_f32_e32 v19, v19
-    //   denom = sqrt(v_hat) + eps   (eps was s14 → now s35)
-    //   v_add_f32_e32 v20, s35, v19  → VOP2 op 0x03: (0x06<<25)|(20<<17)|(19<<9)|35
-    //     legacy 0x0628260E was v_add_f32 v20, s14, v19.  Re-encode src0=s35 (=0x23):
+    //   denom = sqrt(v_hat) + eps   (eps was s14 → now s36)
+    //   v_add_f32_e32 v20, s36, v19  → VOP2 op 0x03: (0x06<<25)|(20<<17)|(19<<9)|36
+    //     legacy 0x0628260E was v_add_f32 v20, s14, v19.  Re-encode src0=s36 (=0x24):
     //     (0x03<<25? no) — decode legacy: 0x0628260E top byte 0x06 = 0000_0110 →
     //     bits[31:25]=0000011=0x03 (v_add_f32 op). vdst[24:17]=20. src1[16:9]=v19.
-    //     src0[8:0]=0x0E=s14.  Swap src0→s35=0x23: 0x0628260E - 0x0E + 0x23 = 0x06282623.
-    asm_u32(0x06282623)   // v_add_f32_e32 v20, s35, v19
+    //     src0[8:0]=0x0E=s14.  Swap src0→s36=0x24: 0x0628260E - 0x0E + 0x24 = 0x06282624.
+    asm_u32(0x06282624)   // v_add_f32_e32 v20, s36, v19
     //   step = lr * m_hat / denom   (lr was s12 → now s34)
     //   v_mul_f32_e32 v21, s34, v18  : legacy 0x102A240C (v21, s12, v18).
     //     top byte 0x10 → op 0x08 (v_mul). vdst[24:17]=21. src1[16:9]=v18.
@@ -21925,8 +21935,8 @@ fn emit_amdgpu_adamw_fused_blob(uint64 out_path) -> uint64 {
     //
     // Register budget audited:
     //   VGPRs used: v0..v21 = 22 → granule 2 → (2+1)*8 = 24 VGPRs (covers 22).
-    //   SGPRs used: s0..s35 = 36 → need ≥36.  granule = ceil((N-16)/8): for 36
-    //     → ceil(20/8)=3 → 16 + 3*8 = 40 SGPRs (covers 36).  GRANULATED field
+    //   SGPRs used: s0..s36 = 37 → need ≥37.  granule = ceil((N-16)/8): for 37
+    //     → ceil(21/8)=3 → 16 + 3*8 = 40 SGPRs (covers 37).  GRANULATED field
     //     in rsrc1 bits[9:6] = 3.
     //   rsrc1 = 0xE0AF00C2:
     //     bits[5:0]  GRANULATED_WORKITEM_VGPR_COUNT = 2  → 24 VGPRs
