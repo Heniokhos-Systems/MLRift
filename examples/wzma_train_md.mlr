@@ -913,20 +913,25 @@ fn main() {
         print_str("AdamW path: LEGACY (6 standalone full-occupancy dispatches)\n")
     }
 
-    // ── F2.3: MLRIFT_FUSE_FWD knob ─────────────────────────────────────────
-    // MLRIFT_FUSE_FWD=1 routes the ~24-dispatch forward (embed + U×4 + V×4 +
-    // 2×repack + fwd_tail, per view) through ONE persistent-WG wzma_fwd_mega
-    // dispatch per view (grid=8, one WG per b-group).  Repack is eliminated;
-    // inter/outk are written bs-major directly.  Validated ≤1e-3 vs oracle
-    // (fusing reorders summation, so not byte-identical).  Default 0 (legacy).
-    u64 use_fuse_fwd = 0
+    // ── F2.4: MLRIFT_FUSE_FWD knob ─────────────────────────────────────────
+    // MLRIFT_FUSE_FWD=1 routes the forward U/V einsums (8 plain launch_gemm per
+    // view: 4 banks × U + 4 banks × V) through the shipped full-occupancy
+    // grouped-GEMM primitive (the bwd_uv path) — 2 grouped dispatches per view,
+    // persistent-WG over all 60 CUs.  embed + 2×repack + legacy wzma_fwd_tail
+    // are unchanged.  Net forward einsums 16→4 dispatches at full occupancy.
+    // Validated ≤1e-3 vs oracle.  (Superseded the F2.3 grid=8 wzma_fwd_mega,
+    // which under-occupied 8 of 60 CUs and was net-slower; that emitter remains
+    // in the codebase but is no longer routed.)  Default flipped per F2.4 A/B.
+    // F2.4: default is now 1 (grouped-forward = production; 36.7% faster forward,
+    // ≤1e-3 vs oracle, 10× no-wedge).  MLRIFT_FUSE_FWD=0 opts back to legacy.
+    u64 use_fuse_fwd = 1
     u64 ev_fuse_fwd = sys_getenv("MLRIFT_FUSE_FWD")
     if ev_fuse_fwd != 0 {
         u8 c0ff = 0; unsafe { *(ev_fuse_fwd as u8) -> c0ff }
-        if c0ff == 49 { use_fuse_fwd = 1 }   // '1'=49
+        if c0ff == 48 { use_fuse_fwd = 0 }   // '0'=48 → explicit legacy
     }
     if use_fuse_fwd == 1 {
-        print_str("Forward path: FUSED (F2 — 1 persistent-WG dispatch/view, repack eliminated)\n")
+        print_str("Forward path: GROUPED (F2.4 — U/V via grouped-GEMM, 2 dispatches/view, full occupancy)\n")
     } else {
         print_str("Forward path: LEGACY (~24 dispatches/view: embed+U+V+repack+tail)\n")
     }
@@ -1078,6 +1083,8 @@ fn main() {
     // call.  Lifetime = full training run (no per-step gpu_malloc/free).
     u64 d_desc_dV    = gpu_malloc(K * 88, "mDescDV")
     u64 d_desc_dU    = gpu_malloc(K * 88, "mDescDU")
+    u64 d_desc_fU    = gpu_malloc(K * 88, "mDescFU")     // F2.4 forward-U grouped
+    u64 d_desc_fV    = gpu_malloc(K * 88, "mDescFV")     // F2.4 forward-V grouped
     u64 d_cntr_grp   = gpu_malloc(4,      "mCntrGrp")    // shared u32 counter
 
     // ── Task 1B.3 fix: bf16 shadow buffers for the bf16-WMMA grouped path ─────
@@ -1172,15 +1179,104 @@ fn main() {
             }
 
             if use_fuse_fwd == 1 {
-                // F2: fused forward — one persistent-WG dispatch produces x, alpha,
-                // inter (bs-major [BS,K,R]), outk (bs-major [BS,K,D]), z, v, norms —
-                // exactly the activation layout the backward consumes.  Repack gone.
-                u64 tf = time_now()
-                launch_wzma_fwd_mega(fh_fwd_mega, d_emb, d_ids, d_U, d_V,
-                                     d_gw, d_gb, d_bias, d_xs, d_as,
-                                     d_is, d_os, d_z, d_v, d_ns, BS, D)
-                sync_or_die("sync fwd mega")
-                u64 tf1 = time_now(); ns_tail = ns_tail + (tf1 - tf)
+                // F2.4: route the forward U/V einsums through the shipped
+                // full-occupancy grouped-GEMM primitive (the bwd_uv path,
+                // persistent-WG over all 60 CUs).  Per view: 4 U-banks +
+                // 4 V-banks (8 plain launch_gemm) collapse to 2 grouped
+                // dispatches (4-bank same-shape fast-path each).  The repack +
+                // legacy wzma_fwd_tail "tail" is unchanged — only the two heavy
+                // einsums migrate.  (The grid=8 F2 megakernel under-occupied
+                // 8 of 60 CUs and was net-slower; launch_wzma_fwd_mega is kept
+                // in the codebase but no longer routed here.)
+
+                // Phase 1: embed → x[BS,D]  (unchanged from legacy)
+                u64 t0 = time_now()
+                launch_embed(fh_embed, d_ids, d_emb, d_xs, BS, D)
+                sync_or_die("sync embed"); u64 t1 = time_now(); ns_embed = ns_embed + (t1 - t0)
+
+                // Phase 2: grouped U-einsum  inter_k[BS,R] = x[BS,D] @ U_k[D,R]
+                //   per-bank: M=BS=128, N=R=32, K=D=384, acc=0 (store), fast-path.
+                //   A_ptr[k] = d_xs (BROADCAST — x shared across all 4 banks)
+                //   B_ptr[k] = d_U + k*D*R*4   C_ptr[k] = d_int_kbsr + k*BS*R*4
+                //   lda=D (A=x[BS,D])  ldb=R (B=U[D,R])  ldc=R (C=inter[BS,R])
+                t0 = time_now()
+                u64 M_fU  = alloc(K*4);  u64 N_fU  = alloc(K*4);  u64 KK_fU = alloc(K*4)
+                u64 LdA_fU= alloc(K*4);  u64 LdB_fU= alloc(K*4);  u64 LdC_fU= alloc(K*4)
+                u64 Ap_fU = alloc(K*8);  u64 Bp_fU = alloc(K*8);  u64 Cp_fU = alloc(K*8)
+                u64 Ac_fU = alloc(K*4)
+                u64 kfu = 0
+                while kfu < K {
+                    unsafe { *((M_fU  + kfu*4) as u32) = BS }
+                    unsafe { *((N_fU  + kfu*4) as u32) = R }
+                    unsafe { *((KK_fU + kfu*4) as u32) = D }
+                    unsafe { *((LdA_fU+ kfu*4) as u32) = D }
+                    unsafe { *((LdB_fU+ kfu*4) as u32) = R }
+                    unsafe { *((LdC_fU+ kfu*4) as u32) = R }
+                    unsafe { *((Ap_fU + kfu*8) as u64) = d_xs }                  // broadcast
+                    unsafe { *((Bp_fU + kfu*8) as u64) = d_U + kfu*D*R*4 }
+                    unsafe { *((Cp_fU + kfu*8) as u64) = d_int_kbsr + kfu*BS*R*4 }
+                    unsafe { *((Ac_fU + kfu*4) as u32) = 0 }                     // store
+                    kfu = kfu + 1
+                }
+                u64 tot_fU_slot = alloc(4); unsafe { *(tot_fU_slot as u32) = 0 }
+                build_gemm_grouped_descriptor(d_desc_fU, K,
+                    M_fU, N_fU, KK_fU, LdA_fU, LdB_fU, LdC_fU,
+                    Ap_fU, Bp_fU, Cp_fU, Ac_fU, 0, 0, tot_fU_slot)
+                u32 tot_fU = 0; unsafe { *(tot_fU_slot as u32) -> tot_fU }
+                launch_gemm_grouped(fh_ggrp, d_desc_fU, K, tot_fU, 1, 0, d_cntr_grp)
+                dealloc(M_fU);  dealloc(N_fU);  dealloc(KK_fU)
+                dealloc(LdA_fU);dealloc(LdB_fU);dealloc(LdC_fU)
+                dealloc(Ap_fU); dealloc(Bp_fU); dealloc(Cp_fU)
+                dealloc(Ac_fU); dealloc(tot_fU_slot)
+                sync_or_die("sync fwd-U grouped"); t1 = time_now(); ns_u = ns_u + (t1 - t0)
+
+                // Phase 3: grouped V-einsum  outk_k[BS,D] = inter_k[BS,R] @ V_k[R,D]
+                //   per-bank: M=BS=128, N=D=384, K=R=32, acc=0 (store), fast-path.
+                //   A_ptr[k] = d_int_kbsr + k*BS*R*4   B_ptr[k] = d_V + k*R*D*4
+                //   C_ptr[k] = d_otk_kbsd + k*BS*D*4
+                //   lda=R (A=inter[BS,R])  ldb=D (B=V[R,D])  ldc=D (C=outk[BS,D])
+                t0 = time_now()
+                u64 M_fV  = alloc(K*4);  u64 N_fV  = alloc(K*4);  u64 KK_fV = alloc(K*4)
+                u64 LdA_fV= alloc(K*4);  u64 LdB_fV= alloc(K*4);  u64 LdC_fV= alloc(K*4)
+                u64 Ap_fV = alloc(K*8);  u64 Bp_fV = alloc(K*8);  u64 Cp_fV = alloc(K*8)
+                u64 Ac_fV = alloc(K*4)
+                u64 kfv = 0
+                while kfv < K {
+                    unsafe { *((M_fV  + kfv*4) as u32) = BS }
+                    unsafe { *((N_fV  + kfv*4) as u32) = D }
+                    unsafe { *((KK_fV + kfv*4) as u32) = R }
+                    unsafe { *((LdA_fV+ kfv*4) as u32) = R }
+                    unsafe { *((LdB_fV+ kfv*4) as u32) = D }
+                    unsafe { *((LdC_fV+ kfv*4) as u32) = D }
+                    unsafe { *((Ap_fV + kfv*8) as u64) = d_int_kbsr + kfv*BS*R*4 }
+                    unsafe { *((Bp_fV + kfv*8) as u64) = d_V + kfv*R*D*4 }
+                    unsafe { *((Cp_fV + kfv*8) as u64) = d_otk_kbsd + kfv*BS*D*4 }
+                    unsafe { *((Ac_fV + kfv*4) as u32) = 0 }
+                    kfv = kfv + 1
+                }
+                u64 tot_fV_slot = alloc(4); unsafe { *(tot_fV_slot as u32) = 0 }
+                build_gemm_grouped_descriptor(d_desc_fV, K,
+                    M_fV, N_fV, KK_fV, LdA_fV, LdB_fV, LdC_fV,
+                    Ap_fV, Bp_fV, Cp_fV, Ac_fV, 0, 0, tot_fV_slot)
+                u32 tot_fV = 0; unsafe { *(tot_fV_slot as u32) -> tot_fV }
+                launch_gemm_grouped(fh_ggrp, d_desc_fV, K, tot_fV, 1, 0, d_cntr_grp)
+                dealloc(M_fV);  dealloc(N_fV);  dealloc(KK_fV)
+                dealloc(LdA_fV);dealloc(LdB_fV);dealloc(LdC_fV)
+                dealloc(Ap_fV); dealloc(Bp_fV); dealloc(Cp_fV)
+                dealloc(Ac_fV); dealloc(tot_fV_slot)
+                sync_or_die("sync fwd-V grouped"); t1 = time_now(); ns_v = ns_v + (t1 - t0)
+
+                // Phase 3b: repack inter [K,BS,R]→[BS,K,R] and outk [K,BS,D]→[BS,K,D]
+                t0 = time_now()
+                launch_repack(fh_repack, d_int_kbsr, d_is, K, BS, R)
+                launch_repack(fh_repack, d_otk_kbsd, d_os, K, BS, D)
+                sync_or_die("sync repack"); t1 = time_now(); ns_repack = ns_repack + (t1 - t0)
+
+                // Phase 4: legacy fwd_tail (gate-softmax→combine→meanpool→L2).
+                t0 = time_now()
+                launch_fwd_tail(fh_tail, d_xs, d_gw, d_gb, d_otk_kbsd, d_bias,
+                                d_as, d_z, d_v, d_ns, BS, D)
+                sync_or_die("sync fwd_tail"); t1 = time_now(); ns_tail = ns_tail + (t1 - t0)
             } else {
             // Phase 1: embed → x[BS,D] (saved per view)
             u64 t0 = time_now()
