@@ -95,6 +95,32 @@ fn fill_matrix(u64 host, u32 rows, u32 cols, u32 salt) {
     }
 }
 
+// f32 → bf16 truncating cast (high 16 bits of each f32 word) — packs n_elem
+// u16 bf16 values into dst.  Matches the kernel's documented bf16 input format.
+fn cast_f32_to_bf16(u64 src_f32, u64 dst_bf16, u32 n_elem) {
+    u32 i = 0
+    while i < n_elem {
+        u32 bits = 0; unsafe { *((src_f32 + i*4) as u32) -> bits }
+        u32 hi = (bits >> 16) & 0xFFFF
+        u16 w = hi
+        unsafe { *((dst_bf16 + i*2) as u16) = w }
+        i = i + 1
+    }
+}
+
+// bf16 → f32 re-inflate (zero-pad low 16 bits) — for building the CPU reference
+// from the exact bf16 values the GPU consumes.
+fn inflate_bf16_to_f32(u64 src_bf16, u64 dst_f32, u32 n_elem) {
+    u32 i = 0
+    while i < n_elem {
+        u16 w = 0; unsafe { *((src_bf16 + i*2) as u16) -> w }
+        u32 w32 = w
+        u32 bits = w32 << 16
+        unsafe { *((dst_f32 + i*4) as u32) = bits }
+        i = i + 1
+    }
+}
+
 // CPU reference: C[M,N] = A[M,K] @ B[K,N], row-major, ijk loop order.
 // f32 accumulation; the GPU uses v_fmac_f32 (single-rounded FMA) so byte-
 // equality is not achievable on non-trivial inputs (~1-4 ULPs of diff per
@@ -823,8 +849,299 @@ fn smoke_bf16_B2(u64 fh) -> u32 {
     return 0
 }
 
+// ─── Smoke 4: bf16-WMMA at REAL bwd_uv geometry (1B.3 fix gate) ───────────
+//
+// The 1B.2 smoke (smoke_bf16_B2) is SQUARE (M=N=K=64).  bwd_uv's grouped
+// dispatches are NON-SQUARE and multi-tile-asymmetric:
+//   dV: M=R=32   N=D=384  K=BS=128   (2 M-tiles × 24 N-tiles × 8 K-steps)
+//   dU: M=D=384  N=R=32   K=BS=128   (24 M-tiles × 2 N-tiles × 8 K-steps)
+// This smoke packs both shapes as a B=2 HETEROGENEOUS descriptor (fast_path=0,
+// prefix-search visitor) so it exercises BOTH geometries + the het visitor in
+// a single dispatch — the coverage gap that let the 1B.2 smoke pass while the
+// real bwd_uv shapes faulted.  Inputs are correctly f32→bf16 cast on host (the
+// kernel's documented input contract); C stays f32.  Gate: max_abs ≤ 1e-3 vs
+// bf16-quantized CPU reference.
+fn smoke_bf16_bwduv_shapes(u64 fh) -> u32 {
+    print_str("smoke_bf16_bwduv_shapes — fast_path=0 (het), bf16 WMMA, dV+dU geometry (1B.3 gate)\n")
+
+    // Group 0 = dV shape; Group 1 = dU shape.
+    u32 M0 = 32;  u32 N0 = 384; u32 K0 = 128
+    u32 M1 = 384; u32 N1 = 32;  u32 K1 = 128
+    u32 lda0 = K0; u32 ldb0 = N0; u32 ldc0 = N0
+    u32 lda1 = K1; u32 ldb1 = N1; u32 ldc1 = N1
+    u32 B_groups = 2
+
+    // tiles per group = (M/16)*(N/16).  dV: 2*24=48.  dU: 24*2=48.  total=96.
+    u32 tiles0 = (M0 / 16) * (N0 / 16)
+    u32 tiles1 = (M1 / 16) * (N1 / 16)
+    u32 total_tiles = tiles0 + tiles1
+
+    u64 bytes_a0_bf = M0 * K0 * 2;  u64 bytes_b0_bf = K0 * N0 * 2;  u64 bytes_c0 = M0 * N0 * 4
+    u64 bytes_a1_bf = M1 * K1 * 2;  u64 bytes_b1_bf = K1 * N1 * 2;  u64 bytes_c1 = M1 * N1 * 4
+
+    u64 d_a0 = gpu_malloc_smoke(bytes_a0_bf, "dV a0 bf16")
+    u64 d_b0 = gpu_malloc_smoke(bytes_b0_bf, "dV b0 bf16")
+    u64 d_c0 = gpu_malloc_smoke(bytes_c0,    "dV c0 f32")
+    u64 d_a1 = gpu_malloc_smoke(bytes_a1_bf, "dU a1 bf16")
+    u64 d_b1 = gpu_malloc_smoke(bytes_b1_bf, "dU b1 bf16")
+    u64 d_c1 = gpu_malloc_smoke(bytes_c1,    "dU c1 f32")
+    u64 d_desc    = gpu_malloc_smoke(176, "desc bwduv bf16")
+    u64 d_counter = gpu_malloc_smoke(4,   "counter bwduv bf16")
+
+    // Host f32 fills.
+    u64 ha0 = alloc(M0 * K0 * 4); fill_matrix(ha0, M0, K0, 11)
+    u64 hb0 = alloc(K0 * N0 * 4); fill_matrix(hb0, K0, N0, 22)
+    u64 ha1 = alloc(M1 * K1 * 4); fill_matrix(ha1, M1, K1, 33)
+    u64 hb1 = alloc(K1 * N1 * 4); fill_matrix(hb1, K1, N1, 44)
+
+    // f32 → bf16 truncating cast (high 16 bits) into bf16 host buffers.
+    u64 ha0_bf = alloc(bytes_a0_bf); u64 hb0_bf = alloc(bytes_b0_bf)
+    u64 ha1_bf = alloc(bytes_a1_bf); u64 hb1_bf = alloc(bytes_b1_bf)
+    cast_f32_to_bf16(ha0, ha0_bf, M0 * K0)
+    cast_f32_to_bf16(hb0, hb0_bf, K0 * N0)
+    cast_f32_to_bf16(ha1, ha1_bf, M1 * K1)
+    cast_f32_to_bf16(hb1, hb1_bf, K1 * N1)
+
+    u32 e; e = hipMemcpy(d_a0, ha0_bf, bytes_a0_bf, 1); if e != 0 { die_gpu_smoke("H2D dV a0", e) }
+    e = hipMemcpy(d_b0, hb0_bf, bytes_b0_bf, 1); if e != 0 { die_gpu_smoke("H2D dV b0", e) }
+    e = hipMemcpy(d_a1, ha1_bf, bytes_a1_bf, 1); if e != 0 { die_gpu_smoke("H2D dU a1", e) }
+    e = hipMemcpy(d_b1, hb1_bf, bytes_b1_bf, 1); if e != 0 { die_gpu_smoke("H2D dU b1", e) }
+
+    // Sentinel-fill C (acc_flag=0 so kernel overwrites; sentinel catches gaps).
+    u64 c0_pad = alloc(bytes_c0); u32 p0 = 0; u32 nC0 = M0 * N0
+    while p0 < nC0 { u32 db = 0xDEADBEEF; unsafe { *((c0_pad + p0*4) as u32) = db }; p0 = p0 + 1 }
+    e = hipMemcpy(d_c0, c0_pad, bytes_c0, 1); if e != 0 { die_gpu_smoke("H2D dV c0 pad", e) }
+    dealloc(c0_pad)
+    u64 c1_pad = alloc(bytes_c1); u32 p1 = 0; u32 nC1 = M1 * N1
+    while p1 < nC1 { u32 db = 0xDEADBEEF; unsafe { *((c1_pad + p1*4) as u32) = db }; p1 = p1 + 1 }
+    e = hipMemcpy(d_c1, c1_pad, bytes_c1, 1); if e != 0 { die_gpu_smoke("H2D dU c1 pad", e) }
+    dealloc(c1_pad)
+
+    // Heterogeneous descriptor (88 bytes/group).  Fields per
+    // build_gemm_grouped_descriptor / 4d load:
+    //   0:M 4:N 8:K 12:lda 16:ldb 20:ldc 24:A_ptr 32:B_ptr 40:C_ptr
+    //   48:acc_flag 52:precision 56:splitK 60:tile_count 64:tile_prefix
+    u64 hd = alloc(176)
+    u64 zi = 0
+    while zi < 176 { u8 zb = 0; unsafe { *((hd + zi) as u8) = zb }; zi = zi + 1 }
+    // Group 0 (dV).
+    unsafe { *((hd +  0) as u32) = M0 };  unsafe { *((hd +  4) as u32) = N0 }
+    unsafe { *((hd +  8) as u32) = K0 };  unsafe { *((hd + 12) as u32) = lda0 }
+    unsafe { *((hd + 16) as u32) = ldb0 };unsafe { *((hd + 20) as u32) = ldc0 }
+    unsafe { *((hd + 24) as u64) = d_a0 };unsafe { *((hd + 32) as u64) = d_b0 }
+    unsafe { *((hd + 40) as u64) = d_c0 };unsafe { *((hd + 48) as u32) = 0 }
+    unsafe { *((hd + 52) as u32) = 1 };   unsafe { *((hd + 56) as u32) = 1 }
+    unsafe { *((hd + 60) as u32) = tiles0 }; unsafe { *((hd + 64) as u32) = 0 }
+    // Group 1 (dU).
+    unsafe { *((hd + 88) as u32) = M1 };  unsafe { *((hd + 92) as u32) = N1 }
+    unsafe { *((hd + 96) as u32) = K1 };  unsafe { *((hd + 100) as u32) = lda1 }
+    unsafe { *((hd + 104) as u32) = ldb1 };unsafe { *((hd + 108) as u32) = ldc1 }
+    unsafe { *((hd + 112) as u64) = d_a1 };unsafe { *((hd + 120) as u64) = d_b1 }
+    unsafe { *((hd + 128) as u64) = d_c1 };unsafe { *((hd + 136) as u32) = 0 }
+    unsafe { *((hd + 140) as u32) = 1 };  unsafe { *((hd + 144) as u32) = 1 }
+    unsafe { *((hd + 148) as u32) = tiles1 }; unsafe { *((hd + 152) as u32) = tiles0 }
+    e = hipMemcpy(d_desc, hd, 176, 1); if e != 0 { die_gpu_smoke("H2D desc bwduv", e) }
+    dealloc(hd)
+
+    u64 zslot = alloc(4); unsafe { *(zslot as u32) = 0 }
+    e = hipMemcpy(d_counter, zslot, 4, 1); if e != 0 { die_gpu_smoke("H2D counter bwduv", e) }
+    dealloc(zslot)
+
+    // Kernarg table (6 slots).  fast_path_flag=0 → heterogeneous visitor.
+    u64 q0 = alloc(8); unsafe { *(q0 as u64) = d_desc }
+    u64 q1 = alloc(8); unsafe { *(q1 as u64) = B_groups }
+    u64 q2 = alloc(8); unsafe { *(q2 as u64) = total_tiles }
+    u64 q3 = alloc(8); unsafe { *(q3 as u64) = 0 }            // fast_path_flag=0 (het)
+    u64 q4 = alloc(8); unsafe { *(q4 as u64) = 1 }            // precision=bf16
+    u64 q5 = alloc(8); unsafe { *(q5 as u64) = d_counter }
+    u64 kq = alloc(6 * 8)
+    unsafe { *(kq        as u64) = q0 }; unsafe { *((kq +  8) as u64) = q1 }
+    unsafe { *((kq + 16) as u64) = q2 }; unsafe { *((kq + 24) as u64) = q3 }
+    unsafe { *((kq + 32) as u64) = q4 }; unsafe { *((kq + 40) as u64) = q5 }
+
+    u64 t_start = time_now()
+    u32 lerr = hipModuleLaunchKernel(fh, 240, 1, 1, 32, 1, 1, 0, 0, kq, 0)
+    if lerr != 0 { die_gpu_smoke("launch bwduv bf16", lerr) }
+    u32 serr = hipDeviceSynchronize()
+    if serr != 0 { die_gpu_smoke("sync bwduv bf16", serr) }
+    u64 elapsed = time_now() - t_start
+    print_str("  dispatch ns="); u64 sd = fmt_dec(elapsed); print_str(sd); dealloc(sd); print_str("\n")
+    dealloc(q0); dealloc(q1); dealloc(q2); dealloc(q3); dealloc(q4); dealloc(q5); dealloc(kq)
+
+    // D2H C.
+    u64 hc0 = alloc(bytes_c0); u64 hc1 = alloc(bytes_c1)
+    e = hipMemcpy(hc0, d_c0, bytes_c0, 2); if e != 0 { die_gpu_smoke("D2H dV c0", e) }
+    e = hipMemcpy(hc1, d_c1, bytes_c1, 2); if e != 0 { die_gpu_smoke("D2H dU c1", e) }
+
+    // CPU reference uses bf16-re-inflated inputs (bf16 << 16) so only WMMA FMA
+    // rounding remains as the diff.
+    u64 ra0 = alloc(M0 * K0 * 4); u64 rb0 = alloc(K0 * N0 * 4)
+    u64 ra1 = alloc(M1 * K1 * 4); u64 rb1 = alloc(K1 * N1 * 4)
+    inflate_bf16_to_f32(ha0_bf, ra0, M0 * K0)
+    inflate_bf16_to_f32(hb0_bf, rb0, K0 * N0)
+    inflate_bf16_to_f32(ha1_bf, ra1, M1 * K1)
+    inflate_bf16_to_f32(hb1_bf, rb1, K1 * N1)
+    u64 rc0 = alloc(bytes_c0); u64 rc1 = alloc(bytes_c1)
+    cpu_gemm_ref(ra0, rb0, rc0, M0, N0, K0, lda0, ldb0, ldc0)
+    cpu_gemm_ref(ra1, rb1, rc1, M1, N1, K1, lda1, ldb1, ldc1)
+
+    u32 mab0 = max_abs_diff_bits(rc0, hc0, M0 * N0)
+    u32 mab1 = max_abs_diff_bits(rc1, hc1, M1 * N1)
+    print_str("  dV(32x384) max_abs bits="); u64 s0 = fmt_hex(mab0); print_str(s0); dealloc(s0)
+    print_str("  dU(384x32) max_abs bits="); u64 s1 = fmt_hex(mab1); print_str(s1); dealloc(s1)
+    print_str("\n")
+
+    dealloc(hc0); dealloc(hc1); dealloc(rc0); dealloc(rc1)
+    dealloc(ra0); dealloc(rb0); dealloc(ra1); dealloc(rb1)
+    dealloc(ha0); dealloc(hb0); dealloc(ha1); dealloc(hb1)
+    dealloc(ha0_bf); dealloc(hb0_bf); dealloc(ha1_bf); dealloc(hb1_bf)
+
+    u32 thresh = 0x3A83126F                       // 1e-3
+    u32 ok = 1
+    if mab0 > thresh { ok = 0 }
+    if mab1 > thresh { ok = 0 }
+    if ok == 0 {
+        print_str("FAIL (bf16 bwduv shapes): max_abs > 1e-3 — kernel wrong at non-square geometry\n")
+        return 1
+    }
+    print_str("PASS (bf16 bwduv shapes): dV+dU geometry within 1e-3 vs bf16 CPU ref\n")
+    return 0
+}
+
+// ─── Smoke 5: bf16-WMMA fast-path + acc_flag=1 + B=4 (EXACT bwd_uv dV config) ─
+//
+// smoke_bf16_bwduv_shapes (smoke 4) uses fast_path=0 (het) + acc=0.  The REAL
+// bwd_uv dV dispatch is fast_path=1 (same-shape divmod), acc_flag=1 (C += A@B),
+// B=4 groups — a combination NO prior bf16 smoke covered.  This smoke replicates
+// it exactly: 4 same-shape groups (M=32 N=384 K=128 = dV), fast-path visitor,
+// acc=1 (C pre-seeded so the kernel must load+add).  Gate: max_abs ≤ 1e-3 vs
+// bf16-quantized CPU ref of (C_init + A@B).
+//
+// NOTE (1B.3): this smoke isolates the residual wedge.  As of commit time it is
+// EXPECTED to surface the fault that the bf16_force bwd_uv run hits (n_bad fp,
+// MODE1 reset).  Run ONLY on freshly-cold-cycled firmware; budget one dispatch.
+fn smoke_bf16_fastpath_acc_B4(u64 fh) -> u32 {
+    print_str("smoke_bf16_fastpath_acc_B4 — fast_path=1, acc=1, B=4, dV shape (1B.3 residual gate)\n")
+
+    u32 M = 32; u32 N = 384; u32 K = 128
+    u32 lda = K; u32 ldb = N; u32 ldc = N
+    u32 B_groups = 4
+    u32 tiles_per = (M / 16) * (N / 16)        // 2*24 = 48
+    u32 total_tiles = tiles_per * B_groups     // 192
+
+    u64 bytes_a_bf = M * K * 2; u64 bytes_b_bf = K * N * 2; u64 bytes_c = M * N * 4
+
+    // 4 groups, distinct A/B/C buffers.
+    u64 d_a = alloc(B_groups * 8); u64 d_b = alloc(B_groups * 8); u64 d_c = alloc(B_groups * 8)
+    u64 g = 0
+    while g < B_groups {
+        u64 da = gpu_malloc_smoke(bytes_a_bf, "fpacc a"); unsafe { *((d_a + g*8) as u64) = da }
+        u64 db = gpu_malloc_smoke(bytes_b_bf, "fpacc b"); unsafe { *((d_b + g*8) as u64) = db }
+        u64 dc = gpu_malloc_smoke(bytes_c,    "fpacc c"); unsafe { *((d_c + g*8) as u64) = dc }
+        g = g + 1
+    }
+    u64 d_desc    = gpu_malloc_smoke(B_groups * 88, "fpacc desc")
+    u64 d_counter = gpu_malloc_smoke(4,             "fpacc counter")
+
+    // Host f32 + bf16 + C-init (per group), and CPU ref of C_init + A@B.
+    u64 ref_c = alloc(B_groups * 8)            // host f32 ref buffers per group
+    g = 0
+    while g < B_groups {
+        u64 ha = alloc(M * K * 4); fill_matrix(ha, M, K, 11 + g*100)
+        u64 hb = alloc(K * N * 4); fill_matrix(hb, K, N, 55 + g*100)
+        u64 ha_bf = alloc(bytes_a_bf); u64 hb_bf = alloc(bytes_b_bf)
+        cast_f32_to_bf16(ha, ha_bf, M*K); cast_f32_to_bf16(hb, hb_bf, K*N)
+        u64 da = 0; unsafe { *((d_a + g*8) as u64) -> da }
+        u64 db = 0; unsafe { *((d_b + g*8) as u64) -> db }
+        u32 e
+        e = hipMemcpy(da, ha_bf, bytes_a_bf, 1); if e != 0 { die_gpu_smoke("H2D fpacc a", e) }
+        e = hipMemcpy(db, hb_bf, bytes_b_bf, 1); if e != 0 { die_gpu_smoke("H2D fpacc b", e) }
+        // C init = small nonzero (so acc=1 load+add is exercised, not just store).
+        u64 hc_init = alloc(bytes_c); u32 ci = 0; u32 nC = M*N
+        while ci < nC { f32 cv = 0.5f; unsafe { *((hc_init + ci*4) as f32) = cv }; ci = ci + 1 }
+        u64 dc = 0; unsafe { *((d_c + g*8) as u64) -> dc }
+        e = hipMemcpy(dc, hc_init, bytes_c, 1); if e != 0 { die_gpu_smoke("H2D fpacc c-init", e) }
+        // CPU ref: inflate bf16, gemm, add C_init.
+        u64 ra = alloc(M*K*4); u64 rb = alloc(K*N*4)
+        inflate_bf16_to_f32(ha_bf, ra, M*K); inflate_bf16_to_f32(hb_bf, rb, K*N)
+        u64 rc = alloc(bytes_c); cpu_gemm_ref(ra, rb, rc, M, N, K, lda, ldb, ldc)
+        u32 ai = 0
+        while ai < nC { f32 v = 0.0f; unsafe { *((rc + ai*4) as f32) -> v }; v = v + 0.5f; unsafe { *((rc + ai*4) as f32) = v }; ai = ai + 1 }
+        unsafe { *((ref_c + g*8) as u64) = rc }
+        dealloc(ha); dealloc(hb); dealloc(ha_bf); dealloc(hb_bf); dealloc(hc_init); dealloc(ra); dealloc(rb)
+        g = g + 1
+    }
+
+    // Descriptor: 4 same-shape groups, fast_path, acc=1, precision=bf16.
+    u64 hd = alloc(B_groups * 88)
+    u64 zi = 0
+    while zi < B_groups * 88 { u8 zb = 0; unsafe { *((hd + zi) as u8) = zb }; zi = zi + 1 }
+    g = 0
+    while g < B_groups {
+        u64 base = hd + g*88
+        u64 da = 0; unsafe { *((d_a + g*8) as u64) -> da }
+        u64 db = 0; unsafe { *((d_b + g*8) as u64) -> db }
+        u64 dc = 0; unsafe { *((d_c + g*8) as u64) -> dc }
+        unsafe { *((base +  0) as u32) = M };  unsafe { *((base +  4) as u32) = N }
+        unsafe { *((base +  8) as u32) = K };  unsafe { *((base + 12) as u32) = lda }
+        unsafe { *((base + 16) as u32) = ldb };unsafe { *((base + 20) as u32) = ldc }
+        unsafe { *((base + 24) as u64) = da }; unsafe { *((base + 32) as u64) = db }
+        unsafe { *((base + 40) as u64) = dc }; unsafe { *((base + 48) as u32) = 1 }   // acc=1
+        unsafe { *((base + 52) as u32) = 1 };  unsafe { *((base + 56) as u32) = 1 }
+        unsafe { *((base + 60) as u32) = tiles_per }
+        unsafe { *((base + 64) as u32) = tiles_per * g }   // prefix
+        g = g + 1
+    }
+    u32 de = hipMemcpy(d_desc, hd, B_groups * 88, 1); if de != 0 { die_gpu_smoke("H2D fpacc desc", de) }
+    dealloc(hd)
+    u64 zslot = alloc(4); unsafe { *(zslot as u32) = 0 }
+    de = hipMemcpy(d_counter, zslot, 4, 1); if de != 0 { die_gpu_smoke("H2D fpacc counter", de) }
+    dealloc(zslot)
+
+    // Kernarg: fast_path_flag=1.
+    u64 q0 = alloc(8); unsafe { *(q0 as u64) = d_desc }
+    u64 q1 = alloc(8); unsafe { *(q1 as u64) = B_groups }
+    u64 q2 = alloc(8); unsafe { *(q2 as u64) = total_tiles }
+    u64 q3 = alloc(8); unsafe { *(q3 as u64) = 1 }            // fast_path=1
+    u64 q4 = alloc(8); unsafe { *(q4 as u64) = 1 }            // precision=bf16
+    u64 q5 = alloc(8); unsafe { *(q5 as u64) = d_counter }
+    u64 kq = alloc(6 * 8)
+    unsafe { *(kq        as u64) = q0 }; unsafe { *((kq +  8) as u64) = q1 }
+    unsafe { *((kq + 16) as u64) = q2 }; unsafe { *((kq + 24) as u64) = q3 }
+    unsafe { *((kq + 32) as u64) = q4 }; unsafe { *((kq + 40) as u64) = q5 }
+
+    u32 lerr = hipModuleLaunchKernel(fh, 240, 1, 1, 32, 1, 1, 0, 0, kq, 0)
+    if lerr != 0 { die_gpu_smoke("launch fpacc bf16", lerr) }
+    u32 serr = hipDeviceSynchronize()
+    if serr != 0 { die_gpu_smoke("sync fpacc bf16", serr) }
+    dealloc(q0); dealloc(q1); dealloc(q2); dealloc(q3); dealloc(q4); dealloc(q5); dealloc(kq)
+
+    // Check each group's C against ref.
+    u32 worst = 0
+    g = 0
+    while g < B_groups {
+        u64 dc = 0; unsafe { *((d_c + g*8) as u64) -> dc }
+        u64 hc = alloc(bytes_c)
+        u32 e = hipMemcpy(hc, dc, bytes_c, 2); if e != 0 { die_gpu_smoke("D2H fpacc c", e) }
+        u64 rc = 0; unsafe { *((ref_c + g*8) as u64) -> rc }
+        u32 mab = max_abs_diff_bits(rc, hc, M*N)
+        if mab > worst { worst = mab }
+        dealloc(hc)
+        g = g + 1
+    }
+    print_str("  worst max_abs bits="); u64 s = fmt_hex(worst); print_str(s); dealloc(s); print_str("\n")
+
+    u32 thresh = 0x3A83126F
+    if worst > thresh {
+        print_str("FAIL (bf16 fastpath+acc B4): max_abs > 1e-3 — residual kernel bug at fast+acc=1\n")
+        return 1
+    }
+    print_str("PASS (bf16 fastpath+acc B4): C += A@B within 1e-3 vs bf16 CPU ref\n")
+    return 0
+}
+
 fn main() {
-    print_str("gemm_grouped_smoke — same-shape (1A.4/1A.5) + heterogeneous (1A.6) + bf16-WMMA (1B.2)\n")
+    print_str("gemm_grouped_smoke — same-shape (1A.4/1A.5) + heterogeneous (1A.6) + bf16-WMMA (1B.2/1B.3)\n")
 
     // Device init.
     u32 sd_err = hipSetDevice(0)
@@ -865,6 +1182,31 @@ fn main() {
         hipkfd_teardown(); exit(1)
     }
 
-    print_str("OVERALL: PASS (1A f32 + 1B.2 bf16-WMMA grouped GEMM smokes all green)\n")
+    // ── 1B.3 gate — bf16 WMMA at REAL bwd_uv geometry (non-square, het) ──
+    print_str("\n--- 1B.3 bf16 grouped WMMA @ bwd_uv shapes ---\n")
+    u32 r_buv = smoke_bf16_bwduv_shapes(fh_bf16)
+    if r_buv != 0 {
+        print_str("OVERALL: FAIL (1B.3 bf16 WMMA bwd_uv-shape smoke failed)\n")
+        hipkfd_teardown(); exit(1)
+    }
+
+    // ── 1B.3 residual gate — fast-path + acc=1 + B=4 (the bwd_uv wedge case) ──
+    // OPT-IN: expected to fault until the residual fast-path/acc bf16 bug is
+    // fixed.  Run only on freshly cold-cycled firmware.  Enable with
+    // GEMM_SMOKE_FASTPATH_ACC=1.
+    u64 ev_fp = sys_getenv("GEMM_SMOKE_FASTPATH_ACC")
+    if ev_fp != 0 {
+        u8 c0 = 0; unsafe { *(ev_fp as u8) -> c0 }
+        if c0 == 49 {   // '1'
+            print_str("\n--- 1B.3 RESIDUAL: bf16 fast-path + acc=1 + B=4 (may wedge) ---\n")
+            u32 r_fp = smoke_bf16_fastpath_acc_B4(fh_bf16)
+            if r_fp != 0 {
+                print_str("OVERALL: FAIL (1B.3 residual fast-path+acc smoke)\n")
+                hipkfd_teardown(); exit(1)
+            }
+        }
+    }
+
+    print_str("OVERALL: PASS (1A f32 + 1B.2/1B.3 bf16-WMMA grouped GEMM smokes all green)\n")
     hipkfd_teardown()
 }

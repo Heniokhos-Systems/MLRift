@@ -5884,6 +5884,100 @@ fn emit_amdgpu_fill_step_blob(uint64 out_path) -> uint64 {
     return 0
 }
 
+// ── pack_f32_to_bf16 (Phase 1B.3 fix) ──────────────────────────────────────
+// Elementwise f32 → bf16 truncating cast: out_bf16[gid] = (u16)(in_f32[gid] >> 16).
+// This is the host-side cast the bf16-WMMA grouped kernel's input contract
+// requires (see _emit_gemm_bf16_grouped_body comment), but done on-GPU so the
+// bwd_uv hot-path doesn't round-trip A/B through host memory each step.
+//
+// Truncating (round-toward-zero of the dropped mantissa) — matches the smoke's
+// host cast (high 16 bits) so CPU/GPU agree on the quantization.  Stochastic /
+// round-to-nearest-even deferred (1B parity with the smoke's truncating ref).
+//
+// Grid: ceil(n/256) blocks × 256 threads.  gid = wg_id_x(s15)*bdim + tid(v0).
+// Kernarg (4 args × 8 = 32 bytes):
+//   0x00 in_ptr  (u64) → s[2:3]
+//   0x08 out_ptr (u64) → s[4:5]
+//   0x10 n       (u64) → s6   (low 32)
+//   0x18 bdim    (u64) → s8   (low 32)
+fn emit_amdgpu_pack_f32_to_bf16_blob(uint64 out_path) -> uint64 {
+    uint64 kname = "pack_f32_to_bf16"
+    uint64 klen  = 16
+
+    asm_init()
+
+    asm_s_load_b64(1, 0)                            // s[2:3] in_ptr
+    asm_s_load_b64_off(2, 0, 0x08)                  // s[4:5] out_ptr
+    asm_s_load_b64_off(3, 0, 0x10)                  // s6 = n (low of s[6:7])
+    asm_s_load_b64_off(4, 0, 0x18)                  // s8 = bdim (low of s[8:9])
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // gid = s15*s8 + v0  (u24 mad; gid < 2^24 for all bwd_uv buffers).
+    asm_v_mad_u32_u24(1, 15, 8, 0)                  // v1 = s15*s8 + v0
+    asm_s_delay_alu(0x01)
+
+    // gid < n guard.
+    asm_v_cmp_gt_u32_sgpr_vgpr(6, 1)                // vcc_lo = (s6 > v1)
+    asm_s_and_saveexec_b32_vcc_lo(46)               // s46 = old exec
+
+    // in byte off = gid*4 → v2 ; load f32.
+    asm_v_lshlrev_b32_imm(2, 2, 1)                  // v2 = v1 << 2
+    asm_s_delay_alu(0x01)
+    // global_load_b32 v9, v2, s[2:3]  (vdst in word2 byte3; saddr=2; vaddr=v2).
+    asm_u32(0xDC520000); asm_u32((9 << 24) | (2 << 16) | (0 << 8) | 2)
+    asm_s_waitcnt_vmcnt_zero()
+
+    // bf16 = f32_bits >> 16   (truncating cast; v9 holds raw f32 bits).
+    //   v_lshrrev_b32 v9, 16, v9   (VOP2 op 0x19, src0 = 128+16).
+    uint64 shr_word = (0x19 << 25) | ((9 & 0xFF) << 17) | ((9 & 0xFF) << 9) | (128 + 16)
+    asm_u32(shr_word)
+    asm_s_delay_alu(0x01)
+
+    // out byte off = gid*2 → v6 ; store low 16 bits (b16).
+    asm_v_lshlrev_b32_imm(6, 1, 1)                  // v6 = v1 << 1
+    asm_s_delay_alu(0x01)
+    // global_store_b16 v6, v9, s[4:5]  (llvm-mc gfx1100: word1 0xDC660000;
+    //   word2 bytes [vaddr=6, vdata=9, saddr=4, 0x00] = 0x00040906).
+    asm_u32(0xDC660000); asm_u32((0x00 << 24) | (4 << 16) | (9 << 8) | 6)
+    asm_s_waitcnt_vscnt_zero()
+
+    asm_s_mov_b32(0x7E, 46)                          // restore exec_lo
+    asm_s_endpgm()
+
+    uint64 rsrc1 = 0xE0AF0001                        // granule 1 → 16 VGPRs (v0..v9)
+    uint64 rsrc2 = 0x0000009E
+    uint64 rsrc3 = 0x00000030
+    uint64 props = 0x0408
+
+    uint64[8] args_desc
+    uint64 p0s = args_desc + 0;   unsafe { *(p0s as uint64) = 8 }
+    uint64 p0k = args_desc + 8;   unsafe { *(p0k as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 p1s = args_desc + 16;  unsafe { *(p1s as uint64) = 8 }
+    uint64 p1k = args_desc + 24;  unsafe { *(p1k as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 p2s = args_desc + 32;  unsafe { *(p2s as uint64) = 8 }
+    uint64 p2k = args_desc + 40;  unsafe { *(p2k as uint64) = AMD_ARG_KIND_BY_VALUE }
+    uint64 p3s = args_desc + 48;  unsafe { *(p3s as uint64) = 8 }
+    uint64 p3k = args_desc + 56;  unsafe { *(p3k as uint64) = AMD_ARG_KIND_BY_VALUE }
+
+    uint64 size = emit_amdgpu_code_object(kname, klen,
+                                           asm_text_buf, asm_text_len,
+                                           32,      // kernarg_size (4 × 8)
+                                           8,       // kernarg_align
+                                           48,      // sgpr_count
+                                           16,      // vgpr_count
+                                           rsrc1, rsrc2, rsrc3, props,
+                                           args_desc, 4)
+
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_pack_f32_to_bf16_blob: cannot open output\n", 54)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
 // ---------------------------------------------------------------------------
 // M1m loop-demo: hand-crafted kernel that exercises the SALU while-
 // loop primitives (s_add_u32, s_cmp_lt_u32, s_cbranch_scc0,

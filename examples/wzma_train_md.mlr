@@ -229,6 +229,27 @@ fn launch_repack(u64 fh, u64 d_in, u64 d_out, u64 A, u64 Bm, u64 W) {
     dealloc(p0); dealloc(p1); dealloc(p2); dealloc(p3); dealloc(p4); dealloc(kp)
 }
 
+// pack_f32_to_bf16 (1B.3 fix): out_bf16[i] = (u16)(in_f32[i] >> 16) for i in [0,n).
+// On-GPU truncating cast so the bf16-WMMA grouped kernel gets the bf16-stored
+// A/B inputs its contract requires, without round-tripping through host memory.
+// Grid = ceil(n/256) × 256.
+fn launch_pack_f32_to_bf16(u64 fh, u64 d_in, u64 d_out, u64 n) {
+    u64 p0 = alloc(8); unsafe { *(p0 as u64) = d_in }
+    u64 p1 = alloc(8); unsafe { *(p1 as u64) = d_out }
+    u64 p2 = alloc(8); unsafe { *(p2 as u64) = n }
+    u64 p3 = alloc(8); unsafe { *(p3 as u64) = 256 }   // bdim
+    u64 kp = alloc(4 * 8)
+    unsafe { *(kp        as u64) = p0 }
+    unsafe { *((kp +  8) as u64) = p1 }
+    unsafe { *((kp + 16) as u64) = p2 }
+    unsafe { *((kp + 24) as u64) = p3 }
+    u32 grid  = (n + 255) / 256
+    u32 block = 256
+    u32 err = hipModuleLaunchKernel(fh, grid, 1, 1, block, 1, 1, 0, 0, kp, 0)
+    if err != 0 { die_gpu("launch pack_f32_to_bf16", err) }
+    dealloc(p0); dealloc(p1); dealloc(p2); dealloc(p3); dealloc(kp)
+}
+
 // gemm_f32_accum: C[M,N] += A[M,K_dim] @ B[K_dim,N]  (ACCUMULATE).  Same grid/
 // block as gemm_f32 (tiles_m*tiles_n WGs, 256 lanes).  Used for dV/dU/dx/dbias
 // accumulation across banks + views (the bwd_uv GEMM rewrite).
@@ -649,20 +670,32 @@ fn main() {
     // MLRIFT_BWD_UV_PRECISION=f32 (default) routes through gemm_f32_grouped.co
     // (block=256, sw-pipelined LDS-tiled f32 FMA; max_abs ≤ 4.17e-7 vs oracle).
     //
-    // 1B.3 status (2026-05-28): the bf16 path is WIRED (descriptor + fh swap
-    // plumbing complete) but DISABLED BY DEFAULT after the bf16 kernel was
-    // shown to GFXHUB-page-fault at bwd_uv real shapes (M=32 N=384 K=128 dV
-    // and M=384 N=32 K=128 dU, B=4 groups).  Step-0 grads max_abs=1.30 vs
-    // oracle (gate 1e-3 — FAIL by 1300×) before the GPU wedged on the second
-    // dispatch; MODE1 auto-reset recovered cleanly.  The 1B.2 smoke (B=2,
-    // small tiles) didn't catch this — classic OOB pad-lane signature only
-    // surfaced at production shapes.  Re-enabling bf16 is a one-line change
-    // here once the WMMA emitter is fixed; the launcher wiring stays.
+    // 1B.3 status (2026-05-28): the bf16 path is WIRED and the launcher now
+    // honors the bf16 kernel's INPUT CONTRACT — the f32 A/B bwd_uv inputs are
+    // cast to bf16 shadow buffers via the on-GPU pack_f32_to_bf16 kernel before
+    // each bf16 grouped dispatch (the 1B.2 contract violation: launcher fed f32
+    // buffers to a bf16-reading kernel — that was the dominant data bug + a
+    // contributor to the OOB).
+    //
+    // The bf16-WMMA grouped KERNEL itself is now VERIFIED CORRECT at the real
+    // dV/dU non-square geometry: examples/gemm_grouped_smoke.mlr's new
+    // smoke_bf16_bwduv_shapes (B=2 het, dV=32x384 + dU=384x32, K=128, acc=0)
+    // passes at max_abs ~1e-5 (≤1e-3 gate), no fault.
+    //
+    // BUT bf16 is STILL DISABLED BY DEFAULT: with correct bf16 inputs + the
+    // pack plumbing, MLRIFT_BWD_UV_PRECISION=bf16_force STILL wedges the real
+    // bwd_uv dispatch (fast_path=1, acc_flag=1, B=4 groups) with the same
+    // n_bad=99152 fingerprint + MODE1 reset.  Residual gap: NO bf16 smoke yet
+    // covers the fast-path divmod + acc_flag=1 (C load+add) combination at
+    // non-square shapes — both bf16 smokes use acc=0 (smoke_bf16_B2 is fast+
+    // square; smoke_bf16_bwduv_shapes is het+non-square).  Next: add a bf16
+    // fast-path + acc=1 + B=4 smoke to isolate, then fix the kernel's acc/
+    // fast-path interaction.
     //
     // For now MLRIFT_BWD_UV_PRECISION=bf16 prints a strong warning and FALLS
     // BACK to f32 to keep CI / downstream tooling unable to silently wedge
     // the GPU.  Set MLRIFT_BWD_UV_PRECISION=bf16_force to actually attempt
-    // the bf16 path (developer-only, expects the wedge).
+    // the bf16 path (developer-only, expects the wedge until the residual fix).
     u64 use_bf16 = 0
     u64 ev_prec = sys_getenv("MLRIFT_BWD_UV_PRECISION")
     if ev_prec != 0 {
@@ -714,6 +747,10 @@ fn main() {
     // MLRIFT_BWD_UV_PRECISION env knob.  Same kernarg ABI as fh_ggrp; differs
     // only in the descriptor's precision field (0 → f32, 1 → bf16-WMMA).
     u64 fh_bf16_grouped = load_co("/tmp/gemm_bf16_grouped.co", "gemm_bf16_grouped")
+    // 1B.3 fix: on-GPU f32→bf16 pack kernel.  The bf16-WMMA grouped kernel reads
+    // bf16-STORED A/B (its documented input contract); the f32 bwd_uv buffers
+    // must be cast to bf16 shadow buffers before each bf16 grouped dispatch.
+    u64 fh_pack_bf16 = load_co("/tmp/pack_f32_to_bf16.co", "pack_f32_to_bf16")
     u64 fh_transp = load_co("/tmp/transpose_f32.co",          "transpose_f32")
     u64 fh_rscale = load_co("/tmp/row_scale_f32.co",          "row_scale_f32")
     u64 fh_gbs    = load_co("/tmp/gate_bwd_bs_f32.co",        "gate_bwd_bs_f32")
@@ -832,6 +869,17 @@ fn main() {
     u64 d_desc_dV    = gpu_malloc(K * 88, "mDescDV")
     u64 d_desc_dU    = gpu_malloc(K * 88, "mDescDU")
     u64 d_cntr_grp   = gpu_malloc(4,      "mCntrGrp")    // shared u32 counter
+
+    // ── Task 1B.3 fix: bf16 shadow buffers for the bf16-WMMA grouped path ─────
+    // The bf16-WMMA kernel reads bf16-STORED A/B.  We cast the f32 bwd_uv inputs
+    // (interT, doutk, xT, dinter) into these half-size shadows via the on-GPU
+    // pack kernel before each bf16 grouped dispatch.  Only allocated/used when
+    // MLRIFT_BWD_UV_PRECISION=bf16[_force]; lifetime = full run.
+    //   dV: A=interT[K,R,BS], B=doutk[K,BS,D]   dU: A=xT[D,BS], B=dinter[K,BS,R]
+    u64 d_interT_bf = gpu_malloc(K * R * BS * 2, "mInterTbf")   // dV A (per bank)
+    u64 d_doutk_bf  = gpu_malloc(K * BS * D * 2, "mDoutkbf")    // dV B (per bank)
+    u64 d_xT_bf     = gpu_malloc(D * BS * 2,     "mXTbf")       // dU A (broadcast)
+    u64 d_dinter_bf = gpu_malloc(K * BS * R * 2, "mDinterbf")   // dU B (per bank)
 
     // ── AdamW moment buffers (zero-init once) ──────────────────────────────
     u64 d_mU=gpu_malloc(K*D*R*4,"mMU"); u64 d_vU=gpu_malloc(K*D*R*4,"mVU")
@@ -1189,8 +1237,15 @@ fn main() {
                     unsafe { *((LdA_dV + kdv*4) as u32) = BS }   // A=interT [R,BS] row-major lda=K=BS
                     unsafe { *((LdB_dV + kdv*4) as u32) = D }    // B=doutk [BS,D] row-major ldb=N=D
                     unsafe { *((LdC_dV + kdv*4) as u32) = D }    // C=dV    [R,D]  row-major ldc=N=D
-                    unsafe { *((Ap_dV  + kdv*8) as u64) = d_interT + kdv*R*BS*4 }
-                    unsafe { *((Bp_dV  + kdv*8) as u64) = d_doutk  + kdv*BS*D*4 }
+                    // A/B pointers: f32 by default; bf16 shadows when bf16 mode.
+                    u64 ap_dv_k = d_interT + kdv*R*BS*4
+                    u64 bp_dv_k = d_doutk  + kdv*BS*D*4
+                    if use_bf16 == 1 {
+                        ap_dv_k = d_interT_bf + kdv*R*BS*2
+                        bp_dv_k = d_doutk_bf  + kdv*BS*D*2
+                    }
+                    unsafe { *((Ap_dV  + kdv*8) as u64) = ap_dv_k }
+                    unsafe { *((Bp_dV  + kdv*8) as u64) = bp_dv_k }
                     unsafe { *((Cp_dV  + kdv*8) as u64) = d_dV     + kdv*R*D*4 }
                     unsafe { *((Ac_dV  + kdv*4) as u32) = 1 }    // accumulate
                     kdv = kdv + 1
@@ -1199,12 +1254,17 @@ fn main() {
                 // 1B.3: route through bf16-WMMA when MLRIFT_BWD_UV_PRECISION=bf16.
                 // Both kernels share the same descriptor layout + kernarg ABI;
                 // only the `precision` descriptor field (offset 52) and the
-                // kernel file-handle differ.
+                // kernel file-handle differ.  In bf16 mode we first pack the f32
+                // A/B inputs into the bf16 shadow buffers (on-GPU truncating cast).
                 u64 fh_for_buv = fh_ggrp
                 u32 prec_for_buv = 0
                 if use_bf16 == 1 {
                     fh_for_buv = fh_bf16_grouped
                     prec_for_buv = 1
+                    // Cast the whole interT [K,R,BS] + doutk [K,BS,D] tensors.
+                    launch_pack_f32_to_bf16(fh_pack_bf16, d_interT, d_interT_bf, K*R*BS)
+                    launch_pack_f32_to_bf16(fh_pack_bf16, d_doutk,  d_doutk_bf,  K*BS*D)
+                    sync_or_die("sync bf16 pack dV")
                 }
                 build_gemm_grouped_descriptor(d_desc_dV, K,
                     M_dV, N_dV, KK_dV, LdA_dV, LdB_dV, LdC_dV,
@@ -1243,14 +1303,27 @@ fn main() {
                     unsafe { *((LdA_dU + kdu*4) as u32) = BS }   // A=xT [D,BS] row-major lda=K=BS
                     unsafe { *((LdB_dU + kdu*4) as u32) = R }    // B=dinter [BS,R] ldb=N=R
                     unsafe { *((LdC_dU + kdu*4) as u32) = R }    // C=dU [D,R] ldc=N=R
-                    unsafe { *((Ap_dU  + kdu*8) as u64) = d_xT }                  // broadcast
-                    unsafe { *((Bp_dU  + kdu*8) as u64) = d_dinter + kdu*BS*R*4 }
+                    // A/B pointers: f32 by default; bf16 shadows when bf16 mode.
+                    u64 ap_du_k = d_xT                       // broadcast (f32)
+                    u64 bp_du_k = d_dinter + kdu*BS*R*4
+                    if use_bf16 == 1 {
+                        ap_du_k = d_xT_bf                    // broadcast (bf16)
+                        bp_du_k = d_dinter_bf + kdu*BS*R*2
+                    }
+                    unsafe { *((Ap_dU  + kdu*8) as u64) = ap_du_k }
+                    unsafe { *((Bp_dU  + kdu*8) as u64) = bp_du_k }
                     unsafe { *((Cp_dU  + kdu*8) as u64) = d_dU     + kdu*D*R*4 }
                     unsafe { *((Ac_dU  + kdu*4) as u32) = 1 }
                     kdu = kdu + 1
                 }
                 u64 tot_dU_slot = alloc(4); unsafe { *(tot_dU_slot as u32) = 0 }
                 // 1B.3: reuse fh_for_buv + prec_for_buv selected for dV above.
+                // In bf16 mode, pack xT [D,BS] (broadcast) + dinter [K,BS,R].
+                if use_bf16 == 1 {
+                    launch_pack_f32_to_bf16(fh_pack_bf16, d_xT,     d_xT_bf,     D*BS)
+                    launch_pack_f32_to_bf16(fh_pack_bf16, d_dinter, d_dinter_bf, K*BS*R)
+                    sync_or_die("sync bf16 pack dU")
+                }
                 build_gemm_grouped_descriptor(d_desc_dU, K,
                     M_dU, N_dU, KK_dU, LdA_dU, LdB_dU, LdC_dU,
                     Ap_dU, Bp_dU, Cp_dU, Ac_dU, prec_for_buv, 0, tot_dU_slot)
