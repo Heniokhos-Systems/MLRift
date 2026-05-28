@@ -9762,6 +9762,76 @@ fn emit_amdgpu_gemm_f32_grouped_blob(uint64 out_path) -> uint64 {
 }
 
 
+// ─── Phase 1B.1 — gemm_bf16_grouped emitter scaffolding ────────────────────
+//
+// New body slot for the WMMA bf16 grouped-GEMM (the real perf lever for Phase
+// 1B: ~3× over the f32 grouped path via RDNA3 tensor cores).  For 1B.1 the
+// inner body is INTENTIONALLY identical to the f32 grouped body — visitor +
+// descriptor load + GEMM math — emitted by simply calling the existing
+// _emit_gemm_f32_grouped_body helper.  The only thing that differs from the
+// f32 path is the AMDHSA kernel symbol name set in the blob wrapper
+// ("gemm_bf16_grouped" vs "gemm_f32_grouped").
+//
+// Why share the body for 1B.1:
+//   - Validates the new emitter slot + CLI flag + .co handoff end-to-end
+//     without dragging in any WMMA bytecode risk.  If the smoke produces
+//     byte-identical C output to the f32 path, the scaffolding is sound.
+//   - When 1B.2 lands the real WMMA math (v_wmma_f32_16x16x16_bf16 with bf16
+//     LDS panels and f32 accumulator), this helper forks: we'll copy the f32
+//     body's structure, swap the inner FMA loop for the WMMA primitive, and
+//     add f32→bf16 LDS-fill casts at the panel-load stage.  KD plumbing
+//     (rsrc1/rsrc2/props/LDS) will likely diverge then too — WMMA needs
+//     specific VGPR allocations for the A/B/C operand tiles.
+//
+// Register / LDS / KD constraints carried over from 1A:
+//   - rsrc1 = 0xE0AF0083  (32 VGPRs / 32 SGPRs granule — covers v[20:27]
+//     b128 panel-load quads + v13 LDS-vaddr scratch from 1A.5b).
+//   - rsrc2 = 0x0000009E  (USER_SGPR=15 → WG_ID_X in s15).
+//   - LDS    = 16384 bytes (buf0 + buf1 double-buffered panels + broadcast
+//     slot at LDS[16368] per 1A.8).
+//   - n_args = 6 (d_desc, b_batch, total_tiles, fast_path_flag,
+//     precision_mode, d_counter — all 8-byte shim slots).
+fn _emit_gemm_bf16_grouped_body(uint64 args_desc) {
+    // 1B.1: byte-identical to the f32 grouped body.  When 1B.2 lands real
+    // WMMA bf16 math this call goes away and we inline the (forked) emit
+    // sequence here.
+    _emit_gemm_f32_grouped_body(args_desc)
+}
+
+@export
+fn emit_amdgpu_gemm_bf16_grouped_blob(uint64 out_path) -> uint64 {
+    uint64[12] args_desc
+    _emit_gemm_bf16_grouped_body(args_desc)
+
+    // KD plumbing — IDENTICAL to the f32 grouped blob.  See the long comment
+    // above emit_amdgpu_gemm_f32_grouped_blob for the bit-by-bit derivation
+    // of rsrc1/rsrc2/props/LDS values.  The ONLY difference here is the
+    // kernel symbol name: "gemm_bf16_grouped" (17 chars) vs "gemm_f32_grouped"
+    // (16 chars) — this is what hipModuleGetFunction(fh, mod, "gemm_bf16_grouped")
+    // resolves against in the launcher.
+    //
+    // 1B.2 will likely change these values: WMMA needs specific VGPR
+    // allocations for A/B/C operand tiles, and we may grow LDS to hold the
+    // bf16 panels (half the f32 footprint per element, but possibly larger
+    // panels for tensor-core occupancy).
+    uint64 size = emit_amdgpu_code_object_lds("gemm_bf16_grouped", 17,
+                                               asm_text_buf, asm_text_len,
+                                               48, 8, 32, 32,
+                                               0xE0AF0083, 0x0000009E, 0x00000010, 0x0408,
+                                               args_desc, 6,
+                                               16384)
+
+    uint64 fd = file_open(out_path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "emit_amdgpu_gemm_bf16_grouped_blob: cannot open output\n", 55)
+        return 1
+    }
+    file_write(fd, amd_buf, size)
+    file_close(fd)
+    return 0
+}
+
+
 
 // LLM Phase A milestone 4 — gemm f16 storage, f32 accum, native-emit.
 // Identical structure to N3 (16x16 LDS-tiled, 2-D dispatch) except:
