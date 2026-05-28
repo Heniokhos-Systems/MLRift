@@ -9791,11 +9791,496 @@ fn emit_amdgpu_gemm_f32_grouped_blob(uint64 out_path) -> uint64 {
 //     slot at LDS[16368] per 1A.8).
 //   - n_args = 6 (d_desc, b_batch, total_tiles, fast_path_flag,
 //     precision_mode, d_counter — all 8-byte shim slots).
+// ─── Phase 1B.2 — real WMMA bf16 grouped GEMM body ─────────────────────────
+//
+// Forks the 1B.1 delegate into a real v_wmma_f32_16x16x16_bf16 implementation.
+//
+// Block size: 32 (1 wave per WG, NOT 256).  Each WG processes ONE 16x16 output
+// tile.  This keeps the WMMA encoding identical to the proven single-GEMM
+// bf16 WMMA body (_emit_gemm_bf16f32_wmma_body at line 10142) — that body is
+// also block=32, so we don't have to invent cross-wave coordination on top of
+// WMMA.  We wrap the proven inner body in the persistent-WG visitor frame
+// from 1A so the grouped dispatch ABI is preserved.
+//
+// Input contract (1B.2):
+//   - A and B buffers in the descriptor are **bf16-stored, NOT f32**.  The
+//     descriptor's `precision` field signals to the launcher (host-side) that
+//     it must pre-cast f32→bf16 into separate bf16 buffers and put the bf16
+//     pointers into A_ptr / B_ptr.  C remains f32.
+//   - lda / ldb are bf16 element strides (= K and N respectively for the
+//     row-major contiguous case).  ldc is f32 elements.
+//
+// Why block=32 instead of 256 (the f32 grouped path's block):
+//   - v_wmma_f32_16x16x16_bf16 is a wave32 instruction.  In a 256-lane block,
+//     8 waves would all execute the WMMA, but the operand VGPRs across waves
+//     don't naturally form a 16x16 tile (each wave has its own 32-lane
+//     fragment).  Coordinating 256-lane WMMA cleanly requires LDS staging +
+//     cross-wave barriers — substantial new logic.
+//   - block=32 means 1 wave = 1 16x16 tile.  This matches the single-GEMM
+//     WMMA body exactly; we reuse its WMMA encoding, lane→element mapping,
+//     and accumulator layout verbatim.
+//   - Trade-off: fewer lanes per WG means lower occupancy than the f32 path.
+//     But each lane does ~16× more tensor-core work via WMMA, so the effective
+//     throughput goal is to break even on launch overhead and let WMMA itself
+//     provide the win.  If perf doesn't beat the f32 path's 5.78 ms baseline,
+//     1B.3+ will revisit with 256-lane WMMA staging.
+//
+// Persistent-WG visitor: identical to 1A's structure, except the cross-wave
+// barrier in section 2a/2b is REMOVED — at block=32 there is only one wave,
+// so v0=0 maps directly to lane-0 and we can skip the LDS broadcast slot
+// entirely.  The atomic still uses s_and_saveexec to restrict to lane-0.
+//
+// VGPR layout (matches _emit_gemm_bf16f32_wmma_body's inner body):
+//   v0       = lane id (0..31, system-set)
+//   v1..v8   = B fragment (16 bf16 per lane)
+//   v9..v16  = A fragment (16 bf16 per lane)
+//   v17..v24 = C accumulator (8 f32 per lane)
+//   v25      = wave_half (= v0 >> 4, 0 or 1)
+//   v26      = lane_idx_in_half (= v0 & 0xF, 0..15)
+//   v27..v30 = address scratch (A v_off, B v_off lo/hi, C v_off)
+//
+// SGPR layout (visitor + descriptor):
+//   s[0:1]   = kernarg ptr (system-set)
+//   s2       = stashed WG_ID_X (USER_SGPR=15 → s15 → save to s2 before kernarg)
+//   s[2:3] is REPURPOSED after the stash: visitor uses s[2:3] = d_desc base.
+//     But the WMMA inner body needs s2 to remain WG_ID_X across the kernarg
+//     load.  Resolution: stash s15→s8 here (not s2 like single-GEMM), so the
+//     visitor's s[2:3]=d_desc usage stays clean.  This is the ONE divergence
+//     from single-GEMM WMMA's ABI.
+//
+// Actually simpler: visitor doesn't need WG_ID_X at all (block=32 here vs
+// block=256 in 1A; with grid=240 each WG gets a unique WG_ID_X already, and
+// the visitor uses an atomic counter for tile assignment so WG_ID_X is
+// unused).  We DON'T need to save WG_ID_X.  This is one less hazard.
+//
+// Kernarg ABI: SAME as f32 grouped (6 slots, identical layout).  Launcher
+// can use the same launch_gemm_grouped() with a fresh fh — only difference
+// is block=32 instead of 256.
 fn _emit_gemm_bf16_grouped_body(uint64 args_desc) {
-    // 1B.1: byte-identical to the f32 grouped body.  When 1B.2 lands real
-    // WMMA bf16 math this call goes away and we inline the (forked) emit
-    // sequence here.
-    _emit_gemm_f32_grouped_body(args_desc)
+    asm_init()
+
+    // ── 1. Kernarg load (mirrors f32 grouped body section 1) ───────────────
+    asm_s_load_b64(1, 0)                              // s[2:3] = d_desc
+    asm_s_load_b32(2, 0, 16)                          // s4 = total_tiles
+    asm_s_load_b64_off(3, 0, 40)                      // s[6:7] = d_global_counter
+    asm_s_load_b64_off(4, 0, 24)                      // s[8:9] = fast_path_flag + pad
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    // Park fast_path_flag in s5 (permanently free SGPR).
+    asm_u32_arch(0xBE850008, 0xBE850308)              // s_mov_b32 s5, s8
+
+    // ── 2. Persistent-WG visitor top.
+    uint64 loop_top_idx = asm_text_len / 4
+
+    // ── 2a. Lane-0 atomic_inc on d_global_counter.  block=32 = single wave,
+    //    so we don't need the cross-wave LDS broadcast.  We still narrow EXEC
+    //    to lane 0 for the atomic, then s_readfirstlane on the result.
+    //
+    // OOB-clamp: init v1 (vaddr) + v2 (addend) in all 32 lanes BEFORE
+    // narrowing EXEC.  This honors the OOB-pad-lane-wedge rule per
+    // feedback_oob_address_pad_lane_wedge.md.
+    asm_v_mov_b32_inline_u(1, 0)                      // v1 = 0 (vaddr)
+    asm_v_mov_b32_inline_u(2, 1)                      // v2 = 1 (addend)
+    asm_s_delay_alu(0x01)
+
+    // Narrow EXEC to lane 0 (v0 == 0).
+    asm_v_cmp_eq_u32_imm_vgpr(0, 0)
+    asm_s_and_saveexec_b32_vcc_lo(8)                  // s8 = old exec
+    uint64 atomic_skip_idx = asm_text_len / 4
+    asm_s_cbranch_execz(0)                            // patched below
+
+    // global_atomic_add_u32 v2, v1, v2, s[6:7] glc.
+    asm_u32(0xDCD64000)
+    asm_u32(0x02060201)
+    asm_s_waitcnt_vmcnt_zero()
+    asm_buffer_gl0_inv()
+    asm_v_readfirstlane_b32(10, 2)                    // s10 = tile_id (from lane 0)
+
+    uint64 after_atomic_idx = asm_text_len / 4
+    uint64 atomic_skip_simm = after_atomic_idx - atomic_skip_idx - 1
+    asm_patch_u32(atomic_skip_idx,
+                  0xBFA50000 | (atomic_skip_simm & 0xFFFF))
+
+    // Restore EXEC (all 32 lanes active again).
+    asm_u32(0x8C7E087E)                               // s_or_b32 exec_lo, exec_lo, s8
+
+    // Broadcast s10 to all lanes via SOPC (it's already scalar — s_readfirstlane
+    // makes it uniform).  At block=32 / 1 wave, no s_barrier needed; the scalar
+    // s10 is already visible to all lanes via the scalar register file.
+
+    // ── 3. Exit condition: if (s10 >= s4 total_tiles) → s_endpgm.
+    asm_u32(0xBF09040A)                               // s_cmp_ge_u32 s10, s4
+    uint64 cbranch_end_idx = asm_text_len / 4
+    asm_u32_arch(0xBFA20000, 0xBF850000)              // s_cbranch_scc1 .Lend
+
+    // ── 4. Visitor dispatch on fast_path_flag (parked in s5).
+    asm_u32(0xBF068005)                               // s_cmp_eq_u32 s5, 0
+    uint64 het_skip_idx = asm_text_len / 4
+    asm_u32_arch(0xBFA10000, 0xBF840000)              // s_cbranch_scc0 .Lfast_path
+
+    // ── 4-het. Heterogeneous prefix-search visitor (same as f32 path) ──
+    asm_u32_arch(0xBE8B0080, 0xBE8B0380)              // s_mov_b32 s11, 0
+    asm_u32_arch(0xBE8E0002, 0xBE8E0302)              // s_mov_b32 s14, s2
+    asm_u32_arch(0xBE8F0003, 0xBE8F0303)              // s_mov_b32 s15, s3
+
+    uint64 het_loop_idx = asm_text_len / 4
+    asm_s_load_b64_off(6, 7, 60)                      // s[12:13] = tile_count + tile_prefix
+    asm_s_waitcnt_lgkmcnt_zero()
+
+    asm_u32(0x800C0D0C)                               // s_add_u32 s12, s12, s13 (end_prefix)
+    asm_u32(0xBF0A0C0A)                               // s_cmp_lt_u32 s10, s12
+    uint64 het_found_br_idx = asm_text_len / 4
+    asm_u32_arch(0xBFA20000, 0xBF850000)              // s_cbranch_scc1 .Lhet_found
+
+    // Not found this iter: advance desc_addr by 88, increment group_idx.
+    asm_u32(0x800EC00E)                               // s_add_u32 s14, s14, 64
+    asm_u32(0x820F800F)                               // s_addc_u32 s15, s15, 0
+    asm_u32(0x800E980E)                               // s_add_u32 s14, s14, 24
+    asm_u32(0x820F800F)                               // s_addc_u32 s15, s15, 0
+    asm_u32(0x800B810B)                               // s_add_u32 s11, s11, 1
+    uint64 het_back_at = asm_text_len / 4
+    uint64 het_back_simm = het_loop_idx - (het_back_at + 1)
+    asm_s_branch(het_back_simm & 0xFFFF)
+
+    uint64 het_found_idx = asm_text_len / 4
+    uint64 het_found_simm = het_found_idx - het_found_br_idx - 1
+    uint64 het_sccbr_top = 0xBFA20000
+    if _is_gfx10() != 0 { het_sccbr_top = 0xBF850000 }
+    asm_patch_u32(het_found_br_idx, het_sccbr_top | (het_found_simm & 0xFFFF))
+    asm_u32(0x808A0D0A)                               // s_sub_u32 s10, s10, s13
+    uint64 het_to_4d_idx = asm_text_len / 4
+    asm_s_branch(0)                                   // patched after 4c
+
+    // ── .Lfast_path: same-shape divmod ─────────────────────────────────────
+    uint64 fast_path_idx = asm_text_len / 4
+    uint64 het_skip_simm = fast_path_idx - het_skip_idx - 1
+    uint64 het_skip_top = 0xBFA10000
+    if _is_gfx10() != 0 { het_skip_top = 0xBF840000 }
+    asm_patch_u32(het_skip_idx, het_skip_top | (het_skip_simm & 0xFFFF))
+
+    asm_s_load_b32(4, 1, 60)                          // s8 = tile_count_per_group
+    asm_s_waitcnt_lgkmcnt_zero()
+    asm_u32_arch(0xBE8B0080, 0xBE8B0380)              // s_mov_b32 s11, 0
+
+    uint64 div_loop_idx = asm_text_len / 4
+    asm_u32(0xBF0A080A)                               // s_cmp_lt_u32 s10, s8
+    asm_u32_arch(0xBFA20003, 0xBF850003)              // s_cbranch_scc1 +3
+    asm_u32(0x808A080A)                               // s_sub_u32 s10, s10, s8
+    asm_u32(0x800B810B)                               // s_add_u32 s11, s11, 1
+    uint64 div_back_at = asm_text_len / 4
+    uint64 div_back_simm = div_loop_idx - (div_back_at + 1)
+    asm_s_branch(div_back_simm & 0xFFFF)
+
+    // ── 4c. desc_offset_bytes = s11 * 88.
+    asm_u32_arch(0x840C860B, 0x8F0C860B)              // s_lshl_b32 s12, s11, 6
+    asm_u32_arch(0x840D840B, 0x8F0D840B)              // s_lshl_b32 s13, s11, 4
+    asm_u32(0x800C0D0C)                               // s_add_u32 s12, s12, s13
+    asm_u32_arch(0x840D830B, 0x8F0D830B)              // s_lshl_b32 s13, s11, 3
+    asm_u32(0x800C0D0C)                               // s_add_u32 s12, s12, s13
+    asm_u32(0x800E0C02)                               // s_add_u32 s14, s2, s12
+    asm_u32(0x820F8003)                               // s_addc_u32 s15, s3, 0
+
+    uint64 after_4c_idx = asm_text_len / 4
+    uint64 het_to_4d_simm = after_4c_idx - het_to_4d_idx - 1
+    asm_patch_u32(het_to_4d_idx, 0xBFA00000 | (het_to_4d_simm & 0xFFFF))
+
+    // ── 4d. Load descriptor: M N K lda ldb ldc A_ptr B_ptr C_ptr acc_flag.
+    asm_u32(0xF4080407); asm_u32(0xF8000000)          // s[16:19] = (M,N,K,lda)
+    asm_u32(0xF4080507); asm_u32(0xF8000010)          // s[20:23] = (ldb,ldc,A_lo,A_hi)
+    asm_u32(0xF4080607); asm_u32(0xF8000020)          // s[24:27] = (B_lo,B_hi,C_lo,C_hi)
+    asm_u32(0xF4000707); asm_u32(0xF8000030)          // s28 = acc_flag
+    asm_s_waitcnt_lgkmcnt_zero()
+    // Now: s16=M s17=N s18=K s19=lda s20=ldb s21=ldc
+    //      s[22:23]=A_ptr s[24:25]=B_ptr s[26:27]=C_ptr s28=acc_flag.
+
+    // ── 4e. Decompose local_tile_id (s10) into (local_m, local_n).
+    //   tiles_n = N >> 4  → s8
+    asm_u32_arch(0x85088411, 0x90088411)              // s_lshr_b32 s8, s17, 4
+    asm_u32_arch(0xBE9D0080, 0xBE9D0380)              // s_mov_b32 s29, 0
+
+    uint64 mn_loop_idx = asm_text_len / 4
+    asm_u32(0xBF0A080A)                               // s_cmp_lt_u32 s10, s8
+    asm_u32_arch(0xBFA20003, 0xBF850003)              // s_cbranch_scc1 +3
+    asm_u32(0x808A080A)                               // s_sub_u32 s10, s10, s8
+    asm_u32(0x801D811D)                               // s_add_u32 s29, s29, 1
+    uint64 mn_back_at = asm_text_len / 4
+    uint64 mn_back_simm = mn_loop_idx - (mn_back_at + 1)
+    asm_s_branch(mn_back_simm & 0xFFFF)
+    // Now: s29 = local_m, s10 = local_n.
+
+    asm_u32_arch(0xBE9E000A, 0xBE9E030A)              // s_mov_b32 s30, s10
+    // Tile origins: s29 = local_m*16, s30 = local_n*16.
+    asm_u32_arch(0x841D841D, 0x8F1D841D)              // s_lshl_b32 s29, s29, 4
+    asm_u32_arch(0x841E841E, 0x8F1E841E)              // s_lshl_b32 s30, s30, 4
+
+    // ── 5. WMMA inner body (adapted from _emit_gemm_bf16f32_wmma_body).
+    //
+    // In the standalone WMMA body, s16/s17 hold WG_ID_Y*16 / WG_ID_X*16
+    // (the tile origins).  Here, s29 / s30 hold the equivalent values from
+    // the visitor's decompose.  Map: s16→s29, s17→s30.
+    // s10 (in standalone) = N → here s17.  s12 (standalone) = N → s17.
+    // s14 (standalone) = K → here s18.  s8/s9 (standalone) = C_ptr →
+    //   here s[26:27].  s4/s5 (standalone) = A_ptr → here s[22:23].
+    //   s6/s7 (standalone) = B_ptr → here s[24:25].
+    //
+    // Stride constants (single-GEMM uses s19/s20/s23):
+    //   s19_local = N*2 (= s20_desc * 2 = ldb in bytes for bf16; but here we
+    //                    use ldb stored at s20 which is ELEMENTS.  For bf16
+    //                    inputs the stride in BYTES = ldb*2 = s20<<1.)
+    //   s20_local = N*4 (= s20_desc << 2; B-row stride for the 4-row jump
+    //                    inside the inner-K block; here =  bf16 stride * 2)
+    //   s23_local = ldc*4 (C is f32 — ldc*4 bytes between C-rows; here = s21<<2)
+    //
+    // We don't have spare SGPRs at the exact slot names from single-GEMM, so
+    // we recompute into fresh slots:
+    //   s8  = ldb * 2 (bf16 row stride for B in bytes; was s19 in standalone)
+    //   s9  = ldb * 4 (4-row jump for inner-K B; was s20 in standalone)
+    //   s11 = ldc * 4 (C row stride; was s23 in standalone)
+    //   s12 = K_tiles (K >> 4)
+    //   s13 = K-loop counter
+    //
+    // Note: s8 was used as the saveexec scratch in section 2a, but that EXEC
+    // window is long closed by now (s_or_b32 restored EXEC in section 2b).
+    // s14/s15 were the per-group desc_addr; we don't need them after section
+    // 4d (descriptor already loaded into s16..s28).  But we keep them as is
+    // to keep the back-edge invariant intact (visitor restart re-loads them).
+
+    //   s8 = ldb (s20) * 2 (bf16 element stride to row stride in bytes)
+    asm_u32_arch(0x84088114, 0x8F088114)              // s_lshl_b32 s8, s20, 1
+    //   s9 = ldb (s20) * 4 (4-row B-jump in bytes)
+    asm_u32_arch(0x84098214, 0x8F098214)              // s_lshl_b32 s9, s20, 2
+    //   s11 = ldc (s21) * 8 (C-store stride between consecutive lane writes;
+    //   WMMA lane→element mapping: lanes 0..15 = wave_half 0 write rows
+    //   {0,2,4,...,14}, lanes 16..31 = wave_half 1 write rows {1,3,...,15}.
+    //   Each lane's 8 stores span 8 of its assigned rows with stride=2 rows
+    //   (= ldc*8 BYTES, since each row = ldc f32 elements = ldc*4 bytes).
+    //   This matches the single-GEMM WMMA body's s23 = N*8 stride.
+    asm_u32_arch(0x840B8315, 0x8F0B8315)              // s_lshl_b32 s11, s21, 3
+
+    //   v26 = v0 & 0xF (lane_idx within half-wave)
+    asm_u32(0x3634008F)
+    //   v25 = v0 >> 4  (wave_half: 0 or 1)
+    asm_u32(0x32320084)
+
+    //   A v_off = (s29 + v26) * lda * 2  (bf16 byte offset into A panel for this row)
+    //     v27 = s29 + v26
+    asm_u32(0x4A36341D)                               // v_add_nc_u32 v27, s29, v26
+    //     v27 = v27 * s19 (lda)  → VOP3 v_mul_lo_u32 v27, v27, s19
+    asm_u32(0xD72C001B); asm_u32(0x0000271B)
+    //     v27 = v27 << 1 (bf16 byte stride)
+    asm_u32(0x30363681)
+
+    //   B v_off lo = (s30 + v26) * 2  (bf16 byte offset into B panel for column)
+    asm_u32(0x4A38341E)                               // v_add_nc_u32 v28, s30, v26
+    asm_u32(0x30383881)                               // v_lshlrev_b32 v28, 1, v28
+    //   B v_off hi = v28 + s8 (+ ldb*2 = next row)
+    asm_u32(0x4A3A3808)                               // v_add_nc_u32 v29, s8, v28
+
+    //   C v_off = ((s29 + v25) * ldc + s30 + v26) * 4
+    asm_u32(0x4A3C321D)                               // v_add_nc_u32 v30, s29, v25
+    asm_u32(0xD72C001E); asm_u32(0x00002B1E)          // v_mul_lo_u32 v30, v30, s21 (ldc)
+    asm_u32(0x4A3C3C1E)                               // v_add_nc_u32 v30, s30, v30
+    asm_u32(0x4A3C351E)                               // v_add_nc_u32 v30, v30, v26
+    asm_u32(0x303C3C82)                               // v_lshlrev_b32 v30, 2, v30
+
+    //   s12 = K_tiles = K (s18) >> 4
+    asm_u32_arch(0x850C8412, 0x900C8412)              // s_lshr_b32 s12, s18, 4
+    //   s13 = K-loop counter = 0
+    asm_u32_arch(0xBE8D0080, 0xBE8D0380)              // s_mov_b32 s13, 0
+
+    //   Init C accumulator v17..v24 to 0 (per-tile reset — critical for
+    //   persistent-WG correctness: each new tile starts from a clean accum).
+    asm_u32(0x7E220280); asm_u32(0x7E240280)
+    asm_u32(0x7E260280); asm_u32(0x7E280280)
+    asm_u32(0x7E2A0280); asm_u32(0x7E2C0280)
+    asm_u32(0x7E2E0280); asm_u32(0x7E300280)
+
+    //   Skip K-loop if K_tiles == 0 (defensive; shouldn't happen for K≥16).
+    asm_u32(0xBF06800C)                               // s_cmp_eq_u32 s12, 0
+    uint64 kt_skip_idx = asm_text_len / 4
+    asm_u32_arch(0xBFA20000, 0xBF850000)              // s_cbranch_scc1 .Lstore
+
+    // ── .Lkt_loop: per-K-tile WMMA accumulate ──────────────────────────────
+    uint64 kt_loop_idx = asm_text_len / 4
+    asm_u32(0xBF870001)                               // s_delay_alu instid0(VALU_DEP_1)
+    //   Load A fragment: 2× global_load_b128 v[9:16] from A_ptr + v27.
+    //     Note: single-GEMM uses s[4:5] as A_ptr saddr; we use s[22:23].
+    //     word2 layout: (vdst<<24)|(saddr<<16)|(0)|(vaddr=v27=27).
+    //     For vdst=9, saddr=22: 0x0916001B.  Same form for vdst=13, +16 offset.
+    asm_u32(0xDC5E0000); asm_u32(0x0916001B)          // global_load_b128 v[9:12], v27, s[22:23]
+    asm_u32(0xDC5E0010); asm_u32(0x0D16001B)          // global_load_b128 v[13:16], v27, s[22:23] off:16
+
+    //   Load B fragment: 16× d16_b16/d16_hi_b16 from B_ptr + v28/v29.
+    //     single-GEMM uses s[6:7] as B_ptr saddr; we use s[24:25].
+    //     d16_b16 word1 = 0xDC820000, word2 = (vdst<<24)|(saddr<<16)|(0)|(vaddr).
+    //     For vdst=1, saddr=24: (1<<24)|(24<<16)|0|28 = 0x0118001C.
+    //     d16_hi_b16 word1 = 0xDC8E0000, word2 same pattern but vaddr=29.
+    asm_u32(0xBF870001)
+    asm_u32(0xDC820000); asm_u32(0x0118001C)
+    asm_u32(0xDC8E0000); asm_u32(0x0118001D)
+    asm_u32(0x4A383809); asm_u32(0x4A3A3A09)          // v28 += s9; v29 += s9
+    asm_u32(0xBF870001)
+    asm_u32(0xDC820000); asm_u32(0x0218001C)
+    asm_u32(0xDC8E0000); asm_u32(0x0218001D)
+    asm_u32(0x4A383809); asm_u32(0x4A3A3A09)
+    asm_u32(0xBF870001)
+    asm_u32(0xDC820000); asm_u32(0x0318001C)
+    asm_u32(0xDC8E0000); asm_u32(0x0318001D)
+    asm_u32(0x4A383809); asm_u32(0x4A3A3A09)
+    asm_u32(0xBF870001)
+    asm_u32(0xDC820000); asm_u32(0x0418001C)
+    asm_u32(0xDC8E0000); asm_u32(0x0418001D)
+    asm_u32(0x4A383809); asm_u32(0x4A3A3A09)
+    asm_u32(0xBF870001)
+    asm_u32(0xDC820000); asm_u32(0x0518001C)
+    asm_u32(0xDC8E0000); asm_u32(0x0518001D)
+    asm_u32(0x4A383809); asm_u32(0x4A3A3A09)
+    asm_u32(0xBF870001)
+    asm_u32(0xDC820000); asm_u32(0x0618001C)
+    asm_u32(0xDC8E0000); asm_u32(0x0618001D)
+    asm_u32(0x4A383809); asm_u32(0x4A3A3A09)
+    asm_u32(0xBF870001)
+    asm_u32(0xDC820000); asm_u32(0x0718001C)
+    asm_u32(0xDC8E0000); asm_u32(0x0718001D)
+    asm_u32(0x4A383809); asm_u32(0x4A3A3A09)
+    asm_u32(0xBF870001)
+    asm_u32(0xDC820000); asm_u32(0x0818001C)
+    asm_u32(0xDC8E0000); asm_u32(0x0818001D)
+    asm_u32(0x4A383809); asm_u32(0x4A3A3A09)
+
+    //   A v_off += 32 (next K-tile = 16 bf16 elements = 32 bytes)
+    asm_u32(0x4A3636A0)                               // v_add_nc_u32 v27, 32, v27
+    asm_u32(0xBF8903F7)                               // s_waitcnt vmcnt(0)
+    asm_u32(0xCC414011); asm_u32(0x1C460309)          // v_wmma_f32_16x16x16_bf16
+    asm_u32(0x800D810D)                               // s_add_u32 s13, s13, 1
+    asm_u32(0xBF0A0C0D)                               // s_cmp_lt_u32 s13, s12
+    uint64 kt_back_at = asm_text_len / 4
+    uint64 kt_back_simm = kt_loop_idx - (kt_back_at + 1)
+    asm_u32_arch(0xBFA20000 | (kt_back_simm & 0xFFFF),
+                 0xBF850000 | (kt_back_simm & 0xFFFF))
+
+    // ── .Lstore: write v17..v24 to C[m, n] respecting acc_flag ──────────────
+    uint64 store_idx = asm_text_len / 4
+    uint64 kt_skip_simm = store_idx - kt_skip_idx - 1
+    uint64 kt_sccbr_top = 0xBFA20000
+    if _is_gfx10() != 0 { kt_sccbr_top = 0xBF850000 }
+    asm_patch_u32(kt_skip_idx, kt_sccbr_top | (kt_skip_simm & 0xFFFF))
+
+    // acc_flag handling.  Stored at s28.
+    //   if (s28 == 0) → branch to .Lstore_pure (no load+add)
+    //   else load 8 existing C values + add to v17..v24, then store.
+    asm_u32(0xBF06801C)                               // s_cmp_eq_u32 s28, 0
+    uint64 acc_skip_idx = asm_text_len / 4
+    asm_u32_arch(0xBFA20000, 0xBF850000)              // s_cbranch_scc1 .Lstore_pure
+
+    //   acc=1 path: 8× global_load_b32 from C_ptr+v30, add into v17..v24.
+    //   Step v30 by s11 (= ldc*4 bytes) between loads.
+    //   We use a scratch v31 for the running address since v30 is the canonical
+    //   base; cheaper to just advance v30 and recover it for the store path.
+    //   But that means we'd add 8 *s11 to v30 then have to subtract 8*s11
+    //   before storing.  Cleaner: copy v30 → v31 and advance v31.
+
+    //   v31 = v30 (copy)
+    asm_u32(0x7E3E031E)                               // v_mov_b32 v31, v30
+    //   load 8 × b32 with v31 += s11 between each.
+    asm_u32(0xDC520000); asm_u32(0x201A001F)          // global_load_b32 v32, v31, s[26:27]
+    asm_s_waitcnt_vmcnt_zero()
+    asm_u32(0x06224111)                               // v_add_f32 v17, v17, v32  (src0=v17=0x111, src1=v32=32<<9=0x4000, vdst=17<<17=0x220000)
+    asm_u32(0x4A3E3E0B)                               // v_add_nc_u32 v31, s11, v31
+
+    asm_u32(0xDC520000); asm_u32(0x201A001F)
+    asm_s_waitcnt_vmcnt_zero()
+    asm_u32(0x06244112)                               // v_add_f32 v18, v18, v32
+    asm_u32(0x4A3E3E0B)
+
+    asm_u32(0xDC520000); asm_u32(0x201A001F)
+    asm_s_waitcnt_vmcnt_zero()
+    asm_u32(0x06264113)                               // v_add_f32 v19, v19, v32
+    asm_u32(0x4A3E3E0B)
+
+    asm_u32(0xDC520000); asm_u32(0x201A001F)
+    asm_s_waitcnt_vmcnt_zero()
+    asm_u32(0x06284114)                               // v_add_f32 v20, v20, v32
+    asm_u32(0x4A3E3E0B)
+
+    asm_u32(0xDC520000); asm_u32(0x201A001F)
+    asm_s_waitcnt_vmcnt_zero()
+    asm_u32(0x062A4115)                               // v_add_f32 v21, v21, v32
+    asm_u32(0x4A3E3E0B)
+
+    asm_u32(0xDC520000); asm_u32(0x201A001F)
+    asm_s_waitcnt_vmcnt_zero()
+    asm_u32(0x062C4116)                               // v_add_f32 v22, v22, v32
+    asm_u32(0x4A3E3E0B)
+
+    asm_u32(0xDC520000); asm_u32(0x201A001F)
+    asm_s_waitcnt_vmcnt_zero()
+    asm_u32(0x062E4117)                               // v_add_f32 v23, v23, v32
+    asm_u32(0x4A3E3E0B)
+
+    asm_u32(0xDC520000); asm_u32(0x201A001F)
+    asm_s_waitcnt_vmcnt_zero()
+    asm_u32(0x06304118)                               // v_add_f32 v24, v24, v32
+    // (no v31 increment after last load — not needed)
+
+    // ── .Lstore_pure: 8 stores at v30, increment by s11 between ──
+    uint64 store_pure_idx = asm_text_len / 4
+    uint64 acc_skip_simm = store_pure_idx - acc_skip_idx - 1
+    uint64 acc_sccbr_top = 0xBFA20000
+    if _is_gfx10() != 0 { acc_sccbr_top = 0xBF850000 }
+    asm_patch_u32(acc_skip_idx, acc_sccbr_top | (acc_skip_simm & 0xFFFF))
+
+    //   global_store_b32 v30, v17, s[26:27]   (word2 = (vdata=v17=17<<8)|vaddr=v30=30
+    //                                          shifted into the right field per
+    //                                          encoding; single-GEMM line 10079 used
+    //                                          0x0008111E = (8<<24)|(s8/0<<16)|(17<<8)|30
+    //                                          where 8 was saddr index for s[8:9].
+    //                                          We use s[26:27] → saddr=26.  word2 =
+    //                                          (8<<24)|(26<<16)|(17<<8)|30 =
+    //                                          0x081A111E).
+    asm_u32(0xDC6A0000); asm_u32(0x081A111E)          // global_store_b32 v30, v17, s[26:27]
+    asm_u32(0x4A3C3C0B)                               // v_add_nc_u32 v30, s11, v30
+    asm_u32(0xDC6A0000); asm_u32(0x081A121E)          // v18
+    asm_u32(0x4A3C3C0B)
+    asm_u32(0xDC6A0000); asm_u32(0x081A131E)          // v19
+    asm_u32(0x4A3C3C0B)
+    asm_u32(0xDC6A0000); asm_u32(0x081A141E)          // v20
+    asm_u32(0x4A3C3C0B)
+    asm_u32(0xDC6A0000); asm_u32(0x081A151E)          // v21
+    asm_u32(0x4A3C3C0B)
+    asm_u32(0xDC6A0000); asm_u32(0x081A161E)          // v22
+    asm_u32(0x4A3C3C0B)
+    asm_u32(0xDC6A0000); asm_u32(0x081A171E)          // v23
+    asm_u32(0x4A3C3C0B)
+    asm_u32(0xDC6A0000); asm_u32(0x081A181E)          // v24 (last; no increment)
+    asm_u32(0xBC7C0000)                               // s_waitcnt_vscnt null, 0
+
+    // ── 5. Back-branch to loop_top (persistent-WG iterate to next tile) ──
+    uint64 s_branch_at = asm_text_len / 4
+    uint64 back_simm   = loop_top_idx - (s_branch_at + 1)
+    asm_s_branch(back_simm & 0xFFFF)
+
+    // ── 6. .Lend ───────────────────────────────────────────────────────────
+    asm_s_endpgm()
+    uint64 end_idx = asm_text_len / 4 - 1
+    uint64 sccbr_top = 0xBFA20000
+    if _is_gfx10() != 0 { sccbr_top = 0xBF850000 }
+    uint64 fwd_simm = end_idx - (cbranch_end_idx + 1)
+    asm_patch_u32(cbranch_end_idx, sccbr_top | (fwd_simm & 0xFFFF))
+
+    // ── 7. args descriptor (same 6-slot ABI as f32 grouped) ────────────────
+    uint64 a0  = args_desc + 0;   unsafe { *(a0  as uint64) = 8 }
+    uint64 a1  = args_desc + 8;   unsafe { *(a1  as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
+    uint64 a2  = args_desc + 16;  unsafe { *(a2  as uint64) = 8 }
+    uint64 a3  = args_desc + 24;  unsafe { *(a3  as uint64) = AMD_ARG_KIND_BY_VALUE }
+    uint64 a4  = args_desc + 32;  unsafe { *(a4  as uint64) = 8 }
+    uint64 a5  = args_desc + 40;  unsafe { *(a5  as uint64) = AMD_ARG_KIND_BY_VALUE }
+    uint64 a6  = args_desc + 48;  unsafe { *(a6  as uint64) = 8 }
+    uint64 a7  = args_desc + 56;  unsafe { *(a7  as uint64) = AMD_ARG_KIND_BY_VALUE }
+    uint64 a8  = args_desc + 64;  unsafe { *(a8  as uint64) = 8 }
+    uint64 a9  = args_desc + 72;  unsafe { *(a9  as uint64) = AMD_ARG_KIND_BY_VALUE }
+    uint64 a10 = args_desc + 80;  unsafe { *(a10 as uint64) = 8 }
+    uint64 a11 = args_desc + 88;  unsafe { *(a11 as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER }
 }
 
 @export
@@ -9803,23 +10288,29 @@ fn emit_amdgpu_gemm_bf16_grouped_blob(uint64 out_path) -> uint64 {
     uint64[12] args_desc
     _emit_gemm_bf16_grouped_body(args_desc)
 
-    // KD plumbing — IDENTICAL to the f32 grouped blob.  See the long comment
-    // above emit_amdgpu_gemm_f32_grouped_blob for the bit-by-bit derivation
-    // of rsrc1/rsrc2/props/LDS values.  The ONLY difference here is the
-    // kernel symbol name: "gemm_bf16_grouped" (17 chars) vs "gemm_f32_grouped"
-    // (16 chars) — this is what hipModuleGetFunction(fh, mod, "gemm_bf16_grouped")
-    // resolves against in the launcher.
+    // KD plumbing — 1B.2 fork.  Significant differences from the f32 grouped
+    // blob:
+    //   * vgpr_count = 33 (v0..v32; was 32 = v0..v27 in f32 grouped).
+    //     Need GRANULATED_WORKITEM_VGPR_COUNT = 4 → (4+1)*8 = 40 VGPRs.
+    //     New rsrc1 low byte = 0x84 (was 0x83 = 32 VGPRs).
+    //   * sgpr_count = 31 (s0..s30; same as f32 grouped).
+    //   * LDS = 0.  block=32 = single wave, no cross-wave LDS broadcast or
+    //     panel staging.  But we keep the LDS allocation at 16384 (matches
+    //     1A's blob wrapper; tiny overhead, avoids changing the rsrc table).
+    //     Actually 0 is fine — set group_segment_size=0 explicitly.
     //
-    // 1B.2 will likely change these values: WMMA needs specific VGPR
-    // allocations for A/B/C operand tiles, and we may grow LDS to hold the
-    // bf16 panels (half the f32 footprint per element, but possibly larger
-    // panels for tensor-core occupancy).
+    // rsrc1 = 0xE0AF0084:
+    //   bits [5:0] (GRANULATED_WORKITEM_VGPR_COUNT) = 4  → (4+1)*8 = 40 VGPRs
+    //   bits [9:6] (GRANULATED_WAVEFRONT_SGPR_COUNT) = 2  → 16 + 2*8 = 32 SGPRs
+    //   (higher bits unchanged: 0xE0AF prefix sets float-control/PRIV/etc.)
+    //
+    // rsrc2 = 0x0000009E unchanged — USER_SGPR=15, WORKGROUP_ID_X enabled.
     uint64 size = emit_amdgpu_code_object_lds("gemm_bf16_grouped", 17,
                                                asm_text_buf, asm_text_len,
-                                               48, 8, 32, 32,
-                                               0xE0AF0083, 0x0000009E, 0x00000010, 0x0408,
+                                               48, 8, 31, 33,
+                                               0xE0AF0084, 0x0000009E, 0x00000010, 0x0408,
                                                args_desc, 6,
-                                               16384)
+                                               0)
 
     uint64 fd = file_open(out_path, 1)
     if fd > 0xFFFFFFFFFFFFF000 {

@@ -564,8 +564,267 @@ fn smoke_heterogeneous_B2(u64 fh) -> u32 {
     return 0
 }
 
+// ─── Smoke 3: B=2 bf16-WMMA (1B.2 gate) ───────────────────────────────────
+//
+// Same shape as smoke 1 (M=N=K=64) but the kernel is the bf16-WMMA grouped
+// body (block=32, 1 wave/tile) and inputs are bf16 in VRAM.  The smoke
+// does the f32→bf16 truncating cast on host (no GPU cast kernel in 1B.2)
+// so the descriptor's A_ptr / B_ptr already point at bf16-quantized data.
+// C remains f32.
+//
+// Why block=32 here (vs block=256 for f32 grouped):
+//   * v_wmma_f32_16x16x16_bf16 is a wave32 primitive — one wave handles a
+//     full 16×16 output tile.  The bf16 grouped kernel reuses the proven
+//     single-GEMM WMMA inner-body math (load A/B, accumulate, store) and
+//     wraps it in the persistent-WG visitor frame from 1A.
+//
+// Tolerance gate: 1e-3 (bf16 has ~3 decimal-digit mantissa; quantization
+// error dominates over FMA rounding).
+fn smoke_bf16_B2(u64 fh) -> u32 {
+    print_str("smoke_bf16_B2 — fast_path_flag=1, block=32, WMMA bf16 (1B.2 gate)\n")
+
+    u32 M = 64; u32 N = 64; u32 K = 64
+    u32 lda = K; u32 ldb = N; u32 ldc = N
+    u32 B_groups    = 2
+    u32 total_tiles = 32
+
+    // A and B are bf16 (2 bytes/elem); C is f32 (4 bytes/elem).
+    u64 bytes_a_bf16 = M * K * 2
+    u64 bytes_b_bf16 = K * N * 2
+    u64 bytes_c      = M * N * 4
+
+    // VRAM allocations.
+    u64 d_a0      = gpu_malloc_smoke(bytes_a_bf16, "d_a0 bf16")
+    u64 d_a1      = gpu_malloc_smoke(bytes_a_bf16, "d_a1 bf16")
+    u64 d_b0      = gpu_malloc_smoke(bytes_b_bf16, "d_b0 bf16")
+    u64 d_b1      = gpu_malloc_smoke(bytes_b_bf16, "d_b1 bf16")
+    u64 d_c0      = gpu_malloc_smoke(bytes_c,      "d_c0 bf16")
+    u64 d_c1      = gpu_malloc_smoke(bytes_c,      "d_c1 bf16")
+    u64 d_desc    = gpu_malloc_smoke(176,          "d_desc bf16")
+    u64 d_counter = gpu_malloc_smoke(4,            "d_counter bf16")
+
+    // Host-side f32 fills.
+    u64 bytes_a_f32 = M * K * 4
+    u64 bytes_b_f32 = K * N * 4
+    u64 h_a0_f32 = alloc(bytes_a_f32); fill_matrix(h_a0_f32, M, K, 0)
+    u64 h_a1_f32 = alloc(bytes_a_f32); fill_matrix(h_a1_f32, M, K, 1000)
+    u64 h_b0_f32 = alloc(bytes_b_f32); fill_matrix(h_b0_f32, K, N, 5000)
+    u64 h_b1_f32 = alloc(bytes_b_f32); fill_matrix(h_b1_f32, K, N, 7777)
+
+    // Host-side f32 → bf16 truncating cast (high 16 bits of each f32 word).
+    //   bf16 storage = (uint16_t)((f32_bits >> 16) & 0xFFFF)
+    // Pack into the bf16 buffers (M*K and K*N u16 elements).
+    u64 h_a0_bf = alloc(bytes_a_bf16)
+    u64 h_a1_bf = alloc(bytes_a_bf16)
+    u64 h_b0_bf = alloc(bytes_b_bf16)
+    u64 h_b1_bf = alloc(bytes_b_bf16)
+    u32 nA = M * K
+    u32 nB = K * N
+    u32 ii = 0
+    while ii < nA {
+        u32 a0_bits = 0; unsafe { *((h_a0_f32 + ii*4) as u32) -> a0_bits }
+        u32 a1_bits = 0; unsafe { *((h_a1_f32 + ii*4) as u32) -> a1_bits }
+        u32 a0_h = (a0_bits >> 16) & 0xFFFF
+        u32 a1_h = (a1_bits >> 16) & 0xFFFF
+        u16 a0_w = a0_h
+        u16 a1_w = a1_h
+        unsafe { *((h_a0_bf + ii*2) as u16) = a0_w }
+        unsafe { *((h_a1_bf + ii*2) as u16) = a1_w }
+        ii = ii + 1
+    }
+    u32 jj = 0
+    while jj < nB {
+        u32 b0_bits = 0; unsafe { *((h_b0_f32 + jj*4) as u32) -> b0_bits }
+        u32 b1_bits = 0; unsafe { *((h_b1_f32 + jj*4) as u32) -> b1_bits }
+        u32 b0_h = (b0_bits >> 16) & 0xFFFF
+        u32 b1_h = (b1_bits >> 16) & 0xFFFF
+        u16 b0_w = b0_h
+        u16 b1_w = b1_h
+        unsafe { *((h_b0_bf + jj*2) as u16) = b0_w }
+        unsafe { *((h_b1_bf + jj*2) as u16) = b1_w }
+        jj = jj + 1
+    }
+
+    // H2D bf16 A/B.
+    u32 err_a0 = hipMemcpy(d_a0, h_a0_bf, bytes_a_bf16, 1); if err_a0 != 0 { die_gpu_smoke("H2D a0 bf16", err_a0) }
+    u32 err_a1 = hipMemcpy(d_a1, h_a1_bf, bytes_a_bf16, 1); if err_a1 != 0 { die_gpu_smoke("H2D a1 bf16", err_a1) }
+    u32 err_b0 = hipMemcpy(d_b0, h_b0_bf, bytes_b_bf16, 1); if err_b0 != 0 { die_gpu_smoke("H2D b0 bf16", err_b0) }
+    u32 err_b1 = hipMemcpy(d_b1, h_b1_bf, bytes_b_bf16, 1); if err_b1 != 0 { die_gpu_smoke("H2D b1 bf16", err_b1) }
+
+    // C buffers: pre-fill with 0xDEADBEEF sentinel.
+    u64 c_pad = alloc(bytes_c)
+    u32 pi    = 0
+    u32 nC    = M * N
+    while pi < nC {
+        u32 db = 0xDEADBEEF
+        unsafe { *((c_pad + pi*4) as u32) = db }
+        pi = pi + 1
+    }
+    u32 ep0 = hipMemcpy(d_c0, c_pad, bytes_c, 1); if ep0 != 0 { die_gpu_smoke("H2D c0 bf16 pad", ep0) }
+    u32 ep1 = hipMemcpy(d_c1, c_pad, bytes_c, 1); if ep1 != 0 { die_gpu_smoke("H2D c1 bf16 pad", ep1) }
+    dealloc(c_pad)
+
+    // Pack descriptor (176 bytes = 2*88) — precision=1 to signal bf16 mode.
+    u64 host_desc = alloc(176)
+    u64 zi = 0
+    while zi < 176 {
+        u8 zb = 0; unsafe { *((host_desc + zi) as u8) = zb }
+        zi = zi + 1
+    }
+    // Group 0.
+    unsafe { *((host_desc +  0) as u32) = M }
+    unsafe { *((host_desc +  4) as u32) = N }
+    unsafe { *((host_desc +  8) as u32) = K }
+    unsafe { *((host_desc + 12) as u32) = lda }
+    unsafe { *((host_desc + 16) as u32) = ldb }
+    unsafe { *((host_desc + 20) as u32) = ldc }
+    unsafe { *((host_desc + 24) as u64) = d_a0 }
+    unsafe { *((host_desc + 32) as u64) = d_b0 }
+    unsafe { *((host_desc + 40) as u64) = d_c0 }
+    unsafe { *((host_desc + 48) as u32) = 0 }       // acc_flag
+    unsafe { *((host_desc + 52) as u32) = 1 }       // precision = 1 (bf16)
+    unsafe { *((host_desc + 56) as u32) = 1 }       // splitK
+    unsafe { *((host_desc + 60) as u32) = 16 }
+    unsafe { *((host_desc + 64) as u32) = 0 }
+    // Group 1.
+    unsafe { *((host_desc +  88) as u32) = M }
+    unsafe { *((host_desc +  92) as u32) = N }
+    unsafe { *((host_desc +  96) as u32) = K }
+    unsafe { *((host_desc + 100) as u32) = lda }
+    unsafe { *((host_desc + 104) as u32) = ldb }
+    unsafe { *((host_desc + 108) as u32) = ldc }
+    unsafe { *((host_desc + 112) as u64) = d_a1 }
+    unsafe { *((host_desc + 120) as u64) = d_b1 }
+    unsafe { *((host_desc + 128) as u64) = d_c1 }
+    unsafe { *((host_desc + 136) as u32) = 0 }       // acc_flag
+    unsafe { *((host_desc + 140) as u32) = 1 }       // precision = 1
+    unsafe { *((host_desc + 144) as u32) = 1 }
+    unsafe { *((host_desc + 148) as u32) = 16 }
+    unsafe { *((host_desc + 152) as u32) = 16 }
+
+    u32 derr = hipMemcpy(d_desc, host_desc, 176, 1)
+    if derr != 0 { die_gpu_smoke("H2D desc bf16", derr) }
+    dealloc(host_desc)
+
+    // Counter zero.
+    u64 zslot = alloc(4); unsafe { *(zslot as u32) = 0 }
+    u32 cerr = hipMemcpy(d_counter, zslot, 4, 1)
+    if cerr != 0 { die_gpu_smoke("H2D counter zero bf16", cerr) }
+    dealloc(zslot)
+
+    // Kernarg ptr table.
+    u64 p0 = alloc(8); unsafe { *(p0 as u64) = d_desc }
+    u64 p1 = alloc(8); unsafe { *(p1 as u64) = B_groups }
+    u64 p2 = alloc(8); unsafe { *(p2 as u64) = total_tiles }
+    u64 p3 = alloc(8); unsafe { *(p3 as u64) = 1 }            // fast_path_flag
+    u64 p4 = alloc(8); unsafe { *(p4 as u64) = 1 }            // precision_mode (bf16)
+    u64 p5 = alloc(8); unsafe { *(p5 as u64) = d_counter }
+    u64 kp = alloc(6 * 8)
+    unsafe { *(kp        as u64) = p0 }
+    unsafe { *((kp +  8) as u64) = p1 }
+    unsafe { *((kp + 16) as u64) = p2 }
+    unsafe { *((kp + 24) as u64) = p3 }
+    unsafe { *((kp + 32) as u64) = p4 }
+    unsafe { *((kp + 40) as u64) = p5 }
+
+    // Dispatch: grid=240 WGs × block=32 lanes (1 wave per WG, WMMA-native).
+    u64 t_start = time_now()
+    u32 lerr = hipModuleLaunchKernel(fh, 240, 1, 1, 32, 1, 1, 0, 0, kp, 0)
+    if lerr != 0 { die_gpu_smoke("launch gemm_bf16_grouped", lerr) }
+    u32 serr = hipDeviceSynchronize()
+    if serr != 0 { die_gpu_smoke("hipDeviceSynchronize bf16", serr) }
+    u64 t_end = time_now()
+    u64 elapsed = t_end - t_start
+    print_str("  dispatch ns=")
+    u64 sd = fmt_dec(elapsed); print_str(sd); dealloc(sd); print_str("\n")
+    dealloc(p0); dealloc(p1); dealloc(p2); dealloc(p3); dealloc(p4); dealloc(p5); dealloc(kp)
+
+    // D2H C buffers.
+    u64 h_c0 = alloc(bytes_c)
+    u64 h_c1 = alloc(bytes_c)
+    u32 r0 = hipMemcpy(h_c0, d_c0, bytes_c, 2); if r0 != 0 { die_gpu_smoke("D2H c0 bf16", r0) }
+    u32 r1 = hipMemcpy(h_c1, d_c1, bytes_c, 2); if r1 != 0 { die_gpu_smoke("D2H c1 bf16", r1) }
+
+    // CPU reference: use the BF16-quantized inputs (i.e., re-inflate bf16 to
+    // f32 by zero-padding the low 16 bits) so the CPU/GPU agree on the
+    // quantization, leaving only FMA-rounding + accumulation order as diffs.
+    // Returns max_abs vs that reference.  An additional "raw" comparison
+    // against the original f32 inputs measures how much pure quantization
+    // error contributes — useful diagnostic but NOT the gate.
+    u64 h_a0_bf_to_f32 = alloc(bytes_a_f32)
+    u64 h_a1_bf_to_f32 = alloc(bytes_a_f32)
+    u64 h_b0_bf_to_f32 = alloc(bytes_b_f32)
+    u64 h_b1_bf_to_f32 = alloc(bytes_b_f32)
+    u32 ki = 0
+    while ki < nA {
+        u16 a0w = 0; unsafe { *((h_a0_bf + ki*2) as u16) -> a0w }
+        u16 a1w = 0; unsafe { *((h_a1_bf + ki*2) as u16) -> a1w }
+        u32 a0w32 = a0w
+        u32 a1w32 = a1w
+        u32 a0_f32_bits = a0w32 << 16
+        u32 a1_f32_bits = a1w32 << 16
+        unsafe { *((h_a0_bf_to_f32 + ki*4) as u32) = a0_f32_bits }
+        unsafe { *((h_a1_bf_to_f32 + ki*4) as u32) = a1_f32_bits }
+        ki = ki + 1
+    }
+    u32 li = 0
+    while li < nB {
+        u16 b0w = 0; unsafe { *((h_b0_bf + li*2) as u16) -> b0w }
+        u16 b1w = 0; unsafe { *((h_b1_bf + li*2) as u16) -> b1w }
+        u32 b0w32 = b0w
+        u32 b1w32 = b1w
+        u32 b0_f32_bits = b0w32 << 16
+        u32 b1_f32_bits = b1w32 << 16
+        unsafe { *((h_b0_bf_to_f32 + li*4) as u32) = b0_f32_bits }
+        unsafe { *((h_b1_bf_to_f32 + li*4) as u32) = b1_f32_bits }
+        li = li + 1
+    }
+
+    u64 h_c0_ref = alloc(bytes_c)
+    u64 h_c1_ref = alloc(bytes_c)
+    cpu_gemm_ref(h_a0_bf_to_f32, h_b0_bf_to_f32, h_c0_ref, M, N, K, lda, ldb, ldc)
+    cpu_gemm_ref(h_a1_bf_to_f32, h_b1_bf_to_f32, h_c1_ref, M, N, K, lda, ldb, ldc)
+
+    u32 max_abs_c0_bits = max_abs_diff_bits(h_c0_ref, h_c0, M * N)
+    u32 max_abs_c1_bits = max_abs_diff_bits(h_c1_ref, h_c1, M * N)
+
+    print_str("  bf16 max_abs c0 bits=")
+    u64 s0 = fmt_hex(max_abs_c0_bits); print_str(s0); dealloc(s0)
+    print_str("  c1 bits=")
+    u64 s1 = fmt_hex(max_abs_c1_bits); print_str(s1); dealloc(s1)
+    print_str("\n  c0[0]=")
+    u32 c0_0 = 0; unsafe { *(h_c0 as u32) -> c0_0 }
+    u64 cs0 = fmt_hex(c0_0); print_str(cs0); dealloc(cs0)
+    print_str(" ref[0]=")
+    u32 rb0 = 0; unsafe { *(h_c0_ref as u32) -> rb0 }
+    u64 rs0 = fmt_hex(rb0); print_str(rs0); dealloc(rs0)
+    print_str("\n")
+
+    dealloc(h_c0); dealloc(h_c1); dealloc(h_c0_ref); dealloc(h_c1_ref)
+    dealloc(h_a0_bf_to_f32); dealloc(h_a1_bf_to_f32)
+    dealloc(h_b0_bf_to_f32); dealloc(h_b1_bf_to_f32)
+    dealloc(h_a0_f32); dealloc(h_a1_f32); dealloc(h_b0_f32); dealloc(h_b1_f32)
+    dealloc(h_a0_bf); dealloc(h_a1_bf); dealloc(h_b0_bf); dealloc(h_b1_bf)
+
+    // Gate: 1e-3 = 0x3A83126F (IEEE f32 bits).  bf16 quantization-and-
+    // re-inflate matches what we feed the GPU exactly, so the diff should
+    // be dominated by FMA-vs-add+mul rounding inside the WMMA primitive
+    // (much smaller than 1e-3 if WMMA is correct).
+    u32 thresh = 0x3A83126F                       // 1e-3
+    u32 ok = 1
+    if max_abs_c0_bits > thresh { ok = 0 }
+    if max_abs_c1_bits > thresh { ok = 0 }
+
+    if ok == 0 {
+        print_str("FAIL (bf16-WMMA): max_abs > 1e-3 — kernel does not match bf16-quantized CPU ref\n")
+        return 1
+    }
+    print_str("PASS (bf16-WMMA): max_abs <= 1e-3 vs bf16-quantized CPU reference\n")
+    return 0
+}
+
 fn main() {
-    print_str("gemm_grouped_smoke — same-shape (1A.4/1A.5) + heterogeneous (1A.6) + bf16-scaffold (1B.1)\n")
+    print_str("gemm_grouped_smoke — same-shape (1A.4/1A.5) + heterogeneous (1A.6) + bf16-WMMA (1B.2)\n")
 
     // Device init.
     u32 sd_err = hipSetDevice(0)
@@ -587,23 +846,25 @@ fn main() {
         hipkfd_teardown(); exit(1)
     }
 
-    // ── 1B.1 gate — bf16 grouped scaffolding ────────────────────────────
+    // ── 1B.2 gate — WMMA bf16 grouped (block=32, 1 wave/tile) ───────────
     //
-    // For 1B.1 the bf16 grouped body is byte-identical to the f32 grouped
-    // body (same _emit_gemm_f32_grouped_body call) — only the kernel name
-    // differs in the AMDHSA metadata.  Dispatching the bf16 .co with the
-    // same B=2 same-shape descriptor must therefore produce byte-identical
-    // C output to the f32 path, confirming the new emitter slot + CLI flag
-    // + .co handoff works end-to-end.  1B.2 forks the body to real WMMA
-    // bf16 math; the smoke will need updating then.
-    print_str("\n--- 1B.1 bf16 grouped scaffolding ---\n")
+    // The 1B.2 body uses real v_wmma_f32_16x16x16_bf16 with a single wave
+    // per WG and an f32 accumulator.  Inputs are bf16 — the smoke does the
+    // f32→bf16 truncating cast on host (high 16 bits of each f32) and
+    // populates VRAM with bf16 buffers, then launches with block=32.
+    //
+    // Tolerance: bf16 has ~3 decimal digits of mantissa precision; the
+    // expected max_abs vs the f32 CPU reference at K=64 is ~5e-4..1e-3
+    // (dominated by the per-element f32→bf16 quantization error, NOT
+    // by FMA rounding).  Gate: ≤ 1e-3.
+    print_str("\n--- 1B.2 bf16 grouped WMMA ---\n")
     u64 fh_bf16 = load_co_smoke("/tmp/gemm_bf16_grouped.co", "gemm_bf16_grouped")
-    u32 r_bf16  = smoke_same_shape_B2(fh_bf16)
+    u32 r_bf16  = smoke_bf16_B2(fh_bf16)
     if r_bf16 != 0 {
-        print_str("OVERALL: FAIL (1B.1 bf16 scaffolding smoke failed)\n")
+        print_str("OVERALL: FAIL (1B.2 bf16 WMMA smoke failed)\n")
         hipkfd_teardown(); exit(1)
     }
 
-    print_str("OVERALL: PASS (all three smokes within FMA-precision floor)\n")
+    print_str("OVERALL: PASS (1A f32 + 1B.2 bf16-WMMA grouped GEMM smokes all green)\n")
     hipkfd_teardown()
 }
