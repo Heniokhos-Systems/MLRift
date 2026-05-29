@@ -7638,6 +7638,40 @@ fn wzm_train_bs_bound() -> uint64 {
     if MEGA_TRAIN_NW <= 1 { return 30 }
     return 31
 }
+
+// ── Multi-WG B-row/col ownership split for wzma_bwd_pre (P4b-2) ────────────
+// The InfoNCE dv1/dv2 output loops iterate over B=8 rows (dv1: row i) / cols
+// (dv2: col j); the renorm/pool dz loop iterates over B=8 b-blocks (each b
+// produces S=16 contiguous BS rows, so a B-block IS a BS-row block of S rows).
+// Under MEGA_TRAIN_NW>1 each WG owns the half-open B-range
+//   [wg*rows_per_wg, (wg+1)*rows_per_wg),  rows_per_wg = B/NW.
+// This MIRRORS the proven bwd_uv idiom (wzm_train_bs_loop_init): rows_per_wg is
+// an EMIT-TIME constant (NW baked from MEGA_TRAIN_NW, which the lowerer sets to
+// WZM_BWD_NW for the whole emit, exactly as amdgpu_lower_wzma_bwd_uv does); the
+// per-WG offset uses the RUNTIME wg_id (s3, stashed in prologue).  B=8 is baked
+// as a literal (the bs helper bakes BS=128 the same way).  s3=wg_id_x.
+//   NW==1: `s_mov_b32 s<ctr>, 0` and bound = s49 (B) → byte-identical to oracle.
+//   NW> 1: s<ctr> = lo = wg_id*rows_per_wg ; s31 = hi = lo+rows_per_wg.
+// s31 is otherwise unused in wzma_bwd_pre (verified by full-disasm SGPR scan:
+// the InfoNCE/renorm/pool body uses s2,s3,s4,s5,s14,s15,s30,s32,s34..s39,
+// s44..s77 — never s31) and persists across the loop body as the bound reg.
+fn wzm_train_b_loop_init(uint64 ctr) {
+    if MEGA_TRAIN_NW <= 1 {
+        wzm_s_mov_b32_0(ctr)              // i/j/b = 0   (oracle-identical)
+    } else {
+        uint64 rpw = 8 / MEGA_TRAIN_NW    // rows_per_wg (B=8); divides evenly
+        wzm_s_mul_i32_lit(ctr, 3, rpw)    // s<ctr> = lo = wg_id * rows_per_wg
+        // s31 = hi = lo + rows_per_wg  (s_add_u32 s31, s<ctr>, rpw via literal)
+        asm_u32((0x80 << 24) | (31 << 16) | (0xFF << 8) | (ctr & 0xFF))
+        asm_u32(rpw & 0xFFFFFFFF)
+    }
+}
+// SGPR# to compare a per-B loop counter against (exclusive upper bound).
+//   NW==1: s49 (B) — oracle-identical.   NW>1: s31 (per-WG hi).
+fn wzm_train_b_bound() -> uint64 {
+    if MEGA_TRAIN_NW <= 1 { return 49 }
+    return 31
+}
 // v_add_nc_u32_e32 vdst, s_src0, v_src1   (op 0x25; src0 SGPR, src1 VGPR)
 fn wzm_v_add_nc_u32_sv(uint64 vdst, uint64 s_src0, uint64 v_src1) {
     asm_u32((0x25 << 25) | ((vdst & 0xFF) << 17) | ((v_src1 & 0xFF) << 9) | (s_src0 & 0x1FF))
@@ -7757,9 +7791,14 @@ fn _wzm_emit_renorm_pool_bwd_view(uint64 q_saddr, uint64 dv_kofs,
     asm_u32(0x7E120280)                   // v9 = 0 (broadcast ds addr)
     asm_v_mov_b32_lit32(14, 0x3D800000)   // v14 = 1/S = 0.0625
 
-    wzm_s_mov_b32_0(34)                   // b = 0
+    // P4b-2: b-loop gated to this WG's B-range [wg*B/NW,(wg+1)*B/NW).  Each b
+    // produces S=16 contiguous BS rows of dz → a B-block IS a BS-row block.
+    // The per-b reduce trees still run over ALL 512 lanes (full exec); only the
+    // SET of b's this WG iterates is restricted → no cross-WG dz overlap.
+    // At NW<=1: init=0, bound=s49 (B) → oracle-identical.
+    wzm_train_b_loop_init(34)             // b = wg*B/NW  (NW=1: 0); s31 = hi
     uint64 b_top = asm_text_len / 4
-    asm_u32(0xBF090000 | (49 << 8) | 34)   // P4a: s_cmp_ge_u32 s34, s49 (b >= B)
+    asm_u32(0xBF090000 | (wzm_train_b_bound() << 8) | 34)   // s_cmp_ge_u32 s34, hi (b >= my_hi)
     uint64 b_exit = asm_text_len / 4
     asm_u32(0xBFA20000)                   // s_cbranch_scc1 .Lb_end (patched)
 
@@ -9683,9 +9722,13 @@ fn _wzm_emit_infonce_dv_bwd() {
     uint64 dv1_execz = asm_text_len / 4
     asm_u32(0xBFA50000)                   // execz .Ldv1_end (patched)
     asm_v_mov_b32_lit32(28, 0x41200000)   // v28 = 1/tau = 10.0
-    wzm_s_mov_b32_0(34)                   // i = 0
+    // P4b-2: dv1[i] OUTPUT loop gated to this WG's B-range [wg*B/NW,(wg+1)*B/NW).
+    // The INNER j reduction (full [B,B] row) is NOT gated — this WG computed the
+    // whole dlogits slice, so it sums all j.  At NW<=1: init=0, bound=s49 (B) →
+    // oracle-identical.  Scalar range setup is wave-uniform (runs under any exec).
+    wzm_train_b_loop_init(34)             // i = wg*B/NW  (NW=1: 0); s31 = hi
     uint64 dv1_i_top = asm_text_len / 4
-    asm_u32(0xBF090000 | (49 << 8) | 34)   // P4a: i >= B (s49)
+    asm_u32(0xBF090000 | (wzm_train_b_bound() << 8) | 34)   // i >= my_hi
     uint64 dv1_i_exit = asm_text_len / 4
     asm_u32(0xBFA20000)
     asm_u32(0x7E3C0280)                   // v30 = 0 (accumulator dv1[i,d])
@@ -9737,9 +9780,13 @@ fn _wzm_emit_infonce_dv_bwd() {
     uint64 dv2_execz = asm_text_len / 4
     asm_u32(0xBFA50000)
     asm_v_mov_b32_lit32(28, 0x41200000)   // 1/tau
-    wzm_s_mov_b32_0(36)                   // j = 0
+    // P4b-2: dv2[j] OUTPUT loop gated to this WG's B-range [wg*B/NW,(wg+1)*B/NW).
+    // The INNER i reduction (full column over all rows) is NOT gated — this WG
+    // computed the whole dlogits slice, so it sums all i.  At NW<=1: init=0,
+    // bound=s49 (B) → oracle-identical.
+    wzm_train_b_loop_init(36)             // j = wg*B/NW  (NW=1: 0); s31 = hi
     uint64 dv2_j_top = asm_text_len / 4
-    asm_u32(0xBF090000 | (49 << 8) | 36)   // P4a: j >= B (s49)
+    asm_u32(0xBF090000 | (wzm_train_b_bound() << 8) | 36)   // j >= my_hi
     uint64 dv2_j_exit = asm_text_len / 4
     asm_u32(0xBFA20000)
     asm_u32(0x7E3C0280)                   // v30 = 0
@@ -10052,16 +10099,31 @@ fn amdgpu_lower_wzma_train_bwd(uint64 kname_ptr, uint64 nl) -> uint64 {
 // ══════════════════════════════════════════════════════════════════════════
 static uint64 WZM_BWD_NW = 8
 
-// amdgpu_lower_wzma_bwd_pre — InfoNCE-bwd + renorm/L2/meanpool.  grid=1.
+// amdgpu_lower_wzma_bwd_pre — InfoNCE-bwd + renorm/L2/meanpool.  grid=WZM_BWD_NW.
+// P4b-2: PARALLELIZED across NW WGs.  Every WG REDUNDANTLY computes the full
+// [B,B] dlogits/softmax (B-1/B-2) into its OWN per-WG global-scratch slice
+// (slice_off = wg_id*B²*4 — set in _wzm_emit_infonce_dv_bwd; distinct slices →
+// no race) because dv2's column reduction needs every row.  The OUTPUTS are
+// partitioned by WG ownership of a half-open B-range [wg*B/NW,(wg+1)*B/NW):
+//   dv1[i] (B-3 row loop), dv2[j] (B-3 col loop), dz (renorm/pool b loop).
+// Mirrors bwd_uv: set MEGA_TRAIN_NW=WZM_BWD_NW for the emit so the wzm_train_b_*
+// helpers bake rows_per_wg=B/NW; the per-WG offset uses the RUNTIME wg_id (s3).
+// At MEGA_TRAIN_NW<=1 (megakernel / standalone-bwd callers) the gates degrade to
+// the oracle (init=0, bound=s49/s30) → byte-identical to the serial grid=1 path.
 fn amdgpu_lower_wzma_bwd_pre(uint64 kname_ptr, uint64 nl) -> uint64 {
+    uint64 saved_nw = MEGA_TRAIN_NW
+    MEGA_TRAIN_NW = WZM_BWD_NW
     asm_init()
     _wzm_emit_bwd_prologue()
-    // B-1/B-2/B-3: logits→softmax→dlogits→dv1/dv2 (single-WG by construction).
+    // B-1/B-2/B-3: logits→softmax→dlogits→dv1/dv2.  B-1/B-2 redundant per WG;
+    // B-3 dv1/dv2 output writes gated to this WG's B-range.
     _wzm_emit_infonce_dv_bwd()
     // B-4/B-5: InfoNCE re-norm bwd + l2norm_bwd + meanpool_bwd → dz1/dz2.
+    // dz b-loop gated to this WG's B-range (each b = S contiguous BS rows).
     _wzm_emit_renorm_pool_bwd_view(44, 0x110, 70, 0x120)   // view 0
     _wzm_emit_renorm_pool_bwd_view(46, 0x118, 72, 0x128)   // view 1
     _wzm_finalize_bwd_kernel(kname_ptr, nl)
+    MEGA_TRAIN_NW = saved_nw
     return 0
 }
 

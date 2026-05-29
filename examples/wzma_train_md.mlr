@@ -66,6 +66,14 @@ static u64 BS_DIM    = 128
 // MUST match the WZM_BWD_NW static in src/format_amdgpu_megakernel.mlr (the
 // per-WG partial slot layout + the bs-row split depend on it).  Divides BS=128.
 static u64 WZM_BWD_NW = 8
+// P4b-2: workgroups for the parallelized wzma_bwd_pre phase.  MUST match the
+// WZM_BWD_NW static in src/format_amdgpu_megakernel.mlr (bwd_pre bakes
+// rows_per_wg = B/NW = 8/NW_pre at emit time via MEGA_TRAIN_NW=WZM_BWD_NW, and
+// gates dv1/dv2/dz outputs by wg_id; the grid MUST equal that baked NW).  NW_pre
+// divides B=8 AND BS=128.  The bwd_pre kernel does NOT read s50 (NW kernarg) at
+// runtime — its range is emit-time-baked + runtime-wg_id-offset — so sharing
+// kernarg idx 65 with the other phases is benign.
+static u64 NW_pre = 8
 
 fn abs_f32(f32 v) -> f32 {
     if v < 0.0f { return 0.0f - v }
@@ -1552,10 +1560,15 @@ fn main() {
         u32 berr = 0
         u32 NW32 = WZM_BWD_NW
 
-        // Phase 1: wzma_bwd_pre (grid=1) — InfoNCE-bwd → dv1/dv2, renorm/L2/
-        // meanpool → dz1/dz2.  Single WG (B=8 logits in LDS).
+        // Phase 1: wzma_bwd_pre (grid=NW_pre) — InfoNCE-bwd → dv1/dv2, renorm/L2/
+        // meanpool → dz1/dz2.  P4b-2: PARALLELIZED across NW_pre WGs.  Every WG
+        // redundantly computes the full [B,B] dlogits/softmax into its own per-WG
+        // global-scratch slice (slice=wg_id*B²*4 → no race), and partitions the
+        // dv1[i]/dv2[j]/dz outputs by a half-open B-range [wg*B/NW,(wg+1)*B/NW).
+        // The kernel does NOT read idx 65 (NW) at runtime — range is emit-baked +
+        // runtime wg_id — so the shared kp (idx 65 = WZM_BWD_NW = NW_pre) is fine.
         t0 = time_now()
-        berr = hipModuleLaunchKernel(fh_bpre, 1, 1, 1, 512, 1, 1, 0, 0, kp, 0)
+        berr = hipModuleLaunchKernel(fh_bpre, NW_pre, 1, 1, 512, 1, 1, 0, 0, kp, 0)
         if berr != 0 { die_gpu("launch wzma_bwd_pre", berr) }
         if profile_on == 1 { sync_or_die("sync bwd_pre"); t1 = time_now(); ns_bpre = ns_bpre + (t1 - t0) + (kb_t1 - kb_t0) }
 
