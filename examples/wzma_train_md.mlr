@@ -1842,6 +1842,37 @@ fn main() {
         if berr != 0 { die_gpu("launch wzma_bwd_embed", berr) }
         if profile_on == 1 { sync_or_die("sync bwd_embed"); t1 = time_now(); ns_bemb = ns_bemb + (t1 - t0) }
 
+        // ── P3 demb-dump hook: MLRIFT_DUMP_DEMB=/path writes the step-0 demb
+        // (D2H, VOCAB*D*4 = 12582912 bytes) to <path>.  Placed AFTER the
+        // bwd_embed scatter (line above) and BEFORE the AdamW phase (line ~1890)
+        // consumes/overwrites d_demb — so this captures the post-embed,
+        // pre-adamw demb.  demb is launch_fill-zeroed at the top of every step
+        // (line ~1445), so the step-0 snapshot is deterministic.  At NW_emb=1
+        // (id_chunk=VOCAB) this is the EXACT serial reference; byte-equality of
+        // the NW_emb=64 dump vs the NW_emb=1 dump proves the id-partition is
+        // bit-exact.  Mirrors the MLRIFT_DUMP_GRADS pattern in validate_grads.
+        if step == 0 {
+            u64 demb_env = sys_getenv("MLRIFT_DUMP_DEMB")
+            if demb_env != 0 {
+                u8 c0e = 0; unsafe { *(demb_env as u8) -> c0e }
+                if c0e != 0 {
+                    sync_or_die("sync bwd_embed (demb dump)")   // ensure scatter complete before D2H
+                    u64 embytes = VOCAB * D * 4
+                    u64 embuf = alloc(embytes)
+                    u32 ee_d = hipMemcpy(embuf, d_demb, embytes, 2)   // D2H
+                    if ee_d == 0 {
+                        u64 efd = file_open(demb_env, 1)
+                        if efd <= 0xFFFFFFFFFFFFF000 {
+                            file_write(efd, embuf, embytes)
+                            file_close(efd)
+                            print_str("step-0 demb dumped to "); print_str(demb_env); print_str("\n")
+                        }
+                    }
+                    dealloc(embuf)
+                }
+            }
+        }
+
         // Phase 4 (wzma_bwd_reduce / per-WG partial reduce) RETIRED — the GEMM
         // contractions in phase 2 accumulate dU/dV/dgw/dgb/dbias DIRECTLY into the
         // final contiguous d_grads (no per-WG partial slots), so there is nothing
