@@ -181,7 +181,7 @@ fn launch_embed(u64 fh, u64 d_ids, u64 d_emb, u64 d_out, u64 seq, u64 D) {
 //   Grid: 1 WG × 512 lanes (single-WG, exactly like the mega-kernel forward).
 fn launch_fwd_tail(u64 fh, u64 d_x, u64 d_gw, u64 d_gb, u64 d_otk,
                    u64 d_bias, u64 d_alpha, u64 d_z, u64 d_v, u64 d_norms,
-                   u64 BS, u64 D) {
+                   u64 BS, u64 D, u64 B) {
     u64 p0 = alloc(8); unsafe { *(p0 as u64) = d_x }
     u64 p1 = alloc(8); unsafe { *(p1 as u64) = d_gw }
     u64 p2 = alloc(8); unsafe { *(p2 as u64) = d_gb }
@@ -205,10 +205,11 @@ fn launch_fwd_tail(u64 fh, u64 d_x, u64 d_gw, u64 d_gb, u64 d_otk,
     unsafe { *((kp + 64) as u64) = p8 }
     unsafe { *((kp + 72) as u64) = p9 }
     unsafe { *((kp + 80) as u64) = pA }
-    // grid = B = 8: each WG owns one encoder output row (rows fully independent;
-    // per-row mean-pool/L2/softmax reductions stay intra-WG). Was grid=1 (1/60
-    // of the GPU); 8 WGs lift occupancy ~8× with NO cross-WG reduction.
-    u32 grid  = 8
+    // grid = B: each WG owns one encoder output row (rows fully independent;
+    // per-row mean-pool/L2/softmax reductions stay intra-WG). Was baked 8;
+    // P-fwd lifts to runtime B for a batch sweep (kernel Phase A owns S=16
+    // contiguous BS-rows per WG; S stays baked).
+    u32 grid  = B
     u32 block = 512
     u32 err = hipModuleLaunchKernel(fh, grid, 1, 1, block, 1, 1, 0, 0, kp, 0)
     if err != 0 { die_gpu("launch fwd_tail", err) }
@@ -228,7 +229,7 @@ fn launch_fwd_tail(u64 fh, u64 d_x, u64 d_gw, u64 d_gb, u64 d_otk,
 fn launch_wzma_fwd_mega(u64 fh, u64 d_emb, u64 d_ids, u64 d_U, u64 d_V,
                         u64 d_gw, u64 d_gb, u64 d_bias, u64 d_xout, u64 d_alpha,
                         u64 d_inter, u64 d_outk, u64 d_z, u64 d_v, u64 d_norms,
-                        u64 BS, u64 D) {
+                        u64 BS, u64 D, u64 B) {
     u64 p0  = alloc(8); unsafe { *(p0  as u64) = d_emb }
     u64 p1  = alloc(8); unsafe { *(p1  as u64) = d_ids }
     u64 p2  = alloc(8); unsafe { *(p2  as u64) = d_U }
@@ -267,7 +268,8 @@ fn launch_wzma_fwd_mega(u64 fh, u64 d_emb, u64 d_ids, u64 d_U, u64 d_V,
     // threads — same as the megakernel forward / fwd_tail this ISA was lifted
     // from.  block=256 leaves d in [256,384) uncomputed and reads unwritten LDS
     // in the reduce → NaN.  (The emitter header says 256; the ISA is 512-wide.)
-    u32 grid  = 8
+    // grid = B (P-fwd): one WG per b-group, lifted from baked 8. S=16 baked.
+    u32 grid  = B
     u32 block = 512
     u32 err = hipModuleLaunchKernel(fh, grid, 1, 1, block, 1, 1, 0, 0, kp, 0)
     if err != 0 { die_gpu("launch fwd_mega", err) }
@@ -1358,7 +1360,7 @@ fn main() {
                 // Phase 4: legacy fwd_tail (gate-softmax→combine→meanpool→L2).
                 t0 = time_now()
                 launch_fwd_tail(fh_tail, d_xs, d_gw, d_gb, d_otk_kbsd, d_bias,
-                                d_as, d_z, d_v, d_ns, BS, D)
+                                d_as, d_z, d_v, d_ns, BS, D, B)
                 if profile_on == 1 { sync_or_die("sync fwd_tail"); t1 = time_now(); ns_tail = ns_tail + (t1 - t0) }
             } else {
             // Phase 1: embed → x[BS,D] (saved per view)
@@ -1394,7 +1396,7 @@ fn main() {
             // Phase 4: fwd_tail (gate-softmax→combine→meanpool→L2). Reads k-major outk.
             t0 = time_now()
             launch_fwd_tail(fh_tail, d_xs, d_gw, d_gb, d_otk_kbsd, d_bias,
-                            d_as, d_z, d_v, d_ns, BS, D)
+                            d_as, d_z, d_v, d_ns, BS, D, B)
             if profile_on == 1 { sync_or_die("sync fwd_tail"); t1 = time_now(); ns_tail = ns_tail + (t1 - t0) }
             }
 
