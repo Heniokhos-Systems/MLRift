@@ -7625,11 +7625,11 @@ fn wzm_train_bs_loop_init(uint64 ctr) {
     if MEGA_TRAIN_NW <= 1 {
         wzm_s_mov_b32_0(ctr)              // bs = 0   (oracle-identical)
     } else {
-        uint64 rpw = 128 / MEGA_TRAIN_NW  // rows_per_wg (BS=128)
-        wzm_s_mul_i32_lit(ctr, 3, rpw)    // s<ctr> = lo = wg_id * rows_per_wg
-        // s31 = hi = lo + rows_per_wg  (s_add_u32 s31, s<ctr>, rpw via literal)
-        asm_u32((0x80 << 24) | (31 << 16) | (0xFF << 8) | (ctr & 0xFF))
-        asm_u32(rpw & 0xFFFFFFFF)
+        // P-own: rows_per_wg = BS/NW is now a RUNTIME kernarg in s8 (rpw_BS), not a
+        // baked literal — so a batch sweep (BS changes, .co unchanged) partitions
+        // the right number of rows.  lo = wg_id*rpw_BS ; hi = lo+rpw_BS.
+        wzm_s_mul_i32_ss(ctr, 3, 8)       // s<ctr> = lo = wg_id * rpw_BS(s8)
+        wzm_s_add_u32_ss(31, ctr, 8)      // s31 = hi = lo + rpw_BS(s8)
     }
 }
 // SGPR# to compare the per-bs loop counter against (the exclusive upper bound).
@@ -7659,11 +7659,11 @@ fn wzm_train_b_loop_init(uint64 ctr) {
     if MEGA_TRAIN_NW <= 1 {
         wzm_s_mov_b32_0(ctr)              // i/j/b = 0   (oracle-identical)
     } else {
-        uint64 rpw = 8 / MEGA_TRAIN_NW    // rows_per_wg (B=8); divides evenly
-        wzm_s_mul_i32_lit(ctr, 3, rpw)    // s<ctr> = lo = wg_id * rows_per_wg
-        // s31 = hi = lo + rows_per_wg  (s_add_u32 s31, s<ctr>, rpw via literal)
-        asm_u32((0x80 << 24) | (31 << 16) | (0xFF << 8) | (ctr & 0xFF))
-        asm_u32(rpw & 0xFFFFFFFF)
+        // P-own: rows_per_wg = B/NW is now a RUNTIME kernarg in s22 (rpw_B), not a
+        // baked literal — so a batch sweep (B changes, .co unchanged) partitions
+        // the right number of B-rows.  lo = wg_id*rpw_B ; hi = lo+rpw_B.
+        wzm_s_mul_i32_ss(ctr, 3, 22)      // s<ctr> = lo = wg_id * rpw_B(s22)
+        wzm_s_add_u32_ss(31, ctr, 22)     // s31 = hi = lo + rpw_B(s22)
     }
 }
 // SGPR# to compare a per-B loop counter against (exclusive upper bound).
@@ -10005,6 +10005,16 @@ fn _wzm_emit_bwd_prologue() {
     // touched in _wzm_emit_infonce_dv_bwd — verified by full-disasm SGPR scan).
     // Pair index 38 → base SGPR 76 (sdata_pair = sgpr/2).
     asm_s_load_b64_off(38, 0, 0x220)   // s[76:77] = d_dlogits_scratch
+    // P-own: runtime rows_per_wg kernargs (by-value uint).  rpw_BS = BS/NW (idx
+    // 69 @ 0x228) → s8 ; rpw_B = B/NW (idx 70 @ 0x230) → s22.  s8 (x_out) and s22
+    // (out) are parity-only prologue loads — written once here, NEVER read in any
+    // of the 4 bwd kernels (verified by full-disasm operand scan) — so they are
+    // free homes for the runtime rows_per_wg.  Both even → reachable by the b32
+    // helper (sdata_pair = sgpr/2: s8→4, s22→11).  Overwrites the unused x_out/out
+    // pointers loaded above.  The wzm_train_bs_*/b_* loop helpers read these in
+    // the NW>1 branch (the NW<=1 degenerate branch ignores them, byte-identical).
+    asm_s_load_b32(4,  0, 0x228)       // s8  = rpw_BS = BS/NW  (by-value uint)
+    asm_s_load_b32(11, 0, 0x230)       // s22 = rpw_B  = B/NW   (by-value uint)
     asm_u32(0xBF89FC07)   // s_waitcnt lgkmcnt(0)
 }
 
@@ -10016,7 +10026,7 @@ fn _wzm_emit_bwd_prologue() {
 fn _wzm_finalize_bwd_kernel(uint64 kname_ptr, uint64 nl) {
     asm_u32(0xBFB00000)   // s_endpgm
 
-    uint64 n_args = 69    // P4b-1: was 68; +1 GLOBAL_BUFFER ptr d_dlogits_scratch (idx 68 @ 0x220)
+    uint64 n_args = 71    // P-own: was 69; +2 BY_VALUE rpw_BS/rpw_B (idx 69 @ 0x228, idx 70 @ 0x230)
     uint64 args_desc = alloc(n_args * 16)
     uint64 ai = 0
     while ai < n_args {
@@ -10026,6 +10036,7 @@ fn _wzm_finalize_bwd_kernel(uint64 kname_ptr, uint64 nl) {
         else if ai == 13 { unsafe { *(kp as uint64) = AMD_ARG_KIND_BY_VALUE } }
         else if ai >= 50 && ai <= 58 { unsafe { *(kp as uint64) = AMD_ARG_KIND_BY_VALUE } }
         else if ai >= 63 && ai <= 67 { unsafe { *(kp as uint64) = AMD_ARG_KIND_BY_VALUE } }   // P2: VOCAB/B/NW; P3: id_chunk (66); P4a: inv_B f32 (67)
+        else if ai >= 69 && ai <= 70 { unsafe { *(kp as uint64) = AMD_ARG_KIND_BY_VALUE } }   // P-own: rpw_BS (69), rpw_B (70)
         else { unsafe { *(kp as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER } }
         ai = ai + 1
     }
