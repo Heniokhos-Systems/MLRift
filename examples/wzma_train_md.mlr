@@ -1102,6 +1102,12 @@ fn main() {
     // by the reduce phase into d_grads.  At WZM_BWD_NW=1 the reduce is identity.
     u64 d_partial = gpu_malloc(WZM_BWD_NW * PART_N * 4, "mPartial")
     u64 d_barrier = gpu_malloc(4096, "mBarrier")  // dummy (no in-kernel cross-WG barrier)
+    // P4b-1: per-WG global scratch for the InfoNCE [B,B] dlogits matrix (relocated
+    // out of LDS so it scales past the 64KB LDS ceiling at large B).  Sized for the
+    // worst case the sweep will hit: NW_PRE_MAX=64 × B≤128 → 64*128*128*4 = 4 MiB.
+    // grid=1/current-B uses only the first slice; allocate full so no realloc later.
+    u64 NW_PRE_MAX = 64
+    u64 d_dlogits_scratch = gpu_malloc(NW_PRE_MAX * 128 * 128 * 4, "mDlogitsScratch")
 
     // ── GEMM-bwd scratch (full-occupancy bwd_uv replacement) ───────────────
     // doutk_k[bs,d] = alpha_k[bs]*dz[bs,d]  (per view, all K banks contiguous).
@@ -1449,7 +1455,7 @@ fn main() {
         // KFD ptr-table: each entry → 8-byte value slot.  Reused by all 4 phase
         // dispatches (they share the megakernel's byte-for-byte kernarg layout).
         u64 kb_t0 = time_now()
-        u64 NA = 68    // P2: +3 VOCAB/B/NW @ 63/64/65; P3: +1 id_chunk @ 66; P4a: +1 inv_B f32 @ 67
+        u64 NA = 69    // P2: +3 VOCAB/B/NW @ 63/64/65; P3: +1 id_chunk @ 66; P4a: +1 inv_B f32 @ 67; P4b-1: +1 dlogits_scratch ptr @ 68
         u64 kp = alloc(NA * 8)
         set_arg_ptr(kp, 0,  d_ids1)   // 0x00
         set_arg_ptr(kp, 1,  d_emb)    // 0x08
@@ -1532,6 +1538,9 @@ fn main() {
         // P4a: inv_B = 1/B (by-value f32; bwd_pre InfoNCE dlogits scale). B=8 → exactly 0.125.
         f32 inv_B = 1.0f / f64_to_f32(int_to_f64(B))
         set_arg_f32(kp, 67, inv_B)      // 0x218 (by-value f32)
+        // P4b-1: dlogits global scratch ptr (used by wzma_bwd_pre; benign for the
+        // other 3 phases that don't reference s[76:77]).  idx 68 @ 0x220.
+        set_arg_ptr(kp, 68, d_dlogits_scratch)  // 0x220 (POINTER)
 
         u64 kb_t1 = time_now()   // kernarg-build cost (folded into ns_bpre)
 

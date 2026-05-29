@@ -9509,7 +9509,20 @@ fn _wzm_emit_infonce_dv_bwd() {
     asm_u32(0xF40003C0); asm_u32(0xF8000218)   // s_load_b32 s15, s[0:1], 0x218
     asm_u32(0xBF89FC07)                   // s_waitcnt lgkmcnt(0)
 
-    // ── B-1: build logits[i,j] = dot_d(v1[i],v2[j])/tau → LDS[2048+(i*8+j)*4] ──
+    // P4b-1: relocate the [B,B] dlogits matrix from LDS[2048..] to a per-WG slice
+    // of the GLOBAL scratch buffer (kernarg 68, base ptr s[76:77] from prologue).
+    // Per-WG slice byte size = B*B*4 ; slice base = scratch + wg_id*(B*B*4).
+    // At grid=1, s3 (wg_id_x) = 0 → slice_off = 0 → base = scratch.  Compute the
+    // slice base into s[76:77] ONCE (s38/s39 are free temps before the B-1 loop).
+    // The row/col addressing below is IDENTICAL to the old LDS layout: byte off
+    // = i*B4 + j*4  (B4 = s4 = B*4), so a dlogits element lives at
+    // s[76:77] + (i*B + j)*4 — same arithmetic that drove the ds_* offset.
+    wzm_s_mul_i32_ss(38, 4, 49)           // s38 = B4 * B = (B*B)*4  (per-WG slice bytes)
+    wzm_s_mul_i32_ss(39, 3, 38)           // s39 = wg_id(s3) * slice_bytes = slice byte off
+    wzm_s_add_u32_ss(76, 76, 39)          // s76 = scratch_lo + slice_off
+    asm_u32(0x82000000 | (77 << 16) | (0x80 << 8) | 77)   // s_addc_u32 s77, s77, 0
+
+    // ── B-1: build logits[i,j] = dot_d(v1[i],v2[j])/tau → GLOBAL[base+(i*B+j)*4] ──
     // (identical to Task-4 logit build; we need the matrix again for softmax.)
     wzm_s_mov_b32_0(34)                   // i = 0
     uint64 bl_i_top = asm_text_len / 4
@@ -9545,12 +9558,14 @@ fn _wzm_emit_infonce_dv_bwd() {
     wzm_v_mul_f32_e32(17, 17, 18)         // logit = dot/tau
     asm_u32(0x7C940080)                   // lane 0
     asm_u32(0xBE82206A)                   // saveexec s2
-    wzm_s_mul_i32_ss(38, 34, 4)           // P4a: i*B4 (s4=B*4, LDS row stride)
+    wzm_s_mul_i32_ss(38, 34, 4)           // P4a: i*B4 (s4=B*4, dlogits row stride)
     wzm_s_lshl2(36, 35)                   // j*4
     wzm_s_add_u32_ss(38, 38, 36)
-    wzm_v_mov_s(1, 38)
-    wzm_ds_store_b32(1, 17, 2048)         // dlogits LDS[2048 + i*32 + j*4] = logit
-    asm_u32(0xBF89FC07)                   // lgkmcnt(0)
+    wzm_v_mov_s(1, 38)                    // v1 = (i*B + j)*4  (slice byte off)
+    // P4b-1: dlogits GLOBAL store (lane-0-gated → only active lane issues; in-range
+    // since i,j<B and slice = B*B*4).  global_store_b32 v1, v17, s[76:77].
+    wzm_gstore_b32_saddr(1, 17, 76)       // dlogits_scratch[i*B + j] = logit
+    asm_u32(0xBC7C0000)                   // vscnt(0) — store visible
     asm_u32(0xBEFE0002)                   // restore exec
     wzm_s_add_u32_1(35, 35)               // j += 1
     uint64 bl_j_back = (bl_j_top - (asm_text_len / 4) - 1) & 0xFFFF
@@ -9580,8 +9595,8 @@ fn _wzm_emit_infonce_dv_bwd() {
     wzm_s_mul_i32_ss(36, 34, 4)           // P4a: row base = i*B4 (s4=B*4)
     // rowmax over j
     wzm_v_mov_s(1, 36)
-    wzm_ds_load_b32(24, 1, 2048)          // v24 = logits[i,0] (rowmax init)
-    asm_u32(0xBF89FC07)
+    wzm_gload_b32_saddr(24, 1, 76)        // P4b-1: v24 = dlogits[i,0] global (rowmax init)
+    asm_u32(0xBF8903F7)                   // vmcnt(0)
     wzm_s_mov_b32_lit(35, 1)              // j = 1
     uint64 sm_mx_top = asm_text_len / 4
     asm_u32(0xBF090000 | (49 << 8) | 35)   // P4a: j >= B (s49)
@@ -9589,8 +9604,8 @@ fn _wzm_emit_infonce_dv_bwd() {
     asm_u32(0xBFA20000)
     wzm_s_lshl2(37, 35); wzm_s_add_u32_ss(37, 36, 37)
     wzm_v_mov_s(1, 37)
-    wzm_ds_load_b32(26, 1, 2048)
-    asm_u32(0xBF89FC07)
+    wzm_gload_b32_saddr(26, 1, 76)        // P4b-1: dlogits global
+    asm_u32(0xBF8903F7)                   // vmcnt(0)
     asm_v_max_f32_e64_vv(24, 24, 26)
     wzm_s_add_u32_1(35, 35)
     uint64 sm_mx_back = (sm_mx_top - (asm_text_len / 4) - 1) & 0xFFFF
@@ -9606,14 +9621,14 @@ fn _wzm_emit_infonce_dv_bwd() {
     asm_u32(0xBFA20000)
     wzm_s_lshl2(37, 35); wzm_s_add_u32_ss(37, 36, 37)
     wzm_v_mov_s(1, 37)
-    wzm_ds_load_b32(26, 1, 2048)          // v26 = logit
-    asm_u32(0xBF89FC07)
+    wzm_gload_b32_saddr(26, 1, 76)        // P4b-1: v26 = dlogits[i,j] (=logit) global
+    asm_u32(0xBF8903F7)                   // vmcnt(0)
     wzm_v_sub_f32_e32(31, 26, 24)         // logit - rowmax
     wzm_v_mul_f32_e32(31, 31, 29)         // * log2e
     asm_v_exp_f32_e64_v(31, 31)           // exp2 = exp(logit-rowmax)
     wzm_v_add_f32_e32(25, 25, 31)         // sumexp += e
-    wzm_ds_store_b32(1, 31, 2048)         // LDS = e (unnormalized)
-    asm_u32(0xBF89FC07)
+    wzm_gstore_b32_saddr(1, 31, 76)       // P4b-1: dlogits = e (unnormalized) global
+    asm_u32(0xBC7C0000)                   // vscnt(0)
     wzm_s_add_u32_1(35, 35)
     uint64 sm_se_back = (sm_se_top - (asm_text_len / 4) - 1) & 0xFFFF
     asm_u32(0xBFA00000 | sm_se_back)
@@ -9628,8 +9643,8 @@ fn _wzm_emit_infonce_dv_bwd() {
     asm_u32(0xBFA20000)
     wzm_s_lshl2(37, 35); wzm_s_add_u32_ss(37, 36, 37)
     wzm_v_mov_s(1, 37)
-    wzm_ds_load_b32(26, 1, 2048)          // v26 = e
-    asm_u32(0xBF89FC07)
+    wzm_gload_b32_saddr(26, 1, 76)        // P4b-1: v26 = dlogits[i,j] (=e) global
+    asm_u32(0xBF8903F7)                   // vmcnt(0)
     wzm_v_mul_f32_e32(26, 26, 25)         // v26 = P[i,j]
     // subtract 1 if i==j
     asm_s_cmp_eq_u32(34, 35)              // scc = (i==j)
@@ -9640,8 +9655,8 @@ fn _wzm_emit_infonce_dv_bwd() {
     uint64 sm_diag_end = asm_text_len / 4
     asm_patch_u32(sm_diag_else, 0xBFA10000 | ((sm_diag_end - sm_diag_else - 1) & 0xFFFF))
     wzm_v_mul_f32_e32(26, 26, 40)         // * 1/B
-    wzm_ds_store_b32(1, 26, 2048)         // dlogits[i,j]
-    asm_u32(0xBF89FC07)
+    wzm_gstore_b32_saddr(1, 26, 76)       // P4b-1: dlogits[i,j] global = (P - 1{i==j})/B
+    asm_u32(0xBC7C0000)                   // vscnt(0)
     wzm_s_add_u32_1(35, 35)
     uint64 sm_n_back = (sm_n_top - (asm_text_len / 4) - 1) & 0xFFFF
     asm_u32(0xBFA00000 | sm_n_back)
@@ -9680,17 +9695,18 @@ fn _wzm_emit_infonce_dv_bwd() {
     asm_u32(0xBF090000 | (49 << 8) | 36)   // P4a: j >= B (s49)
     uint64 dv1_j_exit = asm_text_len / 4
     asm_u32(0xBFA20000)
-    // dlogits[i,j] from LDS[2048 + i*32 + j*4] (uniform; lane reads its own copy)
+    // P4b-1: dlogits[i,j] from GLOBAL slice (uniform off i*B4+j*4; d<D exec-gated →
+    // inactive lanes never issue; in-range since i,j<B).  v16 consumed after the
+    // v2 load's vmcnt(0) below, which drains BOTH vmem loads.
     wzm_s_lshl2(38, 36); wzm_s_add_u32_ss(38, 35, 38)
     wzm_v_mov_s(1, 38)
-    wzm_ds_load_b32(16, 1, 2048)          // v16 = dlogits[i,j]
-    asm_u32(0xBF89FC07)
+    wzm_gload_b32_saddr(16, 1, 76)        // v16 = dlogits[i,j] global
     // v2[j,d] : off = (j*D + d)*4  (d<D guaranteed by exec gate)
     wzm_s_mul_i32_ss(39, 36, 32)          // P4a: j*D (s32=D)
     wzm_v_add_nc_u32_sv(1, 39, 0)
     wzm_v_shl2_e32(1, 1)
     wzm_gload_b32_saddr(17, 1, 46)        // v17 = v2[j,d]
-    asm_u32(0xBF8903F7)                   // vmcnt(0)
+    asm_u32(0xBF8903F7)                   // vmcnt(0) — drains dlogits + v2 loads
     asm_v_fma_f32_e64_vvv(30, 16, 17, 30) // acc += dlogits*v2
     wzm_s_add_u32_1(36, 36)
     uint64 dv1_j_back = (dv1_j_top - (asm_text_len / 4) - 1) & 0xFFFF
@@ -9736,13 +9752,12 @@ fn _wzm_emit_infonce_dv_bwd() {
     wzm_s_mul_i32_ss(38, 34, 4)           // P4a: i*B4 (s4=B*4) + j*4
     wzm_s_add_u32_ss(38, 38, 35)          // + j*4
     wzm_v_mov_s(1, 38)
-    wzm_ds_load_b32(16, 1, 2048)          // v16 = dlogits[i,j]
-    asm_u32(0xBF89FC07)
+    wzm_gload_b32_saddr(16, 1, 76)        // P4b-1: v16 = dlogits[i,j] global
     wzm_s_mul_i32_ss(39, 34, 32)          // P4a: i*D (s32=D)
     wzm_v_add_nc_u32_sv(1, 39, 0)
     wzm_v_shl2_e32(1, 1)
     wzm_gload_b32_saddr(17, 1, 44)        // v17 = v1[i,d]
-    asm_u32(0xBF8903F7)
+    asm_u32(0xBF8903F7)                   // vmcnt(0) — drains dlogits + v1 loads
     asm_v_fma_f32_e64_vvv(30, 16, 17, 30)
     wzm_s_add_u32_1(34, 34)
     uint64 dv2_i_back = (dv2_i_top - (asm_text_len / 4) - 1) & 0xFFFF
@@ -9938,6 +9953,11 @@ fn _wzm_emit_bwd_prologue() {
     // word; SDATA field = s51, base s[0:1], offset 0x210).  Mirrors the s49 idiom:
     // s48=0xF4000C00, s49=0xF4000C40, s50=0xF4000C80, so s51=0xF4000CC0.
     asm_u32(0xF4000CC0); asm_u32(0xF8000210)   // s_load_b32 s51, s[0:1], 0x210 ; s51 = id_chunk
+    // P4b-1: dlogits global scratch ptr (kernarg idx 68 @ 0x220) → s[76:77].
+    // s76/s77 are free across prologue+infonce_dv_bwd (NOT loaded above; NOT
+    // touched in _wzm_emit_infonce_dv_bwd — verified by full-disasm SGPR scan).
+    // Pair index 38 → base SGPR 76 (sdata_pair = sgpr/2).
+    asm_s_load_b64_off(38, 0, 0x220)   // s[76:77] = d_dlogits_scratch
     asm_u32(0xBF89FC07)   // s_waitcnt lgkmcnt(0)
 }
 
@@ -9949,7 +9969,7 @@ fn _wzm_emit_bwd_prologue() {
 fn _wzm_finalize_bwd_kernel(uint64 kname_ptr, uint64 nl) {
     asm_u32(0xBFB00000)   // s_endpgm
 
-    uint64 n_args = 68    // P4a: was 67; +1 by-value f32 kernarg inv_B (idx 67 @ 0x218)
+    uint64 n_args = 69    // P4b-1: was 68; +1 GLOBAL_BUFFER ptr d_dlogits_scratch (idx 68 @ 0x220)
     uint64 args_desc = alloc(n_args * 16)
     uint64 ai = 0
     while ai < n_args {
