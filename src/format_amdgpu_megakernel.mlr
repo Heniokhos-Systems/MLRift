@@ -8220,6 +8220,18 @@ fn _wzm_emit_embed_bwd_view(uint64 ids_saddr, uint64 dx_kofs) {
     asm_u32(0x82000000 | (75 << 16) | (0x80 << 8) | (ids_saddr + 1))  // s_addc_u32 s75, ids_hi, 0
     asm_s_load_b32(18, 37, 0x0)           // s36 = ids[bs]  (sdata_pair 18 → s36, base s[74:75])
     asm_u32(0xBF89FC07)
+    // P3 id-range gate: this WG owns ids in [wg*id_chunk, (wg+1)*id_chunk).  If the
+    // row's id is outside this range, skip the dx-load/demb-RMW/store and fall to the
+    // increment — so demb[id] is written by exactly ONE WG (race-free) in ascending
+    // bs order (bit-exact vs serial).  s3=wg_id_x, s51=id_chunk; s38/s39 free temps.
+    wzm_s_mul_i32_ss(38, 3, 51)           // s38 = id_lo = wg_id * id_chunk
+    wzm_s_add_u32_ss(39, 38, 51)          // s39 = id_hi = id_lo + id_chunk
+    asm_u32(0xBF0A0000 | (38 << 8) | 36)  // s_cmp_lt_u32 s36, s38   (id < id_lo)
+    uint64 eb_skip_lo = asm_text_len / 4
+    asm_u32(0xBFA20000)                   // s_cbranch_scc1 .Leb_inc (patched)
+    asm_u32(0xBF090000 | (39 << 8) | 36)  // s_cmp_ge_u32 s36, s39   (id >= id_hi)
+    uint64 eb_skip_hi = asm_text_len / 4
+    asm_u32(0xBFA20000)                   // s_cbranch_scc1 .Leb_inc (patched)
     // dx[bs,d]  off=(bs*384 + d)*4 → but s[74:75] was clobbered; reload dx.
     asm_s_load_b64_off(37, 0, dx_kofs)    // s[74:75] = dx (restore)
     asm_u32(0xBF89FC07)
@@ -8237,6 +8249,9 @@ fn _wzm_emit_embed_bwd_view(uint64 ids_saddr, uint64 dx_kofs) {
     wzm_v_add_f32_e32(16, 16, 10)         // += dx
     wzm_gstore_b32_saddr(1, 16, 78)
     asm_u32(0xBC7C0000)
+    uint64 eb_inc = asm_text_len / 4      // P3 .Leb_inc — id-gate skip target
+    asm_patch_u32(eb_skip_lo, 0xBFA20000 | ((eb_inc - eb_skip_lo - 1) & 0xFFFF))
+    asm_patch_u32(eb_skip_hi, 0xBFA20000 | ((eb_inc - eb_skip_hi - 1) & 0xFFFF))
     wzm_s_add_u32_1(34, 34)
     uint64 eb_back = (eb_top - (asm_text_len / 4) - 1) & 0xFFFF
     asm_u32(0xBFA00000 | eb_back)
@@ -9911,6 +9926,10 @@ fn _wzm_emit_bwd_prologue() {
     asm_s_load_b32(24, 0, 0x1F8)      // s48 = VOCAB (by-value uint)
     asm_u32(0xF4000C40); asm_u32(0xF8000200)   // s_load_b32 s49, s[0:1], 0x200 ; s49 = B (by-value uint)
     asm_s_load_b32(25, 0, 0x208)      // s50 = NW (by-value uint)
+    // P3: id_chunk (by-value uint, kernarg idx 66 @ 0x210) → s51 (odd → raw SMEM
+    // word; SDATA field = s51, base s[0:1], offset 0x210).  Mirrors the s49 idiom:
+    // s48=0xF4000C00, s49=0xF4000C40, s50=0xF4000C80, so s51=0xF4000CC0.
+    asm_u32(0xF4000CC0); asm_u32(0xF8000210)   // s_load_b32 s51, s[0:1], 0x210 ; s51 = id_chunk
     asm_u32(0xBF89FC07)   // s_waitcnt lgkmcnt(0)
 }
 
@@ -9922,7 +9941,7 @@ fn _wzm_emit_bwd_prologue() {
 fn _wzm_finalize_bwd_kernel(uint64 kname_ptr, uint64 nl) {
     asm_u32(0xBFB00000)   // s_endpgm
 
-    uint64 n_args = 66    // P2: was 63; +3 by-value uint kernargs VOCAB/B/NW (idx 63/64/65 @ 0x1F8/0x200/0x208)
+    uint64 n_args = 67    // P3: was 66; +1 by-value uint kernarg id_chunk (idx 66 @ 0x210)
     uint64 args_desc = alloc(n_args * 16)
     uint64 ai = 0
     while ai < n_args {
@@ -9931,7 +9950,7 @@ fn _wzm_finalize_bwd_kernel(uint64 kname_ptr, uint64 nl) {
         if ai == 12 { unsafe { *(kp as uint64) = AMD_ARG_KIND_BY_VALUE } }
         else if ai == 13 { unsafe { *(kp as uint64) = AMD_ARG_KIND_BY_VALUE } }
         else if ai >= 50 && ai <= 58 { unsafe { *(kp as uint64) = AMD_ARG_KIND_BY_VALUE } }
-        else if ai >= 63 && ai <= 65 { unsafe { *(kp as uint64) = AMD_ARG_KIND_BY_VALUE } }   // P2: VOCAB/B/NW
+        else if ai >= 63 && ai <= 66 { unsafe { *(kp as uint64) = AMD_ARG_KIND_BY_VALUE } }   // P2: VOCAB/B/NW; P3: id_chunk (66)
         else { unsafe { *(kp as uint64) = AMD_ARG_KIND_GLOBAL_BUFFER } }
         ai = ai + 1
     }
