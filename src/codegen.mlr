@@ -72,6 +72,12 @@ static uint64 loop_depth = 0
 // Break fixup list: [patch_offset(4)] × 256
 static uint64 break_fixups = 0
 static uint64 break_fixup_count = 0
+// Match arm-end fixup list: [patch_offset(4)] × 256. Jumps from the end of a
+// matched arm body past the whole match. Kept SEPARATE from break_fixups so a
+// genuine `break` inside a match arm stays visible to the enclosing loop's
+// patch pass instead of being hijacked to end-of-match (H9).
+static uint64 match_end_fixups = 0
+static uint64 match_end_fixup_count = 0
 
 // Fixup table: call sites that need patching after all functions emitted
 // [patch_offset(4), target_name_tok(4)] × 1024
@@ -291,6 +297,8 @@ fn codegen_init(uint64 capacity, uint64 source, uint64 tokens) {
     loop_depth = 0
     break_fixups = alloc(256 * 4)
     break_fixup_count = 0
+    match_end_fixups = alloc(256 * 4)
+    match_end_fixup_count = 0
     enum_table = alloc(512 * 16)
     enum_count = 0
     static_table = alloc(1024 * 8)
@@ -650,6 +658,135 @@ fn tok_matches(uint64 tok_idx, uint64 str_ptr, uint64 str_len) -> uint64 {
         i = i + 1
     }
     return 1
+}
+
+// ---------------------------------------------------------------------------
+// "Did you mean?" suggestions for undeclared identifiers and undefined
+// functions. Classic two-row Levenshtein DP over the two tokens' source
+// bytes, capped at names <= 64 bytes, with an early-out once a whole DP
+// row exceeds 2 (hints are only shown for distance 1-2, so anything
+// larger can bail). Scratch rows live in one flat alloc. Error-path only.
+// ---------------------------------------------------------------------------
+
+static uint64 diag_lev_rows = 0
+
+fn diag_edit_distance(uint64 tok_a, uint64 tok_b) -> uint64 {
+    uint64 la = tok_text_len(tok_a)
+    uint64 lb = tok_text_len(tok_b)
+    if la > 64 { return 99 }
+    if lb > 64 { return 99 }
+    uint64 ldiff = 0
+    if la > lb { ldiff = la - lb } else { ldiff = lb - la }
+    if ldiff > 2 { return ldiff }
+    if diag_lev_rows == 0 { diag_lev_rows = alloc(2 * 65 * 8) }
+    uint64 prev = diag_lev_rows
+    uint64 cur = diag_lev_rows + 520
+    uint64 j = 0
+    while j <= lb {
+        uint64 initp = prev + j * 8
+        unsafe { *(initp as uint64) = j }
+        j = j + 1
+    }
+    uint64 i = 1
+    while i <= la {
+        uint64 c0 = cur
+        unsafe { *(c0 as uint64) = i }
+        uint64 row_min = i
+        uint64 ca = tok_source_byte(tok_a, i - 1)
+        j = 1
+        while j <= lb {
+            uint64 cb = tok_source_byte(tok_b, j - 1)
+            // deletion: prev[j] + 1
+            uint64 delp = prev + j * 8
+            uint64 del = 0
+            unsafe { *(delp as uint64) -> del }
+            del = del + 1
+            // insertion: cur[j-1] + 1
+            uint64 insp = cur + (j - 1) * 8
+            uint64 ins = 0
+            unsafe { *(insp as uint64) -> ins }
+            ins = ins + 1
+            // substitution: prev[j-1] + (ca != cb)
+            uint64 subp = prev + (j - 1) * 8
+            uint64 sub = 0
+            unsafe { *(subp as uint64) -> sub }
+            if ca != cb { sub = sub + 1 }
+            uint64 best = del
+            if ins < best { best = ins }
+            if sub < best { best = sub }
+            uint64 curp = cur + j * 8
+            unsafe { *(curp as uint64) = best }
+            if best < row_min { row_min = best }
+            j = j + 1
+        }
+        if row_min > 2 { return 3 }
+        uint64 tswap = prev
+        prev = cur
+        cur = tswap
+        i = i + 1
+    }
+    uint64 resp = prev + lb * 8
+    uint64 res = 0
+    unsafe { *(resp as uint64) -> res }
+    return res
+}
+
+// Best-candidate accumulator: {best_distance(8), best_tok(8)}. Reset, then
+// feed each symbol table via diag_sugg_scan; diag_sugg_print appends the
+// hint when a candidate landed within edit distance 2.
+static uint64 diag_sugg_cell = 0
+
+fn diag_sugg_reset() {
+    if diag_sugg_cell == 0 { diag_sugg_cell = alloc(16) }
+    uint64 bp = diag_sugg_cell
+    uint64 dmax = 3
+    unsafe { *(bp as uint64) = dmax }
+    uint64 tp = diag_sugg_cell + 8
+    uint64 none = 0xFFFFFFFF
+    unsafe { *(tp as uint64) = none }
+}
+
+// Scan a symbol table whose entries are 8 bytes with the name token in the
+// low u32 — var_table, static_table and fn_table all share this shape.
+// Unknown names shorter than 3 bytes are too noisy to guess.
+fn diag_sugg_scan(uint64 tok, uint64 table, uint64 count) {
+    if diag_sugg_cell == 0 { return }
+    if table == 0 { return }
+    if tok_text_len(tok) < 3 { return }
+    uint64 i = 0
+    while i < count {
+        uint64 entry = table + i * 8
+        uint32 nt = 0
+        unsafe { *(entry as uint32) -> nt }
+        uint64 wnt = nt
+        uint64 d = diag_edit_distance(tok, wnt)
+        uint64 bp = diag_sugg_cell
+        uint64 best = 0
+        unsafe { *(bp as uint64) -> best }
+        if d != 0 && d < best {
+            unsafe { *(bp as uint64) = d }
+            uint64 tp = diag_sugg_cell + 8
+            unsafe { *(tp as uint64) = wnt }
+        }
+        i = i + 1
+    }
+}
+
+// Append "; did you mean 'X'?" (no newline) when a candidate is within
+// distance 2. Callers write the closing quote of the unknown name first,
+// then call this, then write the newline.
+fn diag_sugg_print() {
+    if diag_sugg_cell == 0 { return }
+    uint64 bp = diag_sugg_cell
+    uint64 best = 3
+    unsafe { *(bp as uint64) -> best }
+    if best > 2 { return }
+    uint64 tp = diag_sugg_cell + 8
+    uint64 cand = 0
+    unsafe { *(tp as uint64) -> cand }
+    write(2, "; did you mean '", 16)
+    write(2, cg_source + tok_text_start(cand), tok_text_len(cand))
+    write(2, "'?", 2)
 }
 
 // ---------------------------------------------------------------------------
@@ -3227,7 +3364,15 @@ fn gen_expr(uint64 node) {
     // formats expression values into a stack buffer at var_frame_size.
     // Returns rax = pointer to null-terminated result buffer.
     if kind == 50 {
-        uint64 fs_buf_off = var_frame_size  // scratch area above frame
+        // Reserve a 4096-byte result buffer INSIDE the frame (prologue sub rsp
+        // is patched to the final var_frame_size at function end). Using
+        // var_frame_size as the base overran saved rbx / the return addr (H7).
+        uint64 fs_buf_off = var_count * 8
+        uint64 fs_bkk = 0
+        while fs_bkk < 512 { var_count = var_count + 1; fs_bkk = fs_bkk + 1 }
+        var_frame_size = var_count * 8
+        uint64 fs_brem = var_frame_size & 15
+        if fs_brem != 0 { var_frame_size = var_frame_size + 16 - fs_brem }
         // zero the running offset: temp_slot_1 = 0
         emit_byte(0x48); emit_byte(0x31); emit_byte(0xC0)  // xor rax, rax
         emit_store_rax_to_stack(temp_slot_1)
@@ -3625,6 +3770,8 @@ fn gen_expr(uint64 node) {
                     }
                     if nfsz == 1 {
                         emit_byte(0x0F); emit_byte(0xB6); emit_byte(0x00)
+                    } else if nfsz == 2 {
+                        emit_byte(0x0F); emit_byte(0xB7); emit_byte(0x00)   // movzx eax, word [rax] (H11)
                     } else if nfsz == 4 {
                         emit_byte(0x8B); emit_byte(0x00)
                     } else {
@@ -3725,6 +3872,8 @@ fn gen_expr(uint64 node) {
             // Load field value based on size
             if fsz == 1 {
                 emit_byte(0x0F); emit_byte(0xB6); emit_byte(0x00)
+            } else if fsz == 2 {
+                emit_byte(0x0F); emit_byte(0xB7); emit_byte(0x00)   // movzx eax, word [rax] (H11)
             } else if fsz == 4 {
                 emit_byte(0x8B); emit_byte(0x00)
             } else {
@@ -3778,7 +3927,12 @@ fn gen_expr(uint64 node) {
                 if id_len != 0 {
                     write(2, "error: use of undeclared identifier '", 37)
                     write(2, cg_source + tok_text_start(tok), id_len)
-                    write(2, "'\n", 2)
+                    write(2, "'", 1)
+                    diag_sugg_reset()
+                    diag_sugg_scan(tok, var_table, var_table_size)
+                    diag_sugg_scan(tok, static_table, static_count)
+                    diag_sugg_print()
+                    write(2, "\n", 1)
                     exit(1)
                 }
             }
@@ -4816,8 +4970,12 @@ fn gen_expr(uint64 node) {
             gen_expr(wa3)
             if target_os == 2 {
                 // Windows: GetStdHandle(-(10+fd)) then WriteFile(handle, buf, len, NULL, NULL)
-                // Save len to extra temp
-                uint64 extra_tmp = var_frame_size
+                // Save len to extra temp (reserved frame slot, not above-frame — H7)
+                uint64 extra_tmp = var_count * 8
+                var_count = var_count + 1
+                var_frame_size = var_count * 8
+                uint64 wr_etr = var_frame_size & 15
+                if wr_etr != 0 { var_frame_size = var_frame_size + 16 - wr_etr }
                 emit_store_rax_to_stack(extra_tmp)
                 // GetStdHandle: rcx = -(10 + fd)
                 emit_load_rax_from_stack(temp_slot_0)
@@ -5023,8 +5181,12 @@ fn gen_expr(uint64 node) {
             gen_expr(wa3)
             if target_os == 2 {
                 // Windows: ReadFile(handle, buf, len, &bytesRead, NULL)
-                // Use a frame slot for bytesRead output
-                uint64 extra_tmp = var_frame_size
+                // Reserve two frame slots: extra_tmp (len) + br_slot (bytesRead) — H7
+                uint64 extra_tmp = var_count * 8
+                var_count = var_count + 2
+                var_frame_size = var_count * 8
+                uint64 rd_etr = var_frame_size & 15
+                if rd_etr != 0 { var_frame_size = var_frame_size + 16 - rd_etr }
                 emit_store_rax_to_stack(extra_tmp)
                 uint64 br_slot = extra_tmp + 8
                 // Zero bytesRead slot
@@ -5077,7 +5239,11 @@ fn gen_expr(uint64 node) {
             gen_expr(wa3)
             if target_os == 2 {
                 // Windows: WriteFile(handle, buf, len, &bytesWritten, NULL)
-                uint64 extra_tmp = var_frame_size
+                uint64 extra_tmp = var_count * 8
+                var_count = var_count + 1
+                var_frame_size = var_count * 8
+                uint64 fw_etr = var_frame_size & 15
+                if fw_etr != 0 { var_frame_size = var_frame_size + 16 - fw_etr }
                 emit_store_rax_to_stack(extra_tmp)
                 emit_load_rax_from_stack(temp_slot_0)
                 emit_mov_rcx_rax()
@@ -5187,7 +5353,15 @@ fn gen_expr(uint64 node) {
         if is_extern_call == 0 && tok_matches(wct, "println", 7) != 0 || is_extern_call == 0 && tok_matches(wct, "print", 5) != 0 {
             uint64 pr_is_pln = 0
             if tok_matches(wct, "println", 7) != 0 { pr_is_pln = 1 }
-            uint64 digit_buf = var_frame_size
+            // Reserve a 24-byte digit scratch INSIDE the frame (prologue
+            // `sub rsp` is patched to the final var_frame_size at function end).
+            // Using var_frame_size as the base put the buffer on saved rbx /
+            // the return address, smashing it on return (H7).
+            uint64 digit_buf = var_count * 8
+            var_count = var_count + 3
+            var_frame_size = var_count * 8
+            uint64 db_rem = var_frame_size & 15
+            if db_rem != 0 { var_frame_size = var_frame_size + 16 - db_rem }
             uint32 pr_warg = ast_child(node)
             uint64 pr_first = 1
             while pr_warg != 0 {
@@ -8455,6 +8629,8 @@ fn gen_stmt(uint64 node) {
                         emit_load_rax_from_stack(temp_slot_0)
                         if nfsz_w == 1 {
                             emit_byte(0x88); emit_byte(0x01)
+                        } else if nfsz_w == 2 {
+                            emit_byte(0x66); emit_byte(0x89); emit_byte(0x01)  // mov word [rcx], ax (H11)
                         } else if nfsz_w == 4 {
                             emit_byte(0x89); emit_byte(0x01)
                         } else {
@@ -8536,6 +8712,8 @@ fn gen_stmt(uint64 node) {
                 // Store based on field size
                 if fsz == 1 {
                     emit_byte(0x88); emit_byte(0x01) // mov %al, (%rcx)
+                } else if fsz == 2 {
+                    emit_byte(0x66); emit_byte(0x89); emit_byte(0x01) // mov %ax, (%rcx) (H11)
                 } else if fsz == 4 {
                     emit_byte(0x89); emit_byte(0x01) // mov %eax, (%rcx)
                 } else {
@@ -8907,6 +9085,10 @@ fn gen_stmt(uint64 node) {
 
     // Break
     if kind == 17 {
+        // Outside any loop, `break` is a no-op (matches the IR backend).
+        // Without this, the entry would linger in break_fixups and a later
+        // loop would re-patch it, corrupting emitted code (M1/H9).
+        if loop_depth == 0 { return }
         if break_fixup_count >= 256 {
             write(2, "error: break_fixups overflow (max 256)\n", 39)
             exit(1)
@@ -8923,6 +9105,9 @@ fn gen_stmt(uint64 node) {
 
     // Continue
     if kind == 18 {
+        // Outside any loop, `continue` is a no-op (matches IR; also avoids
+        // reading loop_stack[-1]). M1.
+        if loop_depth == 0 { return }
         // Jump back to loop_start
         uint64 lentry3 = loop_stack + (loop_depth - 1) * 16
         uint64 cont_target = 0
@@ -8945,8 +9130,10 @@ fn gen_stmt(uint64 node) {
         uint64 mrem = var_frame_size & 15
         if mrem != 0 { var_frame_size = var_frame_size + 16 - mrem }
         emit_store_rax_to_stack(match_temp)
-        // Track end-of-match jumps using break_fixups
-        uint64 saved_break = break_fixup_count
+        // Track end-of-match jumps in the dedicated match_end_fixups list (NOT
+        // break_fixups — a genuine `break` in an arm body must stay visible to
+        // the enclosing loop's patch pass). H9.
+        uint64 saved_match_end = match_end_fixup_count
         uint32 arm_idx = ast_data1(node)
         uint64 warm = arm_idx
         while warm != 0 {
@@ -9012,18 +9199,18 @@ fn gen_stmt(uint64 node) {
             uint32 body_idx = ast_data2(warm)
             uint64 wbody = body_idx
             gen_block(wbody)
-            // jmp end_match (stored in break_fixups)
-            if break_fixup_count >= 256 {
-                write(2, "error: break_fixups overflow (max 256)\n", 39)
+            // jmp end_match (stored in match_end_fixups)
+            if match_end_fixup_count >= 256 {
+                write(2, "error: match_end_fixups overflow (max 256)\n", 43)
                 exit(1)
             }
             emit_byte(0xE9)
             uint64 end_patch = out_len
             emit_u32_le(0)
-            uint64 bf = break_fixups + break_fixup_count * 4
+            uint64 bf = match_end_fixups + match_end_fixup_count * 4
             uint32 ep32 = end_patch
             unsafe { *(bf as uint32) = ep32 }
-            break_fixup_count = break_fixup_count + 1
+            match_end_fixup_count = match_end_fixup_count + 1
             // Patch the unconditional jmp (from "none matched") to land
             // here — the skip-arm position — only for non-wildcard arms.
             if is_wild == 0 {
@@ -9035,16 +9222,16 @@ fn gen_stmt(uint64 node) {
         }
         // Patch all end-match jumps to here
         uint64 end_addr = out_len
-        uint64 bi = saved_break
-        while bi < break_fixup_count {
-            uint64 bfe = break_fixups + bi * 4
+        uint64 bi = saved_match_end
+        while bi < match_end_fixup_count {
+            uint64 bfe = match_end_fixups + bi * 4
             uint32 bp32 = 0
             unsafe { *(bfe as uint32) -> bp32 }
             uint64 wbp = bp32
             patch_u32(wbp, (end_addr - wbp - 4) & 0xFFFFFFFF)
             bi = bi + 1
         }
-        break_fixup_count = saved_break
+        match_end_fixup_count = saved_match_end
         return
     }
 
@@ -10302,7 +10489,11 @@ fn resolve_fixups() {
             uint64 ts = tok_text_start(wtt)
             uint64 tl = tok_text_len(wtt)
             write(2, cg_source + ts, tl)
-            write(2, "'\n", 2)
+            write(2, "'", 1)
+            diag_sugg_reset()
+            diag_sugg_scan(wtt, fn_table, fn_count)
+            diag_sugg_print()
+            write(2, "\n", 1)
             exit(1)
         }
         i = i + 1
