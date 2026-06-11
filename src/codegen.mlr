@@ -684,6 +684,26 @@ fn var_type_init() {
 
 fn var_type_register(uint64 name_tok, uint64 type_kind) {
     var_type_init()
+    // A re-declaration of an existing name (legal in a different lexical
+    // scope) shares the variable's stack slot, so its recorded type must
+    // follow the LATEST declaration. Update in place: appending would leave
+    // var_type_lookup returning the FIRST declaration's type, so `int64 x`
+    // after a `uint64 x` would emit unsigned div/cmp and `f64 x` after a
+    // `uint64 x` would load via the integer path. (critique M2)
+    uint64 vti = 0
+    while vti < var_type_count {
+        uint64 ventry = var_type_table + vti * 8
+        uint32 vnt = 0
+        unsafe { *(ventry as uint32) -> vnt }
+        uint64 wvnt = vnt
+        if tok_text_eq(wvnt, name_tok) != 0 {
+            uint64 ve4 = ventry + 4
+            uint32 vtk = type_kind
+            unsafe { *(ve4 as uint32) = vtk }
+            return
+        }
+        vti = vti + 1
+    }
     if var_type_count >= 1024 {
         write(2, "error: var_type_table overflow (max 1024)\n", 42)
         exit(1)
@@ -8770,7 +8790,8 @@ fn gen_stmt(uint64 node) {
         uint64 wcond = cond
         gen_expr(wcond)
 
-        // test eax, eax
+        // test rax, rax (full 64 bits — high bits matter, e.g. 1 << 35)
+        emit_byte(0x48)
         emit_byte(0x85)
         emit_byte(0xC0)
 
@@ -8839,7 +8860,8 @@ fn gen_stmt(uint64 node) {
         uint64 wcond = cond
         gen_expr(wcond)
 
-        // test eax, eax
+        // test rax, rax (full 64 bits — high bits matter, e.g. 1 << 35)
+        emit_byte(0x48)
         emit_byte(0x85)
         emit_byte(0xC0)
 
@@ -10598,6 +10620,23 @@ fn dce_scan_node(uint64 node) {
         uint32 rhs = ast_data2(node)
         uint64 wr = rhs
         if wr != 0 { dce_scan_node(wr) }
+    }
+    // Defer (51): data1=body block. Without this, functions called ONLY from
+    // a `defer { ... }` block are pruned as dead -> "undefined function".
+    if kind == 51 {
+        uint32 def_body = ast_data1(node)
+        uint64 wdb = def_body
+        if wdb != 0 { dce_scan_node(wdb) }
+    }
+    // RangePat (52): data1=lo, data2=hi — scan both so calls in range bounds
+    // (e.g. `lo()..hi()`) keep their callees live.
+    if kind == 52 {
+        uint32 rp_lo = ast_data1(node)
+        uint64 wrl = rp_lo
+        if wrl != 0 { dce_scan_node(wrl) }
+        uint32 rp_hi = ast_data2(node)
+        uint64 wrh = rp_hi
+        if wrh != 0 { dce_scan_node(wrh) }
     }
     // Index: data1=array_name_tok (NOT a node), child=index_expr (handled above),
     //        data2=rhs_value (when used as assignment, 0 otherwise)
