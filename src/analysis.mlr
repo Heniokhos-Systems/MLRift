@@ -1505,9 +1505,50 @@ fn sema_check_stmt(uint64 node) {
         uint32 scrut = ast_child(node)
         uint64 wscrut = scrut
         sema_check_expr(wscrut)
+        // M14: reject a float scrutinee — float equality matching is
+        // ill-defined; the backends compare bit patterns, so 0.1 + 0.2
+        // would never match 0.3. Without a full type checker we catch
+        // the two provable shapes: a float literal, or an Ident whose
+        // declared type is float (sema_var_type_id stores the declared
+        // type's token kind: 94 = f16, 95 = f32, 96 = f64).
+        uint64 scrut_is_float = 0
+        if wscrut != 0 {
+            uint32 sck = ast_kind(wscrut)
+            uint64 wsck = sck
+            if wsck == 46 { scrut_is_float = 1 }   // FloatLitNode
+            if wsck == 32 {
+                uint32 sid_tok = ast_data1(wscrut)
+                uint64 wsid_tok = sid_tok
+                uint64 svi = sema_var_lookup_v(wsid_tok)
+                if svi != 0xFFFFFFFF {
+                    uint64 stid = sema_var_type_id(svi)
+                    if stid == 94 || stid == 95 || stid == 96 {
+                        scrut_is_float = 1
+                    }
+                }
+            }
+        }
+        if scrut_is_float != 0 {
+            // Both caught kinds (FloatLitNode, Ident) carry their token
+            // in data1.
+            uint32 mtok = ast_data1(wscrut)
+            uint64 wmtok = mtok
+            report_error_at(wmtok, "match on a float scrutinee is not supported (float equality is ill-defined); use if/else")
+            sema_errors = sema_errors + 1
+        }
         uint32 arm = ast_data1(node)
         uint64 warm = arm
         while warm != 0 {
+            // Walk the arm's pattern chain (data1, linked via next) so
+            // identifiers and calls inside patterns are visible to the
+            // arity / unused-variable / use-before-init checks.
+            uint32 pat = ast_data1(warm)
+            uint64 wpat = pat
+            while wpat != 0 {
+                sema_check_expr(wpat)
+                uint32 pnx = ast_next(wpat)
+                wpat = pnx
+            }
             uint32 arm_body = ast_data2(warm)
             uint64 wab = arm_body
             if wab != 0 { sema_check_block(wab) }
@@ -1569,10 +1610,60 @@ fn sema_check_functions(uint64 root) {
     }
 }
 
-// Check if a block ends with a return statement (recursively through if/else)
+// Does a single statement guarantee a return on all paths through it?
+//   return-stmt              → yes
+//   if/else where BOTH the then-block and the else-branch return → yes
+//     (the else-branch may itself be an else-if, i.e. another if-node —
+//      that is handled by recursing at the STATEMENT level, not the block
+//      level; recursing via block_has_return on an if-node was the old bug,
+//      since block_has_return walks ast_child expecting a block and would
+//      read the if's condition expression instead of its branches.)
+//   exit(...) call           → yes (never returns to the caller)
+//   exhaustive match         → yes (see match_stmt_returns)
+//   anything else            → no
+// Mutually recursive with block_has_return; MLRift resolves cross-function
+// references across the compilation unit, so definition order is irrelevant.
+fn stmt_returns(uint64 stmt) -> uint64 {
+    if stmt == 0 { return 0 }
+    uint32 k = ast_kind(stmt)
+    uint64 wk = k
+    if wk == 12 { return 1 }
+    if wk == 13 {
+        uint32 then_blk = ast_data1(stmt)
+        uint64 wthen = then_blk
+        uint32 else_blk = ast_data2(stmt)
+        uint64 welse = else_blk
+        if welse == 0 { return 0 }
+        if block_has_return(wthen) == 0 { return 0 }
+        uint32 ek = ast_kind(welse)
+        uint64 wek = ek
+        if wek == 13 { return stmt_returns(welse) }   // else-if: recurse as statement
+        return block_has_return(welse)                // plain else: block
+    }
+    // exit(...) never returns to the caller, so a function whose last
+    // statement is an exit() call cannot fall off the end (M12).
+    if wk == 16 {
+        uint32 ec = ast_child(stmt)
+        uint32 eck = ast_kind(ec)
+        uint64 weck = eck
+        if weck == 35 {
+            uint32 callee = ast_data1(ec)
+            uint64 wcallee = callee
+            if sema_tok_matches(wcallee, "exit", 4) != 0 { return 1 }
+        }
+        return 0
+    }
+    // A match with a `_` default arm whose every arm returns on all paths
+    // is exhaustive and terminating (M12). Without a default arm we can't
+    // prove exhaustiveness over an integer scrutinee, so stay conservative.
+    if wk == 19 { return match_stmt_returns(stmt) }
+    return 0
+}
+
+// A structured block (no goto in MLRift) returns on all paths iff its last
+// statement does.
 fn block_has_return(uint64 block_node) -> uint64 {
     if block_node == 0 { return 0 }
-    // Find last statement in block
     uint32 child = ast_child(block_node)
     uint64 wchild = child
     uint64 last = 0
@@ -1581,36 +1672,40 @@ fn block_has_return(uint64 block_node) -> uint64 {
         uint32 nxt = ast_next(wchild)
         wchild = nxt
     }
-    if last == 0 { return 0 }
-    uint32 lk = ast_kind(last)
-    if lk == 12 { return 1 }
-    if lk == 13 {
-        // If with else: check both branches
-        uint32 then_blk = ast_data1(last)
-        uint64 wthen = then_blk
-        uint32 else_blk = ast_data2(last)
-        uint64 welse = else_blk
-        if welse == 0 { return 0 }
-        uint64 then_ret = block_has_return(wthen)
-        if then_ret == 0 { return 0 }
-        uint32 ek = ast_kind(welse)
-        if ek == 13 {
-            // else-if chain: check recursively as a statement
-            // Wrap in a virtual check: the if-stmt itself must have return
-            uint32 eif_then = ast_data1(welse)
-            uint64 wet = eif_then
-            uint32 eif_else = ast_data2(welse)
-            uint64 wee = eif_else
-            if wee == 0 { return 0 }
-            uint64 et_ret = block_has_return(wet)
-            if et_ret == 0 { return 0 }
-            // Recurse on the else-if's else
-            uint32 eek = ast_kind(wee)
-            if eek == 13 { return block_has_return(wee) }
-            return block_has_return(wee)
+    return stmt_returns(last)
+}
+
+// A `match` returns on all paths iff it has a `_` default arm AND every arm
+// body returns on all paths. The default arm is an Ident pattern (kind 32)
+// whose token is a single underscore, mirroring the backends' wildcard
+// detection. (M12 — previously a function ending in an exhaustive match was
+// wrongly flagged as falling off the end.)
+fn match_stmt_returns(uint64 match_node) -> uint64 {
+    uint32 arm = ast_data1(match_node)
+    uint64 warm = arm
+    if warm == 0 { return 0 }
+    uint64 has_default = 0
+    uint64 all_return = 1
+    while warm != 0 {
+        uint32 body = ast_data2(warm)
+        uint64 wbody = body
+        if block_has_return(wbody) == 0 { all_return = 0 }
+        uint32 pat = ast_data1(warm)
+        uint64 wpat = pat
+        while wpat != 0 {
+            uint32 pk = ast_kind(wpat)
+            if pk == 32 {
+                uint32 ptok = ast_data1(wpat)
+                uint64 wptok = ptok
+                if sema_tok_matches(wptok, "_", 1) != 0 { has_default = 1 }
+            }
+            uint32 pn = ast_next(wpat)
+            wpat = pn
         }
-        return block_has_return(welse)
+        uint32 an = ast_next(warm)
+        warm = an
     }
+    if has_default != 0 && all_return != 0 { return 1 }
     return 0
 }
 
