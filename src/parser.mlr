@@ -41,7 +41,14 @@ fn cur_tok() -> uint64 {
 
 fn advance_tok() -> uint64 {
     uint64 prev = p_tok_pos
-    p_tok_pos = p_tok_pos + 1
+    // Clamp at the final (EOF) token. Error recovery hands control back to
+    // call sites that advance unconditionally (e.g. sizeof's type token);
+    // without the clamp those could step past the EOF token and read off
+    // the end of the token buffer. A valid parse never advances at EOF, so
+    // this branch behaves identically on well-formed input.
+    if p_tok_pos + 1 < p_tok_count {
+        p_tok_pos = p_tok_pos + 1
+    }
     return prev
 }
 
@@ -69,13 +76,15 @@ fn tok_kind_name(uint64 kind) -> uint64 {
     if kind == 29 { return "'=>'" }
     if kind == 34 { return "'='" }
     if kind == 60 { return "'fn'" }
-    if kind == 61 { return "'if'" }
-    if kind == 62 { return "'else'" }
-    if kind == 63 { return "'while'" }
+    if kind == 61 { return "'return'" }
+    if kind == 62 { return "'if'" }
+    if kind == 63 { return "'else'" }
+    if kind == 64 { return "'while'" }
     if kind == 65 { return "'for'" }
+    if kind == 66 { return "'in'" }
     if kind == 67 { return "'break'" }
     if kind == 68 { return "'continue'" }
-    if kind == 69 { return "'return'" }
+    if kind == 69 { return "'loop'" }
     if kind == 70 { return "'const'" }
     if kind == 71 { return "'static'" }
     if kind == 72 { return "'struct'" }
@@ -95,33 +104,41 @@ fn tok_kind_name(uint64 kind) -> uint64 {
     if kind == 94 { return "'f16'" }
     if kind == 95 { return "'f32'" }
     if kind == 96 { return "'f64'" }
+    if kind == 79 { return "'defer'" }
     return "token"
 }
 
 fn expect(uint32 kind) -> uint64 {
     if cur_kind() != kind {
-        uint8[32] nb
-        uint32 line_num = tok_line_at(p_tok_pos)
-        uint64 wln = line_num
-        write(2, "error at line ", 14)
-        uint64 l = fmt_uint(nb, wln)
-        write(2, nb, l)
-        write(2, ": expected ", 11)
-        uint64 ename = tok_kind_name(kind)
-        write(2, ename, str_len(ename))
-        write(2, ", got ", 6)
-        uint64 gname = tok_kind_name(cur_kind())
-        write(2, gname, str_len(gname))
-        // Show the actual text of the unexpected token
-        if cur_kind() == 1 || cur_kind() == 2 || cur_kind() == 3 {
-            write(2, " '", 2)
-            uint64 ts = tok_text_start(p_tok_pos)
-            uint64 tl = tok_text_len(p_tok_pos)
-            write(2, cg_source + ts, tl)
-            write(2, "'", 1)
+        if parse_err_should_report() != 0 {
+            p_err_reported = p_err_reported + 1
+            uint8[32] nb
+            uint32 line_num = tok_line_at(p_tok_pos)
+            uint64 wln = line_num
+            write(2, "error at line ", 14)
+            uint64 l = fmt_uint(nb, wln)
+            write(2, nb, l)
+            write(2, ": expected ", 11)
+            uint64 ename = tok_kind_name(kind)
+            write(2, ename, str_len(ename))
+            write(2, ", got ", 6)
+            uint64 gname = tok_kind_name(cur_kind())
+            write(2, gname, str_len(gname))
+            // Show the actual text of the unexpected token
+            if cur_kind() == 1 || cur_kind() == 2 || cur_kind() == 3 {
+                write(2, " '", 2)
+                uint64 ts = tok_text_start(p_tok_pos)
+                uint64 tl = tok_text_len(p_tok_pos)
+                write(2, cg_source + ts, tl)
+                write(2, "'", 1)
+            }
+            write(2, "\n", 1)
         }
-        write(2, "\n", 1)
-        exit(1)
+        // Panic-mode recovery: skip to a sync token and hand back the
+        // current token index as a poison value. parse_module()'s error
+        // gate exits before this AST can reach sema or codegen.
+        parse_recover_to_sync()
+        return p_tok_pos
     }
     return advance_tok()
 }
@@ -140,6 +157,77 @@ fn eat(uint32 kind) -> uint64 {
 }
 
 // ---------------------------------------------------------------------------
+// Parser error recovery (panic mode)
+//
+// On a syntax error we print the diagnostic (same format as before), skip
+// forward to a synchronization token, and return a poison value so the
+// surrounding production keeps going — one compile run can surface several
+// syntax errors. parse_module() exits(1) before returning if any parse
+// error was recorded, so a poisoned AST never reaches sema or codegen.
+// None of these paths execute on well-formed input.
+// ---------------------------------------------------------------------------
+
+static uint64 p_err_count = 0             // distinct parse errors (drives the gate)
+static uint64 p_err_reported = 0          // printed messages (capped at 20)
+static uint64 p_last_err_pos = 0xFFFFFFFF // token pos of the previous error
+
+// Tokens that plausibly start a new construct (or close the current one):
+// EOF, '}', ';', '@', and the top-level / statement keywords.
+fn parse_is_sync(uint64 k) -> uint64 {
+    if k == 0 { return 1 }     // end of file
+    if k == 13 { return 1 }    // '}'
+    if k == 18 { return 1 }    // ';'
+    if k == 21 { return 1 }    // '@' annotation
+    if k == 60 { return 1 }    // fn
+    if k == 61 { return 1 }    // return
+    if k == 62 { return 1 }    // if
+    if k == 64 { return 1 }    // while
+    if k == 65 { return 1 }    // for
+    if k == 67 { return 1 }    // break
+    if k == 68 { return 1 }    // continue
+    if k == 69 { return 1 }    // loop
+    if k == 70 { return 1 }    // const
+    if k == 71 { return 1 }    // static
+    if k == 72 { return 1 }    // struct
+    if k == 73 { return 1 }    // enum
+    if k == 74 { return 1 }    // extern
+    if k == 75 { return 1 }    // import
+    if k == 76 { return 1 }    // unsafe
+    if k == 79 { return 1 }    // defer
+    if k == 88 { return 1 }    // match
+    if k == 89 { return 1 }    // type
+    if k == 90 { return 1 }    // asm
+    return 0
+}
+
+// Should the error at the current token be printed? Suppresses repeats at
+// the same position (cascade noise after a recovery that could not advance,
+// and the return-tuple lookahead rewind) and everything past the cap of 20.
+fn parse_err_should_report() -> uint64 {
+    if p_tok_pos == p_last_err_pos { return 0 }
+    if p_err_reported >= 20 { return 0 }
+    return 1
+}
+
+// Record the error and skip ahead to the next sync token. Progress
+// guarantee: a repeat error at the same position force-consumes one token
+// (advance_tok is clamped at EOF), so the parser can never spin — every
+// error either moves p_tok_pos forward or arms the force-advance for the
+// next error at that position, and all parser loops terminate at EOF.
+fn parse_recover_to_sync() {
+    uint64 here = p_tok_pos
+    if here == p_last_err_pos {
+        if cur_kind() != 0 { advance_tok() }
+    } else {
+        p_err_count = p_err_count + 1
+    }
+    p_last_err_pos = here
+    while parse_is_sync(cur_kind()) == 0 {
+        advance_tok()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Parser init
 // ---------------------------------------------------------------------------
 
@@ -148,11 +236,78 @@ fn parser_init(uint64 tokens, uint64 count_val) {
     p_tok_buf = tokens
     p_tok_count = count_val
     p_tok_pos = 0
+    p_err_count = 0
+    p_err_reported = 0
+    p_last_err_pos = 0xFFFFFFFF
 }
 
 // ---------------------------------------------------------------------------
 // Expression parsing (Pratt-style precedence climbing)
 // ---------------------------------------------------------------------------
+
+// Rewrite every `continue` (kind 18) that belongs to the CURRENT loop —
+// i.e. reachable without crossing an inner loop boundary (While, kind 14,
+// which `for`/`loop` also desugar to) — into a synthetic
+//   Block { IDENT = IDENT + 1; continue }
+// so a `continue` in a desugared `for` still runs the increment before
+// re-testing the condition. Recurses through blocks, ifs, match arms and
+// defer bodies, but stops at any nested While (inner loops own their own
+// continues; inner `for`s were already rewritten when they desugared).
+// The increment expression subtree (`inc_add`) is SHARED by every rewritten
+// site and by the loop-tail increment: expression nodes are referenced only
+// via child/data2 (their `next` field is never used), so sharing is safe.
+// Each site gets its OWN Assign + Continue nodes because statement siblings
+// link through `next`. Mutating the Continue node in place (kind 18 -> 15)
+// needs no parent pointer and keeps the original `next` chain intact, so
+// (dead) statements after the continue still compile as before. (H10)
+fn for_rewrite_continues(uint64 node, uint64 iter_name_tok, uint64 inc_add) {
+    if node == 0 { return }
+    uint32 k = ast_kind(node)
+    uint64 wk = k
+    if wk == 18 {                            // Continue -> Block { inc; continue }
+        uint64 site_assign = ast_alloc(AstKind.Assign)
+        uint32 it32 = iter_name_tok
+        ast_set_data1(site_assign, it32)
+        uint32 ia32 = inc_add
+        ast_set_child(site_assign, ia32)
+        uint64 new_cont = ast_alloc(AstKind.Continue)
+        uint32 nc32 = new_cont
+        ast_set_next(site_assign, nc32)
+        ast_set_kind(node, 15)               // becomes a Block
+        uint32 sa32 = site_assign
+        ast_set_child(node, sa32)
+        return
+    }
+    if wk == 14 { return }                   // While/loop — inner loop boundary
+    if wk == 15 {                            // Block: walk children
+        uint32 ch = ast_child(node)
+        uint64 wch = ch
+        while wch != 0 {
+            for_rewrite_continues(wch, iter_name_tok, inc_add)
+            uint32 nx = ast_next(wch)
+            wch = nx
+        }
+        return
+    }
+    if wk == 13 {                            // If: then=data1, else=data2
+        for_rewrite_continues(ast_data1(node), iter_name_tok, inc_add)
+        for_rewrite_continues(ast_data2(node), iter_name_tok, inc_add)
+        return
+    }
+    if wk == 19 {                            // Match: arm bodies in data2
+        uint32 arm = ast_data1(node)
+        uint64 wa = arm
+        while wa != 0 {
+            if ast_kind(wa) == 20 {
+                for_rewrite_continues(ast_data2(wa), iter_name_tok, inc_add)
+            }
+            uint32 an = ast_next(wa)
+            wa = an
+        }
+        return
+    }
+    if wk == 51 { for_rewrite_continues(ast_data1(node), iter_name_tok, inc_add) }   // Defer
+}
 
 fn parse_primary() -> uint64 {
     uint32 kind = cur_kind()
@@ -310,8 +465,11 @@ fn parse_primary() -> uint64 {
             uint32 ie = idx_expr
             ast_set_child(idx_node, ie)
             ast_set_tok(idx_node, t32)
-            // Optional .field access (for struct arrays: pts[i].field)
-            if cur_kind() == 17 {
+            // Optional .field access (for struct arrays: pts[i].field).
+            // A following `..` is the range operator, not field access —
+            // leave it for the surrounding range context (M11: `a[0]..a[1]`
+            // used to consume the second dot as a bogus field name).
+            if cur_kind() == 17 && tok_kind_at(p_tok_pos + 1) != 17 {
                 advance_tok()
                 uint64 sfield_tok = advance_tok()
                 uint64 fa_node = ast_alloc(AstKind.FieldAccess)
@@ -348,7 +506,7 @@ fn parse_primary() -> uint64 {
             uint64 last_field_tok = 0
             uint64 last_obj = 0
 
-            while cur_kind() == 17 {
+            while cur_kind() == 17 && tok_kind_at(p_tok_pos + 1) != 17 {
                 advance_tok()
                 uint64 field_tok = advance_tok()
 
@@ -490,25 +648,36 @@ fn parse_primary() -> uint64 {
     }
 
     // Error
-    uint8[32] nb
-    uint32 err_line = tok_line_at(p_tok_pos)
-    uint64 werr = err_line
-    write(2, "error at line ", 14)
-    uint64 l = fmt_uint(nb, werr)
-    write(2, nb, l)
-    write(2, ": unexpected ", 13)
-    uint64 ename = tok_kind_name(kind)
-    write(2, ename, str_len(ename))
-    if kind == 1 || kind == 2 || kind == 3 {
-        write(2, " '", 2)
-        uint64 ts = tok_text_start(p_tok_pos)
-        uint64 tl = tok_text_len(p_tok_pos)
-        write(2, cg_source + ts, tl)
-        write(2, "'", 1)
+    if parse_err_should_report() != 0 {
+        p_err_reported = p_err_reported + 1
+        uint8[32] nb
+        uint32 err_line = tok_line_at(p_tok_pos)
+        uint64 werr = err_line
+        write(2, "error at line ", 14)
+        uint64 l = fmt_uint(nb, werr)
+        write(2, nb, l)
+        write(2, ": unexpected ", 13)
+        uint64 ename = tok_kind_name(kind)
+        write(2, ename, str_len(ename))
+        if kind == 1 || kind == 2 || kind == 3 {
+            write(2, " '", 2)
+            uint64 ts = tok_text_start(p_tok_pos)
+            uint64 tl = tok_text_len(p_tok_pos)
+            write(2, cg_source + ts, tl)
+            write(2, "'", 1)
+        }
+        write(2, " in expression\n", 15)
     }
-    write(2, " in expression\n", 15)
-    exit(1)
-    return 0
+    // Panic-mode recovery: skip to a sync token and return a poison
+    // integer-literal node so the surrounding expression finishes parsing.
+    // The parse-error gate in parse_module() exits before sema/codegen
+    // could ever evaluate it.
+    parse_recover_to_sync()
+    uint64 poison = ast_alloc(AstKind.IntLit)
+    uint32 pt32 = p_tok_pos
+    ast_set_data1(poison, pt32)
+    ast_set_tok(poison, pt32)
+    return poison
 }
 
 fn binop_precedence(uint32 kind) -> uint32 {
@@ -927,8 +1096,10 @@ fn parse_stmt() -> uint64 {
 
     // Match statement: match expr { val => { body } val => { body } ... }
     if kind == 88 {
-        advance_tok()
+        uint64 match_kw = advance_tok()
         uint64 match_node = ast_alloc(19)
+        uint32 mkw = match_kw
+        ast_set_tok(match_node, mkw)
         uint64 scrutinee = parse_expr()
         uint32 s32 = scrutinee
         ast_set_child(match_node, s32)
@@ -1072,6 +1243,13 @@ fn parse_stmt() -> uint64 {
         ast_set_child(inc_add, inci)
         uint32 ol = one_lit
         ast_set_data2(inc_add, ol)
+
+        // Rewrite every `continue` belonging to THIS loop into
+        // Block { IDENT = IDENT + 1; continue } so it still runs the
+        // increment before re-testing the condition. Must run BEFORE the
+        // loop-tail increment is appended to body_block below. (H10 lifted)
+        for_rewrite_continues(body_block, iter_tok, inc_add)
+
         uint64 inc_assign = ast_alloc(AstKind.Assign)
         ast_set_data1(inc_assign, tt)
         uint32 ia = inc_add
@@ -2110,27 +2288,33 @@ fn parse_module() -> uint64 {
                     uint64 val_tok = advance_tok()
                     uint64 tstart = tok_start_at(val_tok)
                     uint64 tlen = tok_len_at(val_tok)
-                    // Parse integer from token
-                    uint64 val = 0
-                    uint64 vi = 0
-                    while vi < tlen {
-                        uint64 sp = p_tok_buf
-                        // Actually need to read from source, but we don't have source ptr here
-                        // Use parse_int_token from codegen? No, it uses cg_source/cg_tokens
-                        // Simplest: just use the token text from the source
-                        // We can compute the value from the token buffer
-                        vi = tlen
-                    }
-                    // For now, use a simpler approach: read digits from source
-                    // Actually, call parse_int_token-like logic inline
+                    // Parse the integer literal from source: decimal, or
+                    // 0x-prefixed hex (e.g. `FLAG = 0x10`). Previously this
+                    // ran an unconditional base-10 loop, so a hex literal
+                    // was misread digit-by-digit (`0x10` -> 7210).
                     next_val = 0
-                    vi = 0
+                    uint64 vi = 0
+                    uint64 vbase = 10
+                    uint64 c0 = 0
+                    uint64 a0 = src_ptr + tstart
+                    unsafe { *(a0 as uint8) -> c0 }
+                    if c0 == 48 && tlen >= 2 {
+                        uint64 a1 = src_ptr + tstart + 1
+                        uint64 c1 = 0
+                        unsafe { *(a1 as uint8) -> c1 }
+                        if c1 == 120 || c1 == 88 {
+                            vbase = 16
+                            vi = 2
+                        }
+                    }
                     while vi < tlen {
-                        // Read byte from source via src_ptr
                         uint64 baddr = src_ptr + tstart + vi
                         uint64 ch = 0
                         unsafe { *(baddr as uint8) -> ch }
-                        next_val = next_val * 10 + ch - 48
+                        uint64 d = ch - 48
+                        if ch >= 97 { d = ch - 87 }
+                        else if ch >= 65 { d = ch - 55 }
+                        next_val = next_val * vbase + d
                         vi = vi + 1
                     }
                 }
@@ -2272,6 +2456,17 @@ fn parse_module() -> uint64 {
         } else {
             advance_tok()
         }
+    }
+
+    // Parse-error gate: if panic-mode recovery fired, report the total and
+    // stop — a poisoned AST must never reach sema or codegen. Every compile
+    // path goes through parse_module(), so this single gate covers them all.
+    if p_err_count > 0 {
+        uint8[24] ebuf
+        uint64 elen = fmt_uint(ebuf, p_err_count)
+        write(2, ebuf, elen)
+        write(2, " parse error(s)\n", 16)
+        exit(1)
     }
 
     return mod_node
