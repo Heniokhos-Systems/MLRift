@@ -1003,7 +1003,9 @@ fn main() {
     u64 fh_fwd_mega = load_co("/tmp/wzma_fwd_mega.co",        "wzma_fwd_mega")  // F2
     u64 fh_repack = load_co("/tmp/repack_abw_to_baw_f32.co",  "repack_abw_to_baw_f32")
     // ── Multi-dispatch full-occupancy BACKWARD phase kernels ───────────────
-    u64 fh_bpre   = load_co("/tmp/wzma_bwd_pre.co",           "wzma_bwd_pre")
+    // L1: bwd_pre split into two driver-synced dispatches (de-redundant).
+    u64 fh_bpre_logits = load_co("/tmp/wzma_bwd_pre_logits.co", "wzma_bwd_pre_logits")
+    u64 fh_bpre_grad   = load_co("/tmp/wzma_bwd_pre_grad.co",   "wzma_bwd_pre_grad")
     u64 fh_buv    = load_co("/tmp/wzma_bwd_uv.co",            "wzma_bwd_uv")
     u64 fh_bemb   = load_co("/tmp/wzma_bwd_embed.co",         "wzma_bwd_embed")
     u64 fh_bred   = load_co("/tmp/wzma_bwd_reduce.co",        "wzma_bwd_reduce")
@@ -1591,16 +1593,22 @@ fn main() {
         u32 berr = 0
         u32 NW32 = WZM_BWD_NW
 
-        // Phase 1: wzma_bwd_pre (grid=NW_pre) — InfoNCE-bwd → dv1/dv2, renorm/L2/
-        // meanpool → dz1/dz2.  P4b-2: PARALLELIZED across NW_pre WGs.  Every WG
-        // redundantly computes the full [B,B] dlogits/softmax into its own per-WG
-        // global-scratch slice (slice=wg_id*B²*4 → no race), and partitions the
-        // dv1[i]/dv2[j]/dz outputs by a half-open B-range [wg*B/NW,(wg+1)*B/NW).
-        // The kernel does NOT read idx 65 (NW) at runtime — range is emit-baked +
-        // runtime wg_id — so the shared kp (idx 65 = WZM_BWD_NW = NW_pre) is fine.
+        // Phase 1: wzma_bwd_pre — L1 SPLIT into two driver-synced dispatches
+        // (de-redundant).  Both grid=NW_pre, same kp block (shared prologue ABI).
+        //   1a) bwd_pre_logits: each WG builds + row-softmaxes ONLY its own rows
+        //       [wg*rpw_B,(+rpw_B)) of the SINGLE shared [B,B] dlogits matrix at
+        //       d_dlogits_scratch (idx 68) offset 0 → the matrix is computed once
+        //       across all WGs (was recomputed NW× in the merged kernel).
+        //   1b) bwd_pre_grad: reads the now-materialized full [B,B] (offset 0) and
+        //       computes dv1/dv2 (B-3) + dz1/dz2 (renorm/L2/meanpool), outputs
+        //       gated to this WG's B-range.
+        // The driver sync between them IS the cross-WG barrier (NO in-kernel spin).
         t0 = time_now()
-        berr = hipModuleLaunchKernel(fh_bpre, NW_pre, 1, 1, 512, 1, 1, 0, 0, kp, 0)
-        if berr != 0 { die_gpu("launch wzma_bwd_pre", berr) }
+        berr = hipModuleLaunchKernel(fh_bpre_logits, NW_pre, 1, 1, 512, 1, 1, 0, 0, kp, 0)
+        if berr != 0 { die_gpu("launch wzma_bwd_pre_logits", berr) }
+        sync_or_die("bwd_pre_logits")
+        berr = hipModuleLaunchKernel(fh_bpre_grad, NW_pre, 1, 1, 512, 1, 1, 0, 0, kp, 0)
+        if berr != 0 { die_gpu("launch wzma_bwd_pre_grad", berr) }
         if profile_on == 1 { sync_or_die("sync bwd_pre"); t1 = time_now(); ns_bpre = ns_bpre + (t1 - t0) + (kb_t1 - kb_t0) }
 
         // Phase 2: bwd_uv via FULL-OCCUPANCY GEMM (replaces the grid=NW serial

@@ -9540,7 +9540,12 @@ fn emit_amdgpu_wzma_fwd_mega_blob(uint64 out_path) -> uint64 {
 // own grid=1 dispatch; the megakernel/standalone-bwd call it inline.  Expects
 // the prologue SGPR map (v1=s44:45, v2=s46:47, BS=s30, D=s32) already loaded.
 //   Writes dv1[B,D] (= dqa, pre re-norm) @0x110, dv2[B,D] @0x118.
-fn _wzm_emit_infonce_dv_bwd() {
+// _wzm_emit_infonce_setup — common B-prologue (v6/v9 reduce-tree addrs, s4=B*4,
+// s15=inv_B) shared by the merged infonce path and the L1 split.  do_slice=1
+// emits the P4b-1 per-WG dlogits slice math (redundant-per-WG merged path);
+// do_slice=0 leaves s[76:77] at the shared scratch base (offset 0 — the L1
+// de-redundant split: a single [B,B] computed once across the NW WGs).
+fn _wzm_emit_infonce_setup(uint64 do_slice) {
     wzm_v_shl2_e32(6, 0)                  // v6 = d*4 (reduce-tree LDS offset)
     asm_u32(0x7E120280)                   // v_mov_b32_e32 v9, 0 (broadcast ds addr)
     // P4a: parameterize B.  B4 = B*4 (= B-row byte stride) into scratch s4 ONCE.
@@ -9551,25 +9556,30 @@ fn _wzm_emit_infonce_dv_bwd() {
     // mirrors the prologue s49/s51 odd-SGPR idiom: SDATA = sgpr<<6 → 15<<6 = 0x3C0).
     asm_u32(0xF40003C0); asm_u32(0xF8000218)   // s_load_b32 s15, s[0:1], 0x218
     asm_u32(0xBF89FC07)                   // s_waitcnt lgkmcnt(0)
+    if do_slice != 0 {
+        // P4b-1: relocate the [B,B] dlogits matrix from LDS[2048..] to a per-WG
+        // slice of GLOBAL scratch (kernarg 68, base s[76:77]).  Slice byte size =
+        // B*B*4 ; slice base = scratch + wg_id*(B*B*4).  At grid=1, s3=0 → off 0.
+        // dlogits element lives at s[76:77] + (i*B + j)*4.
+        wzm_s_mul_i32_ss(38, 4, 49)           // s38 = B4 * B = (B*B)*4  (per-WG slice bytes)
+        wzm_s_mul_i32_ss(39, 3, 38)           // s39 = wg_id(s3) * slice_bytes = slice byte off
+        wzm_s_add_u32_ss(76, 76, 39)          // s76 = scratch_lo + slice_off
+        asm_u32(0x82000000 | (77 << 16) | (0x80 << 8) | 77)   // s_addc_u32 s77, s77, 0
+    }
+}
 
-    // P4b-1: relocate the [B,B] dlogits matrix from LDS[2048..] to a per-WG slice
-    // of the GLOBAL scratch buffer (kernarg 68, base ptr s[76:77] from prologue).
-    // Per-WG slice byte size = B*B*4 ; slice base = scratch + wg_id*(B*B*4).
-    // At grid=1, s3 (wg_id_x) = 0 → slice_off = 0 → base = scratch.  Compute the
-    // slice base into s[76:77] ONCE (s38/s39 are free temps before the B-1 loop).
-    // The row/col addressing below is IDENTICAL to the old LDS layout: byte off
-    // = i*B4 + j*4  (B4 = s4 = B*4), so a dlogits element lives at
-    // s[76:77] + (i*B + j)*4 — same arithmetic that drove the ds_* offset.
-    wzm_s_mul_i32_ss(38, 4, 49)           // s38 = B4 * B = (B*B)*4  (per-WG slice bytes)
-    wzm_s_mul_i32_ss(39, 3, 38)           // s39 = wg_id(s3) * slice_bytes = slice byte off
-    wzm_s_add_u32_ss(76, 76, 39)          // s76 = scratch_lo + slice_off
-    asm_u32(0x82000000 | (77 << 16) | (0x80 << 8) | 77)   // s_addc_u32 s77, s77, 0
-
-    // ── B-1: build logits[i,j] = dot_d(v1[i],v2[j])/tau → GLOBAL[base+(i*B+j)*4] ──
-    // (identical to Task-4 logit build; we need the matrix again for softmax.)
-    wzm_s_mov_b32_0(34)                   // i = 0
+// _wzm_emit_b1_logits — InfoNCE logit build logits[i,j]=dot_d(v1[i],v2[j])/tau
+// → shared GLOBAL [B,B] at s[76:77]+(i*B+j)*4 (per-element reduce-tree dot, lane-0
+// store).  row_part=0: full matrix i=0..B-1 (redundant-per-WG merged path).
+// row_part=1: only this WG's rows [wg*rpw_B,(+rpw_B)) (L1 split — the matrix is
+// computed exactly once across WGs; rows are disjoint → no cross-WG collision).
+fn _wzm_emit_b1_logits(uint64 row_part) {
+    if row_part != 0 { wzm_train_b_loop_init(34) }   // i = wg*rpw_B ; s31 = hi
+    else { wzm_s_mov_b32_0(34) }                      // i = 0
     uint64 bl_i_top = asm_text_len / 4
-    asm_u32(0xBF090000 | (49 << 8) | 34)   // P4a: s_cmp_ge_u32 s34, s49 (i >= B)
+    uint64 bl_i_bound = 49
+    if row_part != 0 { bl_i_bound = wzm_train_b_bound() }
+    asm_u32(0xBF090000 | (bl_i_bound << 8) | 34)   // P4a: s_cmp_ge_u32 s34, bound (i >= my_hi/B)
     uint64 bl_i_exit = asm_text_len / 4
     asm_u32(0xBFA20000)                   // s_cbranch_scc1 .Lbl_i_end (patched)
     wzm_s_mov_b32_0(35)                   // j = 0
@@ -9621,18 +9631,25 @@ fn _wzm_emit_infonce_dv_bwd() {
     uint64 bl_i_end = asm_text_len / 4
     asm_patch_u32(bl_i_exit, 0xBFA20000 | ((bl_i_end - bl_i_exit - 1) & 0xFFFF))
     asm_u32(0xBFBD0000)                   // s_barrier — all logits visible
+}
 
-    // ── B-2: lane 0 converts each row to softmax P[i,j], then dlogits[i,j] =
-    //         (P[i,j] - 1{i==j}) / B  (B=8, 1/B=0.125), in place in LDS. ──
+// _wzm_emit_b2_softmax — lane-0 row-softmax of the shared [B,B] in place:
+// dlogits[i,j] = (P[i,j] - 1{i==j})/B (per-row serial j-reduction → byte-exact).
+// row_part matches _wzm_emit_b1_logits so each WG softmaxes exactly the rows it
+// built (L1 split: no cross-WG read; rows the WG didn't build aren't touched).
+fn _wzm_emit_b2_softmax(uint64 row_part) {
     asm_u32(0x7C940080)                   // lane 0
     asm_u32(0xBE82206A)                   // saveexec s2
     uint64 sm_execz = asm_text_len / 4
     asm_u32(0xBFA50000)                   // s_cbranch_execz .Lsm_end (patched)
     asm_v_mov_b32_lit32(29, 0x3FB8AA3B)   // v29 = log2(e)
     wzm_v_mov_s(40, 15)                    // P4a: v40 = inv_B (s15, kernarg 0x218); =0.125 at B=8
-    wzm_s_mov_b32_0(34)                   // i = 0
+    if row_part != 0 { wzm_train_b_loop_init(34) }   // i = wg*rpw_B ; s31 = hi
+    else { wzm_s_mov_b32_0(34) }                      // i = 0
     uint64 sm_i_top = asm_text_len / 4
-    asm_u32(0xBF090000 | (49 << 8) | 34)   // P4a: i >= B (s49)
+    uint64 sm_i_bound = 49
+    if row_part != 0 { sm_i_bound = wzm_train_b_bound() }
+    asm_u32(0xBF090000 | (sm_i_bound << 8) | 34)   // P4a: i >= my_hi/B
     uint64 sm_i_exit = asm_text_len / 4
     asm_u32(0xBFA20000)
     wzm_s_mul_i32_ss(36, 34, 4)           // P4a: row base = i*B4 (s4=B*4)
@@ -9714,10 +9731,13 @@ fn _wzm_emit_infonce_dv_bwd() {
     asm_patch_u32(sm_execz, 0xBFA50000 | ((sm_end - sm_execz - 1) & 0xFFFF))
     asm_u32(0xBEFE0002)                   // restore exec
     asm_u32(0xBFBD0000)                   // s_barrier — dlogits visible to all lanes
+}
 
-    // ── B-3: dv1[i,d] = (1/tau) sum_j dlogits[i,j]*v2[j,d]  (lane=d, d<D) ──
-    //         dv2[j,d] = (1/tau) sum_i dlogits[i,j]*v1[i,d]
-    //         then re-norm bwd (unit vec): dv -= (dv·q)*q.  Stored to dv1/dv2.
+// _wzm_emit_b3_dv — dv1[i]/dv2[j] from the materialized shared [B,B] dlogits
+// (D-parallel reduce via per-lane d accumulate).  Reads s[76:77]+(i*B+j)*4
+// (offset 0 in the L1 split; per-WG slice in the merged path).  Output rows/cols
+// gated to this WG's B-range (P4b-2); the inner reductions span the full matrix.
+fn _wzm_emit_b3_dv() {
     // dv1: load dv1 ptr (0x110) → s[74:75].
     asm_s_load_b64_off(37, 0, 0x110)      // s[74:75] = dv1
     asm_u32(0xBF89FC07)
@@ -9830,6 +9850,38 @@ fn _wzm_emit_infonce_dv_bwd() {
     asm_patch_u32(dv2_execz, 0xBFA50000 | ((dv2_end - dv2_execz - 1) & 0xFFFF))
     asm_u32(0xBEFE0002)                   // restore exec
     asm_u32(0xBFBD0000)                   // s_barrier — dv1/dv2 (= dqa/dqb) visible
+}
+
+// _wzm_emit_infonce_dv_bwd — merged single-dispatch InfoNCE backward: setup with
+// the per-WG dlogits slice (do_slice=1), full-matrix B-1/B-2 (row_part=0,
+// redundant per WG), then B-3.  Used by the megakernel + standalone
+// wzma_train_bwd.  Byte-identical to the pre-L1-split body.
+fn _wzm_emit_infonce_dv_bwd() {
+    _wzm_emit_infonce_setup(1)
+    _wzm_emit_b1_logits(0)
+    _wzm_emit_b2_softmax(0)
+    _wzm_emit_b3_dv()
+}
+
+// _wzm_emit_logits_softmax — L1 Dispatch-1 body (bwd_pre_logits).  De-redundant:
+// shared [B,B] at scratch offset 0 (do_slice=0); row-partitioned B-1/B-2
+// (row_part=1) so each WG builds + softmaxes only its own rows → the whole matrix
+// is computed exactly ONCE across the NW WGs.  Per-element math byte-identical.
+fn _wzm_emit_logits_softmax() {
+    _wzm_emit_infonce_setup(0)
+    _wzm_emit_b1_logits(1)
+    _wzm_emit_b2_softmax(1)
+}
+
+// _wzm_emit_grad_from_dlogits — L1 Dispatch-2 body (bwd_pre_grad).  Reads the
+// now-materialized shared [B,B] (s[76:77] offset 0) and computes dv1/dv2 (B-3) +
+// dz1/dz2 (renorm/L2/meanpool bwd).  s4=B*4 is the only setup B-3 needs (the
+// reduce-tree addrs v6/v9 + inv_B s15 are logit/softmax-only).
+fn _wzm_emit_grad_from_dlogits() {
+    asm_u32(0x84000000 | (4 << 16) | (0x82 << 8) | 49)    // s_lshl_b32 s4, s49, 2 → s4 = B*4
+    _wzm_emit_b3_dv()
+    _wzm_emit_renorm_pool_bwd_view(44, 0x110, 70, 0x120)   // view 0
+    _wzm_emit_renorm_pool_bwd_view(46, 0x118, 72, 0x128)   // view 1
 }
 
 // _wzm_emit_backward_and_adamw — the shared Task-5/6 backward + AdamW body
@@ -10137,6 +10189,35 @@ fn amdgpu_lower_wzma_bwd_pre(uint64 kname_ptr, uint64 nl) -> uint64 {
     // dz b-loop gated to this WG's B-range (each b = S contiguous BS rows).
     _wzm_emit_renorm_pool_bwd_view(44, 0x110, 70, 0x120)   // view 0
     _wzm_emit_renorm_pool_bwd_view(46, 0x118, 72, 0x128)   // view 1
+    _wzm_finalize_bwd_kernel(kname_ptr, nl)
+    MEGA_TRAIN_NW = saved_nw
+    return 0
+}
+
+// amdgpu_lower_wzma_bwd_pre_logits — L1 Dispatch-1: row-partitioned InfoNCE logit
+// build + row-softmax into the SINGLE shared [B,B] at d_dlogits_scratch offset 0.
+// grid=WZM_BWD_NW; each WG owns rows [wg*rpw_B,(+rpw_B)) → matrix computed ONCE
+// (de-redundant).  Driver-synced before bwd_pre_grad reads the full matrix.
+fn amdgpu_lower_wzma_bwd_pre_logits(uint64 kname_ptr, uint64 nl) -> uint64 {
+    uint64 saved_nw = MEGA_TRAIN_NW
+    MEGA_TRAIN_NW = WZM_BWD_NW
+    asm_init()
+    _wzm_emit_bwd_prologue()
+    _wzm_emit_logits_softmax()
+    _wzm_finalize_bwd_kernel(kname_ptr, nl)
+    MEGA_TRAIN_NW = saved_nw
+    return 0
+}
+
+// amdgpu_lower_wzma_bwd_pre_grad — L1 Dispatch-2: reads the materialized shared
+// [B,B] (offset 0) and computes dv1/dv2 (B-3) + dz1/dz2 (renorm/L2/meanpool bwd),
+// outputs gated to this WG's B-range.  grid=WZM_BWD_NW.
+fn amdgpu_lower_wzma_bwd_pre_grad(uint64 kname_ptr, uint64 nl) -> uint64 {
+    uint64 saved_nw = MEGA_TRAIN_NW
+    MEGA_TRAIN_NW = WZM_BWD_NW
+    asm_init()
+    _wzm_emit_bwd_prologue()
+    _wzm_emit_grad_from_dlogits()
     _wzm_finalize_bwd_kernel(kname_ptr, nl)
     MEGA_TRAIN_NW = saved_nw
     return 0
