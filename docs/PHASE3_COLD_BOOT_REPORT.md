@@ -5,23 +5,44 @@ RX 7800 XT (Navi 32, `psp_13_0_10`). This document captures the GPU's
 internal architecture as we mapped it, every block of data we extracted
 from the silicon, and the final state of the wall analysis.
 
-Status: **investigation closed.** The exact instruction where SOS halts
-has been identified by static reverse engineering: virt `0x0d126e9e`,
-`svc #0xe` (wait_for_event). SOS is blocked waiting for an IPC event
-from a worker thread spawned at virt `0x00202f80` — and that thread's
-code is decompressed at runtime from a `$KDB`-tagged payload into PSP
-private SRAM (`0x00200000..0x00205000`). The worker thread's bytes are
-not in any plaintext we can read, and the event channel IDs it would
-post to are runtime-allocated values in PSP-private SRAM that the host
-cannot write. **No external register or memory write can unblock the
-wait.** Cold-boot without amdgpu/PSP cooperation requires either
-hardware fault injection or access to the decompressed `$KDB` worker
-thread's code.
+Status: **REOPENED (2026-06-11).** The prior "investigation closed —
+silicon wall" conclusion was built on a premise that is now **proven
+false**. See §14 for the full re-audit. In brief:
+
+- The worker thread the report claimed was unreadable ("almost certainly
+  from the encrypted SOS body") is **plaintext firmware we already
+  possess**. It is `INTF_DRV` (the `LOAD_INTFDRV` BL component), loaded
+  at PSP SRAM base `0x00200000`. There is **no encrypted body** — the
+  region the report pointed at (`captures/sos_encrypted_body.bin`,
+  57,344 B) is 99.9 % zeros (entropy 0.02).
+- The "wall" at `svc #0xe` / virt `0x0d126e9e` was a Thumb-alignment
+  **misread**. The real instruction at that address is `bl 0xd12700c`.
+  The actual `svc #0xe` sites (virt `0x0d12655c`, `0x0d126d9e`) are SOS's
+  normal **host-command idle loops** (`wait → svc #0x40 poll → loop`),
+  not a one-shot worker-wait. SOS halts in **init**, before SoL — not
+  parked in a dead wait.
+- The DRAM-training mechanism that §7.5 / η.3m called "genuinely UNKNOWN…
+  inside SOS encrypted body / boot-ROM silicon" is **plaintext code in
+  INTF_DRV**: a mailbox handshake plus `0xaa55aa55` memory-training writes
+  to UMC/PHY registers via kernel register-write services. The training
+  signature is present only in INTF_DRV and absent from the entire SOS
+  blob. It is a readable RDNA3 driver, not silicon ROM. (One detail is
+  still open — the exact runtime call path into the trainer, an
+  INTF_DRV-vs-SOS-`$PS1` overlay question; see §14.3. It does not affect
+  the headline: the trainer is plaintext and in our possession.)
+
+**Still genuinely open:** *why* a from-cold MLRift BL chain fails to reach
+SoL while amdgpu cold-boots this exact card on every power-on. That is a
+software delta (a precondition PS1_1 needs, or MLRift not reaching the
+PS1_1 spawn), now tractable by finishing the RE of the plaintext
+INTF_DRV path — not a fab-rooted silicon wall. The earlier "30+
+hypotheses → silicon wall" closure does **not** hold.
 
 The warm-hybrid path (amdgpu loads PSP firmware once, then hands control
-to MLRift via VFIO) satisfies the LLM mission and is the shipping
-deliverable: Mistral-7B mega-kernel at +24% over PyTorch bf16, Qwen3 at
-200+ tok/s, bit-exact validation across 7 model families.
+to MLRift via VFIO) remains the shipping deliverable for the LLM mission:
+Mistral-7B mega-kernel at +24% over PyTorch bf16, Qwen3 at 200+ tok/s,
+bit-exact validation across 7 model families. Cold-boot is a parallel
+research track, now reopened.
 
 ---
 
@@ -430,8 +451,15 @@ image. Sub-blob #2 (SOS) is the primary target of our RE work.
 ```
 
 Hypothesis-from-eta.3 ("57 KB encrypted body holds the DRAM trainer") is
-**REFUTED**. There is no encrypted body. The DRAM trainer lives in PSP boot
-ROM (on-die silicon).
+**REFUTED**. There is no encrypted body — the `+0x07000..+0x15000` region
+is zero padding (`captures/sos_encrypted_body.bin` is 99.9 % zeros).
+
+> **CORRECTION (2026-06-11):** the follow-on claim "the DRAM trainer lives
+> in PSP boot ROM (on-die silicon)" is **also wrong**. The DRAM trainer is
+> **plaintext code in `INTF_DRV`** (bring-up routine at offset `0x2f80`),
+> loaded by the `LOAD_INTFDRV` BL command at SRAM `0x00200000`. The training
+> signature (`0xaa55aa55`, UMC reg `0x81041e54`) is present only in INTF_DRV
+> and absent from the entire SOS blob. See §14.
 
 ### 7.6 VBIOS / Expansion ROM
 
@@ -502,7 +530,22 @@ the faulting instruction. The handler reports its own location to indicate
 19+ decisive negatives. The wall consistently resolves to "PSP boot ROM"
 which is on-die silicon ROM signed by AMD at fab.
 
-## 9. Where the wall actually is (FINAL, ξ.1-corrected)
+## 9. Where the wall actually is (ξ.1 — **SUPERSEDED by §14, 2026-06-11**)
+
+> **CORRECTION (2026-06-11):** This entire section is unreliable. Its
+> central claims — that SOS halts at `svc #0xe` (virt `0x0d126e9e`) and
+> that the worker thread's code is "NOT in any plaintext sub-blob we
+> possess… almost certainly from the encrypted SOS body" — are both
+> **false**:
+>
+> 1. The address `0x0d126e9e` does not hold `svc #0xe`; it holds
+>    `bl 0xd12700c` (Thumb-alignment misread). The real `svc #0xe` sites
+>    are `0x0d12655c` and `0x0d126d9e`, both host-command idle loops.
+> 2. There is no encrypted SOS body (it is 99.9 %-zero padding). The
+>    worker / DRAM-training code is plaintext in `INTF_DRV` at SRAM
+>    `0x00200000`.
+>
+> Read §14 instead. The text below is retained only for provenance.
 
 The previous "PSP boot ROM unhandled-exception trap" hypothesis is **WRONG**.
 Section 8's "Sysmem at IOVA 0x83f00f80 satisfies fault" line is also a
@@ -714,31 +757,35 @@ python3 tools/lambda4_decode_new_debug_writers.py
 python3 tools/lambda5_find_all_map_physical.py
 ```
 
-## 12. Conclusion
+## 12. Conclusion (**revised 2026-06-11**)
 
-The Navi 32 cold-boot wall is real, precisely located at virt `0x0d126e9e`
-(`svc #0xe`), and software-only unattackable. SOS blocks on an IPC event
-from a worker thread whose code is decompressed at runtime from the
-`$KDB` payload into PSP private SRAM. The event channel IDs that thread
-would post to are PSP-private and not host-writable.
+The previous conclusion — "the cold-boot wall is real, located at
+`svc #0xe`/`0x0d126e9e`, and software-only unattackable" — does **not
+hold**. Both load-bearing facts were wrong (Thumb misread; no encrypted
+body). See §14. The corrected position:
 
-To progress further on cold-boot specifically would require:
-- Hardware fault injection on PSP voltage rail (multi-month bench project)
-- AMD-internal cooperation (not available)
-- A separate exfiltration of the `$KDB`-decompressed worker thread's
-  code from PSP SRAM (which θ.2 proved is not host-mapped pre-SoL)
+- The DRAM-training / hardware bring-up code is **plaintext and in our
+  possession** — thread PS1_1 inside `INTF_DRV`. It is fully analyzable.
+- Cold-boot is therefore **not** gated by silicon-rooted security or by
+  inaccessible firmware. The open question is purely a software delta
+  between MLRift's from-cold BL chain and amdgpu's (which boots this card
+  cold every power-on).
+- Hardware fault injection / AMD cooperation / SRAM exfiltration are **no
+  longer required** to make progress; finishing the static RE of the
+  INTF_DRV path is.
 
-The warm-hybrid path satisfies the LLM mission: amdgpu does the
-PSP-mediated firmware loading once, MLRift takes over via VFIO handoff.
-MLRift's execution path contains no PyTorch, no ROCm, no hipcc. This is
-the shipping deliverable and runs LLMs at competitive performance:
-Mistral-7B mega-kernel at +24% over PT bf16, Qwen3 200+ tok/s,
-bit-exact validation across 7 model families.
+The warm-hybrid path still satisfies the LLM mission independently:
+amdgpu does the PSP-mediated firmware loading once, MLRift takes over via
+VFIO handoff. MLRift's execution path contains no PyTorch, no ROCm, no
+hipcc. Shipping deliverable, competitive performance: Mistral-7B
+mega-kernel at +24% over PT bf16, Qwen3 200+ tok/s, bit-exact validation
+across 7 model families.
 
 The research artifacts (20+ RE tools, complete SOS plaintext decode,
 firmware-cap audit, durable reference values for warm/cold state, full
-μ/ν/ξ campaign infrastructure) are independently valuable even if
-cold-boot remains gated by silicon-rooted security.
+μ/ν/ξ campaign infrastructure, plus the `psp_fuzz/redis.py` capstone
+harness) remain independently valuable, and now anchor an active —
+not closed — cold-boot track.
 
 ---
 
@@ -772,7 +819,7 @@ runner scripts, ranker. Findings:
 | ν.6 | Read SMN `0x032000d8` (the *real* DEBUG_STATUS register): reads `0x00000000`. SOS helper @ `0x1d50` never writes it cold. |
 | ν.7 | SPL_TABLE re-test in modern (ν.1-baseline) chain: SPL load GREEN, BL chain GREEN, SOS still stalls bit-identically. SPL is not the missing piece. |
 | ν.8 | Full 128-register MP0 SMN sweep. Found `C2PMSG_59/89/90/91/115/118` populated — amdgpu source review showed these are BL-side artifacts (`C2PMSG_115` is SPI flash update mailbox `MBOX_READY`), not SOS-runtime indicators. |
-| **ξ.1** | **Static RE of full 109,216-byte SOS** (prior captures were truncated to 94,448 B). Located exact halt at virt `0x0d126e9e` (`svc #0xe` wait_for_event). See §9. |
+| **ξ.1** | **Static RE of full 109,216-byte SOS** (prior captures were truncated to 94,448 B). Claimed exact halt at virt `0x0d126e9e` (`svc #0xe`). **RETRACTED 2026-06-11 (§14):** that address holds `bl 0xd12700c`, not `svc #0xe` — a Thumb-alignment misread. |
 
 ### 13.3 Corrections to earlier doc claims (audit-driven)
 
@@ -840,5 +887,138 @@ Per Gemini's 4-angle framing earlier in session, plus 5-agent audit:
 | SPL_TABLE pre-SYSDRV (agent #1 lead) | Ruled out (ν.7 — loads GREEN, no effect on stall) |
 | Wrong SOS sub-blob | Ruled out (TOC parse — `psp_v2_find` returns correct entry; NV31 label is internal) |
 | Reading wrong DEBUG register | Verified (ν.6 — real reg is `0x032000d8`, reads 0 because SOS clears it) |
-| Static RE of post-version-write code | **Conclusive (ξ.1)**: wall is `svc #0xe` at virt `0x0d126e9e` — waiting for `$KDB` worker thread |
+| Static RE of post-version-write code | **RETRACTED (§14, 2026-06-11)**: the ξ.1 "`svc #0xe` at `0x0d126e9e`" reading was a Thumb misread; the worker/DRAM-trainer is plaintext `INTF_DRV` (PS1_1 @ `0x00202f80`), not an inaccessible `$KDB` thread |
 | Early-attach mmiotrace (ν.4) | Superseded by ξ.1 |
+
+---
+
+## 14. Re-audit (2026-06-11) — the wall premise is false; trainer is plaintext
+
+A fresh, independent static re-audit of the §9/ξ.1 closure found that the
+two facts the "software-only unattackable / silicon wall" conclusion rests
+on are both wrong. All work below is static (no GPU, no cold cycle, zero
+risk), reproduced from `captures/` with `psp_fuzz/redis.py` (capstone 5.0.7).
+
+### 14.1 There is no encrypted body
+
+`captures/sos_encrypted_body.bin` (57,344 B = the SOS `+0x07000..+0x15000`
+region §9 attributes the worker to) is **99.9 % zeros, entropy 0.02** — it
+is padding, not encrypted code. §7.4/§7.5/§8 already say no encrypted body
+exists on this consumer part; §9's "almost certainly from the encrypted SOS
+body" contradicts the rest of the document and is unsupported.
+
+### 14.2 `svc #0xe` at `0x0d126e9e` is a Thumb-alignment misread
+
+Disassembling the full 109,216-B SOS (virt→file: `V − 0x0d110000 + 0x100`):
+
+| virt | actual instruction | §9 claim |
+|---|---|---|
+| `0x0d126e9e` | `bl 0xd12700c` | "`svc #0xe` — THE WALL" (wrong) |
+| `0x0d126eac` | `svc #1` (create_thread, entry `0x00202f80`) | — |
+
+SOS issues exactly **one** `svc #1` (create_thread), spawning entry
+`0x00202f80`. The only real `svc #0xe` sites are `0x0d12655c` and
+`0x0d126d9e`, and both are **host-command idle dispatch loops**:
+
+```
+0x0d12655c: svc #0xe        ; wait for event
+0x0d12655e: svc #0x40       ; poll for a posted host command -> r0
+0x0d126560: cmp r0, #0
+0x0d126562: beq 0x0d12655c  ; nothing posted -> keep waiting
+```
+
+i.e. SOS waiting on the **host** after init completes — not a one-shot wait
+on a worker. Since cold-boot leaves SoL (C2PMSG_81) at 0, SOS is halting
+**in init, before SoL**, not parked in this loop.
+
+### 14.3 The DRAM trainer is plaintext in `INTF_DRV`
+
+**Proven (byte-level):** the hardware bring-up / DRAM-training code is
+plaintext in **`INTF_DRV`** (`captures/intf_drv_subblob.bin` == subblob_12,
+28,928 B; the `LOAD_INTFDRV` = `0x000D0000` component the BL chain already
+loads — Step 4 of `phase3_eta3e7_full_chain_load_sos.mlr`). Loaded at PSP
+SRAM base `0x00200000`, INTF_DRV decodes as a coherent driver. The training
+signature is present **only in INTF_DRV and absent from the entire SOS
+blob**: the pattern `0xaa55aa55` and UMC register `0x81041e54` appear in
+INTF_DRV's literal pool (offsets `0x3008` / `0x3004`); neither byte sequence
+occurs anywhere in `sos_full_109216B.bin`. INTF_DRV contains **no** `svc #1`
+/ `svc #0xe` / `svc #0x40` — it is pure driver code, not a thread/wait owner.
+
+The decoded bring-up routine (INTF_DRV offset `0x2f80`) does:
+
+```
+; mailbox handshake
+mov.w r1,#0x80000000 ; str r1,[r4]
+loop: ldr r0,[r4] ; ubfx r0,r0,#0x10,#8 ; cmp r0,#0xe ; bne loop   ; wait state==0xe
+; register writes via svc #0xa5  (r0=addr, r1=val, r2=size)
+svc #0xa5  0x0000d8b8 = 0x00000000
+svc #0xa5  0x0c9100c4 = 0x00000040
+svc #0xa5  0x81041e54 = 0xaa55aa55      ; <- classic memory-training pattern
+svc #0xa5  0x8100009c = 0xaa55aa55      ; <- UMC/DF/PHY register
+; plus svc #0xc1/#0xc4/#0xc5/#0xb8 (HW control), svc #0xa7 (SMN r/w)
+```
+
+A companion helper (INTF_DRV offset `0x2460`) triggers an op via `svc #0x92`
+and polls a done-flag at `[0x00d06004 + 3]` up to `r6` iterations (`svc #0x91`
+delay between), returning timeout `0xffff3024` on failure. `0x00d06004` is the
+op's byte-field control struct (`+1` = op id, `+2` = enable, `+3` = done).
+
+This is precisely the mechanism §7.5/η.3m declared "genuinely UNKNOWN…
+inside SOS encrypted body / boot-ROM silicon." It is a readable RDNA3
+driver — that conclusion stands independent of any remaining detail below.
+
+**Open detail (not yet resolved — do not over-read §9's "PS1_1 = plumbing"):**
+SOS's single `svc #1` (create_thread, at `0x0d126eac`) spawns thread entry
+`0x00202f80`, which maps to INTF_DRV offset `0x2f80` (the bring-up routine
+above). However, the SOS-tail `$PS1` record at file `0x17100` is *different*
+code (it does not contain the training writes) and, per §9, targets the
+overlapping SRAM range `0x00202f28..0x002037dc`. So there is an unresolved
+overlay question: at runtime, does SRAM `0x00202f80` execute INTF_DRV's
+trainer, or an SOS `$PS1` record copied on top? §9 characterised that SRAM
+as "plumbing, zero MMIO writes" — but it derived that from disassembling the
+SOS-tail `$PS1` record, a *different blob* than INTF_DRV. Resolving which
+bytes win at runtime (and thus the exact call path into the trainer) needs
+tracing the SOS init memcpy (`bl 0xd126fd0`) destination/order vs the BL
+load of INTF_DRV. Either way, the trainer code itself is plaintext and ours.
+
+### 14.4 Corrected model and what is still open
+
+```
+LOAD_SOSDRV -> SOS init -> report_version (C2PMSG_58 = 0x00320d17)
+            -> svc #1 create_thread(entry 0x00202f80 = INTF_DRV PS1_1)
+                 PS1_1: mailbox handshake (poll state==0xe)
+                        + UMC/PHY training writes (0xaa55aa55 ...)
+                        + svc #0x92 ops w/ completion-poll (timeout 0xffff3024)
+            -> (warm) training completes -> SOS asserts SoL (C2PMSG_81)
+                 -> reaches host-command idle loop (svc #0xe @ 0x0d12655c)
+            -> (cold, MLRift) SoL never set -> halt is INSIDE PS1_1 bring-up
+```
+
+**Open question (genuinely unresolved):** why PS1_1's bring-up completes
+under amdgpu (which cold-boots this card every power-on) but not under
+MLRift's from-cold BL chain. Leading candidates, both software and testable:
+
+1. A precondition PS1_1 needs before its mailbox reaches state `0xe`
+   (e.g. SMU/clock state — ν.3 found SMU is in ROM mode cold and rejects
+   MSGs until PSP loads SMU FW during SOS init).
+2. MLRift never actually reaching the PS1_1 spawn (a wrong/missing sub-blob
+   fed to an earlier `LOAD_*`, so init faults before create_thread).
+
+**Next static step:** finish RE of PS1_1 and the INTF_DRV functions it
+calls to recover the full register/SMN bring-up sequence, and resolve the
+`svc #0xa5`/`#0x92`/`#0xa7` kernel handlers (SYS_DRV dispatcher @ file
+`0x50c4`, wrapped in a secure-channel: key-derive via SMN `0x30000004` +
+paired AES/hash calls). That yields the literal cold-boot register script,
+which MLRift can replay from `std/psp.mlr` or use to pinpoint the missing
+precondition.
+
+### 14.5 Specific corrections to earlier text
+
+| Location | Earlier claim | Correction |
+|---|---|---|
+| Status, §9, §12 | "Wall at `svc #0xe`/`0x0d126e9e`; software-only unattackable; silicon wall." | False on both facts (Thumb misread; no encrypted body). Cold-boot is a software RE task, reopened. |
+| §9 | Worker code "NOT in any plaintext sub-blob… almost certainly encrypted SOS body." | Worker/trainer is plaintext `INTF_DRV` at SRAM `0x00200000`. |
+| §7.5 | "DRAM trainer lives in PSP boot ROM (on-die silicon)." | DRAM trainer is plaintext code in INTF_DRV (bring-up routine @ offset `0x2f80`); signature only in INTF_DRV, absent from SOS. |
+| §9 | "SOS spawns worker `0x00202460` directly and waits on its IPC event." | SOS spawns one thread, entry `0x00202f80` (→ INTF_DRV bring-up). `0x00202460` is a downstream helper. The `svc #0xe` loops are host-command idle, not worker-waits. |
+| §9 | "PS1_1 = plumbing, zero MMIO writes." | Derived from the SOS-tail `$PS1` record, a different blob than INTF_DRV; INTF_DRV's code at the same SRAM offset is the MMIO trainer. Runtime overlay still open (§14.3). |
+| §13.6 | "η.3m: DRAM training mechanism genuinely UNKNOWN." | Mechanism is known and readable (INTF_DRV register/SMN bring-up sequence). |
