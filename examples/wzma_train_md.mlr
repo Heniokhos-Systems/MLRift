@@ -66,14 +66,13 @@ static u64 BS_DIM    = 128
 // MUST match the WZM_BWD_NW static in src/format_amdgpu_megakernel.mlr (the
 // per-WG partial slot layout + the bs-row split depend on it).  Divides BS=128.
 static u64 WZM_BWD_NW = 8
-// P4b-2: workgroups for the parallelized wzma_bwd_pre phase.  MUST match the
-// WZM_BWD_NW static in src/format_amdgpu_megakernel.mlr (bwd_pre bakes
-// rows_per_wg = B/NW = 8/NW_pre at emit time via MEGA_TRAIN_NW=WZM_BWD_NW, and
-// gates dv1/dv2/dz outputs by wg_id; the grid MUST equal that baked NW).  NW_pre
-// divides B=8 AND BS=128.  The bwd_pre kernel does NOT read s50 (NW kernarg) at
-// runtime — its range is emit-time-baked + runtime-wg_id-offset — so sharing
-// kernarg idx 65 with the other phases is benign.
-static u64 NW_pre = 8
+// NW-scaling: workgroups for the parallelized wzma_bwd_pre phase.
+// NW_pre is now a PER-BATCH LOCAL computed in main() (= min(cap, B)), NOT a static.
+// bwd_pre's per-WG row ownership is RUNTIME (rpw_b=s22, rpw_bs=s8 kernargs from
+// P-own + wg_id offset) — so NW is purely the launch grid and a PURE PARTITION
+// (each dv1/dv2/dz owned by one WG => byte-identical across NW).  Constraints:
+// NW_pre <= B and NW_pre divides B (partition is over the B batch-rows).
+// WZM_BWD_NW stays 8 ONLY as the emit-time NW>1 path selector (no NW value baked).
 
 fn abs_f32(f32 v) -> f32 {
     if v < 0.0f { return 0.0f - v }
@@ -1622,12 +1621,21 @@ fn main() {
         // P4b-1: dlogits global scratch ptr (used by wzma_bwd_pre; benign for the
         // other 3 phases that don't reference s[76:77]).  idx 68 @ 0x220.
         set_arg_ptr(kp, 68, d_dlogits_scratch)  // 0x220 (POINTER)
-        // P-own: runtime rows_per_wg (by-value uint).  rpw_BS = BS/NW (bwd_uv uses
-        // s8); rpw_B = B/NW (bwd_pre uses BOTH s8 for dz rows and s22 for dv rows).
-        // Set BOTH unconditionally — the 4 phases share kp; bwd_embed/reduce ignore
-        // them.  At B=8/NW=8: rpw_BS=16, rpw_B=1 (= the old baked values → byte-id).
-        u64 rpw_bs = BS / WZM_BWD_NW   // 0x228 → s8
-        u64 rpw_b  = B  / NW_pre       // 0x230 → s22
+        // P-own + NW-scaling (Phase 1): runtime rows_per_wg (by-value uint).
+        // NW_pre = min(cap, B); the partition is over B batch-rows, so NW_pre must
+        // be <= B and divide B exactly (else tail rows are silently dropped).
+        // rpw_BS = BS/NW_pre (bwd_pre_grad's dz renorm/pool reads s8 for BS-rows);
+        // rpw_B = B/NW_pre (dv1/dv2 read s22 for B-rows).  Both MUST use the SAME
+        // NW_pre so rpw_BS == S*rpw_B.  At B=8: min(32,8)=8 ⇒ rpw_BS=16, rpw_B=1
+        // (= the old NW=8 values → byte-identical).  bwd_uv has its own kernarg
+        // block (grouped descriptor) and does NOT read s8/s22.
+        u64 NW_pre = B
+        if NW_pre > 32 { NW_pre = 32 }                              // Phase-1 cap
+        if NW_pre < 1            { die_gpu("NW_pre < 1", NW_pre) }
+        if NW_pre > B            { die_gpu("NW_pre > B (bwd_pre partitions B-rows)", NW_pre) }
+        if (B % NW_pre) != 0     { die_gpu("NW_pre must divide B exactly", NW_pre) }
+        u64 rpw_bs = BS / NW_pre   // 0x228 → s8   (was / WZM_BWD_NW; must track NW_pre)
+        u64 rpw_b  = B  / NW_pre   // 0x230 → s22
         set_arg_ptr(kp, 69, rpw_bs)    // 0x228 (by-value uint)
         set_arg_ptr(kp, 70, rpw_b)     // 0x230 (by-value uint)
 
