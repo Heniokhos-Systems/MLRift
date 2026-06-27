@@ -1194,8 +1194,18 @@ fn main() {
     u64 d_desc_dV    = gpu_malloc(K * 88, "mDescDV")
     u64 d_desc_dU    = gpu_malloc(K * 88, "mDescDU")
     u64 d_desc_dint  = gpu_malloc(K * 88, "mDescDint")   // F3.2a bwd dinter grouped
-    u64 d_desc_fU    = gpu_malloc(K * 88, "mDescFU")     // F2.4 forward-U grouped
-    u64 d_desc_fV    = gpu_malloc(K * 88, "mDescFV")     // F2.4 forward-V grouped
+    u64 d_desc_fU    = gpu_malloc(K * 88, "mDescFU")     // F2.4 forward-U grouped (view 0)
+    u64 d_desc_fU_v1 = gpu_malloc(K * 88, "mDescFUv1")   // forward-U grouped (view 1; differs only by A=x ptr)
+    u64 d_desc_fV    = gpu_malloc(K * 88, "mDescFV")     // F2.4 forward-V grouped (shared both views)
+    // COLD-NaN real fix: the forward descriptors are CONTENT-STABLE across steps
+    // (all pointers are loop-invariant buffers; only fU's A=x ptr differs per
+    // view).  Build them ONCE on step 0 with a sync that genuinely lands the
+    // posted H2D, then reuse the in-VRAM descriptor for every later step with NO
+    // per-step H2D and NO sync.  This kills the cold-launch descriptor-landing
+    // race (the per-step read-back could not force the posted write to land at
+    // low clock) AND is cache-safe (content never changes).  tot_* persist here.
+    u32 tot_fU = 0
+    u32 tot_fV = 0
     // Per-SITE persistent-WG atomic counter slots so the
     // 4-byte counter-zero H2D (dev_copy_h2d → WC store to BAR1, NOT queue-
     // ordered) of one grouped dispatch can never race a still-in-flight prior
@@ -1329,34 +1339,46 @@ fn main() {
                 //   B_ptr[k] = d_U + k*D*R*4   C_ptr[k] = d_int_kbsr + k*BS*R*4
                 //   lda=D (A=x[BS,D])  ldb=R (B=U[D,R])  ldc=R (C=inter[BS,R])
                 t0 = time_now()
-                u64 M_fU  = alloc(K*4);  u64 N_fU  = alloc(K*4);  u64 KK_fU = alloc(K*4)
-                u64 LdA_fU= alloc(K*4);  u64 LdB_fU= alloc(K*4);  u64 LdC_fU= alloc(K*4)
-                u64 Ap_fU = alloc(K*8);  u64 Bp_fU = alloc(K*8);  u64 Cp_fU = alloc(K*8)
-                u64 Ac_fU = alloc(K*4)
-                u64 kfu = 0
-                while kfu < K {
-                    unsafe { *((M_fU  + kfu*4) as u32) = BS }
-                    unsafe { *((N_fU  + kfu*4) as u32) = R }
-                    unsafe { *((KK_fU + kfu*4) as u32) = D }
-                    unsafe { *((LdA_fU+ kfu*4) as u32) = D }
-                    unsafe { *((LdB_fU+ kfu*4) as u32) = R }
-                    unsafe { *((LdC_fU+ kfu*4) as u32) = R }
-                    unsafe { *((Ap_fU + kfu*8) as u64) = d_xs }                  // broadcast
-                    unsafe { *((Bp_fU + kfu*8) as u64) = d_U + kfu*D*R*4 }
-                    unsafe { *((Cp_fU + kfu*8) as u64) = d_int_kbsr + kfu*BS*R*4 }
-                    unsafe { *((Ac_fU + kfu*4) as u32) = 0 }                     // store
-                    kfu = kfu + 1
+                // This view's persistent fU descriptor (view 0 and view 1 differ
+                // only by the A=x pointer).  Built ONCE on step 0, reused after.
+                u64 d_desc_fU_cur = d_desc_fU
+                if view == 1 { d_desc_fU_cur = d_desc_fU_v1 }
+                if step == 0 {
+                    u64 M_fU  = alloc(K*4);  u64 N_fU  = alloc(K*4);  u64 KK_fU = alloc(K*4)
+                    u64 LdA_fU= alloc(K*4);  u64 LdB_fU= alloc(K*4);  u64 LdC_fU= alloc(K*4)
+                    u64 Ap_fU = alloc(K*8);  u64 Bp_fU = alloc(K*8);  u64 Cp_fU = alloc(K*8)
+                    u64 Ac_fU = alloc(K*4)
+                    u64 kfu = 0
+                    while kfu < K {
+                        unsafe { *((M_fU  + kfu*4) as u32) = BS }
+                        unsafe { *((N_fU  + kfu*4) as u32) = R }
+                        unsafe { *((KK_fU + kfu*4) as u32) = D }
+                        unsafe { *((LdA_fU+ kfu*4) as u32) = D }
+                        unsafe { *((LdB_fU+ kfu*4) as u32) = R }
+                        unsafe { *((LdC_fU+ kfu*4) as u32) = R }
+                        unsafe { *((Ap_fU + kfu*8) as u64) = d_xs }                  // broadcast
+                        unsafe { *((Bp_fU + kfu*8) as u64) = d_U + kfu*D*R*4 }
+                        unsafe { *((Cp_fU + kfu*8) as u64) = d_int_kbsr + kfu*BS*R*4 }
+                        unsafe { *((Ac_fU + kfu*4) as u32) = 0 }                     // store
+                        kfu = kfu + 1
+                    }
+                    u64 tot_fU_slot = alloc(4); unsafe { *(tot_fU_slot as u32) = 0 }
+                    build_gemm_grouped_descriptor(d_desc_fU_cur, K,
+                        M_fU, N_fU, KK_fU, LdA_fU, LdB_fU, LdC_fU,
+                        Ap_fU, Bp_fU, Cp_fU, Ac_fU, 0, 0, tot_fU_slot)
+                    unsafe { *(tot_fU_slot as u32) -> tot_fU }
+                    dealloc(M_fU);  dealloc(N_fU);  dealloc(KK_fU)
+                    dealloc(LdA_fU);dealloc(LdB_fU);dealloc(LdC_fU)
+                    dealloc(Ap_fU); dealloc(Bp_fU); dealloc(Cp_fU)
+                    dealloc(Ac_fU); dealloc(tot_fU_slot)
+                    // Land the step-0 descriptor H2D reliably even on a cold GPU:
+                    // a full drain forces the posted write into GPU memory before
+                    // the grouped kernel reads it (the per-step read-back could
+                    // not — it reads a CPU-just-written word, no device round-
+                    // trip).  Step 0 only ⇒ amortized to ~0 over training.
+                    sync_or_die("land fwd-U desc (step 0)")
                 }
-                u64 tot_fU_slot = alloc(4); unsafe { *(tot_fU_slot as u32) = 0 }
-                build_gemm_grouped_descriptor(d_desc_fU, K,
-                    M_fU, N_fU, KK_fU, LdA_fU, LdB_fU, LdC_fU,
-                    Ap_fU, Bp_fU, Cp_fU, Ac_fU, 0, 0, tot_fU_slot)
-                u32 tot_fU = 0; unsafe { *(tot_fU_slot as u32) -> tot_fU }
-                launch_gemm_grouped(fh_ggrp, d_desc_fU, K, tot_fU, 1, 0, d_cntr_fU, fh_fill)
-                dealloc(M_fU);  dealloc(N_fU);  dealloc(KK_fU)
-                dealloc(LdA_fU);dealloc(LdB_fU);dealloc(LdC_fU)
-                dealloc(Ap_fU); dealloc(Bp_fU); dealloc(Cp_fU)
-                dealloc(Ac_fU); dealloc(tot_fU_slot)
+                launch_gemm_grouped(fh_ggrp, d_desc_fU_cur, K, tot_fU, 1, 0, d_cntr_fU, fh_fill)
                 if profile_on == 1 { sync_or_die("sync fwd-U grouped"); t1 = time_now(); ns_u = ns_u + (t1 - t0) }
 
                 // Phase 3: grouped V-einsum  outk_k[BS,D] = inter_k[BS,R] @ V_k[R,D]
@@ -1365,34 +1387,39 @@ fn main() {
                 //   C_ptr[k] = d_otk_kbsd + k*BS*D*4
                 //   lda=R (A=inter[BS,R])  ldb=D (B=V[R,D])  ldc=D (C=outk[BS,D])
                 t0 = time_now()
-                u64 M_fV  = alloc(K*4);  u64 N_fV  = alloc(K*4);  u64 KK_fV = alloc(K*4)
-                u64 LdA_fV= alloc(K*4);  u64 LdB_fV= alloc(K*4);  u64 LdC_fV= alloc(K*4)
-                u64 Ap_fV = alloc(K*8);  u64 Bp_fV = alloc(K*8);  u64 Cp_fV = alloc(K*8)
-                u64 Ac_fV = alloc(K*4)
-                u64 kfv = 0
-                while kfv < K {
-                    unsafe { *((M_fV  + kfv*4) as u32) = BS }
-                    unsafe { *((N_fV  + kfv*4) as u32) = D }
-                    unsafe { *((KK_fV + kfv*4) as u32) = R }
-                    unsafe { *((LdA_fV+ kfv*4) as u32) = R }
-                    unsafe { *((LdB_fV+ kfv*4) as u32) = D }
-                    unsafe { *((LdC_fV+ kfv*4) as u32) = D }
-                    unsafe { *((Ap_fV + kfv*8) as u64) = d_int_kbsr + kfv*BS*R*4 }
-                    unsafe { *((Bp_fV + kfv*8) as u64) = d_V + kfv*R*D*4 }
-                    unsafe { *((Cp_fV + kfv*8) as u64) = d_otk_kbsd + kfv*BS*D*4 }
-                    unsafe { *((Ac_fV + kfv*4) as u32) = 0 }
-                    kfv = kfv + 1
+                // d_desc_fV is identical for both views (A=inter, B=V, C=outk are
+                // the same buffers) — build ONCE on step 0, reuse thereafter.
+                if step == 0 {
+                    u64 M_fV  = alloc(K*4);  u64 N_fV  = alloc(K*4);  u64 KK_fV = alloc(K*4)
+                    u64 LdA_fV= alloc(K*4);  u64 LdB_fV= alloc(K*4);  u64 LdC_fV= alloc(K*4)
+                    u64 Ap_fV = alloc(K*8);  u64 Bp_fV = alloc(K*8);  u64 Cp_fV = alloc(K*8)
+                    u64 Ac_fV = alloc(K*4)
+                    u64 kfv = 0
+                    while kfv < K {
+                        unsafe { *((M_fV  + kfv*4) as u32) = BS }
+                        unsafe { *((N_fV  + kfv*4) as u32) = D }
+                        unsafe { *((KK_fV + kfv*4) as u32) = R }
+                        unsafe { *((LdA_fV+ kfv*4) as u32) = R }
+                        unsafe { *((LdB_fV+ kfv*4) as u32) = D }
+                        unsafe { *((LdC_fV+ kfv*4) as u32) = D }
+                        unsafe { *((Ap_fV + kfv*8) as u64) = d_int_kbsr + kfv*BS*R*4 }
+                        unsafe { *((Bp_fV + kfv*8) as u64) = d_V + kfv*R*D*4 }
+                        unsafe { *((Cp_fV + kfv*8) as u64) = d_otk_kbsd + kfv*BS*D*4 }
+                        unsafe { *((Ac_fV + kfv*4) as u32) = 0 }
+                        kfv = kfv + 1
+                    }
+                    u64 tot_fV_slot = alloc(4); unsafe { *(tot_fV_slot as u32) = 0 }
+                    build_gemm_grouped_descriptor(d_desc_fV, K,
+                        M_fV, N_fV, KK_fV, LdA_fV, LdB_fV, LdC_fV,
+                        Ap_fV, Bp_fV, Cp_fV, Ac_fV, 0, 0, tot_fV_slot)
+                    unsafe { *(tot_fV_slot as u32) -> tot_fV }
+                    dealloc(M_fV);  dealloc(N_fV);  dealloc(KK_fV)
+                    dealloc(LdA_fV);dealloc(LdB_fV);dealloc(LdC_fV)
+                    dealloc(Ap_fV); dealloc(Bp_fV); dealloc(Cp_fV)
+                    dealloc(Ac_fV); dealloc(tot_fV_slot)
+                    sync_or_die("land fwd-V desc (step 0)")
                 }
-                u64 tot_fV_slot = alloc(4); unsafe { *(tot_fV_slot as u32) = 0 }
-                build_gemm_grouped_descriptor(d_desc_fV, K,
-                    M_fV, N_fV, KK_fV, LdA_fV, LdB_fV, LdC_fV,
-                    Ap_fV, Bp_fV, Cp_fV, Ac_fV, 0, 0, tot_fV_slot)
-                u32 tot_fV = 0; unsafe { *(tot_fV_slot as u32) -> tot_fV }
                 launch_gemm_grouped(fh_ggrp, d_desc_fV, K, tot_fV, 1, 0, d_cntr_fV, fh_fill)
-                dealloc(M_fV);  dealloc(N_fV);  dealloc(KK_fV)
-                dealloc(LdA_fV);dealloc(LdB_fV);dealloc(LdC_fV)
-                dealloc(Ap_fV); dealloc(Bp_fV); dealloc(Cp_fV)
-                dealloc(Ac_fV); dealloc(tot_fV_slot)
                 if profile_on == 1 { sync_or_die("sync fwd-V grouped"); t1 = time_now(); ns_v = ns_v + (t1 - t0) }
 
                 // Phase 3b: repack inter [K,BS,R]→[BS,K,R] and outk [K,BS,D]→[BS,K,D]
