@@ -448,6 +448,19 @@ fn build_gemm_grouped_descriptor(
     u32 err = hipMemcpy(d_desc, host_buf, nbytes, 1)
     if err != 0 { die_gpu("H2D gemm_grouped desc", err) }
     dealloc(host_buf)
+    // POSTED-WRITE FLUSH (B=128 wedge fix): the descriptor H2D above is a CPU
+    // PCIe posted write to the VRAM BAR.  mfence drains the CPU WC buffer but
+    // does NOT guarantee the bytes have LANDED in GPU memory before the
+    // subsequent grouped-GEMM doorbell.  A non-posted PCIe read cannot pass
+    // posted writes ahead of it to the same device, so reading the descriptor's
+    // LAST word forces the whole H2D to land.  (Reading only the first word is
+    // NOT sufficient here — empirically still races; the last word is.)
+    // Validated at B=128: this alone removes the GFXHUB-fault/MES wedge, no
+    // device drain needed.
+    u64 drbslot = alloc(4)
+    u32 drberr = hipMemcpy(drbslot, d_desc + (nbytes - 4), 4, 2)
+    if drberr != 0 { die_gpu("D2H descriptor posted-write flush", drberr) }
+    dealloc(drbslot)
 }
 
 // launch_gemm_grouped: dispatch gemm_f32_grouped.co (Tasks 1A.3/1A.4) over a
@@ -467,18 +480,26 @@ fn build_gemm_grouped_descriptor(
 //                                   search, divide directly; 0 = binary-search
 //                                   tile_prefix in the descriptor table)
 //      4   u32   precision_mode    (0 = f32 / Phase 1A; 1 = bf16-WMMA / 1B)
-//      5   u64   d_global_counter  (VRAM u32; this fn zeroes it before launch)
+//      5   u64   d_global_counter  (VRAM u32 in an 8 B buf; this fn zeroes it
+//                                   ON THE COMPUTE QUEUE before launch)
 //
-// This function zeroes d_global_counter via a 4-byte H2D (cheap, one-shot;
-// the per-step on-GPU fill_step path is not warranted for a single u32).
+// d_global_counter is zeroed on-queue via fh_fill/fill_step (see body for the
+// B=128 race this fixes — a CPU H2D zero cannot be barrier-ordered against a
+// live grouped kernel sharing this counter).
 fn launch_gemm_grouped(u64 fh, u64 d_desc, u32 b_batch, u32 total_tiles,
                        u32 fast_path_flag, u32 precision_mode,
-                       u64 d_global_counter) {
-    // 1) Zero the persistent-WG global atomic counter (u32 = 0 H2D).
-    u64 zslot = alloc(4); unsafe { *(zslot as u32) = 0 }
-    u32 zerr = hipMemcpy(d_global_counter, zslot, 4, 1)
-    if zerr != 0 { die_gpu("H2D gemm_grouped counter zero", zerr) }
-    dealloc(zslot)
+                       u64 d_global_counter, u64 fh_fill) {
+    // 1) Zero the persistent-WG global atomic counter ON THE COMPUTE QUEUE.
+    //    REAL FIX (B=128): the counter was previously zeroed by a CPU H2D, but
+    //    a CPU write cannot be ordered by the AQL barrier=1 bit against a still-
+    //    in-flight grouped kernel that shares this counter (the two forward
+    //    views reuse the same d_cntr_f* buffer).  The CPU zero then raced the
+    //    prior dispatch's live atomic increments → corrupted tile claims →
+    //    wrong/NaN grads.  Zeroing on-queue makes it GPU-vs-GPU: fill_step is
+    //    dispatched with barrier=1, so it runs strictly AFTER the prior user's
+    //    last increment and strictly BEFORE this kernel's first read — no race,
+    //    no device drain.  (counter buffers are sized ≥8 B for the f64 fill.)
+    launch_fill(fh_fill, d_global_counter, 2)
     // 2) Pack kernargs (KFD ptr-table ABI — each arg gets its own value slot).
     u64 p0 = alloc(8); unsafe { *(p0 as u64) = d_desc }
     u64 p1 = alloc(8); unsafe { *(p1 as u64) = b_batch }
@@ -1182,11 +1203,11 @@ fn main() {
     // dinter, dV, dU.  This is the durable fix the bwd_uv comment flagged
     // ("(a) per-call counter slots so no zero races a live dispatch") — it lets
     // production async drop the inter-grouped syncs while staying bit-exact.
-    u64 d_cntr_fU    = gpu_malloc(4,      "mCntrFU")
-    u64 d_cntr_fV    = gpu_malloc(4,      "mCntrFV")
-    u64 d_cntr_dint  = gpu_malloc(4,      "mCntrDint")
-    u64 d_cntr_dV    = gpu_malloc(4,      "mCntrDV")
-    u64 d_cntr_dU    = gpu_malloc(4,      "mCntrDU")
+    u64 d_cntr_fU    = gpu_malloc(8,      "mCntrFU")
+    u64 d_cntr_fV    = gpu_malloc(8,      "mCntrFV")
+    u64 d_cntr_dint  = gpu_malloc(8,      "mCntrDint")
+    u64 d_cntr_dV    = gpu_malloc(8,      "mCntrDV")
+    u64 d_cntr_dU    = gpu_malloc(8,      "mCntrDU")
 
     // ── Task 1B.3 fix: bf16 shadow buffers for the bf16-WMMA grouped path ─────
     // The bf16-WMMA kernel reads bf16-STORED A/B.  We cast the f32 bwd_uv inputs
@@ -1331,7 +1352,7 @@ fn main() {
                     M_fU, N_fU, KK_fU, LdA_fU, LdB_fU, LdC_fU,
                     Ap_fU, Bp_fU, Cp_fU, Ac_fU, 0, 0, tot_fU_slot)
                 u32 tot_fU = 0; unsafe { *(tot_fU_slot as u32) -> tot_fU }
-                launch_gemm_grouped(fh_ggrp, d_desc_fU, K, tot_fU, 1, 0, d_cntr_fU)
+                launch_gemm_grouped(fh_ggrp, d_desc_fU, K, tot_fU, 1, 0, d_cntr_fU, fh_fill)
                 dealloc(M_fU);  dealloc(N_fU);  dealloc(KK_fU)
                 dealloc(LdA_fU);dealloc(LdB_fU);dealloc(LdC_fU)
                 dealloc(Ap_fU); dealloc(Bp_fU); dealloc(Cp_fU)
@@ -1367,7 +1388,7 @@ fn main() {
                     M_fV, N_fV, KK_fV, LdA_fV, LdB_fV, LdC_fV,
                     Ap_fV, Bp_fV, Cp_fV, Ac_fV, 0, 0, tot_fV_slot)
                 u32 tot_fV = 0; unsafe { *(tot_fV_slot as u32) -> tot_fV }
-                launch_gemm_grouped(fh_ggrp, d_desc_fV, K, tot_fV, 1, 0, d_cntr_fV)
+                launch_gemm_grouped(fh_ggrp, d_desc_fV, K, tot_fV, 1, 0, d_cntr_fV, fh_fill)
                 dealloc(M_fV);  dealloc(N_fV);  dealloc(KK_fV)
                 dealloc(LdA_fV);dealloc(LdB_fV);dealloc(LdC_fV)
                 dealloc(Ap_fV); dealloc(Bp_fV); dealloc(Cp_fV)
@@ -1720,7 +1741,7 @@ fn main() {
                     M_di, N_di, KK_di, LdA_di, LdB_di, LdC_di,
                     Ap_di, Bp_di, Cp_di, Ac_di, 0, 0, tot_di_slot)
                 u32 tot_di = 0; unsafe { *(tot_di_slot as u32) -> tot_di }
-                launch_gemm_grouped(fh_ggrp, d_desc_dint, K, tot_di, 1, 0, d_cntr_dint)
+                launch_gemm_grouped(fh_ggrp, d_desc_dint, K, tot_di, 1, 0, d_cntr_dint, fh_fill)
                 dealloc(M_di);  dealloc(N_di);  dealloc(KK_di)
                 dealloc(LdA_di);dealloc(LdB_di);dealloc(LdC_di)
                 dealloc(Ap_di); dealloc(Bp_di); dealloc(Cp_di)
@@ -1794,7 +1815,7 @@ fn main() {
                     M_dV, N_dV, KK_dV, LdA_dV, LdB_dV, LdC_dV,
                     Ap_dV, Bp_dV, Cp_dV, Ac_dV, prec_for_buv, 0, tot_dV_slot)
                 u32 tot_dV = 0; unsafe { *(tot_dV_slot as u32) -> tot_dV }
-                launch_gemm_grouped(fh_for_buv, d_desc_dV, K, tot_dV, 1, prec_for_buv, d_cntr_dV)
+                launch_gemm_grouped(fh_for_buv, d_desc_dV, K, tot_dV, 1, prec_for_buv, d_cntr_dV, fh_fill)
                 dealloc(M_dV);   dealloc(N_dV);   dealloc(KK_dV)
                 dealloc(LdA_dV); dealloc(LdB_dV); dealloc(LdC_dV)
                 dealloc(Ap_dV);  dealloc(Bp_dV);  dealloc(Cp_dV)
@@ -1854,7 +1875,7 @@ fn main() {
                     M_dU, N_dU, KK_dU, LdA_dU, LdB_dU, LdC_dU,
                     Ap_dU, Bp_dU, Cp_dU, Ac_dU, prec_for_buv, 0, tot_dU_slot)
                 u32 tot_dU = 0; unsafe { *(tot_dU_slot as u32) -> tot_dU }
-                launch_gemm_grouped(fh_for_buv, d_desc_dU, K, tot_dU, 1, prec_for_buv, d_cntr_dU)
+                launch_gemm_grouped(fh_for_buv, d_desc_dU, K, tot_dU, 1, prec_for_buv, d_cntr_dU, fh_fill)
                 dealloc(M_dU);   dealloc(N_dU);   dealloc(KK_dU)
                 dealloc(LdA_dU); dealloc(LdB_dU); dealloc(LdC_dU)
                 dealloc(Ap_dU);  dealloc(Bp_dU);  dealloc(Cp_dU)
