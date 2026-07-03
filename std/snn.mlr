@@ -1,0 +1,95 @@
+// MLRift std/snn.mlr — Spiking Neural Network primitives.
+//
+// Deterministic, byte-exact (no fma, no vectorized/AVX2 reassociation)
+// leaky integrate-and-fire (LIF) building blocks. These exist to port
+// Noesis's Phase-0 numpy spiking store/recall/decode-margin gate to
+// MLRift-CPU held bit-identical to a straight-line numpy reference —
+// see examples/m8_phase1/ for the first clients.
+//
+// Every op-order below is fixed on purpose: multiply-then-divide,
+// refractory-freeze BEFORE the threshold test. f64 addition/multiplication
+// is non-associative under IEEE-754, so reordering these ops (or letting
+// the compiler fuse a multiply-add into an fma) changes the bit pattern.
+// Callers must build with the default scalar IR codegen path (no
+// vec_f64_avx2, no MT) to preserve byte-exactness.
+
+// Default LIF time constants (Phase-0 verbatim). Exposed as module
+// consts so callers/importers can reference them directly (e.g. to
+// precompute per-neuron thresholds as V_THRESH + theta[i]).
+static f64 DT = 0.1
+static f64 TAU_M = 10.0
+static f64 V_REST = 0.0
+static f64 V_THRESH = 1.0
+static f64 V_RESET = 0.0
+static u64 REFRAC_STEPS = 20
+
+// One deterministic Euler-LIF step over N neurons, with discrete
+// refractory freeze.
+//
+// For each neuron i in [0, N):
+//   if refr[i] <= 0 (neuron is active):
+//     a = V_REST - V[i]
+//     a = a + drive[i]
+//     a = DT * a          // multiply by DT BEFORE dividing by TAU_M
+//     a = a / TAU_M
+//     V[i] = V[i] + a
+//     if V[i] >= vth[i]:
+//       cnt[i] += 1
+//       V[i] = V_RESET
+//       refr[i] = REFRAC_STEPS
+//   else (neuron is refractory):
+//     refr[i] = refr[i] - 1
+//
+// Arguments are raw buffer pointers, N elements each, 8 bytes/element:
+//   V_ptr, vth_ptr, drive_ptr  — f64[N]  (vth is precomputed per-neuron
+//                                          threshold, e.g. V_THRESH+theta[i])
+//   refr_ptr, cnt_ptr          — u64[N]  (refr: steps remaining; cnt:
+//                                          cumulative per-neuron spike count)
+// n_spiked_out receives THIS step's total spike count (not the running
+// cnt[] sum) — recurrent callers (e.g. a WTA readout with feedback
+// inhibition) need the per-step count to update an inhibitory trace.
+//
+// No fma, no AVX2/vectorized path: this scalar, in-order loop is what
+// keeps results bit-identical to a straight-line numpy reference.
+fn snn_lif_step(u64 V_ptr, u64 refr_ptr, u64 vth_ptr, u64 drive_ptr, u64 N, u64 cnt_ptr, u64 n_spiked_out) {
+    u64 n_spiked = 0
+    u64 i = 0
+    while i < N {
+        u64 off = i * 8
+        u64 rp = refr_ptr + off
+        u64 refr_i = 0
+        unsafe { *(rp as u64) -> refr_i }
+        if refr_i <= 0 {
+            u64 vp = V_ptr + off
+            u64 dp = drive_ptr + off
+            u64 tp = vth_ptr + off
+            f64 v = 0.0
+            f64 drive = 0.0
+            f64 vth = 0.0
+            unsafe { *(vp as f64) -> v }
+            unsafe { *(dp as f64) -> drive }
+            unsafe { *(tp as f64) -> vth }
+            f64 a = V_REST - v
+            a = a + drive
+            a = DT * a
+            a = a / TAU_M
+            v = v + a
+            if v >= vth {
+                u64 cp = cnt_ptr + off
+                u64 c = 0
+                unsafe { *(cp as u64) -> c }
+                c = c + 1
+                unsafe { *(cp as u64) = c }
+                v = V_RESET
+                unsafe { *(rp as u64) = REFRAC_STEPS }
+                n_spiked = n_spiked + 1
+            }
+            unsafe { *(vp as f64) = v }
+        } else {
+            refr_i = refr_i - 1
+            unsafe { *(rp as u64) = refr_i }
+        }
+        i = i + 1
+    }
+    unsafe { *(n_spiked_out as u64) = n_spiked }
+}
