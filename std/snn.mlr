@@ -1,3 +1,5 @@
+import "io.mlr"
+
 // MLRift std/snn.mlr — Spiking Neural Network primitives.
 //
 // Deterministic, byte-exact (no fma, no vectorized/AVX2 reassociation)
@@ -92,4 +94,162 @@ fn snn_lif_step(u64 V_ptr, u64 refr_ptr, u64 vth_ptr, u64 drive_ptr, u64 N, u64 
         i = i + 1
     }
     unsafe { *(n_spiked_out as u64) = n_spiked }
+}
+
+// One-shot Hebbian build of a dense associative store `W`.
+//
+// For each sequence position t in [0, L): let s = seq[t] be the symbol
+// at that position. For every pair of (symbol-assembly neuron, active
+// context/cue neuron) at that position — i.e. every
+//   i = symcode[s*K_SYM + a]   for a in [0, K_SYM)
+//   j = cuecode[t*K_CTX + c]   for c in [0, K_CTX)
+// — increment the store cell: W[i*Mc + j] += 1 (plain integer add, so
+// this is exact and op-order-independent — no float accumulation).
+//
+// `W` is a dense N_SYM*Mc row-major u64 array. It is accumulated IN
+// PLACE: the caller must allocate it (`alloc(N_SYM*Mc*8)`) and zero it
+// (e.g. `memzero`, see std/mem.mlr) before calling — this fn only adds.
+//
+// Arguments (all sizes passed explicitly — never hardcode a library
+// caller's N_SYM/Mc/K_SYM/K_CTX; those are gate-specific):
+//   seq_ptr     — u64[L], seq[t] in [0, A) — the symbol id at position t
+//   symcode_ptr — u64[A*K_SYM] row-major, symcode[s*K_SYM + a]
+//   cuecode_ptr — u64[L*K_CTX] row-major, cuecode[t*K_CTX + c]
+//   L           — sequence length (number of positions)
+//   A           — number of distinct symbols (rows of symcode)
+//   N_SYM       — number of symbol-assembly neurons (rows of W)
+//   K_SYM       — symbol-assembly neurons per symbol (cols of symcode)
+//   Mc          — number of context/cue neurons (cols of W, row stride)
+//   K_CTX       — active cue neurons per position (cols of cuecode)
+//   W_ptr       — u64[N_SYM*Mc] row-major, accumulated in place
+fn snn_store_hebbian_build(u64 seq_ptr, u64 symcode_ptr, u64 cuecode_ptr, u64 L, u64 A, u64 N_SYM, u64 K_SYM, u64 Mc, u64 K_CTX, u64 W_ptr) {
+    u64 t = 0
+    while t < L {
+        u64 sp = seq_ptr + t * 8
+        u64 s = 0
+        unsafe { *(sp as u64) -> s }
+        u64 a = 0
+        while a < K_SYM {
+            u64 ip = symcode_ptr + (s * K_SYM + a) * 8
+            u64 i = 0
+            unsafe { *(ip as u64) -> i }
+            u64 c = 0
+            while c < K_CTX {
+                u64 jp = cuecode_ptr + (t * K_CTX + c) * 8
+                u64 j = 0
+                unsafe { *(jp as u64) -> j }
+                u64 wp = W_ptr + (i * Mc + j) * 8
+                u64 w = 0
+                unsafe { *(wp as u64) -> w }
+                w = w + 1
+                unsafe { *(wp as u64) = w }
+                c = c + 1
+            }
+            a = a + 1
+        }
+        t = t + 1
+    }
+}
+
+// Plain column-sum readout over a set of active cue/context neurons.
+//
+// raw[i] = sum over c in [0, k_active) of W[i*Mc + cueidx[c]]
+//
+// This is deliberately just the sum — no row-normalization and no
+// scaling. Turning `raw` into a feed-forward drive (e.g. dividing by
+// each row's total and scaling by an input gain) is a policy decision
+// that belongs to the caller (the gate), not this library primitive.
+//
+// Arguments:
+//   W_ptr      — u64[N_SYM*Mc] row-major store (see snn_store_hebbian_build)
+//   Mc         — row stride of W (number of context/cue neurons)
+//   cueidx_ptr — u64[k_active], the active cue-neuron indices for this trial
+//   k_active   — number of active cue indices (varies trial to trial)
+//   N_SYM      — number of rows (symbol-assembly neurons) to sum over
+//   raw_ptr    — u64[N_SYM], output column sums (caller-allocated)
+fn snn_store_column_sum(u64 W_ptr, u64 Mc, u64 cueidx_ptr, u64 k_active, u64 N_SYM, u64 raw_ptr) {
+    u64 i = 0
+    while i < N_SYM {
+        u64 sum = 0
+        u64 c = 0
+        while c < k_active {
+            u64 jp = cueidx_ptr + c * 8
+            u64 j = 0
+            unsafe { *(jp as u64) -> j }
+            u64 wp = W_ptr + (i * Mc + j) * 8
+            u64 w = 0
+            unsafe { *(wp as u64) -> w }
+            sum = sum + w
+            c = c + 1
+        }
+        u64 rp = raw_ptr + i * 8
+        unsafe { *(rp as u64) = sum }
+        i = i + 1
+    }
+}
+
+// Load a whitespace/newline-separated text file of non-negative
+// integers into a freshly allocated u64 buffer, flattened in file
+// order (so a file with multiple ints per line — e.g. a row-major
+// dump of a 2-D array — flattens to the same row-major order).
+//
+// `io.mlr`'s `scan_int` only reads a single integer from stdin one
+// line at a time, so it cannot load a file; this is a small
+// hand-written tokenizer over the `read_file` byte buffer that
+// generalizes `scan_int`'s digit-scanning logic to an arbitrary
+// number of ints, ragged line lengths, and any run of non-digit
+// bytes (spaces, newlines, multiple spaces) as a separator. Digits
+// only — no sign handling, since this loader targets replay data
+// (sequence symbols, code-assembly indices, cue indices), which are
+// never negative.
+//
+// Returns the buffer pointer (u64[count]) and writes the number of
+// integers parsed to *count_out. Returns 0 (and *count_out = 0) if
+// `path` cannot be read (mirrors read_file's failure contract).
+fn snn_load_ints(u64 path, u64 count_out) -> u64 {
+    u64 buf = read_file(path)
+    if buf == 0 {
+        unsafe { *(count_out as u64) = 0 }
+        return 0
+    }
+    // First pass: count the integers present, to size the output
+    // buffer exactly (no realloc/grow needed on the second pass).
+    u64 count = 0
+    u64 p = buf
+    u64 c = load8(p)
+    while c != 0 {
+        if c >= 48 && c <= 57 {
+            count = count + 1
+            while c >= 48 && c <= 57 {
+                p = p + 1
+                c = load8(p)
+            }
+        } else {
+            p = p + 1
+            c = load8(p)
+        }
+    }
+    u64 out = alloc(count * 8)
+    // Second pass: parse and store each integer in file order.
+    p = buf
+    c = load8(p)
+    u64 idx = 0
+    while c != 0 {
+        if c >= 48 && c <= 57 {
+            u64 val = 0
+            while c >= 48 && c <= 57 {
+                val = val * 10 + c - 48
+                p = p + 1
+                c = load8(p)
+            }
+            u64 op = out + idx * 8
+            unsafe { *(op as u64) = val }
+            idx = idx + 1
+        } else {
+            p = p + 1
+            c = load8(p)
+        }
+    }
+    unsafe { *(count_out as u64) = count }
+    return out
 }
