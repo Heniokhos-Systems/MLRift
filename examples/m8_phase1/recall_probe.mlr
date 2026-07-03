@@ -1,0 +1,128 @@
+// MLRift — third client of std/snn.mlr: the FIRST full-dynamics
+// single-trial byte-exact recall probe.
+//
+// Loads one seed's dumped replay inputs (seq/symcode/cuecode/theta/
+// cueidx) from examples/m8_phase1/data_public/, rebuilds the dense
+// Hebbian store, and for ONE fixed trial replays exactly what Noesis's
+// Phase-0 numpy reference does in `recall()`
+// (m8_phase0_spiking_killgate.py): gate-side feed-forward row-
+// normalization, the recurrent-settling WTA, and the argmax/margin
+// readout. Prints "m margin".
+//
+// Unlike lif_probe.mlr (a single fixed-drive LIF step, no recurrence)
+// and store_probe.mlr (integer-only Hebbian store), this is the first
+// end-to-end check of the REAL recurrent LIF dynamics — see
+// examples/m8_phase1/recall_reference.py for the numpy side:
+//
+//   $PY examples/m8_phase1/recall_reference.py > /tmp/recall_ref.txt
+//   ./build/mlrc --arch=x86_64 --target=linux --emit=elfexe \
+//       examples/m8_phase1/recall_probe.mlr -o /tmp/recall_probe
+//   /tmp/recall_probe > /tmp/recall_out.txt
+//   diff /tmp/recall_out.txt /tmp/recall_ref.txt
+
+import "../../std/snn.mlr"
+import "../../std/mem.mlr"
+
+// Gate constants (verbatim from Phase-0's m8_phase0_spiking_killgate.py).
+// These are gate-specific sizes/policy, deliberately NOT baked into
+// std/snn.mlr — see snn_store_column_sum's doc comment.
+static u64 A = 8
+static u64 N_SYM = 160
+static u64 K_SYM = 20
+static u64 Mc = 300
+static u64 K_CTX = 40
+static u64 L = 300
+static f64 INPUT_SCALE = 20.0
+static f64 G_INH = 0.05
+static f64 INH_DECAY = 0.8
+static u64 WIN_STEPS = 120
+
+// Trial selection: seed 20, trial 0 — data_public/reference_mmargin.txt
+// line "20 0 7 5" (m=7, margin=5).
+static u64 TRIAL = 0
+
+static u64[1] seq_count
+static u64[1] symcode_count
+static u64[1] cuecode_count
+static u64[1] cueidx_count
+
+fn main() {
+    u64 seq = snn_load_ints("examples/m8_phase1/data_public/seed20_seq.txt", seq_count)
+    u64 symcode = snn_load_ints("examples/m8_phase1/data_public/seed20_symcode.txt", symcode_count)
+    u64 cuecode = snn_load_ints("examples/m8_phase1/data_public/seed20_cuecode.txt", cuecode_count)
+    // cueidx.txt is one line (K_CTX ints) per trial -> the flattened
+    // buffer is row-major [trial, k]; trial t's slice starts at
+    // t*K_CTX (see snn_load_ints's doc comment for why this simple
+    // whitespace tokenizer is enough — every trial's noisy cue set is
+    // exactly K_CTX indices here).
+    u64 cueidx = snn_load_ints("examples/m8_phase1/data_public/seed20_cueidx.txt", cueidx_count)
+
+    u64 theta = alloc(N_SYM * 8)
+    snn_load_f64_bin("examples/m8_phase1/data_public/seed20_theta.bin", N_SYM, theta)
+
+    u64 W = alloc(N_SYM * Mc * 8)
+    memzero(W, N_SYM * Mc * 8)
+    snn_store_hebbian_build(seq, symcode, cuecode, L, A, N_SYM, K_SYM, Mc, K_CTX, W)
+
+    // Gate-side row-sum (policy, not library — mirrors _ff_drive's
+    // `row_sum = W.sum(1)` in the Phase-0 reference).
+    u64 row = alloc(N_SYM * 8)
+    u64 i = 0
+    while i < N_SYM {
+        u64 sum = 0
+        u64 j = 0
+        while j < Mc {
+            u64 wp = W + (i * Mc + j) * 8
+            u64 w = 0
+            unsafe { *(wp as u64) -> w }
+            sum = sum + w
+            j = j + 1
+        }
+        u64 rp = row + i * 8
+        unsafe { *(rp as u64) = sum }
+        i = i + 1
+    }
+
+    u64 trial_cueidx = cueidx + TRIAL * K_CTX * 8
+
+    u64 raw = alloc(N_SYM * 8)
+    snn_store_column_sum(W, Mc, trial_cueidx, K_CTX, N_SYM, raw)
+
+    // Gate-side feed-forward drive: raw/row*INPUT_SCALE, replicating
+    // Phase-0's `row_sum[row_sum == 0] = 1.0` guard (51/160 neurons
+    // have all-zero rows here) BEFORE dividing.
+    u64 ff = alloc(N_SYM * 8)
+    i = 0
+    while i < N_SYM {
+        u64 rap = raw + i * 8
+        u64 raw_i = 0
+        unsafe { *(rap as u64) -> raw_i }
+        u64 rp = row + i * 8
+        u64 row_i = 0
+        unsafe { *(rp as u64) -> row_i }
+        if row_i == 0 {
+            row_i = 1
+        }
+        f64 ff_i = int_to_f64(raw_i) / int_to_f64(row_i) * INPUT_SCALE
+        u64 fp = ff + i * 8
+        unsafe { *(fp as f64) = ff_i }
+        i = i + 1
+    }
+
+    u64 cnt = alloc(N_SYM * 8)
+    snn_wta_recall(ff, theta, N_SYM, G_INH, INH_DECAY, WIN_STEPS, V_THRESH, V_RESET, DT, TAU_M, REFRAC_STEPS, cnt)
+
+    u64 m_out = alloc(8)
+    u64 margin_out = alloc(8)
+    snn_readout_argmax_margin(cnt, symcode, A, K_SYM, m_out, margin_out)
+
+    u64 m = 0
+    unsafe { *(m_out as u64) -> m }
+    u64 margin = 0
+    unsafe { *(margin_out as u64) -> margin }
+
+    print(m)
+    print(" ")
+    println(margin)
+    exit(0)
+}

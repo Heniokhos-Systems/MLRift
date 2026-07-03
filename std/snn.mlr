@@ -1,0 +1,464 @@
+import "io.mlr"
+
+// MLRift std/snn.mlr — Spiking Neural Network primitives.
+//
+// Deterministic, byte-exact (no fma, no vectorized/AVX2 reassociation)
+// leaky integrate-and-fire (LIF) building blocks. These exist to port
+// Noesis's Phase-0 numpy spiking store/recall/decode-margin gate to
+// MLRift-CPU held bit-identical to a straight-line numpy reference —
+// see examples/m8_phase1/ for the first clients.
+//
+// Every op-order below is fixed on purpose: multiply-then-divide,
+// refractory-freeze BEFORE the threshold test. f64 addition/multiplication
+// is non-associative under IEEE-754, so reordering these ops (or letting
+// the compiler fuse a multiply-add into an fma) changes the bit pattern.
+// Callers must build with the default scalar IR codegen path (no
+// vec_f64_avx2, no MT) to preserve byte-exactness.
+
+// Default LIF time constants (Phase-0 verbatim). Exposed as module
+// consts so callers/importers can reference them directly (e.g. to
+// precompute per-neuron thresholds as V_THRESH + theta[i]).
+static f64 DT = 0.1
+static f64 TAU_M = 10.0
+static f64 V_REST = 0.0
+static f64 V_THRESH = 1.0
+static f64 V_RESET = 0.0
+static u64 REFRAC_STEPS = 20
+
+// One deterministic Euler-LIF step over N neurons, with discrete
+// refractory freeze.
+//
+// For each neuron i in [0, N):
+//   if refr[i] <= 0 (neuron is active):
+//     a = V_REST - V[i]     // V_REST is fixed at 0.0 (see module const)
+//     a = a + drive[i]
+//     a = dt * a            // multiply by dt BEFORE dividing by tau_m
+//     a = a / tau_m
+//     V[i] = V[i] + a
+//     if V[i] >= vth[i]:
+//       cnt[i] += 1
+//       V[i] = v_reset
+//       refr[i] = refrac_steps
+//   else (neuron is refractory):
+//     refr[i] = refr[i] - 1
+//
+// v_reset, dt, tau_m, refrac_steps are explicit parameters (not baked
+// module consts) so recurrent callers — e.g. snn_wta_recall — can
+// thread their own competition-dynamics constants through the exact
+// same integration op-order instead of duplicating this loop. The
+// DT/TAU_M/V_RESET/REFRAC_STEPS module consts above remain as the
+// Phase-0-verbatim defaults callers can pass through directly.
+//
+// Arguments are raw buffer pointers, N elements each, 8 bytes/element:
+//   V_ptr, vth_ptr, drive_ptr  — f64[N]  (vth is precomputed per-neuron
+//                                          threshold, e.g. v_thresh+theta[i])
+//   refr_ptr, cnt_ptr          — u64[N]  (refr: steps remaining; cnt:
+//                                          cumulative per-neuron spike count)
+// n_spiked_out receives THIS step's total spike count (not the running
+// cnt[] sum) — recurrent callers (e.g. a WTA readout with feedback
+// inhibition) need the per-step count to update an inhibitory trace.
+//
+// No fma, no AVX2/vectorized path: this scalar, in-order loop is what
+// keeps results bit-identical to a straight-line numpy reference.
+fn snn_lif_step(u64 V_ptr, u64 refr_ptr, u64 vth_ptr, u64 drive_ptr, u64 N, f64 v_reset, f64 dt, f64 tau_m, u64 refrac_steps, u64 cnt_ptr, u64 n_spiked_out) {
+    u64 n_spiked = 0
+    u64 i = 0
+    while i < N {
+        u64 off = i * 8
+        u64 rp = refr_ptr + off
+        u64 refr_i = 0
+        unsafe { *(rp as u64) -> refr_i }
+        if refr_i <= 0 {
+            u64 vp = V_ptr + off
+            u64 dp = drive_ptr + off
+            u64 tp = vth_ptr + off
+            f64 v = 0.0
+            f64 drive = 0.0
+            f64 vth = 0.0
+            unsafe { *(vp as f64) -> v }
+            unsafe { *(dp as f64) -> drive }
+            unsafe { *(tp as f64) -> vth }
+            f64 a = V_REST - v
+            a = a + drive
+            a = dt * a
+            a = a / tau_m
+            v = v + a
+            if v >= vth {
+                u64 cp = cnt_ptr + off
+                u64 c = 0
+                unsafe { *(cp as u64) -> c }
+                c = c + 1
+                unsafe { *(cp as u64) = c }
+                v = v_reset
+                unsafe { *(rp as u64) = refrac_steps }
+                n_spiked = n_spiked + 1
+            }
+            unsafe { *(vp as f64) = v }
+        } else {
+            refr_i = refr_i - 1
+            unsafe { *(rp as u64) = refr_i }
+        }
+        i = i + 1
+    }
+    unsafe { *(n_spiked_out as u64) = n_spiked }
+}
+
+// Recurrent-settling winner-take-all: `win` deterministic Euler-LIF
+// steps (see snn_lif_step, which this calls directly — same op-order,
+// same refractory-freeze, no duplicated integration logic) with a
+// feed-forward drive `ff` fed through a single global inhibitory
+// trace:
+//
+//   V = V_REST, refr = 0, cnt = 0, inh = 0.0   (all re-initialized;
+//                                                Phase-0 always starts
+//                                                membranes at V_REST,
+//                                                independent of v_reset)
+//   vth[i] = v_thresh + theta[i]                 (precomputed once)
+//   for each of `win` steps:
+//     drive[i] = ff[i] - (g_inh * inh)           // product first
+//     snn_lif_step(..., v_reset, dt, tau_m, refrac_steps, ...)
+//     inh = (inh * inh_decay) + n_spiked          // this step's count
+//
+// ALL competition constants are explicit parameters — nothing about
+// the competition dynamics is hardcoded, so callers can explore other
+// (g_inh, inh_decay, win, v_thresh, v_reset, dt, tau_m, refrac_steps)
+// regimes without touching this library.
+//
+// Arguments:
+//   ff_ptr    — f64[N], feed-forward drive per neuron (e.g. a
+//               normalized snn_store_column_sum readout)
+//   theta_ptr — f64[N], per-neuron threshold offset
+//   N         — neuron count
+//   g_inh     — global lateral-inhibition gain
+//   inh_decay — inhibitory trace decay per step
+//   win       — number of settling steps
+//   v_thresh  — base spike threshold (vth[i] = v_thresh + theta[i])
+//   v_reset, dt, tau_m, refrac_steps — threaded straight into every
+//               snn_lif_step call
+//   cnt_ptr   — u64[N] output, per-neuron spike count over the run
+//               (caller-allocated; this fn (re-)initializes it to 0)
+fn snn_wta_recall(u64 ff_ptr, u64 theta_ptr, u64 N, f64 g_inh, f64 inh_decay, u64 win, f64 v_thresh, f64 v_reset, f64 dt, f64 tau_m, u64 refrac_steps, u64 cnt_ptr) {
+    u64 V = alloc(N * 8)
+    u64 refr = alloc(N * 8)
+    u64 vth = alloc(N * 8)
+    u64 drive = alloc(N * 8)
+    u64 n_spiked_slot = alloc(8)
+
+    u64 i = 0
+    while i < N {
+        u64 off = i * 8
+        u64 thp = theta_ptr + off
+        f64 th = 0.0
+        unsafe { *(thp as f64) -> th }
+        f64 vth_i = v_thresh + th
+        u64 tp = vth + off
+        unsafe { *(tp as f64) = vth_i }
+        u64 vp = V + off
+        unsafe { *(vp as f64) = V_REST }
+        u64 rp = refr + off
+        unsafe { *(rp as u64) = 0 }
+        u64 cp = cnt_ptr + off
+        unsafe { *(cp as u64) = 0 }
+        i = i + 1
+    }
+
+    f64 inh = 0.0
+    u64 step = 0
+    while step < win {
+        i = 0
+        while i < N {
+            u64 off = i * 8
+            u64 fp = ff_ptr + off
+            f64 ffv = 0.0
+            unsafe { *(fp as f64) -> ffv }
+            f64 d = ffv - (g_inh * inh)
+            u64 dp = drive + off
+            unsafe { *(dp as f64) = d }
+            i = i + 1
+        }
+        snn_lif_step(V, refr, vth, drive, N, v_reset, dt, tau_m, refrac_steps, cnt_ptr, n_spiked_slot)
+        u64 n_spiked = 0
+        unsafe { *(n_spiked_slot as u64) -> n_spiked }
+        inh = (inh * inh_decay) + int_to_f64(n_spiked)
+        step = step + 1
+    }
+}
+
+// Assembly-level readout: sum per-neuron spike counts within each
+// symbol assembly, take the LOWEST-index argmax as the decoded
+// symbol, and report the second order statistic (the top score minus
+// the max score over every OTHER assembly) as the margin.
+//
+//   s[a]   = sum_{k in [0,K_SYM)} cnt[symcode[a*K_SYM + k]]
+//   m      = lowest index a maximizing s[a]
+//   margin = s[m] - (max over a != m of s[a])
+//
+// This is a plain scan — not sort-dependent — so it is reproducible
+// independent of any sort's tie-break order (the numpy reference
+// instead sorts descending and takes srt[0]-srt[1]; the two are
+// mathematically identical, including the tie case: if another
+// assembly ties the max, excluding just the single argmax index m
+// still leaves that tied value as the max of the remainder, so
+// margin is 0 — same as the numpy reference returning the max again).
+//
+// Arguments:
+//   cnt_ptr     — u64[N], per-neuron spike counts (e.g. from snn_wta_recall)
+//   symcode_ptr — u64[A*K_SYM] row-major, symcode[a*K_SYM+k]
+//   A           — number of assemblies (symbols); must be >= 2 for a
+//                 margin to be defined (mirrors the numpy reference,
+//                 which requires at least 2 elements to sort)
+//   K_SYM       — active neurons per assembly
+//   m_out       — u64 out-pointer, the decoded assembly index
+//   margin_out  — u64 out-pointer, the margin (always >= 0)
+fn snn_readout_argmax_margin(u64 cnt_ptr, u64 symcode_ptr, u64 A, u64 K_SYM, u64 m_out, u64 margin_out) {
+    u64 s = alloc(A * 8)
+    u64 a = 0
+    while a < A {
+        u64 sum = 0
+        u64 k = 0
+        while k < K_SYM {
+            u64 ip = symcode_ptr + (a * K_SYM + k) * 8
+            u64 idx = 0
+            unsafe { *(ip as u64) -> idx }
+            u64 cp = cnt_ptr + idx * 8
+            u64 c = 0
+            unsafe { *(cp as u64) -> c }
+            sum = sum + c
+            k = k + 1
+        }
+        u64 sp = s + a * 8
+        unsafe { *(sp as u64) = sum }
+        a = a + 1
+    }
+
+    // Lowest-index argmax.
+    u64 best = 0
+    u64 best_val = 0
+    unsafe { *(s as u64) -> best_val }
+    a = 1
+    while a < A {
+        u64 sp = s + a * 8
+        u64 v = 0
+        unsafe { *(sp as u64) -> v }
+        if v > best_val {
+            best_val = v
+            best = a
+        }
+        a = a + 1
+    }
+
+    // Second order statistic: max over all indices except `best`.
+    u64 second = 0
+    u64 have_second = 0
+    a = 0
+    while a < A {
+        if a != best {
+            u64 sp = s + a * 8
+            u64 v = 0
+            unsafe { *(sp as u64) -> v }
+            if have_second == 0 {
+                second = v
+                have_second = 1
+            } else if v > second {
+                second = v
+            }
+        }
+        a = a + 1
+    }
+
+    unsafe { *(m_out as u64) = best }
+    unsafe { *(margin_out as u64) = best_val - second }
+}
+
+// One-shot Hebbian build of a dense associative store `W`.
+//
+// For each sequence position t in [0, L): let s = seq[t] be the symbol
+// at that position. For every pair of (symbol-assembly neuron, active
+// context/cue neuron) at that position — i.e. every
+//   i = symcode[s*K_SYM + a]   for a in [0, K_SYM)
+//   j = cuecode[t*K_CTX + c]   for c in [0, K_CTX)
+// — increment the store cell: W[i*Mc + j] += 1 (plain integer add, so
+// this is exact and op-order-independent — no float accumulation).
+//
+// `W` is a dense N_SYM*Mc row-major u64 array. It is accumulated IN
+// PLACE: the caller must allocate it (`alloc(N_SYM*Mc*8)`) and zero it
+// (e.g. `memzero`, see std/mem.mlr) before calling — this fn only adds.
+//
+// Arguments (all sizes passed explicitly — never hardcode a library
+// caller's N_SYM/Mc/K_SYM/K_CTX; those are gate-specific):
+//   seq_ptr     — u64[L], seq[t] in [0, A) — the symbol id at position t
+//   symcode_ptr — u64[A*K_SYM] row-major, symcode[s*K_SYM + a]
+//   cuecode_ptr — u64[L*K_CTX] row-major, cuecode[t*K_CTX + c]
+//   L           — sequence length (number of positions)
+//   A           — number of distinct symbols (rows of symcode)
+//   N_SYM       — number of symbol-assembly neurons (rows of W)
+//   K_SYM       — symbol-assembly neurons per symbol (cols of symcode)
+//   Mc          — number of context/cue neurons (cols of W, row stride)
+//   K_CTX       — active cue neurons per position (cols of cuecode)
+//   W_ptr       — u64[N_SYM*Mc] row-major, accumulated in place
+fn snn_store_hebbian_build(u64 seq_ptr, u64 symcode_ptr, u64 cuecode_ptr, u64 L, u64 A, u64 N_SYM, u64 K_SYM, u64 Mc, u64 K_CTX, u64 W_ptr) {
+    u64 t = 0
+    while t < L {
+        u64 sp = seq_ptr + t * 8
+        u64 s = 0
+        unsafe { *(sp as u64) -> s }
+        u64 a = 0
+        while a < K_SYM {
+            u64 ip = symcode_ptr + (s * K_SYM + a) * 8
+            u64 i = 0
+            unsafe { *(ip as u64) -> i }
+            u64 c = 0
+            while c < K_CTX {
+                u64 jp = cuecode_ptr + (t * K_CTX + c) * 8
+                u64 j = 0
+                unsafe { *(jp as u64) -> j }
+                u64 wp = W_ptr + (i * Mc + j) * 8
+                u64 w = 0
+                unsafe { *(wp as u64) -> w }
+                w = w + 1
+                unsafe { *(wp as u64) = w }
+                c = c + 1
+            }
+            a = a + 1
+        }
+        t = t + 1
+    }
+}
+
+// Plain column-sum readout over a set of active cue/context neurons.
+//
+// raw[i] = sum over c in [0, k_active) of W[i*Mc + cueidx[c]]
+//
+// This is deliberately just the sum — no row-normalization and no
+// scaling. Turning `raw` into a feed-forward drive (e.g. dividing by
+// each row's total and scaling by an input gain) is a policy decision
+// that belongs to the caller (the gate), not this library primitive.
+//
+// Arguments:
+//   W_ptr      — u64[N_SYM*Mc] row-major store (see snn_store_hebbian_build)
+//   Mc         — row stride of W (number of context/cue neurons)
+//   cueidx_ptr — u64[k_active], the active cue-neuron indices for this trial
+//   k_active   — number of active cue indices (varies trial to trial)
+//   N_SYM      — number of rows (symbol-assembly neurons) to sum over
+//   raw_ptr    — u64[N_SYM], output column sums (caller-allocated)
+fn snn_store_column_sum(u64 W_ptr, u64 Mc, u64 cueidx_ptr, u64 k_active, u64 N_SYM, u64 raw_ptr) {
+    u64 i = 0
+    while i < N_SYM {
+        u64 sum = 0
+        u64 c = 0
+        while c < k_active {
+            u64 jp = cueidx_ptr + c * 8
+            u64 j = 0
+            unsafe { *(jp as u64) -> j }
+            u64 wp = W_ptr + (i * Mc + j) * 8
+            u64 w = 0
+            unsafe { *(wp as u64) -> w }
+            sum = sum + w
+            c = c + 1
+        }
+        u64 rp = raw_ptr + i * 8
+        unsafe { *(rp as u64) = sum }
+        i = i + 1
+    }
+}
+
+// Load a whitespace/newline-separated text file of non-negative
+// integers into a freshly allocated u64 buffer, flattened in file
+// order (so a file with multiple ints per line — e.g. a row-major
+// dump of a 2-D array — flattens to the same row-major order).
+//
+// `io.mlr`'s `scan_int` only reads a single integer from stdin one
+// line at a time, so it cannot load a file; this is a small
+// hand-written tokenizer over the `read_file` byte buffer that
+// generalizes `scan_int`'s digit-scanning logic to an arbitrary
+// number of ints, ragged line lengths, and any run of non-digit
+// bytes (spaces, newlines, multiple spaces) as a separator. Digits
+// only — no sign handling, since this loader targets replay data
+// (sequence symbols, code-assembly indices, cue indices), which are
+// never negative.
+//
+// Returns the buffer pointer (u64[count]) and writes the number of
+// integers parsed to *count_out. Returns 0 (and *count_out = 0) if
+// `path` cannot be read (mirrors read_file's failure contract).
+fn snn_load_ints(u64 path, u64 count_out) -> u64 {
+    u64 buf = read_file(path)
+    if buf == 0 {
+        unsafe { *(count_out as u64) = 0 }
+        return 0
+    }
+    // First pass: count the integers present, to size the output
+    // buffer exactly (no realloc/grow needed on the second pass).
+    u64 count = 0
+    u64 p = buf
+    u64 c = load8(p)
+    while c != 0 {
+        if c >= 48 && c <= 57 {
+            count = count + 1
+            while c >= 48 && c <= 57 {
+                p = p + 1
+                c = load8(p)
+            }
+        } else {
+            p = p + 1
+            c = load8(p)
+        }
+    }
+    u64 out = alloc(count * 8)
+    // Second pass: parse and store each integer in file order.
+    p = buf
+    c = load8(p)
+    u64 idx = 0
+    while c != 0 {
+        if c >= 48 && c <= 57 {
+            u64 val = 0
+            while c >= 48 && c <= 57 {
+                val = val * 10 + c - 48
+                p = p + 1
+                c = load8(p)
+            }
+            u64 op = out + idx * 8
+            unsafe { *(op as u64) = val }
+            idx = idx + 1
+        } else {
+            p = p + 1
+            c = load8(p)
+        }
+    }
+    unsafe { *(count_out as u64) = count }
+    return out
+}
+
+// Load a raw little-endian f64 binary file (N * 8 bytes, no header,
+// no separators — e.g. `theta.astype("<f8").tofile(...)` on the
+// numpy side) into a caller-allocated f64[N] buffer.
+//
+// Per element: an ARROW load from the file buffer straight into an
+// ARROW store at the destination — `.mlr` has no `out[i]` pointer-
+// indexing and no rvalue-deref, so this is the idiomatic byte-for-
+// byte reinterpret (mirrors examples/b1_lif_full_loop.mlr's `unsafe`
+// f64 patterns and snn_lif_step's own per-neuron loads above).
+// Deliberately NOT a text/decimal parse — `.mlr` has no strtod, and a
+// decimal round-trip would not reproduce numpy's exact bit pattern.
+//
+// Arguments:
+//   path    — file path, N*8 raw little-endian f64 bytes
+//   N       — element count
+//   out_ptr — f64[N], caller-allocated destination
+//
+// No-ops (leaves out_ptr untouched) if `path` cannot be read.
+fn snn_load_f64_bin(u64 path, u64 N, u64 out_ptr) {
+    u64 buf = read_file(path)
+    if buf == 0 {
+        return
+    }
+    u64 i = 0
+    while i < N {
+        u64 off = i * 8
+        u64 src = buf + off
+        u64 dst = out_ptr + off
+        f64 v = 0.0
+        unsafe { *(src as f64) -> v }
+        unsafe { *(dst as f64) = v }
+        i = i + 1
+    }
+}
