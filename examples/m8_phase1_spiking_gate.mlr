@@ -35,6 +35,17 @@
 //   grep '^20 ' examples/m8_phase1/data_public/reference_mmargin.txt \
 //       > /tmp/ref_seed20.txt
 //   diff /tmp/gate_seed20.txt /tmp/ref_seed20.txt
+//
+// Second mode — divergence adjudication (examples/m8_phase1/verdict.py):
+//   m8_phase1_spiking_gate --trace <seed> <trial> <out_bin_path> [data_dir]
+// Re-derives that one trial's feed-forward drive exactly as above, then
+// re-runs the recurrent WTA settle (duplicating snn_wta_recall's loop
+// inline, so the public snn_wta_recall signature stays trace-free) and
+// dumps the per-step membrane potential of EVERY symbol-assembly neuron
+// to out_bin_path as WIN_STEPS*N_SYM raw little-endian f64 values,
+// step-major (same encoding as *_theta.bin). verdict.py slices out the
+// two decisive assemblies' member neurons from this dump to prove (or
+// refute) a byte-diff is terminal-ULP.
 
 import "../std/snn.mlr"
 import "../std/io.mlr"
@@ -161,10 +172,186 @@ fn load_cueidx_lines(u64 path, u64 num_lines, u64 starts_out, u64 counts_out) ->
     return vals
 }
 
+// True iff `s` is exactly the literal "--trace" (memcmp's fixed length
+// plus a null-terminator check afterward, so "--trace2" doesn't match).
+fn is_trace_flag(u64 s) -> u64 {
+    if memcmp(s, "--trace", 7) != 0 {
+        return 0
+    }
+    u64 p = s + 7
+    u64 c = load8(p)
+    if c == 0 {
+        return 1
+    }
+    return 0
+}
+
+// --trace <seed> <trial> <out_bin_path> [data_dir]: dumps one trial's
+// per-step membrane-potential trace for divergence adjudication (see
+// the module doc comment above and examples/m8_phase1/verdict.py).
+// Rebuilds the same store/feed-forward drive as the normal path, then
+// inlines snn_wta_recall's settle loop (calling snn_lif_step directly,
+// the same primitive it uses internally — no duplicated LIF math, just
+// a per-step V snapshot the library's public API doesn't expose).
+fn run_trace() {
+    if cli_argc < 5 {
+        print_str("usage: m8_phase1_spiking_gate --trace <seed> <trial> <out_bin_path> [data_dir]\n")
+        exit(1)
+    }
+    u64 seed_str = argv_at(2)
+    u64 trial_str = argv_at(3)
+    u64 out_path = argv_at(4)
+    u64 trial = str_to_int(trial_str)
+    u64 data_dir = "examples/m8_phase1/data_public"
+    if cli_argc >= 6 {
+        data_dir = argv_at(5)
+    }
+
+    u64 seq_path = build_path(data_dir, seed_str, "_seq.txt")
+    u64 symcode_path = build_path(data_dir, seed_str, "_symcode.txt")
+    u64 cuecode_path = build_path(data_dir, seed_str, "_cuecode.txt")
+    u64 cueidx_path = build_path(data_dir, seed_str, "_cueidx.txt")
+    u64 theta_path = build_path(data_dir, seed_str, "_theta.bin")
+
+    u64[1] seq_count
+    u64[1] symcode_count
+    u64[1] cuecode_count
+    u64 seq = snn_load_ints(seq_path, seq_count)
+    u64 symcode = snn_load_ints(symcode_path, symcode_count)
+    u64 cuecode = snn_load_ints(cuecode_path, cuecode_count)
+
+    u64 theta = alloc(N_SYM * 8)
+    snn_load_f64_bin(theta_path, N_SYM, theta)
+
+    u64 W = alloc(N_SYM * Mc * 8)
+    memzero(W, N_SYM * Mc * 8)
+    snn_store_hebbian_build(seq, symcode, cuecode, L, A, N_SYM, K_SYM, Mc, K_CTX, W)
+
+    u64 row = alloc(N_SYM * 8)
+    u64 i = 0
+    while i < N_SYM {
+        u64 sum = 0
+        u64 j = 0
+        while j < Mc {
+            u64 wp = W + (i * Mc + j) * 8
+            u64 w = 0
+            unsafe { *(wp as u64) -> w }
+            sum = sum + w
+            j = j + 1
+        }
+        u64 rp = row + i * 8
+        unsafe { *(rp as u64) = sum }
+        i = i + 1
+    }
+
+    u64 cue_starts = alloc(L * 8)
+    u64 cue_counts = alloc(L * 8)
+    u64 cue_vals = load_cueidx_lines(cueidx_path, L, cue_starts, cue_counts)
+
+    u64 sp = cue_starts + trial * 8
+    u64 start = 0
+    unsafe { *(sp as u64) -> start }
+    u64 cp = cue_counts + trial * 8
+    u64 k_active = 0
+    unsafe { *(cp as u64) -> k_active }
+    u64 trial_cueidx = cue_vals + start * 8
+
+    u64 raw = alloc(N_SYM * 8)
+    snn_store_column_sum(W, Mc, trial_cueidx, k_active, N_SYM, raw)
+
+    u64 ff = alloc(N_SYM * 8)
+    u64 ii = 0
+    while ii < N_SYM {
+        u64 rap = raw + ii * 8
+        u64 raw_i = 0
+        unsafe { *(rap as u64) -> raw_i }
+        u64 rp2 = row + ii * 8
+        u64 row_i = 0
+        unsafe { *(rp2 as u64) -> row_i }
+        if row_i == 0 {
+            row_i = 1
+        }
+        f64 ff_i = int_to_f64(raw_i) / int_to_f64(row_i) * INPUT_SCALE
+        u64 fp = ff + ii * 8
+        unsafe { *(fp as f64) = ff_i }
+        ii = ii + 1
+    }
+
+    // Inline recurrent-WTA settle (see std/snn.mlr snn_wta_recall):
+    // identical init/op-order, but snapshotting V into trace_buf after
+    // every step instead of only returning the final spike counts.
+    u64 V = alloc(N_SYM * 8)
+    u64 refr = alloc(N_SYM * 8)
+    u64 vth = alloc(N_SYM * 8)
+    u64 drive = alloc(N_SYM * 8)
+    u64 cnt = alloc(N_SYM * 8)
+    u64 n_spiked_slot = alloc(8)
+    u64 trace_buf = alloc(WIN_STEPS * N_SYM * 8)
+
+    i = 0
+    while i < N_SYM {
+        u64 off = i * 8
+        u64 thp = theta + off
+        f64 th = 0.0
+        unsafe { *(thp as f64) -> th }
+        f64 vth_i = V_THRESH + th
+        u64 tp = vth + off
+        unsafe { *(tp as f64) = vth_i }
+        u64 vp = V + off
+        unsafe { *(vp as f64) = V_REST }
+        u64 rp3 = refr + off
+        unsafe { *(rp3 as u64) = 0 }
+        u64 cpp = cnt + off
+        unsafe { *(cpp as u64) = 0 }
+        i = i + 1
+    }
+
+    f64 inh = 0.0
+    u64 step = 0
+    while step < WIN_STEPS {
+        i = 0
+        while i < N_SYM {
+            u64 off = i * 8
+            u64 fp = ff + off
+            f64 ffv = 0.0
+            unsafe { *(fp as f64) -> ffv }
+            f64 d = ffv - (G_INH * inh)
+            u64 dp = drive + off
+            unsafe { *(dp as f64) = d }
+            i = i + 1
+        }
+        snn_lif_step(V, refr, vth, drive, N_SYM, V_RESET, DT, TAU_M, REFRAC_STEPS, cnt, n_spiked_slot)
+        u64 n_spiked = 0
+        unsafe { *(n_spiked_slot as u64) -> n_spiked }
+        inh = (inh * INH_DECAY) + int_to_f64(n_spiked)
+
+        i = 0
+        while i < N_SYM {
+            u64 vp = V + i * 8
+            f64 v = 0.0
+            unsafe { *(vp as f64) -> v }
+            u64 tb = trace_buf + (step * N_SYM + i) * 8
+            unsafe { *(tb as f64) = v }
+            i = i + 1
+        }
+        step = step + 1
+    }
+
+    u64 fd = file_open(out_path, 1)
+    file_write(fd, trace_buf, WIN_STEPS * N_SYM * 8)
+    file_close(fd)
+}
+
 fn main() {
     if cli_argc < 2 {
         print_str("usage: m8_phase1_spiking_gate <seed> [data_dir]\n")
+        print_str("       m8_phase1_spiking_gate --trace <seed> <trial> <out_bin_path> [data_dir]\n")
         exit(1)
+    }
+    u64 arg1 = argv_at(1)
+    if is_trace_flag(arg1) != 0 {
+        run_trace()
+        exit(0)
     }
     u64 seed_str = argv_at(1)
     u64 seed = str_to_int(seed_str)
