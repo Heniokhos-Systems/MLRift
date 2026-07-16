@@ -828,27 +828,205 @@ fn ir_slice_len_get(uint64 name_tok) -> uint64 {
     return 0xFFFFFFFF
 }
 
+// PROTOTYPE: parallel (name_start, name_len) arrays for the var map so
+// lookup compares raw source bytes inline instead of calling
+// tok_text_eq → tok_source_byte (two function calls PER BYTE) per entry.
+// Entry layout in ir_var_map itself is unchanged (8 bytes) — the DWARF
+// snapshot and loop-header merge code index it directly.
+static uint64 ir_var_nstart = 0   // u32 × 1024: source offset of entry's name
+static uint64 ir_var_nlen = 0     // u32 × 1024: length of entry's name
+
+// PROTOTYPE: builtin-call prefilter. The Call lowering used to run ~79
+// sequential tok_matches string compares per call site before falling
+// through to a normal call. This table keys on (first char, name length):
+// if no builtin has that combination, skip the whole chain.
+static uint64 ir_bi_filter = 0
+
+// PROTOTYPE: depth-indexed arena replacing per-call `uint64[32]` mmap
+static uint64 ir_argv_arena = 0
+static uint64 ir_argv_depth = 0
+static uint64 ir_dce_changed_ptr = 0
+
+// PROTOTYPE: bump arena for the strictly-LIFO var-map snapshot buffers in
+// statement lowering (if/while/match) — each was an mmap+munmap syscall
+// pair per control-flow statement (~15k pairs per self-compile).
+static uint64 ir_scr_arena = 0
+static uint64 ir_scr_top = 0
+
+fn ir_scr_alloc(uint64 n) -> uint64 {
+    if ir_scr_arena == 0 { ir_scr_arena = alloc(4194304) }
+    uint64 rn = (n + 15) & 0xFFFFFFFFFFFFFFF0
+    if ir_scr_top + rn > 4194304 {
+        write(2, "error: ir scratch arena overflow\n", 33)
+        exit(1)
+    }
+    uint64 p = ir_scr_arena + ir_scr_top
+    ir_scr_top = ir_scr_top + rn
+    return p
+}
+
+fn ir_scr_free(uint64 n) {
+    uint64 rn = (n + 15) & 0xFFFFFFFFFFFFFFF0
+    ir_scr_top = ir_scr_top - rn
+}
+
+fn ir_bi_add(uint64 c0, uint64 len) {
+    uint64 p = ir_bi_filter + c0 * 32 + len
+    uint8 one = 1
+    unsafe { *(p as uint8) = one }
+}
+
+fn ir_bi_filter_init() {
+    if ir_bi_filter != 0 { return }
+    ir_bi_filter = alloc(128 * 32)
+    memset(ir_bi_filter, 0, 128 * 32)
+    ir_bi_add(100, 12)   // dcache_flush
+    ir_bi_add(100, 3)   // dmb
+    ir_bi_add(100, 3)   // dsb
+    ir_bi_add(100, 7)   // dealloc
+    ir_bi_add(101, 12)   // exec_process
+    ir_bi_add(101, 17)   // exec_process_argv
+    ir_bi_add(101, 4)   // exit
+    ir_bi_add(102, 10)   // f16_to_f32
+    ir_bi_add(102, 10)   // f32_to_f16
+    ir_bi_add(102, 10)   // f32_to_f64
+    ir_bi_add(102, 10)   // f32_to_int
+    ir_bi_add(102, 10)   // f64_to_f32
+    ir_bi_add(102, 10)   // f64_to_int
+    ir_bi_add(102, 10)   // file_close
+    ir_bi_add(102, 10)   // file_write
+    ir_bi_add(102, 7)   // fma_f64
+    ir_bi_add(102, 7)   // fn_addr
+    ir_bi_add(102, 8)   // fmt_uint
+    ir_bi_add(102, 9)   // file_open
+    ir_bi_add(102, 9)   // file_read
+    ir_bi_add(102, 9)   // file_size
+    ir_bi_add(103, 11)   // get_arch_id
+    ir_bi_add(103, 13)   // get_target_os
+    ir_bi_add(103, 15)   // get_module_path
+    ir_bi_add(105, 10)   // int_to_f32
+    ir_bi_add(105, 10)   // int_to_f64
+    ir_bi_add(105, 17)   // icache_invalidate
+    ir_bi_add(105, 3)   // isb
+    ir_bi_add(108, 5)   // load8
+    ir_bi_add(108, 6)   // load16
+    ir_bi_add(108, 6)   // load32
+    ir_bi_add(108, 6)   // load64
+    ir_bi_add(109, 6)   // memcpy
+    ir_bi_add(109, 6)   // memset
+    ir_bi_add(112, 11)   // println_str
+    ir_bi_add(112, 5)   // print
+    ir_bi_add(112, 7)   // println
+    ir_bi_add(112, 9)   // print_str
+    ir_bi_add(114, 4)   // read
+    ir_bi_add(115, 11)   // syscall_raw
+    ir_bi_add(115, 14)   // set_executable
+    ir_bi_add(115, 4)   // sqrt
+    ir_bi_add(115, 6)   // store8
+    ir_bi_add(115, 6)   // str_eq
+    ir_bi_add(115, 7)   // store16
+    ir_bi_add(115, 7)   // store32
+    ir_bi_add(115, 7)   // store64
+    ir_bi_add(115, 7)   // str_len
+    ir_bi_add(115, 8)   // sqrt_f32
+    ir_bi_add(115, 8)   // sqrt_f64
+    ir_bi_add(115, 9)   // signed_ge
+    ir_bi_add(115, 9)   // signed_gt
+    ir_bi_add(115, 9)   // signed_le
+    ir_bi_add(115, 9)   // signed_lt
+    ir_bi_add(116, 7)   // time_ns
+    ir_bi_add(118, 6)   // vload8
+    ir_bi_add(118, 7)   // vload16
+    ir_bi_add(118, 7)   // vload32
+    ir_bi_add(118, 7)   // vload64
+    ir_bi_add(118, 7)   // vstore8
+    ir_bi_add(118, 8)   // vstore16
+    ir_bi_add(118, 8)   // vstore32
+    ir_bi_add(118, 8)   // vstore64
+    ir_bi_add(119, 5)   // write
+    ir_bi_add(97, 10)   // atomic_add
+    ir_bi_add(97, 10)   // atomic_and
+    ir_bi_add(97, 10)   // atomic_cas
+    ir_bi_add(97, 10)   // atomic_sub
+    ir_bi_add(97, 10)   // atomic_xor
+    ir_bi_add(97, 11)   // atomic_load
+    ir_bi_add(97, 12)   // atomic_store
+    ir_bi_add(97, 5)   // alloc
+    ir_bi_add(97, 9)   // atomic_or
+    ir_bi_add(98, 10)   // bit_insert
+    ir_bi_add(98, 10)   // bit_toggle
+    ir_bi_add(98, 7)   // bit_get
+    ir_bi_add(98, 7)   // bit_set
+    ir_bi_add(98, 9)   // bit_clear
+    ir_bi_add(98, 9)   // bit_range
+    ir_bi_add(99, 8)   // call_ptr
+}
+
 fn ir_var_map_init() {
-    if ir_var_map == 0 { ir_var_map = alloc(1024 * 8) }
+    if ir_var_map == 0 {
+        ir_var_map = alloc(1024 * 8)
+        ir_var_nstart = alloc(1024 * 4)
+        ir_var_nlen = alloc(1024 * 4)
+    }
     ir_var_map_count = 0
     ir_slice_len_count = 0
 }
 
-fn ir_var_set(uint64 name_tok, uint64 vreg) {
-    // Update existing or add new
+// Find the var-map index whose name matches name_tok's text, or 0xFFFFFFFF.
+fn ir_var_find(uint64 name_tok) -> uint64 {
+    uint64 q_start = tok_text_start(name_tok)
+    uint64 q_len = tok_text_len(name_tok)
+    uint64 qp = cg_source + q_start
+    uint64 q_first = 0
+    unsafe { *(qp as uint8) -> q_first }
     uint64 i = 0
     while i < ir_var_map_count {
-        uint64 entry = ir_var_map + i * 8
-        uint32 stored = 0
-        unsafe { *(entry as uint32) -> stored }
-        uint64 ws = stored
-        if tok_text_eq(ws, name_tok) != 0 {
-            uint64 e4 = entry + 4
-            uint32 vr = vreg
-            unsafe { *(e4 as uint32) = vr }
-            return
+        uint64 lp = ir_var_nlen + i * 4
+        uint32 sl32 = 0
+        unsafe { *(lp as uint32) -> sl32 }
+        uint64 s_len = sl32
+        if s_len == q_len {
+            uint64 sp = ir_var_nstart + i * 4
+            uint32 ss32 = 0
+            unsafe { *(sp as uint32) -> ss32 }
+            uint64 s_start = ss32
+            uint64 bp = cg_source + s_start
+            uint64 s_first = 0
+            unsafe { *(bp as uint8) -> s_first }
+            if s_first == q_first {
+                uint64 k = 1
+                uint64 same = 1
+                while k < q_len {
+                    uint64 pak = qp + k
+                    uint64 ca = 0
+                    unsafe { *(pak as uint8) -> ca }
+                    uint64 pbk = bp + k
+                    uint64 cb = 0
+                    unsafe { *(pbk as uint8) -> cb }
+                    if ca != cb {
+                        same = 0
+                        k = q_len
+                    } else {
+                        k = k + 1
+                    }
+                }
+                if same != 0 { return i }
+            }
         }
         i = i + 1
+    }
+    return 0xFFFFFFFF
+}
+
+fn ir_var_set(uint64 name_tok, uint64 vreg) {
+    // Update existing or add new
+    uint64 fi = ir_var_find(name_tok)
+    if fi != 0xFFFFFFFF {
+        uint64 entry = ir_var_map + fi * 8
+        uint64 e4 = entry + 4
+        uint32 vr = vreg
+        unsafe { *(e4 as uint32) = vr }
+        return
     }
     // Add new entry
     if ir_var_map_count >= 1024 { return }
@@ -858,6 +1036,12 @@ fn ir_var_set(uint64 name_tok, uint64 vreg) {
     uint64 e4 = entry + 4
     uint32 vr = vreg
     unsafe { *(e4 as uint32) = vr }
+    uint64 sp = ir_var_nstart + ir_var_map_count * 4
+    uint32 ns32 = tok_text_start(name_tok)
+    unsafe { *(sp as uint32) = ns32 }
+    uint64 lp = ir_var_nlen + ir_var_map_count * 4
+    uint32 nl32 = tok_text_len(name_tok)
+    unsafe { *(lp as uint32) = nl32 }
     ir_var_map_count = ir_var_map_count + 1
 }
 
@@ -903,19 +1087,13 @@ fn ir_snapshot_debug_vars() {
 }
 
 fn ir_var_get(uint64 name_tok) -> uint64 {
-    uint64 i = 0
-    while i < ir_var_map_count {
-        uint64 entry = ir_var_map + i * 8
-        uint32 stored = 0
-        unsafe { *(entry as uint32) -> stored }
-        uint64 ws = stored
-        if tok_text_eq(ws, name_tok) != 0 {
-            uint64 e4 = entry + 4
-            uint32 vr = 0
-            unsafe { *(e4 as uint32) -> vr }
-            return vr
-        }
-        i = i + 1
+    uint64 fi = ir_var_find(name_tok)
+    if fi != 0xFFFFFFFF {
+        uint64 entry = ir_var_map + fi * 8
+        uint64 e4 = entry + 4
+        uint32 vr = 0
+        unsafe { *(e4 as uint32) -> vr }
+        return vr
     }
     return 0xFFFFFFFF
 }
@@ -925,7 +1103,7 @@ fn ir_var_get(uint64 name_tok) -> uint64 {
 // Phase 1: snapshot all changed values into fresh vregs (reads before writes).
 // Phase 2: copy from fresh vregs to target vregs.
 fn ir_emit_copy_to_snapshot(uint64 snap_buf, uint64 snap_count, uint64 bb) {
-    uint64 pairs = alloc(snap_count * 16)
+    uint64 pairs = ir_scr_alloc(snap_count * 16)
     uint64 pcnt = 0
     uint64 ci = 0
     while ci < snap_count {
@@ -959,7 +1137,7 @@ fn ir_emit_copy_to_snapshot(uint64 snap_buf, uint64 snap_count, uint64 bb) {
         ir_emit(IR_COPY, target, source, 0, 0, bb)
         ci = ci + 1
     }
-    dealloc(pairs)
+    ir_scr_free(snap_count * 16)
 }
 
 // ---------------------------------------------------------------------------
@@ -1569,6 +1747,21 @@ fn ir_lower_expr(uint64 node) -> uint64 {
     if kind == 35 {
         uint32 callee_tok = ast_data1(node)
         uint64 wct = callee_tok
+        ir_bi_filter_init()
+        uint64 bi_maybe = 0
+        uint64 bi_len = tok_text_len(wct)
+        if bi_len < 32 {
+            uint64 bi_sp = cg_source + tok_text_start(wct)
+            uint64 bi_c0 = 0
+            unsafe { *(bi_sp as uint8) -> bi_c0 }
+            if bi_c0 < 128 {
+                uint64 bi_p = ir_bi_filter + bi_c0 * 32 + bi_len
+                uint64 bi_v = 0
+                unsafe { *(bi_p as uint8) -> bi_v }
+                bi_maybe = bi_v
+            }
+        }
+        if bi_maybe != 0 {
         // Check for exit() builtin — shadowed by a `@dynamic extern fn
         // exit` so the user can route through libc's exit when linking
         // dynamically (libc's exit flushes stdio, ours just calls
@@ -2633,11 +2826,18 @@ fn ir_lower_expr(uint64 node) -> uint64 {
             return dest
         }
 
+        }
         // General call: evaluate all arg exprs first, then emit ARGs + CALL
         // This prevents nested calls from clobbering arg registers.
         // Capacity is 32 args (6 register + up to 26 stack); pushing higher
         // also requires bumping ir_overflow_args / IR_ARG's oi guard below.
-        uint64[32] call_arg_vregs
+        // PROTOTYPE: `uint64[32]` locals lower to IR_ALLOC (mmap) — one
+        // mmap+munmap syscall pair PER LOWERED CALL SITE (~50k pairs per
+        // self-compile). Use a depth-indexed slice of a static arena
+        // instead; nested calls in an arg expression bump the depth.
+        if ir_argv_arena == 0 { ir_argv_arena = alloc(64 * 256) }
+        uint64 call_arg_vregs = ir_argv_arena + ir_argv_depth * 256
+        if ir_argv_depth < 63 { ir_argv_depth = ir_argv_depth + 1 }
         uint32 arg = ast_child(node)
         uint64 warg = arg
         uint64 arg_count = 0
@@ -2730,10 +2930,10 @@ fn ir_lower_expr(uint64 node) -> uint64 {
                 ir_emit(IR_ADD, addr2_v, buf_v, off8_v, 0, ir_current_bb)
                 ir_emit(IR_STORE, 8, addr2_v, rdx_v, 0, ir_current_bb)
             }
-            dealloc(call_arg_vregs)
+            if ir_argv_depth > 0 { ir_argv_depth = ir_argv_depth - 1 }
             return buf_v
         }
-        dealloc(call_arg_vregs)
+        if ir_argv_depth > 0 { ir_argv_depth = ir_argv_depth - 1 }
         return dest
     }
 
@@ -3481,7 +3681,7 @@ fn ir_lower_stmt(uint64 node) {
         ir_bb_set_succ(ir_current_bb, bb_else, bb_then)
         // Snapshot variable map before then-body
         uint64 if_snap_count = ir_var_map_count
-        uint64 if_snap = alloc(if_snap_count * 8)
+        uint64 if_snap = ir_scr_alloc(if_snap_count * 8)
         uint64 ifi = 0
         while ifi < if_snap_count {
             uint64 ifs = ir_var_map + ifi * 8
@@ -3537,7 +3737,7 @@ fn ir_lower_stmt(uint64 node) {
             ir_var_map_count = if_snap_count
         }
         ir_current_bb = bb_merge
-        dealloc(if_snap)
+        ir_scr_free(if_snap_count * 8)
         return
     }
 
@@ -3553,7 +3753,7 @@ fn ir_lower_stmt(uint64 node) {
         ir_bb_set_succ(ir_current_bb, bb_header, 0xFFFFFFFF)
         // Snapshot variable map before header
         uint64 snap_count = ir_var_map_count
-        uint64 snap_buf = alloc(snap_count * 8)
+        uint64 snap_buf = ir_scr_alloc(snap_count * 8)
         uint64 si = 0
         while si < snap_count {
             uint64 sp = ir_var_map + si * 8
@@ -3570,7 +3770,7 @@ fn ir_lower_stmt(uint64 node) {
         ir_bb_set_succ(ir_current_bb, bb_exit, bb_body)
         // Snapshot variable map after header (to know which vregs header uses)
         uint64 hdr_count = ir_var_map_count
-        uint64 hdr_buf = alloc(hdr_count * 8)
+        uint64 hdr_buf = ir_scr_alloc(hdr_count * 8)
         si = 0
         while si < hdr_count {
             uint64 sp = ir_var_map + si * 8
@@ -3635,8 +3835,8 @@ fn ir_lower_stmt(uint64 node) {
         }
         ir_var_map_count = hdr_count
         ir_current_bb = bb_exit
-        dealloc(snap_buf)
-        dealloc(hdr_buf)
+        ir_scr_free(hdr_count * 8)
+        ir_scr_free(snap_count * 8)
         return
     }
 
@@ -3652,7 +3852,7 @@ fn ir_lower_stmt(uint64 node) {
         uint64 scrut_v = ir_lower_expr(scrutinee)
         // Snapshot variable map before match
         uint64 match_snap_count = ir_var_map_count
-        uint64 match_snap = alloc(match_snap_count * 8)
+        uint64 match_snap = ir_scr_alloc(match_snap_count * 8)
         uint64 mi = 0
         while mi < match_snap_count {
             uint64 ms = ir_var_map + mi * 8
@@ -3778,7 +3978,7 @@ fn ir_lower_stmt(uint64 node) {
         }
         ir_var_map_count = match_snap_count
         ir_current_bb = bb_exit
-        dealloc(match_snap)
+        ir_scr_free(match_snap_count * 8)
         return
     }
 
@@ -4571,9 +4771,208 @@ fn ir_insn_has_def(uint64 ii) -> uint64 {
     return 1
 }
 
+// --- PROTOTYPE: per-BB use/def bitsets, computed once per function. ---
+// use[b] = vregs read before any def in b (upward-exposed uses)
+// def[b] = vregs defined in b
+// Then liveness is pure bitset dataflow: in = use | (out & ~def).
+static uint64 ir_live_use = 0
+static uint64 ir_live_def = 0
+// PROTOTYPE: per-BB dirty flags — a BB is reprocessed only when a
+// successor's live_in changed (consumer-side check). Sweep 1 does all.
+static uint64 ir_lv_dirty = 0
+static uint64 ir_lv_dirty2 = 0
+
+fn ir_liveness_build_usedef() {
+    uint64 set_bytes = ir_live_words * 8
+    uint64 total = ir_bb_count * set_bytes
+    if ir_live_use == 0 {
+        ir_live_use = alloc(ir_live_cap)
+        ir_live_def = alloc(ir_live_cap)
+    }
+    memset(ir_live_use, 0, total)
+    memset(ir_live_def, 0, total)
+    uint64 bi = 0
+    while bi < ir_bb_count {
+        uint64 ub = ir_live_use + bi * set_bytes
+        uint64 db = ir_live_def + bi * set_bytes
+        uint64 ii = ir_bb_first_insn(bi)
+        while ii != 0xFFFFFFFF {
+            uint64 op = ir_insn_opcode(ii)
+            if op != 0 {
+                // Uses first (an insn that reads and writes the same vreg
+                // exposes the use upward — matches the backward walk).
+                uint64 use1 = ir_insn_src1(ii)
+                if use1 < ir_vreg_next && op != 1 {
+                    uint64 uw = use1 / 64
+                    uint64 ubit = use1 & 63
+                    uint64 dp = db + uw * 8
+                    uint64 dvv = 0
+                    unsafe { *(dp as uint64) -> dvv }
+                    if ((dvv >> ubit) & 1) == 0 {
+                        uint64 up = ub + uw * 8
+                        uint64 uv = 0
+                        unsafe { *(up as uint64) -> uv }
+                        uv = uv | (1 << ubit)
+                        unsafe { *(up as uint64) = uv }
+                    }
+                }
+                uint64 use2 = ir_insn_src2(ii)
+                if use2 < ir_vreg_next && op != 1 && op != 12 && op != 13 && op != 30 && op != 42 && op != 61 && op != 135 && op != 136 && op != 138 {
+                    uint64 uw = use2 / 64
+                    uint64 ubit = use2 & 63
+                    uint64 dp = db + uw * 8
+                    uint64 dvv = 0
+                    unsafe { *(dp as uint64) -> dvv }
+                    if ((dvv >> ubit) & 1) == 0 {
+                        uint64 up = ub + uw * 8
+                        uint64 uv = 0
+                        unsafe { *(up as uint64) -> uv }
+                        uv = uv | (1 << ubit)
+                        unsafe { *(up as uint64) = uv }
+                    }
+                }
+                // imm-as-vreg use for MEMCPY(72), MEMSET(76), RET3(83), ATOMIC_CAS(93), FFMA(98)
+                if op == 72 || op == 76 || op == 83 || op == 93 || op == 98 {
+                    uint64 use_imm = ir_insn_imm(ii)
+                    if use_imm < ir_vreg_next && use_imm > 0 {
+                        uint64 uw = use_imm / 64
+                        uint64 ubit = use_imm & 63
+                        uint64 dp = db + uw * 8
+                        uint64 dvv = 0
+                        unsafe { *(dp as uint64) -> dvv }
+                        if ((dvv >> ubit) & 1) == 0 {
+                            uint64 up = ub + uw * 8
+                            uint64 uv = 0
+                            unsafe { *(up as uint64) -> uv }
+                            uv = uv | (1 << ubit)
+                            unsafe { *(up as uint64) = uv }
+                        }
+                    }
+                }
+                // Def
+                if ir_insn_has_def(ii) != 0 {
+                    uint64 def_v = ir_insn_dest(ii)
+                    if def_v < ir_vreg_next {
+                        uint64 dw = def_v / 64
+                        uint64 dbit = def_v & 63
+                        uint64 dp = db + dw * 8
+                        uint64 dvv = 0
+                        unsafe { *(dp as uint64) -> dvv }
+                        dvv = dvv | (1 << dbit)
+                        unsafe { *(dp as uint64) = dvv }
+                    }
+                }
+            }
+            ii = ir_insn_next(ii)
+        }
+        bi = bi + 1
+    }
+}
+
 // Iterative dataflow: compute live-in and live-out for every basic block.
 @export
 fn ir_compute_liveness() {
+    ir_liveness_init()
+    ir_liveness_build_usedef()
+    uint64 set_bytes = ir_live_words * 8
+    if ir_lv_dirty == 0 {
+        ir_lv_dirty = alloc(4096)
+        ir_lv_dirty2 = alloc(4096)
+    }
+    uint64 dirty_prev = ir_lv_dirty
+    uint64 dirty_cur = ir_lv_dirty2
+    uint64 sweep = 0
+    uint64 changed = 1
+    while changed != 0 {
+        changed = 0
+        memset(dirty_cur, 0, ir_bb_count)
+        uint64 bi = ir_bb_count
+        while bi > 0 {
+            bi = bi - 1
+            uint64 s0 = ir_bb_succ0(bi)
+            uint64 s1 = ir_bb_succ1(bi)
+            uint64 need = 1
+            if sweep > 0 {
+                need = 0
+                if s0 != 0xFFFFFFFF {
+                    uint64 dp0a = dirty_prev + s0
+                    uint64 dv0a = 0
+                    unsafe { *(dp0a as uint8) -> dv0a }
+                    uint64 dp0b = dirty_cur + s0
+                    uint64 dv0b = 0
+                    unsafe { *(dp0b as uint8) -> dv0b }
+                    need = dv0a | dv0b
+                }
+                if s1 != 0xFFFFFFFF && need == 0 {
+                    uint64 dp1a = dirty_prev + s1
+                    uint64 dv1a = 0
+                    unsafe { *(dp1a as uint8) -> dv1a }
+                    uint64 dp1b = dirty_cur + s1
+                    uint64 dv1b = 0
+                    unsafe { *(dp1b as uint8) -> dv1b }
+                    need = dv1a | dv1b
+                }
+            }
+            if need == 0 { continue }
+            uint64 in_b = ir_live_in + bi * set_bytes
+            uint64 out_b = ir_live_out + bi * set_bytes
+            uint64 use_b = ir_live_use + bi * set_bytes
+            uint64 def_b = ir_live_def + bi * set_bytes
+            uint64 s0b = 0
+            if s0 != 0xFFFFFFFF { s0b = ir_live_in + s0 * set_bytes }
+            uint64 s1b = 0
+            if s1 != 0xFFFFFFFF { s1b = ir_live_in + s1 * set_bytes }
+            uint64 bi_changed = 0
+            uint64 wi = 0
+            while wi < ir_live_words {
+                uint64 off = wi * 8
+                uint64 out_val = 0
+                if s0b != 0 {
+                    uint64 p0 = s0b + off
+                    uint64 v0 = 0
+                    unsafe { *(p0 as uint64) -> v0 }
+                    out_val = out_val | v0
+                }
+                if s1b != 0 {
+                    uint64 p1 = s1b + off
+                    uint64 v1 = 0
+                    unsafe { *(p1 as uint64) -> v1 }
+                    out_val = out_val | v1
+                }
+                uint64 po = out_b + off
+                unsafe { *(po as uint64) = out_val }
+                uint64 pu = use_b + off
+                uint64 uv = 0
+                unsafe { *(pu as uint64) -> uv }
+                uint64 pd = def_b + off
+                uint64 dv = 0
+                unsafe { *(pd as uint64) -> dv }
+                uint64 nin = uv | (out_val & ~dv)
+                uint64 pi = in_b + off
+                uint64 oin = 0
+                unsafe { *(pi as uint64) -> oin }
+                if oin != nin {
+                    changed = 1
+                    bi_changed = 1
+                    unsafe { *(pi as uint64) = nin }
+                }
+                wi = wi + 1
+            }
+            if bi_changed != 0 {
+                uint64 dcp = dirty_cur + bi
+                uint8 one = 1
+                unsafe { *(dcp as uint8) = one }
+            }
+        }
+        // Swap dirty buffers for the next sweep.
+        uint64 dtmp = dirty_prev
+        dirty_prev = dirty_cur
+        dirty_cur = dtmp
+        sweep = sweep + 1
+    }
+}
+
+fn ir_compute_liveness_OLD() {
     ir_liveness_init()
     uint64 set_bytes = ir_live_words * 8
     uint64 changed = 1
@@ -4870,6 +5269,13 @@ fn ir_popcount64(uint64 x) -> uint64 {
     return (x * 0x0101010101010101) >> 56
 }
 
+// PROTOTYPE: count-trailing-zeros via isolate-lowest-bit + popcount.
+// Replaces per-bit shift-search loops (O(bit position) each).
+fn ir_ctz64(uint64 x) -> uint64 {
+    uint64 low = x & (0 - x)
+    return ir_popcount64(low - 1)
+}
+
 fn ir_uf_find(uint64 v) -> uint64 {
     uint64 cur = v
     while 1 == 1 {
@@ -4878,6 +5284,12 @@ fn ir_uf_find(uint64 v) -> uint64 {
         unsafe { *(pp as uint32) -> pw }
         uint64 par = pw
         if par == cur { break }
+        // PROTOTYPE: path halving — point cur at its grandparent so long
+        // chains flatten as they are walked. Root stays the lowest vreg.
+        uint64 gpp = ir_uf_parent + par * 4
+        uint32 gpw = 0
+        unsafe { *(gpp as uint32) -> gpw }
+        unsafe { *(pp as uint32) = gpw }
         cur = par
     }
     // Path compression — flatten so future lookups are O(1).
@@ -5053,13 +5465,7 @@ fn ir_graph_color() {
                             // For each set bit, add interference
                             uint64 bits = lbits
                             while bits != 0 {
-                                // Find lowest set bit
-                                uint64 bit_pos = 0
-                                uint64 test = bits
-                                while (test & 1) == 0 {
-                                    test = test >> 1
-                                    bit_pos = bit_pos + 1
-                                }
+                                uint64 bit_pos = ir_ctz64(bits)
                                 uint64 other = lw * 64 + bit_pos
                                 if other != dv && other < vcount {
                                     // Set ig[dv][other] and ig[other][dv]
@@ -5224,9 +5630,7 @@ fn ir_graph_color() {
                             if (bw == keep / 64) { cb = cb & ~(1 << (keep & 63)) }
                             if (bw == drop / 64) { cb = cb & ~(1 << (drop & 63)) }
                             while cb != 0 {
-                                uint64 sp = 0
-                                uint64 st = cb
-                                while (st & 1) == 0 { st = st >> 1; sp = sp + 1 }
+                                uint64 sp = ir_ctz64(cb)
                                 uint64 nidx = bw * 64 + sp
                                 if nidx < vcount {
                                     uint64 nrep = ir_uf_find(nidx)
@@ -5264,9 +5668,7 @@ fn ir_graph_color() {
                                     if gw == g_b / 64 { gav = gav & ~(1 << (g_b & 63)) }
                                     if gw == g_a / 64 { gav = gav & ~(1 << (g_a & 63)) }
                                     while gav != 0 && ok != 0 {
-                                        uint64 sp = 0
-                                        uint64 st = gav
-                                        while (st & 1) == 0 { st = st >> 1; sp = sp + 1 }
+                                        uint64 sp = ir_ctz64(gav)
                                         uint64 nidx = gw * 64 + sp
                                         if nidx < vcount {
                                             uint64 in_b = (gbv >> sp) & 1
@@ -5311,9 +5713,7 @@ fn ir_graph_color() {
                                 unsafe { *(da as uint64) = dav | sav }
                                 uint64 sb = sav
                                 while sb != 0 {
-                                    uint64 sp = 0
-                                    uint64 st = sb
-                                    while (st & 1) == 0 { st = st >> 1; sp = sp + 1 }
+                                    uint64 sp = ir_ctz64(sb)
                                     uint64 nidx = mw * 64 + sp
                                     if nidx != keep && nidx < vcount {
                                         uint64 nrp = ig + nidx * row_bytes + (keep / 64) * 8
@@ -5375,15 +5775,14 @@ fn ir_graph_color() {
         }
         // Collect colors used by interfering neighbors
         uint64 used_colors = 0
+        uint64 all_colors = (1 << IR_NUM_REGS) - 1
         uint64 nw = 0
-        while nw < row_words {
+        while nw < row_words && used_colors != all_colors {
             uint64 np = ig + vi * row_bytes + nw * 8
             uint64 nbits = 0
             unsafe { *(np as uint64) -> nbits }
             while nbits != 0 {
-                uint64 bp = 0
-                uint64 bt = nbits
-                while (bt & 1) == 0 { bt = bt >> 1; bp = bp + 1 }
+                uint64 bp = ir_ctz64(nbits)
                 uint64 neighbor = nw * 64 + bp
                 if neighbor < vcount {
                     // Look up rep's colour — followers haven't been
@@ -5398,6 +5797,7 @@ fn ir_graph_color() {
                     }
                 }
                 nbits = nbits & ~(1 << bp)
+                if used_colors == all_colors { nbits = 0 }
             }
             nw = nw + 1
         }
@@ -5431,7 +5831,6 @@ fn ir_graph_color() {
         }
         vi = vi + 1
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -10100,15 +10499,21 @@ fn ir_opt_dce() {
     // a use may come before its def in linear order inside a loop, we iterate
     // to a fixed point. Live set only grows — terminates in O(vregs) rounds.
     uint64 changed = 1
-    uint64 changed_ptr = alloc(8)
+    if ir_dce_changed_ptr == 0 { ir_dce_changed_ptr = alloc(8) }
+    uint64 changed_ptr = ir_dce_changed_ptr
     while changed != 0 {
         changed = 0
         unsafe { *(changed_ptr as uint64) = changed }
 
-        uint64 ii = 0
-        while ii < ir_insn_count {
+        // PROTOTYPE: scan BACKWARD. Mark info flows from uses to defs, and
+        // defs precede uses in linear order (except loop-carried deps), so a
+        // backward scan propagates a whole def-chain in ONE pass where the
+        // forward scan needed one full pass per chain level.
+        uint64 ii = ir_insn_count
+        while ii > 0 {
+            ii = ii - 1
             uint64 op = ir_insn_opcode(ii)
-            if op == 0 { ii = ii + 1; continue }
+            if op == 0 { continue }
 
             uint64 dest = ir_insn_dest(ii)
             uint64 s1 = ir_insn_src1(ii)
@@ -10134,13 +10539,10 @@ fn ir_opt_dce() {
                     ir_opt_dce_mark(imm, changed_ptr)
                 }
             }
-
-            ii = ii + 1
         }
 
         unsafe { *(changed_ptr as uint64) -> changed }
     }
-    dealloc(changed_ptr)
 
     // Sweep phase: NOP-out instructions whose dest is not live and which have
     // no side effects. We leave the BB linked list intact; the emitters treat
@@ -10181,6 +10583,13 @@ fn ir_opt_dce() {
 
 static uint64 ir_cse_table = 0
 static uint64 ir_cse_canon = 0   // per-BB canon[vreg] → canonical source vreg
+// PROTOTYPE: epoch-based invalidation. A table/canon entry is valid only if
+// its generation tag equals ir_cse_epoch. Bumping the epoch invalidates
+// everything in O(1) — replaces the ~425 KB of memsets that used to run at
+// every BB boundary AND every STORE/CALL/atomic.
+static uint64 ir_cse_gen = 0        // u32 per table slot (4096)
+static uint64 ir_cse_canon_gen = 0  // u32 per vreg (65536)
+static uint64 ir_cse_epoch = 0
 
 fn ir_cse_hash(uint64 op, uint64 s1, uint64 s2, uint64 imm) -> uint64 {
     uint64 h = op * 2654435761
@@ -10198,6 +10607,11 @@ fn ir_cse_hash(uint64 op, uint64 s1, uint64 s2, uint64 imm) -> uint64 {
 fn ir_cse_canon_of(uint64 v) -> uint64 {
     if v == 0 { return 0 }
     if v >= 65536 { return v }
+    uint64 gp = ir_cse_canon_gen + v * 4
+    uint32 g = 0
+    unsafe { *(gp as uint32) -> g }
+    uint64 g64 = g
+    if g64 != ir_cse_epoch { return v }
     uint64 p = ir_cse_canon + v * 4
     uint32 c = 0
     unsafe { *(p as uint32) -> c }
@@ -10211,6 +10625,9 @@ fn ir_cse_canon_set(uint64 dest, uint64 canonical) {
     uint64 p = ir_cse_canon + dest * 4
     uint32 c = canonical
     unsafe { *(p as uint32) = c }
+    uint64 gp = ir_cse_canon_gen + dest * 4
+    uint32 g = ir_cse_epoch
+    unsafe { *(gp as uint32) = g }
 }
 
 fn ir_opt_cse_invalidates(uint64 op) -> uint64 {
@@ -10242,8 +10659,15 @@ fn ir_opt_cse_is_pure(uint64 op) -> uint64 {
 fn ir_opt_cse() {
     if ir_cse_table == 0 { ir_cse_table = alloc(4096 * 40) }
     if ir_cse_canon == 0 { ir_cse_canon = alloc(65536 * 4) }
-    memset(ir_cse_table, 0, 4096 * 40)
-    memset(ir_cse_canon, 0, 65536 * 4)
+    if ir_cse_gen == 0 {
+        ir_cse_gen = alloc(4096 * 4)
+        memset(ir_cse_gen, 0, 4096 * 4)
+        ir_cse_canon_gen = alloc(65536 * 4)
+        memset(ir_cse_canon_gen, 0, 65536 * 4)
+    }
+    // Epoch 0 is reserved for "never written": bump before use so stale
+    // gen tags from previous functions can never match.
+    ir_cse_epoch = ir_cse_epoch + 1
 
     uint64 cur_bb = 0xFFFFFFFF
 
@@ -10254,8 +10678,7 @@ fn ir_opt_cse() {
 
         uint64 bb = ir_insn_bb(ii)
         if bb != cur_bb {
-            memset(ir_cse_table, 0, 4096 * 40)
-            memset(ir_cse_canon, 0, 65536 * 4)
+            ir_cse_epoch = ir_cse_epoch + 1
             cur_bb = bb
         }
 
@@ -10269,8 +10692,7 @@ fn ir_opt_cse() {
         }
 
         if ir_opt_cse_invalidates(op) != 0 {
-            memset(ir_cse_table, 0, 4096 * 40)
-            memset(ir_cse_canon, 0, 65536 * 4)
+            ir_cse_epoch = ir_cse_epoch + 1
             ii = ii + 1
             continue
         }
@@ -10295,6 +10717,11 @@ fn ir_opt_cse() {
 
         uint64 e_op = 0
         unsafe { *(entry as uint64) -> e_op }
+        uint64 gslot = ir_cse_gen + h * 4
+        uint32 e_gen32 = 0
+        unsafe { *(gslot as uint32) -> e_gen32 }
+        uint64 e_gen = e_gen32
+        if e_gen != ir_cse_epoch { e_op = 0 }
 
         if e_op == op {
             uint64 e_s1 = 0
@@ -10332,6 +10759,8 @@ fn ir_opt_cse() {
         unsafe { *(p_s2w as uint64) = s2 }
         unsafe { *(p_immw as uint64) = imm }
         unsafe { *(p_rw as uint64) = dest }
+        uint32 ng32 = ir_cse_epoch
+        unsafe { *(gslot as uint32) = ng32 }
 
         ii = ii + 1
     }
@@ -10730,9 +11159,14 @@ fn ir_build_def_idx() {
         ir_def_idx_cap = 65536
         ir_def_idx_buf = alloc(ir_def_idx_cap * 4)
     }
-    // 0xFFFFFFFF sentinel = no def found.
+    // 0xFFFFFFFF sentinel = no def found. PROTOTYPE: only the entries a
+    // live vreg can index (ir_vreg_next) need the sentinel — filling the
+    // full 65536-entry capacity cost 256 KB of scalar stores per call,
+    // three calls per function (rotate/lea/ffma).
+    uint64 def_clear_n = ir_vreg_next
+    if def_clear_n > ir_def_idx_cap { def_clear_n = ir_def_idx_cap }
     uint64 i = 0
-    while i < ir_def_idx_cap {
+    while i < def_clear_n {
         uint64 p = ir_def_idx_buf + i * 4
         uint32 fff = 0xFFFFFFFF
         unsafe { *(p as uint32) = fff }
@@ -10875,6 +11309,7 @@ fn ir_opt_recognize_rotate() {
 }
 
 @export
+
 fn ir_emit_x86_function(uint64 fn_node) {
     // Check for @naked attribute: bit 1 of annotation flags
     uint32 ann_flags = ast_data4(fn_node)

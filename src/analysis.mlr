@@ -450,6 +450,7 @@ fn run_analysis(uint64 root) -> uint64 {
 fn sema_init(uint64 source, uint64 tok_buf) {
     fn_sig_table = alloc(4096 * 16)
     fn_sig_count = 0
+    if sigh_buf != 0 { memset(sigh_buf, 0, 8192 * 4) }
     sema_errors = 0
     sema_source = source
     sema_tok_buf = tok_buf
@@ -804,6 +805,27 @@ fn sema_tok_text_eq(uint64 tok_a, uint64 tok_b) -> uint64 {
     return 1
 }
 
+// PROTOTYPE: hash index over fn_sig_table — fn_sig_lookup was a linear
+// string-compare scan over every defined function, once per call site.
+static uint64 sigh_buf = 0
+
+fn sema_name_hash(uint64 name_tok) -> uint64 {
+    uint64 s = sema_tok_text_start(name_tok)
+    uint64 l = sema_tok_text_len(name_tok)
+    uint64 p = sema_source + s
+    uint64 h = 2166136261
+    uint64 i = 0
+    while i < l {
+        uint64 c = 0
+        uint64 pc2 = p + i
+        unsafe { *(pc2 as uint8) -> c }
+        h = (h ^ c) * 16777619
+        h = h & 0xFFFFFFFF
+        i = i + 1
+    }
+    return h & 8191
+}
+
 // Register a function signature: name_tok, param_count, has_return
 fn fn_sig_register(uint64 name_tok, uint64 param_count, uint64 has_return) {
     uint64 entry = fn_sig_table + fn_sig_count * 16
@@ -815,14 +837,52 @@ fn fn_sig_register(uint64 name_tok, uint64 param_count, uint64 has_return) {
     uint64 e8 = entry + 8
     uint32 hr = has_return
     unsafe { *(e8 as uint32) = hr }
+    // Insert into hash (keep-first so lookup semantics stay first-match).
+    if sigh_buf == 0 {
+        sigh_buf = alloc(8192 * 4)
+        memset(sigh_buf, 0, 8192 * 4)
+    }
+    uint64 h = sema_name_hash(name_tok)
+    uint64 probes = 0
+    while probes < 8192 {
+        uint64 sp = sigh_buf + h * 4
+        uint32 sv = 0
+        unsafe { *(sp as uint32) -> sv }
+        if sv == 0 {
+            uint32 nv = fn_sig_count + 1
+            unsafe { *(sp as uint32) = nv }
+            probes = 8192
+        } else {
+            uint64 pidx = sv
+            pidx = pidx - 1
+            uint64 pentry = fn_sig_table + pidx * 16
+            uint32 pt32 = 0
+            unsafe { *(pentry as uint32) -> pt32 }
+            uint64 pt = pt32
+            if sema_tok_text_eq(pt, name_tok) != 0 {
+                probes = 8192
+            } else {
+                h = (h + 1) & 8191
+                probes = probes + 1
+            }
+        }
+    }
     fn_sig_count = fn_sig_count + 1
 }
 
 // Lookup a function signature by name. Returns param_count or 0xFFFFFFFF if not found.
 fn fn_sig_lookup(uint64 name_tok) -> uint64 {
-    uint64 i = 0
-    while i < fn_sig_count {
-        uint64 entry = fn_sig_table + i * 16
+    if sigh_buf == 0 { return 0xFFFFFFFF }
+    uint64 h = sema_name_hash(name_tok)
+    uint64 probes = 0
+    while probes < 8192 {
+        uint64 sp = sigh_buf + h * 4
+        uint32 sv = 0
+        unsafe { *(sp as uint32) -> sv }
+        if sv == 0 { return 0xFFFFFFFF }
+        uint64 idx = sv
+        idx = idx - 1
+        uint64 entry = fn_sig_table + idx * 16
         uint32 stored_tok = 0
         unsafe { *(entry as uint32) -> stored_tok }
         uint64 wst = stored_tok
@@ -832,7 +892,8 @@ fn fn_sig_lookup(uint64 name_tok) -> uint64 {
             unsafe { *(e4 as uint32) -> pc }
             return pc
         }
-        i = i + 1
+        h = (h + 1) & 8191
+        probes = probes + 1
     }
     return 0xFFFFFFFF
 }

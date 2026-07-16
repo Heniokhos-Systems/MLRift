@@ -2022,6 +2022,77 @@ fn fn_section_lookup(uint64 name_tok) -> uint64 {
     return 0
 }
 
+// PROTOTYPE: hash index over fn_table for resolve_fixups (one probe per
+// fixup instead of a linear tok_text_eq scan over ~1900 functions).
+// First-insertion-wins to preserve fn_lookup's first-match semantics.
+static uint64 fnh_buf = 0
+
+fn fn_hash_build() {
+    if fnh_buf == 0 { fnh_buf = alloc(8192 * 4) }
+    memset(fnh_buf, 0, 8192 * 4)
+    uint64 i = 0
+    while i < fn_count {
+        uint64 entry = fn_table + i * 8
+        uint32 nt32 = 0
+        unsafe { *(entry as uint32) -> nt32 }
+        uint64 nt = nt32
+        uint64 h = dce_name_hash(nt)
+        uint64 probes = 0
+        while probes < 8192 {
+            uint64 sp = fnh_buf + h * 4
+            uint32 sv = 0
+            unsafe { *(sp as uint32) -> sv }
+            if sv == 0 {
+                uint32 nv = i + 1
+                unsafe { *(sp as uint32) = nv }
+                probes = 8192
+            } else {
+                // Same name already present? Keep the first (linear
+                // fn_lookup returns the first match).
+                uint64 pidx = sv
+                pidx = pidx - 1
+                uint64 pentry = fn_table + pidx * 8
+                uint32 pt32 = 0
+                unsafe { *(pentry as uint32) -> pt32 }
+                uint64 pt = pt32
+                if tok_text_eq(pt, nt) != 0 {
+                    probes = 8192
+                } else {
+                    h = (h + 1) & 8191
+                    probes = probes + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+fn fn_lookup_hashed(uint64 name_tok) -> uint64 {
+    uint64 h = dce_name_hash(name_tok)
+    uint64 probes = 0
+    while probes < 8192 {
+        uint64 sp = fnh_buf + h * 4
+        uint32 sv = 0
+        unsafe { *(sp as uint32) -> sv }
+        if sv == 0 { return 0xFFFFFFFF }
+        uint64 idx = sv
+        idx = idx - 1
+        uint64 entry = fn_table + idx * 8
+        uint32 st32 = 0
+        unsafe { *(entry as uint32) -> st32 }
+        uint64 st = st32
+        if tok_text_eq(st, name_tok) != 0 {
+            uint64 e4 = entry + 4
+            uint32 off = 0
+            unsafe { *(e4 as uint32) -> off }
+            return off
+        }
+        h = (h + 1) & 8191
+        probes = probes + 1
+    }
+    return 0xFFFFFFFF
+}
+
 fn fn_lookup(uint64 name_tok) -> uint64 {
     uint64 i = 0
     while i < fn_count {
@@ -10551,6 +10622,7 @@ fn find_main_offset() -> uint64 {
 // Resolve call fixups
 @export
 fn resolve_fixups() {
+    fn_hash_build()
     uint64 i = 0
     while i < fixup_count {
         uint64 fentry = fixup_table + i * 8
@@ -10561,7 +10633,7 @@ fn resolve_fixups() {
         unsafe { *(fe4 as uint32) -> target_tok }
 
         uint64 wtt = target_tok
-        uint64 target_off = fn_lookup(wtt)
+        uint64 target_off = fn_lookup_hashed(wtt)
         if target_off != 0xFFFFFFFF {
             uint64 wpo = patch_off
             uint64 disp = target_off - wpo - 4
@@ -10678,6 +10750,27 @@ static uint64 dce_enabled = 0
 static uint64 dce_keep_all = 0
 
 @export
+// PROTOTYPE: hash set over the live table. 8192 slots, linear probing.
+// Slot stores (dce_table index + 1); 0 = empty.
+static uint64 dce_hash_buf = 0
+
+fn dce_name_hash(uint64 name_tok) -> uint64 {
+    uint64 s = tok_text_start(name_tok)
+    uint64 l = tok_text_len(name_tok)
+    uint64 p = cg_source + s
+    uint64 h = 2166136261
+    uint64 i = 0
+    while i < l {
+        uint64 c = 0
+        uint64 pc = p + i
+        unsafe { *(pc as uint8) -> c }
+        h = (h ^ c) * 16777619
+        h = h & 0xFFFFFFFF
+        i = i + 1
+    }
+    return h & 8191
+}
+
 fn dce_init() {
     dce_table = alloc(2048 * 4)
     dce_count = 0
@@ -10685,6 +10778,8 @@ fn dce_init() {
     dce_fn_map_count = 0
     dce_enabled = 1
     dce_keep_all = 0
+    if dce_hash_buf == 0 { dce_hash_buf = alloc(8192 * 4) }
+    memset(dce_hash_buf, 0, 8192 * 4)
 }
 
 @export
@@ -10694,14 +10789,23 @@ fn dce_set_keep_all(uint64 v) {
 
 // Check if a function name token is already in the live set
 fn dce_has(uint64 name_tok) -> uint64 {
-    uint64 i = 0
-    while i < dce_count {
-        uint64 entry = dce_table + i * 4
+    // PROTOTYPE: hash-set probe replaces O(dce_count) tok_text_eq scan.
+    uint64 h = dce_name_hash(name_tok)
+    uint64 probes = 0
+    while probes < 8192 {
+        uint64 sp = dce_hash_buf + h * 4
+        uint32 sv = 0
+        unsafe { *(sp as uint32) -> sv }
+        if sv == 0 { return 0 }
+        uint64 idx = sv
+        idx = idx - 1
+        uint64 entry = dce_table + idx * 4
         uint32 stored = 0
         unsafe { *(entry as uint32) -> stored }
         uint64 ws = stored
         if tok_text_eq(ws, name_tok) != 0 { return 1 }
-        i = i + 1
+        h = (h + 1) & 8191
+        probes = probes + 1
     }
     return 0
 }
@@ -10717,6 +10821,22 @@ fn dce_add(uint64 name_tok) -> uint64 {
     uint64 entry = dce_table + dce_count * 4
     uint32 nt = name_tok
     unsafe { *(entry as uint32) = nt }
+    // Insert into hash set: first empty slot from the name's hash.
+    uint64 h = dce_name_hash(name_tok)
+    uint64 probes = 0
+    while probes < 8192 {
+        uint64 sp = dce_hash_buf + h * 4
+        uint32 sv = 0
+        unsafe { *(sp as uint32) -> sv }
+        if sv == 0 {
+            uint32 nv = dce_count + 1
+            unsafe { *(sp as uint32) = nv }
+            probes = 8192
+        } else {
+            h = (h + 1) & 8191
+            probes = probes + 1
+        }
+    }
     dce_count = dce_count + 1
     return 1
 }
@@ -11021,26 +11141,23 @@ fn dce_scan(uint64 mod_node) {
         }
     }
 
-    // Phase 2: Transitive closure — scan bodies of live functions
-    // Keep iterating until no new functions are added
-    uint64 prev_count = 0
-    while prev_count != dce_count {
-        prev_count = dce_count
-        uint64 i = 0
-        // Scan from the beginning each time (simple but correct)
-        while i < dce_count {
-            uint64 entry = dce_table + i * 4
-            uint32 live_tok = 0
-            unsafe { *(entry as uint32) -> live_tok }
-            uint64 wlt = live_tok
-            // Find the function body
-            uint64 fn_node = dce_lookup_fn(wlt)
-            if fn_node != 0 {
-                // Scan the function body (children after params)
-                dce_scan_node(fn_node)
-            }
-            i = i + 1
+    // Phase 2: Transitive closure. PROTOTYPE: the table only ever appends,
+    // so a single growing-worklist pass visits each live function exactly
+    // once — the old version re-scanned EVERY live body on every outer
+    // fixpoint round (call-graph-depth full AST re-walks).
+    uint64 i = 0
+    while i < dce_count {
+        uint64 entry = dce_table + i * 4
+        uint32 live_tok = 0
+        unsafe { *(entry as uint32) -> live_tok }
+        uint64 wlt = live_tok
+        // Find the function body
+        uint64 fn_node = dce_lookup_fn(wlt)
+        if fn_node != 0 {
+            // Scan the function body (children after params)
+            dce_scan_node(fn_node)
         }
+        i = i + 1
     }
 }
 
