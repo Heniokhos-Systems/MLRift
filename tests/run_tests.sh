@@ -1818,6 +1818,14 @@ fn main() { O o; o.inn.a = 42; uint64 r = poke(o.inn); exit(o.inn.a) }' 42
 fn poke(P c) -> uint64 { c.x = 99; return c.x }
 fn main() { P[3] arr; arr[1].x = 42; uint64 r = poke(arr[1]); exit(arr[1].x) }' 42
 
+    run_test_a64 "a64_method_self_mutation" 'struct P { uint64 x; uint64 y }
+fn P.bump(P self) { self.x = 42 }
+fn main() { P p; p.x = 1; p.bump(); exit(p.x) }' 42
+
+    run_test_a64 "a64_method_self_elem_recv" 'struct P { uint64 x; uint64 y }
+fn P.setx(P self, uint64 v) { self.x = v }
+fn main() { P[3] arr; arr[2].x = 1; arr[2].setx(42); exit(arr[2].x) }' 42
+
     run_test_a64 "a64_struct_return" 'struct P { uint64 x; uint64 y }
 fn make() -> P { P r; r.x = 10; r.y = 32; return r }
 fn main() { P a = make(); exit(a.x + a.y) }' 42
@@ -2816,6 +2824,75 @@ fn main() {
     arr[1].x = 40; arr[1].y = 2
     P c = arr[1]
     exit(c.x + c.y)
+}' 42
+
+# --- Method `self` is BY REFERENCE ---
+# `fn Struct.m(Struct self)` receives self as a reference to the caller''s
+# storage: writes through self must persist. Without this, EVERY mutating
+# method is a silent no-op (there is no diagnostic), and the language has
+# no safe way to pass a mutable struct at all.
+run_test "method_self_mutation" 'struct P { uint64 x; uint64 y }
+fn P.bump(P self) { self.x = 42 }
+fn main() {
+    P p; p.x = 1; p.y = 2
+    p.bump()
+    exit(p.x)
+}' 42
+
+run_test "method_self_mutation_arg" 'struct P { uint64 x; uint64 y }
+fn P.setx(P self, uint64 v) { self.x = v }
+fn P.getx(P self) -> uint64 { return self.x }
+fn main() {
+    P p; p.x = 1
+    p.setx(41)
+    exit(p.getx() + 1)
+}' 42
+
+# Nested-field receiver: w.p.setx(...) mutates the inner struct in place.
+run_test "method_self_nested_recv" 'struct P { uint64 x; uint64 y }
+struct W { P p; uint64 z }
+fn P.setx(P self, uint64 v) { self.x = v }
+fn main() {
+    W w; w.p.x = 1
+    w.p.setx(42)
+    exit(w.p.x)
+}' 42
+
+# Array-element receiver: arr[i].setx(...) used to parse as a bare field
+# access with the argument list silently DROPPED (no call, no diagnostic).
+run_test "method_self_elem_recv" 'struct P { uint64 x; uint64 y }
+fn P.setx(P self, uint64 v) { self.x = v }
+fn main() {
+    P[3] arr
+    arr[2].x = 1
+    arr[2].setx(42)
+    exit(arr[2].x)
+}' 42
+
+run_test_legacy "method_self_mutation_legacy" 'struct P { uint64 x; uint64 y }
+fn P.bump(P self) { self.x = 42 }
+fn main() {
+    P p; p.x = 1; p.y = 2
+    p.bump()
+    exit(p.x)
+}' 42
+
+run_test_legacy "method_self_nested_recv_legacy" 'struct P { uint64 x; uint64 y }
+struct W { P p; uint64 z }
+fn P.setx(P self, uint64 v) { self.x = v }
+fn main() {
+    W w; w.p.x = 1
+    w.p.setx(42)
+    exit(w.p.x)
+}' 42
+
+run_test_legacy "method_self_elem_recv_legacy" 'struct P { uint64 x; uint64 y }
+fn P.setx(P self, uint64 v) { self.x = v }
+fn main() {
+    P[3] arr
+    arr[2].x = 1
+    arr[2].setx(42)
+    exit(arr[2].x)
 }' 42
 
 # Semantics lock: plain params never alias even when re-passed through a
