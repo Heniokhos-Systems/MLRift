@@ -387,7 +387,8 @@ fn build_gemm_grouped_descriptor(
     u64 acc_flag_arr,
     u32 precision,
     u64 tile_count_out,
-    u64 total_tiles_out
+    u64 total_tiles_out,
+    u64 tile_dim
 ) {
     u64 b64 = b_batch
     u64 nbytes = b64 * 88
@@ -411,8 +412,10 @@ fn build_gemm_grouped_descriptor(
         // partial-tile lanes are correctly bounded under the OOB-pad clamp.
         u64 m64 = m_g
         u64 n64 = n_g
-        u64 tiles_m = (m64 + 15) / 16
-        u64 tiles_n = (n64 + 15) / 16
+        // tile_dim = 16 (baseline gemm_f32_grouped / bf16) or 32 (RB2 variant,
+        // 2x2 register-blocked).  Must match the kernel the descriptor is fed to.
+        u64 tiles_m = (m64 + tile_dim - 1) / tile_dim
+        u64 tiles_n = (n64 + tile_dim - 1) / tile_dim
         u32 tc_g = tiles_m * tiles_n
         u32 tp_g = total_tiles
         unsafe { *((base +  0) as u32) = m_g }
@@ -1047,6 +1050,11 @@ fn main() {
     // descriptor table; we use it in same-shape fast-path mode for the dV/dU
     // contractions (1 dispatch per view per shape) instead of 4× gemm_f32_accum.
     u64 fh_ggrp   = load_co("/tmp/gemm_f32_grouped.co",       "gemm_f32_grouped")
+    // RB2 variant (2x2 register-blocked, 32x32 output tile): halves the redundant
+    // global A/B panel traffic. Same symbol/ABI, separate .co. Requires 32|M,32|N —
+    // all WZMA grouped shapes (R=32, D=384, BS=16*B) satisfy it. Descriptors fed to
+    // this handle MUST be built with tile_dim=32.
+    u64 fh_ggrp_rb2 = load_co("/tmp/gemm_f32_grouped_rb2.co", "gemm_f32_grouped")
     // ── Task 1B.3: bf16-WMMA grouped .co (Phase 1B.1/1B.2) — opt-in path ───
     // Loaded alongside the f32 kernel; the bwd_uv code-path picks via the
     // MLRIFT_BWD_UV_PRECISION env knob.  Same kernarg ABI as fh_ggrp; differs
@@ -1372,7 +1380,7 @@ fn main() {
                     u64 tot_fU_slot = alloc(4); unsafe { *(tot_fU_slot as u32) = 0 }
                     build_gemm_grouped_descriptor(d_desc_fU_cur, K,
                         M_fU, N_fU, KK_fU, LdA_fU, LdB_fU, LdC_fU,
-                        Ap_fU, Bp_fU, Cp_fU, Ac_fU, 0, 0, tot_fU_slot)
+                        Ap_fU, Bp_fU, Cp_fU, Ac_fU, 0, 0, tot_fU_slot, 32)
                     unsafe { *(tot_fU_slot as u32) -> tot_fU }
                     dealloc(M_fU);  dealloc(N_fU);  dealloc(KK_fU)
                     dealloc(LdA_fU);dealloc(LdB_fU);dealloc(LdC_fU)
@@ -1385,7 +1393,7 @@ fn main() {
                     // trip).  Step 0 only ⇒ amortized to ~0 over training.
                     sync_or_die("land fwd-U desc (step 0)")
                 }
-                launch_gemm_grouped(fh_ggrp, d_desc_fU_cur, K, tot_fU, 1, 0, d_cntr_fU, fh_fill)
+                launch_gemm_grouped(fh_ggrp_rb2, d_desc_fU_cur, K, tot_fU, 1, 0, d_cntr_fU, fh_fill)
                 if profile_on == 1 { sync_or_die("sync fwd-U grouped"); t1 = time_now(); ns_u = ns_u + (t1 - t0) }
 
                 // Phase 3: grouped V-einsum  outk_k[BS,D] = inter_k[BS,R] @ V_k[R,D]
@@ -1418,7 +1426,7 @@ fn main() {
                     u64 tot_fV_slot = alloc(4); unsafe { *(tot_fV_slot as u32) = 0 }
                     build_gemm_grouped_descriptor(d_desc_fV, K,
                         M_fV, N_fV, KK_fV, LdA_fV, LdB_fV, LdC_fV,
-                        Ap_fV, Bp_fV, Cp_fV, Ac_fV, 0, 0, tot_fV_slot)
+                        Ap_fV, Bp_fV, Cp_fV, Ac_fV, 0, 0, tot_fV_slot, 32)
                     unsafe { *(tot_fV_slot as u32) -> tot_fV }
                     dealloc(M_fV);  dealloc(N_fV);  dealloc(KK_fV)
                     dealloc(LdA_fV);dealloc(LdB_fV);dealloc(LdC_fV)
@@ -1426,7 +1434,7 @@ fn main() {
                     dealloc(Ac_fV); dealloc(tot_fV_slot)
                     sync_or_die("land fwd-V desc (step 0)")
                 }
-                launch_gemm_grouped(fh_ggrp, d_desc_fV, K, tot_fV, 1, 0, d_cntr_fV, fh_fill)
+                launch_gemm_grouped(fh_ggrp_rb2, d_desc_fV, K, tot_fV, 1, 0, d_cntr_fV, fh_fill)
                 if profile_on == 1 { sync_or_die("sync fwd-V grouped"); t1 = time_now(); ns_v = ns_v + (t1 - t0) }
 
                 // Phase 3b: repack inter [K,BS,R]→[BS,K,R] and outk [K,BS,D]→[BS,K,D]
@@ -1782,9 +1790,9 @@ fn main() {
                 u64 tot_di_slot = alloc(4); unsafe { *(tot_di_slot as u32) = 0 }
                 build_gemm_grouped_descriptor(d_desc_dint, K,
                     M_di, N_di, KK_di, LdA_di, LdB_di, LdC_di,
-                    Ap_di, Bp_di, Cp_di, Ac_di, 0, 0, tot_di_slot)
+                    Ap_di, Bp_di, Cp_di, Ac_di, 0, 0, tot_di_slot, 32)
                 u32 tot_di = 0; unsafe { *(tot_di_slot as u32) -> tot_di }
-                launch_gemm_grouped(fh_ggrp, d_desc_dint, K, tot_di, 1, 0, d_cntr_dint, fh_fill)
+                launch_gemm_grouped(fh_ggrp_rb2, d_desc_dint, K, tot_di, 1, 0, d_cntr_dint, fh_fill)
                 dealloc(M_di);  dealloc(N_di);  dealloc(KK_di)
                 dealloc(LdA_di);dealloc(LdB_di);dealloc(LdC_di)
                 dealloc(Ap_di); dealloc(Bp_di); dealloc(Cp_di)
@@ -1844,11 +1852,13 @@ fn main() {
                 // only the `precision` descriptor field (offset 52) and the
                 // kernel file-handle differ.  In bf16 mode we first pack the f32
                 // A/B inputs into the bf16 shadow buffers (on-GPU truncating cast).
-                u64 fh_for_buv = fh_ggrp
+                u64 fh_for_buv = fh_ggrp_rb2
                 u32 prec_for_buv = 0
+                u64 td_for_buv = 32
                 if use_bf16 == 1 {
                     fh_for_buv = fh_bf16_grouped
                     prec_for_buv = 1
+                    td_for_buv = 16
                     // Cast the whole interT [K,R,BS] + doutk [K,BS,D] tensors.
                     launch_pack_f32_to_bf16(fh_pack_bf16, d_interT, d_interT_bf, K*R*BS)
                     launch_pack_f32_to_bf16(fh_pack_bf16, d_doutk,  d_doutk_bf,  K*BS*D)
@@ -1856,7 +1866,7 @@ fn main() {
                 }
                 build_gemm_grouped_descriptor(d_desc_dV, K,
                     M_dV, N_dV, KK_dV, LdA_dV, LdB_dV, LdC_dV,
-                    Ap_dV, Bp_dV, Cp_dV, Ac_dV, prec_for_buv, 0, tot_dV_slot)
+                    Ap_dV, Bp_dV, Cp_dV, Ac_dV, prec_for_buv, 0, tot_dV_slot, td_for_buv)
                 u32 tot_dV = 0; unsafe { *(tot_dV_slot as u32) -> tot_dV }
                 launch_gemm_grouped(fh_for_buv, d_desc_dV, K, tot_dV, 1, prec_for_buv, d_cntr_dV, fh_fill)
                 dealloc(M_dV);   dealloc(N_dV);   dealloc(KK_dV)
@@ -1916,7 +1926,7 @@ fn main() {
                 }
                 build_gemm_grouped_descriptor(d_desc_dU, K,
                     M_dU, N_dU, KK_dU, LdA_dU, LdB_dU, LdC_dU,
-                    Ap_dU, Bp_dU, Cp_dU, Ac_dU, prec_for_buv, 0, tot_dU_slot)
+                    Ap_dU, Bp_dU, Cp_dU, Ac_dU, prec_for_buv, 0, tot_dU_slot, td_for_buv)
                 u32 tot_dU = 0; unsafe { *(tot_dU_slot as u32) -> tot_dU }
                 launch_gemm_grouped(fh_for_buv, d_desc_dU, K, tot_dU, 1, prec_for_buv, d_cntr_dU, fh_fill)
                 dealloc(M_dU);   dealloc(N_dU);   dealloc(KK_dU)
