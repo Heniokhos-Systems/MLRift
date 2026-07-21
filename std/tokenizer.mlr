@@ -5,17 +5,20 @@
 //   — tokenizer_load(path): mmap the JSON, extract the vocab and byte-fallback
 //     table into heap arrays, build a string→id hash for encode, and cache the
 //     special-token IDs the caller usually needs (bos/eos/pad/unk).
-//   — tokenizer_encode(tk, input): greedy longest-prefix-match encoding
-//     against the vocab with byte-fallback for anything unmatched. Not a
-//     true BPE implementation — Phase C will swap in the real merge loop.
+//   — tokenizer_encode(tk, input): byte-level BPE via the merge-rank loop
+//     when the loaded tokenizer is byte-level AND carries a "merges" table;
+//     otherwise greedy longest-prefix-match against the vocab with
+//     byte-fallback for anything unmatched (SentencePiece / WordPiece).
 //   — tokenizer_decode(tk, ids, count): correct decoder — vocab lookups,
 //     byte-fallback tokens resolved to raw bytes, space ↔ '▁' reversal.
 //
-// Everything else from the full HF spec (normalizer stack, pre-tokenizers,
-// post-processors, template processing, added_tokens merging order) is
-// deliberately skipped for now — the greedy encoder produces HF-compatible
-// *decodings* but not HF-bit-identical *encodings*. Sufficient for running
-// a forward pass; insufficient for reproducing public token-ID traces.
+// Everything else from the full HF spec (normalizer stack, post-processors,
+// template processing, added_tokens merging order) is deliberately skipped.
+// The pre-tokenizer is an approximation of the byte-level regex — see the
+// notes above tk_bpe_encode for exactly which alternatives are modelled and
+// which aren't. The greedy path produces HF-compatible *decodings* but not
+// HF-bit-identical *encodings*; the BPE path reproduces canonical HF token
+// IDs for inputs the pre-tokenizer approximation covers.
 
 import "io.mlr"
 import "string.mlr"
@@ -113,6 +116,17 @@ static u64 tk_bpe_ranks    = 0
 static u64 tk_bpe_cap      = 0
 static u64 tk_bpe_count    = 0
 static u64 tk_encoder_mode = 0
+
+// Digit pre-tokenization rule — the two byte-level tokenizer families
+// disagree and the ids differ if you pick the wrong one:
+//   0 (default) : llama-bpe / qwen2 regex — `\p{N}{1,3}`, digits split into
+//                 groups of at most 3 and a leading space never folds into
+//                 them. This is what the GGUF gpt2 path needs.
+//   1           : GPT-2 / plain-ByteLevel regex — ` ?\p{N}+`, one pre-token
+//                 per digit run of any length, with an optional leading
+//                 space folded in. Set by tokenizer_load when the JSON's
+//                 pre_tokenizer is a bare ByteLevel.
+static u64 tk_bpe_gpt2_digits = 0
 
 // ---------------------------------------------------------------------------
 // Small JSON scanning helpers — tailored to tokenizer.json's structure.
@@ -289,6 +303,27 @@ fn tk_parse_uint(u64 base, u64 size, u64 pos, u64 out_val) -> u64 {
     return pos
 }
 
+// Find the first occurrence of the NUL-terminated `needle` in the mmap'd
+// range [from, size). Returns the byte offset of the match, or
+// 0xFFFFFFFFFFFFFFFF when the needle is absent. We can't use
+// str_index_of here — the JSON is mmap'd, so there's no NUL terminator.
+fn tk_find_sub(u64 base, u64 size, u64 from, u64 needle) -> u64 {
+    u64 nlen = str_len(needle)
+    if nlen == 0 { return 0xFFFFFFFFFFFFFFFF }
+    u64 scan = from
+    while scan + nlen <= size {
+        u64 match_ = 1
+        u64 k = 0
+        while k < nlen {
+            if load8(base + scan + k) != load8(needle + k) { match_ = 0; k = nlen; continue }
+            k = k + 1
+        }
+        if match_ != 0 { return scan }
+        scan = scan + 1
+    }
+    return 0xFFFFFFFFFFFFFFFF
+}
+
 // ---------------------------------------------------------------------------
 // FNV-1a 32-bit hash on a byte range — fast enough for vocab-lookup and
 // small enough that the whole hash table fits in a few megabytes.
@@ -390,6 +425,11 @@ fn tokenizer_load(u64 path) -> Tokenizer {
     file_close(fd)
     tk.file_size = sz
     tk.file_base = base
+    // Fresh load — don't inherit an encoder mode or pre-tokenizer rule from a
+    // previously-loaded tokenizer. The merges/byte-level checks at the end
+    // re-enable them.
+    tk_encoder_mode = 0
+    tk_bpe_gpt2_digits = 0
 
     // -----------------------------------------------------------------------
     // Find the `"vocab":{` opening and the enclosing `}` that ends the dict.
@@ -398,23 +438,8 @@ fn tokenizer_load(u64 path) -> Tokenizer {
     // always names this key this exact way, so this is stable.
     // -----------------------------------------------------------------------
     u64 needle = "\"vocab\":"
-    u64 idx = 0xFFFFFFFFFFFFFFFF
-    u64 npos = 0
-    u64 bb = 0
-    // Manual substring search — the JSON is mmap'd, so we can't use str_index_of
-    // directly (it needs a null-terminated haystack).
-    u64 scan = 0
     u64 nlen = str_len(needle)
-    while scan + nlen <= sz {
-        u64 match_ = 1
-        u64 k = 0
-        while k < nlen {
-            if load8(base + scan + k) != load8(needle + k) { match_ = 0; k = nlen; continue }
-            k = k + 1
-        }
-        if match_ != 0 { idx = scan; scan = sz; continue }
-        scan = scan + 1
-    }
+    u64 idx = tk_find_sub(base, sz, 0, needle)
     if idx == 0xFFFFFFFFFFFFFFFF {
         print("[tokenizer] \"vocab\": not found\n")
         exit(1)
@@ -533,6 +558,80 @@ fn tokenizer_load(u64 path) -> Tokenizer {
     tk.unk_id = tokenizer_id_of(tk, "<unk>", 5)
     tk.byte_fallback_base = tokenizer_id_of(tk, "<0x00>", 6)
 
+    // -----------------------------------------------------------------------
+    // Byte-level detection. HF serialises `model` last, so the normalizer /
+    // pre_tokenizer / decoder stanzas all live before the "vocab" key — we
+    // only scan that prefix, which keeps a vocab token that happens to spell
+    // "ByteLevel" from being mistaken for a pre_tokenizer type. As a backstop
+    // we probe the vocab for "Ġ" (U+0120), which only a bytes_to_unicode
+    // vocab contains.
+    // -----------------------------------------------------------------------
+    u64 is_byte_level = 0
+    if tk_find_sub(base, idx, 0, "\"ByteLevel\"") != 0xFFFFFFFFFFFFFFFF {
+        is_byte_level = 1
+    }
+    if is_byte_level == 0 {
+        u64 gprobe = alloc(2)
+        u8 g0 = 0xC4
+        u8 g1 = 0xA0
+        store8(gprobe, g0)
+        store8(gprobe + 1, g1)
+        if tokenizer_id_of(tk, gprobe, 2) != 0xFFFFFFFFFFFFFFFF { is_byte_level = 1 }
+        dealloc(gprobe)
+    }
+
+    // -----------------------------------------------------------------------
+    // Merges. `pos` sits just past the vocab dict's closing '}', and HF always
+    // writes "merges" after "vocab" inside the same model object — starting
+    // the search there means a vocab token spelling "merges" can't be
+    // mistaken for the key. Two passes: one to count (so the table can be
+    // sized exactly like the GGUF path), one to insert.
+    //
+    // No merges key => leave the table empty and stay on greedy
+    // longest-prefix-match, which is what SentencePiece tokenizer.json files
+    // (Gemma / Mistral / Llama-2) need.
+    // -----------------------------------------------------------------------
+    u64 midx = tk_find_sub(base, sz, pos, "\"merges\"")
+    if midx != 0xFFFFFFFFFFFFFFFF {
+        u64 mpos = midx + 8
+        mpos = tk_skip_ws(base, sz, mpos)
+        if load8(base + mpos) == 58 {          // ':'
+            mpos = mpos + 1
+            mpos = tk_skip_ws(base, sz, mpos)
+            if load8(base + mpos) == 91 {      // '['
+                u64 scratch_cap = tk.max_tok_len * 2 + 64
+                u64 scratch = alloc(scratch_cap)
+                u64 m_pos_box = alloc(8)
+                u64 m_off_box = alloc(8)
+                u64 n_merges = tk_json_scan_merges(tk, base, sz, mpos, 0,
+                                                    scratch, m_pos_box, m_off_box)
+                if n_merges != 0 {
+                    tk_bpe_table_alloc(n_merges)
+                    tk_json_scan_merges(tk, base, sz, mpos, 1,
+                                         scratch, m_pos_box, m_off_box)
+                }
+                dealloc(scratch)
+                dealloc(m_pos_box)
+                dealloc(m_off_box)
+            }
+        }
+    }
+
+    // Byte-level vocab + a populated merge table => the real BPE encoder.
+    // Byte-level with no merges keeps greedy matching, just over the
+    // bytes_to_unicode alphabet.
+    if is_byte_level != 0 {
+        tokenizer_set_kind_gpt2(tk)
+        // A *bare* ByteLevel pre_tokenizer (no Split stage) means the GPT-2
+        // regex, whose digit rule differs from llama-bpe's. Qwen2/3 wrap
+        // ByteLevel in a Sequence with an explicit Split regex — those keep
+        // the default rule.
+        if tk_find_sub(base, idx, 0, "\"Split\"") == 0xFFFFFFFFFFFFFFFF {
+            tk_bpe_gpt2_digits = 1
+        }
+        if tk_bpe_count != 0 { tk_encoder_mode = 1 }
+    }
+
     return tk
 }
 
@@ -644,18 +743,13 @@ fn tk_bpe_lookup(u64 left_id, u64 right_id) -> u64 {
     return 0xFFFFFFFFFFFFFFFF
 }
 
-// Build the BPE merge-rank table from tokenizer.ggml.merges. Each
-// merges-array entry has the form "<left> <right>" (single space
-// separator). Both halves get looked up in the already-built vocab
-// hash. Entries whose halves are missing from the vocab are skipped
-// (shouldn't happen in well-formed GGUFs but we don't trust input).
-fn tk_bpe_build_merge_table(Tokenizer tk, GGUFFile gf) {
-    u64 n_merges = gguf_meta_array_len(gf, "tokenizer.ggml.merges")
-    if n_merges == 0 {
-        print_str("[tokenizer_gguf] WARNING: tokenizer.ggml.model=gpt2 but no tokenizer.ggml.merges array\n")
-        return
-    }
-    // Size to >= 2× n_merges, power-of-two.
+// Allocate and zero the BPE merge-rank hash for `n_merges` entries.
+// Capacity is the next power of two >= 2× n_merges, so the open-addressed
+// table stays at <= 0.5 load factor and linear probing stays cheap. Any
+// previously-built table is released first. Shared by both merge-table
+// builders (GGUF and tokenizer.json) so the sizing protocol lives in
+// exactly one place.
+fn tk_bpe_table_alloc(u64 n_merges) {
     u64 cap = 1
     while cap < n_merges * 2 { cap = cap * 2 }
     tk_bpe_cap = cap
@@ -669,6 +763,20 @@ fn tk_bpe_build_merge_table(Tokenizer tk, GGUFFile gf) {
         unsafe { *((tk_bpe_keys + z * 8) as u64) = 0 }
         z = z + 1
     }
+}
+
+// Build the BPE merge-rank table from tokenizer.ggml.merges. Each
+// merges-array entry has the form "<left> <right>" (single space
+// separator). Both halves get looked up in the already-built vocab
+// hash. Entries whose halves are missing from the vocab are skipped
+// (shouldn't happen in well-formed GGUFs but we don't trust input).
+fn tk_bpe_build_merge_table(Tokenizer tk, GGUFFile gf) {
+    u64 n_merges = gguf_meta_array_len(gf, "tokenizer.ggml.merges")
+    if n_merges == 0 {
+        print_str("[tokenizer_gguf] WARNING: tokenizer.ggml.model=gpt2 but no tokenizer.ggml.merges array\n")
+        return
+    }
+    tk_bpe_table_alloc(n_merges)
 
     u64 p_box = alloc(8)
     u64 l_box = alloc(8)
@@ -703,6 +811,106 @@ fn tk_bpe_build_merge_table(Tokenizer tk, GGUFFile gf) {
         i = i + 1
     }
     dealloc(p_box); dealloc(l_box)
+}
+
+// ---------------------------------------------------------------------------
+// tokenizer.json merges-array scanner.
+//
+// `pos` points at the '[' that opens the array. Both HF encodings are
+// accepted:
+//   modern : [ ["i","n"], ["o","n"], ... ]   — 2-element arrays of strings
+//   legacy : [ "i n", "o n", ... ]           — space-separated single string
+// An entry's index in the array IS its rank (0 = highest priority), which
+// is the same convention tk_bpe_build_merge_table uses for GGUF merges.
+// Entries whose halves aren't in the vocab are skipped but still consume a
+// rank, so the surviving ranks keep their relative order.
+//
+// Returns the number of entries seen. With `do_insert` == 0 nothing is
+// written to the table — the caller uses that pass to size it, then calls
+// again with `do_insert` == 1. `scratch` must have room for both decoded
+// halves of the longest merge (2 × max_tok_len is plenty).
+// ---------------------------------------------------------------------------
+fn tk_json_scan_merges(Tokenizer tk, u64 base, u64 size, u64 pos,
+                       u64 do_insert, u64 scratch,
+                       u64 tmp_pos, u64 tmp_off) -> u64 {
+    if load8(base + pos) != 91 { return 0 }    // '['
+    pos = pos + 1
+    u64 rank = 0
+    while pos < size {
+        pos = tk_skip_ws(base, size, pos)
+        u64 c = load8(base + pos)
+        if c == 93 { return rank }             // ']' — end of array
+        if c == 44 { pos = pos + 1; continue } // ','
+
+        u64 lp = 0
+        u64 ll = 0
+        u64 rp = 0
+        u64 rl = 0
+
+        if c == 91 {
+            // ["left","right"] — decode both halves back-to-back into
+            // scratch so the left half stays valid while we parse the right.
+            pos = pos + 1
+            pos = tk_skip_ws(base, size, pos)
+            tk_parse_string(base, size, pos, scratch, 0, tmp_pos, tmp_off)
+            unsafe { *(tmp_pos as u64) -> pos }
+            unsafe { *(tmp_off as u64) -> ll }
+            lp = scratch
+            pos = tk_skip_ws(base, size, pos)
+            if load8(base + pos) != 44 {
+                print("[tokenizer] expected ',' inside merges pair\n")
+                exit(1)
+            }
+            pos = pos + 1
+            pos = tk_skip_ws(base, size, pos)
+            u64 rend = 0
+            tk_parse_string(base, size, pos, scratch, ll, tmp_pos, tmp_off)
+            unsafe { *(tmp_pos as u64) -> pos }
+            unsafe { *(tmp_off as u64) -> rend }
+            rp = scratch + ll
+            rl = rend - ll
+            pos = tk_skip_ws(base, size, pos)
+            if load8(base + pos) != 93 {
+                print("[tokenizer] expected ']' closing merges pair\n")
+                exit(1)
+            }
+            pos = pos + 1
+        } else if c == 34 {
+            // "left right" — split on the single separating space.
+            u64 tot = 0
+            tk_parse_string(base, size, pos, scratch, 0, tmp_pos, tmp_off)
+            unsafe { *(tmp_pos as u64) -> pos }
+            unsafe { *(tmp_off as u64) -> tot }
+            u64 sep = 0
+            u64 found_sep = 0
+            u64 j = 0
+            while j < tot {
+                if load8(scratch + j) == 32 { sep = j; found_sep = 1; j = tot; continue }
+                j = j + 1
+            }
+            if found_sep == 0 {
+                rank = rank + 1
+                continue
+            }
+            lp = scratch
+            ll = sep
+            rp = scratch + sep + 1
+            rl = tot - sep - 1
+        } else {
+            print("[tokenizer] unexpected byte in merges array\n")
+            exit(1)
+        }
+
+        if do_insert != 0 && ll != 0 && rl != 0 {
+            u64 lid = tokenizer_id_of(tk, lp, ll)
+            u64 rid = tokenizer_id_of(tk, rp, rl)
+            if lid != 0xFFFFFFFFFFFFFFFF && rid != 0xFFFFFFFFFFFFFFFF {
+                tk_bpe_insert(lid, rid, rank)
+            }
+        }
+        rank = rank + 1
+    }
+    return rank
 }
 
 fn tokenizer_load_from_gguf(GGUFFile gf) -> Tokenizer {
@@ -896,6 +1104,7 @@ fn tokenizer_free(Tokenizer tk) {
     tk_bpe_cap = 0
     tk_bpe_count = 0
     tk_encoder_mode = 0
+    tk_bpe_gpt2_digits = 0
     tk_gpt2_kind = 0
     if tk.file_base != 0 && tk.file_size != 0 {
         syscall_raw(11, tk.file_base, tk.file_size, 0, 0, 0, 0)    // munmap
@@ -993,7 +1202,9 @@ fn tokenizer_lookup(Tokenizer tk, u64 id, u64 out_ptr, u64 out_len) {
 //        - "letter-like" = ASCII A-Z, a-z, or any byte ≥ 0x80
 //          (we don't have full Unicode \p{L} tables; the ≥0x80 fallback
 //          treats every UTF-8 continuation/start byte as letter-like).
-//        - "digit" = ASCII 0-9; groups of up to 3 digits per pre-token.
+//        - "digit" = ASCII 0-9. Grouping follows tk_bpe_gpt2_digits:
+//          groups of up to 3 with no space folding (llama-bpe / qwen2),
+//          or one unbounded run with an optional leading space (GPT-2).
 //        - "symbol" = any other ASCII byte.
 //        - A single leading SPACE (0x20, not tab/newline) folds into a
 //          following letter-run OR symbol-run; trailing/multiple spaces
@@ -1006,10 +1217,15 @@ fn tokenizer_lookup(Tokenizer tk, u64 id, u64 out_ptr, u64 out_len) {
 //          everything else as non-foldable. Tab-prefix prompts get
 //          slightly different IDs than canonical but our 3 chat-REPL
 //          test corpus (Hello / What is 2+2? / etc.) has no tabs.
-//        - Contractions ('s, 't, 're, 've, 'm, 'll, 'd) are NOT
-//          recognised; an apostrophe falls into the symbol-run branch.
-//          Acceptable for chat REPLs whose validation corpus has no
-//          English contractions.
+//        - Contractions ('s, 't, 're, 've, 'm, 'll, 'd) ARE recognised
+//          (case-insensitively), matching the leading alternative of all
+//          three byte-level regex families.
+//        - The llama-bpe/qwen2 `[^\r\n\p{L}\p{N}]?\p{L}+` rule, which folds
+//          ANY single non-letter (not just a space) into a following letter
+//          run, is NOT modelled — only the space fold is. So "a-b"
+//          pre-tokenizes as "a","-","b" where canonical llama-bpe gives
+//          "a","-b". GPT-2-family tokenizers use ` ?\p{L}+` and are
+//          unaffected.
 //
 //   2. For each pre-token span:
 //        - Map each input byte b through tk_gpt2_b2c[b] to produce a
@@ -1037,6 +1253,27 @@ fn tk_bpe_byte_class(u64 b) -> u64 {
     if b == 32 { return 2 }
     if b == 9 || b == 10 || b == 11 || b == 12 || b == 13 { return 3 }
     return 4
+}
+
+// ASCII-lowercase a byte — the contraction alternative is case-insensitive.
+fn tk_bpe_lower(u64 b) -> u64 {
+    if b >= 65 && b <= 90 { return b + 32 }
+    return b
+}
+
+// If a contraction (`'s 't 're 've 'm 'll 'd`, case-insensitive) starts at
+// `p`, return its byte length (2 or 3); otherwise 0.
+fn tk_bpe_contraction_len(u64 input, u64 input_len, u64 p) -> u64 {
+    if load8(input + p) != 39 { return 0 }      // '\''
+    if p + 1 >= input_len { return 0 }
+    u64 a = tk_bpe_lower(load8(input + p + 1))
+    if a == 115 || a == 116 || a == 109 || a == 100 { return 2 }   // s t m d
+    if p + 2 >= input_len { return 0 }
+    u64 b = tk_bpe_lower(load8(input + p + 2))
+    if a == 114 && b == 101 { return 3 }        // re
+    if a == 118 && b == 101 { return 3 }        // ve
+    if a == 108 && b == 108 { return 3 }        // ll
+    return 0
 }
 
 // Encode a single pre-token (raw input bytes) via byte→cp mapping then
@@ -1226,12 +1463,26 @@ fn tk_bpe_encode(Tokenizer tk, u64 input, u64 input_len,
         u64 c = load8(input + p)
         u64 cls = tk_bpe_byte_class(c)
 
+        // Contraction alternative — `(?i:'s|'t|'re|'ve|'m|'ll|'d)`. It's the
+        // first alternative in the GPT-2, llama-bpe AND qwen2 regexes alike,
+        // so it applies to every byte-level family. Without it an apostrophe
+        // starts a symbol run and "don't" pre-tokenizes as "don" + "'" + "t".
+        u64 contr = tk_bpe_contraction_len(input, input_len, p)
+        if contr != 0 {
+            tk_bpe_encode_pretoken(tk, input + p, contr, buf_box, cnt_box, cap_box)
+            p = p + contr
+            continue
+        }
+
         if cls == 0 {
-            // Digit run of up to 3 chars.
+            // Digit run — capped at 3 under the llama-bpe rule, unbounded
+            // under the GPT-2 rule.
+            u64 lim = 3
+            if tk_bpe_gpt2_digits != 0 { lim = 0xFFFFFFFFFFFFFFFF }
             u64 end = p + 1
             u64 take = 1
             u64 stop = 0
-            while stop == 0 && end < input_len && take < 3 {
+            while stop == 0 && end < input_len && take < lim {
                 if tk_bpe_byte_class(load8(input + end)) != 0 { stop = 1 }
                 else {
                     end = end + 1
@@ -1266,6 +1517,8 @@ fn tk_bpe_encode(Tokenizer tk, u64 input, u64 input_len,
                 u64 ncls = tk_bpe_byte_class(nc)
                 if ncls == 1 { fold = 1 }
                 if ncls == 4 { fold = 1 }
+                // GPT-2's ` ?\p{N}+` also folds the space into a digit run.
+                if ncls == 0 && tk_bpe_gpt2_digits != 0 { fold = 1 }
             }
             if fold == 1 {
                 if sp_end - p > 1 {
@@ -1281,6 +1534,15 @@ fn tk_bpe_encode(Tokenizer tk, u64 input, u64 input_len,
                     u64 stop_l = 0
                     while stop_l == 0 && run_end < input_len {
                         if tk_bpe_byte_class(load8(input + run_end)) != 1 { stop_l = 1 }
+                        else { run_end = run_end + 1 }
+                    }
+                } else if ncls == 0 {
+                    // Digit run — only reachable with tk_bpe_gpt2_digits set,
+                    // since that's the only case where fold turns on for a
+                    // digit. Consume the whole run.
+                    u64 stop_d = 0
+                    while stop_d == 0 && run_end < input_len {
+                        if tk_bpe_byte_class(load8(input + run_end)) != 0 { stop_d = 1 }
                         else { run_end = run_end + 1 }
                     }
                 } else {
