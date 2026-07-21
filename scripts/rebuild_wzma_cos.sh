@@ -1,5 +1,5 @@
 #!/bin/bash
-# rebuild_wzma_cos.sh — rebuild EXACTLY the 21 `/tmp/*.co` kernels that the
+# rebuild_wzma_cos.sh — rebuild EXACTLY the 22 `/tmp/*.co` kernels that the
 # WZMA training launcher (examples/wzma_train_md.mlr) loads at startup.
 #
 # CPU-only compilation. This script NEVER runs a GPU launcher, never touches
@@ -63,6 +63,7 @@ emit_flag '--emit-amdgpu-embedding-lookup-f32=/tmp/embedding_lookup_f32.co'
 emit_flag '--emit-amdgpu-fill-step=/tmp/fill_step.co'
 emit_flag '--emit-amdgpu-gemm-bf16-grouped-v2=/tmp/gemm_bf16_grouped.co'
 emit_flag '--emit-amdgpu-gemm-f32-grouped-v2=/tmp/gemm_f32_grouped.co'
+emit_flag '--emit-amdgpu-gemm-f32-grouped-rb2=/tmp/gemm_f32_grouped_rb2.co'
 emit_flag '--emit-amdgpu-pack-f32-to-bf16=/tmp/pack_f32_to_bf16.co'
 emit_flag '--emit-amdgpu-transpose-f32=/tmp/transpose_f32.co'
 emit_flag '--emit-amdgpu-wzma-fwd-mega-v2=/tmp/wzma_fwd_mega.co'
@@ -83,8 +84,8 @@ emit_native examples/llm/wzma_bwd_uv_kernel.mlr      /tmp/wzma_bwd_uv
 emit_native examples/llm/wzma_fwd_tail.mlr           /tmp/wzma_fwd_tail
 
 echo
-echo "=== verify all 21 exist and are non-empty ==="
-WZMA_COS="adamw_fused adamw_step_f32 embedding_lookup_f32 fill_step \
+echo "=== verify all 22 exist and are non-empty ==="
+WZMA_COS="gemm_f32_grouped_rb2 adamw_fused adamw_step_f32 embedding_lookup_f32 fill_step \
 gate_bwd_bs_f32 gate_bwd_dgrad_f32 gemm_bf16_grouped gemm_f32_accum \
 gemm_f32_grouped gemm_f32_native pack_f32_to_bf16 repack_abw_to_baw_f32 \
 row_scale_f32 transpose_f32 wzma_bwd_embed wzma_bwd_pre_grad \
@@ -100,5 +101,5 @@ for k in $WZMA_COS; do
 done
 
 echo
-echo "Done. WZMA .co present = ${n}/21"
+echo "Done. WZMA .co present = ${n}/22"
 [ "$fail" -eq 0 ] || { echo "rebuild_wzma_cos: one or more kernels FAILED" >&2; exit 1; }
