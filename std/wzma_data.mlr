@@ -1,0 +1,480 @@
+// std/wzma_data.mlr — CPU-only contrastive data pipeline for the WZMA embedder.
+//
+// Feeds real (anchor, positive) text pairs to the WZMA embedder trainer,
+// replacing the single fixed batch it uses today. Per training step it
+// produces a fresh batch of B contrastive pairs drawn from a newline-
+// separated corpus, tokenized to a fixed length S with attention masks.
+//
+// This module NEVER touches the GPU. All randomness comes from the seeded,
+// seekable splitmix64 in std/rng.mlr — no wall-clock — so a given
+// (seed, step, example, view) is fully reproducible.
+//
+// Contract (mirrors AtlasLM/wzma_reference/{data.py,tokenizer.py}):
+//   encode(text, S): raw byte-level BPE encode (NO BOS/EOS). If the token
+//     count > S, truncate to S (mask all 1). Else pad with <PAD>=0 up to S;
+//     mask = 1 for real tokens then 0 for pad.
+//   pair: anchor = a corpus line's text; positive = augment(anchor).
+//   augment(text): whitespace-split, pick ONE of 4 ops uniformly, rejoin
+//     with single spaces:
+//       0 word-dropout : keep each word w/ prob ~0.8; if all dropped, keep all.
+//       1 span-dropout : if >3 words, drop a contiguous run of 1..3 words.
+//       2 local-shuffle: if >5 words, Fisher-Yates the middle 50%.
+//       3 punct-noise  : append one of '.' ',' '!' '?' to one random word.
+//
+// Public API:
+//   wzma_data_open(corpus_path, tk) -> WzmaData
+//   wzma_data_next_batch(d, B, S, seed, step, a_ids, a_mask, p_ids, p_mask)
+//   wzma_data_free(d)
+//
+// CPU only — nothing here launches a kernel.
+
+import "tokenizer.mlr"
+import "rng.mlr"
+import "io.mlr"
+import "string.mlr"
+
+// Maximum bytes of a single corpus line we materialize (before augment /
+// tokenization truncates it anyway). Keeps scratch buffers bounded.
+static u64 WZMA_LINE_CAP = 8192
+
+struct WzmaData {
+    u64 corpus_base   // mmap base of the corpus file (read-only)
+    u64 corpus_size   // bytes
+    u64 tk_ptr        // Tokenizer pointer (opaque here; owned by the caller)
+}
+
+// ---------------------------------------------------------------------------
+// wzma_data_open — mmap the corpus read-only, record base/size + tokenizer.
+// The Tokenizer is borrowed (not owned): wzma_data_free does NOT free it.
+// Returns a WzmaData whose corpus_size is 0 on failure.
+// ---------------------------------------------------------------------------
+fn wzma_data_open(u64 corpus_path, Tokenizer tk) -> WzmaData {
+    WzmaData d = alloc(24)
+    d.corpus_base = 0
+    d.corpus_size = 0
+    d.tk_ptr = tk
+
+    u64 fd = file_open(corpus_path, 0)
+    if is_errno(fd) != 0 {
+        print("[wzma_data] open failed: ")
+        println_str(corpus_path)
+        return d
+    }
+    u64 sz = file_size(fd)
+    // mmap PROT_READ (1) MAP_PRIVATE (2)
+    u64 base = syscall_raw(9, 0, sz, 1, 2, fd, 0)
+    if is_errno(base) != 0 {
+        print("[wzma_data] mmap failed\n")
+        file_close(fd)
+        return d
+    }
+    file_close(fd)
+    d.corpus_base = base
+    d.corpus_size = sz
+    return d
+}
+
+// ---------------------------------------------------------------------------
+// wzma_data_free — munmap the corpus and free the handle. The borrowed
+// Tokenizer is left untouched (the caller owns its lifetime).
+// ---------------------------------------------------------------------------
+fn wzma_data_free(WzmaData d) {
+    if d.corpus_base != 0 {
+        syscall_raw(11, d.corpus_base, d.corpus_size, 0, 0, 0, 0)   // munmap
+        d.corpus_base = 0
+    }
+    dealloc(d)
+}
+
+// True when byte c is ASCII whitespace (space, tab, CR, LF, VT, FF).
+fn wd_is_ws(u64 c) -> u64 {
+    if c == 32 { return 1 }
+    if c == 9  { return 1 }
+    if c == 10 { return 1 }
+    if c == 13 { return 1 }
+    if c == 11 { return 1 }
+    if c == 12 { return 1 }
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// wd_copy_line — given a random byte offset `off` into the corpus, mimic the
+// reference's seek()/readline()/readline() O(1) sampling: skip the (partial)
+// line containing `off`, then take the NEXT full line. Strips leading/trailing
+// whitespace into `out` (NUL-terminated, capped at WZMA_LINE_CAP-1 bytes).
+// Retries subsequent lines (wrapping at EOF) until a non-empty line is found
+// or the try budget is exhausted. Returns the stripped byte length (0 if
+// nothing usable was found).
+// ---------------------------------------------------------------------------
+fn wd_copy_line(u64 base, u64 size, u64 off, u64 out, u64 out_cap) -> u64 {
+    if size == 0 { store8(out, 0); return 0 }
+    u64 p = off % size
+
+    // Skip the partial line: advance to just past the next newline. If we
+    // started at a line boundary (p==0 or prev byte is '\n') we still consume
+    // to the next '\n' to match readline()-then-readline() semantics.
+    while p < size {
+        u64 c = load8(base + p)
+        p = p + 1
+        if c == 10 { break }
+    }
+    if p >= size { p = 0 }   // wrap: partial ran to EOF, start at file head
+
+    u64 tries = 0
+    while tries < 64 {
+        // Read one full line [p, q) up to the next '\n' or EOF.
+        u64 q = p
+        while q < size {
+            u64 c = load8(base + q)
+            if c == 10 { break }
+            q = q + 1
+        }
+        // Strip leading whitespace.
+        u64 s = p
+        while s < q {
+            u64 c = load8(base + s)
+            if wd_is_ws(c) == 0 { break }
+            s = s + 1
+        }
+        // Strip trailing whitespace.
+        u64 e = q
+        while e > s {
+            u64 c = load8(base + e - 1)
+            if wd_is_ws(c) == 0 { break }
+            e = e - 1
+        }
+        u64 n = e - s
+        if n != 0 {
+            if n > out_cap - 1 { n = out_cap - 1 }
+            u64 i = 0
+            while i < n {
+                u8 b = load8(base + s + i)
+                store8(out + i, b)
+                i = i + 1
+            }
+            store8(out + n, 0)
+            return n
+        }
+        // Empty after strip — advance past this line and retry.
+        p = q + 1
+        if p >= size { p = 0 }
+        tries = tries + 1
+    }
+    store8(out, 0)
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// wd_split_words — whitespace-split `src[0..len)` (Python str.split()
+// semantics: split on runs of whitespace, drop empties). Fills word_off[k] /
+// word_len[k] arrays (u64 each). Returns the word count.
+// ---------------------------------------------------------------------------
+fn wd_split_words(u64 src, u64 len, u64 word_off, u64 word_len) -> u64 {
+    u64 n = 0
+    u64 i = 0
+    while i < len {
+        // skip whitespace
+        while i < len {
+            u64 c = load8(src + i)
+            if wd_is_ws(c) == 0 { break }
+            i = i + 1
+        }
+        if i >= len { break }
+        u64 start = i
+        while i < len {
+            u64 c = load8(src + i)
+            if wd_is_ws(c) != 0 { break }
+            i = i + 1
+        }
+        unsafe { *((word_off + n * 8) as u64) = start }
+        unsafe { *((word_len + n * 8) as u64) = (i - start) }
+        n = n + 1
+    }
+    return n
+}
+
+// ---------------------------------------------------------------------------
+// wd_emit — join the selected words `sel[0..m)` (indices into word_off/
+// word_len) from `src` into `out` with single-space separators. If
+// punct_pos is a valid output position (< m), append `punct_char` immediately
+// after that word's bytes. Writes a NUL terminator. Returns byte length.
+// ---------------------------------------------------------------------------
+fn wd_emit(u64 src, u64 word_off, u64 word_len, u64 sel, u64 m,
+           u64 punct_pos, u64 punct_char, u64 out, u64 out_cap) -> u64 {
+    u64 o = 0
+    u64 k = 0
+    while k < m {
+        if k != 0 {
+            if o < out_cap - 1 { store8(out + o, 32); o = o + 1 }   // ' '
+        }
+        u64 wi = 0
+        unsafe { *((sel + k * 8) as u64) -> wi }
+        u64 wo = 0
+        u64 wl = 0
+        unsafe { *((word_off + wi * 8) as u64) -> wo }
+        unsafe { *((word_len + wi * 8) as u64) -> wl }
+        u64 j = 0
+        while j < wl {
+            if o < out_cap - 1 {
+                u8 b = load8(src + wo + j)
+                store8(out + o, b)
+                o = o + 1
+            }
+            j = j + 1
+        }
+        if k == punct_pos {
+            if o < out_cap - 1 {
+                u8 pc = punct_char
+                store8(out + o, pc)
+                o = o + 1
+            }
+        }
+        k = k + 1
+    }
+    store8(out + o, 0)
+    return o
+}
+
+// ---------------------------------------------------------------------------
+// wzma_augment — apply one randomly-chosen augmentation op to `src[0..len)`,
+// writing the augmented, NUL-terminated text into `out`. `aug_seed` seeds the
+// splitmix64 stream; every draw is `rng_at(aug_seed, ctr)` with ctr rising, so
+// the whole op is reproducible for a fixed aug_seed. Returns out byte length.
+//
+// Scratch (word_off/word_len/sel) must each hold >= (len/2 + 2) u64 slots.
+// ---------------------------------------------------------------------------
+fn wzma_augment(u64 aug_seed, u64 src, u64 len,
+                u64 word_off, u64 word_len, u64 sel,
+                u64 out, u64 out_cap) -> u64 {
+    u64 n = wd_split_words(src, len, word_off, word_len)
+
+    // < 2 words: return the text unchanged (verbatim copy).
+    if n < 2 {
+        u64 c = len
+        if c > out_cap - 1 { c = out_cap - 1 }
+        u64 i = 0
+        while i < c {
+            u8 b = load8(src + i)
+            store8(out + i, b)
+            i = i + 1
+        }
+        store8(out + c, 0)
+        return c
+    }
+
+    u64 ctr = 0
+    u64 op = rng_at(aug_seed, ctr) % 4
+    ctr = ctr + 1
+
+    u64 m = 0
+    u64 punct_pos = 0xFFFFFFFFFFFFFFFF
+    u64 punct_char = 0
+
+    if op == 0 {
+        // word-dropout: keep each word with prob ~0.8.
+        u64 k = 0
+        while k < n {
+            u64 r = rng_at(aug_seed, ctr) % 1000
+            ctr = ctr + 1
+            if r >= 200 {
+                unsafe { *((sel + m * 8) as u64) = k }
+                m = m + 1
+            }
+            k = k + 1
+        }
+        if m == 0 {
+            // all dropped — keep original order
+            u64 j = 0
+            while j < n {
+                unsafe { *((sel + j * 8) as u64) = j }
+                j = j + 1
+            }
+            m = n
+        }
+    } else {
+        if op == 1 {
+            // span-dropout: if >3 words, drop a contiguous 1..3-word run.
+            if n > 3 {
+                u64 start = rng_at(aug_seed, ctr) % (n - 1)   // 0 .. n-2
+                ctr = ctr + 1
+                u64 span = 1 + (rng_at(aug_seed, ctr) % 3)     // 1 .. 3
+                ctr = ctr + 1
+                u64 end = start + span
+                if end > n { end = n }
+                u64 k = 0
+                while k < n {
+                    if k < start {
+                        unsafe { *((sel + m * 8) as u64) = k }
+                        m = m + 1
+                    } else {
+                        if k >= end {
+                            unsafe { *((sel + m * 8) as u64) = k }
+                            m = m + 1
+                        }
+                    }
+                    k = k + 1
+                }
+                if m == 0 {
+                    u64 j = 0
+                    while j < n {
+                        unsafe { *((sel + j * 8) as u64) = j }
+                        j = j + 1
+                    }
+                    m = n
+                }
+            } else {
+                u64 j = 0
+                while j < n {
+                    unsafe { *((sel + j * 8) as u64) = j }
+                    j = j + 1
+                }
+                m = n
+            }
+        } else {
+            if op == 2 {
+                // local-shuffle: identity order, then Fisher-Yates the middle 50%.
+                u64 j = 0
+                while j < n {
+                    unsafe { *((sel + j * 8) as u64) = j }
+                    j = j + 1
+                }
+                m = n
+                if n > 5 {
+                    u64 mid_s = n / 4
+                    u64 mid_e = n - mid_s
+                    // Fisher-Yates over [mid_s, mid_e): for i = mid_e-1 down to mid_s+1
+                    u64 i = mid_e - 1
+                    while i > mid_s {
+                        u64 span = i - mid_s + 1
+                        u64 jj = mid_s + (rng_at(aug_seed, ctr) % span)
+                        ctr = ctr + 1
+                        u64 a = 0
+                        u64 b = 0
+                        unsafe { *((sel + i * 8) as u64) -> a }
+                        unsafe { *((sel + jj * 8) as u64) -> b }
+                        unsafe { *((sel + i * 8) as u64) = b }
+                        unsafe { *((sel + jj * 8) as u64) = a }
+                        i = i - 1
+                    }
+                }
+            } else {
+                // op == 3 : punct-noise. Identity order, append punct to one word.
+                u64 j = 0
+                while j < n {
+                    unsafe { *((sel + j * 8) as u64) = j }
+                    j = j + 1
+                }
+                m = n
+                punct_pos = rng_at(aug_seed, ctr) % n
+                ctr = ctr + 1
+                u64 pk = rng_at(aug_seed, ctr) % 4
+                ctr = ctr + 1
+                if pk == 0 { punct_char = 46 }        // '.'
+                if pk == 1 { punct_char = 44 }        // ','
+                if pk == 2 { punct_char = 33 }        // '!'
+                if pk == 3 { punct_char = 63 }        // '?'
+            }
+        }
+    }
+
+    return wd_emit(src, word_off, word_len, sel, m, punct_pos, punct_char,
+                   out, out_cap)
+}
+
+// ---------------------------------------------------------------------------
+// wzma_encode_fixed — raw byte-level BPE encode of `text[0..len)` into a
+// fixed [S] window. Writes u32 ids into out_ids and u32 mask (1/0) into
+// out_mask. No BOS/EOS. Truncate if > S (mask all 1); else pad with <PAD>=0
+// and mask 0. Returns the real (unclamped) token count.
+// ---------------------------------------------------------------------------
+fn wzma_encode_fixed(Tokenizer tk, u64 text, u64 len, u64 S,
+                     u64 out_ids, u64 out_mask) -> u64 {
+    u64 ids_p = alloc(8)
+    u64 cnt_p = alloc(8)
+    // tokenizer_encode allocates the ids buffer and writes its pointer +
+    // count back through these boxes; we own the returned buffer.
+    tokenizer_encode(tk, text, len, ids_p, cnt_p)
+    u64 ids = 0
+    u64 cnt = 0
+    unsafe { *(ids_p as u64) -> ids }
+    unsafe { *(cnt_p as u64) -> cnt }
+    dealloc(ids_p)
+    dealloc(cnt_p)
+
+    u64 real = cnt
+    u64 keep = cnt
+    if keep > S { keep = S }
+
+    u64 i = 0
+    while i < keep {
+        u32 id32 = 0
+        unsafe { *((ids + i * 4) as uint32) -> id32 }
+        unsafe { *((out_ids + i * 4) as uint32) = id32 }
+        u32 one = 1
+        unsafe { *((out_mask + i * 4) as uint32) = one }
+        i = i + 1
+    }
+    while i < S {
+        u32 z = 0
+        unsafe { *((out_ids + i * 4) as uint32) = z }
+        unsafe { *((out_mask + i * 4) as uint32) = z }
+        i = i + 1
+    }
+
+    if ids != 0 { dealloc(ids) }
+    return real
+}
+
+// ---------------------------------------------------------------------------
+// wzma_data_next_batch — fill four caller-allocated u32[B*S] buffers with a
+// fresh contrastive batch for training step `step`.
+//   a_ids / a_mask  : anchor ids + mask, row-major [B, S]
+//   p_ids / p_mask  : positive (augmented) ids + mask, row-major [B, S]
+// Sampling and augmentation are a pure function of (seed, step, example), so
+// the same arguments reproduce the same batch byte-for-byte.
+// ---------------------------------------------------------------------------
+fn wzma_data_next_batch(WzmaData d, u64 B, u64 S, u64 seed, u64 step,
+                        u64 a_ids, u64 a_mask, u64 p_ids, u64 p_mask) {
+    Tokenizer tk = d.tk_ptr
+
+    u64 line_cap = WZMA_LINE_CAP
+    u64 aug_cap = WZMA_LINE_CAP * 2 + 8
+    u64 line_buf = alloc(line_cap)
+    u64 aug_buf = alloc(aug_cap)
+    // Word scratch: at most (line_cap/2 + 2) words.
+    u64 wcap = line_cap / 2 + 2
+    u64 word_off = alloc(wcap * 8)
+    u64 word_len = alloc(wcap * 8)
+    u64 sel = alloc(wcap * 8)
+
+    // Per-step stream seed; per-example draws hang off it.
+    u64 step_seed = splitmix64_at(seed, step)
+
+    u64 e = 0
+    while e < B {
+        // Two independent draws per example: line offset + augment stream.
+        u64 off_rng = rng_at(step_seed, e * 2)
+        u64 aug_seed = rng_at(step_seed, e * 2 + 1)
+
+        u64 off = off_rng % d.corpus_size
+        u64 llen = wd_copy_line(d.corpus_base, d.corpus_size, off,
+                                line_buf, line_cap)
+
+        u64 a_off = (e * S) * 4
+        wzma_encode_fixed(tk, line_buf, llen, S,
+                          a_ids + a_off, a_mask + a_off)
+
+        u64 plen = wzma_augment(aug_seed, line_buf, llen,
+                                word_off, word_len, sel, aug_buf, aug_cap)
+        wzma_encode_fixed(tk, aug_buf, plen, S,
+                          p_ids + a_off, p_mask + a_off)
+
+        e = e + 1
+    }
+
+    dealloc(sel)
+    dealloc(word_len)
+    dealloc(word_off)
+    dealloc(aug_buf)
+    dealloc(line_buf)
+}

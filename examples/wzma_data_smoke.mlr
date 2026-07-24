@@ -1,0 +1,268 @@
+// examples/wzma_data_smoke.mlr — CPU-only smoke for std/wzma_data.mlr.
+//
+// Exercises the WZMA contrastive data pipeline end-to-end on the real
+// corpus + tokenizer, and asserts the batch invariants, encode-vs-Python
+// ground truth (printed for external cross-check), augment sanity, and
+// determinism. NOTHING here touches the GPU.
+//
+// Usage:
+//   ./build/mlrc --arch=x86_64 examples/wzma_data_smoke.mlr -o /tmp/wd_smoke
+//   /tmp/wd_smoke
+//
+// Optional env overrides:
+//   MLRIFT_WZMA_CORPUS    — path to corpus.txt
+//   MLRIFT_WZMA_TOKENIZER — path to tokenizer.json
+
+import "../std/wzma_data.mlr"
+import "../std/mem.mlr"
+import "../std/tokenizer.mlr"
+import "../std/rng.mlr"
+import "../std/io.mlr"
+import "../std/fmt.mlr"
+import "../std/string.mlr"
+import "../std/sys.mlr"
+
+fn put(u64 s) { print_str(s) }
+fn putu(u64 v) { u64 s = fmt_dec(v); put(s); dealloc(s) }
+fn nl() { put("\n") }
+
+// Print a u32[S] id/mask row.
+fn print_row(u64 buf, u64 S) {
+    u64 i = 0
+    while i < S {
+        if i != 0 { put(" ") }
+        u32 v = 0
+        unsafe { *((buf + i * 4) as uint32) -> v }
+        putu(v)
+        i = i + 1
+    }
+    nl()
+}
+
+// ---- global fail counter ----
+static u64 g_fails = 0
+fn fail(u64 msg) { put("FAIL: "); put(msg); nl(); g_fails = g_fails + 1 }
+
+// Validate one [S] id/mask row: ids in [0,8192); mask is a prefix of 1s then
+// 0s; masked-out positions have id==0; returns the mask 1-count.
+fn check_row(u64 ids, u64 mask, u64 S, u64 label) -> u64 {
+    u64 ones = 0
+    u64 seen_zero = 0
+    u64 i = 0
+    while i < S {
+        u32 idv = 0
+        u32 mv = 0
+        unsafe { *((ids + i * 4) as uint32) -> idv }
+        unsafe { *((mask + i * 4) as uint32) -> mv }
+        u64 id64 = idv
+        u64 m64 = mv
+        if id64 >= 8192 { fail("id out of range"); }
+        if m64 != 0 {
+            if m64 != 1 { fail("mask not 0/1") }
+            if seen_zero != 0 { fail("mask has a gap (1 after 0)") }
+            ones = ones + 1
+        } else {
+            seen_zero = 1
+            if id64 != 0 { fail("masked-out pos not PAD(0)") }
+        }
+        i = i + 1
+    }
+    return ones
+}
+
+// Encode a fixed text through the SAME encode+truncate+pad path the batcher
+// uses, print it as `ENC <text> -> <ids>` for external Python cross-check.
+fn enc_print(Tokenizer tk, u64 text, u64 S) {
+    u64 len = str_len(text)
+    u64 ids = alloc(S * 4)
+    u64 mask = alloc(S * 4)
+    u64 real = wzma_encode_fixed(tk, text, len, S, ids, mask)
+    put("ENC ["); put(text); put("] real="); putu(real); put(" -> ")
+    print_row(ids, S)
+    dealloc(ids)
+    dealloc(mask)
+}
+
+// Count how many words in `src` (whitespace-split) — for augment sanity.
+fn word_count(u64 src) -> u64 {
+    u64 n = 0
+    u64 i = 0
+    u64 in_word = 0
+    while 1 == 1 {
+        u8 c = load8(src + i)
+        if c == 0 { break }
+        u64 ws = wd_is_ws(c)
+        if ws == 0 {
+            if in_word == 0 { n = n + 1; in_word = 1 }
+        } else {
+            in_word = 0
+        }
+        i = i + 1
+    }
+    return n
+}
+
+fn main() {
+    u64 corpus = sys_getenv("MLRIFT_WZMA_CORPUS")
+    if corpus == 0 {
+        corpus = "/home/pantelis/Desktop/Projects/Work/AtlasLM/checkpoints/wzma_embedder/corpus.txt"
+    }
+    u64 tkpath = sys_getenv("MLRIFT_WZMA_TOKENIZER")
+    if tkpath == 0 {
+        tkpath = "/home/pantelis/Desktop/Projects/Work/AtlasLM/checkpoints/wzma_embedder/tokenizer.json"
+    }
+
+    put("[wzma_data_smoke] tokenizer "); put(tkpath); nl()
+    Tokenizer tk = tokenizer_load(tkpath)
+    if tk.file_size == 0 { put("tokenizer load fail\n"); exit(1) }
+    put("VOCAB "); putu(tk.vocab_count)
+    put(" MERGES "); putu(tk_bpe_count)
+    put(" MODE "); putu(tk_encoder_mode); nl()
+
+    put("[wzma_data_smoke] corpus "); put(corpus); nl()
+    WzmaData d = wzma_data_open(corpus, tk)
+    if d.corpus_size == 0 { put("corpus open fail\n"); exit(1) }
+    put("CORPUS_SIZE "); putu(d.corpus_size); nl(); nl()
+
+    u64 B = 8
+    u64 S = 16
+    u64 seed = 12345
+    u64 step = 7
+
+    u64 nel = B * S
+    u64 a_ids  = alloc(nel * 4)
+    u64 a_mask = alloc(nel * 4)
+    u64 p_ids  = alloc(nel * 4)
+    u64 p_mask = alloc(nel * 4)
+
+    wzma_data_next_batch(d, B, S, seed, step, a_ids, a_mask, p_ids, p_mask)
+
+    // ---- (a) Show a couple of examples: anchor+positive ids/mask ----
+    // (We reconstruct the anchor/positive *text* the same way the batcher
+    //  does so the print matches what was encoded.)
+    put("=== SAMPLE EXAMPLES (batch seed="); putu(seed); put(" step="); putu(step); put(") ===\n")
+    u64 line_buf = alloc(WZMA_LINE_CAP)
+    u64 aug_buf  = alloc(WZMA_LINE_CAP * 2 + 8)
+    u64 wcap = WZMA_LINE_CAP / 2 + 2
+    u64 wo = alloc(wcap * 8)
+    u64 wl = alloc(wcap * 8)
+    u64 sel = alloc(wcap * 8)
+    u64 step_seed = splitmix64_at(seed, step)
+
+    u64 show = 0
+    while show < 3 {
+        u64 off_rng = rng_at(step_seed, show * 2)
+        u64 aug_seed = rng_at(step_seed, show * 2 + 1)
+        u64 off = off_rng % d.corpus_size
+        u64 llen = wd_copy_line(d.corpus_base, d.corpus_size, off, line_buf, WZMA_LINE_CAP)
+        u64 plen = wzma_augment(aug_seed, line_buf, llen, wo, wl, sel, aug_buf, WZMA_LINE_CAP * 2 + 8)
+
+        put("-- example "); putu(show); put(" --\n")
+        put("ANCHOR   ["); put(line_buf); put("]\n")
+        put("  a_ids : "); print_row(a_ids + (show * S) * 4, S)
+        put("  a_mask: "); print_row(a_mask + (show * S) * 4, S)
+        put("POSITIVE ["); put(aug_buf); put("]\n")
+        put("  p_ids : "); print_row(p_ids + (show * S) * 4, S)
+        put("  p_mask: "); print_row(p_mask + (show * S) * 4, S)
+        show = show + 1
+    }
+    nl()
+
+    // ---- (b) Assert invariants across the whole batch ----
+    put("=== BATCH INVARIANTS ===\n")
+    u64 e = 0
+    while e < B {
+        u64 aoff = (e * S) * 4
+        check_row(a_ids + aoff, a_mask + aoff, S, e)
+        check_row(p_ids + aoff, p_mask + aoff, S, e)
+        e = e + 1
+    }
+    if g_fails == 0 { put("invariants: OK (ids<8192, mask prefix-of-1s, pad==0)\n") }
+    nl()
+
+    // ---- (c) Determinism ----
+    put("=== DETERMINISM ===\n")
+    u64 b2_ai = alloc(nel * 4)
+    u64 b2_am = alloc(nel * 4)
+    u64 b2_pi = alloc(nel * 4)
+    u64 b2_pm = alloc(nel * 4)
+    wzma_data_next_batch(d, B, S, seed, step, b2_ai, b2_am, b2_pi, b2_pm)
+    u64 same = 1
+    if memcmp(a_ids,  b2_ai, nel * 4) != 0 { same = 0 }
+    if memcmp(a_mask, b2_am, nel * 4) != 0 { same = 0 }
+    if memcmp(p_ids,  b2_pi, nel * 4) != 0 { same = 0 }
+    if memcmp(p_mask, b2_pm, nel * 4) != 0 { same = 0 }
+    if same == 1 { put("same (seed,step) -> BYTE-IDENTICAL: OK\n") }
+    else { fail("re-run with same (seed,step) differs") }
+
+    // different step must differ
+    u64 b3_ai = alloc(nel * 4)
+    u64 b3_am = alloc(nel * 4)
+    u64 b3_pi = alloc(nel * 4)
+    u64 b3_pm = alloc(nel * 4)
+    wzma_data_next_batch(d, B, S, seed, step + 1, b3_ai, b3_am, b3_pi, b3_pm)
+    u64 diff = 0
+    if memcmp(a_ids, b3_ai, nel * 4) != 0 { diff = 1 }
+    if diff == 1 { put("different step -> DIFFERS: OK\n") }
+    else { fail("different step produced identical batch") }
+    nl()
+
+    // ---- ENCODE ground truth for Python cross-check ----
+    put("=== ENCODE GROUND TRUTH (S=16) ===\n")
+    enc_print(tk, "the quick brown fox", 16)
+    enc_print(tk, "machine learning models", 16)
+    enc_print(tk, "in the beginning was the word", 16)
+    enc_print(tk, "Hello world", 16)
+    nl()
+
+    // ---- AUGMENT distribution ----
+    put("=== AUGMENT DISTRIBUTION ===\n")
+    u64 base_txt = "the quick brown fox jumps over the lazy sleeping old dog"
+    u64 bt_len = str_len(base_txt)
+    put("BASE ["); put(base_txt); put("] words="); putu(word_count(base_txt)); nl()
+    u64 op_hist0 = 0
+    u64 op_hist1 = 0
+    u64 op_hist2 = 0
+    u64 op_hist3 = 0
+    u64 sum_words = 0
+    u64 sample_shown = 0
+    u64 it = 0
+    while it < 400 {
+        u64 as2 = rng_at(999, it)
+        // op is the first draw % 4 (mirror wzma_augment's first draw)
+        u64 op = rng_at(as2, 0) % 4
+        if op == 0 { op_hist0 = op_hist0 + 1 }
+        if op == 1 { op_hist1 = op_hist1 + 1 }
+        if op == 2 { op_hist2 = op_hist2 + 1 }
+        if op == 3 { op_hist3 = op_hist3 + 1 }
+        wzma_augment(as2, base_txt, bt_len, wo, wl, sel, aug_buf, WZMA_LINE_CAP * 2 + 8)
+        sum_words = sum_words + word_count(aug_buf)
+        // show a few concrete before/after per op type early on
+        if sample_shown < 8 {
+            put("  op="); putu(op); put(" -> ["); put(aug_buf); put("]\n")
+            sample_shown = sample_shown + 1
+        }
+        it = it + 1
+    }
+    put("op counts (400 draws): dropout="); putu(op_hist0)
+    put(" span="); putu(op_hist1)
+    put(" shuffle="); putu(op_hist2)
+    put(" noise="); putu(op_hist3); nl()
+    put("mean word count after augment (x1000): "); putu(sum_words * 1000 / 400)
+    put("  (base words="); putu(word_count(base_txt)); put(")\n")
+    nl()
+
+    // ---- cleanup ----
+    dealloc(sel); dealloc(wl); dealloc(wo)
+    dealloc(aug_buf); dealloc(line_buf)
+    dealloc(b3_pm); dealloc(b3_pi); dealloc(b3_am); dealloc(b3_ai)
+    dealloc(b2_pm); dealloc(b2_pi); dealloc(b2_am); dealloc(b2_ai)
+    dealloc(p_mask); dealloc(p_ids); dealloc(a_mask); dealloc(a_ids)
+    wzma_data_free(d)
+    tokenizer_free(tk)
+
+    put("FAILS "); putu(g_fails); nl()
+    if g_fails != 0 { exit(1) }
+    put("ALL OK\n")
+    exit(0)
+}
