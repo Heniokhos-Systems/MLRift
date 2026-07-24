@@ -1,0 +1,1018 @@
+// codegen_riscv.kr — hosted RV32 emission for target_arch == 2 (riscv32):
+// Elf32 executable headers (Task 1), Elf32 relocatable .o writer (Task 5),
+// and the RV32IMC disassembler for --emit=asm (Task 7). Mirrors
+// codegen_aarch64.kr. The freestanding flat-binary path stays in
+// ir_riscv.kr / main.kr and never calls into here.
+
+// Elf32_Ehdr (52 bytes). e_entry is patched by main.kr's arch-2 entry
+// branch (offset 24). e_flags = EF_RISCV_RVC (0x1) because the
+// C-compression pass emits compressed instructions; float-ABI bits are 0
+// (soft-float ILP32).
+fn emit_elf_header_rv32() {
+    emit_byte(0x7F); emit_byte(69); emit_byte(76); emit_byte(70)  // \x7F E L F
+    emit_byte(1); emit_byte(1); emit_byte(1); emit_byte(0)        // ELFCLASS32, LSB, EV_CURRENT, OSABI
+    uint64 i = 0
+    while i < 8 { emit_byte(0); i = i + 1 }                       // e_ident padding
+    emit_u16_le(2)          // e_type = ET_EXEC
+    emit_u16_le(243)        // e_machine = EM_RISCV
+    emit_u32_le(1)          // e_version
+    emit_u32_le(0)          // e_entry  (u32; patched)
+    emit_u32_le(52)         // e_phoff  = 52
+    emit_u32_le(0)          // e_shoff  = 0
+    emit_u32_le(1)          // e_flags  = EF_RISCV_RVC
+    emit_u16_le(52)         // e_ehsize
+    emit_u16_le(32)         // e_phentsize
+    emit_u16_le(1)          // e_phnum
+    emit_u16_le(0)          // e_shentsize
+    emit_u16_le(0)          // e_shnum
+    emit_u16_le(0)          // e_shstrndx
+}
+
+// Elf32_Phdr (32 bytes). WARNING: field order differs from Elf64_Phdr —
+// p_flags sits AFTER p_memsz here (offset 24 into the phdr = file offset
+// 84), NOT right after p_type. p_filesz/p_memsz (file offsets 68/72) are
+// patched by main.kr's arch-2 entry/BSS branch. Single PT_LOAD, RWX, maps
+// file offset 0 -> vaddr 0x10000 so byte F lives at vaddr 0x10000+F.
+fn emit_program_header_rv32(uint64 text_size) {
+    uint64 total = 84 + text_size          // placeholder; patched later
+    emit_u32_le(1)          // p_type = PT_LOAD
+    emit_u32_le(0)          // p_offset = 0
+    emit_u32_le(0x10000)    // p_vaddr = load base
+    emit_u32_le(0x10000)    // p_paddr
+    emit_u32_le(total)      // p_filesz  (offset 68; patched)
+    emit_u32_le(total)      // p_memsz   (offset 72; patched)
+    emit_u32_le(7)          // p_flags = RWX
+    emit_u32_le(0x1000)     // p_align
+}
+
+// Elf32 relocatable (.o) writer — Task 5. Transcribed from
+// emit_elf_relocatable() in codegen.kr (the x86_64/arm64 Elf64 writer),
+// with every field narrowed/reordered per the Elf32 ABI (see the Task 5
+// brief's substitution table). No `arch` param: this function is arch-2
+// (EM_RISCV) by construction, so there is no e_machine/rtype switch.
+//
+// Elf32 differs from Elf64 in three load-bearing ways this function must
+// get exactly right:
+//   1. Elf32_Ehdr is 52 bytes (vs 64): e_entry/e_phoff/e_shoff are 32-bit
+//      words, so the whole header is 13 x 4-byte fields after e_ident.
+//   2. Elf32_Sym is 16 bytes (vs 24) AND reorders its fields: st_name(u32),
+//      st_value(u32), st_size(u32), st_info(byte), st_other(byte),
+//      st_shndx(u16) — value/size come BEFORE info/other/shndx, the
+//      opposite of Elf64_Sym's layout.
+//   3. Elf32_Rela is 12 bytes (vs 24) and packs r_info as
+//      (sym_idx << 8) | rtype (vs Elf64's << 32).
+//
+// For Task 5 (single self-contained object, no extern calls) has_relocs
+// is always 0 and the .rela.text section/reloc loop below are dead code
+// at runtime — they are written now, Elf32-correct, so Task 6 only has to
+// add the recording side (populating extern_call_sites) and can reuse
+// this writer unmodified.
+fn emit_elf_relocatable_rv32(uint64 text_len, uint64 data_len) {
+    // Save the generated code+data blob
+    uint64 blob_len = out_len
+    uint64 blob = alloc(blob_len + 16)
+    uint64 ci = 0
+    while ci < blob_len {
+        uint64 sp = out_buf + ci
+        uint64 dp = blob + ci
+        uint64 bv = 0
+        unsafe { *(sp as uint8) -> bv }
+        uint8 bb = bv
+        unsafe { *(dp as uint8) = bb }
+        ci = ci + 1
+    }
+
+    // Reset output buffer
+    out_len = 0
+
+    // Build section name string table (.shstrtab) content:
+    // idx 0: \0
+    // idx 1: .text\0           (6 bytes)
+    // idx 7: .data\0           (6 bytes)
+    // idx 13: .symtab\0        (8 bytes)
+    // idx 21: .strtab\0        (8 bytes)
+    // idx 29: .shstrtab\0      (10 bytes)
+    // idx 39: .note.GNU-stack\0 (16 bytes) — emitted always to prevent
+    //                                        ld "executable stack" warning
+    // idx 55: .rela.text\0     (11 bytes) — only if extern_call_count > 0
+    // Total: 55 or 66 bytes
+    uint64 has_relocs = 0
+    if extern_call_count > 0 { has_relocs = 1 }
+    uint64 shstrtab_size = 55
+    if has_relocs != 0 { shstrtab_size = 66 }
+
+    // Build string table (.strtab) for symbol names:
+    // idx 0: \0 (null symbol name)
+    // idx 1: function names from fn_table, each null-terminated
+    // We'll also compute symtab entries count.
+    // Allocate temp buffer for strtab content
+    uint64 strtab_buf = alloc(8192)
+    uint64 strtab_len = 1  // start at 1 (index 0 = null byte)
+    uint64 sb0 = strtab_buf
+    uint8 nul = 0
+    unsafe { *(sb0 as uint8) = nul }
+
+    // Symtab: first entry is null (STN_UNDEF), then one per function,
+    // then one per extern function.
+    // Elf32_Sym = 16 bytes each
+    uint64 sym_count = 1 + fn_count + extern_fn_count
+    uint64 symtab_size = sym_count * 16
+
+    // Build strtab: copy each function name from source
+    // Also track name offsets for symtab
+    uint64 name_offsets = alloc(fn_count * 8)
+    uint64 fi = 0
+    while fi < fn_count {
+        uint64 fentry = fn_table + fi * 8
+        uint32 stored_tok = 0
+        unsafe { *(fentry as uint32) -> stored_tok }
+        uint64 ws = stored_tok
+        // Store name offset
+        uint64 no_ptr = name_offsets + fi * 8
+        unsafe { *(no_ptr as uint64) = strtab_len }
+        // Copy name bytes
+        uint64 nstart = tok_text_start(ws)
+        uint64 nlen = tok_text_len(ws)
+        uint64 ni = 0
+        while ni < nlen {
+            uint64 src_p = cg_source + nstart + ni
+            uint64 dst_p = strtab_buf + strtab_len
+            uint64 ch = 0
+            unsafe { *(src_p as uint8) -> ch }
+            uint8 cb = ch
+            unsafe { *(dst_p as uint8) = cb }
+            strtab_len = strtab_len + 1
+            ni = ni + 1
+        }
+        // Null terminate
+        uint64 ntp = strtab_buf + strtab_len
+        unsafe { *(ntp as uint8) = nul }
+        strtab_len = strtab_len + 1
+        fi = fi + 1
+    }
+
+    // Append extern function names to strtab and record their offsets
+    uint64 extern_name_offsets = 0
+    if extern_fn_count > 0 {
+        extern_name_offsets = alloc(extern_fn_count * 8)
+        uint64 ei = 0
+        while ei < extern_fn_count {
+            uint64 xe = extern_fn_table + ei * 8
+            uint32 xtok = 0
+            unsafe { *(xe as uint32) -> xtok }
+            uint64 wxt = xtok
+            uint64 xno_ptr = extern_name_offsets + ei * 8
+            unsafe { *(xno_ptr as uint64) = strtab_len }
+            uint64 xnstart = tok_text_start(wxt)
+            uint64 xnlen = tok_text_len(wxt)
+            uint64 xni = 0
+            while xni < xnlen {
+                uint64 xsp = cg_source + xnstart + xni
+                uint64 xdp = strtab_buf + strtab_len
+                uint64 xc = 0
+                unsafe { *(xsp as uint8) -> xc }
+                uint8 xcb = xc
+                unsafe { *(xdp as uint8) = xcb }
+                strtab_len = strtab_len + 1
+                xni = xni + 1
+            }
+            uint64 xntp = strtab_buf + strtab_len
+            unsafe { *(xntp as uint8) = nul }
+            strtab_len = strtab_len + 1
+            ei = ei + 1
+        }
+    }
+
+    // Layout:
+    // 0x00: ELF header (52 bytes)
+    // 0x34: .text section content (text_len bytes)
+    // 0x34 + text_len: .data section content (data_len bytes)
+    // then: .symtab (symtab_size bytes)
+    // then: .strtab (strtab_len bytes)
+    // then: .shstrtab (shstrtab_size bytes)
+    // then: .rela.text (optional, only if externs exist)
+    // then: section headers (7 or 8 * 40 bytes)
+
+    uint64 rela_count = extern_call_count
+    uint64 rela_size = rela_count * 12   // Elf32_Rela = 12 bytes
+
+    uint64 elf_hdr_size = 52
+    uint64 text_off = elf_hdr_size
+    uint64 data_off = text_off + text_len
+    uint64 symtab_off = data_off + data_len
+    uint64 strtab_off = symtab_off + symtab_size
+    uint64 shstrtab_off = strtab_off + strtab_len
+    // Align .rela.text to 4 bytes
+    uint64 rela_off = shstrtab_off + shstrtab_size
+    uint64 rela_align_pad = (4 - (rela_off & 3)) & 3
+    rela_off = rela_off + rela_align_pad
+    // Align section headers to 4 bytes
+    uint64 shdr_off = rela_off + rela_size
+    uint64 shdr_align_pad = (4 - (shdr_off & 3)) & 3
+    shdr_off = shdr_off + shdr_align_pad
+    // null, .text, .data, .symtab, .strtab, .shstrtab, .note.GNU-stack
+    uint64 num_sections = 7
+    if has_relocs != 0 { num_sections = 8 }  // + .rela.text
+
+    // --- Emit ELF header (52 bytes) ---
+    // e_ident[0..3]: magic
+    emit_byte(0x7F); emit_byte(69); emit_byte(76); emit_byte(70)
+    // e_ident[4]: class = ELFCLASS32
+    emit_byte(1)
+    // e_ident[5]: data = ELFDATA2LSB
+    emit_byte(1)
+    // e_ident[6]: version = EV_CURRENT
+    emit_byte(1)
+    // e_ident[7]: OS/ABI = ELFOSABI_NONE
+    emit_byte(0)
+    // e_ident[8..15]: padding
+    uint64 pi = 0
+    while pi < 8 { emit_byte(0); pi = pi + 1 }
+    // e_type = ET_REL (1)
+    emit_u16_le(1)
+    // e_machine = EM_RISCV
+    emit_u16_le(243)
+    // e_version = 1
+    emit_u32_le(1)
+    // e_entry = 0 (no entry point for .o)
+    emit_u32_le(0)
+    // e_phoff = 0 (no program headers)
+    emit_u32_le(0)
+    // e_shoff = offset to section headers
+    emit_u32_le(shdr_off)
+    // e_flags = EF_RISCV_RVC
+    emit_u32_le(1)
+    // e_ehsize = 52
+    emit_u16_le(52)
+    // e_phentsize = 0 (no program headers)
+    emit_u16_le(0)
+    // e_phnum = 0
+    emit_u16_le(0)
+    // e_shentsize = 40
+    emit_u16_le(40)
+    // e_shnum = number of sections
+    emit_u16_le(num_sections)
+    // e_shstrndx = 5 (.shstrtab is section 5)
+    emit_u16_le(5)
+
+    // --- Emit .text section content ---
+    ci = 0
+    while ci < text_len {
+        uint64 p = blob + ci
+        uint64 bv = 0
+        unsafe { *(p as uint8) -> bv }
+        uint8 bb = bv
+        emit_byte(bb)
+        ci = ci + 1
+    }
+
+    // --- Emit .data section content ---
+    ci = 0
+    while ci < data_len {
+        uint64 p = blob + text_len + ci
+        uint64 bv = 0
+        unsafe { *(p as uint8) -> bv }
+        uint8 bb = bv
+        emit_byte(bb)
+        ci = ci + 1
+    }
+
+    // --- Emit .symtab ---
+    // Entry 0: STN_UNDEF (16 zero bytes — Elf32_Sym is 16 bytes)
+    uint64 si = 0
+    while si < 16 { emit_byte(0); si = si + 1 }
+
+    // Entries for each function. ALL defined functions are emitted GLOBAL
+    // (STB_GLOBAL << 4 | STT_FUNC = 0x12), not just `main`. This is required
+    // for cross-object linking: a callee like `addfive`, defined in one .o
+    // and called (via an R_RISCV_CALL_PLT relocation) from another, must be a
+    // GLOBAL symbol so the linker can satisfy the reference — a LOCAL symbol
+    // is file-scoped and invisible across objects. It mirrors the C default
+    // that top-level functions have external linkage (KernRift has no
+    // `static`/private-fn modifier). `main` is no longer special-cased; it was
+    // already GLOBAL. Only the null symbol is LOCAL, so all functions may be
+    // emitted in a single pass while still honouring the ELF rule that
+    // STB_LOCAL symbols precede STB_GLOBAL (local_count stays 1, and the
+    // .symtab sh_info below points one past the null symbol, at the first fn).
+    uint64 local_count = 1  // null symbol only (STB_LOCAL by convention)
+    fi = 0
+    while fi < fn_count {
+        uint64 no_ptr = name_offsets + fi * 8
+        uint64 name_off = 0
+        unsafe { *(no_ptr as uint64) -> name_off }
+        // st_name
+        emit_u32_le(name_off)
+        // st_value = offset within .text section
+        uint64 fentry = fn_table + fi * 8
+        uint64 fe4 = fentry + 4
+        uint32 code_off = 0
+        unsafe { *(fe4 as uint32) -> code_off }
+        emit_u32_le(code_off)
+        // st_size = 0
+        emit_u32_le(0)
+        // st_info = STB_GLOBAL(1) << 4 | STT_FUNC(2) = 0x12
+        emit_byte(0x12)
+        // st_other = 0
+        emit_byte(0)
+        // st_shndx = 1 (.text section)
+        emit_u16_le(1)
+        fi = fi + 1
+    }
+
+    // Extern function symbols (GLOBAL, STT_NOTYPE, SHN_UNDEF) follow all
+    // defined functions. The linker resolves these when producing the final
+    // executable. extern_sym_base is the symbol-table index of the first
+    // extern (used by the .rela.text loop's r_info): null + all fn symbols.
+    uint64 extern_sym_base = local_count + fn_count
+    uint64 ei2 = 0
+    while ei2 < extern_fn_count {
+        uint64 xno_ptr2 = extern_name_offsets + ei2 * 8
+        uint64 xname_off = 0
+        unsafe { *(xno_ptr2 as uint64) -> xname_off }
+        // st_name
+        emit_u32_le(xname_off)
+        // st_value = 0
+        emit_u32_le(0)
+        // st_size = 0
+        emit_u32_le(0)
+        // st_info = STB_GLOBAL(1) << 4 | STT_NOTYPE(0) = 0x10
+        emit_byte(0x10)
+        // st_other = 0
+        emit_byte(0)
+        // st_shndx = 0 (SHN_UNDEF — linker resolves)
+        emit_u16_le(0)
+        ei2 = ei2 + 1
+    }
+
+    // --- Emit .strtab ---
+    ci = 0
+    while ci < strtab_len {
+        uint64 p = strtab_buf + ci
+        uint64 bv = 0
+        unsafe { *(p as uint8) -> bv }
+        uint8 bb = bv
+        emit_byte(bb)
+        ci = ci + 1
+    }
+
+    // --- Emit .shstrtab ---
+    // \0
+    emit_byte(0)
+    // .text\0
+    emit_byte(46); emit_byte(116); emit_byte(101); emit_byte(120); emit_byte(116); emit_byte(0)
+    // .data\0
+    emit_byte(46); emit_byte(100); emit_byte(97); emit_byte(116); emit_byte(97); emit_byte(0)
+    // .symtab\0
+    emit_byte(46); emit_byte(115); emit_byte(121); emit_byte(109); emit_byte(116); emit_byte(97); emit_byte(98); emit_byte(0)
+    // .strtab\0
+    emit_byte(46); emit_byte(115); emit_byte(116); emit_byte(114); emit_byte(116); emit_byte(97); emit_byte(98); emit_byte(0)
+    // .shstrtab\0
+    emit_byte(46); emit_byte(115); emit_byte(104); emit_byte(115); emit_byte(116); emit_byte(114); emit_byte(116); emit_byte(97); emit_byte(98); emit_byte(0)
+    // .note.GNU-stack\0
+    emit_byte(46); emit_byte(110); emit_byte(111); emit_byte(116); emit_byte(101)
+    emit_byte(46); emit_byte(71); emit_byte(78); emit_byte(85); emit_byte(45)
+    emit_byte(115); emit_byte(116); emit_byte(97); emit_byte(99); emit_byte(107); emit_byte(0)
+    if has_relocs != 0 {
+        // .rela.text\0
+        emit_byte(46); emit_byte(114); emit_byte(101); emit_byte(108); emit_byte(97)
+        emit_byte(46); emit_byte(116); emit_byte(101); emit_byte(120); emit_byte(116); emit_byte(0)
+    }
+
+    // --- Pad up to rela.text's 4-byte alignment BEFORE the (optional)
+    // relocation content. shdr_off is computed assuming these pad bytes
+    // exist regardless of whether we actually emit relocs, so skipping
+    // them when has_relocs==0 leaves the file short by rela_align_pad.
+    pi = 0
+    while pi < rela_align_pad { emit_byte(0); pi = pi + 1 }
+
+    // --- Emit .rela.text section content ---
+    if has_relocs != 0 {
+        uint64 ri = 0
+        while ri < rela_count {
+            uint64 re = extern_call_sites + ri * 16
+            uint32 rco = 0
+            unsafe { *(re as uint32) -> rco }
+            uint64 re4 = re + 4
+            uint32 xidx = 0
+            unsafe { *(re4 as uint32) -> xidx }
+            uint64 wxi = xidx
+            uint64 sym_idx = extern_sym_base + wxi
+            // r_offset: code offset inside .text
+            emit_u32_le(rco)
+            // r_info: (sym_idx << 8) | type — Elf32_Rela packs the symbol
+            // index into the top 24 bits and the type into the low 8,
+            // unlike Elf64_Rela's 32/32 split.
+            uint64 rtype = 19  // R_RISCV_CALL_PLT
+            uint64 r_info = (sym_idx << 8) | rtype
+            emit_u32_le(r_info)
+            // r_addend = 0
+            emit_u32_le(0)
+            ri = ri + 1
+        }
+    }
+
+    // --- Alignment padding before section headers ---
+    pi = 0
+    while pi < shdr_align_pad { emit_byte(0); pi = pi + 1 }
+
+    // --- Section Headers (7 or 8 entries, 40 bytes each) ---
+
+    // Section 0: SHN_UNDEF (40 zero bytes — Elf32_Shdr is 40 bytes)
+    si = 0
+    while si < 40 { emit_byte(0); si = si + 1 }
+
+    // Section 1: .text
+    emit_u32_le(1)          // sh_name (offset 1 in .shstrtab)
+    emit_u32_le(1)          // sh_type = SHT_PROGBITS
+    emit_u32_le(6)          // sh_flags = SHF_ALLOC | SHF_EXECINSTR
+    emit_u32_le(0)          // sh_addr = 0 (relocatable)
+    emit_u32_le(text_off)   // sh_offset
+    emit_u32_le(text_len)   // sh_size
+    emit_u32_le(0)          // sh_link
+    emit_u32_le(0)          // sh_info
+    emit_u32_le(16)         // sh_addralign
+    emit_u32_le(0)          // sh_entsize
+
+    // Section 2: .data
+    emit_u32_le(7)          // sh_name (offset 7 in .shstrtab)
+    emit_u32_le(1)          // sh_type = SHT_PROGBITS
+    emit_u32_le(3)          // sh_flags = SHF_ALLOC | SHF_WRITE
+    emit_u32_le(0)          // sh_addr = 0
+    emit_u32_le(data_off)   // sh_offset
+    emit_u32_le(data_len)   // sh_size
+    emit_u32_le(0)          // sh_link
+    emit_u32_le(0)          // sh_info
+    emit_u32_le(8)          // sh_addralign
+    emit_u32_le(0)          // sh_entsize
+
+    // Section 3: .symtab
+    emit_u32_le(13)         // sh_name (offset 13 in .shstrtab)
+    emit_u32_le(2)          // sh_type = SHT_SYMTAB
+    emit_u32_le(0)          // sh_flags = 0
+    emit_u32_le(0)          // sh_addr = 0
+    emit_u32_le(symtab_off) // sh_offset
+    emit_u32_le(symtab_size) // sh_size
+    emit_u32_le(4)          // sh_link = index of .strtab (section 4)
+    emit_u32_le(local_count) // sh_info = one past last local symbol
+    emit_u32_le(4)          // sh_addralign
+    emit_u32_le(16)         // sh_entsize = sizeof(Elf32_Sym)
+
+    // Section 4: .strtab
+    emit_u32_le(21)         // sh_name (offset 21 in .shstrtab)
+    emit_u32_le(3)          // sh_type = SHT_STRTAB
+    emit_u32_le(0)          // sh_flags = 0
+    emit_u32_le(0)          // sh_addr = 0
+    emit_u32_le(strtab_off) // sh_offset
+    emit_u32_le(strtab_len) // sh_size
+    emit_u32_le(0)          // sh_link
+    emit_u32_le(0)          // sh_info
+    emit_u32_le(1)          // sh_addralign
+    emit_u32_le(0)          // sh_entsize
+
+    // Section 5: .shstrtab
+    emit_u32_le(29)         // sh_name (offset 29 in .shstrtab)
+    emit_u32_le(3)          // sh_type = SHT_STRTAB
+    emit_u32_le(0)          // sh_flags = 0
+    emit_u32_le(0)          // sh_addr = 0
+    emit_u32_le(shstrtab_off) // sh_offset
+    emit_u32_le(shstrtab_size) // sh_size
+    emit_u32_le(0)          // sh_link
+    emit_u32_le(0)          // sh_info
+    emit_u32_le(1)          // sh_addralign
+    emit_u32_le(0)          // sh_entsize
+
+    // Section 6: .note.GNU-stack — empty PROGBITS with no flags. Its mere
+    // presence (without SHF_EXECINSTR) tells ld the input doesn't request
+    // an executable stack, preventing the default-exec-stack behavior and
+    // the "missing .note.GNU-stack section implies executable stack" warning.
+    emit_u32_le(39)          // sh_name (offset 39 in .shstrtab = .note.GNU-stack)
+    emit_u32_le(1)           // sh_type = SHT_PROGBITS
+    emit_u32_le(0)           // sh_flags = 0 (no WRITE, no EXEC)
+    emit_u32_le(0)           // sh_addr
+    emit_u32_le(rela_off)    // sh_offset — reuse rela_off since section has 0 size
+    emit_u32_le(0)           // sh_size = 0
+    emit_u32_le(0)           // sh_link
+    emit_u32_le(0)           // sh_info
+    emit_u32_le(1)           // sh_addralign
+    emit_u32_le(0)           // sh_entsize
+
+    // Section 7: .rela.text (only if we have extern call sites)
+    if has_relocs != 0 {
+        emit_u32_le(55)         // sh_name (offset 55 in .shstrtab, shifted +16)
+        emit_u32_le(4)          // sh_type = SHT_RELA
+        emit_u32_le(0x40)       // sh_flags = SHF_INFO_LINK
+        emit_u32_le(0)          // sh_addr = 0
+        emit_u32_le(rela_off)   // sh_offset
+        emit_u32_le(rela_size)  // sh_size
+        emit_u32_le(3)          // sh_link = index of .symtab (section 3)
+        emit_u32_le(1)          // sh_info = index of .text (section 1)
+        emit_u32_le(4)          // sh_addralign
+        emit_u32_le(12)         // sh_entsize = sizeof(Elf32_Rela)
+    }
+}
+
+// ===========================================================================
+// RV32IMC disassembler for `--emit=asm` (Task 7).
+//
+// Decodes EXACTLY the subset the encoder emits into an objdump-parity listing:
+//   * ir_riscv.kr full-width forms: U-type (lui/auipc), J-type (jal), I-type
+//     (jalr, loads, OP-IMM incl. slli/srli/srai), S-type (stores), B-type
+//     (branches), R-type OP (+ RV32M mul..remu when funct7==0x01), ecall.
+//   * every c.* form rv_try_compress() produces: c.li c.addi c.mv c.add
+//     c.slli c.srli c.srai c.andi c.sub c.lw c.sw.
+// Any word outside that set decodes to `.unknown` (the objdump golden diff in
+// tests/run_tests.sh is the backstop). Mnemonics/operands follow
+// `riscv64-linux-gnu-objdump -M no-aliases -d` (raw forms, no pseudo-ops).
+// Reads the emitted stream from out_buf; calls write / write_hex32 / fmt_uint
+// / hex_nibble (defined in main.kr / runtime.kr — resolved whole-program).
+// ===========================================================================
+
+// ABI name for integer register x0..x31, written to fd.
+fn rv_regname(uint64 fd, uint64 n) {
+    if n == 0 { write(fd, "zero", 4) return }
+    if n == 1 { write(fd, "ra", 2) return }
+    if n == 2 { write(fd, "sp", 2) return }
+    if n == 3 { write(fd, "gp", 2) return }
+    if n == 4 { write(fd, "tp", 2) return }
+    if n == 5 { write(fd, "t0", 2) return }
+    if n == 6 { write(fd, "t1", 2) return }
+    if n == 7 { write(fd, "t2", 2) return }
+    if n == 8 { write(fd, "s0", 2) return }
+    if n == 9 { write(fd, "s1", 2) return }
+    uint8[4] rb
+    uint64 rl = 0
+    if n >= 10 && n <= 17 {
+        write(fd, "a", 1)
+        rl = fmt_uint(rb, n - 10)      // a0..a7
+        write(fd, rb, rl)
+        return
+    }
+    if n >= 18 && n <= 27 {
+        write(fd, "s", 1)
+        rl = fmt_uint(rb, n - 16)      // s2..s11
+        write(fd, rb, rl)
+        return
+    }
+    write(fd, "t", 1)
+    rl = fmt_uint(rb, n - 25)          // t3..t6 (x28..x31)
+    write(fd, rb, rl)
+}
+
+// Print `imm` (a `bits`-wide field) as a signed decimal, sign-extended.
+fn rv_write_simm(uint64 fd, uint64 imm, uint64 bits) {
+    uint64 m = 1 << bits
+    uint64 signbit = m >> 1
+    uint64 low = imm & (m - 1)
+    uint8[24] nb
+    uint64 nl = 0
+    if (low & signbit) != 0 {
+        uint64 mag = m - low
+        write(fd, "-", 1)
+        nl = fmt_uint(nb, mag)
+        write(fd, nb, nl)
+        return
+    }
+    nl = fmt_uint(nb, low)
+    write(fd, nb, nl)
+}
+
+// Print unsigned decimal.
+fn rv_write_udec(uint64 fd, uint64 v) {
+    uint8[24] nb
+    uint64 nl = fmt_uint(nb, v)
+    write(fd, nb, nl)
+}
+
+// Print a 32-bit value in minimal lowercase hex (no leading zeros, no 0x),
+// matching objdump's branch/jump target formatting.
+fn rv_write_hexmin(uint64 fd, uint64 v) {
+    uint8[16] hb
+    uint64 idx = 0
+    uint64 started = 0
+    uint64 shift = 28
+    while shift > 0 {
+        uint64 nib = (v >> shift) & 0xF
+        if nib != 0 || started != 0 {
+            started = 1
+            uint8 c = hex_nibble(nib)
+            uint64 pp = hb + idx
+            unsafe { *(pp as uint8) = c }
+            idx = idx + 1
+        }
+        shift = shift - 4
+    }
+    uint8 c0 = hex_nibble(v & 0xF)
+    uint64 pp0 = hb + idx
+    unsafe { *(pp0 as uint8) = c0 }
+    idx = idx + 1
+    write(fd, hb, idx)
+}
+
+// Print "0x" + minimal hex (objdump shift-amount style, e.g. slli rd,rs,0x3).
+fn rv_write_hexpfx(uint64 fd, uint64 v) {
+    write(fd, "0x", 2)
+    rv_write_hexmin(fd, v)
+}
+
+// CSR address -> name, mirror of rv_asm_csr's table (ir_riscv.kr) so every
+// CSR our own inline-asm encoder can name also disassembles back to that
+// name (objdump does the same for its larger built-in CSR table). Unknown
+// addresses (reachable via the raw-hex asm escape hatch) fall back to
+// objdump's own fallback: the numeric address in hex.
+fn rv_write_csr(uint64 fd, uint64 csr) {
+    if csr == 0x300 { write(fd, "mstatus", 7) return }
+    if csr == 0x304 { write(fd, "mie", 3) return }
+    if csr == 0x305 { write(fd, "mtvec", 5) return }
+    if csr == 0x341 { write(fd, "mepc", 4) return }
+    if csr == 0x342 { write(fd, "mcause", 6) return }
+    if csr == 0x344 { write(fd, "mip", 3) return }
+    if csr == 0xF14 { write(fd, "mhartid", 7) return }
+    rv_write_hexpfx(fd, csr)
+}
+
+// FENCE pred/succ 4-bit set -> "iorw" letter subset (bit3=i,bit2=o,bit1=r,
+// bit0=w), matching `objdump -M no-aliases`. An all-zero set prints
+// "unknown" (objdump's own label for it — not reachable via asm_emit_rv's
+// fixed `fence` encoding, but the raw-hex escape can produce it).
+fn rv_write_fence_set(uint64 fd, uint64 v) {
+    if v == 0 { write(fd, "unknown", 7) return }
+    if (v & 8) != 0 { write(fd, "i", 1) }
+    if (v & 4) != 0 { write(fd, "o", 1) }
+    if (v & 2) != 0 { write(fd, "r", 1) }
+    if (v & 1) != 0 { write(fd, "w", 1) }
+}
+
+// Decode a 16-bit compressed instruction `h` -> one mnemonic + operands.
+fn rv_disasm_c(uint64 fd, uint64 h) {
+    if h == 0 { write(fd, "c.unimp", 7) return }
+    uint64 op = h & 3
+    uint64 f3 = (h >> 13) & 7
+    uint64 rd = (h >> 7) & 0x1F
+    uint64 imm6 = ((h >> 2) & 0x1F) | (((h >> 12) & 1) << 5)
+
+    if op == 1 {
+        if f3 == 0 {
+            write(fd, "c.addi ", 7)
+            rv_regname(fd, rd)
+            write(fd, ",", 1)
+            rv_write_simm(fd, imm6, 6)
+            return
+        }
+        if f3 == 2 {
+            write(fd, "c.li ", 5)
+            rv_regname(fd, rd)
+            write(fd, ",", 1)
+            rv_write_simm(fd, imm6, 6)
+            return
+        }
+        if f3 == 4 {
+            uint64 sub = (h >> 10) & 3
+            uint64 rdp = ((h >> 7) & 7) + 8
+            if sub == 0 {
+                write(fd, "c.srli ", 7)
+                rv_regname(fd, rdp)
+                write(fd, ",", 1)
+                rv_write_hexpfx(fd, imm6)
+                return
+            }
+            if sub == 1 {
+                write(fd, "c.srai ", 7)
+                rv_regname(fd, rdp)
+                write(fd, ",", 1)
+                rv_write_hexpfx(fd, imm6)
+                return
+            }
+            if sub == 2 {
+                write(fd, "c.andi ", 7)
+                rv_regname(fd, rdp)
+                write(fd, ",", 1)
+                rv_write_simm(fd, imm6, 6)
+                return
+            }
+            // sub == 3: CA group; encoder only emits c.sub (bits[6:5]==00).
+            uint64 rs2p = ((h >> 2) & 7) + 8
+            if ((h >> 5) & 3) == 0 && ((h >> 12) & 1) == 0 {
+                write(fd, "c.sub ", 6)
+                rv_regname(fd, rdp)
+                write(fd, ",", 1)
+                rv_regname(fd, rs2p)
+                return
+            }
+            write(fd, ".unknown", 8)
+            return
+        }
+        write(fd, ".unknown", 8)
+        return
+    }
+
+    if op == 2 {
+        if f3 == 0 {
+            write(fd, "c.slli ", 7)
+            rv_regname(fd, rd)
+            write(fd, ",", 1)
+            rv_write_hexpfx(fd, imm6)
+            return
+        }
+        if f3 == 4 {
+            uint64 rs2 = (h >> 2) & 0x1F
+            if ((h >> 12) & 1) == 0 {
+                write(fd, "c.mv ", 5)
+            } else {
+                write(fd, "c.add ", 6)
+            }
+            rv_regname(fd, rd)
+            write(fd, ",", 1)
+            rv_regname(fd, rs2)
+            return
+        }
+        write(fd, ".unknown", 8)
+        return
+    }
+
+    if op == 0 {
+        uint64 rs1p = ((h >> 7) & 7) + 8
+        uint64 rdp = ((h >> 2) & 7) + 8
+        // CL/CS offset: [12:10]=off[5:3], [6]=off[2], [5]=off[6]
+        uint64 off = (((h >> 10) & 7) << 3) | (((h >> 6) & 1) << 2) | (((h >> 5) & 1) << 6)
+        if f3 == 2 {
+            write(fd, "c.lw ", 5)
+            rv_regname(fd, rdp)
+            write(fd, ",", 1)
+            rv_write_udec(fd, off)
+            write(fd, "(", 1)
+            rv_regname(fd, rs1p)
+            write(fd, ")", 1)
+            return
+        }
+        if f3 == 6 {
+            write(fd, "c.sw ", 5)
+            rv_regname(fd, rdp)
+            write(fd, ",", 1)
+            rv_write_udec(fd, off)
+            write(fd, "(", 1)
+            rv_regname(fd, rs1p)
+            write(fd, ")", 1)
+            return
+        }
+        write(fd, ".unknown", 8)
+        return
+    }
+    write(fd, ".unknown", 8)
+}
+
+// Decode a 32-bit instruction `insn` (at listing offset `addr`) -> mnemonic.
+fn rv_disasm_word(uint64 fd, uint64 insn, uint64 addr) {
+    uint64 op = insn & 0x7F
+    uint64 rd = (insn >> 7) & 0x1F
+    uint64 f3 = (insn >> 12) & 7
+    uint64 rs1 = (insn >> 15) & 0x1F
+    uint64 rs2 = (insn >> 20) & 0x1F
+    uint64 f7 = (insn >> 25) & 0x7F
+    uint64 immI = (insn >> 20) & 0xFFF
+
+    // ----- U-type: lui / auipc -----
+    if op == 0x37 || op == 0x17 {
+        if op == 0x37 { write(fd, "lui ", 4) } else { write(fd, "auipc ", 6) }
+        rv_regname(fd, rd)
+        write(fd, ",", 1)
+        rv_write_hexpfx(fd, (insn >> 12) & 0xFFFFF)
+        return
+    }
+
+    // ----- J-type: jal -----
+    if op == 0x6F {
+        uint64 j = (((insn >> 31) & 1) << 20) | (((insn >> 12) & 0xFF) << 12) | (((insn >> 20) & 1) << 11) | (((insn >> 21) & 0x3FF) << 1)
+        // sign-extend 21-bit and add to addr
+        uint64 tgt = 0
+        if (j & (1 << 20)) != 0 {
+            tgt = addr - ((1 << 21) - j)
+        } else {
+            tgt = addr + j
+        }
+        write(fd, "jal ", 4)
+        rv_regname(fd, rd)
+        write(fd, ",", 1)
+        rv_write_hexmin(fd, tgt)
+        return
+    }
+
+    // ----- I-type: jalr -----
+    if op == 0x67 {
+        write(fd, "jalr ", 5)
+        rv_regname(fd, rd)
+        write(fd, ",", 1)
+        rv_write_simm(fd, immI, 12)
+        write(fd, "(", 1)
+        rv_regname(fd, rs1)
+        write(fd, ")", 1)
+        return
+    }
+
+    // ----- B-type: branches -----
+    if op == 0x63 {
+        if f3 == 0 { write(fd, "beq ", 4) }
+        else if f3 == 1 { write(fd, "bne ", 4) }
+        else if f3 == 4 { write(fd, "blt ", 4) }
+        else if f3 == 5 { write(fd, "bge ", 4) }
+        else if f3 == 6 { write(fd, "bltu ", 5) }
+        else if f3 == 7 { write(fd, "bgeu ", 5) }
+        else { write(fd, ".unknown", 8) return }
+        uint64 b = (((insn >> 31) & 1) << 12) | (((insn >> 7) & 1) << 11) | (((insn >> 25) & 0x3F) << 5) | (((insn >> 8) & 0xF) << 1)
+        uint64 tgt = 0
+        if (b & (1 << 12)) != 0 {
+            tgt = addr - ((1 << 13) - b)
+        } else {
+            tgt = addr + b
+        }
+        rv_regname(fd, rs1)
+        write(fd, ",", 1)
+        rv_regname(fd, rs2)
+        write(fd, ",", 1)
+        rv_write_hexmin(fd, tgt)
+        return
+    }
+
+    // ----- I-type: loads -----
+    if op == 0x03 {
+        if f3 == 0 { write(fd, "lb ", 3) }
+        else if f3 == 1 { write(fd, "lh ", 3) }
+        else if f3 == 2 { write(fd, "lw ", 3) }
+        else if f3 == 4 { write(fd, "lbu ", 4) }
+        else if f3 == 5 { write(fd, "lhu ", 4) }
+        else { write(fd, ".unknown", 8) return }
+        rv_regname(fd, rd)
+        write(fd, ",", 1)
+        rv_write_simm(fd, immI, 12)
+        write(fd, "(", 1)
+        rv_regname(fd, rs1)
+        write(fd, ")", 1)
+        return
+    }
+
+    // ----- S-type: stores -----
+    if op == 0x23 {
+        if f3 == 0 { write(fd, "sb ", 3) }
+        else if f3 == 1 { write(fd, "sh ", 3) }
+        else if f3 == 2 { write(fd, "sw ", 3) }
+        else { write(fd, ".unknown", 8) return }
+        uint64 immS = (((insn >> 25) & 0x7F) << 5) | ((insn >> 7) & 0x1F)
+        rv_regname(fd, rs2)
+        write(fd, ",", 1)
+        rv_write_simm(fd, immS, 12)
+        write(fd, "(", 1)
+        rv_regname(fd, rs1)
+        write(fd, ")", 1)
+        return
+    }
+
+    // ----- OP-IMM (0x13) -----
+    if op == 0x13 {
+        if f3 == 1 {
+            // slli: shamt in immI[4:0]
+            write(fd, "slli ", 5)
+            rv_regname(fd, rd)
+            write(fd, ",", 1)
+            rv_regname(fd, rs1)
+            write(fd, ",", 1)
+            rv_write_hexpfx(fd, immI & 0x1F)
+            return
+        }
+        if f3 == 5 {
+            if (immI >> 5) == 0x20 { write(fd, "srai ", 5) } else { write(fd, "srli ", 5) }
+            rv_regname(fd, rd)
+            write(fd, ",", 1)
+            rv_regname(fd, rs1)
+            write(fd, ",", 1)
+            rv_write_hexpfx(fd, immI & 0x1F)
+            return
+        }
+        if f3 == 0 { write(fd, "addi ", 5) }
+        else if f3 == 2 { write(fd, "slti ", 5) }
+        else if f3 == 3 { write(fd, "sltiu ", 6) }
+        else if f3 == 4 { write(fd, "xori ", 5) }
+        else if f3 == 6 { write(fd, "ori ", 4) }
+        else { write(fd, "andi ", 5) }
+        rv_regname(fd, rd)
+        write(fd, ",", 1)
+        rv_regname(fd, rs1)
+        write(fd, ",", 1)
+        rv_write_simm(fd, immI, 12)
+        return
+    }
+
+    // ----- OP (0x33): R-type + RV32M -----
+    if op == 0x33 {
+        if f7 == 0x01 {
+            if f3 == 0 { write(fd, "mul ", 4) }
+            else if f3 == 1 { write(fd, "mulh ", 5) }
+            else if f3 == 2 { write(fd, "mulhsu ", 7) }
+            else if f3 == 3 { write(fd, "mulhu ", 6) }
+            else if f3 == 4 { write(fd, "div ", 4) }
+            else if f3 == 5 { write(fd, "divu ", 5) }
+            else if f3 == 6 { write(fd, "rem ", 4) }
+            else { write(fd, "remu ", 5) }
+        } else {
+            if f3 == 0 {
+                if f7 == 0x20 { write(fd, "sub ", 4) } else { write(fd, "add ", 4) }
+            }
+            else if f3 == 1 { write(fd, "sll ", 4) }
+            else if f3 == 2 { write(fd, "slt ", 4) }
+            else if f3 == 3 { write(fd, "sltu ", 5) }
+            else if f3 == 4 { write(fd, "xor ", 4) }
+            else if f3 == 5 {
+                if f7 == 0x20 { write(fd, "sra ", 4) } else { write(fd, "srl ", 4) }
+            }
+            else if f3 == 6 { write(fd, "or ", 3) }
+            else { write(fd, "and ", 4) }
+        }
+        rv_regname(fd, rd)
+        write(fd, ",", 1)
+        rv_regname(fd, rs1)
+        write(fd, ",", 1)
+        rv_regname(fd, rs2)
+        return
+    }
+
+    // ----- MISC-MEM (0x0F): fence / fence.i -----
+    if op == 0x0F {
+        if f3 == 0 {
+            uint64 pred = (insn >> 24) & 0xF
+            uint64 succ = (insn >> 20) & 0xF
+            write(fd, "fence ", 6)
+            rv_write_fence_set(fd, pred)
+            write(fd, ",", 1)
+            rv_write_fence_set(fd, succ)
+            return
+        }
+        if f3 == 1 && insn == 0x0000100F { write(fd, "fence.i", 7) return }
+        write(fd, ".unknown", 8)
+        return
+    }
+
+    // ----- SYSTEM (0x73): ecall/ebreak/wfi/mret + CSR ops -----
+    if op == 0x73 {
+        if f3 == 0 {
+            if rd == 0 && rs1 == 0 {
+                if immI == 0 { write(fd, "ecall", 5) return }
+                if immI == 1 { write(fd, "ebreak", 6) return }
+                if immI == 0x105 { write(fd, "wfi", 3) return }
+                if immI == 0x302 { write(fd, "mret", 4) return }
+            }
+            write(fd, ".unknown", 8)
+            return
+        }
+        if f3 == 1 || f3 == 2 || f3 == 3 {
+            if f3 == 1 { write(fd, "csrrw ", 6) }
+            else if f3 == 2 { write(fd, "csrrs ", 6) }
+            else { write(fd, "csrrc ", 6) }
+            rv_regname(fd, rd)
+            write(fd, ",", 1)
+            rv_write_csr(fd, immI)
+            write(fd, ",", 1)
+            rv_regname(fd, rs1)
+            return
+        }
+        if f3 == 5 || f3 == 6 || f3 == 7 {
+            if f3 == 5 { write(fd, "csrrwi ", 7) }
+            else if f3 == 6 { write(fd, "csrrsi ", 7) }
+            else { write(fd, "csrrci ", 7) }
+            rv_regname(fd, rd)
+            write(fd, ",", 1)
+            rv_write_csr(fd, immI)
+            write(fd, ",", 1)
+            rv_write_udec(fd, rs1)
+            return
+        }
+        write(fd, ".unknown", 8)
+        return
+    }
+
+    write(fd, ".unknown", 8)
+}
+
+// Decode the instruction at out_buf offset `pos`, write one listing line
+// "  <off>: <hex>  <mnemonic> <operands>\n" to fd, return bytes consumed
+// (2 for a compressed halfword, 4 for a full word). `(insn & 3) != 3` marks
+// a 16-bit compressed instruction; otherwise it is a 32-bit instruction.
+fn rv_disasm_at(uint64 fd, uint64 pos, uint64 text_start) -> uint64 {
+    uint64 bp = out_buf + pos
+    uint64 lo16 = 0
+    unsafe { *(bp as uint16) -> lo16 }
+    write(fd, "  ", 2)
+    write_hex32(fd, pos - text_start)
+    write(fd, ": ", 2)
+    if (lo16 & 3) != 3 {
+        write_hex32(fd, lo16 & 0xFFFF)
+        write(fd, "  ", 2)
+        rv_disasm_c(fd, lo16 & 0xFFFF)
+        write(fd, "\n", 1)
+        return 2
+    }
+    uint64 insn = 0
+    unsafe { *(bp as uint32) -> insn }
+    write_hex32(fd, insn)
+    write(fd, "  ", 2)
+    rv_disasm_word(fd, insn, pos - text_start)
+    write(fd, "\n", 1)
+    return 4
+}
