@@ -898,6 +898,25 @@ fn fn_sig_lookup(uint64 name_tok) -> uint64 {
     return 0xFFFFFFFF
 }
 
+// ---- riscv32 (target_arch == 2) type restrictions ----
+// RV32IMC is a 32-bit, integer-only target (word size 4, no hardware FPU).
+// Reject the 64-bit integer type kinds (KwUint64 = 83, KwInt64 = 87) and all
+// float kinds (KwFloat16/32/64 = 94/95/96) wherever a type annotation reaches
+// sema. No-op off riscv32, so x86_64/arm64 sema is byte-for-byte unchanged.
+// Mirrors KernRift type_check.kr's tc_riscv32_reject_kind (KernRift has a
+// dedicated type_check.kr; MLRift's sema lives here in analysis.mlr).
+fn analysis_riscv32_reject_kind(uint64 kind, uint64 tok) {
+    if target_arch != 2 { return }
+    if kind == 83 || kind == 87 {
+        report_error_at(tok, "64-bit integers not supported on riscv32; use uint32")
+        sema_errors = sema_errors + 1
+    }
+    if kind >= 94 && kind <= 96 {
+        report_error_at(tok, "float (f16/f32/f64) not supported on riscv32 (no hardware FPU)")
+        sema_errors = sema_errors + 1
+    }
+}
+
 // Collect function signatures from top-level AST
 fn sema_collect_signatures(uint64 root) {
     uint32 child = ast_child(root)
@@ -919,9 +938,21 @@ fn sema_collect_signatures(uint64 root) {
                     uint32 pflag_sp = ast_data4(wpchild)
                     uint64 wpflag_sp = pflag_sp
                     if wpflag_sp == 1 { param_count = param_count + 1 }
+                    // riscv32: reject 64-bit / float parameter types. Param
+                    // node (kind 3): data1 = type token, data2 = name token.
+                    uint32 ptype_tok = ast_data1(wpchild)
+                    uint64 wptype_tok = ptype_tok
+                    analysis_riscv32_reject_kind(sema_tok_kind(wptype_tok), wptype_tok)
                 }
                 uint32 pnxt = ast_next(wpchild)
                 wpchild = pnxt
+            }
+            // riscv32: reject a 64-bit / float return type (FnDecl data2 =
+            // return-type token; 0 when the function returns nothing).
+            uint32 rtype_tok_rv = ast_data2(wchild)
+            if rtype_tok_rv != 0 {
+                uint64 wrtype_tok_rv = rtype_tok_rv
+                analysis_riscv32_reject_kind(sema_tok_kind(wrtype_tok_rv), wrtype_tok_rv)
             }
             // Check for duplicate. A duplicate is fine when both decls
             // are @dynamic extern (data4 flag bits 3 + 5 set, i.e. 0x28)
@@ -1334,6 +1365,8 @@ fn sema_check_stmt(uint64 node) {
         uint32 vd_type_tok_idx = ast_data1(node)
         uint64 vd_type_tok = vd_type_tok_idx
         uint64 decl_type_kind = sema_tok_kind(vd_type_tok)
+        // riscv32: reject a 64-bit / float declared type on the local.
+        analysis_riscv32_reject_kind(decl_type_kind, vd_type_tok)
         if winit != 0 {
             sema_check_expr(winit)
             // Strict bool/int separation: check type tag of initializer
@@ -1384,6 +1417,14 @@ fn sema_check_stmt(uint64 node) {
                 if decl_type_kind == 82 || decl_type_kind == 86 { limit = 0x100000000 }
                 if limit != 0 && lit_val >= limit {
                     report_warn_at(wtype_tok, "literal initializer does not fit the declared type (truncated)")
+                }
+                // riscv32: a 32-bit target has no 64-bit integer register, so
+                // an integer literal that doesn't fit in 32 bits is a hard
+                // error (mirrors KernRift type_check.kr's 32-bit literal-
+                // overflow diagnostic). Fires only under --arch=riscv.
+                if target_arch == 2 && lit_val >= 0x100000000 {
+                    report_error_at(wtype_tok, "integer literal does not fit in 32 bits (64-bit integers not supported on riscv32)")
+                    sema_errors = sema_errors + 1
                 }
             }
         }
