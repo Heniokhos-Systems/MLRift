@@ -1,0 +1,3203 @@
+// ir_xtensa.mlr — Xtensa LX6 IR-only backend (target_arch == 3). Mirrors
+// ir_riscv.mlr. CALL0 ABI, literal-pool + L32R, branch relaxation.
+//
+// Ported from KernRift src/ir_xtensa.kr (Track A, xtensa half). The only
+// deliberate divergences from the KernRift original are:
+//   * the IR_AND_IMM..IR_SAR_IMM (140..145) handlers are OMITTED — see the
+//     two explanatory comments below (opcode collision with MLRift's GPU ops);
+//   * the undefined-function diagnostic in resolve_fixups_xtensa uses
+//     MLRift's diagnostic vocabulary (no diag_loc_head/diag_span_of);
+//   * fixup_table_ensure() is the capacity-assert shim already defined by
+//     src/ir_riscv.mlr (MLRift pre-allocates fixed tables); it is reused, not
+//     redefined — one global namespace, dup `fn` is a build error.
+// Everything else is a byte-for-byte transcription.
+
+// CALL0 register roles: a0=ret addr, a1=SP, a2=arg0/retval, a2-a7=args,
+// a8-a11=caller temps, a12-a15=callee-saved.
+static uint64 XT_A0 = 0
+static uint64 XT_SP = 1        // a1
+static uint64 XT_A2 = 2
+static uint64 XT_A5 = 5        // scratch (arg reg a5, but free whenever the op makes no call)
+static uint64 XT_A8 = 8        // scratch
+static uint64 XT_A9 = 9        // scratch
+static uint64 XT_A10 = 10      // scratch (zero source in the .bss-zeroing preamble;
+                               // dedicated address-formation scratch for large-frame
+                               // SP stores — see xt_s32i_sp. Never allocated, never
+                               // live across an IR op.)
+static uint64 XT_A11 = 11      // scratch (byte tmp in the memcpy loop)
+
+// CALL0 has SIX argument registers a2..a7 (regs 2..7) — narrower than the
+// eight a0-a7 riscv/arm64 use. arg index 0..5 -> a2..a7; index 6+ overflows
+// to the stack (mirror of ir_riscv.kr's imm<8 split, but the boundary is 6).
+static uint64 XT_ARG0 = 2      // a2 (also the return-value register)
+static uint64 XT_NUM_ARG_REGS = 6
+
+// Fixed outgoing-argument overflow region at the BOTTOM of every frame
+// (mirror of ir_riscv.kr's RV_OVERFLOW_RESERVE = 64). The caller stores the
+// 7th+ arg at [a1 + oi*4] with no SP adjustment; the callee reads it back at
+// [a1 + callee_frame + oi*4] (IR_COPY imm 6..99). 64 bytes = 16 slots, so the
+// IR_ARG overflow guard caps oi at 16 exactly as riscv does. Spill slots sit
+// ABOVE this region (xt_spill_offset adds it in), so outgoing args never
+// clobber a live spill across the call.
+static uint64 XT_OVERFLOW_RESERVE = 64
+
+// Per-function scratchpad (Task 6): fixed byte region FMT_UINT uses to stage
+// decimal digits before copying them into the caller's buffer in reversed
+// (most-significant-first) order. Mirror of ir_riscv.kr's RV_SCRATCH_SIZE=32
+// / ir_rv_scratch_off. 32 bytes comfortably covers a 32-bit uint's max 10
+// digits. ir_xt_scratch_off is computed once per function in ir_xtensa_gen
+// (step 5, frame layout) and consumed by IR_FMT_UINT's handler below.
+static uint64 XT_SCRATCH_SIZE = 32
+static uint64 ir_xt_scratch_off = 0
+
+// Freestanding boot (Task 8). The entry function AST node (a live `_start` if
+// present, else `main`) is selected in main.kr's xt_raw path and passed to
+// ir_xtensa_gen as its `xt_entry_node` parameter — mirroring riscv's
+// rv_entry_node, a threaded value rather than a cross-file global, so the
+// reference resolves under both the concatenated and import builds. It is
+// non-zero ONLY under --arch=xtensa --freestanding, so ir_xtensa_gen gates the
+// SP-init preamble on `fn_node == xt_entry_node` with no separate raw flag. The
+// preamble is emitted as the entry fn's FIRST code (past its pool), so e_entry
+// (= code_start) lands on it. XT_STACK_TOP is the initial SP: the stack grows
+// DOWN from here, so it must sit above the (tiny) boot image in the lx60 cached
+// DRAM window (load base 0xd0000000, see codegen_xtensa.kr). 0xd0040000 = 256
+// KiB into that window — pinned against qemu-system-xtensa -M lx60 (see task-8
+// report).
+static uint64 XT_STACK_TOP = 0xd0040000
+
+// --- ESP32 machine target (--target=esp32) memory map -----------------------
+// Spec §3 (docs/superpowers/specs/2026-07-20-esp32-machine-target-design.md),
+// every value HARDWARE-CONFIRMED 2026-07-20 (the IDF 2nd-stage bootloader
+// itself loads at 0x40080400 in the captured ROM boot log). Do not "improve"
+// any constant. Code loads in IRAM (0x40080400, 1 KiB clear of the vector
+// area, limit 0x400A0000); byte-addressable data loads in DRAM (0x3FFB0000,
+// must stay below 0x3FFE0000); initial SP = 0x3FFE0000 (16-byte aligned, the
+// stack grows DOWN from the top of the DRAM window, clear of ROM-reserved
+// 0x3FFE0000-0x3FFE0440 which sits ABOVE it). main.kr assigns XT_STACK_TOP =
+// XT_ESP32_STACK_TOP before codegen when the esp32 target is active, so the
+// entry preamble's pre-scan interns the right pool literal.
+//
+// ⚠️ THE IRAM BYTE-ACCESS INVARIANT the constants below enforce: ESP32 IRAM
+// supports ONLY aligned 32-bit accesses. A byte load (l8ui — exactly how
+// puts/strlen/memcpy read strings) from an IRAM address raises LoadStoreError
+// = silently dead board, no output, no JTAG. Therefore ALL byte-addressable
+// data (string literals, statics, .bss) must live in the DRAM segment; only
+// code and 4-byte-aligned literal-pool words (read by l32r) may live in IRAM.
+// resolve_addr_fixups_xtensa_esp32 + xt_esp32_check_layout below turn any
+// violation into a hard COMPILE error — never an emitted image.
+static uint64 XT_ESP32_IRAM_BASE = 0x40080400
+static uint64 XT_ESP32_IRAM_LIMIT = 0x400A0000
+static uint64 XT_ESP32_DRAM_BASE = 0x3FFB0000
+static uint64 XT_ESP32_DRAM_LIMIT = 0x3FFE0000
+static uint64 XT_ESP32_STACK_TOP = 0x3FFE0000
+// Stack headroom reserved below XT_ESP32_STACK_TOP, i.e. the number of bytes
+// at the top of the DRAM window that .data+.bss may NOT claim. The stack
+// grows DOWN from XT_ESP32_STACK_TOP, which is the SAME address as
+// XT_ESP32_DRAM_LIMIT — without this reservation a program whose statics fill
+// the window compiles clean and then has its .bss tail scribbled on by the
+// entry prologue's first frame push. 4 KiB covers a typical frame (the old
+// 2047-byte cap) plus a few nested call0 frames; since the large-frame work
+// a single frame may legitimately reach 32752 bytes, which this floor does
+// NOT cover — it is a floor, not a promise that 4 KiB is enough stack for
+// any given program. Enforced by xt_esp32_check_layout.
+static uint64 XT_ESP32_MIN_STACK = 4096
+
+// --- ESP32 startup stub (Task 4) ---------------------------------------------
+// xt_esp32_target: set to 1 by main.kr alongside XT_STACK_TOP when
+// --target=esp32 is active (ir_xtensa.kr precedes main.kr in the concat build,
+// so it cannot read main.kr's machine_target directly — same pattern as
+// XT_STACK_TOP). Gates the WDT/PS/park additions to the entry preamble: with
+// it 0 (lx60 qemu path, every other arch/target) the preamble is BYTE-
+// IDENTICAL to Task 3 — the lx60 boot test asserts e_entry still decodes to
+// `l32r a1` FIRST.
+static uint64 xt_esp32_target = 0
+//
+// Watchdogs — THE footgun (confirmed on real silicon): the mask ROM hands
+// off with RWDT and MWDT0 ARMED in flash-boot mode; MWDT1's flash-boot bit
+// also defaults to 1, so it is cleared defensively. The stub must write 0 to
+// the WHOLE CONFIG0 register, not just the enable bit: TIMG_WDT_FLASHBOOT_
+// MOD_EN (bit 14) resets to 1 in hardware and forces the WDT on regardless
+// of the enable bit — clearing EN alone leaves the chip rebooting ~1s in
+// with no clue why. Unlock key 0x50D83AA1 for all three; re-locking is
+// optional (skipped). No "super WDT" exists on this die.
+static uint64 XT_ESP32_WDT_KEY = 0x50D83AA1
+static uint64 XT_ESP32_RWDT_WPROT = 0x3FF480A4     // RWDT unlock (write key)
+static uint64 XT_ESP32_RWDT_CFG0 = 0x3FF4808C      // RWDT config0 (write 0)
+static uint64 XT_ESP32_MWDT0_WPROT = 0x3FF5F064    // MWDT0/TIMG0 unlock
+static uint64 XT_ESP32_MWDT0_CFG0 = 0x3FF5F048     // MWDT0 config0
+static uint64 XT_ESP32_MWDT1_WPROT = 0x3FF60064    // MWDT1/TIMG1 unlock
+static uint64 XT_ESP32_MWDT1_CFG0 = 0x3FF60048     // MWDT1 config0
+// PS value the stub pins after the WDT writes (rather than inheriting
+// whatever the ROM left): INTLEVEL=15 (all maskable interrupts masked — M1
+// installs no handlers and VECBASE still points at ROM vectors), UM=1 (user
+// exception vector, the ESP-IDF/CALL0 convention), WOE=0 (CALL0 ABI — this
+// backend never emits windowed call/entry/retw, so window exceptions must
+// stay impossible), EXCM=0, RING=0, CALLINC=0.
+static uint64 XT_ESP32_PS = 0x2F
+// Pool word holding the absolute IRAM address of the park self-branch. The
+// preamble loads it into a0 BEFORE main's prologue saves a0, so if main ever
+// returns, its epilogue restores this a0 and ret.n lands on `j .` — a genuine
+// hang — instead of decoding garbage (which raises an exception -> reset loop
+// that mimics a WDT failure exactly). Reserved in the entry fn's pre-scan
+// (after the .bss slots), patched at preamble-emit time when the park offset
+// is known: the park sits in the preamble, ahead of every relaxable branch,
+// so its offset never shifts (same stability argument as the .bss l32r's).
+static uint64 xt_esp32_park_pool_off = 0
+
+fn xt_err(uint64 msg) {
+    write(2, msg, str_len(msg))
+    exit(1)
+}
+fn xt_nyi_op(uint64 op) {
+    uint64 m = "error: xtensa: IR op "
+    write(2, m, str_len(m))
+    uint8[16] nb
+    uint64 nl = fmt_uint(nb, op)
+    write(2, nb, nl)
+    uint64 t = " not yet implemented\n"
+    write(2, t, str_len(t))
+    exit(1)
+}
+
+// ---------------------------------------------------------------------------
+// Instruction encoders (Task 2). All fields verified byte-exact against
+// `xtensa-lx106-elf-as --no-transform` via scripts/xt-golden.sh — see
+// .superpowers/sdd/task-2-xtensa-report.md for the golden-diff evidence.
+//
+// ENDIANNESS: xtensa-lx106-elf-objdump -d --show-raw-insn prints each
+// instruction as a WORD, MSB-first (e.g. `movi a2,100` prints `64a022`),
+// but the actual little-endian memory bytes are the reverse (`22 a0 64`).
+// Every encoder here builds the word W exactly as objdump prints it, then
+// xt_emit24/xt_emit16 emit it LITTLE-ENDIAN (low byte first). Do not emit
+// bytes in objdump's printed order.
+// ---------------------------------------------------------------------------
+
+fn xt_emit24(uint64 w) {
+    emit_byte(w & 0xFF)
+    emit_byte((w >> 8) & 0xFF)
+    emit_byte((w >> 16) & 0xFF)
+}
+
+fn xt_emit16(uint64 w) {
+    emit_byte(w & 0xFF)
+    emit_byte((w >> 8) & 0xFF)
+}
+
+// ---------------------------------------------------------------------------
+// RRR format (24-bit): op0[3:0] | t[7:4] | s[11:8] | r[15:12] | op1[19:16] | op2[23:20]
+// ---------------------------------------------------------------------------
+fn xt_rrr(uint64 op0, uint64 t, uint64 s, uint64 r, uint64 op1, uint64 op2) {
+    uint64 w = (op0 & 0xF) | ((t & 0xF) << 4) | ((s & 0xF) << 8) | ((r & 0xF) << 12) | ((op1 & 0xF) << 16) | ((op2 & 0xF) << 20)
+    xt_emit24(w)
+}
+
+// Arithmetic/logical (op0=0, op1=0): r=ar(dest), s=as, t=at
+fn xt_add(uint64 rd, uint64 rs, uint64 rt) { xt_rrr(0, rt, rs, rd, 0, 0x8) }
+fn xt_sub(uint64 rd, uint64 rs, uint64 rt) { xt_rrr(0, rt, rs, rd, 0, 0xC) }
+fn xt_and(uint64 rd, uint64 rs, uint64 rt) { xt_rrr(0, rt, rs, rd, 0, 0x1) }
+fn xt_or(uint64 rd, uint64 rs, uint64 rt)  { xt_rrr(0, rt, rs, rd, 0, 0x2) }
+fn xt_xor(uint64 rd, uint64 rs, uint64 rt) { xt_rrr(0, rt, rs, rd, 0, 0x3) }
+// Multiply option (op0=0, op1=2): MULL
+fn xt_mull(uint64 rd, uint64 rs, uint64 rt) { xt_rrr(0, rt, rs, rd, 2, 0x8) }
+
+// DIV32 option (op0=0, op1=2, op2=0xC..0xF): QUOU/QUOS/REMU/REMS. Hand-
+// encoded — `xtensa-lx106-elf-as`/`-objdump` REJECT these (the LX106 core
+// config lacks the DIV32 option, so Task 2's golden-diff harness cannot
+// exercise them the way every other encoder in this file was verified).
+// Encoding provenance for Task 4 (two independent sources, both agree):
+//   1. Real binutils source, host-binutils-2.43.1's bfd/xtensa-modules.c:
+//      Opcode_quou_Slot_inst_encode -> slotbuf[0] = 0xc20000
+//      Opcode_quos_Slot_inst_encode -> slotbuf[0] = 0xd20000
+//      Opcode_remu_Slot_inst_encode -> slotbuf[0] = 0xe20000
+//      Opcode_rems_Slot_inst_encode -> slotbuf[0] = 0xf20000
+//      (compare Opcode_mull_Slot_inst_encode -> 0x820000, matching xt_mull
+//      above exactly: same op1=2 field, only op2 differs.) These words are
+//      op0=0,t=0,s=0,r=0,op1=2,op2={0xC,0xD,0xE,0xF} — i.e.
+//      xt_rrr(0, 0, 0, 0, 2, 0xC..0xF), confirming the op1/op2 fields.
+//      The same file's disassembly switch (Field_op2_Slot_inst_get, case
+//      2 i.e. op1=2) maps op2 12/13/14/15 -> quou/quos/remu/rems.
+//      Iclass_xt_iclass_div_args = { arr:'o', ars:'i', art:'i' }: assembly
+//      order is `quou ar, as, at` meaning ar <- as OP at (as=dividend in
+//      the `s` field, at=divisor in the `t` field) — the SAME s/t
+//      convention as xt_sub (ar <- as - at) above, hence the (rd, rs, rt)
+//      argument order below mirrors xt_sub's exactly.
+//   2. GBATEK's Xtensa opcode encoding tables (RRR op1=2 "RST2" group):
+//      op2 8=MULL 9=reserved A=MULUH B=MULSH C=QUOU D=QUOS E=REMU F=REMS.
+// Runtime note: LX6/ESP32 (unlike LX106) DOES implement DIV32, so these
+// are real, executable instructions on the target — only the dev-host
+// toolchain's assembler/disassembler (built for LX106) can't handle them.
+// No local qemu-system-xtensa / xtensa-esp32-elf-objdump was available to
+// runtime- or disassembly-verify beyond the two independent ISA sources
+// above; T8 (qemu boot) is the first point a runtime check becomes
+// possible for these four opcodes.
+fn xt_quou(uint64 rd, uint64 rs, uint64 rt) { xt_rrr(0, rt, rs, rd, 2, 0xC) }
+fn xt_quos(uint64 rd, uint64 rs, uint64 rt) { xt_rrr(0, rt, rs, rd, 2, 0xD) }
+fn xt_remu(uint64 rd, uint64 rs, uint64 rt) { xt_rrr(0, rt, rs, rd, 2, 0xE) }
+fn xt_rems(uint64 rd, uint64 rs, uint64 rt) { xt_rrr(0, rt, rs, rd, 2, 0xF) }
+
+// Shift-amount-register ops (op0=0, op1=0, op2=4): s=as, r selects SSR(0)/SSL(1)
+fn xt_ssr(uint64 rs) { xt_rrr(0, 0, rs, 0, 0, 0x4) }
+fn xt_ssl(uint64 rs) { xt_rrr(0, 0, rs, 1, 0, 0x4) }
+
+// Variable shifts (op0=0, op1=1): shift amount comes from SAR (set via ssl/ssr)
+fn xt_sll(uint64 rd, uint64 rs) { xt_rrr(0, 0, rs, rd, 1, 0xA) }
+fn xt_srl(uint64 rd, uint64 rs) { xt_rrr(0, rs, 0, rd, 1, 0x9) }
+fn xt_sra(uint64 rd, uint64 rs) { xt_rrr(0, rs, 0, rd, 1, 0xB) }
+
+// Immediate shifts (op0=0, op1=1). SRLI: s=sa (4-bit, 0-15 — no high bit).
+// SRAI: s=sa[3:0], and sa[4] rides op2 bit0 (op2=0x2 for sa<16, 0x3 for sa>=16)
+// — byte-exact across the full 0..31 range (verified vs xtensa-lx106-elf-as).
+// SLLI: t=(16-sa)&0xF (ISA quirk — verified for sa 1..15, the only range this
+// MVP needs; sa==0/17..31 are out of scope here).
+fn xt_slli(uint64 rd, uint64 rs, uint64 sa) { xt_rrr(0, (16 - sa) & 0xF, rs, rd, 1, 0x1) }
+fn xt_srli(uint64 rd, uint64 rs, uint64 sa) { xt_rrr(0, rs, sa & 0xF, rd, 1, 0x4) }
+fn xt_srai(uint64 rd, uint64 rs, uint64 sa) { xt_rrr(0, rs, sa & 0xF, rd, 1, 0x2 | ((sa >> 4) & 1)) }
+
+// MEMW: fixed encoding, no operands (op0=0,t=0xC,s=0,r=2,op1=0,op2=0)
+fn xt_memw() { xt_rrr(0, 0xC, 0, 2, 0, 0) }
+// RSYNC: same RRR group as MEMW, t=1 (word 0x002010) — waits for a WSR to a
+// special register (PS here) to take effect before dependent instructions.
+fn xt_rsync() { xt_rrr(0, 1, 0, 2, 0, 0) }
+
+// RSR/WSR (op0=0, op1=3): special-register number sr split as r=sr[7:4], s=sr[3:0]
+fn xt_rsr(uint64 sr, uint64 rt) { xt_rrr(0, rt, sr & 0xF, (sr >> 4) & 0xF, 3, 0x0) }
+fn xt_wsr(uint64 sr, uint64 rt) { xt_rrr(0, rt, sr & 0xF, (sr >> 4) & 0xF, 3, 0x1) }
+static uint64 XT_SR_SAR = 3
+static uint64 XT_SR_PS = 230   // 0xE6 — processor state (INTLEVEL/EXCM/UM/WOE)
+
+// CALLX0 (op0=0,op1=0,op2=0): t=0xC (fixed selector), s=target reg
+fn xt_callx0(uint64 rs) { xt_rrr(0, 0xC, rs, 0, 0, 0) }
+
+// ---------------------------------------------------------------------------
+// RRI8 format (24-bit): op0[3:0] | t[7:4] | s[11:8] | r[15:12] | imm8[23:16]
+// ---------------------------------------------------------------------------
+fn xt_rri8(uint64 op0, uint64 t, uint64 s, uint64 r, uint64 imm8) {
+    uint64 w = (op0 & 0xF) | ((t & 0xF) << 4) | ((s & 0xF) << 8) | ((r & 0xF) << 12) | ((imm8 & 0xFF) << 16)
+    xt_emit24(w)
+}
+
+fn xt_addi(uint64 rd, uint64 rs, uint64 imm) { xt_rri8(2, rd, rs, 0xC, imm) }
+// ADDMI at, as, imm — ADDI's RRI8 twin (r=0xD instead of 0xC) whose imm8 is
+// shifted left 8: adds a signed multiple of 256 in -32768..32512. `imm` is
+// the BYTE value (must be a multiple of 256; callers guarantee it — the low
+// 8 bits are simply not encodable and would be silently dropped otherwise).
+// Verified byte-exact against `xtensa-lx106-elf-as --no-transform` via
+// scripts/xt-golden.sh: addmi a10,a1,0x400 -> 04d1a2, a1,0x7f00 -> 7fd1a2,
+// a1,-32768 -> 80d1a2 (large-frame task).
+fn xt_addmi(uint64 rd, uint64 rs, uint64 imm) { xt_rri8(2, rd, rs, 0xD, (imm >> 8) & 0xFF) }
+fn xt_l8ui(uint64 rt, uint64 rs, uint64 off)  { xt_rri8(2, rt, rs, 0x0, off) }
+fn xt_l16ui(uint64 rt, uint64 rs, uint64 off) { xt_rri8(2, rt, rs, 0x1, off >> 1) }
+fn xt_l32i(uint64 rt, uint64 rs, uint64 off)  { xt_rri8(2, rt, rs, 0x2, off >> 2) }
+fn xt_s8i(uint64 rt, uint64 rs, uint64 off)   { xt_rri8(2, rt, rs, 0x4, off) }
+fn xt_s16i(uint64 rt, uint64 rs, uint64 off)  { xt_rri8(2, rt, rs, 0x5, off >> 1) }
+fn xt_s32i(uint64 rt, uint64 rs, uint64 off)  { xt_rri8(2, rt, rs, 0x6, off >> 2) }
+fn xt_l16si(uint64 rt, uint64 rs, uint64 off) { xt_rri8(2, rt, rs, 0x9, off >> 1) }
+
+// MOVI ar, imm12 (op0=2, r=0xA fixed): t=ar, s=imm12[11:8], imm8=imm12[7:0]
+fn xt_movi(uint64 rd, uint64 imm12) { xt_rri8(2, rd, (imm12 >> 8) & 0xF, 0xA, imm12 & 0xFF) }
+
+// ---------------------------------------------------------------------------
+// RI16 format (24-bit): op0[3:0] | t[7:4] | imm16[23:8]  — L32R only.
+// Target = ((PC+3) & ~3) + (imm16 - 0x10000) * 4, i.e. imm16 = (target-base)>>2
+// masked to 16 bits (two's-complement wraparound gives the correct field
+// for backward-only displacements, which is all L32R ever needs).
+// ---------------------------------------------------------------------------
+fn xt_l32r(uint64 rd, uint64 target_off) {
+    uint64 pc = codegen_output_len()
+    uint64 base = (pc + 3) & ~3
+    uint64 diff = target_off - base
+    uint64 imm16 = (diff >> 2) & 0xFFFF
+    uint64 w = 0x1 | ((rd & 0xF) << 4) | ((imm16 & 0xFFFF) << 8)
+    xt_emit24(w)
+}
+
+// ---------------------------------------------------------------------------
+// CALL0 (24-bit, op0=5, n=00 fixed at bits[5:4]): imm18 = bits[23:6].
+// Target = ((PC+4) & ~3) + imm18*4 (call targets are always word-aligned).
+// ---------------------------------------------------------------------------
+fn xt_call0(uint64 target_off) {
+    uint64 pc = codegen_output_len()
+    uint64 base = (pc + 4) & ~3
+    uint64 diff = target_off - base
+    xt_check_call18(diff)
+    uint64 imm18 = (diff >> 2) & 0x3FFFF
+    uint64 w = 0x5 | (imm18 << 6)
+    xt_emit24(w)
+}
+
+// ---------------------------------------------------------------------------
+// J (24-bit, op0=6, n=00 fixed at bits[5:4]): imm18 = bits[23:6], byte offset
+// (not word-scaled). Target = PC + 4 + imm18.
+// ---------------------------------------------------------------------------
+fn xt_j(uint64 target_off) {
+    uint64 pc = codegen_output_len()
+    uint64 diff = target_off - (pc + 4)
+    xt_check_j18(diff)
+    uint64 imm18 = diff & 0x3FFFF
+    uint64 w = 0x6 | (imm18 << 6)
+    xt_emit24(w)
+}
+
+// ---------------------------------------------------------------------------
+// BRI8 format (24-bit, two-register compare branches): op0=7,
+// t[7:4]=at, s[11:8]=as, r[15:12]=condition code, imm8[23:16].
+// Target = PC + 4 + imm8 (signed byte displacement).
+// Condition codes: BEQ=1, BLT=2, BLTU=3, BGE=(BLT|8)=0xA, BGEU=0xB, BNE=(BEQ|8)=9.
+// ---------------------------------------------------------------------------
+fn xt_bri8(uint64 cond, uint64 rs, uint64 rt, uint64 target_off) {
+    uint64 pc = codegen_output_len()
+    uint64 diff = target_off - (pc + 4)
+    uint64 imm8 = diff & 0xFF
+    uint64 w = 0x7 | ((rt & 0xF) << 4) | ((rs & 0xF) << 8) | ((cond & 0xF) << 12) | ((imm8 & 0xFF) << 16)
+    xt_emit24(w)
+}
+fn xt_beq(uint64 rs, uint64 rt, uint64 target_off)  { xt_bri8(0x1, rs, rt, target_off) }
+fn xt_bne(uint64 rs, uint64 rt, uint64 target_off)  { xt_bri8(0x9, rs, rt, target_off) }
+fn xt_blt(uint64 rs, uint64 rt, uint64 target_off)  { xt_bri8(0x2, rs, rt, target_off) }
+fn xt_bge(uint64 rs, uint64 rt, uint64 target_off)  { xt_bri8(0xA, rs, rt, target_off) }
+fn xt_bltu(uint64 rs, uint64 rt, uint64 target_off) { xt_bri8(0x3, rs, rt, target_off) }
+fn xt_bgeu(uint64 rs, uint64 rt, uint64 target_off) { xt_bri8(0xB, rs, rt, target_off) }
+
+// ---------------------------------------------------------------------------
+// BRI12 format (24-bit, reg-vs-zero branches): op0=6, n[5:4]=1 (fixed,
+// distinguishes from J's n=0), m[7:6]=0(BEQZ)/1(BNEZ), s[11:8]=register,
+// imm12[23:12]. Target = PC + 4 + imm12 (signed).
+// ---------------------------------------------------------------------------
+fn xt_bri12(uint64 m, uint64 reg, uint64 target_off) {
+    uint64 pc = codegen_output_len()
+    uint64 diff = target_off - (pc + 4)
+    uint64 imm12 = diff & 0xFFF
+    uint64 nib1 = ((m & 0x3) << 2) | 0x1
+    uint64 w = 0x6 | (nib1 << 4) | ((reg & 0xF) << 8) | ((imm12 & 0xFFF) << 12)
+    xt_emit24(w)
+}
+fn xt_beqz(uint64 reg, uint64 target_off) { xt_bri12(0, reg, target_off) }
+fn xt_bnez(uint64 reg, uint64 target_off) { xt_bri12(1, reg, target_off) }
+
+// ---------------------------------------------------------------------------
+// Density (.N) forms — 16-bit, emitted via xt_emit16.
+// ---------------------------------------------------------------------------
+
+// ADD.N (op0=0xA): r[7:4]=at(src2), s[11:8]=as(src1), t[15:12]=ar(dest).
+fn xt_add_n(uint64 rd, uint64 rs, uint64 rt) {
+    uint64 w = 0xA | ((rt & 0xF) << 4) | ((rs & 0xF) << 8) | ((rd & 0xF) << 12)
+    xt_emit16(w)
+}
+// MOV.N (op0=0xD): r[7:4]=ar(dest), s[11:8]=as(src), t[15:12]=0.
+fn xt_mov_n(uint64 rd, uint64 rs) {
+    uint64 w = 0xD | ((rd & 0xF) << 4) | ((rs & 0xF) << 8)
+    xt_emit16(w)
+}
+// L32I.N (op0=8): r[7:4]=at(dest), s[11:8]=as(base), t[15:12]=off>>2 (0-60).
+fn xt_l32i_n(uint64 rt, uint64 rs, uint64 off) {
+    uint64 w = 0x8 | ((rt & 0xF) << 4) | ((rs & 0xF) << 8) | (((off >> 2) & 0xF) << 12)
+    xt_emit16(w)
+}
+// S32I.N (op0=9): same field layout as L32I.N.
+fn xt_s32i_n(uint64 rt, uint64 rs, uint64 off) {
+    uint64 w = 0x9 | ((rt & 0xF) << 4) | ((rs & 0xF) << 8) | (((off >> 2) & 0xF) << 12)
+    xt_emit16(w)
+}
+// MOVI.N ar, imm7 (op0=0xC, range -32..95): s[11:8]=ar, r[7:4]=imm7[6:4], t[15:12]=imm7[3:0].
+fn xt_movi_n(uint64 rd, uint64 imm) {
+    uint64 imm7 = imm & 0x7F
+    uint64 r = (imm7 >> 4) & 0xF
+    uint64 t = imm7 & 0xF
+    uint64 w = 0xC | (r << 4) | ((rd & 0xF) << 8) | (t << 12)
+    xt_emit16(w)
+}
+// RET.N / NOP.N: fixed 16-bit encodings, no operands.
+fn xt_ret_n() { xt_emit16(0xF00D) }
+fn xt_nop_n() { xt_emit16(0xF03D) }
+
+// ===========================================================================
+// Task 3: per-function codegen driver (mirror of ir_riscv_gen).
+//
+// CALL0 register roles used below: a0=return address, a1=SP, a2=arg0/retval,
+// a2-a7=args, a8/a9=caller-saved scratch (spill reload), a12-a15=callee-saved
+// (the register-allocator colour file). RISC-V's t5/t6 scratch pair maps to
+// a8/a9 here; RISC-V's s0-s11 colour file (12 regs) maps to a12-a15 (4 regs).
+// ===========================================================================
+
+// --- Register allocation -------------------------------------------------
+// Colour 0..3 -> a12..a15 (callee-saved). Only four allocatable colours: the
+// Xtensa AR file is narrow once a2-a7 (args) and a8-a11 (caller temps) are
+// carved out. IR_NUM_REGS = 4 for xtensa (flagged narrow in the spec).
+fn xt_reg_for_color(uint64 color) -> uint64 {
+    return 12 + color        // color 0..3 -> a12..a15
+}
+
+// Nonzero once ir_phys_regs points at a >= 4-slot buffer this init sized
+// itself (mirror of ir_rv_phys_regs_sized). x86/arm64 inits allocate 10
+// slots, riscv 12, xtensa needs only 4 — so we can reuse a bigger buffer if
+// one already exists; we only allocate our own the first time.
+static uint64 ir_xt_phys_regs_sized = 0
+
+fn ir_regalloc_init_xtensa() {
+    IR_NUM_REGS = 4
+    if ir_xt_phys_regs_sized == 0 {
+        if ir_phys_regs == 0 { ir_phys_regs = alloc(4 * 8) }
+        ir_xt_phys_regs_sized = 1
+    }
+    uint64 c = 0
+    while c < 4 {
+        uint64 p = ir_phys_regs + c * 8
+        uint64 phys = xt_reg_for_color(c)
+        unsafe { *(p as uint64) = phys }
+        c = c + 1
+    }
+}
+
+// --- Immediate classification -------------------------------------------
+// Does a 32-bit value fit MOVI's sign-extended 12-bit immediate (-2048..2047)?
+// movi sign-extends imm12 to 32 bits, so a 32-bit two's-complement value whose
+// signed magnitude is in range materialises in one instruction. Re-bias into
+// [0,0x1000): 42 -> 0x82A (fits); -5 = 0xFFFFFFFB -> 0x7FB (fits); 0x800=2048
+// -> 0x1000 (rejected, needs a literal). Mirror of rv_fits_imm12.
+fn xt_fits_movi(uint64 v) -> uint64 {
+    uint64 biased = (v + 0x800) & 0xFFFFFFFF
+    if biased < 0x1000 { return 1 }
+    return 0
+}
+
+// Does a 32-bit value fit ADDI's sign-extended 8-bit immediate (-128..127)?
+// Same re-bias trick as xt_fits_movi, threshold 0x100 instead of 0x1000.
+fn xt_fits_addi(uint64 v) -> uint64 {
+    uint64 biased = (v + 0x80) & 0xFFFFFFFF
+    if biased < 0x100 { return 1 }
+    return 0
+}
+
+// --- Large-frame SP-relative access (ADDMI path) --------------------------
+// l32i/s32i offsets are imm8<<2 (max 1020) and MOVI is signed-12 (max 2047),
+// so any frame slot past those needs runtime address formation. This is the
+// x11 pattern of ir_aarch64.kr's ir_a64_ldr_sp/ir_a64_str_sp, built on ADDMI
+// instead of a materialized offset: ADDMI adds a signed multiple of 256
+// (imm8<<8, up to 32512) in ONE instruction, and the residue (< 256 and
+// 4-aligned, so <= 252) rides the l32i/s32i offset field. Deliberately NO
+// literal pool anywhere in this path: the pool is flushed to its final file
+// offset before any code is emitted, so an emit-time intern that the
+// pre-scan didn't perform corrupts it silently (the original Xtensa work's
+// "emit-time reserve past the flush" HIGH finding). ADDMI removes that
+// hazard class entirely — nothing here can ever disagree with the pre-scan
+// because nothing here touches the pool. Cost: frames cap at 32752 bytes
+// (guard in ir_xtensa_gen step 5) — already several times the ESP32 target's
+// whole 4 KiB minimum stack reservation. Anything larger loud-fails; no
+// offset is ever silently truncated.
+//
+// a10 is the dedicated address-formation scratch for the STORE helper: it is
+// not in the allocatable colour file (a12-a15), not the reload scratch pair
+// (a8/a9), and — like ARM64's x11 — it is formed immediately before the
+// access and never lives across an IR op. The LOAD helper needs no scratch
+// at all: it forms the address in the destination register itself.
+static uint64 XT_SP_OFF_MAX = 32764   // 32512 (max ADDMI) + 252 (max 4-aligned residue)
+
+fn xt_check_sp_off(uint64 off) {
+    if off > XT_SP_OFF_MAX {
+        xt_err("error: xtensa: SP-relative offset exceeds the ADDMI large-frame range (32764)\n")
+    }
+    // Every frame slot (spill, callee-saved, a0, overflow param) is 4-aligned
+    // by construction; an unaligned offset would silently lose its low bits
+    // in both the ADDMI high part and the l32i/s32i offset field, so guard
+    // loudly rather than truncate.
+    if (off & 3) != 0 {
+        xt_err("error: xtensa: unaligned SP-relative offset in large-frame path\n")
+    }
+}
+
+// SP-relative word load at any offset up to XT_SP_OFF_MAX. off <= 1020 emits
+// the exact single l32i it always did (byte-identity for small frames).
+// The large path forms the address IN rt ITSELF (addmi rt, a1, hi; l32i rt,
+// rt, lo), clobbering nothing beyond what the load clobbers anyway — safe at
+// every xt_load_spill call site, including those with a8-a11 temporaries
+// live around it (e.g. IR_FMT_UINT resolves a spilled value while its
+// scratch base sits in a10).
+fn xt_l32i_sp(uint64 rt, uint64 off) {
+    if off <= 1020 {
+        xt_l32i(rt, XT_SP, off)
+        return
+    }
+    xt_check_sp_off(off)
+    uint64 lo = off & 0xFF
+    xt_addmi(rt, XT_SP, off - lo)
+    xt_l32i(rt, rt, lo)
+}
+
+// SP-relative word store at any offset up to XT_SP_OFF_MAX. off <= 1020
+// emits the exact single s32i it always did. The large path must preserve
+// the value register, so the address forms in a10 (see the block comment
+// above); the addmi/s32i pair is adjacent — a10 is dead again one
+// instruction later and never crosses an IR op boundary. rt == a10 would
+// silently store the formed address over the value, so it loud-fails (no
+// current caller ever passes a10; this guards future ops).
+fn xt_s32i_sp(uint64 rt, uint64 off) {
+    if off <= 1020 {
+        xt_s32i(rt, XT_SP, off)
+        return
+    }
+    xt_check_sp_off(off)
+    if rt == XT_A10 {
+        xt_err("error: xtensa: cannot spill a10 through the large-frame path (a10 is the address scratch)\n")
+    }
+    uint64 lo = off & 0xFF
+    xt_addmi(XT_A10, XT_SP, off - lo)
+    xt_s32i(rt, XT_A10, lo)
+}
+
+// Materialize a frame-layout constant (an SP delta or in-frame offset,
+// 0..32767) into `reg` with NO literal pool: plain movi when it fits the
+// signed-12 immediate (byte-identity with the old movi-only path for every
+// pre-existing frame), else movi of the low byte + addmi of the high part.
+// Pool-free by design — the frame code can never drift from the pre-scan.
+fn xt_movi_frame(uint64 reg, uint64 v) {
+    if xt_fits_movi(v) != 0 {
+        xt_movi(reg, v)
+        return
+    }
+    if v > 32767 {
+        xt_err("error: xtensa: frame constant exceeds the ADDMI range (32767)\n")
+    }
+    uint64 lo = v & 0xFF
+    xt_movi(reg, lo)
+    xt_addmi(reg, reg, v - lo)
+}
+
+// --- Per-function literal pool ------------------------------------------
+// L32R is backward-only (the literal word must precede the instruction), so
+// the pool is emitted FIRST, before any code, at the function's start. Its
+// contents are known only after scanning the lowered IR — hence the pre-scan
+// in ir_xtensa_gen interns every needed literal here, then flushes the
+// word-aligned pool, then code emission consumes the same interned slots.
+//
+// This is the divergence from riscv: because the pool precedes the code, the
+// function's entry offset (what fn_register records for e_entry / call
+// targets) is code_start = pool_end, NOT out_len at function entry. So
+// ir_xtensa_gen registers the function ITSELF (main.kr's arch-3 loop must not
+// pre-register). Address-literals (call target / str / static / fnaddr,
+// arriving in later tasks) reserve a slot holding a placeholder word that the
+// fixup resolvers patch into the POOL word rather than an inline instruction.
+static uint64 xt_lit_buf = 0        // uint64[] of interned literal values
+static uint64 xt_lit_cap = 0
+static uint64 xt_lit_count = 0
+static uint64 xt_lit_base = 0       // file offset of pool word 0 (set by flush)
+
+fn xt_lit_reset() {
+    xt_lit_count = 0
+}
+
+// Intern a literal value, deduplicating by value. Returns its slot index
+// (pool word i lives at xt_lit_base + i*4). Called once per needed literal in
+// the pre-scan and again at each use site — the dedup makes both agree.
+fn xt_lit_intern(uint64 value) -> uint64 {
+    uint64 v = value & 0xFFFFFFFF
+    uint64 i = 0
+    while i < xt_lit_count {
+        uint64 p = xt_lit_buf + i * 8
+        uint64 ev = 0
+        unsafe { *(p as uint64) -> ev }
+        if ev == v { return i }
+        i = i + 1
+    }
+    if xt_lit_count >= xt_lit_cap {
+        uint64 new_cap = xt_lit_cap * 2
+        if new_cap < 64 { new_cap = 64 }
+        uint64 nb = alloc(new_cap * 8)
+        if xt_lit_buf != 0 {
+            memcpy(nb, xt_lit_buf, xt_lit_count * 8)
+            dealloc(xt_lit_buf)
+        }
+        xt_lit_buf = nb
+        xt_lit_cap = new_cap
+    }
+    uint64 slot = xt_lit_count
+    uint64 sp = xt_lit_buf + slot * 8
+    unsafe { *(sp as uint64) = v }
+    xt_lit_count = xt_lit_count + 1
+    return slot
+}
+
+// Emit the word-aligned pool at the current output offset and record its base.
+// Each L32R target must be 4-byte-aligned (imm16 is word-scaled off
+// ((PC+3)&~3)), so pad to a 4-byte boundary before laying the words down.
+// With an empty pool, xt_lit_base is simply the code start (no padding).
+fn xt_lit_flush() {
+    if xt_lit_count == 0 {
+        xt_lit_base = out_len
+        return
+    }
+    while (out_len & 3) != 0 { emit_byte(0) }
+    xt_lit_base = out_len
+    uint64 i = 0
+    while i < xt_lit_count {
+        uint64 p = xt_lit_buf + i * 8
+        uint64 ev = 0
+        unsafe { *(p as uint64) -> ev }
+        emit_u32_le(ev & 0xFFFFFFFF)
+        i = i + 1
+    }
+}
+
+// Reserve a pool word WITHOUT dedup — always appends one placeholder word (0)
+// and returns its slot index. **PRE-SCAN ONLY (H1):** the pool is flushed to a
+// fixed file offset right after the pre-scan, so calling this during code
+// emission would append PAST the flushed pool and the site's pool_word_off
+// (= xt_lit_base + slot*4) would point into code bytes instead of the pool —
+// silent corruption. Contrast xt_lit_intern, which dedups by value: two PIC
+// sites both "interning" a placeholder 0 would collapse onto one slot and the
+// second delta-patch would clobber the first. Address deltas are per-site
+// unique (target − anchor, anchor differs per site), so every PIC site needs
+// its own reserved word — this non-deduping append guarantees that.
+fn xt_lit_reserve() -> uint64 {
+    if xt_lit_count >= xt_lit_cap {
+        uint64 new_cap = xt_lit_cap * 2
+        if new_cap < 64 { new_cap = 64 }
+        uint64 nb = alloc(new_cap * 8)
+        if xt_lit_buf != 0 {
+            memcpy(nb, xt_lit_buf, xt_lit_count * 8)
+            dealloc(xt_lit_buf)
+        }
+        xt_lit_buf = nb
+        xt_lit_cap = new_cap
+    }
+    uint64 slot = xt_lit_count
+    uint64 sp = xt_lit_buf + slot * 8
+    unsafe { *(sp as uint64) = 0 }
+    xt_lit_count = xt_lit_count + 1
+    return slot
+}
+
+// --- Spill slots ---------------------------------------------------------
+// Spilled vregs (colour >= IR_NUM_REGS) live at the BOTTOM of the frame:
+// slot i at [a1 + i*4]. 4-byte words (uint64/float are rejected on xtensa by
+// sema, so every value is one 4-byte slot). a8/a9 are the reserved reload
+// scratch — never allocated, never live across an IR op.
+fn xt_spill_offset(uint64 vreg) -> uint64 {
+    uint64 slot = vreg - IR_NUM_REGS - 1
+    // Offsets past 1020 (s32i/l32i's imm8<<2 max) take the ADDMI large-frame
+    // path inside xt_s32i_sp/xt_l32i_sp; a genuinely unrepresentable offset
+    // (> 32764) loud-fails there rather than truncating.
+    return XT_OVERFLOW_RESERVE + slot * 4
+}
+
+fn xt_store_spill(uint64 reg, uint64 vreg) {
+    xt_s32i_sp(reg, xt_spill_offset(vreg))
+}
+fn xt_load_spill(uint64 scratch, uint64 vreg) {
+    xt_l32i_sp(scratch, xt_spill_offset(vreg))
+}
+
+// Coloured vregs resolve through ir_get_phys_reg (colour -> ir_phys_regs[],
+// filled by ir_regalloc_init_xtensa); spilled vregs reload into the
+// caller-provided scratch (a8 or a9). Mirror of rv_resolve_src.
+fn xt_resolve_src(uint64 vreg, uint64 scratch) -> uint64 {
+    if vreg == 0 { return scratch }
+    uint64 phys = ir_get_phys_reg(vreg)
+    if phys != 0xFFFFFFFF { return phys }
+    xt_load_spill(scratch, vreg)
+    return scratch
+}
+
+// mov rd, rs — MOV.N (16-bit).
+fn xt_mv(uint64 rd, uint64 rs) {
+    if rd == rs { return }
+    xt_mov_n(rd, rs)
+}
+
+// Materialize an arbitrary 32-bit value into `scratch` — movi if it fits
+// the sign-extended 12-bit immediate, else via the literal pool (exact
+// mirror of IR_CONST's own materialize path in ir_emit_xtensa_insn).
+// Every call site that can reach the literal-pool branch MUST have
+// interned the same value in ir_xtensa_gen's pre-scan (step 6) first: the
+// pool is flushed to its final file offset before any code is emitted, so
+// a fresh xt_lit_intern here (past the flush) would allocate a slot with
+// no backing word in the file.
+fn xt_materialize(uint64 v, uint64 scratch) {
+    uint64 vv = v & 0xFFFFFFFF
+    if xt_fits_movi(vv) != 0 {
+        xt_movi(scratch, vv)
+    } else {
+        uint64 slot = xt_lit_intern(vv)
+        xt_emit_l32r_pooled(scratch, slot)
+    }
+}
+
+// --- 24-bit patch + J re-encode (return-fixup patcher) -------------------
+// J is 3 bytes; patch_u32 would clobber a 4th byte (the next instruction), so
+// patch exactly three. Return sites emit a `j #0` placeholder; step 10
+// re-encodes each to jump to the epilogue.
+fn xt_patch24(uint64 off, uint64 w) {
+    uint64 p = out_buf + off
+    unsafe { *(p as uint8) = w & 0xFF }
+    uint64 p1 = p + 1
+    unsafe { *(p1 as uint8) = (w >> 8) & 0xFF }
+    uint64 p2 = p + 2
+    unsafe { *(p2 as uint8) = (w >> 16) & 0xFF }
+}
+
+// J word for a jump at `site` to `target`: target = PC+4+imm18 (byte offset),
+// so imm18 = target - (site+4). ±128 KiB reach. The range check (deferred
+// from T3) now lands here — J is unconditional and never relaxed, so an
+// overflow is a genuine (MVP-unreachable) hard error.
+fn xt_j_word(uint64 site, uint64 target) -> uint64 {
+    uint64 diff = target - (site + 4)
+    xt_check_j18(diff)
+    uint64 imm18 = diff & 0x3FFFF
+    return 0x6 | (imm18 << 6)
+}
+
+// ===========================================================================
+// Task 6: compares + branches + bounded-iterative branch relaxation.
+//
+// Xtensa's only compare mechanism is the fused compare-and-branch: BRI8
+// two-register compares (beq/bne/blt/bge/bltu/bgeu) reach ±128 B, BRI12
+// reg-vs-zero (beqz/bnez) reach ±2 KiB, J reaches ±128 KiB. There is no
+// `slt`-style set instruction on core LX6, so an IR compare whose result is
+// used as a value materialises 0/1 through a local (always-in-range) branch
+// (see the compare handler in ir_emit_xtensa_insn). Control-flow branches
+// (IR_BR/IR_BR_COND terminators) are emitted as placeholders + fixups and,
+// when a conditional target is out of BRI12 range, rewritten as
+// `Binv cond, .+6 ; j target` (invert the condition to skip a 3-byte J that
+// carries the real ±128 KiB displacement). Inserting those 3 bytes shifts
+// every later offset, so the relaxation set is solved to a fixed point
+// (below) before any bytes move, then all recorded offsets are remapped
+// through xt_remap (the rv_c_remap analog).
+// ---------------------------------------------------------------------------
+
+// Displacement range checks (deferred from T3). J's imm18 is a signed BYTE
+// offset (±128 KiB); CALL0's imm18 is signed WORD-scaled (±512 KiB). `disp`
+// arrives as a two's-complement uint64 (backward = huge), so re-bias to
+// range-check, exactly like rv_check_j21.
+fn xt_check_j18(uint64 disp) {
+    uint64 biased = disp + 0x20000
+    if biased >= 0x40000 {
+        xt_err("error: xtensa: J displacement out of range (+/-128 KiB)\n")
+    }
+}
+fn xt_check_call18(uint64 disp) {
+    uint64 biased = disp + 0x80000
+    if biased >= 0x100000 {
+        xt_err("error: xtensa: CALL0 displacement out of range (+/-512 KiB)\n")
+    }
+}
+
+// Signed-range fits checks on a branch displacement (disp = target-(site+4)).
+fn xt_fits_bri8(uint64 disp) -> uint64 {
+    uint64 biased = disp + 0x80
+    if biased < 0x100 { return 1 }
+    return 0
+}
+fn xt_fits_bri12(uint64 disp) -> uint64 {
+    uint64 biased = disp + 0x800
+    if biased < 0x1000 { return 1 }
+    return 0
+}
+
+// Explicit-site word builders (the emit-time xt_beq/... use out_len; these
+// take the site so the fixup patcher can re-encode on the final layout).
+fn xt_bri8_word(uint64 cond, uint64 rs, uint64 rt, uint64 site, uint64 target) -> uint64 {
+    uint64 diff = target - (site + 4)
+    uint64 imm8 = diff & 0xFF
+    return 0x7 | ((rt & 0xF) << 4) | ((rs & 0xF) << 8) | ((cond & 0xF) << 12) | ((imm8 & 0xFF) << 16)
+}
+fn xt_bri12_word(uint64 m, uint64 reg, uint64 site, uint64 target) -> uint64 {
+    uint64 diff = target - (site + 4)
+    uint64 imm12 = diff & 0xFFF
+    uint64 nib1 = ((m & 0x3) << 2) | 0x1
+    return 0x6 | (nib1 << 4) | ((reg & 0xF) << 8) | ((imm12 & 0xFFF) << 12)
+}
+
+// --- Branch-kind enum + explicit invert table ---------------------------
+// One kind per emittable conditional branch, plus J for the unconditional
+// fixup. The invert table below lists EVERY invertible pair the MVP knows;
+// a to-be-relaxed opcode not in the table is a hard error (guards against a
+// future non-invertible branch like BANY/BBCI being added without a
+// relaxation path). Today only BNEZ (from IR_BR_COND) flows through
+// relaxation — the two-register kinds exist for a future fused compare+
+// branch and keep the invert table / word dispatcher complete.
+static uint64 XT_BK_BEQ  = 0
+static uint64 XT_BK_BNE  = 1
+static uint64 XT_BK_BLT  = 2
+static uint64 XT_BK_BGE  = 3
+static uint64 XT_BK_BLTU = 4
+static uint64 XT_BK_BGEU = 5
+static uint64 XT_BK_BEQZ = 6
+static uint64 XT_BK_BNEZ = 7
+static uint64 XT_BK_BGEZ = 8
+static uint64 XT_BK_BLTZ = 9
+static uint64 XT_BK_J    = 10
+
+fn xt_invert_branch(uint64 bk) -> uint64 {
+    if bk == XT_BK_BEQ  { return XT_BK_BNE }
+    if bk == XT_BK_BNE  { return XT_BK_BEQ }
+    if bk == XT_BK_BLT  { return XT_BK_BGE }
+    if bk == XT_BK_BGE  { return XT_BK_BLT }
+    if bk == XT_BK_BLTU { return XT_BK_BGEU }
+    if bk == XT_BK_BGEU { return XT_BK_BLTU }
+    if bk == XT_BK_BEQZ { return XT_BK_BNEZ }
+    if bk == XT_BK_BNEZ { return XT_BK_BEQZ }
+    if bk == XT_BK_BGEZ { return XT_BK_BLTZ }
+    if bk == XT_BK_BLTZ { return XT_BK_BGEZ }
+    xt_err("error: xtensa: branch opcode has no invert (cannot relax)\n")
+    return 0
+}
+
+// Does branch kind `bk`'s displacement fit its native range?
+fn xt_fits_cond(uint64 bk, uint64 disp) -> uint64 {
+    if bk == XT_BK_BEQZ || bk == XT_BK_BNEZ || bk == XT_BK_BGEZ || bk == XT_BK_BLTZ {
+        return xt_fits_bri12(disp)
+    }
+    return xt_fits_bri8(disp)
+}
+
+// Encode a conditional branch of kind `bk` (rs/rt registers; rt unused for
+// the BRI12 reg-vs-zero kinds) at `site` to `target`.
+fn xt_cond_word(uint64 bk, uint64 rs, uint64 rt, uint64 site, uint64 target) -> uint64 {
+    if bk == XT_BK_BEQ  { return xt_bri8_word(0x1, rs, rt, site, target) }
+    if bk == XT_BK_BNE  { return xt_bri8_word(0x9, rs, rt, site, target) }
+    if bk == XT_BK_BLT  { return xt_bri8_word(0x2, rs, rt, site, target) }
+    if bk == XT_BK_BGE  { return xt_bri8_word(0xA, rs, rt, site, target) }
+    if bk == XT_BK_BLTU { return xt_bri8_word(0x3, rs, rt, site, target) }
+    if bk == XT_BK_BGEU { return xt_bri8_word(0xB, rs, rt, site, target) }
+    if bk == XT_BK_BEQZ { return xt_bri12_word(0, rs, site, target) }
+    if bk == XT_BK_BNEZ { return xt_bri12_word(1, rs, site, target) }
+    xt_err("error: xtensa: unencodable cond branch kind\n")
+    return 0
+}
+
+// --- Branch fixup table (24-byte entries) -------------------------------
+//   [0]  patch_off (u32)   [4]  target_bb (u32)   [8]  bk (u32)
+//   [12] rs (u32)          [16] rt (u32)          [20] relaxed (u32)
+static uint64 xt_br_fixups = 0
+static uint64 xt_br_fixups_cap = 0
+static uint64 xt_br_fixup_count = 0
+
+// Fused compare+branch handoff (mirror of x86's ir_fused_jcc_code). Xtensa
+// branches ARE fused compare-and-branch, so when a compare is the last non-
+// terminator of its block and single-use by the BR_COND terminator (checked
+// via the shared ir_cmp_fuse_code), the compare emits NOTHING and stashes
+// its op + operand vregs here; the terminator emits the two-register BRI8
+// branch directly. `op == 0` means no pending fusion (reset per block).
+static uint64 xt_fused_cmp_op = 0
+static uint64 xt_fused_cmp_s1 = 0
+static uint64 xt_fused_cmp_s2 = 0
+
+fn xt_fx_get(uint64 idx, uint64 field) -> uint64 {
+    uint64 e = xt_br_fixups + idx * 24 + field
+    uint32 v = 0
+    unsafe { *(e as uint32) -> v }
+    return v
+}
+fn xt_fx_set(uint64 idx, uint64 field, uint64 val) {
+    uint64 e = xt_br_fixups + idx * 24 + field
+    uint32 v = val
+    unsafe { *(e as uint32) = v }
+}
+fn xt_add_fixup(uint64 patch_off, uint64 target_bb, uint64 bk, uint64 rs, uint64 rt) {
+    if xt_br_fixup_count >= xt_br_fixups_cap {
+        uint64 nc = xt_br_fixups_cap * 2
+        if nc < 256 { nc = 256 }
+        uint64 nb = alloc(nc * 24)
+        if xt_br_fixups != 0 {
+            memcpy(nb, xt_br_fixups, xt_br_fixup_count * 24)
+            dealloc(xt_br_fixups)
+        }
+        xt_br_fixups = nb
+        xt_br_fixups_cap = nc
+    }
+    uint64 idx = xt_br_fixup_count
+    xt_fx_set(idx, 0, patch_off)
+    xt_fx_set(idx, 4, target_bb)
+    xt_fx_set(idx, 8, bk)
+    xt_fx_set(idx, 12, rs)
+    xt_fx_set(idx, 16, rt)
+    xt_fx_set(idx, 20, 0)
+    xt_br_fixup_count = idx + 1
+}
+
+// --- Pool (L32R) fixup table (8-byte entries: {u32 site; u32 slot}) ------
+// An L32R references a word in the per-function literal pool that precedes
+// all code (a FIXED offset). If relaxation shifts the L32R instruction, its
+// PC changes while the pool word does not, so the encoded imm16 is stale and
+// must be re-derived on the final layout. Every L32R emitted during block
+// code is recorded here for the post-relaxation re-patch.
+static uint64 xt_pool_fixups = 0
+static uint64 xt_pool_fixups_cap = 0
+static uint64 xt_pool_fixup_count = 0
+
+fn xt_add_pool_fixup(uint64 site, uint64 slot) {
+    if xt_pool_fixup_count >= xt_pool_fixups_cap {
+        uint64 nc = xt_pool_fixups_cap * 2
+        if nc < 256 { nc = 256 }
+        uint64 nb = alloc(nc * 8)
+        if xt_pool_fixups != 0 {
+            memcpy(nb, xt_pool_fixups, xt_pool_fixup_count * 8)
+            dealloc(xt_pool_fixups)
+        }
+        xt_pool_fixups = nb
+        xt_pool_fixups_cap = nc
+    }
+    uint64 e = xt_pool_fixups + xt_pool_fixup_count * 8
+    uint32 so = site
+    unsafe { *(e as uint32) = so }
+    uint64 e4 = e + 4
+    uint32 sl = slot
+    unsafe { *(e4 as uint32) = sl }
+    xt_pool_fixup_count = xt_pool_fixup_count + 1
+}
+
+// Emit an L32R into `rd` for pool slot `slot`, recording the site so
+// relaxation can re-derive its displacement (pool is backward + fixed).
+fn xt_emit_l32r_pooled(uint64 rd, uint64 slot) {
+    uint64 site = out_len
+    xt_l32r(rd, xt_lit_base + slot * 4)
+    xt_add_pool_fixup(site, slot)
+}
+
+// --- PIC address materialization (real per-function PC anchor) -----------
+// Xtensa's base ISA has no auipc, so a load-base-independent address is built
+// at runtime as `call0 __xt_pcbase` (a0 = anchor = absolute addr of the next
+// instruction) + `l32r aT,<pool:delta>` (delta = compile-time const) +
+// `add dst,a0,aT`. The delta is patched at finalize into the reserved pool
+// word once the data blobs have a base (str_start / data_start / fn offset).
+//
+// Address-fixup table (16-byte entries) — one per PIC site:
+//   [0]  anchor_off  (u32)  return addr of the call0 (a0's runtime value);
+//                           remapped IN PLACE during the site's own function
+//                           relaxation (H1), so by finalize it is final.
+//   [4]  table_sel   (u32)  0=string(base str_start) 1=static(base data_start)
+//                           2=fnaddr(target = fn_lookup(payload token))
+//   [8]  payload     (u32)  data byte offset (str/static) or callee name token
+//   [12] pool_word_off(u32) ABSOLUTE file offset of the reserved delta word
+//                           (= xt_lit_base + slot*4, captured at emit — stable
+//                           because the pool precedes code_start and never
+//                           moves under that function's relaxation, H2).
+static uint64 xt_addr_fixups = 0
+static uint64 xt_addr_fixups_cap = 0
+static uint64 xt_addr_fixup_count = 0
+
+fn xt_af_get(uint64 idx, uint64 field) -> uint64 {
+    uint64 e = xt_addr_fixups + idx * 16 + field
+    uint32 v = 0
+    unsafe { *(e as uint32) -> v }
+    return v
+}
+fn xt_af_set(uint64 idx, uint64 field, uint64 val) {
+    uint64 e = xt_addr_fixups + idx * 16 + field
+    uint32 v = val
+    unsafe { *(e as uint32) = v }
+}
+fn xt_add_addr_fixup(uint64 anchor_off, uint64 table_sel, uint64 payload, uint64 pool_word_off) {
+    if xt_addr_fixup_count >= xt_addr_fixups_cap {
+        uint64 nc = xt_addr_fixups_cap * 2
+        if nc < 256 { nc = 256 }
+        uint64 nb = alloc(nc * 16)
+        if xt_addr_fixups != 0 {
+            memcpy(nb, xt_addr_fixups, xt_addr_fixup_count * 16)
+            dealloc(xt_addr_fixups)
+        }
+        xt_addr_fixups = nb
+        xt_addr_fixups_cap = nc
+    }
+    uint64 idx = xt_addr_fixup_count
+    xt_af_set(idx, 0, anchor_off)
+    xt_af_set(idx, 4, table_sel)
+    xt_af_set(idx, 8, payload)
+    xt_af_set(idx, 12, pool_word_off)
+    xt_addr_fixup_count = idx + 1
+}
+
+// __xt_pcbase helper. A single ret.n, emitted ONCE at the function boundary in
+// main.kr's xt_raw path (H2) — never mid-body. xt_pcbase_tok is its registered
+// name token; xt_pic_base is the first pre-reserved PIC pool slot for the
+// function currently being emitted; xt_pic_k is the running PIC-site index
+// within that function (reset at function start, incremented per site — so the
+// k-th PIC site recovers slot xt_pic_base + k without a second reserve, H1).
+// xt_cur_is_naked flags the @naked function whose body is being emitted (H3).
+static uint64 xt_pcbase_tok = 0
+static uint64 xt_pic_base = 0
+static uint64 xt_pic_k = 0
+static uint64 xt_cur_is_naked = 0
+
+// [M-6] Absolute file offsets of the TWO pool words the entry preamble's
+// .bss-zeroing loop loads: xt_bss_lo_pool_off holds `0xd0000000 + p_filesz`
+// (loop start) and xt_bss_hi_pool_off holds `0xd0000000 + p_memsz` (loop end).
+// Reserved in the entry fn's pre-scan AFTER the PIC reserves (so they never
+// shift xt_pic_base or collide with the xt_pic_k running index) and captured
+// once xt_lit_base is known (post-flush). BOTH the preamble l32r's (below) and
+// the main.kr finalize patch (M-4) reference these same two words.
+static uint64 xt_bss_lo_pool_off = 0
+static uint64 xt_bss_hi_pool_off = 0
+
+// Assign __xt_pcbase's name token identity — called ONCE before the per-fn emit
+// loop (main.kr), so every `call0 __xt_pcbase` fixup recorded during emission
+// carries the right token (the body itself is emitted later, conditionally).
+// Registered as a zero-length synthetic name token: fn_lookup compares by TEXT
+// (tok_text_eq), and no real function has an empty name, so tok_text_eq(pcbase,
+// real_fn) is always false (length mismatch) while tok_text_eq(pcbase, pcbase)
+// is trivially true — every `call0 __xt_pcbase` resolves to THIS registration
+// and nothing else, and no real call ever mis-resolves to it. The token is
+// parked in the spare tail of the lexer's over-allocated token buffer (only
+// lexer_token_count() of its 524288 slots are used).
+fn xt_setup_pcbase_tok() {
+    uint64 tidx = lexer_token_count()
+    uint64 te = cg_tokens + tidx * 16
+    uint32 zk = 1                              // Ident kind (cosmetic)
+    unsafe { *(te as uint32) = zk }
+    uint64 te4 = te + 4
+    unsafe { *(te4 as uint32) = 0 }            // text start
+    uint64 te8 = te + 8
+    unsafe { *(te8 as uint32) = 0 }            // text len = 0 (collision-free)
+    uint64 te12 = te + 12
+    unsafe { *(te12 as uint32) = 0 }           // line
+    xt_pcbase_tok = tidx
+}
+
+// Emit + register the __xt_pcbase body (a single ret.n) ONCE, at the function
+// boundary (main.kr, after all functions are laid out). Body is 4-aligned and
+// 4-padded so the following data stays aligned (the 5f97006 invariant). Only
+// called when at least one PIC site exists, so a program with no
+// string/static/fn-address material stays byte-identical. xt_pcbase_tok was
+// already assigned by xt_setup_pcbase_tok before the emit loop, so the call0
+// fixups recorded during emission resolve to this registration.
+fn xt_emit_pcbase_fn() {
+    while (out_len & 3) != 0 { emit_byte(0) }  // CALL0 target must be 4-aligned
+    uint64 code_start = out_len
+    fn_register(xt_pcbase_tok, code_start)
+    xt_ret_n()
+    while (out_len & 3) != 0 { emit_byte(0) }  // keep following data aligned
+}
+
+// Materialize a PIC address into `dst`, consuming the k-th pre-reserved PIC
+// slot of the current function (running index, NEVER a fresh reserve — H1) and
+// recording an address-fixup for finalize. Loud-fails (H3) if the current
+// function is @naked BEFORE emitting or recording anything: @naked skips the
+// prologue, so a0 is never frame-saved and `call0 __xt_pcbase` would corrupt
+// the return address. The l32r goes through xt_emit_l32r_pooled (M1) so its
+// imm16 re-derives after branch relaxation.
+fn xt_emit_pic_addr(uint64 dst, uint64 table_sel, uint64 payload) {
+    if xt_cur_is_naked != 0 {
+        xt_err("error: xtensa: address materialization (string/static/fn) not supported in @naked function\n")
+    }
+    // call0 __xt_pcbase — a0 = anchor = addr of the following instruction.
+    // Record a call fixup into the shared fixup_table exactly as IR_CALL does;
+    // resolve_fixups_xtensa patches its imm18 once every function is laid out.
+    uint64 call_patch = out_len
+    xt_emit24(0x5)                                  // call0 #0 (patched)
+    fixup_table_ensure()
+    uint64 fentry = fixup_table + fixup_count * 8
+    uint32 fo = call_patch
+    unsafe { *(fentry as uint32) = fo }
+    uint64 fe4 = fentry + 4
+    uint32 ct = xt_pcbase_tok
+    unsafe { *(fe4 as uint32) = ct }
+    fixup_count = fixup_count + 1
+
+    uint64 anchor_off = out_len                     // a0's runtime value (call0+3)
+    uint64 slot = xt_pic_base + xt_pic_k
+    xt_pic_k = xt_pic_k + 1
+    uint64 pool_word_off = xt_lit_base + slot * 4
+    xt_emit_l32r_pooled(XT_A9, slot)                // l32r a9, <pool:delta>
+    xt_add(dst, XT_A0, XT_A9)                        // add dst, a0, a9
+    xt_add_addr_fixup(anchor_off, table_sel, payload, pool_word_off)
+}
+
+// One watchdog (esp32 stub, Task 4): *wprot = key (unlock), then *cfg0 = 0
+// (disable — the WHOLE register, clearing both EN and the flash-boot-mode
+// bit 14 that resets to 1 and forces the WDT on; see the XT_ESP32_WDT_KEY
+// comment block). MEMW after each store keeps the MMIO writes in program
+// order (same fence discipline as the device-block loads/stores below, spec
+// §6): the unlock must reach the peripheral before the config0 write or the
+// latter is silently ignored and the board reboots ~1s in. Every l32r here
+// targets a pool word interned in the entry fn's pre-scan (re-interned
+// deduped, the XT_STACK_TOP pattern); like the SP-init l32r these sit ahead
+// of every relaxable branch, so the emit-time displacement stays valid with
+// no pool fixup.
+fn xt_esp32_wdt_pair(uint64 wprot, uint64 cfg0) {
+    uint64 us = xt_lit_intern(wprot)
+    xt_l32r(XT_A8, xt_lit_base + us * 4)           // l32r a8, <pool[wprot]>
+    xt_s32i(XT_A9, XT_A8, 0)                        // *wprot = key (a9)
+    xt_memw()
+    uint64 cs = xt_lit_intern(cfg0)
+    xt_l32r(XT_A8, xt_lit_base + cs * 4)           // l32r a8, <pool[cfg0]>
+    xt_s32i(XT_A10, XT_A8, 0)                       // *cfg0 = 0 (a10) — WHOLE reg
+    xt_memw()
+}
+
+// ESP32 stub head (--target=esp32 only): the VERY FIRST instructions after
+// the ROM hand-off — before SP init, before .bss zeroing, before everything
+// (RWDT + MWDT0 arrive from the mask ROM already ARMED; a stub that does
+// anything else first loses the race and the board reboots with no
+// output). Then pin PS
+// (XT_ESP32_PS rationale at its definition) instead of inheriting the ROM's,
+// with the architecturally required rsync after the wsr. a8/a9/a10 are free:
+// at hand-off only a2 (bootparam, deliberately untouched) carries state.
+fn xt_emit_esp32_wdt_ps() {
+    uint64 ks = xt_lit_intern(XT_ESP32_WDT_KEY)
+    xt_l32r(XT_A9, xt_lit_base + ks * 4)           // a9 = 0x50D83AA1 (unlock key)
+    xt_movi(XT_A10, 0)                              // a10 = 0 (config0 clear)
+    xt_esp32_wdt_pair(XT_ESP32_RWDT_WPROT, XT_ESP32_RWDT_CFG0)
+    xt_esp32_wdt_pair(XT_ESP32_MWDT0_WPROT, XT_ESP32_MWDT0_CFG0)
+    xt_esp32_wdt_pair(XT_ESP32_MWDT1_WPROT, XT_ESP32_MWDT1_CFG0)
+    xt_movi(XT_A8, XT_ESP32_PS)                     // movi a8, 0x2F
+    xt_wsr(XT_SR_PS, XT_A8)                          // wsr.ps a8
+    xt_rsync()                                       // PS visible before use
+}
+
+// Freestanding boot SP preamble (Task 8, --arch=xtensa --freestanding only),
+// emitted as the entry fn's FIRST code inside ir_xtensa_gen — so e_entry
+// (= code_start, past the pool) is this instruction. At reset a1 (SP) is
+// UNDEFINED and a2 holds the bootparam pointer (NOT an argument — leave it).
+// PS.WOE=0 at reset, so flat CALL0 needs no PS/window setup on the lx60 path
+// (the esp32 target pins PS explicitly instead of trusting the ROM hand-off —
+// xt_emit_esp32_wdt_ps above). Load XT_STACK_TOP from the pool word interned
+// in ir_xtensa_gen's pre-scan into a1. Deliberately does NOT record a pool
+// fixup: this L32R sits at code_start, ahead of every branch, so relaxation
+// never shifts it and the pool (below code_start) never moves — the emit-time
+// displacement stays valid (recording a fixup would be wiped by
+// ir_xtensa_gen's per-fn fixup reset, which runs after this preamble).
+fn xt_emit_raw_sp_preamble() {
+    // ESP32 (Task 4): WDT disable + PS pin MUST precede even the SP init —
+    // RWDT/MWDT0 arrive ARMED from the ROM and reboot the chip ~1s in. The
+    // lx60 path keeps `l32r a1` first (its boot test asserts exactly that).
+    if xt_esp32_target != 0 {
+        xt_emit_esp32_wdt_ps()
+    }
+    uint64 slot = xt_lit_intern(XT_STACK_TOP)     // deduped: the pre-scan's slot
+    xt_l32r(XT_SP, xt_lit_base + slot * 4)         // l32r a1, <pool[XT_STACK_TOP]>
+    // [D2/L-3/M-4] .bss-zeroing loop over [p_filesz, p_memsz). The SP-init l32r
+    // above MUST stay FIRST on lx60 (L-4: e_entry decodes to `l32r a1`; on
+    // esp32 the WDT/PS head precedes it — e_entry lands there). The two bounds
+    // are unknown at emit time (data is laid out at finalize), so they live in
+    // two pool words reserved in the pre-scan and patched by main.kr with the
+    // absolute addresses 0xd0000000 + p_filesz / + p_memsz. Like the SP-init
+    // l32r, these two l32r's sit at code_start ahead of every branch, so
+    // relaxation never shifts them (no pool fixup). a0 is undefined/unused at
+    // reset, so a8/a9/a10 are free. Both hand-emitted branches (never tracked
+    // fixups, L-3) have BOTH endpoints inside this preamble, ahead of any
+    // relaxable body branch, so a later 3-byte insertion can't invalidate a
+    // displacement. This is a PRE-CHECKED while, not a do-while: when there is
+    // no gap (p_filesz == p_memsz, i.e. lo >= hi) the forward `bgeu` guard skips
+    // the body entirely, so a no-gap image NEVER stores past p_memsz (a do-while
+    // would write one word at [p_memsz], outside the declared LOAD segment —
+    // benign on qemu lx60 but a hardware-latent defect on ESP32). The guard's
+    // forward target (`done`, the insn after the backward `bltu`) is unknown
+    // until the body is laid out, so emit a placeholder `bgeu` (disp 0), record
+    // its site, emit the body, then backpatch the imm8 with the real target.
+    xt_l32r(XT_A8, xt_bss_lo_pool_off)             // l32r a8, <lo = 0xd0000000+p_filesz>
+    xt_l32r(XT_A9, xt_bss_hi_pool_off)             // l32r a9, <hi = 0xd0000000+p_memsz>
+    uint64 guard_site = out_len                    // bgeu site (backpatched below)
+    xt_bgeu(XT_A8, XT_A9, guard_site + 4)          // bgeu a8, a9, done  (placeholder: disp 0)
+    xt_movi(XT_A10, 0)                             // movi a10, 0  (the zero source)
+    uint64 top = out_len
+    xt_s32i(XT_A10, XT_A8, 0)                       // top: s32i a10, a8, 0
+    xt_addi(XT_A8, XT_A8, 4)                        //      addi a8, a8, 4
+    xt_bltu(XT_A8, XT_A9, top)                      //      bltu a8, a9, top
+    uint64 done = out_len                          // done: first insn after the loop
+    // Backpatch the guard: imm8 = done - (guard_site+4). BGEU cond = 0xB; the
+    // whole preamble is < 128 B so the signed byte displacement always fits.
+    xt_patch24(guard_site, xt_bri8_word(0xB, XT_A8, XT_A9, guard_site, done))
+    // ESP32 park (see xt_esp32_park_pool_off): preset a0 = &park so a
+    // returning main falls into a genuine self-branch instead of the lx60
+    // tail idiom (an illegal instruction on silicon -> exception -> reset
+    // loop that mimics a WDT failure exactly). a0 is undefined at hand-off
+    // and the prologue immediately frame-saves it, so a normal (non-recursive)
+    // main parks on its return.
+    //
+    // NOTE — RECURSION INTO THE ENTRY FN IS UNSUPPORTED (pre-existing, both
+    // targets). fn_register records code_start BEFORE this preamble is
+    // emitted, so a recursive call to the entry fn re-enters at the PREAMBLE,
+    // not the body: SP is reset to the stack top (destroying all outer
+    // frames), .bss is re-zeroed (destroying state), and a0 is overwritten
+    // with &park before the prologue saves it — so the FIRST inner return
+    // parks. This was already fatal on lx60 (the SP/.bss reset) before the
+    // park existed; the park does not change it. Do not read the park as
+    // making recursive entry work.
+    //
+    // Both hand-emitted j's have both endpoints
+    // inside the preamble, ahead of every relaxable branch (the L-3/M-4
+    // stability argument above), so the emit-time offsets — including the
+    // absolute park address patched into the pool word — are final.
+    if xt_esp32_target != 0 {
+        xt_l32r(XT_A0, xt_esp32_park_pool_off)     // a0 = &park (pool, patched below)
+        uint64 skip_site = out_len
+        xt_j(skip_site + 6)                        // j past the 3-byte park
+        uint64 park_off = out_len
+        xt_j(park_off)                             // park: j park  (self-branch)
+        patch_u32(xt_esp32_park_pool_off, XT_ESP32_IRAM_BASE + park_off)
+    }
+}
+
+// --- Offset-remap after relaxation (rv_c_remap analog) ------------------
+// The relaxed set is the ascending list of ORIGINAL patch offsets of the
+// conditional branches chosen for `Binv; J` rewriting. Each inserts 3 bytes
+// at its site, so an original offset `old` shifts by 3 for every relaxed
+// branch strictly before it. (num relaxed branches is tiny — linear scan.)
+static uint64 xt_relaxed = 0
+static uint64 xt_relaxed_cap = 0
+static uint64 xt_relaxed_count = 0
+
+fn xt_remap(uint64 old) -> uint64 {
+    uint64 add = 0
+    uint64 i = 0
+    while i < xt_relaxed_count {
+        uint64 p = xt_relaxed + i * 8
+        uint64 f = 0
+        unsafe { *(p as uint64) -> f }
+        if f < old { add = add + 3 }
+        i = i + 1
+    }
+    return old + add
+}
+
+// Rebuild the ascending relaxed-offset list from the fixups' relaxed flags.
+// Fixups are recorded in ascending patch_off order (blocks emit in order,
+// cond-before-uncond within a block), so a forward scan yields ascending
+// offsets with no sort.
+fn xt_build_relaxed() {
+    xt_relaxed_count = 0
+    uint64 fi = 0
+    while fi < xt_br_fixup_count {
+        if xt_fx_get(fi, 20) != 0 {
+            if xt_relaxed_count >= xt_relaxed_cap {
+                uint64 nc = xt_relaxed_cap * 2
+                if nc < 256 { nc = 256 }
+                uint64 nb = alloc(nc * 8)
+                if xt_relaxed != 0 {
+                    memcpy(nb, xt_relaxed, xt_relaxed_count * 8)
+                    dealloc(xt_relaxed)
+                }
+                xt_relaxed = nb
+                xt_relaxed_cap = nc
+            }
+            uint64 f = xt_fx_get(fi, 0)
+            uint64 p = xt_relaxed + xt_relaxed_count * 8
+            unsafe { *(p as uint64) = f }
+            xt_relaxed_count = xt_relaxed_count + 1
+        }
+        fi = fi + 1
+    }
+}
+
+// The relaxation pass. Runs after all blocks are emitted (step 9), before
+// branch/ret fixup patching. `code_start` = function entry offset (past the
+// pool); `line_start` = line_table_count at entry (only this function's -g
+// records shift). On return: out_len is the final size, and every recorded
+// offset (block offsets, branch/ret fixup sites, this function's line
+// records) is remapped to the relaxed layout; pooled L32R words are
+// re-patched. Each fixup's relaxed flag says whether the patcher should
+// emit `Binv; J` or the direct branch.
+fn xt_relax_function(uint64 code_start, uint64 line_start) {
+    // 1. Fixed-point planning. Clear flags, then repeatedly measure each
+    //    still-direct conditional branch on the CURRENT relaxed layout and
+    //    mark any out-of-range one. Marking is monotone (never un-relaxed)
+    //    and each mark can only push LATER branches out, so this converges
+    //    in <= #fixups passes; cap + hard-error on non-convergence.
+    uint64 cf = 0
+    while cf < xt_br_fixup_count {
+        xt_fx_set(cf, 20, 0)
+        cf = cf + 1
+    }
+    xt_relaxed_count = 0
+    uint64 cap_iter = xt_br_fixup_count + 4
+    uint64 iter = 0
+    uint64 changed = 1
+    while changed != 0 {
+        if iter > cap_iter {
+            xt_err("error: xtensa: branch relaxation did not converge\n")
+        }
+        xt_build_relaxed()
+        changed = 0
+        uint64 fi = 0
+        while fi < xt_br_fixup_count {
+            uint64 bk = xt_fx_get(fi, 8)
+            uint64 already = xt_fx_get(fi, 20)
+            if bk != XT_BK_J && already == 0 {
+                uint64 f = xt_fx_get(fi, 0)
+                uint64 tbb = xt_fx_get(fi, 4)
+                uint64 bop = ir_block_offsets + tbb * 8
+                uint64 bo = 0
+                unsafe { *(bop as uint64) -> bo }
+                uint64 nt = xt_remap(bo)
+                uint64 nf = xt_remap(f)
+                uint64 disp = nt - (nf + 4)
+                if xt_fits_cond(bk, disp) == 0 {
+                    xt_fx_set(fi, 20, 1)
+                    changed = 1
+                }
+            }
+            fi = fi + 1
+        }
+        iter = iter + 1
+    }
+    xt_build_relaxed()
+
+    // 2. Physically expand each relaxed branch from 3 to 6 bytes. The
+    //    function body is the tail of out_buf (epilogue not yet emitted),
+    //    so copy it to scratch and re-emit with 6-byte gaps at the relaxed
+    //    sites (append-only; avoids overlap). The gap bytes are patched in
+    //    step 4 (caller). New branch start == xt_remap(original site).
+    uint64 old_end = out_len
+    if xt_relaxed_count > 0 {
+        uint64 body_len = old_end - code_start
+        uint64 scratch = alloc(body_len)
+        memcpy(scratch, out_buf + code_start, body_len)
+        out_len = code_start
+        uint64 prev = code_start
+        uint64 k = 0
+        while k < xt_relaxed_count {
+            uint64 pp = xt_relaxed + k * 8
+            uint64 f = 0
+            unsafe { *(pp as uint64) -> f }
+            uint64 j = prev
+            while j < f {
+                uint64 sp = scratch + (j - code_start)
+                uint8 b = 0
+                unsafe { *(sp as uint8) -> b }
+                emit_byte(b)
+                j = j + 1
+            }
+            // 6 placeholder bytes: Binv (3) + J (3), patched by the caller.
+            emit_byte(0)
+            emit_byte(0)
+            emit_byte(0)
+            emit_byte(0)
+            emit_byte(0)
+            emit_byte(0)
+            prev = f + 3
+            k = k + 1
+        }
+        uint64 j2 = prev
+        while j2 < old_end {
+            uint64 sp = scratch + (j2 - code_start)
+            uint8 b = 0
+            unsafe { *(sp as uint8) -> b }
+            emit_byte(b)
+            j2 = j2 + 1
+        }
+        dealloc(scratch)
+    }
+
+    // 3. Remap every recorded offset to the relaxed layout.
+    uint64 bi = 0
+    while bi < ir_bb_count {
+        uint64 bop = ir_block_offsets + bi * 8
+        uint64 bo = 0
+        unsafe { *(bop as uint64) -> bo }
+        uint64 nb = xt_remap(bo)
+        unsafe { *(bop as uint64) = nb }
+        bi = bi + 1
+    }
+    uint64 fi2 = 0
+    while fi2 < xt_br_fixup_count {
+        uint64 f = xt_fx_get(fi2, 0)
+        xt_fx_set(fi2, 0, xt_remap(f))
+        fi2 = fi2 + 1
+    }
+    uint64 ri = 0
+    while ri < ir_ret_fixup_count {
+        uint64 rfp = ir_ret_fixups + ri * 4
+        uint32 rpo = 0
+        unsafe { *(rfp as uint32) -> rpo }
+        uint64 nr = xt_remap(rpo)
+        uint32 nrp = nr
+        unsafe { *(rfp as uint32) = nrp }
+        ri = ri + 1
+    }
+    // Call-site fixups (shared fixup_table) recorded during THIS function's
+    // emission also shift when a relaxed branch inserts bytes before them.
+    // Only remap entries at/after code_start: earlier functions' call sites
+    // are all below code_start, hence below every relaxed offset (which are
+    // in this function), so xt_remap would leave them unchanged anyway — the
+    // >= code_start guard makes that explicit. resolve_fixups_xtensa (run
+    // after all functions) then patches these final offsets.
+    uint64 cfi = 0
+    while cfi < fixup_count {
+        uint64 cfe = fixup_table + cfi * 8
+        uint32 cfo = 0
+        unsafe { *(cfe as uint32) -> cfo }
+        uint64 wcfo = cfo
+        if wcfo >= code_start {
+            uint32 ncfo = xt_remap(wcfo)
+            unsafe { *(cfe as uint32) = ncfo }
+        }
+        cfi = cfi + 1
+    }
+    // Address-fixup anchors (H1): the PIC anchor_off (return addr of a call0 in
+    // THIS function's body) shifts when a relaxed branch before it inserts
+    // bytes. xt_remap is only valid during a function's own relaxation (the
+    // relaxed list is reset per function), so each anchor is remapped IN PLACE
+    // here — mirror of the call-site loop above. By finalize the stored anchor
+    // is final and the resolver does delta = target − anchor with no remap.
+    // Guard >= code_start so earlier functions' anchors (all below every
+    // relaxed offset, which live in this function) stay untouched.
+    uint64 afi = 0
+    while afi < xt_addr_fixup_count {
+        uint64 aoff = xt_af_get(afi, 0)
+        if aoff >= code_start {
+            xt_af_set(afi, 0, xt_remap(aoff))
+        }
+        afi = afi + 1
+    }
+    uint64 li = line_start
+    while li < line_table_count {
+        uint64 entry = line_table + li * 16
+        uint32 lo = 0
+        unsafe { *(entry as uint32) -> lo }
+        uint64 nl = xt_remap(lo)
+        uint32 nlp = nl
+        unsafe { *(entry as uint32) = nlp }
+        li = li + 1
+    }
+
+    // 4. Re-derive each pooled L32R's imm16 on the final layout (pool word
+    //    is fixed at xt_lit_base + slot*4; only the instruction PC moved).
+    //    Preserve the op0|rd low byte already in place; replace imm16 only.
+    uint64 pi = 0
+    while pi < xt_pool_fixup_count {
+        uint64 e = xt_pool_fixups + pi * 8
+        uint32 so = 0
+        unsafe { *(e as uint32) -> so }
+        uint64 e4 = e + 4
+        uint32 sl = 0
+        unsafe { *(e4 as uint32) -> sl }
+        uint64 nsite = xt_remap(so)
+        uint64 target = xt_lit_base + sl * 4
+        uint64 base = (nsite + 3) & ~3
+        uint64 diff = target - base
+        uint64 imm16 = (diff >> 2) & 0xFFFF
+        uint64 lp = out_buf + nsite
+        uint8 b0 = 0
+        unsafe { *(lp as uint8) -> b0 }
+        uint64 w = (b0 & 0xFF) | ((imm16 & 0xFFFF) << 8)
+        xt_patch24(nsite, w)
+        pi = pi + 1
+    }
+}
+
+// --- Inline-asm mnemonic assembler --------------------------------------
+// Assembles ONE quoted asm string token into the code stream. Mirrors
+// asm_emit_rv (ir_riscv.kr:991) but for Xtensa. Scope is deliberately tight
+// (audit: constraint-binding hardcodes x86 reg codes upstream, ir.kr:4225):
+// operand-less nullary mnemonics only — the register conventions the boot
+// test exercises. Xtensa has no intra-instruction compression pass, so unlike
+// riscv there is no non-compressible range to mark (rv_mark_noc has no analog).
+fn asm_emit_xt(uint64 str_tok) {
+    uint64 tstart = tok_text_start(str_tok)
+    uint64 tlen = tok_text_len(str_tok)
+    uint64 sptr = cg_source + tstart + 1     // skip opening quote
+    uint64 slen = tlen - 2                    // drop both quotes
+    if slen == 0 { return }
+
+    // Nullary intrinsics (fixed-width words; NOP.N = 16-bit, MEMW = 24-bit).
+    if asm_match(sptr, 0, "nop", 3) != 0 && slen == 3 { xt_nop_n(); return }
+    if asm_match(sptr, 0, "memw", 4) != 0 && slen == 4 { xt_memw(); return }
+
+    // Unrecognized mnemonic — hard error (loud, like the riscv path). Operand
+    // and raw-hex forms are out of scope for this MVP (widths are ambiguous on
+    // Xtensa's variable-length ISA); extend here when a consumer needs them.
+    write(2, "error: xtensa: unrecognized asm instruction '", 45)
+    write(2, sptr, slen)
+    write(2, "'\n", 2)
+    exit(1)
+}
+
+// --- Per-instruction emission -------------------------------------------
+fn ir_emit_xtensa_insn(uint64 ii) {
+    uint64 op = ir_insn_opcode(ii)
+    if op == 0 { return }            // NOP (LICM-elided slot)
+    uint64 dest_v = ir_insn_dest(ii)
+    uint64 s1_v = ir_insn_src1(ii)
+    uint64 s2_v = ir_insn_src2(ii)
+    uint64 imm = ir_insn_imm(ii)
+
+    // DWARF line-table hook (same as the x86/arm64/riscv emitters).
+    uint64 ir_src_tok = ir_insn_src_tok_at(ii)
+    if ir_src_tok != 0 { line_table_record(ir_src_tok) }
+
+    uint64 dst_r = 0xFFFFFFFF
+    if dest_v != 0 { dst_r = ir_get_phys_reg(dest_v) }
+
+    // ----- IR_CONST (1): dst = imm -----
+    if op == 1 {
+        // >32-bit constant backstop (mirror of ir_riscv.kr:1147): reject a
+        // genuine 64-bit literal, but accept a sign-extended 32-bit negative
+        // (the shared optimiser const-folds in 64-bit, so `int32 a = 0 - 5`
+        // arrives as 0xFFFFFFFFFFFFFFFB — its low 32 bits are the value).
+        if imm > 0xFFFFFFFF {
+            if imm < 0xFFFFFFFF80000000 {
+                xt_err("error: 64-bit constant not supported on xtensa\n")
+            }
+        }
+        uint64 v = imm & 0xFFFFFFFF
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = XT_A8 }
+        if xt_fits_movi(v) != 0 {
+            xt_movi(d, v)
+        } else {
+            uint64 slot = xt_lit_intern(v)
+            xt_emit_l32r_pooled(d, slot)
+        }
+        if dst_r == 0xFFFFFFFF { xt_store_spill(XT_A8, dest_v) }
+        return
+    }
+
+    // ----- IR_RET (42): move result to a2, branch to epilogue -----
+    if op == 42 {
+        uint64 ret_r = xt_resolve_src(s1_v, XT_A8)
+        if ret_r != XT_A2 { xt_mv(XT_A2, ret_r) }
+        uint64 rfp = ir_ret_fixups + ir_ret_fixup_count * 4
+        uint32 rpo = out_len
+        unsafe { *(rfp as uint32) = rpo }
+        ir_ret_fixup_count = ir_ret_fixup_count + 1
+        xt_emit24(0x6)                            // j #0 (patched to epilogue)
+        return
+    }
+
+    // ----- IR_RET_VOID (43): a2 = 0, branch to epilogue -----
+    if op == 43 {
+        xt_movi(XT_A2, 0)
+        uint64 rfp = ir_ret_fixups + ir_ret_fixup_count * 4
+        uint32 rpo = out_len
+        unsafe { *(rfp as uint32) = rpo }
+        ir_ret_fixup_count = ir_ret_fixup_count + 1
+        xt_emit24(0x6)                            // j #0 (patched to epilogue)
+        return
+    }
+
+    // ----- IR_ARG (51): move value to CALL0 arg register a2..a7 -----
+    // Mirror of ir_riscv.kr:1523. imm is the 0-based arg index (ir.kr:2784):
+    // < 6 = register arg in a2..a7 (CALL0 ABI — six arg registers, vs
+    // riscv's eight a0-a7); >= 100 = direct physical AR target (ASM I/O
+    // constraints); 6..99 = overflow arg (the 7th+), stored to the pre-
+    // reserved bottom-of-frame slots (XT_OVERFLOW_RESERVE) at [a1 + oi*4].
+    // a2 (XT_ARG0) is BOTH arg0 and the return-value register; the caller's
+    // ARG-then-CALL sequencing (ir.kr emits all ARGs, then the CALL) writes
+    // a2 as arg0 before the call, and IR_CALL reads the result back out of
+    // a2 after — no aliasing hazard because nothing reads a2 as arg0 after
+    // the call returns.
+    if op == 51 {
+        if imm < XT_NUM_ARG_REGS {
+            uint64 target = XT_ARG0 + imm
+            uint64 src_reg = xt_resolve_src(s1_v, XT_A8)
+            xt_mv(target, src_reg)
+        } else if imm >= 100 {
+            uint64 phys_target = imm - 100
+            uint64 src_reg = xt_resolve_src(s1_v, XT_A8)
+            xt_mv(phys_target, src_reg)
+        } else {
+            // Overflow arg: the frame reserves XT_OVERFLOW_RESERVE bytes at
+            // [a1 + 0), so SP at the upcoming call sits exactly on the slots
+            // — no SP adjustment, just s32i at [a1 + (imm-6)*4]. The callee's
+            // IR_COPY (imm 6..99) reads it back at [a1 + callee_frame +
+            // (imm-6)*4]. 4-byte slots.
+            uint64 oi = imm - XT_NUM_ARG_REGS
+            if oi >= 16 {
+                xt_err("error: xtensa: overflow args overflow (max 16)\n")
+            }
+            uint64 src_reg = xt_resolve_src(s1_v, XT_A8)
+            xt_s32i(src_reg, XT_SP, oi * 4)           // s32i src, oi*4(a1)
+        }
+        return
+    }
+
+    // ----- IR_CALL (50): call0 <target> with a callee-name fixup -----
+    // Mirror of ir_riscv.kr:1557, but xtensa reaches the callee in a single
+    // `call0` (24-bit, PC-relative ±512 KiB) rather than an auipc+jalr pair.
+    // src1 is the ARG COUNT (ir.kr:2788), NOT a vreg — never resolve it. imm
+    // is the callee's name token. Emit a placeholder call0 (imm18=0) and
+    // record [call0_site:u32, callee_tok:u32] into the shared fixup_table;
+    // resolve_fixups_xtensa() patches the imm18 after every function is laid
+    // out (fn_register recorded each function's code_start). The result
+    // comes back in a2 (XT_ARG0) -> move to dst / spill.
+    if op == 50 {
+        uint64 call_patch = out_len
+        xt_emit24(0x5)                                 // call0 #0 (patched)
+        fixup_table_ensure()
+        uint64 fentry = fixup_table + fixup_count * 8
+        uint32 fo = call_patch
+        unsafe { *(fentry as uint32) = fo }
+        uint64 fe4 = fentry + 4
+        uint32 ct = imm
+        unsafe { *(fe4 as uint32) = ct }
+        fixup_count = fixup_count + 1
+        ir_overflow_arg_count = 0
+        // Result in a2. Allocatable regs are a12-a15, so dst_r can never BE
+        // a2 — the guard just skips a no-op mv.
+        if dst_r != 0xFFFFFFFF {
+            if dst_r != XT_ARG0 { xt_mv(dst_r, XT_ARG0) }
+        } else {
+            xt_store_spill(XT_ARG0, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_CALL_IND (87): callx0 <reg> — indirect through a pointer ----
+    // Mirror of ir_riscv.kr:1614 (jalr through a vreg). fn-pointer vreg in
+    // src1, result in a2. callx0 reads the target register before writing a0
+    // (return addr), so the pointer may live in the a8 scratch. imm==1 flags
+    // an f64 return on other arches; floats are rejected on xtensa by sema,
+    // so no special case is needed. (Function pointers are materialized via
+    // IR_FN_ADDR, a pool address-literal — a later task — this form just
+    // consumes whatever vreg produced the target address.)
+    if op == 87 {
+        uint64 ptr_r = xt_resolve_src(s1_v, XT_A8)
+        xt_callx0(ptr_r)
+        if dst_r != 0xFFFFFFFF {
+            if dst_r != XT_ARG0 { xt_mv(dst_r, XT_ARG0) }
+        } else {
+            xt_store_spill(XT_ARG0, dest_v)
+        }
+        return
+    }
+
+    // ----- R-type arith/logic: IR_ADD(2) IR_SUB(3) IR_AND(7) IR_OR(8)
+    // ----- IR_XOR(9), reg-reg. Resolve src1 into a8 / src2 into a9 when
+    // spilled (mirror of rv_resolve_src's t5/t6 pair), dest falls back to
+    // a8 + spill store — same "dest scratch aliases src1 scratch" safety
+    // argument as riscv (ir_riscv.kr:1168): every RRR instruction here
+    // reads both sources before writing rd, so d==a_reg is fine even when
+    // both fall back to a8.
+    if op == 2 || op == 3 || op == 7 || op == 8 || op == 9 {
+        uint64 a_reg = xt_resolve_src(s1_v, XT_A8)
+        uint64 b_reg = xt_resolve_src(s2_v, XT_A9)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = XT_A8 }
+        if op == 2 { xt_add(d, a_reg, b_reg) }
+        if op == 3 { xt_sub(d, a_reg, b_reg) }
+        if op == 7 { xt_and(d, a_reg, b_reg) }
+        if op == 8 { xt_or(d, a_reg, b_reg) }
+        if op == 9 { xt_xor(d, a_reg, b_reg) }
+        if dst_r == 0xFFFFFFFF { xt_store_spill(XT_A8, dest_v) }
+        return
+    }
+
+    // ----- IR_MUL (4): hardware MULL, reg-reg. -----
+    if op == 4 {
+        uint64 a_reg = xt_resolve_src(s1_v, XT_A8)
+        uint64 b_reg = xt_resolve_src(s2_v, XT_A9)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = XT_A8 }
+        xt_mull(d, a_reg, b_reg)
+        if dst_r == 0xFFFFFFFF { xt_store_spill(XT_A8, dest_v) }
+        return
+    }
+
+    // ----- Hardware divide/remainder: IR_DIV(5) unsigned -> QUOU,
+    // ----- IR_MOD(6) unsigned -> REMU, IR_SDIV(132) signed -> QUOS,
+    // ----- IR_SMOD(133) signed -> REMS. ESP32/LX6 has the DIV32 option;
+    // encoding provenance + s/t (dividend/divisor) convention documented
+    // at xt_quou's definition above. Signed/unsigned mapping mirrors the
+    // riscv/arm64 handlers (ir_riscv.kr:1190-1216) — a mixup here silently
+    // corrupts negative-number division, so keep this in lockstep with
+    // those if either changes.
+    if op == 5 || op == 6 || op == 132 || op == 133 {
+        uint64 a_reg = xt_resolve_src(s1_v, XT_A8)
+        uint64 b_reg = xt_resolve_src(s2_v, XT_A9)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = XT_A8 }
+        if op == 5 { xt_quou(d, a_reg, b_reg) }
+        if op == 6 { xt_remu(d, a_reg, b_reg) }
+        if op == 132 { xt_quos(d, a_reg, b_reg) }
+        if op == 133 { xt_rems(d, a_reg, b_reg) }
+        if dst_r == 0xFFFFFFFF { xt_store_spill(XT_A8, dest_v) }
+        return
+    }
+
+    // ----- IR_ADD_IMM (135) / IR_SUB_IMM (136): dst = src1 ± imm -----
+    // addi's imm8 field is signed −128..127. Outside that range,
+    // materialize imm into a9 (xt_materialize: movi or literal pool) and
+    // fall back to the R-type add/sub — mirrors riscv's li+R-type fallback
+    // (ir_riscv.kr:1218). No `subi` exists on Xtensa, so SUB_IMM negates
+    // for the addi fast path (dst = src1 + (-imm)) but passes the ORIGINAL
+    // imm to the materialize+sub fallback (xt_sub does the subtraction).
+    if op == 135 || op == 136 {
+        uint64 a_reg = xt_resolve_src(s1_v, XT_A8)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = XT_A8 }
+        uint64 addi_val = imm
+        if op == 136 { addi_val = 0 - imm }
+        if xt_fits_addi(addi_val) != 0 {
+            xt_addi(d, a_reg, addi_val & 0xFF)
+        } else {
+            xt_materialize(imm & 0xFFFFFFFF, XT_A9)
+            if op == 135 { xt_add(d, a_reg, XT_A9) }
+            if op == 136 { xt_sub(d, a_reg, XT_A9) }
+        }
+        if dst_r == 0xFFFFFFFF { xt_store_spill(XT_A8, dest_v) }
+        return
+    }
+
+    // ----- IMM bitwise/shift ops (KernRift IR_AND_IMM..IR_SAR_IMM = 140..145)
+    //       DELIBERATELY OMITTED IN MLRIFT (opcode-collision landmine).
+    // In KernRift, opcodes 140..145 are the immediate bitwise/shift ops
+    // produced only by KernRift's IR imm-fusion optimizer. MLRift's shared IR
+    // NEVER emits them (it lacks that optimizer pass), so the handlers are
+    // dormant. Worse, in MLRift opcodes 140..147 are ALREADY taken by the GPU
+    // ops (IR_GPU_ALLOC..IR_GPU_BARRIER, ir_hip.mlr). Handling 140..145 here
+    // would mis-decode GPU opcodes and could move the AMDGPU golden md5, so the
+    // AND/OR/XOR/SHL/SHR/SAR-imm handlers are omitted entirely (as they are in
+    // src/ir_riscv.mlr). The companion literal-pool pre-scan branch for
+    // sop 140..142 in ir_xtensa_gen is omitted for the same reason. If the
+    // imm-fusion optimizer is ever ported to MLRift, assign the imm ops fresh
+    // opcodes >= 148 (first free above IR_GPU_BARRIER=147) and reintroduce
+    // both sites here.
+
+    // ----- Variable shifts: IR_SHL(10) IR_SHR(11) IR_SAR(134), reg-reg.
+    // ----- SSL/SSR load the shift amount from a register into the SAR
+    // special register (SSL encodes it as 32-minus-amount internally, SSR
+    // directly — both are pure hardware idiom, xt_ssl/xt_ssr already
+    // encapsulate the difference), then SLL/SRL/SRA shift using SAR. SSL/
+    // SSR write only the special SAR register, never a8/a9, so resolving
+    // src1 into a8 and src2 into a9 first and reading them after is safe
+    // regardless of spill/alias.
+    if op == 10 || op == 11 || op == 134 {
+        uint64 a_reg = xt_resolve_src(s1_v, XT_A8)
+        uint64 b_reg = xt_resolve_src(s2_v, XT_A9)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = XT_A8 }
+        if op == 10 {
+            xt_ssl(b_reg)
+            xt_sll(d, a_reg)
+        } else if op == 11 {
+            xt_ssr(b_reg)
+            xt_srl(d, a_reg)
+        } else {
+            xt_ssr(b_reg)
+            xt_sra(d, a_reg)
+        }
+        if dst_r == 0xFFFFFFFF { xt_store_spill(XT_A8, dest_v) }
+        return
+    }
+
+    // ----- IR_LOAD (30): dest = *(src1), width in imm (or src2) -----
+    // Mirror of ir_riscv.kr:1363. Offset is always 0 — struct/array offsets
+    // are folded into a prior ADD by the IR lowering, so the address is
+    // entirely in src1. Width can arrive in imm OR src2 (struct field
+    // loads reuse the src2 slot — ir.kr:3045/3081/3147 — the same as the
+    // riscv/arm64 backends read it). IR has no signed-load marking
+    // anywhere in ir.kr (riscv's comment at the same site: x86 uses movzx,
+    // arm64 ldrb/ldrh, never a sign-extending load, for every narrow load
+    // in the tree) — l8ui/l16ui/l32i (zero-extending, matching riscv's
+    // lbu/lhu/lw) cover every width. l16si is defined and golden-diff
+    // verified (Task 2) but has no IR_LOAD caller to reach it — kept for a
+    // future signed-load IR shape, unused here exactly as riscv's `lh`
+    // would be.
+    if op == 30 {
+        uint64 width = imm
+        if width == 0 && s2_v != 0 { width = s2_v }
+        if width == 8 {
+            xt_err("error: xtensa: 64-bit load not supported\n")
+        }
+        uint64 addr_reg = xt_resolve_src(s1_v, XT_A8)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = XT_A8 }
+        if width == 1 { xt_l8ui(d, addr_reg, 0) }
+        else if width == 2 { xt_l16ui(d, addr_reg, 0) }
+        else { xt_l32i(d, addr_reg, 0) }
+        if dst_r == 0xFFFFFFFF { xt_store_spill(XT_A8, dest_v) }
+        return
+    }
+
+    // ----- IR_STORE (31): *(src1) = src2, width in dest_v -----
+    // Mirror of ir_riscv.kr:1383. dest_v here is a WIDTH (1/2/4/8), not a
+    // vreg — the generic `dst_r = ir_get_phys_reg(dest_v)` computed at the
+    // top of this function is garbage for this op and MUST NOT be used
+    // below (same caveat riscv documents at its own IR_STORE). Offset is
+    // always 0, address entirely in src1 (same as IR_LOAD).
+    if op == 31 {
+        uint64 width = dest_v
+        if width == 8 {
+            xt_err("error: xtensa: 64-bit store not supported\n")
+        }
+        uint64 addr_reg = xt_resolve_src(s1_v, XT_A8)
+        uint64 val_reg = xt_resolve_src(s2_v, XT_A9)
+        if width == 1 { xt_s8i(val_reg, addr_reg, 0) }
+        else if width == 2 { xt_s16i(val_reg, addr_reg, 0) }
+        else { xt_s32i(val_reg, addr_reg, 0) }
+        return
+    }
+
+    // ----- IR_VSTORE (94) / IR_VLOAD (95): volatile MMIO store/load -----
+    // Same operand shape as IR_STORE/IR_LOAD (mirror of ir_riscv.kr:1414):
+    // width in dest_v for VSTORE, in imm for VLOAD; address entirely in src1,
+    // offset 0. Unlike riscv (which relies on the in-order hart alone), emit a
+    // MEMW fence before each access (xt_memw) so an MMIO access is
+    // ordered against surrounding memory ops — the UART poll loop reads LSR and
+    // then writes THR, and MEMW keeps that ordering explicit on the LX6
+    // pipeline. Width 8 loud-fails (no 64-bit access on xtensa).
+    if op == 94 {
+        uint64 width = dest_v
+        if width == 8 {
+            xt_err("error: xtensa: 64-bit volatile store not supported\n")
+        }
+        uint64 addr_reg = xt_resolve_src(s1_v, XT_A8)
+        uint64 val_reg = xt_resolve_src(s2_v, XT_A9)
+        xt_memw()
+        if width == 1 { xt_s8i(val_reg, addr_reg, 0) }
+        else if width == 2 { xt_s16i(val_reg, addr_reg, 0) }
+        else { xt_s32i(val_reg, addr_reg, 0) }
+        return
+    }
+    if op == 95 {
+        uint64 width = imm
+        if width == 8 {
+            xt_err("error: xtensa: 64-bit volatile load not supported\n")
+        }
+        uint64 addr_reg = xt_resolve_src(s1_v, XT_A8)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = XT_A8 }
+        xt_memw()
+        if width == 1 { xt_l8ui(d, addr_reg, 0) }
+        else if width == 2 { xt_l16ui(d, addr_reg, 0) }
+        else { xt_l32i(d, addr_reg, 0) }
+        if dst_r == 0xFFFFFFFF { xt_store_spill(XT_A8, dest_v) }
+        return
+    }
+
+    // ----- IR_COPY (61): dst = src1, or param/phys-reg init -----
+    // Mirror of ir_riscv.kr:1451. src1 != 0: plain mv (bind a named
+    // local/temp to an existing vreg — what `uint32 x = expr` lowers to).
+    // src1 == 0 selects on imm: < 6 = incoming CALL0 param in a2..a7
+    // (arg index i -> a2+i, the same slot the caller's IR_ARG wrote; the
+    // boundary is 6, not riscv's 8, because CALL0 has six arg registers);
+    // >= 100 = ASM-block output read from physical AR imm-100; 6..99 =
+    // overflow param loaded from the CALLER's frame at
+    // [a1 + ir_frame_size + (imm-6)*4] (4-byte slots — IR_ARG's overflow
+    // path stored it at caller [a1 + oi*4], which is this frame's
+    // [a1 + ir_frame_size + oi*4]). Param regs a2..a7 are never clobbered
+    // between the prologue and these leading IR_COPYs (the prologue touches
+    // only a0/a1/a8/a12..a15), so reading them here is safe.
+    if op == 61 {
+        if s1_v != 0 {
+            uint64 src_reg = xt_resolve_src(s1_v, XT_A8)
+            if dst_r != 0xFFFFFFFF {
+                xt_mv(dst_r, src_reg)
+            } else {
+                if src_reg != XT_A8 { xt_mv(XT_A8, src_reg) }
+                xt_store_spill(XT_A8, dest_v)
+            }
+        } else if imm < XT_NUM_ARG_REGS {
+            uint64 pr = XT_ARG0 + imm
+            if dst_r != 0xFFFFFFFF {
+                xt_mv(dst_r, pr)
+            } else {
+                xt_mv(XT_A8, pr)
+                xt_store_spill(XT_A8, dest_v)
+            }
+        } else if imm >= 100 {
+            uint64 phys_src = imm - 100
+            if dst_r != 0xFFFFFFFF {
+                xt_mv(dst_r, phys_src)
+            } else {
+                xt_mv(XT_A8, phys_src)
+                xt_store_spill(XT_A8, dest_v)
+            }
+        } else {
+            // Overflow param: load from the caller's frame at
+            // [a1 + ir_frame_size + (imm-6)*4]. Offsets past l32i's 1020
+            // take the ADDMI large-frame path inside xt_l32i_sp (address
+            // formed in d itself — no scratch); an offset past 32764
+            // (near-max frame + a high overflow index) loud-fails there.
+            uint64 overflow_off = ir_frame_size + (imm - XT_NUM_ARG_REGS) * 4
+            uint64 d = dst_r
+            if d == 0xFFFFFFFF { d = XT_A8 }
+            xt_l32i_sp(d, overflow_off)
+            if dst_r == 0xFFFFFFFF { xt_store_spill(XT_A8, dest_v) }
+        }
+        return
+    }
+
+    // ----- Compares: IR_CMP_EQ(14) NE(15) LTU(16) LEU(17) GTU(18) GEU(19)
+    // ----- signed LT(120) LE(121) GT(122) GE(123). Xtensa has no slt-style
+    // set instruction on core LX6 — the only compare is the fused compare-
+    // and-branch — so materialise a 0/1 boolean via a local branch. The IR
+    // feeds the boolean vreg into IR_BR_COND (src1) exactly as riscv does
+    // (rv_resolve_src at ir_riscv.kr:2491), so this backend mirrors riscv's
+    // "materialise 0/1, then branch on it" shape rather than fusing.
+    //
+    // Sequence (all displacements tiny + fixed, never relaxed):
+    //     bcc  a, b, Ltrue     ; if (a CC b) goto Ltrue   (reads a,b FIRST)
+    //     movi d, 0            ; false case
+    //     j    Lend
+    //   Ltrue: movi d, 1       ; true case
+    //   Lend:
+    // The compare-branch reads both sources before d is written, so d may
+    // safely alias a_reg/b_reg (a coalesced/spilled dest sharing a8). Each
+    // op maps to a two-register branch with the operand order that makes
+    // "branch taken" mean "condition true": LE/GT/GEU/... swap operands
+    // and/or pick the >= form, the same algebra as riscv's slt lowering.
+    uint64 is_cmp = 0
+    if op >= 14 && op <= 19 { is_cmp = 1 }
+    if op >= 120 && op <= 123 { is_cmp = 1 }
+    if is_cmp != 0 {
+        // Fusion: if this compare is the last non-terminator of its block and
+        // single-use by the BR_COND terminator (ir_cmp_fuse_code applies the
+        // exact criteria the x86 backend uses), emit nothing here — stash the
+        // op + operands and let the terminator emit the fused compare-branch.
+        if ir_cmp_fuse_code(ii) != 0 {
+            xt_fused_cmp_op = op
+            xt_fused_cmp_s1 = s1_v
+            xt_fused_cmp_s2 = s2_v
+            return
+        }
+        uint64 a_reg = xt_resolve_src(s1_v, XT_A8)
+        uint64 b_reg = xt_resolve_src(s2_v, XT_A9)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = XT_A8 }
+        uint64 p = codegen_output_len()
+        uint64 ltrue = p + 9         // bcc(3) + movi(3) + j(3)
+        uint64 lend = p + 12         // + movi(3)
+        if op == 14 { xt_beq(a_reg, b_reg, ltrue) }
+        else if op == 15 { xt_bne(a_reg, b_reg, ltrue) }
+        else if op == 16 { xt_bltu(a_reg, b_reg, ltrue) }
+        else if op == 17 { xt_bgeu(b_reg, a_reg, ltrue) }   // a<=b == b>=a (u)
+        else if op == 18 { xt_bltu(b_reg, a_reg, ltrue) }   // a>b  == b<a  (u)
+        else if op == 19 { xt_bgeu(a_reg, b_reg, ltrue) }   // a>=b
+        else if op == 120 { xt_blt(a_reg, b_reg, ltrue) }
+        else if op == 121 { xt_bge(b_reg, a_reg, ltrue) }   // a<=b == b>=a (s)
+        else if op == 122 { xt_blt(b_reg, a_reg, ltrue) }   // a>b  == b<a  (s)
+        else { xt_bge(a_reg, b_reg, ltrue) }                // a>=b (123)
+        xt_movi(d, 0)
+        xt_j(lend)
+        xt_movi(d, 1)
+        if dst_r == 0xFFFFFFFF { xt_store_spill(XT_A8, dest_v) }
+        return
+    }
+
+    // ----- IR_STR_CONST (79): dst = address of string literal -----
+    // imm = byte offset into the string-literal blob. Materialize the address
+    // via the PIC sequence (table_sel 0 = strings), resolved against str_start
+    // once the string data is laid out (resolve_addr_fixups_xtensa). Mirror of
+    // ir_riscv.kr:1629, adapted to the xtensa PC-anchor addressing model.
+    if op == 79 {
+        uint64 rd = dst_r
+        if rd == 0xFFFFFFFF { rd = XT_A8 }
+        xt_emit_pic_addr(rd, 0, imm)                  // table_sel 0 = strings
+        if dst_r == 0xFFFFFFFF { xt_store_spill(rd, dest_v) }
+        return
+    }
+
+    // ----- IR_STATIC_ADDR (84): dst = address of static/global slot -----
+    // imm = byte offset into the static-data blob (assigned at parse time by
+    // static_declare*, arch-shared 8-byte slots — do not touch). Same PIC
+    // sequence as STR_CONST, just table_sel 1 (statics), resolved against
+    // data_start (resolve_addr_fixups_xtensa). Mirror of ir_riscv.kr op==84.
+    if op == 84 {
+        uint64 rd = dst_r
+        if rd == 0xFFFFFFFF { rd = XT_A8 }
+        xt_emit_pic_addr(rd, 1, imm)                  // table_sel 1 = statics
+        if dst_r == 0xFFFFFFFF { xt_store_spill(rd, dest_v) }
+        return
+    }
+
+    // ----- IR_FN_ADDR (86): dst = code address of a named function -----
+    // imm = the fn_addr("name") STRING-LITERAL token (ir.kr:2541). Same PIC
+    // sequence as STR_CONST/STATIC_ADDR, table_sel 2 (fn addrs), resolved
+    // against the function's code offset in resolve_addr_fixups_xtensa (NO
+    // remap — code_start is final, H1). One PIC site → one reserved pool word
+    // (pre-scan opcode set includes 86). Mirror of ir_riscv.kr op==86. The
+    // materialized pointer is then called through CALL_IND(87), already done.
+    if op == 86 {
+        uint64 rd = dst_r
+        if rd == 0xFFFFFFFF { rd = XT_A8 }
+        xt_emit_pic_addr(rd, 2, imm)                  // table_sel 2 = fn addrs
+        if dst_r == 0xFFFFFFFF { xt_store_spill(rd, dest_v) }
+        return
+    }
+
+    // ----- IR_STATIC_LOAD (77): dst = *(static base + imm) -----
+    // imm = byte offset into the static-data blob. Statics are fixed 8-byte
+    // slots (shared parse-time layout); the low 4 bytes hold the 32-bit value
+    // little-endian (emit_static_data), so a plain `l32i dst, base, 0` off the
+    // materialized base is correct. Base -> a8 via the PIC pair (offset folded
+    // into the delta pool word); the l32i is a fresh instruction. data_start is
+    // 8-aligned at finalize (M-2), so the base a8 is word-aligned and l32i never
+    // traps. Mirror of ir_riscv.kr op==77.
+    if op == 77 {
+        xt_emit_pic_addr(XT_A8, 1, imm)               // base -> a8
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = XT_A8 }
+        xt_l32i(d, XT_A8, 0)                           // l32i d, a8, 0
+        if dst_r == 0xFFFFFFFF { xt_store_spill(d, dest_v) }
+        return
+    }
+
+    // ----- IR_STATIC_STORE (78): *(static base + imm) = src1 -----
+    // src1 = value vreg, imm = byte offset; no dest. [M-5] Pin the value into
+    // a8, evaluating it FIRST, so it never aliases the base register a9 or the
+    // anchor a0 that xt_emit_pic_addr uses. __xt_pcbase is a ret.n-only leaf, so
+    // the `call0 __xt_pcbase` inside xt_emit_pic_addr clobbers only a0 — a8
+    // survives across it. Then s32i a8, a9, 0 (value a8 != base a9 != anchor a0).
+    // Base a9's low 2 bits are zero (data_start 8-aligned + imm folded, slot
+    // offsets are multiples of 8), so s32i never traps. Mirror of ir_riscv.kr
+    // op==78 (value-first), adapted to the register-pinning M-5 requires.
+    if op == 78 {
+        uint64 val_reg = xt_resolve_src(s1_v, XT_A8)  // value -> a8 first
+        if val_reg != XT_A8 { xt_mv(XT_A8, val_reg) }
+        xt_emit_pic_addr(XT_A9, 1, imm)               // base -> a9 second
+        xt_s32i(XT_A8, XT_A9, 0)                       // s32i a8, a9, 0
+        return
+    }
+
+    // ----- IR_STACK_ADDR (32): dst = address of a compile-time local array -----
+    // imm = byte offset within this function's stack-array region (rel_off,
+    // assigned by ir.kr:3414). The region sits directly above the spill
+    // slots — exactly matching the frame layout already folded into
+    // cs_base/total_frame above (ir_xtensa_gen step 5):
+    //     base_off = XT_OVERFLOW_RESERVE + ir_spill_count*4 + imm
+    // Not a PIC op: no pool/pre-scan/fixup involvement (the emit-side PIC set
+    // above is {77,78,79,84}; op 32 never joins it). base_off materializes
+    // through xt_movi_frame — plain movi inside signed-12 (byte-identity with
+    // the old path for every pre-existing frame), movi+addmi past it, NEVER
+    // the literal pool (nothing here can drift from the pre-scan), loud-fail
+    // past the ADDMI range. Mirror of ir_riscv.kr:2019-2038 (rv_addi_sp_big),
+    // adapted to Xtensa's addi imm8 range via xt_fits_addi / xt_movi_frame +
+    // xt_add. STACK_ADDR has no source operands, so a8/a9 are both free
+    // scratch here.
+    if op == 32 {
+        uint64 base_off = XT_OVERFLOW_RESERVE + ir_spill_count * 4 + imm
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = XT_A8 }
+        if xt_fits_addi(base_off) != 0 {
+            xt_addi(d, XT_SP, base_off & 0xFF)         // addi d, sp, base_off
+        } else {
+            xt_movi_frame(XT_A9, base_off)              // a9 = base_off (movi / movi+addmi)
+            xt_add(d, XT_SP, XT_A9)                      // d = sp + a9
+        }
+        if dst_r == 0xFFFFFFFF { xt_store_spill(XT_A8, dest_v) }
+        return
+    }
+
+    // ----- IR_MEMCMP (88): fixed-length byte compare -----
+    // Semantics (ir.kr:91/8095, mirror of ir_riscv.kr:1777-1828): dest =
+    // (memcmp(src1, src2, imm) == 0) ? 1 : 0. src1/src2 = pointers, imm = a
+    // COMPILE-TIME byte count (not a vreg — struct_total_size() folded in at
+    // the one emit site, ir.kr:1548). Assume-equal result preset AFTER the
+    // loop (not before, unlike the riscv/arm64 twins): every write to `d`
+    // happens only at the two converging exit points (natural loop
+    // exhaustion / len==0 guard-skip -> both "equal") or at the mismatch
+    // tail (NE -> "not equal"), so `d` is dormant during the hot loop body
+    // and can safely reuse ptrA's register (a8, dead once the loop is
+    // exited) as the spilled-dest fallback — sidestepping the register
+    // pressure a preset-before-the-loop `d` would hit (5 live temps for the
+    // loop body already exhausts a8/a9/a10/a11 + one caller temp; riscv can
+    // afford a 6th because rv has far more free a/t regs than xtensa's
+    // documented a8-a11 caller-temp set). a5 is a caller temp per the
+    // top-of-file ABI comment (a2-a7=args, a8-a11=caller temps) and this op
+    // never calls out, so it is free scratch here alongside a8-a11.
+    if op == 88 {
+        uint64 mc_a = xt_resolve_src(s1_v, XT_A8)
+        uint64 ptrA = XT_A8
+        if mc_a != ptrA { xt_mv(ptrA, mc_a) }
+        uint64 mc_b = xt_resolve_src(s2_v, XT_A9)
+        uint64 ptrB = XT_A9
+        if mc_b != ptrB { xt_mv(ptrB, mc_b) }
+        uint64 lenC = XT_A10
+        // imm is a compile-time literal (struct byte size), never a vreg —
+        // loud-fail rather than risk xt_materialize's un-prescanned pool path.
+        if xt_fits_movi(imm) != 0 {
+            xt_movi(lenC, imm)
+        } else {
+            xt_err("error: xtensa: memcmp compile-time length exceeds MOVI range\n")
+        }
+        uint64 byteA = XT_A11
+        uint64 byteB = XT_A5            // free caller-temp scratch (no call in this op)
+        uint64 guard_site = out_len
+        xt_beqz(lenC, guard_site + 4)   // len==0 -> EQ (placeholder; patched below)
+        uint64 top = out_len
+        // L:
+        xt_l8ui(byteA, ptrA, 0)         // l8ui byteA, ptrA, 0
+        xt_l8ui(byteB, ptrB, 0)         // l8ui byteB, ptrB, 0
+        uint64 bne_site = out_len
+        xt_bne(byteA, byteB, bne_site + 4) // mismatch -> NE (placeholder)
+        xt_addi(ptrA, ptrA, 1)          // addi ptrA, ptrA, 1
+        xt_addi(ptrB, ptrB, 1)          // addi ptrB, ptrB, 1
+        xt_addi(lenC, lenC, 0 - 1)      // addi lenC, lenC, -1
+        xt_bnez(lenC, top)              // loop while lenC != 0 (backward, direct)
+        // EQ: (loop exhausted, all bytes matched)
+        uint64 eq_off = out_len
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = XT_A8 }  // ptrA is dead here (loop exited)
+        xt_movi(d, 1)                    // d = 1 (equal)
+        uint64 jd_site = out_len
+        xt_j(jd_site + 4)                // j DONE (placeholder)
+        // NE:
+        uint64 ne_off = out_len
+        xt_movi(d, 0)                    // d = 0 (mismatch found)
+        uint64 done_off = out_len
+        // Backpatch: guard (beqz) -> EQ, bne -> NE, j -> DONE.
+        xt_patch24(guard_site, xt_bri12_word(0, lenC, guard_site, eq_off))
+        xt_patch24(bne_site, xt_bri8_word(0x9, byteA, byteB, bne_site, ne_off))
+        xt_patch24(jd_site, xt_j_word(jd_site, done_off))
+        if dst_r == 0xFFFFFFFF { xt_store_spill(XT_A8, dest_v) }
+        return
+    }
+
+    // ----- IR_MEMCPY (72): byte copy loop -----
+    // Semantics (ir.kr:75, mirror of ir_riscv.kr:1830-1888): dest = returned
+    // dst pointer, src1 = dst ptr, src2 = src ptr, imm = the COUNT VREG'S ID
+    // (not a literal — same "len vreg in imm" convention riscv/arm64 use).
+    // End-pointer loop (cur < end via bltu) rather than riscv's decrement
+    // style: xtensa's BLTU is a native two-register compare-branch, so
+    // comparing against a fixed `end` costs nothing extra and avoids
+    // needing a separate always-live length register. cur_dst=a8, cur_src=
+    // a9, end=a10, byte tmp=a11 (l8ui/s8ui may alias src/dst register with
+    // itself — never needed here since cur_dst != cur_src). The return
+    // value is NOT threaded through the loop in a saved register (unlike
+    // riscv's a4): since the loop only mutates its OWN scratch copies
+    // (a8/a9), the original dst (s1_v's colour reg or spill slot) is never
+    // touched, so it is simply re-resolved fresh after the loop — sidesteps
+    // needing a 5th scratch register purely to babysit the return value.
+    if op == 72 {
+        uint64 mc_dst = xt_resolve_src(s1_v, XT_A8)
+        uint64 cur_dst = XT_A8
+        if mc_dst != cur_dst { xt_mv(cur_dst, mc_dst) }
+        uint64 mc_src = xt_resolve_src(s2_v, XT_A9)
+        uint64 cur_src = XT_A9
+        if mc_src != cur_src { xt_mv(cur_src, mc_src) }
+        // Resolve len from imm (stored as vreg index, not a literal).
+        uint64 mc_len_vreg = imm
+        uint64 len_reg = XT_A10
+        if mc_len_vreg > 0 && mc_len_vreg < ir_vreg_next {
+            uint64 p = ir_get_phys_reg(mc_len_vreg)
+            if p != 0xFFFFFFFF {
+                len_reg = p
+            } else {
+                xt_load_spill(XT_A10, mc_len_vreg)
+            }
+        } else {
+            xt_movi(XT_A10, 0)
+        }
+        uint64 end = XT_A10
+        xt_add(end, cur_dst, len_reg)   // end = cur_dst + len (in-place-safe if len_reg==a10)
+        uint64 guard_site = out_len
+        xt_bgeu(cur_dst, end, guard_site + 4) // cur_dst>=end (len==0) -> DONE (placeholder)
+        uint64 top = out_len
+        // L:
+        xt_l8ui(XT_A11, cur_src, 0)     // l8ui a11, cur_src, 0
+        xt_s8i(XT_A11, cur_dst, 0)      // s8i  a11, cur_dst, 0
+        xt_addi(cur_dst, cur_dst, 1)    // addi cur_dst, cur_dst, 1
+        xt_addi(cur_src, cur_src, 1)    // addi cur_src, cur_src, 1
+        xt_bltu(cur_dst, end, top)      // loop while cur_dst < end (backward, direct)
+        uint64 done = out_len
+        xt_patch24(guard_site, xt_bri8_word(0xB, cur_dst, end, guard_site, done))
+        // DONE: return original dst (re-resolved fresh — never mutated above)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = XT_A8 }
+        uint64 od = xt_resolve_src(s1_v, d)
+        if od != d { xt_mv(d, od) }
+        // dest_v==0 for the statement-form lowering (return value discarded) —
+        // nothing to spill-store in that case; storing anyway would be a dead
+        // write into the overflow-reserve slot. Mirror of ir_riscv.kr:1886.
+        if dst_r == 0xFFFFFFFF && dest_v != 0 { xt_store_spill(XT_A8, dest_v) }
+        return
+    }
+
+    // ----- IR_MEMSET (76): byte fill loop -----
+    // Semantics (ir.kr:79, mirror of ir_riscv.kr:1890-1941): dest = returned
+    // dst pointer, src1 = dst ptr, src2 = fill-byte VALUE, imm = the COUNT
+    // VREG'S ID (same convention as MEMCPY above). End-pointer loop like
+    // MEMCPY: cur=a8, end=a10; the fill value never mutates so it stays in
+    // whatever register xt_resolve_src hands back (a9 if spilled, else its
+    // live colour register) with no extra copy needed. Return value handled
+    // exactly as MEMCPY: re-resolve s1_v fresh after the loop instead of
+    // threading a saved-dst register through it.
+    if op == 76 {
+        uint64 ms_dst = xt_resolve_src(s1_v, XT_A8)
+        uint64 cur = XT_A8
+        if ms_dst != cur { xt_mv(cur, ms_dst) }
+        uint64 val_reg = xt_resolve_src(s2_v, XT_A9)   // fill byte value (never mutated)
+        // Resolve len from imm (stored as vreg index, not a literal).
+        uint64 ms_len_vreg = imm
+        uint64 len_reg = XT_A10
+        if ms_len_vreg > 0 && ms_len_vreg < ir_vreg_next {
+            uint64 p = ir_get_phys_reg(ms_len_vreg)
+            if p != 0xFFFFFFFF {
+                len_reg = p
+            } else {
+                xt_load_spill(XT_A10, ms_len_vreg)
+            }
+        } else {
+            xt_movi(XT_A10, 0)
+        }
+        uint64 end = XT_A10
+        xt_add(end, cur, len_reg)       // end = cur + len (in-place-safe if len_reg==a10)
+        uint64 guard_site = out_len
+        xt_bgeu(cur, end, guard_site + 4) // cur>=end (len==0) -> DONE (placeholder)
+        uint64 top = out_len
+        // L:
+        xt_s8i(val_reg, cur, 0)         // s8i val, cur, 0
+        xt_addi(cur, cur, 1)            // addi cur, cur, 1
+        xt_bltu(cur, end, top)          // loop while cur < end (backward, direct)
+        uint64 done = out_len
+        xt_patch24(guard_site, xt_bri8_word(0xB, cur, end, guard_site, done))
+        // DONE: return original dst (re-resolved fresh — never mutated above)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = XT_A8 }
+        uint64 od = xt_resolve_src(s1_v, d)
+        if od != d { xt_mv(d, od) }
+        // dest_v==0 for the statement-form lowering (return value discarded) —
+        // nothing to spill-store in that case. Mirror of ir_riscv.kr:1939.
+        if dst_r == 0xFFFFFFFF && dest_v != 0 { xt_store_spill(XT_A8, dest_v) }
+        return
+    }
+
+    // ----- IR_STRLEN (73): byte scan loop -----
+    // Semantics (ir.kr:76/2182, mirror of ir_riscv.kr:1684-1719): dest =
+    // length, src1 = NUL-terminated string pointer. cur=a8 (walking ptr),
+    // start=a9 (fixed at the original ptr), byte tmp=a10. Loop scans cur
+    // forward until a NUL byte (forward beqz -> END, placeholder + patch,
+    // since END isn't laid out yet), then dest = cur - start. The back-edge
+    // (`j top`) is a plain backward jump — top is already emitted, so no
+    // placeholder/patch is needed there (same asymmetry as MEMCPY/MEMSET's
+    // bltu-backward-direct + beqz-forward-placeholder shape above). a8-a10
+    // are free scratch (never colour-mapped — colours are a12-a15).
+    if op == 73 {
+        uint64 sl_str = xt_resolve_src(s1_v, XT_A8)
+        uint64 cur = XT_A8
+        if sl_str != cur { xt_mv(cur, sl_str) }
+        uint64 start = XT_A9
+        xt_mv(start, cur)               // a9 = start ptr (fixed)
+        uint64 top = out_len
+        // L:
+        xt_l8ui(XT_A10, cur, 0)         // l8ui a10, cur, 0
+        uint64 beqz_site = out_len
+        xt_beqz(XT_A10, beqz_site + 4)  // a10==0 -> END (placeholder)
+        xt_addi(cur, cur, 1)            // addi cur, cur, 1
+        xt_j(top)                       // loop while byte != 0 (backward, direct)
+        uint64 end_off = out_len
+        xt_patch24(beqz_site, xt_bri12_word(0, XT_A10, beqz_site, end_off))
+        // END: dest = cur - start
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = XT_A8 }  // cur is dead here (loop exited)
+        xt_sub(d, cur, start)           // d = cur - start
+        if dst_r == 0xFFFFFFFF { xt_store_spill(XT_A8, dest_v) }
+        return
+    }
+
+    // ----- IR_STR_EQ (75): byte-by-byte string compare, no flags -----
+    // Semantics (ir.kr:78/2200, mirror of ir_riscv.kr:1721-1775): dest = 1
+    // if equal else 0, src1/src2 = pointers. Mirrors this file's IR_MEMCMP
+    // (88) shape but with no length bound: loop body loads both bytes, a
+    // mismatch (bne) jumps to NE, a shared NUL (beqz on byteA once bytes
+    // are known equal) jumps to EQ, else both pointers advance and the loop
+    // repeats. ptrA=a8, ptrB=a9, byteA=a10, byteB=a11 — a8-a11 are free
+    // scratch (never colour-mapped). Same placeholder-then-patch shape as
+    // MEMCMP: bne/beqz/j all target code not yet emitted at the point
+    // they're issued, so each bakes a "diff==0" placeholder (site+4) that
+    // xt_patch24 rewrites once the real target offset is known; the
+    // back-edge `j top` is backward-direct like STRLEN's.
+    if op == 75 {
+        uint64 se_a = xt_resolve_src(s1_v, XT_A8)
+        uint64 ptrA = XT_A8
+        if se_a != ptrA { xt_mv(ptrA, se_a) }
+        uint64 se_b = xt_resolve_src(s2_v, XT_A9)
+        uint64 ptrB = XT_A9
+        if se_b != ptrB { xt_mv(ptrB, se_b) }
+        uint64 byteA = XT_A10
+        uint64 byteB = XT_A11
+        uint64 top = out_len
+        // L:
+        xt_l8ui(byteA, ptrA, 0)         // l8ui a10, ptrA, 0
+        xt_l8ui(byteB, ptrB, 0)         // l8ui a11, ptrB, 0
+        uint64 bne_site = out_len
+        xt_bne(byteA, byteB, bne_site + 4)  // mismatch -> NE (placeholder)
+        uint64 beqz_site = out_len
+        xt_beqz(byteA, beqz_site + 4)   // byteA==0 (both NUL == equal) -> EQ (placeholder)
+        xt_addi(ptrA, ptrA, 1)          // addi ptrA, ptrA, 1
+        xt_addi(ptrB, ptrB, 1)          // addi ptrB, ptrB, 1
+        xt_j(top)                       // loop (backward, direct)
+        uint64 ne_off = out_len
+        // NE:
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = XT_A8 }  // ptrA is dead here (loop exited)
+        xt_movi(d, 0)                    // d = 0 (not equal)
+        uint64 jd_site = out_len
+        xt_j(jd_site + 4)                // j DONE (placeholder)
+        uint64 eq_off = out_len
+        // EQ:
+        xt_movi(d, 1)                    // d = 1 (equal)
+        uint64 done_off = out_len
+        // Backpatch: bne -> NE, beqz -> EQ, j -> DONE.
+        xt_patch24(bne_site, xt_bri8_word(0x9, byteA, byteB, bne_site, ne_off))
+        xt_patch24(beqz_site, xt_bri12_word(0, byteA, beqz_site, eq_off))
+        xt_patch24(jd_site, xt_j_word(jd_site, done_off))
+        if dst_r == 0xFFFFFFFF { xt_store_spill(XT_A8, dest_v) }
+        return
+    }
+
+    // ----- IR_FMT_UINT (74): format uint to buffer -----
+    // Semantics (ir.kr:2190-2199, "fmt_uint(buf, val) -> IR_FMT_UINT"): dest
+    // = digit count, src1 = output buffer pointer, src2 = value. Mirror of
+    // ir_riscv.kr:1943-2017's two-pass shape, but re-budgeted for Xtensa's
+    // narrower free-scratch set (a5,a8-a11 = 5 regs vs riscv's a0-a7 = 8):
+    // digit loop divides by 10 (native xt_quou/xt_remu, no msub synthesis
+    // needed) writing ASCII digits LEAST-significant-first into the frame
+    // scratchpad via a WALKING write cursor (a11) rather than riscv's fixed
+    // base + index-register pair — cheaper register-wise since the digit
+    // count is recovered afterward as (cursor - base) instead of needing
+    // its own live counter throughout the loop. ten=a5 (constant), tmp=a8
+    // (remainder/digit byte), val=a9 (quotient, mutated in place), base=a10
+    // (fixed scratch base), wptr=a11 (moving write cursor). After the digit
+    // loop: a9 = wptr - base (digit count), then a5 (dead — 10 no longer
+    // needed) saves a copy of it as the RETURN value, since the copy loop
+    // below destroys a9 by counting it back down to 0. Copy loop: resolve
+    // buf into a8 (dead — STRLEN/STR_EQ-style late resolve, only needed
+    // from here on) as the forward write cursor, a11 walks the scratch
+    // digits backward (pre-decrement — it's one-past-the-last-digit after
+    // the digit loop) into a10 (dead — base no longer needed) as the read
+    // byte, count-tested at the TOP via a9 (mirrors MEMCPY/MEMSET's
+    // CBZ-before-first-access shape: 0 digits never happens here since the
+    // digit loop always emits at least one, but the shape is kept for
+    // uniformity with every other loop in this file). Final dest = the a5
+    // copy of the digit count.
+    if op == 74 {
+        // Materialize the scratch base into a10 FIRST (may need a9 as an
+        // xt_movi temp via the STACK_ADDR (op 32) fallback shape below,
+        // before a9 is claimed for `val`).
+        uint64 base = XT_A10
+        if xt_fits_addi(ir_xt_scratch_off) != 0 {
+            xt_addi(base, XT_SP, ir_xt_scratch_off & 0xFF)
+        } else {
+            xt_movi_frame(XT_A9, ir_xt_scratch_off)   // movi / movi+addmi (never pool)
+            xt_add(base, XT_SP, XT_A9)
+        }
+        uint64 wptr = XT_A11
+        xt_mv(wptr, base)                  // a11 = scratch base (moving write cursor)
+        uint64 ten = XT_A5
+        xt_movi(ten, 10)                   // a5 = 10 (divisor)
+        uint64 val_r = xt_resolve_src(s2_v, XT_A9)
+        uint64 val = XT_A9
+        if val_r != val { xt_mv(val, val_r) }
+
+        uint64 top = out_len
+        // Digit loop L: tmp = val%10 + '0', store at [wptr], wptr++,
+        // val = val/10, loop while val != 0 (at least one iteration always
+        // runs, so val==0 still emits digit '0').
+        uint64 tmp = XT_A8
+        xt_remu(tmp, val, ten)             // a8 = val % 10
+        xt_addi(tmp, tmp, 48)              // a8 += '0'
+        xt_s8i(tmp, wptr, 0)               // s8i a8, wptr, 0
+        xt_addi(wptr, wptr, 1)             // wptr++
+        xt_quou(val, val, ten)             // val = val / 10
+        xt_bnez(val, top)                  // loop while val != 0 (backward, direct)
+
+        // digit count = wptr - base; save a copy in `ten` (a5, dead — the
+        // divisor is no longer needed) since the copy loop below counts
+        // `count` back down to 0.
+        uint64 count = XT_A9               // val (a9) is dead post-loop; reuse for count
+        xt_sub(count, wptr, base)          // a9 = wptr - base
+        uint64 saved_count = ten           // a5
+        xt_mv(saved_count, count)          // a5 = digit count (preserved for return)
+
+        // Copy loop: resolve buf now (late — matches STRLEN/STR_EQ's
+        // resolve-after-scratch-use idiom) as the forward write cursor.
+        // Walk the scratch digits backward (most-significant first, since
+        // wptr is one-past-the-last-digit) into buf forward. Count tested
+        // at the TOP (mirrors MEMCPY/MEMSET's CBZ-before-first-access
+        // shape) — count==0 falls straight through, never underflows.
+        uint64 buf_r = xt_resolve_src(s1_v, XT_A8)
+        uint64 buf = XT_A8
+        if buf_r != buf { xt_mv(buf, buf_r) }
+        uint64 rptr = wptr                 // a11, reused as the read cursor
+        uint64 byte = base                 // a10, reused as the digit-byte tmp (base is dead)
+        uint64 guard_site = out_len
+        xt_beqz(count, guard_site + 4)     // count==0 -> DONE (placeholder)
+        uint64 ctop = out_len
+        // L:
+        xt_addi(rptr, rptr, 0 - 1)         // rptr-- (pre-decrement: one-past-end -> last digit)
+        xt_l8ui(byte, rptr, 0)             // l8ui byte, rptr, 0
+        xt_s8i(byte, buf, 0)               // s8i byte, buf, 0
+        xt_addi(buf, buf, 1)               // buf++
+        xt_addi(count, count, 0 - 1)       // count--
+        xt_bnez(count, ctop)               // loop while count != 0 (backward, direct)
+        uint64 done_off = out_len
+        xt_patch24(guard_site, xt_bri12_word(0, count, guard_site, done_off))
+
+        // DONE: dest = digit count (saved_count / a5)
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = XT_A8 }   // buf is dead here (copy loop exited)
+        xt_mv(d, saved_count)
+        if dst_r == 0xFFFFFFFF { xt_store_spill(XT_A8, dest_v) }
+        return
+    }
+
+    // ----- IR_ASM_BLOCK (96): inline asm passthrough -----
+    // Mirror of ir_riscv.kr:2172 / ir_aarch64.kr:1508: walk the AsmBlock node's
+    // string children (data1 = single-line `asm("...")` form; child list =
+    // multi-line `asm { "..."; ... }` form) and hand each to asm_emit_xt. I/O
+    // constraints are NOT handled here (the block is operand-less by scope — the
+    // upstream binding hardcodes x86 reg codes, ir.kr:4225). The asm text is
+    // opaque passthrough. No non-compressible marking is needed (Xtensa has no
+    // intra-instruction compression pass, so the emitted words are never
+    // rewritten after the fact — unlike riscv's rv_compress_function).
+    if op == 96 {
+        uint64 asm_node = s1_v
+        uint32 single_tok = ast_data1(asm_node)
+        uint64 ws = single_tok
+        if ws != 0 {
+            asm_emit_xt(ws)
+        }
+        uint32 child_str = ast_child(asm_node)
+        uint64 wcs = child_str
+        while wcs != 0 {
+            uint32 stk = ast_data1(wcs)
+            uint64 wstk = stk
+            asm_emit_xt(wstk)
+            uint32 nxt = ast_next(wcs)
+            wcs = nxt
+        }
+        return
+    }
+
+    // Everything else lands in later tasks (call=T5.1/T5.2).
+    xt_nyi_op(op)
+}
+
+// --- Codegen driver ------------------------------------------------------
+// Mirror of ir_riscv_gen (ir_riscv.kr:2255), minus the C-compression pass
+// (there is no compressed relayout on xtensa) and plus the literal-pool
+// emission + self-registration described above.
+fn ir_xtensa_gen(uint64 fn_node, uint64 xt_entry_node) {
+    uint32 ann_flags = ast_data4(fn_node)
+    uint64 is_naked = ann_flags & 2
+    // Current-function @naked flag for the PIC emitter's H3 guard: a PIC site in
+    // a naked body would clobber the unsaved a0 via call0 __xt_pcbase.
+    xt_cur_is_naked = is_naked
+
+    // 1. Lower AST to IR
+    ir_lower_function(fn_node)
+
+    // 1a. Optimise
+    if ir_opt_level > 0 {
+        ir_optimize()
+    }
+
+    // 2. Liveness + per-vreg use counts (the latter feeds ir_cmp_fuse_code,
+    //    which proves a compare's boolean is single-use before the terminator
+    //    fuses it into a compare-branch).
+    ir_compute_liveness()
+    ir_compute_use_count()
+
+    // 3. Xtensa register allocator (4 callee-saved colours a12..a15).
+    //    IR_NUM_REGS is shared; save/pin/restore around emission.
+    uint64 saved_num_regs = IR_NUM_REGS
+    IR_NUM_REGS = 4
+    ir_regalloc_init_xtensa()
+    ir_graph_color()
+
+    // 4. Spill count
+    ir_spill_count = 0
+    if ir_vreg_next > IR_NUM_REGS + 1 {
+        ir_spill_count = ir_vreg_next - IR_NUM_REGS - 1
+    }
+
+    // 4a. Snapshot the function's var map for DWARF (if -g)
+    ir_snapshot_debug_vars()
+
+    // 5. Frame — 4-byte slots, 16-byte-aligned SP. Layout from a1 upward:
+    //      [a1 + 0 .. XT_OVERFLOW_RESERVE)  outgoing calls' args 7+
+    //      [spill slots ...]               spilled vregs (4 bytes each)
+    //      [stack arrays ...]              compile-time-sized local arrays
+    //      [scratchpad ...]                XT_SCRATCH_SIZE fixed bytes
+    //                                       (ir_xt_scratch_off points at its
+    //                                       base; IR_FMT_UINT etc.)
+    //      [cs_base ...]                   saved a12-a15 (used colours)
+    //      [a1 + total_frame - 4]          saved a0 (return address)
+    //    With the overflow reserve at the bottom, IR_ARG stores outgoing args
+    //    at [a1 + oi*4] with no SP adjustment — the callee reads them at
+    //    [a1 + callee_frame + oi*4] (IR_COPY imm 6..99), exactly as riscv does.
+    uint64 spill_size = ir_spill_count * 4
+    uint64 used_mask = ir_used_color_mask()
+    uint64 nsaved = 0
+    uint64 mc = 0
+    while mc < 4 {
+        if ((used_mask >> mc) & 1) != 0 { nsaved = nsaved + 1 }
+        mc = mc + 1
+    }
+    // Scratchpad sits between the stack-array region and the callee-saved
+    // block, exactly mirroring ir_riscv.kr:2336-2343 — every downstream
+    // offset (cs_base, saved-reg loops, a0 slot, total_frame) is derived
+    // FROM ir_xt_scratch_off, so it shifts automatically with the frame.
+    // XT_SCRATCH_SIZE=32 is a multiple of 4, so 16-byte alignment of
+    // total_frame is unaffected by inserting it.
+    ir_xt_scratch_off = XT_OVERFLOW_RESERVE + spill_size + ir_stack_array_bytes
+    uint64 cs_base = ir_xt_scratch_off + XT_SCRATCH_SIZE
+    uint64 total_frame = cs_base + nsaved * 4 + 4
+    if (total_frame & 15) != 0 { total_frame = total_frame + 16 - (total_frame & 15) }
+    if is_naked != 0 { total_frame = 0 }
+    // Large-frame regime: every SP-relative slot access goes through
+    // xt_l32i_sp/xt_s32i_sp (ADDMI + 4-aligned residue, max offset 32764)
+    // and the prologue/epilogue SP adjust through xt_movi_frame (movi +
+    // addmi, max 32767) — no literal pool anywhere, so nothing can drift
+    // from the pre-scan. 32752 is the largest 16-aligned frame whose a0
+    // slot (total_frame - 4) and ADDMI high part both stay in range.
+    // Genuinely bigger frames loud-fail — never truncate.
+    if is_naked == 0 {
+        if total_frame > 32752 {
+            xt_err("error: xtensa: frame exceeds 32752 bytes (ADDMI large-frame limit)\n")
+        }
+    }
+    ir_frame_size = total_frame
+
+    // 6. Literal pool FIRST (before any code). Pre-scan the lowered+optimised
+    //    IR for every IR_CONST that does not fit MOVI; intern each. (Address-
+    //    literals — call/str/static/fnaddr — reserve slots here in later
+    //    tasks.) Also pre-scan the ALU immediate ops (Task 4) whose emit-time
+    //    handler falls back to xt_materialize when the fast immediate
+    //    encoding doesn't fit: IR_ADD_IMM/IR_SUB_IMM(135/136) miss addi's
+    //    imm8, IR_AND_IMM/IR_OR_IMM/IR_XOR_IMM(140/141/142) always
+    //    materialize (no andi/ori/xori on core Xtensa). Mirror the exact
+    //    fits-check + value each handler uses below, so the same
+    //    xt_lit_intern call (dedup by value) reserves the same slot the
+    //    handler's xt_materialize will later resolve — the pool is flushed
+    //    to a fixed file offset right after this scan, so any literal
+    //    needed at emit time MUST be interned here first. Then flush the
+    //    word-aligned pool. code_start follows it.
+    xt_lit_reset()
+    uint64 sbi = 0
+    while sbi < ir_bb_count {
+        uint64 sii = ir_bb_first_insn(sbi)
+        while sii != 0xFFFFFFFF {
+            uint64 sop = ir_insn_opcode(sii)
+            if sop == 1 {
+                uint64 cimm = ir_insn_imm(sii)
+                // Only 32-bit-representable constants reach the pool; genuine
+                // 64-bit literals are rejected at emit time (loud), so the
+                // pre-scan need not pool them.
+                uint64 pool_ok = 1
+                if cimm > 0xFFFFFFFF {
+                    if cimm < 0xFFFFFFFF80000000 { pool_ok = 0 }
+                }
+                if pool_ok != 0 {
+                    uint64 cv = cimm & 0xFFFFFFFF
+                    if xt_fits_movi(cv) == 0 { xt_lit_intern(cv) }
+                }
+            } else if sop == 135 || sop == 136 {
+                uint64 aimm = ir_insn_imm(sii)
+                uint64 addi_val = aimm
+                if sop == 136 { addi_val = 0 - aimm }
+                if xt_fits_addi(addi_val) == 0 {
+                    uint64 amv = aimm & 0xFFFFFFFF
+                    if xt_fits_movi(amv) == 0 { xt_lit_intern(amv) }
+                }
+            }
+            // KernRift also pre-interns the AND/OR/XOR-imm (140..142) literal
+            // here. OMITTED in MLRift: 140..147 are the GPU opcodes
+            // (IR_GPU_ALLOC..IR_GPU_BARRIER), so this branch would intern
+            // garbage pool words for GPU IR. See the matching comment in
+            // ir_emit_xtensa_insn.
+            sii = ir_insn_next(sii)
+        }
+        sbi = sbi + 1
+    }
+    // Freestanding entry fn: reserve the pool word the SP-init preamble loads.
+    // Must be interned BEFORE the flush (like every other literal) so its slot
+    // has a backing word; xt_emit_raw_sp_preamble re-interns (deduped) to get
+    // the same slot.
+    if fn_node == xt_entry_node {
+        xt_lit_intern(XT_STACK_TOP)
+        // ESP32 stub literals (Task 4): the WDT unlock key + all six register
+        // addresses the preamble head l32r's. Interned (deduped) here so the
+        // flush gives them backing words; xt_emit_esp32_wdt_ps re-interns to
+        // recover the same slots — the XT_STACK_TOP pattern exactly.
+        if xt_esp32_target != 0 {
+            xt_lit_intern(XT_ESP32_WDT_KEY)
+            xt_lit_intern(XT_ESP32_RWDT_WPROT)
+            xt_lit_intern(XT_ESP32_RWDT_CFG0)
+            xt_lit_intern(XT_ESP32_MWDT0_WPROT)
+            xt_lit_intern(XT_ESP32_MWDT0_CFG0)
+            xt_lit_intern(XT_ESP32_MWDT1_WPROT)
+            xt_lit_intern(XT_ESP32_MWDT1_CFG0)
+        }
+    }
+    // PIC address sites (H1/M1): capture the first PIC slot, then walk the IR
+    // AGAIN in the SAME block/insn order reserving ONE non-deduped pool word per
+    // STR_CONST site (contiguous, so site k -> slot xt_pic_base + k). Emission
+    // recovers each slot by a running index (xt_pic_k), never a second reserve —
+    // a reserve after the flush would point the delta word into code bytes (H1).
+    // Reserved LAST so the address words stay contiguous; the emit-time recovery
+    // in xt_emit_pic_addr matches this pre-scan walk exactly. Every opcode listed
+    // here calls xt_emit_pic_addr EXACTLY ONCE per site during emission, so one
+    // reserved word per site keeps the running index (xt_pic_k) in lockstep with
+    // the reservation order (H1 — a mismatch corrupts the pool words). The set
+    // must stay identical to the emit-side dispatch: STR_CONST(79),
+    // STATIC_ADDR(84), STATIC_LOAD(77), STATIC_STORE(78). (FN_ADDR joins this
+    // same contiguous run in a later task.)
+    xt_pic_base = xt_lit_count
+    uint64 pbi = 0
+    while pbi < ir_bb_count {
+        uint64 pii = ir_bb_first_insn(pbi)
+        while pii != 0xFFFFFFFF {
+            uint64 pop = ir_insn_opcode(pii)
+            if pop == 79 || pop == 84 || pop == 77 || pop == 78 || pop == 86 {
+                xt_lit_reserve()
+            }
+            pii = ir_insn_next(pii)
+        }
+        pbi = pbi + 1
+    }
+    // [M-6] Entry-fn only: reserve the TWO .bss-bound pool words AFTER the PIC
+    // reserves. Because xt_pic_base was captured BEFORE the PIC loop and the PIC
+    // running index (xt_pic_k) only ever reaches n-1 (n = PIC-site count), these
+    // two words — which land at slots xt_pic_base+n and xt_pic_base+n+1, the
+    // tail of the pool — are NEVER consumed by a PIC site. Their absolute file
+    // offsets are captured post-flush (below), once xt_lit_base is final; the
+    // preamble loads them and main.kr patches them at finalize (M-4).
+    uint64 xt_bss_lo_slot = 0
+    uint64 xt_bss_hi_slot = 0
+    uint64 xt_esp32_park_slot = 0
+    if fn_node == xt_entry_node {
+        xt_bss_lo_slot = xt_lit_reserve()
+        xt_bss_hi_slot = xt_lit_reserve()
+        // ESP32 park-address word (Task 4): reserved (never interned — its
+        // value, an absolute IRAM address, is unknown until the preamble is
+        // emitted) AFTER the .bss slots for the same reason those follow the
+        // PIC reserves: the tail of the pool, untouchable by xt_pic_k.
+        if xt_esp32_target != 0 {
+            xt_esp32_park_slot = xt_lit_reserve()
+        }
+    }
+    // CALL0 targets — and thus every function's code_start (= e_entry / the
+    // call destination) — must be 4-byte aligned: the LX6 computes the target
+    // as ((PC+4) & ~3) + imm18*4, so the low two bits of any call destination
+    // are implicitly zero. xt_lit_flush aligns out_len only when the pool is
+    // non-empty (it early-returns otherwise); a pool-less function would then
+    // inherit the previous function's unaligned end and every call0 to it would
+    // round down into the tail of the preceding function. Align here so both
+    // the pool (L32R word targets) and code_start land on a word boundary.
+    while (out_len & 3) != 0 { emit_byte(0) }
+    xt_lit_flush()
+    // [M-6] Now that xt_lit_base is final, turn the two reserved slots into the
+    // absolute file offsets the preamble l32r's and the finalize patch share.
+    if fn_node == xt_entry_node {
+        xt_bss_lo_pool_off = xt_lit_base + xt_bss_lo_slot * 4
+        xt_bss_hi_pool_off = xt_lit_base + xt_bss_hi_slot * 4
+        if xt_esp32_target != 0 {
+            xt_esp32_park_pool_off = xt_lit_base + xt_esp32_park_slot * 4
+        }
+    }
+
+    // 6a. Self-register at code_start (past the pool) so find_main_offset /
+    //     fn_lookup return the entry, not the pool. main.kr must NOT pre-
+    //     register (unlike the riscv arch-2 branch).
+    uint64 code_start = out_len
+    uint32 fn_name_tok = ast_data1(fn_node)
+    fn_register(fn_name_tok, code_start)
+    line_table_record_fn_entry(fn_name_tok)
+    // -g line records from here on shift under relaxation; the fn-entry
+    // record above sits at code_start (which never moves) so is excluded.
+    uint64 fn_line_start = line_table_count
+
+    // 6b. Freestanding entry preamble (Task 8): init a1 (SP) as the FIRST code
+    //     — before the prologue, so e_entry == code_start lands on it and the
+    //     prologue's stack stores run against a valid SP. Only the selected
+    //     entry fn; a no-op for every other function and for hosted builds
+    //     (xt_entry_node == 0). See xt_emit_raw_sp_preamble for why this L32R
+    //     records no pool fixup.
+    if fn_node == xt_entry_node {
+        // ⚠️ @naked voids the ESP32 preamble's a0-park safety net, so refuse
+        // the combination outright. The preamble emits `l32r a0, &park` so
+        // that if the entry function ever returns, its epilogue restores that
+        // a0 and `ret.n` lands on a self-branch — a visible hang — instead of
+        // decoding whatever follows (an illegal instruction on silicon,
+        // which raises an exception and reboots in a loop that is
+        // indistinguishable from a watchdog failure). That only works
+        // because the prologue frame-saves a0 immediately afterwards. @naked
+        // skips the prologue, so a0 is never saved and the FIRST call0 in
+        // the body clobbers the park address — silently turning the one
+        // diagnosable failure mode back into the undiagnosable one.
+        if is_naked != 0 && xt_esp32_target != 0 {
+            xt_err("error: xtensa/esp32: the entry function may not be @naked — the entry preamble parks a0 on a self-branch so a returning entry hangs visibly instead of rebooting in a loop, and @naked skips the prologue that saves a0, so the first call0 destroys it. Drop @naked from the entry function.\n")
+        }
+        xt_emit_raw_sp_preamble()
+    }
+
+    // 7. Prologue (skip for @naked). CALL0: lower SP, save a0 (return addr)
+    //    at [a1 + total_frame - 4], save used a12-a15. addi is signed-8, so a
+    //    single-instruction adjust needs |delta| <= 127; larger frames
+    //    materialise N in a8 (movi, or movi+addmi past signed-12 — never the
+    //    pool). Slot stores past s32i's 1020 go through xt_s32i_sp's a10
+    //    address path: a10 is caller-saved and dead here (the entry
+    //    preamble's uses of it are complete before the prologue runs), and
+    //    each addmi/s32i pair is adjacent, so a10 never carries a value
+    //    across anything.
+    if is_naked == 0 {
+        if total_frame <= 127 {
+            xt_addi(XT_SP, XT_SP, (0 - total_frame) & 0xFF)   // addi a1, a1, -N
+        } else {
+            xt_movi_frame(XT_A8, total_frame)
+            xt_sub(XT_SP, XT_SP, XT_A8)                        // a1 = a1 - a8
+        }
+        xt_s32i_sp(XT_A0, total_frame - 4)                    // s32i a0, a1, N-4
+        uint64 pc = 0
+        uint64 pslot = 0
+        while pc < 4 {
+            if ((used_mask >> pc) & 1) != 0 {
+                xt_s32i_sp(xt_reg_for_color(pc), cs_base + pslot * 4)
+                pslot = pslot + 1
+            }
+            pc = pc + 1
+        }
+    }
+
+    // 8. Branch/return fixup tracking (shared grow-as-needed buffers).
+    uint64 bo_need = ir_bb_count
+    if bo_need < 4096 { bo_need = 4096 }
+    if bo_need > ir_block_offsets_cap {
+        if ir_block_offsets != 0 { dealloc(ir_block_offsets) }
+        ir_block_offsets = alloc(bo_need * 8)
+        ir_block_offsets_cap = bo_need
+    }
+    uint64 ret_need = ir_bb_count
+    if ret_need < 1024 { ret_need = 1024 }
+    if ret_need > ir_ret_fixups_cap {
+        if ir_ret_fixups != 0 { dealloc(ir_ret_fixups) }
+        ir_ret_fixups = alloc(ret_need * 4)
+        ir_ret_fixups_cap = ret_need
+    }
+    ir_ret_fixup_count = 0
+    xt_br_fixup_count = 0
+    xt_pool_fixup_count = 0
+    // Running PIC-site index for THIS function's emission. The pre-scan walked
+    // the IR in this same order reserving one pool word per PIC site starting at
+    // xt_pic_base; each xt_emit_pic_addr consumes slot xt_pic_base + xt_pic_k
+    // and increments, so pre-scan and emit stay in lockstep (H1).
+    xt_pic_k = 0
+
+    // 9. Emit basic blocks. IR_RET/IR_RET_VOID are non-terminators here (like
+    //    riscv) — emitted in the insn loop. IR_BR/IR_BR_COND terminators emit
+    //    a placeholder branch + a fixup record (mirror of ir_riscv.kr:2461);
+    //    displacements are resolved after relaxation (step 9a) so the layout
+    //    is final. Conditional branches are BNEZ on the compare's 0/1 boolean
+    //    (src1) — the non-fused shape riscv uses.
+    uint64 bi = 0
+    while bi < ir_bb_count {
+        uint64 bop = ir_block_offsets + bi * 8
+        unsafe { *(bop as uint64) = out_len }
+        xt_fused_cmp_op = 0            // clear any stale fusion handoff
+        uint64 ii = ir_bb_first_insn(bi)
+        while ii != 0xFFFFFFFF {
+            uint64 iop = ir_insn_opcode(ii)
+            if iop != 40 && iop != 41 {
+                ir_emit_xtensa_insn(ii)
+            }
+            ii = ir_insn_next(ii)
+        }
+        uint64 last = ir_bb_last_insn(bi)
+        if last != 0xFFFFFFFF {
+            uint64 last_op = ir_insn_opcode(last)
+            if last_op == 40 {
+                // IR_BR: unconditional J to target_bb (fall-through elided).
+                uint64 target = ir_insn_imm(last)
+                if target != bi + 1 {
+                    uint64 po = out_len
+                    xt_add_fixup(po, target, XT_BK_J, 0, 0)
+                    xt_emit24(0x6)                     // j #0 placeholder
+                }
+            }
+            if last_op == 41 {
+                // IR_BR_COND: TRUE target = imm, FALSE target = succ0. Both
+                // fall-through edges are elided, and when the TRUE edge is the
+                // fall-through the branch is INVERTED to target FALSE (drops
+                // the extra J riscv keeps). This inversion is what puts a
+                // conditional branch across a large body: in a `while` the
+                // TRUE edge is the loop body (bi+1), so the header branches to
+                // the (far) exit — the branch step 9a must relax.
+                uint64 target_true = ir_insn_imm(last)
+                uint64 target_false = ir_bb_succ0(bi)
+                uint64 bk = 0
+                uint64 rs = 0
+                uint64 rt = 0
+                if xt_fused_cmp_op != 0 {
+                    // Fused: emit the two-register BRI8 compare-branch. Map the
+                    // compare op to the branch kind + operand order that is
+                    // TAKEN exactly when the compare is TRUE (same swap algebra
+                    // as the non-fused materialize path). ±128 B reach — this
+                    // is the branch that relaxes across a >128 B body.
+                    uint64 cop = xt_fused_cmp_op
+                    uint64 a_reg = xt_resolve_src(xt_fused_cmp_s1, XT_A8)
+                    uint64 b_reg = xt_resolve_src(xt_fused_cmp_s2, XT_A9)
+                    rs = a_reg
+                    rt = b_reg
+                    if cop == 14 { bk = XT_BK_BEQ }
+                    else if cop == 15 { bk = XT_BK_BNE }
+                    else if cop == 16 { bk = XT_BK_BLTU }
+                    else if cop == 17 { bk = XT_BK_BGEU
+                        rs = b_reg
+                        rt = a_reg }
+                    else if cop == 18 { bk = XT_BK_BLTU
+                        rs = b_reg
+                        rt = a_reg }
+                    else if cop == 19 { bk = XT_BK_BGEU }
+                    else if cop == 120 { bk = XT_BK_BLT }
+                    else if cop == 121 { bk = XT_BK_BGE
+                        rs = b_reg
+                        rt = a_reg }
+                    else if cop == 122 { bk = XT_BK_BLT
+                        rs = b_reg
+                        rt = a_reg }
+                    else { bk = XT_BK_BGE }
+                    xt_fused_cmp_op = 0
+                } else {
+                    // Non-fused: cond is a materialised 0/1 in src1; branch on
+                    // "cond != 0" (BNEZ) or its inverse (BEQZ).
+                    uint64 cond_v = ir_insn_src1(last)
+                    rs = xt_resolve_src(cond_v, XT_A8)
+                    rt = 0
+                    bk = XT_BK_BNEZ
+                }
+                if target_true == bi + 1 {
+                    if target_false != 0xFFFFFFFF && target_false != bi + 1 {
+                        uint64 ibk = xt_invert_branch(bk)
+                        uint64 po = out_len
+                        xt_add_fixup(po, target_false, ibk, rs, rt)
+                        xt_emit24(xt_cond_word(ibk, rs, rt, po, po))
+                    }
+                } else {
+                    uint64 po = out_len
+                    xt_add_fixup(po, target_true, bk, rs, rt)
+                    xt_emit24(xt_cond_word(bk, rs, rt, po, po))
+                    if target_false != 0xFFFFFFFF && target_false != bi + 1 {
+                        uint64 po2 = out_len
+                        xt_add_fixup(po2, target_false, XT_BK_J, 0, 0)
+                        xt_emit24(0x6)                                // j #0
+                    }
+                }
+            }
+        }
+        bi = bi + 1
+    }
+
+    // 9a. Branch relaxation: solve the out-of-range conditional set to a
+    //     fixed point, expand each to `Binv; J`, and remap every recorded
+    //     offset (block offsets, branch/ret fixup sites, line records) +
+    //     re-patch pooled L32R words. After this, out_len is final.
+    xt_relax_function(code_start, fn_line_start)
+
+    // 9b. Patch branch fixups on the final layout. Unconditional -> J.
+    //     Conditional -> BNEZ direct, or (if relaxed) inverted BEQZ that
+    //     skips a J carrying the real ±128 KiB displacement.
+    uint64 fbi = 0
+    while fbi < xt_br_fixup_count {
+        uint64 np = xt_fx_get(fbi, 0)
+        uint64 tbb = xt_fx_get(fbi, 4)
+        uint64 bk = xt_fx_get(fbi, 8)
+        uint64 rs = xt_fx_get(fbi, 12)
+        uint64 rt = xt_fx_get(fbi, 16)
+        uint64 relaxed = xt_fx_get(fbi, 20)
+        uint64 tbp = ir_block_offsets + tbb * 8
+        uint64 nt = 0
+        unsafe { *(tbp as uint64) -> nt }
+        if bk == XT_BK_J {
+            xt_patch24(np, xt_j_word(np, nt))
+        } else {
+            if relaxed != 0 {
+                uint64 inv = xt_invert_branch(bk)
+                xt_patch24(np, xt_cond_word(inv, rs, rt, np, np + 6))
+                xt_patch24(np + 3, xt_j_word(np + 3, nt))
+            } else {
+                xt_patch24(np, xt_cond_word(bk, rs, rt, np, nt))
+            }
+        }
+        fbi = fbi + 1
+    }
+
+    // 10. Patch return fixups — all jump to the epilogue (offsets already
+    //     remapped by step 9a).
+    uint64 epilogue_off = out_len
+    uint64 ri = 0
+    while ri < ir_ret_fixup_count {
+        uint64 rfp = ir_ret_fixups + ri * 4
+        uint32 rpatch = 0
+        unsafe { *(rfp as uint32) -> rpatch }
+        uint64 wrp = rpatch
+        xt_patch24(wrp, xt_j_word(wrp, epilogue_off))
+        ri = ri + 1
+    }
+
+    // 11. Epilogue (skip for @naked): restore a12-a15, restore a0, unwind SP,
+    //     ret.n. No auto-exit trampoline yet (runtime is T8). Large-frame
+    //     restores go through xt_l32i_sp, which forms each address in the
+    //     DESTINATION register itself (addmi rt,a1,hi; l32i rt,rt,lo) — so
+    //     the a0 restore never needs a scratch and nothing already-restored
+    //     is disturbed; the SP unwind materialises N in a8 (dead here) via
+    //     movi/movi+addmi AFTER a0 is back, clobbering neither.
+    if is_naked == 0 {
+        uint64 ec = 0
+        uint64 eslot = 0
+        while ec < 4 {
+            if ((used_mask >> ec) & 1) != 0 {
+                xt_l32i_sp(xt_reg_for_color(ec), cs_base + eslot * 4)
+                eslot = eslot + 1
+            }
+            ec = ec + 1
+        }
+        xt_l32i_sp(XT_A0, total_frame - 4)                    // l32i a0, a1, N-4
+        if total_frame <= 127 {
+            xt_addi(XT_SP, XT_SP, total_frame & 0xFF)         // addi a1, a1, N
+        } else {
+            xt_movi_frame(XT_A8, total_frame)
+            xt_add(XT_SP, XT_SP, XT_A8)                        // a1 = a1 + a8
+        }
+        xt_ret_n()
+    }
+
+    // Restore IR_NUM_REGS for functions compiled later on other arches.
+    IR_NUM_REGS = saved_num_regs
+}
+
+// ---------------------------------------------------------------------------
+// Call fixup resolution — runs after ALL functions are laid out (the arch-3
+// branch of main.kr, same slot where arch 0/1/2 run
+// resolve_fixups/resolve_fixups_a64/resolve_fixups_riscv).
+//
+// IR_CALL recorded [call0_site:u32, callee_name_token:u32] entries in the
+// shared fixup_table (codegen.kr:114). fn_register(name, code_start) recorded
+// each function's entry offset (past its literal pool), so fn_lookup(token)
+// yields the callee's code offset. Each call site is a single
+//     call0 <target>        @ site  (24-bit)
+// whose imm18 is WORD-scaled off a PC that is first rounded DOWN to a 4-byte
+// boundary: the LX6 hardware computes target = ((PC+4) & ~3) + imm18*4, so
+//     imm18 = (target - ((site+4) & ~3)) >> 2
+// This is byte-for-byte the same formula xt_call0() uses at emit time (Task 2,
+// golden-diff verified against `xtensa-lx106-elf-as --no-transform`); it is
+// replicated here rather than called because xt_call0() derives PC from the
+// live out_len, whereas the patcher must use the recorded `site`. Pure file-
+// offset math: a flat image maps file offset 0 to a 4-byte-aligned load VA, so
+// the (PC+4)&~3 rounding is identical whether computed on the file offset or
+// the runtime PC. call0 is patched with xt_patch24 (3 bytes) — NOT patch_u32,
+// which would clobber the following instruction's first byte. If the callee is
+// undefined, loud-fail exactly like resolve_fixups_riscv.
+fn resolve_fixups_xtensa() {
+    uint64 i = 0
+    while i < fixup_count {
+        uint64 fentry = fixup_table + i * 8
+        uint32 patch_off = 0
+        unsafe { *(fentry as uint32) -> patch_off }
+        uint64 fe4 = fentry + 4
+        uint32 target_tok = 0
+        unsafe { *(fe4 as uint32) -> target_tok }
+
+        uint64 wtt = target_tok
+        uint64 target_off = fn_lookup(wtt)
+        if target_off != 0xFFFFFFFF {
+            uint64 wpo = patch_off
+            uint64 base = (wpo + 4) & ~3
+            uint64 diff = target_off - base
+            xt_check_call18(diff)
+            uint64 imm18 = (diff >> 2) & 0x3FFFF
+            uint64 w = 0x5 | (imm18 << 6)
+            xt_patch24(wpo, w)
+        } else {
+            // Undefined function — mirror MLRift's resolve_fixups_riscv
+            // (ir_riscv.mlr): without this the placeholder call0 would
+            // reach its own (rounded) PC at runtime. MLRift has no
+            // diag_loc_head/diag_span_of, so the message shape follows
+            // resolve_fixups_a64/resolve_fixups_riscv instead.
+            write(2, "error: undefined function '", 27)
+            uint64 ts = tok_text_start(wtt)
+            uint64 tl = tok_text_len(wtt)
+            write(2, cg_source + ts, tl)
+            write(2, "'", 1)
+            diag_sugg_reset()
+            diag_sugg_scan(wtt, fn_table, fn_count)
+            // The inliner can absorb a callee into every call site, in which
+            // case it never reaches fn_table — dce_fn_map still holds every
+            // declared function (same 8-byte name-token-low-u32 shape).
+            diag_sugg_scan(wtt, dce_fn_map, dce_fn_map_count)
+            diag_sugg_print()
+            write(2, "\n", 1)
+            exit(1)
+        }
+        i = i + 1
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Address-fixup resolution — runs at finalize (main.kr's xt_raw path) AFTER
+// the data blobs are laid out, so str_start / data_start have bases. Each PIC
+// site's delta pool word (at the recorded ABSOLUTE pool_word_off, H2) is
+// patched with the little-endian displacement
+//     delta = base(table_sel) + payload − anchor_off
+// where anchor_off is already final (remapped in place during its function's
+// relaxation, H1), so NO xt_remap here. At runtime a0 = 0xd0000000 + anchor_off
+// and the target = 0xd0000000 + base + payload, so a0 + delta = target exactly.
+//   table_sel 0 -> str_start + payload   (strings; this task)
+//   table_sel 1 -> data_start + payload  (statics; Task 2)
+//   table_sel 2 -> fn_table code offset (fn addrs; Task 7) — payload is the
+//                  fn_addr("name") StrLit token, resolved by a quote-stripping
+//                  byte-scan of fn_table (NOT fn_lookup; see the else branch).
+// Mirror of resolve_static_fixups_riscv:2743 (the fixup-table + patch shape).
+fn resolve_addr_fixups_xtensa(uint64 str_start, uint64 data_start) {
+    uint64 i = 0
+    while i < xt_addr_fixup_count {
+        uint64 anchor_off = xt_af_get(i, 0)
+        uint64 table_sel = xt_af_get(i, 4)
+        uint64 payload = xt_af_get(i, 8)
+        uint64 pool_word_off = xt_af_get(i, 12)
+        uint64 target = 0
+        if table_sel == 0 {
+            target = str_start + payload
+        } else if table_sel == 1 {
+            target = data_start + payload
+        } else {
+            target = xt_fnaddr_code_off(payload)
+        }
+        uint64 delta = (target - anchor_off) & 0xFFFFFFFF
+        patch_u32(pool_word_off, delta)
+        i = i + 1
+    }
+}
+
+// table_sel 2 = fn addrs. payload is the fn_addr("name") STRING-LITERAL
+// token (ir.kr:2541), whose text carries the surrounding quotes ("dbl" = 5
+// bytes), so fn_lookup — which byte-compares via tok_text_eq (length-first)
+// against the bare fn identifier ("dbl" = 3 bytes) — NEVER matches. Strip
+// the quotes and byte-scan fn_table directly. Ported from
+// resolve_fnaddr_fixups_riscv (ir_riscv.kr:2798). NO xt_remap: fn_table code
+// offsets are final (code_start never moves — H1). Returns the named
+// function's code offset; loud-fails if undefined. Shared by the lx60
+// resolver above and the esp32 resolver below (pure extraction — the math
+// and the failure mode are byte-for-byte the lx60 path's).
+fn xt_fnaddr_code_off(uint64 payload) -> uint64 {
+    uint64 wst = payload
+    uint64 sstart = tok_text_start(wst)
+    uint64 slen = tok_text_len(wst)
+    uint64 name_start = sstart + 1
+    uint64 name_len = slen - 2
+    uint64 found = 0
+    uint64 target2 = 0
+    uint64 fi = 0
+    while fi < fn_count {
+        uint64 fe = fn_table + fi * 8
+        uint32 fn_name_tok = 0
+        unsafe { *(fe as uint32) -> fn_name_tok }
+        uint64 wfn = fn_name_tok
+        uint64 fn_start = tok_text_start(wfn)
+        uint64 fn_len = tok_text_len(wfn)
+        if fn_len == name_len {
+            uint64 eq = 1
+            uint64 ci = 0
+            while ci < name_len {
+                uint64 ca = cg_source + name_start + ci
+                uint64 cb = cg_source + fn_start + ci
+                uint64 va = 0
+                uint64 vb = 0
+                unsafe { *(ca as uint8) -> va }
+                unsafe { *(cb as uint8) -> vb }
+                if va != vb { eq = 0 }
+                ci = ci + 1
+            }
+            if eq != 0 {
+                uint64 fe4 = fe + 4
+                uint32 foff = 0
+                unsafe { *(fe4 as uint32) -> foff }
+                target2 = foff
+                found = 1
+            }
+        }
+        fi = fi + 1
+    }
+    if found == 0 {
+        xt_err("error: xtensa: fn_addr references an undefined function\n")
+    }
+    return target2
+}
+
+// ---------------------------------------------------------------------------
+// ESP32 (--target=esp32) address-fixup resolution — the cross-segment twin of
+// resolve_addr_fixups_xtensa above, run from main.kr's esp32 finalize AFTER
+// the data blobs are laid out. Two differences from the lx60 path:
+//
+//  1. TWO load bases. Code (with every PIC anchor in it) runs at
+//     XT_ESP32_IRAM_BASE + file offset (the esp32 image has no ELF header, so
+//     file offset == IRAM offset); byte-addressable data loads at
+//     XT_ESP32_DRAM_BASE + (file offset - data_file_base). The delta pool
+//     word therefore holds target_VA - anchor_VA (a compile-time constant that
+//     spans the two windows); at runtime a0 = anchor_VA and a0 + delta =
+//     target_VA exactly, same 32-bit wraparound algebra as the lx60 path.
+//
+//  2. ⚠️ THE IRAM BYTE-ACCESS GUARD. Every table_sel 0/1 fixup is a BYTE-ADDRESSABLE
+//     datum (string literal / static) about to be handed to l8ui-shaped code.
+//     Its computed VA must land inside the DRAM window — if it computes into
+//     the IRAM range (or anywhere outside DRAM), that is the
+//     LoadStoreError-dead-board failure mode, and we LOUD-FAIL the compile
+//     instead of emitting the image. A false positive that blocks a build
+//     beats a false negative that bricks a board. (What this can't catch:
+//     byte access through a runtime-computed pointer to a hardcoded IRAM
+//     address — that never flows through an address fixup.)
+//
+// table_sel 2 (fn addrs) targets CODE — an IRAM VA is exactly right there;
+// the pointer is jumped through (callx0), never byte-loaded.
+fn resolve_addr_fixups_xtensa_esp32(uint64 data_file_base, uint64 str_file_start, uint64 static_file_start) {
+    uint64 i = 0
+    while i < xt_addr_fixup_count {
+        uint64 anchor_off = xt_af_get(i, 0)
+        uint64 table_sel = xt_af_get(i, 4)
+        uint64 payload = xt_af_get(i, 8)
+        uint64 pool_word_off = xt_af_get(i, 12)
+        uint64 target_va = 0
+        if table_sel == 0 {
+            target_va = XT_ESP32_DRAM_BASE + (str_file_start - data_file_base) + payload
+        } else if table_sel == 1 {
+            target_va = XT_ESP32_DRAM_BASE + (static_file_start - data_file_base) + payload
+        } else {
+            target_va = XT_ESP32_IRAM_BASE + xt_fnaddr_code_off(payload)
+        }
+        if table_sel == 0 || table_sel == 1 {
+            // Byte-addressable datum: must be a DRAM address. Check the
+            // IRAM range first for the specific (scariest) diagnostic, then
+            // the DRAM window bounds.
+            if target_va >= 0x40000000 && target_va < XT_ESP32_IRAM_LIMIT {
+                xt_err("error: xtensa/esp32: byte-addressable data (string/static) would land in IRAM, which is 32-bit-access-only — refusing to emit an image that dies with LoadStoreError on first byte access\n")
+            }
+            if target_va < XT_ESP32_DRAM_BASE || target_va >= XT_ESP32_DRAM_LIMIT {
+                xt_err("error: xtensa/esp32: data address falls outside the DRAM window 0x3FFB0000..0x3FFE0000\n")
+            }
+        }
+        uint64 anchor_va = XT_ESP32_IRAM_BASE + anchor_off
+        uint64 delta = (target_va - anchor_va) & 0xFFFFFFFF
+        patch_u32(pool_word_off, delta)
+        i = i + 1
+    }
+}
+
+// ESP32 segment-layout guard. Design rule this enforces: when a program
+// cannot be laid out safely on the chip, LOUD-FAIL the compile rather than
+// emit an image that miscompiles silently — on a JTAG-less board a wrong
+// image is indistinguishable from dead hardware. Called from main.kr's esp32
+// finalize with the final segment sizes, BEFORE any image byte is written:
+//   - code (+ literal pools) must fit IRAM  [0x40080400, 0x400A0000)
+//   - entry must sit inside the code segment, 4-byte aligned (call0/ROM
+//     jump targets are word targets)
+//   - data + bss must fit the DRAM window   [0x3FFB0000, 0x3FFE0000) with at
+//     least XT_ESP32_MIN_STACK bytes left over — past the window lie
+//     ROM-reserved RAM and then IRAM (the byte-access brick range documented
+//     at the top of this file), and the stack grows DOWN from 0x3FFE0000
+//     into this same window, so statics that reach the limit are overwritten
+//     by the very first frame push. See XT_ESP32_MIN_STACK.
+fn xt_esp32_check_layout(uint64 code_len, uint64 data_memsz, uint64 entry_off) {
+    if XT_ESP32_IRAM_BASE + code_len > XT_ESP32_IRAM_LIMIT {
+        xt_err("error: xtensa/esp32: code segment exceeds the IRAM limit 0x400A0000\n")
+    }
+    if entry_off >= code_len {
+        xt_err("error: xtensa/esp32: entry offset falls outside the code segment\n")
+    }
+    if (entry_off & 3) != 0 {
+        xt_err("error: xtensa/esp32: entry address is not 4-byte aligned\n")
+    }
+    if XT_ESP32_DRAM_BASE + data_memsz > XT_ESP32_DRAM_LIMIT {
+        xt_err("error: xtensa/esp32: data+bss exceed the DRAM window 0x3FFB0000..0x3FFE0000 (would overlap ROM-reserved RAM / the 32-bit-only IRAM range)\n")
+    }
+    // Stack headroom. XT_ESP32_STACK_TOP == XT_ESP32_DRAM_LIMIT, so the check
+    // above alone would happily let .data+.bss end exactly at the initial SP.
+    // The entry prologue's very first act is `s32i a0, a1, total_frame-4`,
+    // which then lands ON TOP of the tail of .bss — and it happens AFTER the
+    // preamble's zero loop has already run, so nothing ever restores those
+    // bytes. That is silent data corruption on a board with no debugger: the
+    // exact failure class this target's guards exist to make impossible.
+    if XT_ESP32_DRAM_BASE + data_memsz + XT_ESP32_MIN_STACK > XT_ESP32_DRAM_LIMIT {
+        xt_err("error: xtensa/esp32: data+bss leave less than 4 KiB below the initial stack pointer 0x3FFE0000 — the entry prologue's frame push would overwrite the tail of .bss after the zero loop has run (silent corruption). Shrink the statics, or move the bulk of them into a runtime-allocated region.\n")
+    }
+}
