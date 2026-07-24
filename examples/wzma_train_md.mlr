@@ -54,6 +54,7 @@ import "../std/math_float.mlr"
 import "../std/fmt.mlr"
 import "../std/time.mlr"
 import "../std/hip.mlr"
+import "../std/wzma_data.mlr"
 
 static u64 B_DIM     = 8
 static u64 S_DIM     = 16
@@ -1136,6 +1137,33 @@ fn main() {
     err = hipMemcpy(d_ids1, ids1_i32, BS * 4,        1); if err != 0 { die_gpu("H2D ids1", err) }
     err = hipMemcpy(d_ids2, ids2_i32, BS * 4,        1); if err != 0 { die_gpu("H2D ids2", err) }
 
+    // ── MLRIFT_TRAIN=1: real-corpus contrastive training ───────────────────
+    //   Unset/0 = the fixed bench batch (production/validation path, untouched).
+    //   =1 = stream fresh (anchor, positive) pairs from the corpus each step via
+    //   std/wzma_data.mlr, re-uploading d_ids1/d_ids2; bench_ref/oracle checks off.
+    u64 train_mode = 0
+    u64 ev_train = sys_getenv("MLRIFT_TRAIN")
+    if ev_train != 0 {
+        u8 c0tr = 0; unsafe { *(ev_train as u8) -> c0tr }
+        if c0tr == 49 { train_mode = 1 }   // '1'
+    }
+    u64 wd_train = 0   // WzmaData handle (struct is a u64 ptr; `WzmaData x = 0` crashes)
+    u64 tr_a_ids = 0; u64 tr_a_mask = 0; u64 tr_p_ids = 0; u64 tr_p_mask = 0
+    u64 train_seed = 3735928559   // 0xDEADBEEF; override via MLRIFT_TRAIN_SEED
+    if train_mode == 1 {
+        u64 ev_seed = sys_getenv("MLRIFT_TRAIN_SEED")
+        if ev_seed != 0 { u64 ps = str_to_int(ev_seed); if ps > 0 { train_seed = ps } }
+        u64 tk_path = sys_getenv("MLRIFT_TRAIN_TOKENIZER")
+        if tk_path == 0 { tk_path = "/home/pantelis/Desktop/Projects/Work/AtlasLM/checkpoints/wzma_embedder/tokenizer.json" }
+        u64 corpus_path = sys_getenv("MLRIFT_TRAIN_CORPUS")
+        if corpus_path == 0 { corpus_path = "/home/pantelis/Desktop/Projects/Work/AtlasLM/checkpoints/wzma_embedder/corpus.txt" }
+        Tokenizer tk_train = tokenizer_load(tk_path)
+        wd_train = wzma_data_open(corpus_path, tk_train)
+        tr_a_ids  = alloc(BS * 4); tr_a_mask = alloc(BS * 4)
+        tr_p_ids  = alloc(BS * 4); tr_p_mask = alloc(BS * 4)
+        print_str("MLRIFT_TRAIN=1 -> real-corpus contrastive training (fresh batch/step; bench checks off).\n")
+    }
+
     // ── Forward scratch (k-major einsum outputs) ──────────────────────────
     u64 d_int_kbsr = gpu_malloc(K * BS * R * 4, "mIntKBSR")  // U-gemm out [K,BS,R]
     u64 d_otk_kbsd = gpu_malloc(K * BS * D * 4, "mOtkKBSD")  // V-gemm out [K,BS,D]
@@ -1320,6 +1348,13 @@ fn main() {
     u64 step = 0
     while step < NSTEPS {
         u64 step_t0 = time_now()
+
+        // Train mode: fresh contrastive batch each step (anchor→ids1, positive→ids2).
+        if train_mode == 1 {
+            wzma_data_next_batch(wd_train, B, S, train_seed, step, tr_a_ids, tr_a_mask, tr_p_ids, tr_p_mask)
+            err = hipMemcpy(d_ids1, tr_a_ids, BS * 4, 1); if err != 0 { die_gpu("H2D train ids1", err) }
+            err = hipMemcpy(d_ids2, tr_p_ids, BS * 4, 1); if err != 0 { die_gpu("H2D train ids2", err) }
+        }
 
         // ════════════════ FORWARD (both views) ════════════════
         u64 view = 0
@@ -1523,11 +1558,17 @@ fn main() {
         f32 ref = ref_loss(step)
         f32 lerr = abs_f32(gpu_loss - ref)
         if lerr > max_loss_err { max_loss_err = lerr }
-        if step == 0 || step == 49 || step == 1 {
+        u64 do_print = 0
+        if step == 0 || step == 49 || step == 1 { do_print = 1 }
+        if train_mode == 1 { if step % 10 == 0 { do_print = 1 } }
+        if do_print == 1 {
             print_str("step "); u64 ss = fmt_dec(step); print_str(ss); dealloc(ss)
             print_str(" loss="); ss = fmt_f32(gpu_loss, 6); print_str(ss); dealloc(ss)
-            print_str(" ref=");  ss = fmt_f32(ref, 6); print_str(ss); dealloc(ss)
-            print_str(" |err|="); ss = fmt_f32(lerr, 8); print_str(ss); dealloc(ss); print_str("\n")
+            if train_mode == 0 {
+                print_str(" ref=");  ss = fmt_f32(ref, 6); print_str(ss); dealloc(ss)
+                print_str(" |err|="); ss = fmt_f32(lerr, 8); print_str(ss); dealloc(ss)
+            }
+            print_str("\n")
         }
 
         // ════════════════ Zero d_grads + d_demb (RMW accumulators) ══════════
@@ -2128,12 +2169,18 @@ fn main() {
     print_str("(native 17.6 / megakernel 6.9 / PyTorch 1.62 ms/step)\n")
 
     // identity check: print loss[0]/[49] error summary
+    u64 ok = 1
+    if train_mode == 1 {
+        print_str("\n=== Results (MLRIFT_TRAIN) ===\n")
+        print_str("real-corpus contrastive run complete; bench_ref identity check skipped.\n")
+        wzma_data_free(wd_train)
+    } else {
     print_str("\n=== Results ===\n")
     print_str("max |loss - bench_ref| over 50 steps: ")
     u64 s = fmt_f32(max_loss_err, 8); print_str(s); dealloc(s); print_str("\n")
-    u64 ok = 1
     if max_loss_err > 0.01f { print_str("FAIL: some step loss > 1e-2 from bench_ref\n"); ok = 0 }
     if ok == 1 { print_str("PASS: all 50 losses within 1e-2 of bench_ref.json\n") }
+    }
 
     dealloc(zbig)
     hipkfd_teardown()
