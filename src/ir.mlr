@@ -54,6 +54,12 @@ static uint64 IR_FTOI = 27
 static uint64 IR_LOAD = 30
 static uint64 IR_STORE = 31
 static uint64 IR_STACK_ADDR = 32
+// Fixed-size local arrays (`T[N] x` in a fn body) get stack storage instead
+// of a per-call IR_ALLOC (an mmap/VirtualAlloc syscall, ~2 us/call and a ~4 KB
+// leak per invocation). Each array bumps this during lowering and records a
+// relative offset in the function's stack-array region, which sits above the
+// spill slots in the prologue frame. Reset per function in ir_lower_function.
+static uint64 ir_stack_array_bytes = 0
 
 static uint64 IR_BR = 40
 static uint64 IR_BR_COND = 41
@@ -3382,13 +3388,23 @@ fn ir_lower_stmt(uint64 node) {
         uint32 struct_marker = ast_data4(node)
         uint64 wsm = struct_marker
         if was != 0 && wsm == 0 {
-            // Array: allocate N bytes on heap, bind pointer to name
+            // Array: bind pointer to name. Small compile-time-sized arrays get
+            // stack storage (IR_STACK_ADDR); larger ones fall back to IR_ALLOC.
             uint64 arr_size = parse_int_token(was)
             uint32 type_tok_v = ast_data1(node)
             uint64 elem_size_v = type_tok_elem_size(type_tok_v)
             uint64 total_bytes = arr_size * elem_size_v
             uint64 buf_v = ir_new_vreg()
-            ir_emit(IR_ALLOC, buf_v, 0, 0, total_bytes, ir_current_bb)
+            if arr_size > 0 && total_bytes <= 4096 {
+                uint64 rel_off = ir_stack_array_bytes
+                // Pad to 8-byte alignment so subsequent arrays stay aligned.
+                uint64 padded = total_bytes
+                if (padded & 7) != 0 { padded = padded + 8 - (padded & 7) }
+                ir_stack_array_bytes = ir_stack_array_bytes + padded
+                ir_emit(IR_STACK_ADDR, buf_v, 0, 0, rel_off, ir_current_bb)
+            } else {
+                ir_emit(IR_ALLOC, buf_v, 0, 0, total_bytes, ir_current_bb)
+            }
             // Zero-initialize the buffer
             uint64 zero_v = ir_new_vreg()
             ir_emit(IR_CONST, zero_v, 0, 0, 0, ir_current_bb)
@@ -4624,6 +4640,7 @@ fn ir_lower_function(uint64 fn_node) {
     // field, which then resolves to a garbage offset). See
     // examples/codegen_struct_var_collision.mlr.
     struct_var_count = 0
+    ir_stack_array_bytes = 0
     ir_current_bb = ir_new_bb()  // entry block
 
     // Register parameters
@@ -7197,6 +7214,37 @@ fn ir_emit_x86_insn(uint64 ii) {
                 uint8 stm = st_modrm
                 emit_byte(stm)
             }
+        }
+        return
+    }
+
+    if op == 32 {
+        // IR_STACK_ADDR: dst = &[rsp + spill_count*8 + imm].
+        // imm is the offset within the stack-array region, which sits
+        // directly above the spill slots in the prologue's frame.
+        uint64 base_off = ir_spill_count * 8 + imm
+        uint64 lea_dst = dst_r
+        if lea_dst == 0xFFFFFFFF { lea_dst = 0 }
+        uint8 lea_rex = 0x48
+        if lea_dst >= 8 { lea_rex = lea_rex | 4 }
+        emit_byte(lea_rex)
+        emit_byte(0x8D)
+        if base_off < 128 {
+            uint64 mv = 0x44 | ((lea_dst & 7) << 3)
+            uint8 modrm = mv
+            emit_byte(modrm)
+            emit_byte(0x24)
+            uint8 o8 = base_off
+            emit_byte(o8)
+        } else {
+            uint64 mv = 0x84 | ((lea_dst & 7) << 3)
+            uint8 modrm = mv
+            emit_byte(modrm)
+            emit_byte(0x24)
+            emit_u32_le(base_off)
+        }
+        if dst_r == 0xFFFFFFFF {
+            ir_emit_store_spill(0, dest_v)
         }
         return
     }
@@ -11492,7 +11540,10 @@ fn ir_emit_x86_function(uint64 fn_node) {
     ir_callee_save_bytes = push_count * 8
 
     // sub rsp, frame_size
-    uint64 frame_size = ir_spill_count * 8
+    // Layout (from RSP up): [spill slots | stack arrays]. IR_STACK_ADDR
+    // offsets are relative to the stack-array region, so the emitter adds
+    // ir_spill_count*8 to resolve them.
+    uint64 frame_size = ir_spill_count * 8 + ir_stack_array_bytes
     // SysV: SP is 8 mod 16 at function entry (CALL pushed RET_ADDR).
     // After N pushes SP is (N+1)*8 mod 16. Want frame_size + (N+1)*8
     // ≡ 0 mod 16. So if push_count is odd we want frame_size 16-aligned;

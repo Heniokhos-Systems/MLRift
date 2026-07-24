@@ -368,6 +368,21 @@ fn ir_emit_arm64_insn(uint64 ii) {
 
     uint64 dst_r = ir_get_phys_reg(dest_v)
 
+    // ----- IR_STACK_ADDR (32): compute address of a stack-local array -----
+    if op == 32 {
+        // imm = offset within the stack-array region (placed directly above
+        // the spill slots). Absolute SP offset:
+        //   IR_A64_OVERFLOW_RESERVE + ir_spill_count*8 + imm
+        uint64 base_off = IR_A64_OVERFLOW_RESERVE + ir_spill_count * 8 + imm
+        uint64 d = dst_r
+        if d == 0xFFFFFFFF { d = 9 }
+        emit_a64_add_imm(d, 31, base_off)
+        if dst_r == 0xFFFFFFFF {
+            ir_a64_emit_store_spill(9, dest_v)
+        }
+        return
+    }
+
     // ----- IR_STR_CONST (79): dst = lea string data -----
     if op == 79 {
         uint64 str_offset = imm
@@ -2480,13 +2495,16 @@ fn ir_emit_arm64_function(uint64 fn_node) {
     // With the overflow reserve at the bottom, the caller can STR
     // outgoing args to [SP + offset] without any SUB — the callee
     // reads [SP + callee_frame + (idx-8)*8] = caller's arg slots.
-    uint64 total_frame = IR_A64_OVERFLOW_RESERVE + spill_size + scratch_size + callee_save_size
+    // Layout from SP up: [overflow reserve | spills | stack arrays | scratch |
+    // callee save]. Stack arrays (IR_STACK_ADDR) sit between spills and scratch.
+    uint64 total_frame = IR_A64_OVERFLOW_RESERVE + spill_size + ir_stack_array_bytes + scratch_size + callee_save_size
     if (total_frame & 15) != 0 { total_frame = total_frame + 16 - (total_frame & 15) }
     if is_naked != 0 { total_frame = 0 }
 
     ir_frame_size = total_frame
     // Scratchpad sits right after spill slots (which start at the overflow reserve).
-    ir_a64_scratch_off = IR_A64_OVERFLOW_RESERVE + spill_size
+    // Scratchpad sits right after the stack-array region.
+    ir_a64_scratch_off = IR_A64_OVERFLOW_RESERVE + spill_size + ir_stack_array_bytes
 
     // 5a. For main(): set up argc/argv BEFORE prologue
     uint32 fn_name_tok = ast_data1(fn_node)
@@ -2565,7 +2583,7 @@ fn ir_emit_arm64_function(uint64 fn_node) {
         // Pair them with STP — halves the instruction count vs per-reg
         // STRs. STP's offset is imm7 scaled by 8, capped at 504; fall
         // back to individual STR for large frames to stay correct.
-        uint64 cs_base = IR_A64_OVERFLOW_RESERVE + spill_size + scratch_size
+        uint64 cs_base = IR_A64_OVERFLOW_RESERVE + spill_size + ir_stack_array_bytes + scratch_size
         uint64 fp_off = cs_base + 80
         if fp_off + 8 <= 504 {
             ir_a64_stp_sp(19, 20, cs_base)
@@ -2763,7 +2781,7 @@ fn ir_emit_arm64_function(uint64 fn_node) {
         }
         // Restore callee-saved registers. Mirror the prologue: LDP
         // pairs when the frame fits, individual LDRs otherwise.
-        uint64 cs_base_e = IR_A64_OVERFLOW_RESERVE + spill_size + scratch_size
+        uint64 cs_base_e = IR_A64_OVERFLOW_RESERVE + spill_size + ir_stack_array_bytes + scratch_size
         uint64 fp_off_e = cs_base_e + 80
         if fp_off_e + 8 <= 504 {
             ir_a64_ldp_sp(19, 20, cs_base_e)
