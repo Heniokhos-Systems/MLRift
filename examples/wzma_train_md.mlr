@@ -845,6 +845,125 @@ fn print_ms(u64 label, f32 ms) {
 // (CPU gate-softmax/combine/mean-pool/L2 helpers removed — these phases are now
 //  GPU-resident inside the wzma_fwd_tail kernel; only InfoNCE CE stays on CPU.)
 
+// ════════════════════════ Step 3b: checkpointing ══════════════════════════
+// Save/restore the full trainable state so a MLRIFT_TRAIN run can resume.
+// On-disk format (little-endian, one file):
+//   64-byte header:
+//     [0]  u32 magic   = 0x575A4331  ('WZC1')
+//     [4]  u32 version = 1
+//     [8]  u64 step    = completed-step count to resume FROM
+//     [16] u32 VOCAB   [20] u32 D   [24] u32 K   [28] u32 R   (dims — validated)
+//     [32] u32 nblocks (=18)        [36..64] reserved (zero)
+//   payload: nblocks raw-f32 blocks, save order == load order:
+//     6 weights  (emb,U,V,gw,gb,bias) then
+//     12 moments (mU,vU,mV,vV,mGw,vGw,mGb,vGb,mBias,vBias,mEmb,vEmb).
+// ck_bufs = host u64[nblk] device pointers; ck_sizes = host u64[nblk] elem counts.
+// D2H/H2D one block at a time through a single staging buffer sized to the
+// largest block (emb = VOCAB*D f32), so host RAM stays ~13 MB not ~40 MB.
+fn wzma_ckpt_save(u64 path, u64 step, u64 VOCAB, u64 D, u64 K, u64 R,
+                  u64 ck_bufs, u64 ck_sizes, u64 nblk) -> u64 {
+    u64 fd = file_open(path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        print_str("ckpt_save: cannot open "); print_str(path); print_str("\n"); return 1
+    }
+    u64 hdr = alloc(64)
+    u64 hi = 0
+    while hi < 64 { unsafe { *((hdr + hi) as u8) = 0 } hi = hi + 1 }
+    u32 magic = 0x575A4331            // 'WZC1'
+    u32 ver = 1
+    u32 vocab32 = VOCAB; u32 d32 = D; u32 k32 = K; u32 r32 = R; u32 nb32 = nblk
+    unsafe { *((hdr + 0) as u32) = magic }
+    unsafe { *((hdr + 4) as u32) = ver }
+    unsafe { *((hdr + 8) as u64) = step }
+    unsafe { *((hdr + 16) as u32) = vocab32 }
+    unsafe { *((hdr + 20) as u32) = d32 }
+    unsafe { *((hdr + 24) as u32) = k32 }
+    unsafe { *((hdr + 28) as u32) = r32 }
+    unsafe { *((hdr + 32) as u32) = nb32 }
+    file_write(fd, hdr, 64)
+    dealloc(hdr)
+    // stage buffer sized to the largest block
+    u64 maxn = 0
+    u64 bi = 0
+    while bi < nblk {
+        u64 sz = 0; unsafe { *((ck_sizes + bi*8) as u64) -> sz }
+        if sz > maxn { maxn = sz }
+        bi = bi + 1
+    }
+    u64 stage = alloc(maxn * 4)
+    u64 rc = 0
+    bi = 0
+    while bi < nblk {
+        u64 dptr = 0; u64 sz = 0
+        unsafe { *((ck_bufs  + bi*8) as u64) -> dptr }
+        unsafe { *((ck_sizes + bi*8) as u64) -> sz }
+        u32 e = hipMemcpy(stage, dptr, sz*4, 2)      // D2H
+        if e != 0 { rc = 2 }
+        file_write(fd, stage, sz*4)
+        bi = bi + 1
+    }
+    dealloc(stage)
+    file_close(fd)
+    return rc
+}
+
+// Load: returns the resume-from step, or 0xFFFFFFFFFFFFFFFF on
+// missing-file / bad-magic / dim-mismatch (caller then starts fresh).
+fn wzma_ckpt_load(u64 path, u64 VOCAB, u64 D, u64 K, u64 R,
+                  u64 ck_bufs, u64 ck_sizes, u64 nblk) -> u64 {
+    u64 fd = file_open(path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 { return 0xFFFFFFFFFFFFFFFF }
+    u64 hdr = alloc(64)
+    file_read(fd, hdr, 64)
+    u32 magic = 0; u32 ver = 0; u64 step = 0
+    u32 vocab32 = 0; u32 d32 = 0; u32 k32 = 0; u32 r32 = 0; u32 nb32 = 0
+    unsafe { *((hdr + 0) as u32) -> magic }
+    unsafe { *((hdr + 4) as u32) -> ver }
+    unsafe { *((hdr + 8) as u64) -> step }
+    unsafe { *((hdr + 16) as u32) -> vocab32 }
+    unsafe { *((hdr + 20) as u32) -> d32 }
+    unsafe { *((hdr + 24) as u32) -> k32 }
+    unsafe { *((hdr + 28) as u32) -> r32 }
+    unsafe { *((hdr + 32) as u32) -> nb32 }
+    dealloc(hdr)
+    if magic != 0x575A4331 { print_str("ckpt_load: bad magic\n"); file_close(fd); return 0xFFFFFFFFFFFFFFFF }
+    u32 vchk = VOCAB; u32 dchk = D; u32 kchk = K; u32 rchk = R; u32 nchk = nblk
+    if vocab32 != vchk { print_str("ckpt_load: VOCAB mismatch\n"); file_close(fd); return 0xFFFFFFFFFFFFFFFF }
+    if d32 != dchk    { print_str("ckpt_load: D mismatch\n");     file_close(fd); return 0xFFFFFFFFFFFFFFFF }
+    if k32 != kchk    { print_str("ckpt_load: K mismatch\n");     file_close(fd); return 0xFFFFFFFFFFFFFFFF }
+    if r32 != rchk    { print_str("ckpt_load: R mismatch\n");     file_close(fd); return 0xFFFFFFFFFFFFFFFF }
+    if nb32 != nchk   { print_str("ckpt_load: nblocks mismatch\n"); file_close(fd); return 0xFFFFFFFFFFFFFFFF }
+    // Read the ENTIRE payload into one stable host buffer FIRST, then H2D each
+    // block from its own offset.  Critical: H2D in the KFD shim is queued/posted
+    // (not host-blocking, unlike D2H), so a single reused staging buffer would be
+    // overwritten by the next file_read before the prior copy landed → the GPU
+    // saw garbage (degenerate ln(B) loss on resume).  A stable per-block source
+    // (bench_init's pattern) is race-free; one device sync then guards the free.
+    u64 tot = 0
+    u64 bi = 0
+    while bi < nblk {
+        u64 sz = 0; unsafe { *((ck_sizes + bi*8) as u64) -> sz }
+        tot = tot + sz
+        bi = bi + 1
+    }
+    u64 host = alloc(tot * 4)
+    file_read(fd, host, tot * 4)                     // whole payload, contiguous
+    file_close(fd)
+    u64 off = 0
+    bi = 0
+    while bi < nblk {
+        u64 dptr = 0; u64 sz = 0
+        unsafe { *((ck_bufs  + bi*8) as u64) -> dptr }
+        unsafe { *((ck_sizes + bi*8) as u64) -> sz }
+        hipMemcpy(dptr, host + off*4, sz*4, 1)       // H2D from a stable source
+        off = off + sz
+        bi = bi + 1
+    }
+    sync_or_die("ckpt load h2d")                     // drain queued H2Ds before free
+    dealloc(host)
+    return step
+}
+
 fn main() {
     u64 B     = B_DIM
     u64 S     = S_DIM
@@ -1322,6 +1441,55 @@ fn main() {
         print_str(tcs); dealloc(tcs); print_str("\n")
     }
 
+    // ── Step 3b: checkpointing (MLRIFT_TRAIN path only) ─────────────────────
+    //   MLRIFT_CKPT_LOAD=<path>   resume weights+moments+step if the file exists
+    //   MLRIFT_CKPT_SAVE=<path>   write state every MLRIFT_CKPT_EVERY steps + at end
+    // The bench path (train_mode==0) never touches any of this → byte-identical.
+    u64 start_step   = 0
+    u64 ck_save_path = 0
+    u64 ck_every     = 0
+    u64 ck_bufs      = 0
+    u64 ck_sizes     = 0
+    u64 ck_nblk      = 18
+    if train_mode == 1 {
+        ck_bufs  = alloc(ck_nblk * 8)
+        ck_sizes = alloc(ck_nblk * 8)
+        // 6 weights, then 12 moments (m,v per param) — same order in save & load.
+        unsafe { *((ck_bufs+0*8)  as u64) = d_emb   } unsafe { *((ck_sizes+0*8)  as u64) = VOCAB*D }
+        unsafe { *((ck_bufs+1*8)  as u64) = d_U     } unsafe { *((ck_sizes+1*8)  as u64) = K*D*R }
+        unsafe { *((ck_bufs+2*8)  as u64) = d_V     } unsafe { *((ck_sizes+2*8)  as u64) = K*R*D }
+        unsafe { *((ck_bufs+3*8)  as u64) = d_gw    } unsafe { *((ck_sizes+3*8)  as u64) = K*D }
+        unsafe { *((ck_bufs+4*8)  as u64) = d_gb    } unsafe { *((ck_sizes+4*8)  as u64) = K }
+        unsafe { *((ck_bufs+5*8)  as u64) = d_bias  } unsafe { *((ck_sizes+5*8)  as u64) = D }
+        unsafe { *((ck_bufs+6*8)  as u64) = d_mU    } unsafe { *((ck_sizes+6*8)  as u64) = K*D*R }
+        unsafe { *((ck_bufs+7*8)  as u64) = d_vU    } unsafe { *((ck_sizes+7*8)  as u64) = K*D*R }
+        unsafe { *((ck_bufs+8*8)  as u64) = d_mV    } unsafe { *((ck_sizes+8*8)  as u64) = K*R*D }
+        unsafe { *((ck_bufs+9*8)  as u64) = d_vV    } unsafe { *((ck_sizes+9*8)  as u64) = K*R*D }
+        unsafe { *((ck_bufs+10*8) as u64) = d_mGw   } unsafe { *((ck_sizes+10*8) as u64) = K*D }
+        unsafe { *((ck_bufs+11*8) as u64) = d_vGw   } unsafe { *((ck_sizes+11*8) as u64) = K*D }
+        unsafe { *((ck_bufs+12*8) as u64) = d_mGb   } unsafe { *((ck_sizes+12*8) as u64) = K }
+        unsafe { *((ck_bufs+13*8) as u64) = d_vGb   } unsafe { *((ck_sizes+13*8) as u64) = K }
+        unsafe { *((ck_bufs+14*8) as u64) = d_mBias } unsafe { *((ck_sizes+14*8) as u64) = D }
+        unsafe { *((ck_bufs+15*8) as u64) = d_vBias } unsafe { *((ck_sizes+15*8) as u64) = D }
+        unsafe { *((ck_bufs+16*8) as u64) = d_mEmb  } unsafe { *((ck_sizes+16*8) as u64) = VOCAB*D }
+        unsafe { *((ck_bufs+17*8) as u64) = d_vEmb  } unsafe { *((ck_sizes+17*8) as u64) = VOCAB*D }
+
+        u64 ev_ckload = sys_getenv("MLRIFT_CKPT_LOAD")
+        if ev_ckload != 0 {
+            u64 ls = wzma_ckpt_load(ev_ckload, VOCAB, D, K, R, ck_bufs, ck_sizes, ck_nblk)
+            if ls != 0xFFFFFFFFFFFFFFFF {
+                start_step = ls
+                print_str("MLRIFT_CKPT_LOAD -> resumed from step ")
+                u64 ss = fmt_dec(start_step); print_str(ss); dealloc(ss); print_str("\n")
+            } else {
+                print_str("MLRIFT_CKPT_LOAD -> no valid checkpoint; starting fresh from bench_init\n")
+            }
+        }
+        ck_save_path = sys_getenv("MLRIFT_CKPT_SAVE")
+        u64 ev_every = sys_getenv("MLRIFT_CKPT_EVERY")
+        if ev_every != 0 { ck_every = str_to_int(ev_every) }
+    }
+
     // ── AdamW hyperparams ──────────────────────────────────────────────────
     f32 lr = 0.001f
     f32 beta1 = 0.9f
@@ -1345,8 +1513,9 @@ fn main() {
     }
     f32 fNSTEPS = f64_to_f32(int_to_f64(NSTEPS))
     f32 max_loss_err = 0.0f
-    u64 step = 0
-    while step < NSTEPS {
+    u64 step = start_step               // resume point (0 unless MLRIFT_CKPT_LOAD)
+    u64 step_end = start_step + NSTEPS  // run NSTEPS more steps from here
+    while step < step_end {
         u64 step_t0 = time_now()
 
         // Train mode: fresh contrastive batch each step (anchor→ids1, positive→ids2).
@@ -1390,10 +1559,13 @@ fn main() {
                 //   lda=D (A=x[BS,D])  ldb=R (B=U[D,R])  ldc=R (C=inter[BS,R])
                 t0 = time_now()
                 // This view's persistent fU descriptor (view 0 and view 1 differ
-                // only by the A=x pointer).  Built ONCE on step 0, reused after.
+                // only by the A=x pointer).  Built ONCE on the FIRST loop iteration
+                // (step == start_step, which is 0 fresh or the resume step on a
+                // MLRIFT_CKPT_LOAD), reused after.  Keying on ==0 would leave
+                // tot_fU=0 + garbage descriptor on a resumed run → degenerate fwd.
                 u64 d_desc_fU_cur = d_desc_fU
                 if view == 1 { d_desc_fU_cur = d_desc_fU_v1 }
-                if step == 0 {
+                if step == start_step {
                     u64 M_fU  = alloc(K*4);  u64 N_fU  = alloc(K*4);  u64 KK_fU = alloc(K*4)
                     u64 LdA_fU= alloc(K*4);  u64 LdB_fU= alloc(K*4);  u64 LdC_fU= alloc(K*4)
                     u64 Ap_fU = alloc(K*8);  u64 Bp_fU = alloc(K*8);  u64 Cp_fU = alloc(K*8)
@@ -1438,8 +1610,9 @@ fn main() {
                 //   lda=R (A=inter[BS,R])  ldb=D (B=V[R,D])  ldc=D (C=outk[BS,D])
                 t0 = time_now()
                 // d_desc_fV is identical for both views (A=inter, B=V, C=outk are
-                // the same buffers) — build ONCE on step 0, reuse thereafter.
-                if step == 0 {
+                // the same buffers) — build ONCE on the first loop iteration
+                // (step == start_step; ==0 would break resume, see fU above).
+                if step == start_step {
                     u64 M_fV  = alloc(K*4);  u64 N_fV  = alloc(K*4);  u64 KK_fV = alloc(K*4)
                     u64 LdA_fV= alloc(K*4);  u64 LdB_fV= alloc(K*4);  u64 LdC_fV= alloc(K*4)
                     u64 Ap_fV = alloc(K*8);  u64 Bp_fV = alloc(K*8);  u64 Cp_fV = alloc(K*8)
@@ -2136,6 +2309,18 @@ fn main() {
             }
         }
 
+        // ── Step 3b: periodic checkpoint (MLRIFT_TRAIN + MLRIFT_CKPT_SAVE) ──
+        if train_mode == 1 { if ck_save_path != 0 { if ck_every > 0 {
+            u64 done = step + 1
+            if done % ck_every == 0 {
+                sync_or_die("sync ckpt")
+                u64 se = wzma_ckpt_save(ck_save_path, done, VOCAB, D, K, R, ck_bufs, ck_sizes, ck_nblk)
+                if se == 0 {
+                    print_str("  [ckpt] saved at step "); u64 ds = fmt_dec(done); print_str(ds); dealloc(ds); print_str("\n")
+                } else { print_str("  [ckpt] SAVE FAILED\n") }
+            }
+        } } }
+
         u64 step_t1 = time_now(); ns_total_step = ns_total_step + (step_t1 - step_t0)
         step = step + 1
     }
@@ -2172,6 +2357,16 @@ fn main() {
     u64 ok = 1
     if train_mode == 1 {
         print_str("\n=== Results (MLRIFT_TRAIN) ===\n")
+        // Final checkpoint: `step` == start_step + NSTEPS (total completed steps).
+        if ck_save_path != 0 {
+            sync_or_die("sync ckpt final")
+            u64 se = wzma_ckpt_save(ck_save_path, step, VOCAB, D, K, R, ck_bufs, ck_sizes, ck_nblk)
+            if se == 0 {
+                print_str("final checkpoint saved to "); print_str(ck_save_path)
+                print_str(" (step "); u64 fs = fmt_dec(step); print_str(fs); dealloc(fs); print_str(")\n")
+            } else { print_str("final checkpoint SAVE FAILED\n") }
+        }
+        if ck_bufs != 0 { dealloc(ck_bufs); dealloc(ck_sizes) }
         print_str("real-corpus contrastive run complete; bench_ref identity check skipped.\n")
         wzma_data_free(wd_train)
     } else {
