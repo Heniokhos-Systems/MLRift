@@ -1877,6 +1877,867 @@ fn sema_check_unreachable(uint64 root) {
     }
 }
 
+// ===========================================================================
+// Structural type checker (Track D — ported from KernRift src/type_check.kr)
+// ===========================================================================
+// 13 structural rules across 3 phases. Ported into analysis.mlr because
+// MLRift keeps sema here (no separate type_check file by convention).
+//
+//   P1: A3 unknown-field, A4 field-of-non-struct, A6 return-type-mismatch,
+//       B5 binop-on-struct, B7 bool-required-in-condition
+//   P2: A5 void-fn-as-value, B1 assign-struct-vs-non, B2 assign-struct-kind,
+//       B6 compare-on-struct
+//   P3: B3 return-struct-mismatch, C7 return-float-kind (f32 vs f64),
+//       C6 call-arg-struct-mismatch, C10 match-arm-type-mismatch
+//
+// Dialect deltas vs KernRift: MLRift has NO let / ternary (53) / match-EXPR
+// (54), so those AST cases are dropped. riscv32/xtensa arch restrictions are
+// Track A, not ported here. Reuses codegen.mlr's struct/fn_ret tables and
+// token helpers (one global namespace — do NOT redefine).
+//
+// TypeKind tags: 0=unknown, 1=void, 80-87=int, 94-96=float, 98=bool, 99=char,
+// 200+i=StructRef, 0xFFFFFFFF=poisoned.
+//
+// ROLLOUT: advisory-first. tc_diag emits a WARNING unless BOTH the master gate
+// tc_fatal_enabled AND the per-rule fatal flag are set. Flip per-rule flags to
+// fatal only after triaging false positives to zero on MLRift's own source.
+
+static uint64 tc_local_table = 0
+static uint64 tc_local_count = 0
+static uint64 tc_local_cap = 0
+static uint64 tc_current_ret_kind = 0
+static uint64 tc_current_fn_tok = 0
+
+static uint64 tc_fn_node_table = 0
+static uint64 tc_fn_node_count = 0
+
+static uint64 tc_fn_hash_tbl = 0
+static uint64 tc_fn_hash_built_n = 0
+
+static uint64 tc_local_hash_tbl = 0
+static uint64 tc_local_gen = 0
+
+// Diagnostic mode + error tally. Default fatal: false-positive triage against
+// MLRift's own source AND the full test corpus came back clean (zero tc
+// diagnostics), so all 13 rules ship fatal. `--no-check-types` downgrades to
+// advisory (warnings only) at runtime via tc_set_fatal(0).
+static uint64 tc_fatal_enabled = 1
+static uint64 tc_error_count = 0
+
+// FNV-1a over a token's source text — mirrors codegen.mlr dce_name_hash.
+// (KernRift used tok_text_hash; MLRift has no such export, so provide one.)
+fn tc_tok_hash(uint64 name_tok) -> uint64 {
+    uint64 s = tok_text_start(name_tok)
+    uint64 l = tok_text_len(name_tok)
+    uint64 p = cg_source + s
+    uint64 h = 2166136261
+    uint64 i = 0
+    while i < l {
+        uint64 c = 0
+        uint64 pc = p + i
+        unsafe { *(pc as uint8) -> c }
+        h = (h ^ c) * 16777619
+        h = h & 0xFFFFFFFF
+        i = i + 1
+    }
+    return h
+}
+
+// severity/mode router. rule_fatal = per-rule opt-in to fatal; the emission is
+// only an error when tc_fatal_enabled AND rule_fatal are both nonzero.
+fn tc_diag(uint64 tok, uint64 msg, uint64 rule_fatal) {
+    if tc_fatal_enabled != 0 && rule_fatal != 0 {
+        report_error_at(tok, msg)
+        tc_error_count = tc_error_count + 1
+    } else {
+        report_warn_at(tok, msg)
+    }
+}
+
+fn tc_fn_node_register(uint64 name_tok, uint64 fn_node) {
+    if tc_fn_node_count >= 1024 { return }
+    uint64 entry = tc_fn_node_table + tc_fn_node_count * 8
+    uint32 nt = name_tok
+    unsafe { *(entry as uint32) = nt }
+    uint64 e4 = entry + 4
+    uint32 fn32 = fn_node
+    unsafe { *(e4 as uint32) = fn32 }
+    tc_fn_node_count = tc_fn_node_count + 1
+}
+
+fn tc_fn_hash_sync() {
+    if tc_fn_hash_tbl == 0 {
+        tc_fn_hash_tbl = alloc(4096 * 8)
+        uint64 ci = 0
+        while ci < 4096 {
+            uint64 sp = tc_fn_hash_tbl + ci * 8 + 4
+            uint32 ff = 0xFFFFFFFF
+            unsafe { *(sp as uint32) = ff }
+            ci = ci + 1
+        }
+    }
+    while tc_fn_hash_built_n < tc_fn_node_count {
+        uint64 entry = tc_fn_node_table + tc_fn_hash_built_n * 8
+        uint32 nt = 0
+        unsafe { *(entry as uint32) -> nt }
+        uint64 wnt = nt
+        uint64 h = tc_tok_hash(wnt) & 4095
+        uint64 placed = 0
+        while placed == 0 {
+            uint64 slot = tc_fn_hash_tbl + h * 8
+            uint64 s4 = slot + 4
+            uint32 sidx = 0
+            unsafe { *(s4 as uint32) -> sidx }
+            if sidx == 0xFFFFFFFF {
+                uint32 nt2 = nt
+                unsafe { *(slot as uint32) = nt2 }
+                uint32 mi = tc_fn_hash_built_n
+                unsafe { *(s4 as uint32) = mi }
+                placed = 1
+            } else {
+                uint32 snt = 0
+                unsafe { *(slot as uint32) -> snt }
+                uint64 wsnt = snt
+                if tok_text_eq(wsnt, wnt) != 0 { placed = 1 }
+                else { h = (h + 1) & 4095 }
+            }
+        }
+        tc_fn_hash_built_n = tc_fn_hash_built_n + 1
+    }
+}
+
+fn tc_fn_node_lookup(uint64 name_tok) -> uint64 {
+    tc_fn_hash_sync()
+    uint64 h = tc_tok_hash(name_tok) & 4095
+    while 1 == 1 {
+        uint64 slot = tc_fn_hash_tbl + h * 8
+        uint64 s4 = slot + 4
+        uint32 sidx = 0
+        unsafe { *(s4 as uint32) -> sidx }
+        if sidx == 0xFFFFFFFF { return 0 }
+        uint32 snt = 0
+        unsafe { *(slot as uint32) -> snt }
+        uint64 wsnt = snt
+        if tok_text_eq(wsnt, name_tok) != 0 {
+            uint64 wi = sidx
+            uint64 entry = tc_fn_node_table + wi * 8
+            uint64 e4 = entry + 4
+            uint32 fn32 = 0
+            unsafe { *(e4 as uint32) -> fn32 }
+            return fn32
+        }
+        h = (h + 1) & 4095
+    }
+    return 0
+}
+
+fn tc_locals_reset() {
+    tc_local_count = 0
+    if tc_local_hash_tbl == 0 {
+        tc_local_hash_tbl = alloc(16384 * 12)
+        memset(tc_local_hash_tbl, 0, 16384 * 12)
+    }
+    tc_local_gen = tc_local_gen + 1
+}
+
+fn tc_init() {
+    if tc_local_table == 0 {
+        tc_local_cap = 4096
+        tc_local_table = alloc(tc_local_cap * 8)
+    }
+    tc_locals_reset()
+    if tc_fn_node_table == 0 {
+        tc_fn_node_table = alloc(1024 * 8)
+    }
+    tc_fn_node_count = 0
+}
+
+fn tc_local_find_slot(uint64 name_tok) -> uint64 {
+    uint64 h = tc_tok_hash(name_tok) & 16383
+    uint32 cur_gen = tc_local_gen
+    while 1 == 1 {
+        uint64 slot = tc_local_hash_tbl + h * 12
+        uint32 g = 0
+        unsafe { *(slot as uint32) -> g }
+        if g != cur_gen { return slot }
+        uint64 s4 = slot + 4
+        uint32 nt = 0
+        unsafe { *(s4 as uint32) -> nt }
+        uint64 wnt = nt
+        if tok_text_eq(wnt, name_tok) != 0 { return slot }
+        h = (h + 1) & 16383
+    }
+    return 0
+}
+
+fn tc_local_register(uint64 name_tok, uint64 typekind) {
+    if tc_local_count >= tc_local_cap { return }
+    uint64 entry = tc_local_table + tc_local_count * 8
+    uint32 nt = name_tok
+    unsafe { *(entry as uint32) = nt }
+    uint64 e4 = entry + 4
+    uint32 tk = typekind
+    unsafe { *(e4 as uint32) = tk }
+    tc_local_count = tc_local_count + 1
+    uint64 slot = tc_local_find_slot(name_tok)
+    uint32 cur_gen = tc_local_gen
+    unsafe { *(slot as uint32) = cur_gen }
+    uint64 s4 = slot + 4
+    unsafe { *(s4 as uint32) = nt }
+    uint64 s8 = slot + 8
+    unsafe { *(s8 as uint32) = tk }
+}
+
+fn tc_local_lookup(uint64 name_tok) -> uint64 {
+    uint64 slot = tc_local_find_slot(name_tok)
+    uint32 g = 0
+    unsafe { *(slot as uint32) -> g }
+    uint32 cur_gen = tc_local_gen
+    if g != cur_gen { return 0 }
+    uint64 s8 = slot + 8
+    uint32 tk = 0
+    unsafe { *(s8 as uint32) -> tk }
+    return tk
+}
+
+// Map a type-keyword / struct-name token to a TypeKind. (riscv32/xtensa
+// rejection from KernRift is Track A — dropped here.)
+fn tc_kind_of_type_tok(uint64 type_tok) -> uint64 {
+    if type_tok == 0 { return 1 }   // void
+    uint64 k = tok_kind_at_raw(type_tok)
+    if k >= 80 && k <= 87 { return k }
+    if k >= 94 && k <= 96 { return k }
+    if k == 98 || k == 99 { return k }
+    if k == 1 {
+        uint64 si = struct_lookup(type_tok)
+        if si != 0xFFFFFFFF { return 200 + si }
+    }
+    return 0
+}
+
+fn tc_is_struct_kind(uint64 tk) -> uint64 {
+    if tk >= 200 && tk < 0xFFFF { return 1 }
+    return 0
+}
+
+fn tc_is_float_kind(uint64 tk) -> uint64 {
+    if tk >= 94 && tk <= 96 { return 1 }
+    return 0
+}
+
+// Module-level static/const kind. MLRift's static table only tracks float-ness
+// (static_fkind_of: 1=f64, 2=f32), so we resolve float globals precisely and
+// return 0 (unknown) otherwise — a safe under-approximation that suppresses
+// rather than false-positives on non-float globals.
+fn tc_static_kind_of(uint64 name_tok) -> uint64 {
+    uint64 fk = static_fkind_of(name_tok)
+    if fk == 1 { return 96 }
+    if fk == 2 { return 95 }
+    return 0
+}
+
+// 1 iff `node` is a Call to a known, locally-defined void function.
+// Unknown / extern / builtin callees return 0 (never flagged). Self-contained
+// via tc_fn_node_lookup (KernRift used fn_sig_returns; equivalent here).
+fn tc_call_returns_void(uint64 node) -> uint64 {
+    if node == 0 { return 0 }
+    uint32 kind = ast_kind(node)
+    if kind != 35 { return 0 }
+    uint32 callee = ast_data1(node)
+    uint64 wcallee = callee
+    uint64 fn_node = tc_fn_node_lookup(wcallee)
+    if fn_node == 0 { return 0 }
+    uint32 ret_tok = ast_data2(fn_node)
+    if ret_tok == 0 { return 1 }
+    return 0
+}
+
+// Derive the TypeKind of an expression. 0 = unknown, 0xFFFFFFFF = poisoned.
+fn tc_expr_kind(uint64 node) -> uint64 {
+    if node == 0 { return 0 }
+    uint32 kind = ast_kind(node)
+    uint64 wkind = kind
+    if wkind == 30 {
+        uint32 d4 = ast_data4(node)
+        uint64 wd4 = d4
+        if wd4 == 98 { return 98 }
+        if wd4 == 99 { return 99 }
+        return 83
+    }
+    if wkind == 46 { return 96 }
+    if wkind == 31 { return 83 }
+    if wkind == 32 {
+        uint32 nt = ast_data1(node)
+        uint64 wnt = nt
+        uint64 lk = tc_local_lookup(wnt)
+        if lk != 0 { return lk }
+        return tc_static_kind_of(wnt)
+    }
+    if wkind == 38 { return 98 }
+    if wkind == 39 { return 98 }
+    if wkind == 40 { return 98 }
+    if wkind == 33 {
+        uint32 lhs = ast_child(node)
+        uint64 wlhs = lhs
+        return tc_expr_kind(wlhs)
+    }
+    if wkind == 34 {
+        uint32 op = ast_child(node)
+        uint64 wop = op
+        return tc_expr_kind(wop)
+    }
+    // (kinds 53 ternary / 54 match-expr do not exist in MLRift — dropped)
+    if wkind == 35 {
+        uint32 callee = ast_data1(node)
+        uint64 wcallee = callee
+        uint64 fret = fn_ret_float_lookup(wcallee)
+        if fret == 1 { return 96 }
+        if fret == 2 { return 95 }
+        uint64 sret = fn_ret_struct_lookup(wcallee)
+        if sret != 0xFFFFFFFF { return 200 + sret }
+        uint64 fn_node = tc_fn_node_lookup(wcallee)
+        if fn_node != 0 {
+            uint32 ret_tok = ast_data2(fn_node)
+            uint64 wret = ret_tok
+            if wret != 0 {
+                uint64 rk = tc_kind_of_type_tok(ret_tok)
+                if rk >= 80 && rk <= 99 { return rk }
+                if rk >= 200 && rk != 0xFFFFFFFF { return rk }
+            }
+        }
+        return 83
+    }
+    if wkind == 36 {
+        uint32 recv = ast_child(node)
+        uint64 wrecv = recv
+        uint64 rk = tc_expr_kind(wrecv)
+        if tc_is_struct_kind(rk) == 0 { return 0xFFFFFFFF }
+        uint64 si = rk - 200
+        uint32 ft = ast_data2(node)
+        uint64 wft = ft
+        uint64 ftk = struct_field_type_kind_by_tok(si, wft)
+        if ftk == 0 { return 0xFFFFFFFF }
+        if ftk >= 256 { return 200 + (ftk - 256) }
+        return ftk
+    }
+    if wkind == 49 { return 83 }
+    if wkind == 37 { return 83 }
+    if wkind == 48 {
+        uint32 type_tok = ast_data1(node)
+        uint64 wtt = type_tok
+        return tc_kind_of_type_tok(wtt)
+    }
+    return 0
+}
+
+fn tc_check_expr(uint64 node) {
+    if node == 0 { return }
+    uint32 kind = ast_kind(node)
+    uint64 wkind = kind
+
+    // Call (35): walk args, then C6 param/arg struct-kind check.
+    if wkind == 35 {
+        uint32 arg = ast_child(node)
+        uint64 warg = arg
+        while warg != 0 {
+            tc_check_expr(warg)
+            uint32 anxt = ast_next(warg)
+            warg = anxt
+        }
+        uint32 callee = ast_data1(node)
+        uint64 wcallee = callee
+        uint64 fn_node = tc_fn_node_lookup(wcallee)
+        if fn_node != 0 {
+            uint32 param = ast_child(fn_node)
+            uint64 wp = param
+            uint32 ai = ast_child(node)
+            uint64 wai = ai
+            while wp != 0 && wai != 0 {
+                uint32 pk = ast_kind(wp)
+                if pk != 3 { wp = 0 }
+                if pk == 3 {
+                    uint32 ptype_tok = ast_data1(wp)
+                    uint64 wptype = ptype_tok
+                    uint64 expected = tc_kind_of_type_tok(wptype)
+                    uint64 actual = tc_expr_kind(wai)
+                    if expected != 0 && actual != 0 && actual != 0xFFFFFFFF {
+                        uint64 e_struct = tc_is_struct_kind(expected)
+                        uint64 a_struct = tc_is_struct_kind(actual)
+                        // ---- C6 ----
+                        if e_struct != 0 && a_struct != 0 && expected != actual {
+                            uint32 atok = ast_tok(wai)
+                            uint64 watok = atok
+                            tc_diag(watok, "argument struct kind does not match parameter type", 1)
+                        }
+                    }
+                    uint32 pn = ast_next(wp)
+                    wp = pn
+                    uint32 anxt2 = ast_next(wai)
+                    wai = anxt2
+                }
+            }
+        }
+        return
+    }
+
+    // BinOp (33), Compare (38): child=lhs, data2=rhs.
+    if wkind == 33 || wkind == 38 {
+        uint32 lhs = ast_child(node)
+        uint64 wlhs = lhs
+        if wlhs != 0 { tc_check_expr(wlhs) }
+        uint32 rhs = ast_data2(node)
+        uint64 wrhs = rhs
+        if wrhs != 0 { tc_check_expr(wrhs) }
+        uint64 lk = tc_expr_kind(wlhs)
+        uint64 rk = tc_expr_kind(wrhs)
+        // ---- B5: binop-on-struct ----
+        if wkind == 33 {
+            if tc_is_struct_kind(lk) != 0 || tc_is_struct_kind(rk) != 0 {
+                uint32 ot = ast_tok(node)
+                uint64 wot = ot
+                tc_diag(wot, "arithmetic operator on struct value", 1)
+            }
+        }
+        // ---- B6: ordering-comparison-on-struct (== / != are allowed) ----
+        if wkind == 38 {
+            uint32 op_tok = ast_data1(node)
+            uint64 wop_tok = op_tok
+            uint64 opk = tok_kind_at_raw(wop_tok)
+            if opk != 35 && opk != 36 {
+                if tc_is_struct_kind(lk) != 0 || tc_is_struct_kind(rk) != 0 {
+                    uint32 ot = ast_tok(node)
+                    uint64 wot = ot
+                    tc_diag(wot, "ordering comparison on struct value (compare fields individually)", 1)
+                }
+            }
+        }
+        // ---- A5: void-fn-used-as-value ----
+        if tc_call_returns_void(wlhs) != 0 || tc_call_returns_void(wrhs) != 0 {
+            uint32 ot = ast_tok(node)
+            uint64 wot = ot
+            tc_diag(wot, "result of void-returning function used as a value", 1)
+        }
+        return
+    }
+
+    // LogicalAnd (39), LogicalOr (40): child=lhs, data2=rhs.
+    if wkind == 39 || wkind == 40 {
+        uint32 lhs = ast_child(node)
+        uint64 wlhs = lhs
+        if wlhs != 0 { tc_check_expr(wlhs) }
+        uint32 rhs = ast_data2(node)
+        uint64 wrhs = rhs
+        if wrhs != 0 { tc_check_expr(wrhs) }
+        return
+    }
+
+    // UnaryOp (34): child=operand.
+    if wkind == 34 {
+        uint32 op = ast_child(node)
+        uint64 wop = op
+        if wop != 0 { tc_check_expr(wop) }
+        return
+    }
+
+    // FieldAccess (36): child=recv, data2=field-name token.
+    if wkind == 36 {
+        uint32 recv = ast_child(node)
+        uint64 wrecv = recv
+        if wrecv != 0 { tc_check_expr(wrecv) }
+        uint32 fname0 = ast_data2(node)
+        uint64 wfname0 = fname0
+        if tok_matches(wfname0, "len", 3) != 0 { return }
+        uint64 rk = tc_expr_kind(wrecv)
+        uint64 recv_is_index = 0
+        if wrecv != 0 {
+            uint32 recv_k = ast_kind(wrecv)
+            if recv_k == 37 { recv_is_index = 1 }
+        }
+        // ---- A4: struct-field-of-non-struct ----
+        if rk != 0 && rk != 0xFFFFFFFF && tc_is_struct_kind(rk) == 0 && recv_is_index == 0 {
+            uint32 ft = ast_tok(node)
+            uint64 wft = ft
+            tc_diag(wft, "field access on non-struct value", 1)
+        }
+        // ---- A3: unknown-field ----
+        if tc_is_struct_kind(rk) != 0 {
+            uint64 si = rk - 200
+            uint32 fname = ast_data2(node)
+            uint64 wfn = fname
+            uint64 fo = struct_field_offset(si, wfn)
+            if fo == 0xFFFFFFFF {
+                tc_diag(wfn, "no such field on this struct type", 1)
+            }
+        }
+        return
+    }
+
+    // Index (37): child=index_expr.
+    if wkind == 37 {
+        uint32 idx = ast_child(node)
+        uint64 widx = idx
+        if widx != 0 { tc_check_expr(widx) }
+        return
+    }
+
+    // FString (50): child=first segment, linked via next.
+    if wkind == 50 {
+        uint32 seg = ast_child(node)
+        uint64 wseg = seg
+        while wseg != 0 {
+            tc_check_expr(wseg)
+            uint32 snxt = ast_next(wseg)
+            wseg = snxt
+        }
+        return
+    }
+}
+
+fn tc_check_stmt(uint64 node) {
+    if node == 0 { return }
+    uint32 kind = ast_kind(node)
+    uint64 wkind = kind
+
+    // Block (15).
+    if wkind == 15 {
+        uint32 c = ast_child(node)
+        uint64 wc = c
+        while wc != 0 {
+            tc_check_stmt(wc)
+            uint32 nxt = ast_next(wc)
+            wc = nxt
+        }
+        return
+    }
+
+    // VarDecl (10): register var with its type, then check init (B1/B2, A5).
+    if wkind == 10 {
+        uint32 type_tok = ast_data1(node)
+        uint32 name_tok = ast_data2(node)
+        uint32 d4 = ast_data4(node)
+        uint64 wtt_tc = type_tok
+        uint64 wd4_tc = d4
+        uint64 tk = 0
+        if wd4_tc != 0 {
+            tk = 200 + (wd4_tc - 1)
+        } else {
+            tk = tc_kind_of_type_tok(type_tok)
+        }
+        tc_local_register(name_tok, tk)
+        uint32 init = ast_child(node)
+        uint64 winit = init
+        if winit != 0 {
+            tc_check_expr(winit)
+            // ---- A5 ----
+            if tc_call_returns_void(winit) != 0 {
+                uint32 it = ast_tok(node)
+                uint64 wit = it
+                tc_diag(wit, "void-returning function used to initialize a variable", 1)
+            }
+            // ---- B1 / B2 ----
+            uint64 ik = tc_expr_kind(winit)
+            if ik != 0 && ik != 0xFFFFFFFF {
+                uint64 lhs_struct = tc_is_struct_kind(tk)
+                uint64 rhs_struct = tc_is_struct_kind(ik)
+                if lhs_struct != 0 && rhs_struct != 0 && tk != ik {
+                    uint32 it = ast_tok(node)
+                    uint64 wit = it
+                    tc_diag(wit, "initializer struct kind does not match declared type", 1)
+                }
+            }
+        }
+        return
+    }
+
+    // Assign (11): data1=name_tok, child=value_expr.
+    if wkind == 11 {
+        uint32 c = ast_child(node)
+        uint64 wc = c
+        if wc != 0 { tc_check_expr(wc) }
+        // ---- A5 ----
+        if tc_call_returns_void(wc) != 0 {
+            uint32 atok = ast_tok(node)
+            uint64 watok = atok
+            tc_diag(watok, "void-returning function assigned to a variable", 1)
+        }
+        // ---- B1 / B2 ----
+        uint32 lhs_name = ast_data1(node)
+        uint64 wln = lhs_name
+        uint64 lk = tc_local_lookup(wln)
+        uint64 rk = tc_expr_kind(wc)
+        if lk != 0 && rk != 0 && rk != 0xFFFFFFFF {
+            uint64 lhs_struct = tc_is_struct_kind(lk)
+            uint64 rhs_struct = tc_is_struct_kind(rk)
+            if lhs_struct != 0 && rhs_struct != 0 && lk != rk {
+                uint32 atok = ast_tok(node)
+                uint64 watok = atok
+                tc_diag(watok, "assignment struct kind does not match", 1)
+            }
+        }
+        return
+    }
+
+    // Return (12): A6 + A5 + B3 + C7.
+    if wkind == 12 {
+        uint32 expr = ast_child(node)
+        uint64 wexpr = expr
+        if tc_current_ret_kind == 1 {
+            // ---- A6: void fn — return must be bare ----
+            if wexpr != 0 {
+                uint32 rt = ast_tok(node)
+                uint64 wrt = rt
+                tc_diag(wrt, "return with value in void function", 1)
+                tc_check_expr(wexpr)
+            }
+        } else {
+            // ---- A6: non-void fn — return must carry a value ----
+            if wexpr == 0 {
+                uint32 rt = ast_tok(node)
+                uint64 wrt = rt
+                tc_diag(wrt, "return without value in non-void function", 1)
+            } else {
+                tc_check_expr(wexpr)
+                // ---- A5 ----
+                if tc_call_returns_void(wexpr) != 0 {
+                    uint32 rt = ast_tok(node)
+                    uint64 wrt = rt
+                    tc_diag(wrt, "returning the result of a void-returning function", 1)
+                }
+                uint64 rk = tc_expr_kind(wexpr)
+                if rk != 0 && rk != 0xFFFFFFFF {
+                    uint64 lhs_struct = tc_is_struct_kind(tc_current_ret_kind)
+                    uint64 rhs_struct = tc_is_struct_kind(rk)
+                    // ---- B3 ----
+                    if lhs_struct != 0 && rhs_struct != 0 && tc_current_ret_kind != rk {
+                        uint32 rt = ast_tok(node)
+                        uint64 wrt = rt
+                        tc_diag(wrt, "return value struct kind does not match declared type", 1)
+                    }
+                    // ---- C7 ----
+                    if tc_is_float_kind(tc_current_ret_kind) != 0 && tc_is_float_kind(rk) != 0 {
+                        if tc_current_ret_kind != rk {
+                            uint32 rt = ast_tok(node)
+                            uint64 wrt = rt
+                            tc_diag(wrt, "return value float kind does not match declared type", 1)
+                        }
+                    }
+                }
+            }
+        }
+        return
+    }
+
+    // ExprStmt (16).
+    if wkind == 16 {
+        uint32 e = ast_child(node)
+        uint64 we = e
+        tc_check_expr(we)
+        return
+    }
+
+    // If (13): child=cond, data1=then, data2=else. ---- B7 ----
+    if wkind == 13 {
+        uint32 cond = ast_child(node)
+        uint64 wcond = cond
+        if wcond != 0 {
+            uint64 ck = tc_expr_kind(wcond)
+            if tc_is_struct_kind(ck) != 0 {
+                uint32 tt = ast_tok(node)
+                uint64 wtt = tt
+                tc_diag(wtt, "condition must be a scalar, got struct value", 1)
+            }
+            if tc_is_float_kind(ck) != 0 {
+                uint32 tt = ast_tok(node)
+                uint64 wtt = tt
+                tc_diag(wtt, "condition must be a scalar, got float value", 1)
+            }
+            tc_check_expr(wcond)
+        }
+        uint32 thenb = ast_data1(node)
+        uint64 wt = thenb
+        if wt != 0 { tc_check_stmt(wt) }
+        uint32 elseb = ast_data2(node)
+        uint64 we2 = elseb
+        if we2 != 0 { tc_check_stmt(we2) }
+        return
+    }
+
+    // Match (19): child=scrutinee, data1=first_arm. ---- C10 ----
+    if wkind == 19 {
+        uint32 scrut = ast_child(node)
+        uint64 wscrut = scrut
+        if wscrut != 0 { tc_check_expr(wscrut) }
+        uint64 sk = tc_expr_kind(wscrut)
+        // (float-scrutinee reject omitted: MLRift sema already fatally rejects
+        //  it in sema_check_stmt / M14.)
+        uint32 arm = ast_data1(node)
+        uint64 warm = arm
+        while warm != 0 {
+            uint32 ak = ast_kind(warm)
+            if ak == 20 {
+                uint32 pat = ast_data1(warm)
+                uint64 wpat = pat
+                while wpat != 0 {
+                    uint32 pk = ast_kind(wpat)
+                    uint64 skip = 0
+                    if pk == 32 {
+                        uint32 nt = ast_data1(wpat)
+                        uint64 wnt = nt
+                        if tc_local_lookup(wnt) == 0 { skip = 1 }
+                    }
+                    if pk == 52 { skip = 1 }
+                    if skip == 0 {
+                        uint64 pkk = tc_expr_kind(wpat)
+                        if pkk != 0 && pkk != 0xFFFFFFFF && sk != 0 && sk != 0xFFFFFFFF {
+                            uint64 s_struct = tc_is_struct_kind(sk)
+                            uint64 p_struct = tc_is_struct_kind(pkk)
+                            if s_struct != 0 && p_struct != 0 && sk != pkk {
+                                uint32 pt = ast_tok(wpat)
+                                uint64 wpt = pt
+                                tc_diag(wpt, "match-arm pattern struct kind does not match scrutinee", 1)
+                            }
+                        }
+                        tc_check_expr(wpat)
+                    }
+                    uint32 pn = ast_next(wpat)
+                    wpat = pn
+                }
+                uint32 body = ast_data2(warm)
+                uint64 wbody = body
+                if wbody != 0 { tc_check_stmt(wbody) }
+            }
+            uint32 anxt = ast_next(warm)
+            warm = anxt
+        }
+        return
+    }
+
+    // While (14): child=cond, data1=body. ---- B7 ----
+    if wkind == 14 {
+        uint32 cond = ast_child(node)
+        uint64 wcond = cond
+        if wcond != 0 {
+            uint64 ck = tc_expr_kind(wcond)
+            if tc_is_struct_kind(ck) != 0 {
+                uint32 tt = ast_tok(node)
+                uint64 wtt = tt
+                tc_diag(wtt, "condition must be a scalar, got struct value", 1)
+            }
+            if tc_is_float_kind(ck) != 0 {
+                uint32 tt = ast_tok(node)
+                uint64 wtt = tt
+                tc_diag(wtt, "condition must be a scalar, got float value", 1)
+            }
+            tc_check_expr(wcond)
+        }
+        uint32 body = ast_data1(node)
+        uint64 wb = body
+        if wb != 0 { tc_check_stmt(wb) }
+        return
+    }
+
+    // Default: walk children as statements.
+    uint32 c2 = ast_child(node)
+    uint64 wc2 = c2
+    while wc2 != 0 {
+        tc_check_stmt(wc2)
+        uint32 nxt = ast_next(wc2)
+        wc2 = nxt
+    }
+}
+
+fn tc_check_function(uint64 fn_node) {
+    tc_locals_reset()
+    uint32 fn_tok = ast_data1(fn_node)
+    uint32 ret_tok = ast_data2(fn_node)
+    tc_current_fn_tok = fn_tok
+    tc_current_ret_kind = tc_kind_of_type_tok(ret_tok)
+    if ret_tok == 0 { tc_current_ret_kind = 1 }
+
+    uint32 param = ast_child(fn_node)
+    uint64 wp = param
+    while wp != 0 {
+        uint32 pkind = ast_kind(wp)
+        if pkind == 3 {
+            uint32 ptype_tok = ast_data1(wp)
+            uint32 pname_tok = ast_data2(wp)
+            uint64 wptype = ptype_tok
+            uint64 ptk = tc_kind_of_type_tok(wptype)
+            tc_local_register(pname_tok, ptk)
+        }
+        uint32 nxt = ast_next(wp)
+        wp = nxt
+    }
+
+    uint32 b = ast_data3(fn_node)
+    uint64 body = b
+    if body != 0 { tc_check_stmt(body) }
+}
+
+// Pre-pass: seed fn_ret_struct/float tables (so tc_expr_kind can resolve Call
+// return kinds) and the name->fn_node table (for C6). Method-table seeding and
+// riscv return-type rejection from KernRift are not applicable here.
+fn tc_collect_signatures(uint64 root) {
+    uint32 child = ast_child(root)
+    uint64 wc = child
+    while wc != 0 {
+        uint32 ck = ast_kind(wc)
+        if ck == 2 {
+            uint32 fname = ast_data1(wc)
+            uint32 ret_tok = ast_data2(wc)
+            uint64 wname = fname
+            uint64 wret = ret_tok
+            tc_fn_node_register(wname, wc)
+            if wret != 0 {
+                uint64 rk = tok_kind_at_raw(wret)
+                if rk == 96 { fn_ret_float_register(wname, 1) }
+                if rk == 95 { fn_ret_float_register(wname, 2) }
+                if rk == 1 {
+                    uint64 si = struct_lookup(wret)
+                    if si != 0xFFFFFFFF {
+                        fn_ret_struct_register(wname, si)
+                    }
+                }
+            }
+        }
+        uint32 nxt = ast_next(wc)
+        wc = nxt
+    }
+}
+
+// Optional master switch for fatal mode (advisory-first default = 0).
+@export
+fn tc_set_fatal(uint64 v) {
+    tc_fatal_enabled = v
+}
+
+@export
+fn tc_check_module(uint64 root) -> uint64 {
+    tc_init()
+    tc_error_count = 0
+    // Snapshot codegen-side return-type table counts (statics in codegen.mlr,
+    // reachable in this shared namespace) and roll them back after the pre-pass
+    // so codegen's own walk starts from a clean count.
+    uint64 saved_struct_count = fn_ret_struct_count
+    uint64 saved_float_count = fn_ret_float_count
+    tc_collect_signatures(root)
+
+    uint32 child = ast_child(root)
+    uint64 wc = child
+    while wc != 0 {
+        uint32 ck = ast_kind(wc)
+        if ck == 2 {
+            tc_check_function(wc)
+        }
+        uint32 nxt = ast_next(wc)
+        wc = nxt
+    }
+
+    fn_ret_struct_count = saved_struct_count
+    fn_ret_float_count = saved_float_count
+    return tc_error_count
+}
+
 // Entry point for semantic validation
 @export
 fn run_semantic_checks(uint64 root, uint64 source, uint64 tok_buf) -> uint64 {
