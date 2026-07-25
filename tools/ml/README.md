@@ -57,3 +57,91 @@ anchors win. On the same image, int8 (`--pct 99.99`) vs float:
 So a "34% worst per-tensor error" still reproduces the float model's
 detections almost exactly, because detection depends on the *ranking* of
 anchor scores rather than their absolute values.
+
+## Stage 4: on-target execution
+
+| script | does |
+|---|---|
+| `krnn.py` | the **KRNN** flat container format — spec, packers, arena planner. The spec block is duplicated verbatim in `std/nn_model.mlr`; the runner reads by fixed offset and cannot notice drift |
+| `onnx_to_mlrift.py --emit-binary` | NHWC shape inference, quantisation-parameter derivation, offline arena planning, packing |
+| `krnn_to_mlr.py` | bake a `.krnn` into MLRift source (see the caveat below) |
+| `gen_frame.py` | the deterministic validation frame, mirroring `nn_mt_rand()` in `tests/nn/nn_model_core.mlr` |
+| `frame_from_image.py` | a real image → the quantised int8 NHWC frame the runner is handed |
+
+`std/nn_model.mlr` walks the container and dispatches to `std/nn_int8.mlr`.
+There is no JSON on target, no allocator, no strings and no shape inference:
+every tensor's offset inside a single activation arena is decided here, by a
+greedy-by-size planner over tensor lifetimes, and baked into the layer record.
+
+### End to end on YuNet
+
+```sh
+# convert (needs the calibration ranges from stage 2)
+python3 tools/ml/onnx_to_mlrift.py yunet_128.onnx -o /tmp/y \
+    --emit-binary /tmp/yunet128.krnn --ranges ranges_p99.99.json
+
+# the frame both sides will start from
+python3 tools/ml/gen_frame.py 128 128 3 /tmp/frame.i8
+
+# the oracle
+python3 tools/ml/int8_sim.py yunet_128.onnx ranges_p99.99.json \
+    --input-i8 /tmp/frame.i8 --dump /tmp/sim --no-float-ref
+python3 - <<'EOF' > /tmp/expected.txt
+import numpy as np
+for n in ['cls_8','cls_16','cls_32','obj_8','obj_16','obj_32',
+          'bbox_8','bbox_16','bbox_32','kps_8','kps_16','kps_32']:
+    for v in np.fromfile(f'/tmp/sim/out_{n}.i8', dtype=np.int8):
+        print(int(v))
+EOF
+
+# host, xtensa and riscv32, all compared against it
+NN_KRNN_MODEL=/tmp/yunet128.krnn NN_KRNN_EXPECTED=/tmp/expected.txt \
+    MLRC=./build/mlrc bash tests/nn/run_nn_tests.sh
+```
+
+Measured (YuNet @128, 106 nodes, 5376 output values): host x86_64, xtensa
+under `qemu-system-xtensa -M lx60` and riscv32 under `qemu-system-riscv32
+-M virt` are **byte-identical to `int8_sim.py` and to each other** — and so
+are all 106 intermediate tensors, not just the outputs. Peak arena 131072 B.
+
+### int8_sim.py is now bit-faithful, and was not before
+
+Two bugs had to be fixed before "bit-exact" was even a testable claim:
+
+- `srdhm` used an arithmetic right shift where gemmlowp (and `nn_ref.py`, and
+  `nn_int8.mlr`) divide with **truncation toward zero**. Off by one on every
+  negative product with a remainder.
+- it carried a **doubled** product compensated by an extra right shift, i.e.
+  the opposite shift-sign convention to TFLite and `nn_mul_by_qm`. That is a
+  clean factor of 2 in every requantised value, and it is invisible in the
+  float-error summary because a uniform halving of a per-channel multiplier
+  looks like a slightly worse quantiser, not like a bug.
+- `Add` was done in floating point. It is now TFLite's integer AddGeneral,
+  which is what `nn_add_int8` implements.
+
+Both files now use TFLite's convention throughout, so `--emit-binary` passes
+`(multiplier, shift)` straight through.
+
+### Baking a model into an image: don't, at this size
+
+`krnn_to_mlr.py` exists and works, but MLRift has no `include_bytes`, array
+statics take no initialiser and the compiler's whole-program string pool caps
+at 65536 bytes — so a model can only be emitted as *code*, about 19 bytes of
+`store32` per 4 model bytes. YuNet's 89 KB becomes a ~590 KB image. On
+freestanding **xtensa that hangs**: `XT_STACK_TOP` is pinned at `0xd0040000`,
+256 KiB into the load window, so the initial stack grows straight down into
+the text of any larger image, mid-fill, with no diagnostic. Keep freestanding
+xtensa images under ~200 KiB.
+
+Load the model instead. `nn_model_run()` never writes to it and never assumes
+where it lives, so a flash partition address and `qemu -device
+loader,file=...,addr=...,force-raw=on` are the same thing. Note that qemu's
+loader address is PHYSICAL: on the dc232b the cached window maps `0xd0000000`
+→ `0x00000000`, so the model goes to `0x00800000` and the runner reads
+`0xd0800000`.
+
+### Static declaration order decides what lands in .bss
+
+Every static up to and including the last one with an initialiser is written
+into the image file. Declaring an initialised scalar *after* a 192 KiB array
+put the whole array in the ELF: a 210 KB freestanding image instead of 14 KB.

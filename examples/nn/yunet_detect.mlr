@@ -1,0 +1,249 @@
+// examples/nn/yunet_detect.mlr — run a converted YuNet face detector with
+// std/nn_model.mlr and print the highest-scoring anchors.
+//
+//   mlrc --arch=x86_64 examples/nn/yunet_detect.mlr -o /tmp/yunet
+//   /tmp/yunet yunet128.krnn frame.i8 [topk]
+//
+// Producing the two inputs (see tools/ml/README.md):
+//   tools/ml/onnx_to_mlrift.py yunet_128.onnx -o /tmp/y \
+//       --emit-binary /tmp/yunet128.krnn --ranges ranges_p99.99.json
+//   tools/ml/frame_from_image.py face.jpg 128 /tmp/frame.i8
+//
+// WHY THE MODEL IS A FILE AND NOT A `static u8[] = {...}`
+// ------------------------------------------------------
+// MLRift has no include_bytes; array statics take no initialiser list, and
+// the compiler's whole-program string pool caps at 65536 bytes, so an 89 KB
+// model cannot be written as data at all. It can only be written as CODE —
+// one store32 per word, ~19 bytes of instructions per 4 model bytes — which
+// tools/ml/krnn_to_mlr.py will do if you need it. On the host that is merely
+// wasteful; on freestanding xtensa it is fatal, because XT_STACK_TOP sits
+// 256 KiB into the load window and the initial stack grows down into the
+// text of any larger image.
+//
+// So the model is loaded, not embedded, and nn_model_run() is written to
+// suit that: it never writes to the model and never assumes where it lives.
+// On the host that means read() into a static; on an MCU it means a flash
+// partition address (tests/nn/nn_model_mcu.mlr passes one directly).
+//
+// WHAT IS AND IS NOT DECODED HERE
+// -------------------------------
+// YuNet emits, per anchor and per FPN level: a classification score, an
+// objectness score, a 4-vector box regression and 10 keypoint offsets. The
+// detection score is cls*obj and the box centre is
+// ((col + dx) * stride, (row + dy) * stride) — all of which is exact in
+// fixed point and is what this prints. The box WIDTH and HEIGHT are
+// exp(dw)*stride and exp(dh)*stride; there is no expf on an MCU and this
+// file will not pretend otherwise, so the raw regression values are printed
+// instead and the exponential is left to whatever consumes them.
+//
+// Everything below is Q16 fixed point (value * 65536), derived from the
+// per-output (zero_point, scale_q16) pair in the .krnn output table.
+
+import "../../std/nn_model.mlr"
+import "../../std/io.mlr"
+
+static u32 yd_topk = 5
+static u8[262144] yd_model
+static u8[262144] yd_arena
+
+static u64 cli_argc = 0
+static u64 cli_argv = 0
+
+
+fn yd_arg(u64 i) -> u64 {
+    if i >= cli_argc { return 0 }
+    u64 slot = cli_argv + i * 8
+    u64 a = 0
+    unsafe { *(slot as u64) -> a }
+    return a
+}
+
+fn yd_num(u64 i, u64 dflt) -> u64 {
+    u64 s = yd_arg(i)
+    if s == 0 { return dflt }
+    u64 v = 0
+    u64 k = 0
+    u64 c = load8(s)
+    while c >= 48 && c <= 57 {
+        v = v * 10 + (c - 48)
+        k = k + 1
+        c = load8(s + k)
+    }
+    if k == 0 { return dflt }
+    return v
+}
+
+// Read a whole file into a static buffer; returns the byte count, 0 on error.
+fn yd_slurp(u64 path, u32 dst, u64 cap) -> u64 {
+    u64 fd = file_open(path, 0)
+    if is_errno(fd) != 0 { return 0 }
+    u64 size = file_size(fd)
+    if size > cap { file_close(fd) return 0 }
+    file_read(fd, dst, size)
+    file_close(fd)
+    return size
+}
+
+// Dequantise one int8 output element into Q16.
+fn yd_q16(u32 m, u32 oi, u32 idx) -> i32 {
+    u32 p = yd_arena + nn_model_output_off(m, oi)
+    i32 v = nn_load_i8(p + idx) - nn_model_output_zp(m, oi)
+    i32 s = nn_model_output_scale_q16(m, oi)
+    return v * s
+}
+
+// Print a Q16 value as a signed decimal with 3 fractional digits.
+fn yd_print_q16(i32 v) {
+    i32 x = v
+    if x < 0 {
+        print_str("-")
+        x = 0 - x
+    }
+    u32 u = x
+    print(u >> 16)
+    print_str(".")
+    u32 frac = ((u & 0xFFFF) * 1000) >> 16
+    if frac < 100 { print_str("0") }
+    if frac < 10 { print_str("0") }
+    print(frac)
+}
+
+// The FPN level that owns output slot `lv`: stride 8, 16, 32 and a grid of
+// input_side/stride cells each.
+fn yd_stride(u32 lv) -> u32 {
+    return 8 << lv
+}
+
+
+fn main() {
+    u64 mpath = yd_arg(1)
+    u64 fpath = yd_arg(2)
+    if mpath == 0 || fpath == 0 {
+        println_str("usage: yunet_detect <model.krnn> <frame.i8> [topk]")
+        exit(2)
+    }
+    yd_topk = yd_num(3, 5)
+
+    if yd_slurp(mpath, yd_model, 262144) == 0 {
+        println_str("cannot read the model (missing, or bigger than 256 KiB)")
+        exit(2)
+    }
+    u32 m = yd_model
+    u32 bad = nn_model_check(m)
+    if bad != 0 {
+        print_str("not a usable KRNN model, code ")
+        println(bad)
+        exit(2)
+    }
+    if nn_model_arena_bytes(m) > 262144 {
+        print_str("model needs an arena of ")
+        print(nn_model_arena_bytes(m))
+        println_str(" bytes; this example has 262144")
+        exit(2)
+    }
+
+    print_str("model      : ")
+    print(nn_model_layer_count(m))
+    print_str(" layers, arena ")
+    print(nn_model_arena_bytes(m))
+    print_str(" B, input ")
+    print(nn_model_input_h(m))
+    print_str("x")
+    print(nn_model_input_w(m))
+    print_str("x")
+    print(nn_model_input_c(m))
+    println_str("")
+
+    u32 n_in = nn_model_input_h(m) * nn_model_input_w(m) * nn_model_input_c(m)
+    u64 got = yd_slurp(fpath, yd_arena + nn_model_input_off(m), n_in)
+    if got != n_in {
+        print_str("frame must be exactly ")
+        print(n_in)
+        println_str(" int8 bytes in NHWC order")
+        exit(2)
+    }
+
+    bad = nn_model_run(m, yd_arena)
+    if bad != 0 {
+        print_str("run failed, code ")
+        println(bad)
+        exit(1)
+    }
+    println_str("inference   : done")
+
+    // Rank every anchor of every level by cls * obj, both already in [0,1].
+    // 336 anchors at 128x128, so a K-pass selection scan is cheaper than a
+    // sort and needs no scratch buffer.
+    print_str("top ")
+    print(yd_topk)
+    println_str(" anchors (score, level, grid cell, centre px, raw w/h regression)")
+
+    i32 prev = 2147483647
+    u32 rank = 0
+    while rank < yd_topk {
+        i32 best = 0 - 1
+        u32 best_lv = 0
+        u32 best_i = 0
+        u32 lv = 0
+        while lv < 3 {
+            u32 n = nn_model_output_n(m, lv)
+            u32 i = 0
+            while i < n {
+                i32 cls = yd_q16(m, lv, i)
+                i32 obj = yd_q16(m, 3 + lv, i)
+                u32 cu = cls
+                u32 ou = obj
+                if cls < 0 { cu = 0 }
+                if obj < 0 { ou = 0 }
+                i32 sc = (cu * ou) >> 16
+                if sc < prev {
+                    if sc > best {
+                        best = sc
+                        best_lv = lv
+                        best_i = i
+                    }
+                }
+                i = i + 1
+            }
+            lv = lv + 1
+        }
+        if best < 0 { return }
+
+        u32 stride = yd_stride(best_lv)
+        u32 grid = nn_model_input_w(m) / stride
+        u32 row = best_i / grid
+        u32 col = best_i % grid
+        i32 dx = yd_q16(m, 6 + best_lv, (best_i * 4) + 0)
+        i32 dy = yd_q16(m, 6 + best_lv, (best_i * 4) + 1)
+        i32 dw = yd_q16(m, 6 + best_lv, (best_i * 4) + 2)
+        i32 dh = yd_q16(m, 6 + best_lv, (best_i * 4) + 3)
+        i32 colq = col
+        i32 rowq = row
+        i32 cx = ((colq << 16) + dx) * stride
+        i32 cy = ((rowq << 16) + dy) * stride
+
+        print_str("  #")
+        print(rank)
+        print_str(" score=")
+        yd_print_q16(best)
+        print_str(" stride=")
+        print(stride)
+        print_str(" cell=(")
+        print(col)
+        print_str(",")
+        print(row)
+        print_str(") centre=(")
+        yd_print_q16(cx)
+        print_str(",")
+        yd_print_q16(cy)
+        print_str(") wh_raw=(")
+        yd_print_q16(dw)
+        print_str(",")
+        yd_print_q16(dh)
+        println_str(")")
+
+        prev = best
+        rank = rank + 1
+    }
+    exit(0)
+}
