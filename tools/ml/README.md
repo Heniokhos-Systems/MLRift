@@ -138,7 +138,53 @@ where it lives, so a flash partition address and `qemu -device
 loader,file=...,addr=...,force-raw=on` are the same thing. Note that qemu's
 loader address is PHYSICAL: on the dc232b the cached window maps `0xd0000000`
 → `0x00000000`, so the model goes to `0x00800000` and the runner reads
-`0xd0800000`.
+`0xd0800000`. On real ESP32 silicon the same idea is spelled `--model` — see
+below.
+
+### On real ESP32 silicon: `--model` makes the blob a flash segment
+
+The qemu trick has an exact hardware equivalent, and it is not a flash driver.
+`mlrc --target=esp32 --model <file>` appends the file's raw bytes to the
+esp-image as an extra RAM segment loaded at `0x3FFB0000`; the mask ROM copies
+it from flash into DRAM *before* the entry point runs, which you can watch in
+the boot log:
+
+```
+rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+load:0x3ffb0000,len:89304      <- the model
+load:0x3ffc5ce0,len:60         <- .data, moved up above it
+load:0x40080400,len:13788      <- code
+entry 0x4008384c
+```
+
+No MMU work, no SPI reads, and no ~590 KB image. The blob goes at the BOTTOM
+of the DRAM window and `.data`/`.bss` move up above it, so `0x3FFB0000` is a
+compile-time constant the program hardcodes (`tests/nn/nn_model_esp32.mlr`)
+and it does not move when an unrelated static is added.
+
+**The 192 KiB DRAM window is the binding constraint.** `[0x3FFB0000,
+0x3FFE0000)` holds the model AND `.data`/`.bss` AND the stack. YuNet's `.krnn`
+is 89304 B at any input size, and the runner's arena is exactly `8 * side^2`:
+
+| side | arena | model + arena | fits 192 KiB? |
+|---|---|---|---|
+| 64 | 32768 | 122072 | yes, ~72 KiB spare |
+| 96 | 73728 | 163040 | yes, ~32 KiB spare |
+| 128 | 131072 | 220376 | **no** — over before code or stack |
+
+YuNet is fully convolutional, so a smaller input is a valid model; it only
+reduces detection range. `xt_esp32_check_layout` counts the blob against the
+budget and loud-fails the compile rather than emitting an image that
+overruns — see `src/ir_xtensa.mlr`.
+
+Two things that cost real time on this board and are worth designing around:
+it has no DTR/RTS, so **the host cannot reset the chip** and a capture that
+attaches a second late misses a single-shot run entirely; and there is no
+JTAG, so a hang is indistinguishable from a dead board. Hence
+`nn_model_esp32.mlr` runs in a `loop` and prints a `BOOT <magic>` line before
+each run: the loop makes the capture window irrelevant, and the magic word
+read back from `0x3FFB0000` proves the ROM actually delivered the blob before
+any number it prints can be trusted.
 
 ### Static declaration order decides what lands in .bss
 
