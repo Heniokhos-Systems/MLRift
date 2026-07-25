@@ -188,55 +188,6 @@ def pack_output(arena_off, n_elem, zp, scale_q16):
 
 
 # ---------------------------------------------------------------------------
-# Arena allocation
-# ---------------------------------------------------------------------------
-
-class Arena:
-    """First-fit allocator with coalescing over a growing high-water mark.
-
-    Runs entirely on the host at convert time. The result is a set of fixed
-    byte offsets baked into the layer records, so the target never allocates
-    anything: it is handed one contiguous buffer of `high_water` bytes.
-    """
-
-    def __init__(self, align=4):
-        self.align = align
-        self.free = []          # sorted list of [start, size]
-        self.high_water = 0
-
-    def alloc(self, size):
-        size = (size + self.align - 1) // self.align * self.align
-        if size == 0:
-            size = self.align
-        for i, blk in enumerate(self.free):
-            if blk[1] >= size:
-                off = blk[0]
-                if blk[1] == size:
-                    del self.free[i]
-                else:
-                    blk[0] += size
-                    blk[1] -= size
-                return off
-        off = self.high_water
-        self.high_water += size
-        return off
-
-    def free_block(self, off, size):
-        size = (size + self.align - 1) // self.align * self.align
-        if size == 0:
-            size = self.align
-        self.free.append([off, size])
-        self.free.sort()
-        merged = []
-        for blk in self.free:
-            if merged and merged[-1][0] + merged[-1][1] == blk[0]:
-                merged[-1][1] += blk[1]
-            else:
-                merged.append(blk)
-        self.free = merged
-
-
-# ---------------------------------------------------------------------------
 # Blob builder
 # ---------------------------------------------------------------------------
 
