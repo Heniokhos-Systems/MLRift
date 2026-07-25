@@ -1,0 +1,759 @@
+// tests/nn/nn_test_core.mlr — shared numeric-validation body for
+// std/nn_int8.mlr. Emits one decimal integer per line; the exact same line
+// sequence is produced independently by tests/nn/nn_ref.py.
+//
+// This file has NO main() and no I/O of its own: the including program must
+// define `nn_t_putc(u8 c)`. tests/nn/nn_host.mlr wires it to print_str,
+// tests/nn/nn_mcu.mlr wires it to the qemu lx60 16550 UART. Both then run
+// nn_t_run() and must produce byte-identical output.
+//
+// Everything that feeds a kernel goes through memory (static arrays), never
+// through a literal-only expression: the optimiser const-folds literal
+// expressions in 64 bits and the xtensa emitter rejects a folded value above
+// 0xFFFFFFFF. Keeping one operand dynamic sidesteps that entirely.
+
+import "../../std/nn_int8.mlr"
+
+static u8[256] nn_t_in
+static u8[64]  nn_t_in2
+static u8[256] nn_t_wt
+static u8[256] nn_t_out
+static i32[16] nn_t_bias
+static i32[16] nn_t_mult
+static i32[16] nn_t_shift
+static i32[64] nn_t_fx
+static u32 nn_t_seed = 0
+
+
+// ---------------------------------------------------------------------------
+// Output
+// ---------------------------------------------------------------------------
+
+fn nn_t_emit_u32(u32 v) {
+    if v == 0 {
+        nn_t_putc(48)
+        return
+    }
+    u32 div = 1000000000
+    u32 started = 0
+    while div > 0 {
+        u32 d = (v / div) % 10
+        if d != 0 { started = 1 }
+        if started != 0 { nn_t_putc(d + 48) }
+        div = div / 10
+    }
+}
+
+// Signed decimal + newline. INT32_MIN is handled by the negate-then-print-as-
+// unsigned path: 0 - INT32_MIN is 0x80000000 on both target classes.
+fn nn_t_emit(i32 v) {
+    i32 n = v
+    if n < 0 {
+        nn_t_putc(45)
+        n = 0 - n
+    }
+    u32 u = n
+    nn_t_emit_u32(u)
+    nn_t_putc(10)
+}
+
+
+// ---------------------------------------------------------------------------
+// Deterministic vectors — mirrored exactly by class Rng in nn_ref.py
+// ---------------------------------------------------------------------------
+
+fn nn_t_srand(u32 s) {
+    nn_t_seed = s
+}
+
+fn nn_t_r32() -> u32 {
+    u32 s = nn_t_seed
+    s = ((s * 1103515245) + 12345) & 0xFFFFFFFF
+    nn_t_seed = s
+    return s
+}
+
+fn nn_t_i8() -> i32 {
+    u32 v = nn_t_r32()
+    i32 r = (v >> 16) & 0xFF
+    return r - 128
+}
+
+fn nn_t_r30() -> u32 {
+    return (nn_t_r32() >> 2) & 0x3FFFFFFF
+}
+
+// TFLite normalises multipliers into [2^30, 2^31).
+fn nn_t_mult_v() -> i32 {
+    u32 m = 0x40000000 + (nn_t_r30() >> 1)
+    i32 r = m
+    return r
+}
+
+fn nn_t_shift_v() -> i32 {
+    u32 v = nn_t_r32() >> 28
+    i32 s = v % 12
+    return (0 - s) - 1
+}
+
+fn nn_t_bias_v() -> i32 {
+    u32 v = nn_t_r32()
+    i32 x = nn_u32_to_i32(v)
+    return x >> 20
+}
+
+
+// ---------------------------------------------------------------------------
+// Buffer helpers
+// ---------------------------------------------------------------------------
+
+fn nn_t_fill(u32 p, u32 n) {
+    u32 i = 0
+    while i < n {
+        nn_store_i8(p + i, nn_t_i8())
+        i = i + 1
+    }
+}
+
+fn nn_t_copy(u32 d, u32 s, u32 n) {
+    u32 i = 0
+    while i < n {
+        nn_store_i8(d + i, nn_load_i8(s + i))
+        i = i + 1
+    }
+}
+
+fn nn_t_dump(u32 p, u32 n) {
+    u32 i = 0
+    while i < n {
+        nn_t_emit(nn_load_i8(p + i))
+        i = i + 1
+    }
+}
+
+fn nn_t_fill_bias(u32 n) {
+    u32 p = nn_t_bias
+    u32 i = 0
+    while i < n {
+        nn_store_i32(p + (i * 4), nn_t_bias_v())
+        i = i + 1
+    }
+}
+
+fn nn_t_fill_mult(u32 n) {
+    u32 p = nn_t_mult
+    u32 i = 0
+    while i < n {
+        nn_store_i32(p + (i * 4), nn_t_mult_v())
+        i = i + 1
+    }
+}
+
+fn nn_t_fill_shift(u32 n) {
+    u32 p = nn_t_shift
+    u32 i = 0
+    while i < n {
+        nn_store_i32(p + (i * 4), nn_t_shift_v())
+        i = i + 1
+    }
+}
+
+fn nn_t_fx_set(u32 i, i32 v) {
+    u32 p = nn_t_fx
+    nn_store_i32(p + (i * 4), v)
+}
+
+fn nn_t_fx_get(u32 i) -> i32 {
+    u32 p = nn_t_fx
+    return nn_load_i32(p + (i * 4))
+}
+
+
+// ---------------------------------------------------------------------------
+// S1 — SaturatingRoundingDoublingHighMul
+// ---------------------------------------------------------------------------
+
+fn nn_t_s1_fx() {
+    i32 mn = nn_i32_min()
+    i32 mx = nn_i32_max()
+    i32 p30 = 1 << 30
+    i32 n30 = 0 - p30
+    i32 p30m1 = p30 - 1
+
+    nn_t_fx_set(0, p30)          nn_t_fx_set(1, p30)
+    nn_t_fx_set(2, n30)          nn_t_fx_set(3, p30)
+    nn_t_fx_set(4, mx)           nn_t_fx_set(5, mx)
+    nn_t_fx_set(6, mn)           nn_t_fx_set(7, mn)
+    nn_t_fx_set(8, mn)           nn_t_fx_set(9, mx)
+    nn_t_fx_set(10, mx)          nn_t_fx_set(11, mn)
+    nn_t_fx_set(12, 0)           nn_t_fx_set(13, 12345)
+    nn_t_fx_set(14, 12345)       nn_t_fx_set(15, 0)
+    nn_t_fx_set(16, 1)           nn_t_fx_set(17, 1)
+    nn_t_fx_set(18, 0 - 1)       nn_t_fx_set(19, 1)
+    nn_t_fx_set(20, 0 - 1)       nn_t_fx_set(21, 0 - 1)
+    nn_t_fx_set(22, 1)           nn_t_fx_set(23, 0 - 1)
+    nn_t_fx_set(24, 3)           nn_t_fx_set(25, 1431655765)
+    nn_t_fx_set(26, 0 - 3)       nn_t_fx_set(27, 1431655765)
+    nn_t_fx_set(28, 12345678)    nn_t_fx_set(29, 0 - 87654321)
+    nn_t_fx_set(30, mx)          nn_t_fx_set(31, 1)
+    nn_t_fx_set(32, mn)          nn_t_fx_set(33, 1)
+    nn_t_fx_set(34, mn)          nn_t_fx_set(35, 0 - 1)
+    nn_t_fx_set(36, 0x7FFFFFFF)  nn_t_fx_set(37, 0x40000000)
+    nn_t_fx_set(38, p30m1)       nn_t_fx_set(39, p30m1)
+}
+
+fn nn_t_s1() {
+    nn_t_s1_fx()
+    u32 i = 0
+    while i < 20 {
+        nn_t_emit(nn_srdhm(nn_t_fx_get(i * 2), nn_t_fx_get((i * 2) + 1)))
+        i = i + 1
+    }
+
+    nn_t_srand(12345)
+    u32 k = 0
+    while k < 64 {
+        i32 a = nn_u32_to_i32(nn_t_r32())
+        i32 b = nn_u32_to_i32(nn_t_r32())
+        nn_t_emit(nn_srdhm(a, b))
+        k = k + 1
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// S1b — the software multiply-high primitives themselves
+//
+// nn_umulhi32 is the crux of the whole library: these targets are 32-bit with
+// no i64 and the xtensa backend emits only MULL, so the 64-bit intermediate
+// that requantization needs has to come out of four 16-bit half-products.
+// 0xFFFFFFFF^2 is the pair that catches a carry dropped in the recombination.
+//
+// S1b RE-SEEDS with 12345 and re-walks the same 64 random pairs S1 used, so
+// srdhm and mulhi_i32 are compared on identical inputs.
+// ---------------------------------------------------------------------------
+
+fn nn_t_s1b() {
+    // Unsigned pairs live in nn_t_fx as raw bit patterns.
+    nn_t_fx_set(0, nn_u32_to_i32(0xFFFFFFFF))  nn_t_fx_set(1, nn_u32_to_i32(0xFFFFFFFF))
+    nn_t_fx_set(2, 0x12345678)                 nn_t_fx_set(3, nn_u32_to_i32(0x9ABCDEF0))
+    nn_t_fx_set(4, 1000000)                    nn_t_fx_set(5, 1000000)
+    nn_t_fx_set(6, 0)                          nn_t_fx_set(7, nn_u32_to_i32(0xFFFFFFFF))
+    nn_t_fx_set(8, 1)                          nn_t_fx_set(9, nn_u32_to_i32(0xFFFFFFFF))
+    nn_t_fx_set(10, nn_u32_to_i32(0x80000000)) nn_t_fx_set(11, nn_u32_to_i32(0x80000000))
+    nn_t_fx_set(12, 0xFFFF)                    nn_t_fx_set(13, 0xFFFF)
+    nn_t_fx_set(14, 0x10000)                   nn_t_fx_set(15, 0x10000)
+    nn_t_fx_set(16, nn_u32_to_i32(0xFFFFFFFF)) nn_t_fx_set(17, 1)
+    nn_t_fx_set(18, 0x7FFFFFFF)                nn_t_fx_set(19, nn_u32_to_i32(0x80000001))
+
+    u32 i = 0
+    while i < 10 {
+        u32 a = nn_i32_to_u32(nn_t_fx_get(i * 2))
+        u32 b = nn_i32_to_u32(nn_t_fx_get((i * 2) + 1))
+        nn_t_emit_u32(nn_umulhi32(a, b))
+        nn_t_putc(10)
+        nn_t_emit_u32(nn_umullo32(a, b))
+        nn_t_putc(10)
+        i = i + 1
+    }
+
+    // Signed mulhi over the same fixed pairs S1 used.
+    nn_t_s1_fx()
+    i = 0
+    while i < 20 {
+        nn_t_emit(nn_mulhi_i32(nn_t_fx_get(i * 2), nn_t_fx_get((i * 2) + 1)))
+        i = i + 1
+    }
+
+    nn_t_srand(12345)
+    u32 k = 0
+    while k < 64 {
+        i32 a = nn_u32_to_i32(nn_t_r32())
+        i32 b = nn_u32_to_i32(nn_t_r32())
+        nn_t_emit(nn_mulhi_i32(a, b))
+        k = k + 1
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// S2 — RoundingDivideByPOT, ties and negatives
+// ---------------------------------------------------------------------------
+
+fn nn_t_s2() {
+    i32 mn = nn_i32_min()
+    i32 mx = nn_i32_max()
+
+    nn_t_fx_set(0, 1)            nn_t_fx_set(1, 1)
+    nn_t_fx_set(2, 0 - 1)        nn_t_fx_set(3, 1)
+    nn_t_fx_set(4, 2)            nn_t_fx_set(5, 1)
+    nn_t_fx_set(6, 0 - 2)        nn_t_fx_set(7, 1)
+    nn_t_fx_set(8, 3)            nn_t_fx_set(9, 1)
+    nn_t_fx_set(10, 0 - 3)       nn_t_fx_set(11, 1)
+    nn_t_fx_set(12, 4)           nn_t_fx_set(13, 2)
+    nn_t_fx_set(14, 0 - 4)       nn_t_fx_set(15, 2)
+    nn_t_fx_set(16, 5)           nn_t_fx_set(17, 2)
+    nn_t_fx_set(18, 0 - 5)       nn_t_fx_set(19, 2)
+    nn_t_fx_set(20, 6)           nn_t_fx_set(21, 2)
+    nn_t_fx_set(22, 0 - 6)       nn_t_fx_set(23, 2)
+    nn_t_fx_set(24, 7)           nn_t_fx_set(25, 2)
+    nn_t_fx_set(26, 0 - 7)       nn_t_fx_set(27, 2)
+    nn_t_fx_set(28, 0)           nn_t_fx_set(29, 5)
+    nn_t_fx_set(30, 1)           nn_t_fx_set(31, 31)
+    nn_t_fx_set(32, 0 - 1)       nn_t_fx_set(33, 31)
+    nn_t_fx_set(34, mx)          nn_t_fx_set(35, 31)
+    nn_t_fx_set(36, mn)          nn_t_fx_set(37, 31)
+    nn_t_fx_set(38, 12345)       nn_t_fx_set(39, 3)
+    nn_t_fx_set(40, 0 - 12345)   nn_t_fx_set(41, 3)
+    nn_t_fx_set(42, 128)         nn_t_fx_set(43, 8)
+    nn_t_fx_set(44, 0 - 128)     nn_t_fx_set(45, 8)
+    nn_t_fx_set(46, 192)         nn_t_fx_set(47, 8)
+    nn_t_fx_set(48, 0 - 192)     nn_t_fx_set(49, 8)
+
+    u32 i = 0
+    while i < 25 {
+        i32 x = nn_t_fx_get(i * 2)
+        i32 e = nn_t_fx_get((i * 2) + 1)
+        u32 eu = e
+        nn_t_emit(nn_rdbpot(x, eu))
+        i = i + 1
+    }
+
+    nn_t_srand(777)
+    u32 k = 0
+    while k < 48 {
+        i32 x = nn_u32_to_i32(nn_t_r32())
+        u32 e = nn_t_r32() % 32
+        nn_t_emit(nn_rdbpot(x, e))
+        k = k + 1
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// S3 — MultiplyByQuantizedMultiplier
+// ---------------------------------------------------------------------------
+
+fn nn_t_s3() {
+    nn_t_srand(4242)
+    u32 k = 0
+    while k < 64 {
+        i32 xr = nn_u32_to_i32(nn_t_r32())
+        i32 x = xr >> 8
+        i32 m = nn_t_mult_v()
+        i32 s = nn_t_shift_v()
+        nn_t_emit(nn_mul_by_qm(x, m, s))
+        k = k + 1
+    }
+    k = 0
+    while k < 16 {
+        i32 xr = nn_u32_to_i32(nn_t_r32())
+        i32 x = xr >> 20
+        i32 m = nn_t_mult_v()
+        u32 sv = nn_t_r32() >> 28
+        i32 s = (sv % 4) + 1
+        nn_t_emit(nn_mul_by_qm(x, m, s))
+        k = k + 1
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// S4 — requantize to int8, including saturation
+// ---------------------------------------------------------------------------
+
+fn nn_t_s4() {
+    nn_t_srand(99991)
+    u32 k = 0
+    while k < 48 {
+        i32 ar = nn_u32_to_i32(nn_t_r32())
+        i32 acc = ar >> 10
+        i32 m = nn_t_mult_v()
+        i32 s = nn_t_shift_v()
+        nn_t_emit(nn_requantize(acc, m, s))
+        k = k + 1
+    }
+
+    i32 mn = nn_i32_min()
+    i32 mx = nn_i32_max()
+    i32 p30 = 1 << 30
+    i32 p20 = 1 << 20
+    nn_t_fx_set(0, p30)
+    nn_t_fx_set(1, 0 - p30)
+    nn_t_fx_set(2, mx)
+    nn_t_fx_set(3, mn)
+    nn_t_fx_set(4, p20)
+    nn_t_fx_set(5, 0 - p20)
+    u32 i = 0
+    while i < 6 {
+        i32 mm = 1 << 30
+        i32 ss = 0 - 1
+        nn_t_emit(nn_requantize(nn_t_fx_get(i), mm, ss))
+        i = i + 1
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// S5 — requantize with zero point and activation range
+// ---------------------------------------------------------------------------
+
+fn nn_t_s5() {
+    nn_t_srand(31337)
+    u32 k = 0
+    while k < 32 {
+        i32 ar = nn_u32_to_i32(nn_t_r32())
+        i32 acc = ar >> 12
+        i32 m = nn_t_mult_v()
+        i32 s = nn_t_shift_v()
+        i32 zp = 0 - 5
+        i32 lo = 0 - 128
+        nn_t_emit(nn_requantize_zp(acc, m, s, zp, lo, 127))
+        k = k + 1
+    }
+    k = 0
+    while k < 32 {
+        i32 ar = nn_u32_to_i32(nn_t_r32())
+        i32 acc = ar >> 12
+        i32 m = nn_t_mult_v()
+        i32 s = nn_t_shift_v()
+        nn_t_emit(nn_requantize_zp(acc, m, s, 7, 7, 127))
+        k = k + 1
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// S6/S7 — conv2d
+// ---------------------------------------------------------------------------
+
+fn nn_t_s6() {
+    u32 ip = nn_t_in
+    u32 wp = nn_t_wt
+    u32 op = nn_t_out
+    u32 bp = nn_t_bias
+    u32 mp = nn_t_mult
+    u32 sp = nn_t_shift
+
+    // 5x5x2 input, 3x3 kernel, stride 1, pad 1, 3 output channels, per-channel
+    nn_t_srand(2026)
+    nn_t_fill(ip, 50)
+    nn_t_fill(wp, 54)
+    nn_t_fill_bias(3)
+    nn_t_fill_mult(3)
+    nn_t_fill_shift(3)
+    i32 izp = 0 - 3
+    i32 lo = 0 - 128
+    nn_conv2d_int8(ip, 5, 5, 2, izp, wp, 3, 3, bp, mp, sp, 1, op, 3, 11,
+                   1, 1, 1, 1, lo, 127)
+    nn_t_dump(op, 75)
+}
+
+fn nn_t_s7() {
+    u32 ip = nn_t_in
+    u32 wp = nn_t_wt
+    u32 op = nn_t_out
+    u32 bp = nn_t_bias
+    u32 mp = nn_t_mult
+    u32 sp = nn_t_shift
+
+    // 6x6x2 input, 3x3 kernel, stride 2, pad 0, 2 output channels, per-tensor
+    nn_t_srand(60606)
+    nn_t_fill(ip, 72)
+    nn_t_fill(wp, 36)
+    nn_t_fill_bias(2)
+    nn_t_fill_mult(1)
+    nn_t_fill_shift(1)
+    i32 ozp = 0 - 8
+    i32 lo = 0 - 128
+    nn_conv2d_int8(ip, 6, 6, 2, 5, wp, 3, 3, bp, mp, sp, 0, op, 2, ozp,
+                   2, 2, 0, 0, lo, 127)
+    nn_t_dump(op, 8)
+}
+
+
+// ---------------------------------------------------------------------------
+// S8 — depthwise conv2d
+// ---------------------------------------------------------------------------
+
+fn nn_t_s8a() {
+    u32 ip = nn_t_in
+    u32 wp = nn_t_wt
+    u32 op = nn_t_out
+    u32 bp = nn_t_bias
+    u32 mp = nn_t_mult
+    u32 sp = nn_t_shift
+
+    // 5x5x3, 3x3, stride 1, pad 1, depth multiplier 1
+    nn_t_srand(808)
+    nn_t_fill(ip, 75)
+    nn_t_fill(wp, 27)
+    nn_t_fill_bias(3)
+    nn_t_fill_mult(3)
+    nn_t_fill_shift(3)
+    i32 izp = 0 - 12
+    i32 lo = 0 - 128
+    nn_depthwise_conv2d_int8(ip, 5, 5, 3, izp, wp, 3, 3, bp, mp, sp, 1, op, 4,
+                             1, 1, 1, 1, 1, lo, 127)
+    nn_t_dump(op, 75)
+}
+
+fn nn_t_s8b() {
+    u32 ip = nn_t_in
+    u32 wp = nn_t_wt
+    u32 op = nn_t_out
+    u32 bp = nn_t_bias
+    u32 mp = nn_t_mult
+    u32 sp = nn_t_shift
+
+    // 4x4x2, 3x3, stride 2, pad 1, depth multiplier 2  -> 2x2x4
+    nn_t_srand(80808)
+    nn_t_fill(ip, 32)
+    nn_t_fill(wp, 36)
+    nn_t_fill_bias(4)
+    nn_t_fill_mult(4)
+    nn_t_fill_shift(4)
+    i32 ozp = 0 - 2
+    i32 lo = 0 - 128
+    nn_depthwise_conv2d_int8(ip, 4, 4, 2, 0, wp, 3, 3, bp, mp, sp, 1, op, ozp,
+                             2, 2, 1, 1, 2, lo, 127)
+    nn_t_dump(op, 16)
+}
+
+
+// ---------------------------------------------------------------------------
+// S9 — 1x1 pointwise conv
+// ---------------------------------------------------------------------------
+
+fn nn_t_s9() {
+    u32 ip = nn_t_in
+    u32 wp = nn_t_wt
+    u32 op = nn_t_out
+    u32 bp = nn_t_bias
+    u32 mp = nn_t_mult
+    u32 sp = nn_t_shift
+
+    nn_t_srand(1111)
+    nn_t_fill(ip, 48)
+    nn_t_fill(wp, 12)
+    nn_t_fill_bias(4)
+    nn_t_fill_mult(4)
+    nn_t_fill_shift(4)
+    i32 lo = 0 - 128
+    nn_pointwise_conv_int8(ip, 4, 4, 3, 6, wp, bp, mp, sp, 1, op, 4, 0,
+                           lo, 127)
+    nn_t_dump(op, 64)
+}
+
+
+// ---------------------------------------------------------------------------
+// S10/S11 — gemv and gemm
+// ---------------------------------------------------------------------------
+
+fn nn_t_s10() {
+    u32 ip = nn_t_in
+    u32 wp = nn_t_wt
+    u32 op = nn_t_out
+    u32 bp = nn_t_bias
+    u32 mp = nn_t_mult
+    u32 sp = nn_t_shift
+
+    nn_t_srand(51515)
+    nn_t_fill(ip, 16)
+    nn_t_fill(wp, 80)
+    nn_t_fill_bias(5)
+    nn_t_fill_mult(5)
+    nn_t_fill_shift(5)
+    i32 xzp = 0 - 9
+    i32 lo = 0 - 128
+    nn_gemv_int8(ip, 16, xzp, wp, 5, bp, mp, sp, 1, op, 3, lo, 127)
+    nn_t_dump(op, 5)
+}
+
+fn nn_t_s11() {
+    u32 ip = nn_t_in
+    u32 wp = nn_t_wt
+    u32 op = nn_t_out
+    u32 bp = nn_t_bias
+    u32 mp = nn_t_mult
+    u32 sp = nn_t_shift
+
+    nn_t_srand(383838)
+    nn_t_fill(ip, 24)
+    nn_t_fill(wp, 32)
+    nn_t_fill_bias(4)
+    nn_t_fill_mult(4)
+    nn_t_fill_shift(4)
+    i32 ozp = 0 - 1
+    i32 lo = 0 - 128
+    nn_gemm_int8(ip, 3, 8, 2, wp, 4, bp, mp, sp, 1, op, ozp, lo, 127)
+    nn_t_dump(op, 12)
+}
+
+
+// ---------------------------------------------------------------------------
+// S12/S13 — pooling
+// ---------------------------------------------------------------------------
+
+fn nn_t_s12() {
+    u32 ip = nn_t_in
+    u32 op = nn_t_out
+    i32 lo = 0 - 128
+
+    nn_t_srand(1234567)
+    nn_t_fill(ip, 50)
+
+    nn_maxpool_int8(ip, 5, 5, 2, op, 2, 2, 2, 2, 0, 0, lo, 127)
+    nn_t_dump(op, 8)
+    nn_maxpool_int8(ip, 5, 5, 2, op, 3, 3, 2, 2, 1, 1, lo, 127)
+    nn_t_dump(op, 18)
+    nn_avgpool_int8(ip, 5, 5, 2, op, 2, 2, 2, 2, 0, 0, lo, 127)
+    nn_t_dump(op, 8)
+    nn_avgpool_int8(ip, 5, 5, 2, op, 3, 3, 2, 2, 1, 1, lo, 127)
+    nn_t_dump(op, 18)
+}
+
+
+// ---------------------------------------------------------------------------
+// S14 — activations
+// ---------------------------------------------------------------------------
+
+fn nn_t_s14() {
+    u32 ip = nn_t_in
+    u32 op = nn_t_out
+
+    nn_t_srand(20260724)
+    nn_t_fill(ip, 24)
+
+    nn_t_copy(op, ip, 24)
+    i32 zp = 0 - 7
+    nn_relu_int8(op, 24, zp)
+    nn_t_dump(op, 24)
+
+    nn_t_copy(op, ip, 24)
+    nn_relu6_int8(op, 24, 3, 100)
+    nn_t_dump(op, 24)
+}
+
+
+// ---------------------------------------------------------------------------
+// S15 — quantized elementwise add
+// ---------------------------------------------------------------------------
+
+fn nn_t_s15() {
+    u32 ap = nn_t_in
+    u32 bp = nn_t_in2
+    u32 op = nn_t_out
+
+    nn_t_srand(555)
+    nn_t_fill(ap, 24)
+    nn_t_fill(bp, 24)
+
+    i32 m = 1 << 30
+    i32 azp = 0 - 2
+    i32 as_ = 0 - 1
+    i32 bs = 0 - 2
+    i32 os = 0 - 20
+    i32 lo = 0 - 128
+    nn_add_int8(ap, azp, m, as_, bp, 4, m, bs, op, 6, m, os, 24, 20, lo, 127)
+    nn_t_dump(op, 24)
+}
+
+
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// S16 — end-to-end detector-shaped stack
+//
+//   8x8x1 int8 "image"
+//     -> conv 3x3 stride 2 pad 1, 4 channels      -> 4x4x4
+//     -> relu (quantized domain, zero point 0)
+//     -> depthwise 3x3 stride 1 pad 1             -> 4x4x4
+//     -> pointwise 1x1, 2 channels                -> 4x4x2
+//     -> global average pool 4x4                  -> 1x1x2
+//
+// The WEIGHTS ARE SYNTHETIC (pseudo-random). This exercises the shape of a
+// tiny MobileNet-style face-detection head and proves the stack composes on
+// an MCU; it is NOT a trained detector and the two output values mean nothing.
+//
+// Buffer plan inside the 256-byte scratch tensors (no aliasing between the
+// input and output of any stage):
+//   nn_t_wt  +0   conv weights (36)   +64 depthwise (36)   +128 pointwise (8)
+//   nn_t_out +0   conv/relu (64)      +64 depthwise (64)
+//            +128 pointwise (32)      +160 pooled (2)
+// ---------------------------------------------------------------------------
+
+fn nn_t_s16() {
+    u32 ip = nn_t_in
+    u32 wp = nn_t_wt
+    u32 op = nn_t_out
+    u32 bp = nn_t_bias
+    u32 mp = nn_t_mult
+    u32 sp = nn_t_shift
+    i32 lo = 0 - 128
+
+    nn_t_srand(777001)
+    nn_t_fill(ip, 64)
+
+    // stage 1 — conv 3x3 stride 2 pad 1, 1 -> 4 channels
+    nn_t_fill(wp, 36)
+    nn_t_fill_bias(4)
+    nn_t_fill_mult(4)
+    nn_t_fill_shift(4)
+    i32 izp = 0 - 5
+    nn_conv2d_int8(ip, 8, 8, 1, izp, wp, 3, 3, bp, mp, sp, 1, op, 4, 0,
+                   2, 2, 1, 1, lo, 127)
+
+    // stage 2 — ReLU in the quantized domain (output zero point is 0)
+    nn_relu_int8(op, 64, 0)
+
+    // stage 3 — depthwise 3x3 stride 1 pad 1
+    u32 wp2 = wp + 64
+    u32 op2 = op + 64
+    nn_t_fill(wp2, 36)
+    nn_t_fill_bias(4)
+    nn_t_fill_mult(4)
+    nn_t_fill_shift(4)
+    nn_depthwise_conv2d_int8(op, 4, 4, 4, 0, wp2, 3, 3, bp, mp, sp, 1, op2, 0,
+                             1, 1, 1, 1, 1, lo, 127)
+
+    // stage 4 — pointwise 1x1, 4 -> 2 channels
+    u32 wp3 = wp + 128
+    u32 op3 = op + 128
+    nn_t_fill(wp3, 8)
+    nn_t_fill_bias(2)
+    nn_t_fill_mult(2)
+    nn_t_fill_shift(2)
+    nn_pointwise_conv_int8(op2, 4, 4, 4, 0, wp3, bp, mp, sp, 1, op3, 2, 0,
+                           lo, 127)
+
+    // stage 5 — global average pool
+    u32 op4 = op + 160
+    nn_avgpool_int8(op3, 4, 4, 2, op4, 4, 4, 4, 4, 0, 0, lo, 127)
+
+    nn_t_dump(op, 64)
+    nn_t_dump(op2, 64)
+    nn_t_dump(op3, 32)
+    nn_t_dump(op4, 2)
+}
+
+
+fn nn_t_run() {
+    nn_t_s1()
+    nn_t_s1b()
+    nn_t_s2()
+    nn_t_s3()
+    nn_t_s4()
+    nn_t_s5()
+    nn_t_s6()
+    nn_t_s7()
+    nn_t_s8a()
+    nn_t_s8b()
+    nn_t_s9()
+    nn_t_s10()
+    nn_t_s11()
+    nn_t_s12()
+    nn_t_s14()
+    nn_t_s15()
+    nn_t_s16()
+}
