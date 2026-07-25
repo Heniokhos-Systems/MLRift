@@ -1,0 +1,370 @@
+// MLRift Standard Library — int8 CNN model runner
+// ===========================================================================
+//
+// A layer walker that executes a converted int8 CNN out of a flat binary
+// container, driving the kernels in std/nn_int8.mlr. It runs identically on
+// x86_64, riscv32 and xtensa.
+//
+// ---------------------------------------------------------------------------
+// What this file deliberately does NOT do
+// ---------------------------------------------------------------------------
+//   * It does not parse JSON, or any text. The container is fixed-offset
+//     little-endian binary; every field is one load32 at a constant offset.
+//   * It does not allocate. The caller hands it one activation arena; the
+//     offset of every intermediate tensor inside that arena was decided
+//     OFFLINE by tools/ml/onnx_to_mlrift.py --emit-binary and is baked into
+//     the layer records.
+//   * It does not infer shapes. Every extent is a field.
+//   * It uses no u64, no i64 and no floats, so it survives riscv32/xtensa
+//     sema unchanged.
+//
+// ---------------------------------------------------------------------------
+// Memory model — where the arena has to live
+// ---------------------------------------------------------------------------
+// As in nn_int8.mlr, every buffer is a u32 address. On the HOST that means
+// the arena and the model image must be `static` arrays: statics land near
+// 0x400000, which fits in u32, while the stack and alloc()'s mmap results do
+// not. On an MCU they are .bss and .rodata anyway.
+//
+// The arena is ONE contiguous buffer of nn_model_arena_bytes() bytes.
+//
+// Why one arena and not a literal two-buffer ping-pong: a ping-pong is a
+// special case of an offline liveness assignment, and it is not general
+// enough for this class of model. YuNet's FPN neck adds a skip tensor
+// produced 19 layers earlier, and three of its neck outputs each feed five
+// consumers, so "the previous layer's output" is not the only thing that has
+// to stay alive. The converter therefore runs a greedy-by-size memory
+// planner (the same algorithm TFLite Micro uses) over the tensor lifetimes
+// and emits absolute offsets. On YuNet@128 that assignment IS a ping-pong for
+// the backbone — the two large feature maps sit at arena+0 and arena+65536
+// and alternate — with the skip and multi-consumer tensors tucked into the
+// gaps, and it costs strictly less memory than a hand-rolled A/B/side split
+// would. The target still does zero allocation: it reads three constants per
+// layer.
+//
+// ---------------------------------------------------------------------------
+// Layout-only ops
+// ---------------------------------------------------------------------------
+// Transpose and Reshape are recorded as OP_NOP and cost nothing at run time.
+// This is not a cheat: the converter checks that each one is genuinely a
+// relabelling of the SAME bytes in our layout, and refuses to convert the
+// model otherwise. For an ONNX graph in NCHW, a Transpose with perm
+// (0,2,3,1) is precisely "reinterpret as NHWC", and our tensors are already
+// NHWC; the Reshapes that follow flatten [1,H,W,C] to [1,H*W,C], which is the
+// same flat order. Both therefore alias their input's buffer. On YuNet all
+// 24 of them fold away and NOTHING has to be materialised. A layout change
+// that is not a relabelling would be emitted as OP_COPY, which does move
+// bytes — the converter has never had to emit one for this model.
+//
+// ===========================================================================
+// FORMAT SPECIFICATION  (KRNN, version 1)
+// ---------------------------------------------------------------------------
+// This block is duplicated VERBATIM in tools/ml/krnn.py, which is what writes
+// the file. If you change one, change the other: the runner reads every field
+// by fixed byte offset and has no way to notice that the emitter has drifted.
+//
+// Everything is little-endian. There is no string data, no varints, no
+// alignment padding beyond what is written below, and nothing that requires
+// an allocator or a parser.
+//
+//   file = header (64 B)
+//        | layer records (layer_count * 160 B)
+//        | output records (output_count * 16 B)
+//        | blob (weights, biases, multipliers, shifts, LUTs)
+//
+// --- header, 64 bytes ---------------------------------------------------
+//   0x00 u32  magic          'K','R','N','N' = 0x4E4E524B
+//   0x04 u32  version        1
+//   0x08 u32  layer_count
+//   0x0C u32  arena_bytes    peak activation arena the runner needs
+//   0x10 u32  layers_off     byte offset of the layer table
+//   0x14 u32  layer_stride   bytes per layer record (160)
+//   0x18 u32  outputs_off    byte offset of the output table
+//   0x1C u32  output_count
+//   0x20 u32  blob_off       byte offset of the parameter blob
+//   0x24 u32  blob_bytes
+//   0x28 u32  input_off      arena offset the caller writes the input to
+//   0x2C u32  input_h
+//   0x30 u32  input_w
+//   0x34 u32  input_c
+//   0x38 i32  input_zp       zero point of the input quantisation
+//   0x3C u32  input_scale_q16  round(input_scale * 65536), informational
+//
+// --- layer record, 160 bytes -------------------------------------------
+//   0x00 u32  op             see the opcode table below
+//   0x04 u32  in0_off        arena offset of input A
+//   0x08 u32  in1_off        arena offset of input B (Add only)
+//   0x0C u32  out_off        arena offset of the output
+//   0x10 u32  in_h
+//   0x14 u32  in_w
+//   0x18 u32  in_c
+//   0x1C u32  out_h
+//   0x20 u32  out_w
+//   0x24 u32  out_c
+//   0x28 u32  kh             kernel / pool height   (Resize: unused)
+//   0x2C u32  kw
+//   0x30 u32  stride_h       (Resize: integer H scale factor)
+//   0x34 u32  stride_w       (Resize: integer W scale factor)
+//   0x38 u32  pad_h          symmetric padding
+//   0x3C u32  pad_w
+//   0x40 u32  depth_mult     depthwise depth multiplier
+//   0x44 u32  q_stride       1 = per-channel requant, 0 = per-tensor
+//   0x48 u32  w_off          blob offset of the int8 weights   (NONE = 0xFFFFFFFF)
+//   0x4C u32  bias_off       blob offset of the int32 biases   (NONE)
+//   0x50 u32  mult_off       blob offset of the int32 mults    (NONE)
+//   0x54 u32  shift_off      blob offset of the int32 shifts   (NONE)
+//   0x58 i32  in_zp          zero point of input A
+//   0x5C i32  out_zp
+//   0x60 i32  act_min        output clamp, quantised domain
+//   0x64 i32  act_max
+//   0x68 u32  n_elem         out_h * out_w * out_c (elementwise ops use it)
+//   0x6C i32  in1_zp         zero point of input B (Add)
+//   0x70 i32  a_mult         Add: rescale A onto the common scale
+//   0x74 i32  a_shift
+//   0x78 i32  b_mult         Add: rescale B
+//   0x7C i32  b_shift
+//   0x80 i32  o_mult         Add: rescale the sum onto the output scale
+//   0x84 i32  o_shift
+//   0x88 u32  left_shift     Add: TFLite's intermediate left shift (20)
+//   0x8C u32  lut_off        blob offset of a 256-byte int8 LUT (NONE)
+//   0x90 u32  flags          bit 0 = this layer's output is a graph output
+//   0x94 u32  reserved0
+//   0x98 u32  reserved1
+//   0x9C u32  reserved2
+//
+//   Every `shift` field uses TFLite's SIGNED convention, which is what
+//   nn_mul_by_qm() consumes: POSITIVE shifts the input left first, NEGATIVE
+//   divides the product right afterwards.
+//
+// --- output record, 16 bytes -------------------------------------------
+//   0x00 u32  arena_off
+//   0x04 u32  n_elem
+//   0x08 i32  zero_point
+//   0x0C u32  scale_q16      round(scale * 65536); dequantise on the host
+//
+// --- opcodes ------------------------------------------------------------
+//   0  NOP          layout-only Transpose/Reshape; output aliases the input
+//   1  CONV2D       nn_conv2d_int8
+//   2  DEPTHWISE    nn_depthwise_conv2d_int8
+//   3  POINTWISE    nn_pointwise_conv_int8 (1x1, stride 1, no pad)
+//   4  RELU         nn_relu_int8, in place (in0_off == out_off)
+//   5  MAXPOOL      nn_maxpool_int8
+//   6  ADD          nn_add_int8
+//   7  RESIZE_NN    nn_resize_nearest_int8
+//   8  SIGMOID_LUT  nn_sigmoid_lut_int8
+//   9  COPY         nn_copy_i8 (a materialised layout change)
+//  10  AVGPOOL      nn_avgpool_int8
+// ===========================================================================
+
+import "nn_int8.mlr"
+
+
+// ---------------------------------------------------------------------------
+// Header accessors
+// ---------------------------------------------------------------------------
+
+fn nn_model_magic() -> u32 {
+    u32 m = 0x4E4E524B
+    return m
+}
+
+fn nn_model_none() -> u32 {
+    u32 v = 0xFFFFFFFF
+    return v
+}
+
+// 0 = usable. 1 = not a KRNN file. 2 = version we do not speak.
+// 3 = layer record stride we were not compiled against.
+fn nn_model_check(u32 m) -> u32 {
+    if load32(m) != nn_model_magic() { return 1 }
+    if load32(m + 4) != 1 { return 2 }
+    if load32(m + 20) != 160 { return 3 }
+    return 0
+}
+
+fn nn_model_layer_count(u32 m) -> u32 { return load32(m + 8) }
+fn nn_model_arena_bytes(u32 m) -> u32 { return load32(m + 12) }
+fn nn_model_output_count(u32 m) -> u32 { return load32(m + 28) }
+fn nn_model_input_off(u32 m) -> u32 { return load32(m + 40) }
+fn nn_model_input_h(u32 m) -> u32 { return load32(m + 44) }
+fn nn_model_input_w(u32 m) -> u32 { return load32(m + 48) }
+fn nn_model_input_c(u32 m) -> u32 { return load32(m + 52) }
+fn nn_model_input_zp(u32 m) -> i32 { return nn_load_i32(m + 56) }
+fn nn_model_input_scale_q16(u32 m) -> u32 { return load32(m + 60) }
+
+fn nn_model_layer_rec(u32 m, u32 i) -> u32 {
+    return m + load32(m + 16) + (i * load32(m + 20))
+}
+
+fn nn_model_layer_op(u32 m, u32 i) -> u32 {
+    return load32(nn_model_layer_rec(m, i))
+}
+
+// Arena offset and element count of layer i's output. Exposed so a host
+// harness can dump ANY intermediate tensor and bisect a divergence, which is
+// the only practical way to debug a 106-layer graph.
+fn nn_model_layer_out_off(u32 m, u32 i) -> u32 {
+    return load32(nn_model_layer_rec(m, i) + 12)
+}
+
+fn nn_model_layer_n_elem(u32 m, u32 i) -> u32 {
+    return load32(nn_model_layer_rec(m, i) + 104)
+}
+
+fn nn_model_output_rec(u32 m, u32 i) -> u32 {
+    return m + load32(m + 24) + (i * 16)
+}
+
+fn nn_model_output_off(u32 m, u32 i) -> u32 {
+    return load32(nn_model_output_rec(m, i))
+}
+
+fn nn_model_output_n(u32 m, u32 i) -> u32 {
+    return load32(nn_model_output_rec(m, i) + 4)
+}
+
+fn nn_model_output_zp(u32 m, u32 i) -> i32 {
+    return nn_load_i32(nn_model_output_rec(m, i) + 8)
+}
+
+fn nn_model_output_scale_q16(u32 m, u32 i) -> u32 {
+    return load32(nn_model_output_rec(m, i) + 12)
+}
+
+
+// ---------------------------------------------------------------------------
+// Layer dispatch
+// ---------------------------------------------------------------------------
+
+// A blob offset of 0xFFFFFFFF means "absent"; the kernels spell that as a
+// null pointer (they already treat bias_p == 0 as "no bias").
+fn nn_model_blob_ptr(u32 blob, u32 off) -> u32 {
+    if off == nn_model_none() { return 0 }
+    return blob + off
+}
+
+fn nn_model_exec(u32 r, u32 arena, u32 blob) {
+    u32 op = load32(r)
+    if op == 0 { return }
+
+    u32 in0 = arena + load32(r + 4)
+    u32 out = arena + load32(r + 12)
+    u32 in_h = load32(r + 16)
+    u32 in_w = load32(r + 20)
+    u32 in_c = load32(r + 24)
+    u32 out_c = load32(r + 36)
+    i32 in_zp = nn_load_i32(r + 88)
+    i32 out_zp = nn_load_i32(r + 92)
+    i32 act_min = nn_load_i32(r + 96)
+    i32 act_max = nn_load_i32(r + 100)
+    u32 n_elem = load32(r + 104)
+
+    if op == 4 {
+        // nn_relu_int8 is in place. The planner aliases the output onto the
+        // input whenever the producer's value is dead afterwards, which is
+        // every Relu in YuNet; when it cannot, move the bytes first.
+        if in0 != out { nn_copy_i8(out, in0, n_elem) }
+        nn_relu_int8(out, n_elem, in_zp)
+        return
+    }
+    if op == 8 {
+        nn_sigmoid_lut_int8(in0, n_elem,
+                            nn_model_blob_ptr(blob, load32(r + 140)), out)
+        return
+    }
+    if op == 9 {
+        nn_copy_i8(out, in0, n_elem)
+        return
+    }
+    if op == 7 {
+        nn_resize_nearest_int8(in0, in_h, in_w, in_c, out,
+                               load32(r + 48), load32(r + 52))
+        return
+    }
+    if op == 6 {
+        nn_add_int8(in0, in_zp, nn_load_i32(r + 112), nn_load_i32(r + 116),
+                    arena + load32(r + 8), nn_load_i32(r + 108),
+                    nn_load_i32(r + 120), nn_load_i32(r + 124),
+                    out, out_zp, nn_load_i32(r + 128), nn_load_i32(r + 132),
+                    n_elem, load32(r + 136), act_min, act_max)
+        return
+    }
+    if op == 5 {
+        nn_maxpool_int8(in0, in_h, in_w, in_c, out,
+                        load32(r + 40), load32(r + 44),
+                        load32(r + 48), load32(r + 52),
+                        load32(r + 56), load32(r + 60),
+                        act_min, act_max)
+        return
+    }
+    if op == 10 {
+        nn_avgpool_int8(in0, in_h, in_w, in_c, out,
+                        load32(r + 40), load32(r + 44),
+                        load32(r + 48), load32(r + 52),
+                        load32(r + 56), load32(r + 60),
+                        act_min, act_max)
+        return
+    }
+
+    u32 w_p = nn_model_blob_ptr(blob, load32(r + 72))
+    u32 bias_p = nn_model_blob_ptr(blob, load32(r + 76))
+    u32 mult_p = nn_model_blob_ptr(blob, load32(r + 80))
+    u32 shift_p = nn_model_blob_ptr(blob, load32(r + 84))
+    u32 q_stride = load32(r + 68)
+
+    if op == 3 {
+        nn_pointwise_conv_int8(in0, in_h, in_w, in_c, in_zp,
+                               w_p, bias_p, mult_p, shift_p, q_stride,
+                               out, out_c, out_zp, act_min, act_max)
+        return
+    }
+    if op == 2 {
+        nn_depthwise_conv2d_int8(in0, in_h, in_w, in_c, in_zp,
+                                 w_p, load32(r + 40), load32(r + 44),
+                                 bias_p, mult_p, shift_p, q_stride,
+                                 out, out_zp,
+                                 load32(r + 48), load32(r + 52),
+                                 load32(r + 56), load32(r + 60),
+                                 load32(r + 64), act_min, act_max)
+        return
+    }
+    if op == 1 {
+        nn_conv2d_int8(in0, in_h, in_w, in_c, in_zp,
+                       w_p, load32(r + 40), load32(r + 44),
+                       bias_p, mult_p, shift_p, q_stride,
+                       out, out_c, out_zp,
+                       load32(r + 48), load32(r + 52),
+                       load32(r + 56), load32(r + 60),
+                       act_min, act_max)
+        return
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Entry points
+// ---------------------------------------------------------------------------
+
+// Run layers [0, n_layers). The caller must already have written the
+// quantised input to arena + nn_model_input_off(m).
+// Returns 0 on success, or the nn_model_check() code.
+fn nn_model_run_prefix(u32 m, u32 arena, u32 n_layers) -> u32 {
+    u32 bad = nn_model_check(m)
+    if bad != 0 { return bad }
+    u32 lay = m + load32(m + 16)
+    u32 stride = load32(m + 20)
+    u32 blob = m + load32(m + 32)
+    u32 total = nn_model_layer_count(m)
+    u32 n = n_layers
+    if n > total { n = total }
+    u32 i = 0
+    while i < n {
+        nn_model_exec(lay + (i * stride), arena, blob)
+        i = i + 1
+    }
+    return 0
+}
+
+fn nn_model_run(u32 m, u32 arena) -> u32 {
+    return nn_model_run_prefix(m, arena, nn_model_layer_count(m))
+}

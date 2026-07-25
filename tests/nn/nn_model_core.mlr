@@ -1,0 +1,160 @@
+// tests/nn/nn_model_core.mlr — shared body for the std/nn_model.mlr runner
+// validation. Emits one signed decimal integer per line: every element of
+// every graph output, in graph-output order. tools/ml/int8_sim.py produces
+// the same line sequence independently, and the two must be EQUAL, not close.
+//
+// This file has no main() and no I/O of its own: the including program must
+// define `nn_mt_putc(u8 c)`. tests/nn/nn_model_host.mlr wires it to
+// print_str and reads the .krnn from a file; tests/nn/nn_model_mcu.mlr wires
+// it to the qemu lx60 16550 UART and gets the model from a generated static
+// blob. Both must produce byte-identical output.
+//
+// The input frame is GENERATED, not baked: a 3-line LCG that Python mirrors
+// exactly (tools/ml/gen_frame.py). Baking a 49 KB frame into the MCU image
+// as store8 literals would have cost more code than the model itself, and a
+// pseudorandom frame exercises more of the int8 dynamic range than a photo
+// does anyway. The example (examples/nn/yunet_detect.mlr) uses a real image.
+
+import "../../std/nn_model.mlr"
+
+// 192 KiB. YuNet@128 needs 131072; the runner refuses to start if the model
+// asks for more than this, rather than silently scribbling past the end.
+static u8[196608] nn_mt_arena
+static u32 nn_mt_seed = 12345
+
+
+fn nn_mt_arena_p() -> u32 {
+    return nn_mt_arena
+}
+
+fn nn_mt_arena_cap() -> u32 {
+    u32 v = 196608
+    return v
+}
+
+
+// ---------------------------------------------------------------------------
+// Output
+// ---------------------------------------------------------------------------
+
+fn nn_mt_emit_u32(u32 v) {
+    if v == 0 {
+        nn_mt_putc(48)
+        return
+    }
+    u32 div = 1000000000
+    u32 started = 0
+    while div > 0 {
+        u32 d = (v / div) % 10
+        if d != 0 { started = 1 }
+        if started != 0 { nn_mt_putc(d + 48) }
+        div = div / 10
+    }
+}
+
+fn nn_mt_emit(i32 v) {
+    i32 n = v
+    if n < 0 {
+        nn_mt_putc(45)
+        n = 0 - n
+    }
+    u32 u = n
+    nn_mt_emit_u32(u)
+    nn_mt_putc(10)
+}
+
+fn nn_mt_str(u32 s) {
+    u32 i = 0
+    u32 c = load8(s + i)
+    while c != 0 {
+        nn_mt_putc(c)
+        i = i + 1
+        c = load8(s + i)
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Deterministic input frame — mirrored exactly by tools/ml/gen_frame.py
+// ---------------------------------------------------------------------------
+
+fn nn_mt_rand() -> u32 {
+    u32 s = nn_mt_seed
+    s = ((s * 1103515245) + 12345) & 0xFFFFFFFF
+    nn_mt_seed = s
+    return s
+}
+
+fn nn_mt_fill_input(u32 m) {
+    nn_mt_seed = 12345
+    u32 p = nn_mt_arena + nn_model_input_off(m)
+    u32 n = nn_model_input_h(m) * nn_model_input_w(m) * nn_model_input_c(m)
+    u32 i = 0
+    while i < n {
+        u32 v = (nn_mt_rand() >> 16) & 0xFF
+        store8(p + i, v)
+        i = i + 1
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Run
+// ---------------------------------------------------------------------------
+
+// Dump every element of every graph output as a signed decimal, one per line.
+fn nn_mt_emit_outputs(u32 m) {
+    u32 no = nn_model_output_count(m)
+    u32 o = 0
+    while o < no {
+        u32 p = nn_mt_arena + nn_model_output_off(m, o)
+        u32 n = nn_model_output_n(m, o)
+        u32 i = 0
+        while i < n {
+            nn_mt_emit(nn_load_i8(p + i))
+            i = i + 1
+        }
+        o = o + 1
+    }
+}
+
+// Dump layer `k`'s output tensor instead. Used to bisect a divergence.
+fn nn_mt_emit_layer(u32 m, u32 k) {
+    u32 p = nn_mt_arena + nn_model_layer_out_off(m, k)
+    u32 n = nn_model_layer_n_elem(m, k)
+    u32 i = 0
+    while i < n {
+        nn_mt_emit(nn_load_i8(p + i))
+        i = i + 1
+    }
+}
+
+// Run the first `n_layers` layers (pass a huge value for "all") and emit.
+// `dump_layer` selects a single layer's output when `dump_all` is 0.
+// Returns 0 on success.
+fn nn_mt_run(u32 m, u32 n_layers, u32 dump_all, u32 dump_layer) -> u32 {
+    u32 bad = nn_model_check(m)
+    if bad != 0 {
+        nn_mt_str("ERR:model ")
+        nn_mt_emit(bad)
+        return bad
+    }
+    if nn_model_arena_bytes(m) > nn_mt_arena_cap() {
+        nn_mt_str("ERR:arena ")
+        nn_mt_emit(nn_model_arena_bytes(m))
+        return 4
+    }
+    nn_mt_fill_input(m)
+    bad = nn_model_run_prefix(m, nn_mt_arena, n_layers)
+    if bad != 0 {
+        nn_mt_str("ERR:run ")
+        nn_mt_emit(bad)
+        return bad
+    }
+    if dump_all != 0 {
+        nn_mt_emit_outputs(m)
+    } else {
+        nn_mt_emit_layer(m, dump_layer)
+    }
+    return 0
+}

@@ -1,0 +1,84 @@
+// tests/nn/nn_model_host.mlr — host driver for the std/nn_model.mlr runner
+// validation.
+//
+//   nn_model_host <model.krnn> [n_layers] [dump_layer]
+//
+// n_layers   how many layers to execute (default: all)
+// dump_layer if present, dump ONLY that layer's output tensor instead of the
+//            graph outputs — the bisection lever for a divergence
+//
+// Output must be byte-identical to tests/nn/nn_model_mcu.mlr under qemu and
+// to tools/ml/int8_sim.py.
+import "nn_model_core.mlr"
+import "../../std/io.mlr"
+
+// The .krnn is read into a static because every pointer in nn_int8.mlr /
+// nn_model.mlr is a u32: statics live near 0x400000, alloc()'s mmap results
+// do not fit in 32 bits. 256 KiB covers YuNet@128 (89304 bytes) with room.
+static u8[262144] nn_mh_model
+static u8[2] nn_mh_cbuf
+
+// Opt in to the compiler's argc/argv plumbing: declaring these two names
+// makes main()'s prologue populate them. Host-only, which is why they are
+// here and not in nn_model_core.mlr — the MCU driver must stay u64-free.
+static u64 cli_argc = 0
+static u64 cli_argv = 0
+
+fn nn_mt_putc(u8 c) {
+    u32 p = nn_mh_cbuf
+    store8(p, c)
+    store8(p + 1, 0)
+    print_str(p)
+}
+
+fn nn_mh_arg(u64 i) -> u64 {
+    if i >= cli_argc { return 0 }
+    u64 slot = cli_argv + i * 8
+    u64 a = 0
+    unsafe { *(slot as u64) -> a }
+    return a
+}
+
+// Decimal parse; returns `dflt` for a missing argument.
+fn nn_mh_num(u64 i, u64 dflt) -> u64 {
+    u64 s = nn_mh_arg(i)
+    if s == 0 { return dflt }
+    u64 v = 0
+    u64 k = 0
+    u64 c = load8(s)
+    while c >= 48 && c <= 57 {
+        v = v * 10 + (c - 48)
+        k = k + 1
+        c = load8(s + k)
+    }
+    if k == 0 { return dflt }
+    return v
+}
+
+fn main() {
+    u64 path = nn_mh_arg(1)
+    if path == 0 {
+        println_str("usage: nn_model_host <model.krnn> [n_layers] [dump_layer]")
+        exit(2)
+    }
+    u64 fd = file_open(path, 0)
+    if is_errno(fd) != 0 {
+        println_str("cannot open model")
+        exit(2)
+    }
+    u64 size = file_size(fd)
+    if size > 262144 {
+        println_str("model larger than the static model buffer")
+        exit(2)
+    }
+    file_read(fd, nn_mh_model, size)
+    file_close(fd)
+
+    u64 nlay = nn_mh_num(2, 1000000)
+    u64 dump_layer = nn_mh_num(3, 4294967295)
+    u32 dump_all = 1
+    if dump_layer != 4294967295 { dump_all = 0 }
+
+    u32 rc = nn_mt_run(nn_mh_model, nlay, dump_all, dump_layer)
+    exit(rc)
+}

@@ -765,6 +765,16 @@ fn nn_relu6_int8(u32 p, u32 n, i32 zp, i32 six_q) {
 // Section 7 — elementwise
 // ---------------------------------------------------------------------------
 
+// Byte copy, used when a layout change has to be materialised rather than
+// folded into the tensor's interpretation.
+fn nn_copy_i8(u32 dst, u32 src, u32 n) {
+    u32 i = 0
+    while i < n {
+        store8(dst + i, load8(src + i))
+        i = i + 1
+    }
+}
+
 // Quantized elementwise add (the residual connection), TFLite's AddGeneral:
 // both inputs are shifted left by `left_shift` (20 in TFLite's own kernels)
 // so the two rescalings can be done without losing precision, summed, then
@@ -793,6 +803,93 @@ fn nn_add_int8(u32 a_p, i32 a_zp, i32 a_mult, i32 a_shift,
         i32 ov = nn_mul_by_qm(sum, o_mult, o_shift) + out_zp
         ov = nn_clamp_i32(ov, act_min, act_max)
         nn_store_i8(out_p + i, ov)
+        i = i + 1
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Section 8 — resize
+// ---------------------------------------------------------------------------
+
+// Nearest-neighbour upsample of an NHWC int8 tensor by INTEGER scale factors.
+//
+// This is ONNX Resize with mode=nearest, nearest_mode=floor and
+// coordinate_transformation_mode=asymmetric, which is the combination every
+// FPN-style detector neck uses (YuNet included) and the only one that is a
+// pure gather. Asymmetric maps x_in = x_out / scale, and with an integer
+// scale the floor is exact, so this is index arithmetic and a byte copy —
+// no interpolation, no requantization, and the output inherits the input's
+// scale and zero point unchanged.
+//
+// Non-integer scales are NOT supported: they would need a division per
+// output pixel and a rounding rule that ONNX specifies in floating point.
+// The caller (the offline converter) rejects them.
+fn nn_resize_nearest_int8(u32 in_p, u32 in_h, u32 in_w, u32 in_c,
+                          u32 out_p, u32 scale_h, u32 scale_w) {
+    if scale_h == 0 { return }
+    if scale_w == 0 { return }
+    u32 out_h = in_h * scale_h
+    u32 out_w = in_w * scale_w
+    u32 oy = 0
+    while oy < out_h {
+        u32 iy = oy / scale_h
+        if iy >= in_h { iy = in_h - 1 }
+        u32 src_row = in_p + ((iy * in_w) * in_c)
+        u32 dst_row = out_p + ((oy * out_w) * in_c)
+        u32 ox = 0
+        while ox < out_w {
+            u32 ix = ox / scale_w
+            if ix >= in_w { ix = in_w - 1 }
+            u32 s = src_row + (ix * in_c)
+            u32 d = dst_row + (ox * in_c)
+            u32 c = 0
+            while c < in_c {
+                store8(d + c, load8(s + c))
+                c = c + 1
+            }
+            ox = ox + 1
+        }
+        oy = oy + 1
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Section 9 — table-driven activations
+// ---------------------------------------------------------------------------
+
+// Apply a 256-entry int8 -> int8 lookup table elementwise.
+//
+// WHY A TABLE, and why the decision was not "threshold in logit space":
+//
+// An int8 tensor has 256 possible values, so ANY elementwise function of it —
+// sigmoid, tanh, swish — is fully described by 256 bytes. The table is built
+// offline by the converter from the tensor's own input scale/zero-point and
+// its output scale/zero-point, so it is not an approximation of the reference
+// pipeline, it IS the reference pipeline evaluated at every input it can ever
+// see. That makes the on-target result bit-identical to the float-expf host
+// simulator by construction, costs one load per element, and puts no expf,
+// no floats and no polynomial minimax anywhere near the MCU.
+//
+// The alternative — never computing sigmoid at all and comparing pre-sigmoid
+// logits against logit(threshold), which works because sigmoid is monotonic —
+// is cheaper still and is genuinely viable for ranking anchors. It was
+// rejected as the default because the model's DECLARED outputs are
+// post-sigmoid probabilities: a runner that silently emitted logits would
+// produce tensors that do not match the model's own contract, and any
+// downstream consumer that mixes cls and obj scores multiplicatively (as
+// YuNet's detection post-processing does) needs the actual probabilities,
+// not an order-isomorphic surrogate. 256 bytes per Sigmoid node — 1536 bytes
+// for the whole of YuNet — is not a price worth arguing about.
+//
+// Index: an int8 value q maps to table entry q + 128, i.e. -128 -> 0.
+fn nn_sigmoid_lut_int8(u32 in_p, u32 n, u32 lut_p, u32 out_p) {
+    u32 i = 0
+    while i < n {
+        u32 v = load8(in_p + i) & 0xFF
+        u32 idx = (v + 128) & 0xFF
+        store8(out_p + i, load8(lut_p + idx))
         i = i + 1
     }
 }
