@@ -1,0 +1,56 @@
+// tests/nn/nn_model_mcu.mlr — freestanding xtensa driver for the
+// std/nn_model.mlr runner validation. Same body as tests/nn/nn_model_host.mlr;
+// only where the model comes from and where characters go differ.
+//
+// Build + run:
+//   mlrc --arch=xtensa --freestanding tests/nn/nn_model_mcu.mlr -o /tmp/nn.elf
+//   qemu-system-xtensa -M lx60 -nographic -kernel /tmp/nn.elf \
+//       -device loader,file=model.krnn,addr=0x00800000,force-raw=on
+//
+// THE MODEL IS NOT BAKED INTO THE IMAGE, and that is deliberate:
+//
+//   * On real silicon you do not compile a model into .text. It lives in a
+//     flash partition at a known address and the runner is handed a pointer.
+//     nn_model_run() never writes to the model and never assumes where it is,
+//     so "flash partition" and "qemu -device loader" are the same thing.
+//   * Baking it is also not possible here at this size. MLRift has no
+//     include_bytes; the compiler's string pool caps at 65536 bytes total and
+//     array statics take no initialiser, so a baked model becomes ~19 bytes of
+//     store32 code per 4 model bytes (tools/ml/krnn_to_mlr.py does exactly
+//     that). For YuNet's 89 KB that is a ~590 KB image — and XT_STACK_TOP is
+//     pinned at 0xd0040000, i.e. 256 KiB into the load window, so the initial
+//     stack grows straight down into the text of any image bigger than that.
+//     The symptom is a hang partway through the fill with no diagnostic. Keep
+//     freestanding xtensa images under ~200 KiB.
+//
+// qemu's generic loader takes a PHYSICAL address. The dc232b boots with the
+// cached kernel window mapping 0xd0000000 -> 0x00000000, which is why the
+// image loads at 0xd0000000 but the model is placed at 0x00800000 and read
+// back through 0xd0800000.
+//
+// The lx60 UART is a 16550 at 0xfd050020 (thr u32 @0x00, lsr u8 @0x14) — NOT
+// the ESP32's 0x3FF40000. Spin until the TX holding register is empty (LSR
+// bit 5) before writing, or characters are dropped.
+import "nn_model_core.mlr"
+
+device Uart at 0xfd050020 {
+    thr at 0x00 : u32
+    lsr at 0x14 : u8
+}
+
+fn nn_mt_putc(u8 c) {
+    while (Uart.lsr & 0x20) == 0 { }
+    Uart.thr = c
+}
+
+// Freestanding: there is nothing to return to. Falling off the end of main
+// executes whatever follows it in .text, which silently produces no output.
+fn main() {
+    u32 model = 0xd0800000
+    nn_mt_run(model, 1000000, 1, 0)
+    nn_mt_putc(69)
+    nn_mt_putc(78)
+    nn_mt_putc(68)
+    nn_mt_putc(10)
+    loop { }
+}

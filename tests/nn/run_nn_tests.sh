@@ -144,3 +144,109 @@ if [ "$BUILD_OK" = 1 ]; then
 else
     echo "FAIL: nn_build_mcu"
 fi
+
+# ---------------------------------------------------------------------------
+# 6. The model runner (std/nn_model.mlr) on a synthetic .krnn
+# ---------------------------------------------------------------------------
+# tests/nn/nn_model_ref.py builds a small model covering every opcode and
+# says what running it must print. It needs only the standard library — no
+# ONNX, no numpy, no model file — so this runs everywhere the kernel test
+# does. The 106-node YuNet check that proves the NUMBERS on a real graph is
+# opt-in below via NN_KRNN_MODEL.
+#
+# The model is NOT baked into the MCU images: qemu's generic loader drops it
+# at a fixed address, which is what a flash partition is on real silicon.
+# xtensa's loader address is PHYSICAL (0x00800000, read back through the
+# dc232b cached window at 0xd0800000); riscv32 machine mode has no
+# translation so 0x81000000 is both.
+XT_MODEL_PADDR=0x00800000
+RV_MODEL_PADDR=0x81000000
+
+run_krnn() {
+    # run_krnn <label> <model.krnn> <expected.txt>
+    local label="$1" model="$2" expected="$3"
+    local n
+    n=$(wc -l < "$expected" | tr -d ' ')
+
+    if ! $MLRC --arch="$(uname -m)" "$DIR/nn_model_host.mlr" \
+            -o "$TMP/nm_host" > "$TMP/nmhost.txt" 2>&1; then
+        echo "FAIL: ${label}_host (build failed)"
+        head -5 "$TMP/nmhost.txt"
+        return
+    fi
+    chmod +x "$TMP/nm_host"
+    "$TMP/nm_host" "$model" > "$TMP/nm_host.txt" 2>&1
+    if cmp -s "$expected" "$TMP/nm_host.txt"; then
+        echo "PASS: ${label}_host ($n values exactly equal to the reference)"
+    else
+        echo "FAIL: ${label}_host (output != reference)"
+        diff "$expected" "$TMP/nm_host.txt" | head -10
+    fi
+
+    if ! command -v qemu-system-xtensa > /dev/null 2>&1; then
+        echo "SKIP: ${label}_xtensa (no qemu-system-xtensa)"
+    elif ! $MLRC --arch=xtensa --freestanding "$DIR/nn_model_mcu.mlr" \
+            -o "$TMP/nm_xt.elf" > "$TMP/nmxt.txt" 2>&1; then
+        echo "FAIL: ${label}_xtensa (build failed)"
+        head -5 "$TMP/nmxt.txt"
+    else
+        qemu_until_end "$TMP/nm_xt.txt" \
+            qemu-system-xtensa -M lx60 -nographic -kernel "$TMP/nm_xt.elf" \
+            -device "loader,file=$model,addr=$XT_MODEL_PADDR,force-raw=on"
+        head -n "$n" "$TMP/nm_xt.txt" > "$TMP/nm_xtvals.txt"
+        if ! grep -q '^END$' "$TMP/nm_xt.txt"; then
+            echo "FAIL: ${label}_xtensa (image did not reach END under qemu)"
+        elif cmp -s "$expected" "$TMP/nm_xtvals.txt"; then
+            echo "PASS: ${label}_xtensa ($n values byte-identical to host and reference)"
+        else
+            echo "FAIL: ${label}_xtensa (output != reference)"
+            diff "$expected" "$TMP/nm_xtvals.txt" | head -10
+        fi
+    fi
+
+    if ! command -v qemu-system-riscv32 > /dev/null 2>&1; then
+        echo "SKIP: ${label}_riscv32 (no qemu-system-riscv32)"
+    elif ! $MLRC --arch=riscv32 --freestanding "$DIR/nn_model_mcu_riscv.mlr" \
+            -o "$TMP/nm_rv.bin" > "$TMP/nmrv.txt" 2>&1; then
+        echo "FAIL: ${label}_riscv32 (build failed)"
+        head -5 "$TMP/nmrv.txt"
+    else
+        qemu_until_end "$TMP/nm_rv.txt" \
+            qemu-system-riscv32 -M virt -nographic -bios "$TMP/nm_rv.bin" \
+            -device "loader,file=$model,addr=$RV_MODEL_PADDR,force-raw=on"
+        head -n "$n" "$TMP/nm_rv.txt" > "$TMP/nm_rvvals.txt"
+        if ! grep -q '^END$' "$TMP/nm_rv.txt"; then
+            echo "FAIL: ${label}_riscv32 (image did not reach END under qemu)"
+        elif cmp -s "$expected" "$TMP/nm_rvvals.txt"; then
+            echo "PASS: ${label}_riscv32 ($n values byte-identical to host and reference)"
+        else
+            echo "FAIL: ${label}_riscv32 (output != reference)"
+            diff "$expected" "$TMP/nm_rvvals.txt" | head -10
+        fi
+    fi
+}
+
+if ! command -v python3 > /dev/null 2>&1; then
+    echo "SKIP: nn_model_host (no python3 for the reference)"
+    echo "SKIP: nn_model_xtensa (no python3 for the reference)"
+    echo "SKIP: nn_model_riscv32 (no python3 for the reference)"
+elif ! python3 "$DIR/nn_model_ref.py" "$TMP/smoke.krnn" \
+        > "$TMP/smoke_expected.txt" 2> "$TMP/smokeerr.txt"; then
+    echo "FAIL: nn_model_host (reference nn_model_ref.py failed)"
+    head -5 "$TMP/smokeerr.txt"
+else
+    run_krnn nn_model "$TMP/smoke.krnn" "$TMP/smoke_expected.txt"
+fi
+
+# ---------------------------------------------------------------------------
+# 7. OPT-IN: the same runner on a real converted graph
+# ---------------------------------------------------------------------------
+# Set NN_KRNN_MODEL to a .krnn produced by
+#   tools/ml/onnx_to_mlrift.py <model.onnx> -o <pfx> \
+#       --emit-binary <out.krnn> --ranges <ranges.json>
+# and NN_KRNN_EXPECTED to the matching int8_sim.py dump rendered one decimal
+# per line (tools/ml/README.md spells out the two commands). Skipped when
+# unset, because the ONNX model and its calibration are not in this repo.
+if [ -n "$NN_KRNN_MODEL" ] && [ -n "$NN_KRNN_EXPECTED" ]; then
+    run_krnn nn_krnn "$NN_KRNN_MODEL" "$NN_KRNN_EXPECTED"
+fi

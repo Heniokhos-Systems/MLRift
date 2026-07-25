@@ -253,6 +253,14 @@ class Blob:
         self.buf += arr.astype("int8").tobytes()
         return off
 
+    # numpy-free variant, so tests/nn/nn_model_ref.py can build a model with
+    # nothing but the standard library.
+    def add_i8_list(self, values):
+        off = len(self.buf)
+        for v in values:
+            self.buf += struct.pack("<b", int(v))
+        return off
+
     def add_i32(self, values):
         self._align(4)
         off = len(self.buf)
