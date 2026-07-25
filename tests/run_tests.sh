@@ -4843,6 +4843,39 @@ else
     echo "  esp32_krc_identity: SKIP (no KernRift checkout with a built build/krc2 next door)"
 fi
 
+# ---------------------------------------------------------------------------
+# int8 quantized NN kernels (std/nn_int8.mlr)
+#
+# Numeric validation, not a smoke test: tests/nn/nn_ref.py is an independent
+# Python implementation of the gemmlowp/TFLite integer arithmetic that uses
+# native 64-bit products, and the kernels — which have no 64-bit type at all
+# on the MCU targets and synthesise the 32x32 high product from 16-bit halves
+# — must match it EXACTLY. The same 896 values are then re-derived on a
+# freestanding xtensa image (qemu -M lx60) and a freestanding riscv32 image
+# (qemu -M virt) and compared byte for byte.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- int8 NN kernels (std/nn_int8.mlr) ---"
+while IFS= read -r NN_LINE; do
+    case "$NN_LINE" in
+        PASS:*)
+            TOTAL=$((TOTAL + 1)); PASS=$((PASS + 1))
+            NN_REST="${NN_LINE#PASS: }"
+            echo "  ${NN_REST%% *}: PASS ${NN_REST#* }"
+            ;;
+        FAIL:*)
+            TOTAL=$((TOTAL + 1)); FAIL=$((FAIL + 1))
+            echo "FAIL: ${NN_LINE#FAIL: }"
+            ;;
+        SKIP:*)
+            echo "  ${NN_LINE#SKIP: } SKIPPED"
+            ;;
+        *)
+            echo "    $NN_LINE"
+            ;;
+    esac
+done < <(MLRC="$MLRC" bash "$DIR/nn/run_nn_tests.sh" 2>&1)
+
 # --- Summary ---
 echo ""
 echo "=== Results: $PASS/$TOTAL passed, $FAIL failed ==="
