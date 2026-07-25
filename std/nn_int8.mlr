@@ -1,0 +1,798 @@
+// MLRift Standard Library — int8 quantized neural-network kernels
+// ===========================================================================
+//
+// A TFLite-Micro-compatible int8 inference kernel set written in plain MLRift.
+// It compiles and runs identically on x86_64 (host), riscv32 and xtensa.
+//
+// ---------------------------------------------------------------------------
+// Why every line of this file is integer-only and 32-bit-only
+// ---------------------------------------------------------------------------
+// riscv32 and xtensa reject `u64`/`i64` and every float type at sema
+// (src/analysis.mlr). There is therefore:
+//
+//   * NO 64-bit integer anywhere. The 64-bit intermediate that int8
+//     requantization fundamentally needs (a 32x32 product) is carried as an
+//     explicit (hi, lo) pair of u32 and built from 16-bit half-products —
+//     see nn_umulhi32. The xtensa backend emits only MULL (no MULUH/MULSH),
+//     so a hardware multiply-high is not available even where the ISA has one.
+//
+//   * NO floats. Quantization scales are (int32 multiplier, int32 shift)
+//     fixed-point pairs exactly as TFLite stores them. Producing that pair
+//     from a float scale is an offline/host job; on-device we only consume it.
+//
+// ---------------------------------------------------------------------------
+// Host / MCU bit-exactness — the one rule that makes it work
+// ---------------------------------------------------------------------------
+// On x86_64 every MLRift variable lives in a 64-bit slot, so `u32` arithmetic
+// does NOT wrap at 32 bits; on riscv32/xtensa it does. Any expression that can
+// exceed 32 bits is therefore masked with `& 0xFFFFFFFF` explicitly. The mask
+// is a no-op on the 32-bit targets and forces the host to agree with them.
+// Signed values are converted through nn_u32_to_i32 / nn_i32_to_u32 rather
+// than being reinterpreted implicitly. Verified: x86_64, xtensa (qemu lx60)
+// and riscv32 (qemu virt) all produce byte-identical output, and that output
+// is exactly equal to an independent Python reference written from the
+// gemmlowp/TFLite definitions with native 64-bit products (tests/nn/).
+//
+// Compiler gotcha, learned the hard way: an expression whose operands are ALL
+// literals is const-folded in 64 bits, and a folded value above 0xFFFFFFFF is
+// rejected by the xtensa emitter ("64-bit constant not supported"). Never
+// write e.g. `shr(0 - 9, 1)` with two literals; keep one operand dynamic.
+//
+// ---------------------------------------------------------------------------
+// Pointers
+// ---------------------------------------------------------------------------
+// MLRift has no pointer type; addresses are plain integers. Every buffer here
+// is a `u32` address plus explicit dimensions.
+//
+// On the 32-bit targets that is the native width. ON THE HOST, a u32 address
+// means tensors MUST live in `static` arrays: MLRift places statics in the
+// data section around 0x400000, which fits in 32 bits, whereas the stack
+// (~0x7fff_ffff_xxxx) and alloc()'s mmap results do not. This is also the
+// right thing on an MCU, where all tensors are static .bss anyway.
+//
+// ---------------------------------------------------------------------------
+// Tensor memory layout (stated, because it is a choice)
+// ---------------------------------------------------------------------------
+// Batch is always 1. All layouts match TFLite's.
+//
+//   activations       int8   NHWC : [H][W][C]
+//                            index = ((h * W) + w) * C + c
+//
+//   conv2d weights    int8   OHWI : [out_c][kh][kw][in_c]
+//                            index = (((oc * kh) + i) * kw + j) * in_c + ic
+//
+//   depthwise weights int8   1HWC : [1][kh][kw][out_c],
+//                            out_c = in_c * depth_multiplier
+//                            index = ((i * kw) + j) * out_c + oc
+//                            oc    = ic * depth_multiplier + m
+//
+//   gemv / gemm B     int8   row-major [N][K] (i.e. already transposed:
+//                            each output n owns a contiguous K-vector)
+//
+//   bias              int32  [out_c]                (little-endian words)
+//   multiplier        int32  [out_c]  or  [1]
+//   shift             int32  [out_c]  or  [1]
+//
+// `q_stride` selects between per-channel and per-tensor quantization:
+//   q_stride = 1  ->  multiplier[oc], shift[oc]   (per channel)
+//   q_stride = 0  ->  multiplier[0],  shift[0]    (per tensor)
+//
+// Output spatial extent is NOT a parameter of the spatial kernels; it is
+// always nn_out_dim(in, k, stride, pad) — for both convolutions and both
+// poolings. Two reasons: it removes a whole class of caller bug (a mismatched
+// out_h silently walks off the end of the output tensor), and the xtensa
+// backend allows at most 22 call arguments (6 registers + 16 overflow slots),
+// which a fully explicit conv2d signature exceeds. Call nn_out_dim yourself
+// to size the output buffer. Padding is symmetric (`pad` on both sides); the
+// asymmetric half of TFLite's SAME padding is not modelled.
+//
+// Padding is implicit-zero in the REAL domain, which in the quantized domain
+// means the padded input value equals in_zp, so (in_val - in_zp) * w == 0.
+// The kernels therefore simply skip out-of-bounds taps — that is exact, not an
+// approximation.
+//
+// A bias pointer of 0 means "no bias".
+//
+// ---------------------------------------------------------------------------
+// Numerics
+// ---------------------------------------------------------------------------
+// Requantization follows gemmlowp / TFLite exactly:
+//
+//   MultiplyByQuantizedMultiplier(x, m, s)
+//     = RoundingDivideByPOT(
+//           SaturatingRoundingDoublingHighMul(x << max(s,0), m),
+//           max(-s, 0))
+//
+// SaturatingRoundingDoublingHighMul computes (a*b + nudge) / 2^31 over a true
+// 64-bit product with C truncation-toward-zero, saturating the single
+// INT32_MIN * INT32_MIN case to INT32_MAX. RoundingDivideByPOT rounds half
+// AWAY FROM ZERO (its negative-value threshold bump is what makes -1.5 go to
+// -2 rather than -1). Both are reproduced bit-for-bit below.
+// ===========================================================================
+
+
+// ---------------------------------------------------------------------------
+// Section 1 — 32-bit fixed-point core
+// ---------------------------------------------------------------------------
+
+fn nn_i32_max() -> i32 {
+    i32 v = 2147483647
+    return v
+}
+
+fn nn_i32_min() -> i32 {
+    u32 b = 0x80000000
+    return nn_u32_to_i32(b)
+}
+
+// Reinterpret a 32-bit pattern as a signed 32-bit integer.
+// On the 32-bit targets this is the identity on the bits; on the host it is
+// the sign extension the hardware would have done for free.
+fn nn_u32_to_i32(u32 v) -> i32 {
+    u32 x = v & 0xFFFFFFFF
+    if (x & 0x80000000) == 0 {
+        i32 p = x
+        return p
+    }
+    // magnitude = (~x) + 1; for x == 0x80000000 this is 0x80000000 and the
+    // negation below lands exactly on INT32_MIN on both target classes.
+    u32 mag = (x ^ 0xFFFFFFFF) + 1
+    i32 r = mag
+    return 0 - r
+}
+
+// Reinterpret a signed 32-bit integer as its 32-bit pattern.
+fn nn_i32_to_u32(i32 v) -> u32 {
+    u32 p = v
+    return p & 0xFFFFFFFF
+}
+
+// |v| as an unsigned 32-bit magnitude. |INT32_MIN| == 0x80000000 is exact.
+fn nn_abs_u32(i32 v) -> u32 {
+    if v < 0 {
+        i32 n = 0 - v
+        return nn_i32_to_u32(n)
+    }
+    return nn_i32_to_u32(v)
+}
+
+// High 32 bits of a 32x32 unsigned product, from four 16-bit half-products.
+// No intermediate here can exceed 32 bits, so no masking is needed and the
+// host agrees with the 32-bit targets for free (0xFFFFFFFF^2 included).
+fn nn_umulhi32(u32 a, u32 b) -> u32 {
+    u32 x = a & 0xFFFFFFFF
+    u32 y = b & 0xFFFFFFFF
+    u32 al = x & 0xFFFF
+    u32 ah = x >> 16
+    u32 bl = y & 0xFFFF
+    u32 bh = y >> 16
+    u32 lo = al * bl
+    u32 m1 = ah * bl
+    u32 m2 = al * bh
+    u32 t = (lo >> 16) + (m1 & 0xFFFF) + (m2 & 0xFFFF)
+    return ah * bh + (m1 >> 16) + (m2 >> 16) + (t >> 16)
+}
+
+// Low 32 bits of a 32x32 unsigned product.
+fn nn_umullo32(u32 a, u32 b) -> u32 {
+    u32 x = a & 0xFFFFFFFF
+    u32 y = b & 0xFFFFFFFF
+    return (x * y) & 0xFFFFFFFF
+}
+
+// High 32 bits of a 32x32 SIGNED product.
+// Computed from the magnitude product and then negated as a 64-bit (hi, lo)
+// pair. The usual `umulhi - (a<0 ? b : 0) - (b<0 ? a : 0)` correction is
+// deliberately avoided: it relies on 32-bit wrap-around, which the host
+// does not do.
+fn nn_mulhi_i32(i32 a, i32 b) -> i32 {
+    u32 ua = nn_abs_u32(a)
+    u32 ub = nn_abs_u32(b)
+    u32 hi = nn_umulhi32(ua, ub)
+    u32 lo = nn_umullo32(ua, ub)
+
+    u32 neg = 0
+    if a < 0 { neg = 1 }
+    if b < 0 { neg = neg ^ 1 }
+    if hi == 0 {
+        if lo == 0 { neg = 0 }
+    }
+    if neg == 1 {
+        u32 carry = 0
+        if lo == 0 { carry = 1 }
+        u32 nlo = ((lo ^ 0xFFFFFFFF) + 1) & 0xFFFFFFFF
+        u32 nhi = ((hi ^ 0xFFFFFFFF) + carry) & 0xFFFFFFFF
+        lo = nlo
+        hi = nhi
+    }
+    return nn_u32_to_i32(hi)
+}
+
+// gemmlowp SaturatingRoundingDoublingHighMul:
+//   nudge   = (a*b >= 0) ? 2^30 : 1 - 2^30
+//   result  = (int32)((a*b + nudge) / 2^31)     // C truncation toward zero
+//   INT32_MIN * INT32_MIN saturates to INT32_MAX
+fn nn_srdhm(i32 a, i32 b) -> i32 {
+    u32 ua = nn_abs_u32(a)
+    u32 ub = nn_abs_u32(b)
+
+    // |a| == 2^31 only for INT32_MIN, so this is exactly the overflow case.
+    if ua == 0x80000000 {
+        if ub == 0x80000000 { return nn_i32_max() }
+    }
+
+    u32 hi = nn_umulhi32(ua, ub)
+    u32 lo = nn_umullo32(ua, ub)
+
+    u32 neg = 0
+    if a < 0 { neg = 1 }
+    if b < 0 { neg = neg ^ 1 }
+    if hi == 0 {
+        if lo == 0 { neg = 0 }
+    }
+    if neg == 1 {
+        u32 carry = 0
+        if lo == 0 { carry = 1 }
+        u32 nlo = ((lo ^ 0xFFFFFFFF) + 1) & 0xFFFFFFFF
+        u32 nhi = ((hi ^ 0xFFFFFFFF) + carry) & 0xFFFFFFFF
+        lo = nlo
+        hi = nhi
+    }
+
+    // nudge as a sign-extended 64-bit addend:
+    //   +2^30           -> (0x00000000, 0x40000000)
+    //   1 - 2^30        -> (0xFFFFFFFF, 0xC0000001)
+    u32 add_hi = 0
+    u32 add_lo = 0x40000000
+    if neg == 1 {
+        add_hi = 0xFFFFFFFF
+        add_lo = 0xC0000001
+    }
+    u32 slo = (lo + add_lo) & 0xFFFFFFFF
+    u32 c2 = 0
+    if slo < lo { c2 = 1 }
+    u32 shi = (hi + add_hi + c2) & 0xFFFFFFFF
+
+    // (hi, lo) >> 31, keeping bits 62..31 — this is the FLOOR of the division.
+    u32 q = ((shi << 1) | (slo >> 31)) & 0xFFFFFFFF
+    i32 res = nn_u32_to_i32(q)
+
+    // C divides toward zero, so a negative value with a non-zero remainder
+    // must be bumped from floor to ceil.
+    if (shi & 0x80000000) != 0 {
+        if (slo & 0x7FFFFFFF) != 0 { res = res + 1 }
+    }
+    return res
+}
+
+// gemmlowp RoundingDivideByPOT — divide by 2^exponent rounding half AWAY
+// FROM ZERO. The `+1` on the threshold for negative x is what distinguishes
+// this from round-half-up and is required for TFLite equivalence.
+fn nn_rdbpot(i32 x, u32 exponent) -> i32 {
+    u32 e = exponent
+    if e == 0 { return x }
+    if e > 31 { e = 31 }
+    i32 mask = (1 << e) - 1
+    i32 remainder = x & mask
+    i32 threshold = mask >> 1
+    if x < 0 { threshold = threshold + 1 }
+    i32 r = x >> e
+    if remainder > threshold { r = r + 1 }
+    return r
+}
+
+// TFLite MultiplyByQuantizedMultiplier. `shift` is TFLite's signed shift:
+// positive means shift the input LEFT first, negative means divide the
+// product right afterwards. Valid range is [-31, 31].
+fn nn_mul_by_qm(i32 x, i32 multiplier, i32 shift) -> i32 {
+    u32 left_shift = 0
+    u32 right_shift = 0
+    if shift > 0 {
+        left_shift = shift
+    } else {
+        i32 ns = 0 - shift
+        right_shift = ns
+    }
+    if left_shift > 31 { left_shift = 31 }
+
+    i32 xs = x
+    if left_shift > 0 {
+        u32 ux = nn_i32_to_u32(x)
+        ux = (ux << left_shift) & 0xFFFFFFFF
+        xs = nn_u32_to_i32(ux)
+    }
+    i32 h = nn_srdhm(xs, multiplier)
+    return nn_rdbpot(h, right_shift)
+}
+
+fn nn_clamp_i32(i32 v, i32 lo, i32 hi) -> i32 {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+
+// Requantize an int32 accumulator to int8 with no output zero point and the
+// full int8 range. Returned as i32 in [-128, 127] (MLRift has no i8 return
+// slot distinct from i32; store it with nn_store_i8).
+fn nn_requantize(i32 acc, i32 multiplier, i32 shift) -> i32 {
+    i32 v = nn_mul_by_qm(acc, multiplier, shift)
+    i32 lo = 0 - 128
+    return nn_clamp_i32(v, lo, 127)
+}
+
+// Full form: adds the output zero point and clamps to an activation range
+// (act_min/act_max are already in the quantized domain, as TFLite stores
+// them — a fused ReLU is just act_min = out_zp).
+fn nn_requantize_zp(i32 acc, i32 multiplier, i32 shift, i32 out_zp, i32 act_min, i32 act_max) -> i32 {
+    i32 v = nn_mul_by_qm(acc, multiplier, shift) + out_zp
+    return nn_clamp_i32(v, act_min, act_max)
+}
+
+// Signed divide truncating toward zero (C semantics), implemented on
+// magnitudes so it behaves identically on every backend.
+fn nn_sdiv_trunc(i32 a, u32 b) -> i32 {
+    if b == 0 { return 0 }
+    if a >= 0 {
+        u32 ua = a
+        u32 q = ua / b
+        i32 r = q
+        return r
+    }
+    u32 um = nn_abs_u32(a)
+    u32 qq = um / b
+    i32 rr = qq
+    return 0 - rr
+}
+
+
+// ---------------------------------------------------------------------------
+// Section 2 — typed memory access
+// ---------------------------------------------------------------------------
+
+// Load one int8 element, sign-extended into an i32.
+fn nn_load_i8(u32 p) -> i32 {
+    u32 b = load8(p)
+    i32 v = b & 0xFF
+    if v > 127 { return v - 256 }
+    return v
+}
+
+// Store the low byte of a (already clamped) i32 as int8.
+fn nn_store_i8(u32 p, i32 v) {
+    u32 u = nn_i32_to_u32(v)
+    store8(p, u & 0xFF)
+}
+
+fn nn_load_i32(u32 p) -> i32 {
+    u32 w = load32(p)
+    return nn_u32_to_i32(w)
+}
+
+fn nn_store_i32(u32 p, i32 v) {
+    store32(p, nn_i32_to_u32(v))
+}
+
+// Output spatial extent for a conv/pool with symmetric padding.
+fn nn_out_dim(u32 in_dim, u32 k, u32 stride, u32 pad) -> u32 {
+    u32 eff = (in_dim + (2 * pad))
+    if eff < k { return 0 }
+    return ((eff - k) / stride) + 1
+}
+
+
+// ---------------------------------------------------------------------------
+// Section 3 — convolution kernels
+// ---------------------------------------------------------------------------
+
+// General int8 convolution. NHWC activations, OHWI weights, int32 bias,
+// per-channel (q_stride = 1) or per-tensor (q_stride = 0) requantization.
+fn nn_conv2d_int8(u32 in_p, u32 in_h, u32 in_w, u32 in_c, i32 in_zp,
+                  u32 w_p, u32 kh, u32 kw,
+                  u32 bias_p, u32 mult_p, u32 shift_p, u32 q_stride,
+                  u32 out_p, u32 out_c, i32 out_zp,
+                  u32 stride_h, u32 stride_w, u32 pad_h, u32 pad_w,
+                  i32 act_min, i32 act_max) {
+    u32 out_h = nn_out_dim(in_h, kh, stride_h, pad_h)
+    u32 out_w = nn_out_dim(in_w, kw, stride_w, pad_w)
+    i32 ih_i = in_h
+    i32 iw_i = in_w
+    i32 pad_h_i = pad_h
+    i32 pad_w_i = pad_w
+
+    u32 oy = 0
+    while oy < out_h {
+        u32 ox = 0
+        while ox < out_w {
+            u32 oc = 0
+            while oc < out_c {
+                i32 acc = 0
+                if bias_p != 0 { acc = nn_load_i32(bias_p + (oc * 4)) }
+
+                u32 ki = 0
+                while ki < kh {
+                    u32 iy_base = (oy * stride_h) + ki
+                    i32 iy = iy_base
+                    iy = iy - pad_h_i
+                    if iy >= 0 {
+                        if iy < ih_i {
+                            u32 iy_u = iy
+                            u32 kj = 0
+                            while kj < kw {
+                                u32 ix_base = (ox * stride_w) + kj
+                                i32 ix = ix_base
+                                ix = ix - pad_w_i
+                                if ix >= 0 {
+                                    if ix < iw_i {
+                                        u32 ix_u = ix
+                                        u32 in_row = ((iy_u * in_w) + ix_u) * in_c
+                                        u32 w_row = ((((oc * kh) + ki) * kw) + kj) * in_c
+                                        u32 ic = 0
+                                        while ic < in_c {
+                                            i32 iv = nn_load_i8(in_p + in_row + ic) - in_zp
+                                            i32 wv = nn_load_i8(w_p + w_row + ic)
+                                            acc = acc + (iv * wv)
+                                            ic = ic + 1
+                                        }
+                                    }
+                                }
+                                kj = kj + 1
+                            }
+                        }
+                    }
+                    ki = ki + 1
+                }
+
+                u32 qi = (oc * q_stride) * 4
+                i32 m = nn_load_i32(mult_p + qi)
+                i32 sh = nn_load_i32(shift_p + qi)
+                i32 ov = nn_requantize_zp(acc, m, sh, out_zp, act_min, act_max)
+                nn_store_i8(out_p + ((((oy * out_w) + ox) * out_c) + oc), ov)
+                oc = oc + 1
+            }
+            ox = ox + 1
+        }
+        oy = oy + 1
+    }
+}
+
+// Depthwise convolution — the workhorse of MobileNet-class detectors.
+// Weights are [1][kh][kw][out_c] with out_c = in_c * depth_mult; output
+// channel oc = ic * depth_mult + m draws from input channel ic.
+fn nn_depthwise_conv2d_int8(u32 in_p, u32 in_h, u32 in_w, u32 in_c, i32 in_zp,
+                            u32 w_p, u32 kh, u32 kw,
+                            u32 bias_p, u32 mult_p, u32 shift_p, u32 q_stride,
+                            u32 out_p, i32 out_zp,
+                            u32 stride_h, u32 stride_w, u32 pad_h, u32 pad_w,
+                            u32 depth_mult, i32 act_min, i32 act_max) {
+    u32 out_h = nn_out_dim(in_h, kh, stride_h, pad_h)
+    u32 out_w = nn_out_dim(in_w, kw, stride_w, pad_w)
+    u32 out_c = in_c * depth_mult
+    i32 ih_i = in_h
+    i32 iw_i = in_w
+    i32 pad_h_i = pad_h
+    i32 pad_w_i = pad_w
+
+    u32 oy = 0
+    while oy < out_h {
+        u32 ox = 0
+        while ox < out_w {
+            u32 ic = 0
+            while ic < in_c {
+                u32 dm = 0
+                while dm < depth_mult {
+                    u32 oc = (ic * depth_mult) + dm
+                    i32 acc = 0
+                    if bias_p != 0 { acc = nn_load_i32(bias_p + (oc * 4)) }
+
+                    u32 ki = 0
+                    while ki < kh {
+                        u32 iy_base = (oy * stride_h) + ki
+                        i32 iy = iy_base
+                        iy = iy - pad_h_i
+                        if iy >= 0 {
+                            if iy < ih_i {
+                                u32 iy_u = iy
+                                u32 kj = 0
+                                while kj < kw {
+                                    u32 ix_base = (ox * stride_w) + kj
+                                    i32 ix = ix_base
+                                    ix = ix - pad_w_i
+                                    if ix >= 0 {
+                                        if ix < iw_i {
+                                            u32 ix_u = ix
+                                            u32 ipos = (((iy_u * in_w) + ix_u) * in_c) + ic
+                                            u32 wpos = (((ki * kw) + kj) * out_c) + oc
+                                            i32 iv = nn_load_i8(in_p + ipos) - in_zp
+                                            i32 wv = nn_load_i8(w_p + wpos)
+                                            acc = acc + (iv * wv)
+                                        }
+                                    }
+                                    kj = kj + 1
+                                }
+                            }
+                        }
+                        ki = ki + 1
+                    }
+
+                    u32 qi = (oc * q_stride) * 4
+                    i32 m = nn_load_i32(mult_p + qi)
+                    i32 sh = nn_load_i32(shift_p + qi)
+                    i32 ov = nn_requantize_zp(acc, m, sh, out_zp, act_min, act_max)
+                    nn_store_i8(out_p + ((((oy * out_w) + ox) * out_c) + oc), ov)
+                    dm = dm + 1
+                }
+                ic = ic + 1
+            }
+            ox = ox + 1
+        }
+        oy = oy + 1
+    }
+}
+
+// 1x1 (pointwise) convolution — stride 1, no padding, output extent equals
+// input extent. Weights are [out_c][1][1][in_c], i.e. a plain [out_c][in_c]
+// matrix, which is why this is also spelled gemm.
+fn nn_pointwise_conv_int8(u32 in_p, u32 in_h, u32 in_w, u32 in_c, i32 in_zp,
+                          u32 w_p, u32 bias_p, u32 mult_p, u32 shift_p, u32 q_stride,
+                          u32 out_p, u32 out_c, i32 out_zp,
+                          i32 act_min, i32 act_max) {
+    nn_conv2d_int8(in_p, in_h, in_w, in_c, in_zp,
+                   w_p, 1, 1,
+                   bias_p, mult_p, shift_p, q_stride,
+                   out_p, out_c, out_zp,
+                   1, 1, 0, 0,
+                   act_min, act_max)
+}
+
+
+// ---------------------------------------------------------------------------
+// Section 4 — dense kernels
+// ---------------------------------------------------------------------------
+
+// out[n] = requantize( bias[n] + sum_k (x[k] - x_zp) * W[n][k] )
+// W is row-major [n_dim][k_dim] int8 with a zero point of 0 (symmetric).
+fn nn_gemv_int8(u32 x_p, u32 k_dim, i32 x_zp,
+                u32 w_p, u32 n_dim,
+                u32 bias_p, u32 mult_p, u32 shift_p, u32 q_stride,
+                u32 out_p, i32 out_zp, i32 act_min, i32 act_max) {
+    u32 n = 0
+    while n < n_dim {
+        i32 acc = 0
+        if bias_p != 0 { acc = nn_load_i32(bias_p + (n * 4)) }
+        u32 row = w_p + (n * k_dim)
+        u32 k = 0
+        while k < k_dim {
+            i32 xv = nn_load_i8(x_p + k) - x_zp
+            i32 wv = nn_load_i8(row + k)
+            acc = acc + (xv * wv)
+            k = k + 1
+        }
+        u32 qi = (n * q_stride) * 4
+        i32 m = nn_load_i32(mult_p + qi)
+        i32 sh = nn_load_i32(shift_p + qi)
+        i32 ov = nn_requantize_zp(acc, m, sh, out_zp, act_min, act_max)
+        nn_store_i8(out_p + n, ov)
+        n = n + 1
+    }
+}
+
+// out[m][n] = requantize( bias[n] + sum_k (A[m][k] - a_zp) * B[n][k] )
+// A is [m_dim][k_dim] int8 activations, B is [n_dim][k_dim] int8 weights.
+fn nn_gemm_int8(u32 a_p, u32 m_dim, u32 k_dim, i32 a_zp,
+                u32 b_p, u32 n_dim,
+                u32 bias_p, u32 mult_p, u32 shift_p, u32 q_stride,
+                u32 out_p, i32 out_zp, i32 act_min, i32 act_max) {
+    u32 r = 0
+    while r < m_dim {
+        nn_gemv_int8(a_p + (r * k_dim), k_dim, a_zp,
+                     b_p, n_dim,
+                     bias_p, mult_p, shift_p, q_stride,
+                     out_p + (r * n_dim), out_zp, act_min, act_max)
+        r = r + 1
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Section 5 — pooling
+// ---------------------------------------------------------------------------
+
+// Max pooling over an NHWC int8 tensor. Padded taps are ignored entirely
+// (TFLite's behaviour), so a window that is fully outside the input yields
+// the int8 minimum clamped into the activation range.
+fn nn_maxpool_int8(u32 in_p, u32 in_h, u32 in_w, u32 in_c,
+                   u32 out_p,
+                   u32 kh, u32 kw, u32 stride_h, u32 stride_w,
+                   u32 pad_h, u32 pad_w,
+                   i32 act_min, i32 act_max) {
+    u32 out_h = nn_out_dim(in_h, kh, stride_h, pad_h)
+    u32 out_w = nn_out_dim(in_w, kw, stride_w, pad_w)
+    i32 ih_i = in_h
+    i32 iw_i = in_w
+    i32 pad_h_i = pad_h
+    i32 pad_w_i = pad_w
+
+    u32 oy = 0
+    while oy < out_h {
+        u32 ox = 0
+        while ox < out_w {
+            u32 c = 0
+            while c < in_c {
+                i32 best = 0 - 128
+                u32 ki = 0
+                while ki < kh {
+                    u32 iy_base = (oy * stride_h) + ki
+                    i32 iy = iy_base
+                    iy = iy - pad_h_i
+                    if iy >= 0 {
+                        if iy < ih_i {
+                            u32 iy_u = iy
+                            u32 kj = 0
+                            while kj < kw {
+                                u32 ix_base = (ox * stride_w) + kj
+                                i32 ix = ix_base
+                                ix = ix - pad_w_i
+                                if ix >= 0 {
+                                    if ix < iw_i {
+                                        u32 ix_u = ix
+                                        u32 ipos = (((iy_u * in_w) + ix_u) * in_c) + c
+                                        i32 v = nn_load_i8(in_p + ipos)
+                                        if v > best { best = v }
+                                    }
+                                }
+                                kj = kj + 1
+                            }
+                        }
+                    }
+                    ki = ki + 1
+                }
+                i32 ov = nn_clamp_i32(best, act_min, act_max)
+                nn_store_i8(out_p + ((((oy * out_w) + ox) * in_c) + c), ov)
+                c = c + 1
+            }
+            ox = ox + 1
+        }
+        oy = oy + 1
+    }
+}
+
+// Average pooling over an NHWC int8 tensor. Divides by the count of VALID
+// (non-padded) taps and rounds half away from zero, matching TFLite's
+// `(acc +/- count/2) / count` with C truncating division.
+fn nn_avgpool_int8(u32 in_p, u32 in_h, u32 in_w, u32 in_c,
+                   u32 out_p,
+                   u32 kh, u32 kw, u32 stride_h, u32 stride_w,
+                   u32 pad_h, u32 pad_w,
+                   i32 act_min, i32 act_max) {
+    u32 out_h = nn_out_dim(in_h, kh, stride_h, pad_h)
+    u32 out_w = nn_out_dim(in_w, kw, stride_w, pad_w)
+    i32 ih_i = in_h
+    i32 iw_i = in_w
+    i32 pad_h_i = pad_h
+    i32 pad_w_i = pad_w
+
+    u32 oy = 0
+    while oy < out_h {
+        u32 ox = 0
+        while ox < out_w {
+            u32 c = 0
+            while c < in_c {
+                i32 acc = 0
+                u32 count = 0
+                u32 ki = 0
+                while ki < kh {
+                    u32 iy_base = (oy * stride_h) + ki
+                    i32 iy = iy_base
+                    iy = iy - pad_h_i
+                    if iy >= 0 {
+                        if iy < ih_i {
+                            u32 iy_u = iy
+                            u32 kj = 0
+                            while kj < kw {
+                                u32 ix_base = (ox * stride_w) + kj
+                                i32 ix = ix_base
+                                ix = ix - pad_w_i
+                                if ix >= 0 {
+                                    if ix < iw_i {
+                                        u32 ix_u = ix
+                                        u32 ipos = (((iy_u * in_w) + ix_u) * in_c) + c
+                                        acc = acc + nn_load_i8(in_p + ipos)
+                                        count = count + 1
+                                    }
+                                }
+                                kj = kj + 1
+                            }
+                        }
+                    }
+                    ki = ki + 1
+                }
+                i32 ov = 0
+                if count != 0 {
+                    i32 half = count / 2
+                    i32 num = acc
+                    if acc > 0 {
+                        num = acc + half
+                    } else {
+                        num = acc - half
+                    }
+                    ov = nn_sdiv_trunc(num, count)
+                }
+                ov = nn_clamp_i32(ov, act_min, act_max)
+                nn_store_i8(out_p + ((((oy * out_w) + ox) * in_c) + c), ov)
+                c = c + 1
+            }
+            ox = ox + 1
+        }
+        oy = oy + 1
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Section 6 — activations
+// ---------------------------------------------------------------------------
+
+// In-place ReLU in the quantized domain: everything below the zero point
+// represents a negative real value, so clamping to zp IS the ReLU.
+fn nn_relu_int8(u32 p, u32 n, i32 zp) {
+    u32 i = 0
+    while i < n {
+        i32 v = nn_load_i8(p + i)
+        if v < zp { v = zp }
+        nn_store_i8(p + i, v)
+        i = i + 1
+    }
+}
+
+// In-place ReLU6. `six_q` is the quantized value of the real number 6.0 for
+// this tensor, i.e. round(6.0 / scale) + zp — computed offline by the
+// quantizer, because there are no floats here. Values above 127 are clipped
+// to 127 so the result still fits int8.
+fn nn_relu6_int8(u32 p, u32 n, i32 zp, i32 six_q) {
+    i32 hi = six_q
+    if hi > 127 { hi = 127 }
+    u32 i = 0
+    while i < n {
+        i32 v = nn_load_i8(p + i)
+        v = nn_clamp_i32(v, zp, hi)
+        nn_store_i8(p + i, v)
+        i = i + 1
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Section 7 — elementwise
+// ---------------------------------------------------------------------------
+
+// Quantized elementwise add (the residual connection), TFLite's AddGeneral:
+// both inputs are shifted left by `left_shift` (20 in TFLite's own kernels)
+// so the two rescalings can be done without losing precision, summed, then
+// rescaled once more into the output quantization.
+//
+//   a_mult/a_shift  rescale input A onto the common intermediate scale
+//   b_mult/b_shift  ditto for B
+//   o_mult/o_shift  rescale the sum onto the output scale
+//
+// Zero points are TFLite's raw zero points; they are SUBTRACTED here.
+fn nn_add_int8(u32 a_p, i32 a_zp, i32 a_mult, i32 a_shift,
+               u32 b_p, i32 b_zp, i32 b_mult, i32 b_shift,
+               u32 out_p, i32 out_zp, i32 o_mult, i32 o_shift,
+               u32 n, u32 left_shift, i32 act_min, i32 act_max) {
+    u32 i = 0
+    while i < n {
+        i32 av = nn_load_i8(a_p + i) - a_zp
+        i32 bv = nn_load_i8(b_p + i) - b_zp
+        u32 ua = nn_i32_to_u32(av)
+        u32 ub = nn_i32_to_u32(bv)
+        ua = (ua << left_shift) & 0xFFFFFFFF
+        ub = (ub << left_shift) & 0xFFFFFFFF
+        i32 as_v = nn_mul_by_qm(nn_u32_to_i32(ua), a_mult, a_shift)
+        i32 bs_v = nn_mul_by_qm(nn_u32_to_i32(ub), b_mult, b_shift)
+        i32 sum = as_v + bs_v
+        i32 ov = nn_mul_by_qm(sum, o_mult, o_shift) + out_zp
+        ov = nn_clamp_i32(ov, act_min, act_max)
+        nn_store_i8(out_p + i, ov)
+        i = i + 1
+    }
+}
