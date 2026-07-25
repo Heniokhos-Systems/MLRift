@@ -102,6 +102,30 @@ static uint64 XT_ESP32_STACK_TOP = 0x3FFE0000
 // any given program. Enforced by xt_esp32_check_layout.
 static uint64 XT_ESP32_MIN_STACK = 4096
 
+// --- ESP32 model/blob segment (--model <file>) ------------------------------
+// `--model <file>` appends the file's bytes to the esp-image as an EXTRA RAM
+// segment, so the mask ROM copies it from flash into DRAM at boot and the
+// program is handed a plain pointer — no MMU work, no flash driver, and none
+// of the ~19-bytes-of-code-per-4-bytes-of-data explosion that baking a blob
+// into .text costs (tools/ml/krnn_to_mlr.py).
+//
+// The blob loads at XT_ESP32_MODEL_BASE == the BOTTOM of the DRAM window, and
+// .data/.bss move UP to sit above it. That direction is deliberate: the blob's
+// address is then a COMPILE-TIME CONSTANT the program can hardcode
+// (0x3FFB0000), and it stays constant as the program's statics change. The
+// other direction (blob above .data) would make the address depend on the
+// static layout, i.e. it would silently move whenever an unrelated static was
+// added — on a JTAG-less board that reads as a corrupt model, not as a moved
+// pointer.
+//
+// xt_esp32_data_base is the load address of the .data/.bss segment: equal to
+// XT_ESP32_DRAM_BASE with no --model, and XT_ESP32_DRAM_BASE + align16(blob)
+// with one. main.kr assigns it during the esp32 finalize, BEFORE
+// resolve_addr_fixups_xtensa_esp32 (which turns it into every PIC delta) and
+// before xt_esp32_check_layout (which bounds-checks the sum).
+static uint64 XT_ESP32_MODEL_BASE = 0x3FFB0000
+static uint64 xt_esp32_data_base = 0x3FFB0000
+
 // --- ESP32 startup stub (Task 4) ---------------------------------------------
 // xt_esp32_target: set to 1 by main.kr alongside XT_STACK_TOP when
 // --target=esp32 is active (ir_xtensa.kr precedes main.kr in the concat build,
@@ -3139,9 +3163,9 @@ fn resolve_addr_fixups_xtensa_esp32(uint64 data_file_base, uint64 str_file_start
         uint64 pool_word_off = xt_af_get(i, 12)
         uint64 target_va = 0
         if table_sel == 0 {
-            target_va = XT_ESP32_DRAM_BASE + (str_file_start - data_file_base) + payload
+            target_va = xt_esp32_data_base + (str_file_start - data_file_base) + payload
         } else if table_sel == 1 {
-            target_va = XT_ESP32_DRAM_BASE + (static_file_start - data_file_base) + payload
+            target_va = xt_esp32_data_base + (static_file_start - data_file_base) + payload
         } else {
             target_va = XT_ESP32_IRAM_BASE + xt_fnaddr_code_off(payload)
         }
@@ -3187,8 +3211,8 @@ fn xt_esp32_check_layout(uint64 code_len, uint64 data_memsz, uint64 entry_off) {
     if (entry_off & 3) != 0 {
         xt_err("error: xtensa/esp32: entry address is not 4-byte aligned\n")
     }
-    if XT_ESP32_DRAM_BASE + data_memsz > XT_ESP32_DRAM_LIMIT {
-        xt_err("error: xtensa/esp32: data+bss exceed the DRAM window 0x3FFB0000..0x3FFE0000 (would overlap ROM-reserved RAM / the 32-bit-only IRAM range)\n")
+    if xt_esp32_data_base + data_memsz > XT_ESP32_DRAM_LIMIT {
+        xt_err("error: xtensa/esp32: data+bss exceed the DRAM window 0x3FFB0000..0x3FFE0000 (would overlap ROM-reserved RAM / the 32-bit-only IRAM range). With --model the blob sits at the bottom of the window and .data/.bss start above it, so the blob's size counts against this budget too.\n")
     }
     // Stack headroom. XT_ESP32_STACK_TOP == XT_ESP32_DRAM_LIMIT, so the check
     // above alone would happily let .data+.bss end exactly at the initial SP.
@@ -3197,7 +3221,7 @@ fn xt_esp32_check_layout(uint64 code_len, uint64 data_memsz, uint64 entry_off) {
     // preamble's zero loop has already run, so nothing ever restores those
     // bytes. That is silent data corruption on a board with no debugger: the
     // exact failure class this target's guards exist to make impossible.
-    if XT_ESP32_DRAM_BASE + data_memsz + XT_ESP32_MIN_STACK > XT_ESP32_DRAM_LIMIT {
+    if xt_esp32_data_base + data_memsz + XT_ESP32_MIN_STACK > XT_ESP32_DRAM_LIMIT {
         xt_err("error: xtensa/esp32: data+bss leave less than 4 KiB below the initial stack pointer 0x3FFE0000 — the entry prologue's frame push would overwrite the tail of .bss after the zero loop has run (silent corruption). Shrink the statics, or move the bulk of them into a runtime-allocated region.\n")
     }
 }

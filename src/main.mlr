@@ -2829,11 +2829,50 @@ fn compile(uint64 input_path, uint64 output_path, uint64 arch, uint64 emit_mode)
             emit_static_data()
             uint64 esp_total = codegen_output_len()
 
+            // --model <file>: read the blob into its OWN buffer — never into
+            // out_buf, which is the raw code+data material the segments point
+            // INTO (appending would realloc it out from under those pointers
+            // AND splice the blob into the code segment). Done HERE, before
+            // the fixup resolve and the layout guard, because it decides
+            // xt_esp32_data_base: the blob loads at the bottom of the DRAM
+            // window and .data/.bss move up above it, so its size is part of
+            // every string/static VA and of the DRAM budget. See the comment
+            // on XT_ESP32_MODEL_BASE in src/ir_xtensa.mlr for why the blob is
+            // at the bottom (a compile-time-constant address the program can
+            // hardcode) rather than after the statics (an address that would
+            // move whenever an unrelated static was added).
+            uint64 esp_model_ptr = 0
+            uint64 esp_model_len = 0
+            if machine_model_path != 0 {
+                uint64 esp_mfd = file_open(machine_model_path, 0)
+                if esp_mfd >= 0xFFFFFFFF {
+                    write(2, "error: --model: cannot open ", 28)
+                    write(2, machine_model_path, str_len(machine_model_path))
+                    write(2, "\n", 1)
+                    exit(1)
+                }
+                esp_model_len = file_size(esp_mfd)
+                if esp_model_len == 0 {
+                    file_close(esp_mfd)
+                    write(2, "error: --model: file is empty\n", 30)
+                    exit(1)
+                }
+                esp_model_ptr = alloc(esp_model_len)
+                file_read(esp_mfd, esp_model_ptr, esp_model_len)
+                file_close(esp_mfd)
+                // Round the .data/.bss base up to 16: STATIC_LOAD/STORE's
+                // l32i/s32i trap on an unaligned base, and the file-side data
+                // area is only padded to 8, so the VA base must be at least
+                // 8-aligned for file offset and VA to agree mod 8.
+                uint64 esp_model_pad = (esp_model_len + 15) & ~15
+                xt_esp32_data_base = XT_ESP32_MODEL_BASE + esp_model_pad
+            }
+
             // PIC deltas cross segments here: delta = target VA - anchor VA
-            // (anchors run at IRAM base + code offset; data lives at DRAM base
-            // + segment offset). The resolver also owns the per-datum
-            // guard: any string/static whose VA computes into the IRAM range
-            // is a hard compile error, never an emitted image.
+            // (anchors run at IRAM base + code offset; data lives at
+            // xt_esp32_data_base + segment offset). The resolver also owns the
+            // per-datum guard: any string/static whose VA computes into the
+            // IRAM range is a hard compile error, never an emitted image.
             resolve_addr_fixups_xtensa_esp32(esp_data_file, esp_data_file, esp_static_file)
 
             // Real BSS: drop the data area's trailing zero bytes from the
@@ -2860,20 +2899,25 @@ fn compile(uint64 input_path, uint64 output_path, uint64 arch, uint64 emit_mode)
             // the image. (The lx60 path patches 0xd0000000+p_filesz/p_memsz
             // below; the esp32 data segment has its own base.)
             if xt_bss_lo_pool_off != 0 {
-                patch_u32(xt_bss_lo_pool_off, XT_ESP32_DRAM_BASE + esp_data_len)
-                patch_u32(xt_bss_hi_pool_off, XT_ESP32_DRAM_BASE + esp_data_memsz)
+                patch_u32(xt_bss_lo_pool_off, xt_esp32_data_base + esp_data_len)
+                patch_u32(xt_bss_hi_pool_off, xt_esp32_data_base + esp_data_memsz)
             }
 
             // Assemble the container (src/format_espimage.mlr): segments
-            // ascending by load address (DRAM data first, IRAM code second —
-            // esptool's order, our byte-comparability oracle), SKIPPING a
-            // zero-length data segment entirely (esptool omits empty sections;
-            // an [addr][0] record would break comparability with elf2image).
+            // ascending by load address (--model blob at the bottom of DRAM,
+            // then DRAM data, then IRAM code — esptool's order, our
+            // byte-comparability oracle), SKIPPING a zero-length data segment
+            // entirely (esptool omits empty sections; an [addr][0] record
+            // would break comparability with elf2image).
             uint64 esp_seg_count = 2
             if esp_data_len == 0 { esp_seg_count = 1 }
+            if esp_model_len != 0 { esp_seg_count = esp_seg_count + 1 }
             esp_image_begin(XT_ESP32_IRAM_BASE + xt_entry_code, esp_seg_count)
+            if esp_model_len != 0 {
+                esp_image_segment(XT_ESP32_MODEL_BASE, esp_model_ptr, esp_model_len)
+            }
             if esp_data_len != 0 {
-                esp_image_segment(XT_ESP32_DRAM_BASE, out_buf + esp_data_file, esp_data_len)
+                esp_image_segment(xt_esp32_data_base, out_buf + esp_data_file, esp_data_len)
             }
             esp_image_segment(XT_ESP32_IRAM_BASE, out_buf, esp_code_end)
             esp_image_finish()
@@ -5115,6 +5159,15 @@ static uint64 freestanding = 0
 // (validated after arg parsing, so flag order doesn't matter).
 static uint64 machine_target = 0
 
+// --model <file> (--target=esp32 only): append the file's raw bytes to the
+// esp-image as an extra RAM segment loaded at XT_ESP32_MODEL_BASE
+// (0x3FFB0000, the bottom of the DRAM window); .data/.bss move up above it.
+// The mask ROM copies the blob from flash into RAM before the entry point
+// runs, so the program just reads 0x3FFB0000 — see the block comment on
+// XT_ESP32_MODEL_BASE in src/ir_xtensa.mlr for why the blob goes at the
+// BOTTOM (constant address) rather than after the statics.
+static uint64 machine_model_path = 0
+
 // Compiler-level auto-injection of `hipkfd_teardown()` at every exit
 // path (main epilogue + every exit() syscall) when `--target=amdgpu-native`
 // is on AND `hipkfd_teardown` is reachable in the link set. Default ON;
@@ -6494,6 +6547,22 @@ fn main() {
                     write(2, tgt_err, str_len(tgt_err))
                     exit(1)
                 }
+            } else if str_eq_full(arg, "--model") != 0 {
+                // `--model <file>` — two-token form. EXACT match so it cannot
+                // swallow a future `--model-something` flag.
+                i = i + 1
+                if i >= cli_argc {
+                    write(2, "mlrc: --model requires a file path\n", 35)
+                    exit(1)
+                }
+                uint64 mdl_ptr = cli_argv + i * 8
+                // Via a LOCAL, then assign. `unsafe { *p -> <static> }`
+                // silently does nothing — the deref form only writes locals.
+                uint64 mdl_val = 0
+                unsafe { *(mdl_ptr as uint64) -> mdl_val }
+                machine_model_path = mdl_val
+            } else if str_starts_with(arg, "--model=", 8) != 0 {
+                machine_model_path = arg + 8
             } else if str_starts_with(arg, "--target-arch=", 14) != 0 {
                 // Slice B: select AMDGPU target arch for --target=amdgpu-native.
                 // Default (no flag) = gfx1100 (RX 7800 XT — current dev box).
@@ -6526,6 +6595,8 @@ fn main() {
                 write(1, "  --arch=x86_64|arm64|riscv32|xtensa   single-arch binary (no fat-binary wrap)\n", 79)
                 uint64 tgt_help = "  --target=linux|macos|windows|android|esp32   single-target binary\n"
                 write(1, tgt_help, str_len(tgt_help))
+                uint64 mdl_help = "  --model <file>            --target=esp32: load <file> into DRAM at 0x3FFB0000\n"
+                write(1, mdl_help, str_len(mdl_help))
                 write(1, "  --target-arch=<gfxNNNN>   AMDGPU sub-target (gfx1030/1100/1200/...)\n", 70)
                 write(1, "  --targets=<list>         custom fat binary subset\n", 52)
                 write(1, "                              e.g. linux-x64,macos-arm64,win-x64\n", 65)
@@ -6678,6 +6749,16 @@ fn main() {
         // self-branch) in ir_xtensa.mlr — it precedes main.mlr in the concat
         // build so it cannot read machine_target itself.
         xt_esp32_target = 1
+    }
+
+    // --model is a property of the esp-image container, so it is meaningless
+    // anywhere else. Loud-fail instead of silently dropping the blob: a
+    // program built without its model reads whatever happens to be at
+    // 0x3FFB0000 and produces plausible-looking garbage.
+    if machine_model_path != 0 && machine_target != 1 {
+        uint64 mdl_msg = "error: --model requires --target=esp32 (it appends a RAM segment to the esp-image)\n"
+        write(2, mdl_msg, str_len(mdl_msg))
+        exit(1)
     }
 
     // Derive output name from input if not specified with -o
