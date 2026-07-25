@@ -79,9 +79,7 @@ an allocator or a parser: the runner does load32(base + constant).
 
   Every `shift` field uses TFLite's SIGNED convention, which is what
   nn_mul_by_qm() consumes: POSITIVE shifts the input left first, NEGATIVE
-  divides the product right afterwards. (int8_sim.py internally uses the
-  opposite sign; the emitter negates on the way out. Getting this backwards
-  is a silent factor of 2^2s.)
+  divides the product right afterwards.
 
 --- output record, 16 bytes -------------------------------------------
   0x00 u32  arena_off
