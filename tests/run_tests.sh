@@ -4097,6 +4097,90 @@ else
 fi
 rm -f "$ESP_MIN_BIN"
 
+# --- esp32 --model: the blob becomes a THIRD segment, .data moves above it ---
+# `--model <file>` appends the file's raw bytes as an extra RAM segment loaded
+# at 0x3FFB0000 (the bottom of the DRAM window) so the mask ROM copies it from
+# flash into RAM before the entry point runs. .data/.bss move UP to
+# 0x3FFB0000 + align16(blob) — that direction is what makes the blob's address
+# a compile-time constant the program can hardcode (tests/nn/nn_model_esp32.mlr
+# reads 0x3FFB0000). Asserted with od only:
+#   byte 1 = 0x03 (three segments now)
+#   seg 0 load_addr = 0x3FFB0000, data_len = the blob's size
+#   seg 1 load_addr = 0x3FFB0000 + align16(blob size)   <- .data moved up
+#   seg 2 load_addr = 0x40080400                        <- IRAM code, unmoved
+# and the byte-identity of the blob payload itself is checked with cmp.
+echo ""
+echo "--- esp32 --model blob segment test ---"
+TOTAL=$((TOTAL + 1))
+ESP_MDL_BIN="/tmp/mlrc_esp_mdl_$$.bin"
+ESP_MDL_BLOB="/tmp/mlrc_esp_blob_$$.bin"
+ESP_MDL_OUT="/tmp/mlrc_esp_blobout_$$.bin"
+ESP_MDL_OK=1
+# 4001 bytes: deliberately NOT a multiple of 16, so the align16 of the data
+# base and the align4 payload padding are both exercised.
+head -c 4001 /dev/urandom > "$ESP_MDL_BLOB" 2>/dev/null
+ESP_MDL_SZ=$(wc -c < "$ESP_MDL_BLOB" | tr -d ' ')
+if [ "$ESP_MDL_SZ" != "4001" ]; then
+    echo "SKIP: esp32_model_segment (could not create the 4001-byte test blob)"
+    TOTAL=$((TOTAL - 1))
+    ESP_MDL_OK=skip
+elif ! $MLRC --arch=xtensa --freestanding --target=esp32 --model "$ESP_MDL_BLOB" \
+     "$DIR/../examples/esp32/minimal.mlr" -o "$ESP_MDL_BIN" >/dev/null 2>&1; then
+    echo "FAIL: esp32_model_segment (compilation failed)"
+    $MLRC --arch=xtensa --freestanding --target=esp32 --model "$ESP_MDL_BLOB" \
+        "$DIR/../examples/esp32/minimal.mlr" -o "$ESP_MDL_BIN" 2>&1 | head -3
+    ESP_MDL_OK=0
+else
+    ESP_MDL_NSEG=$(od -An -tu1 -j 1 -N 1 "$ESP_MDL_BIN" | tr -d ' ')
+    if [ "$ESP_MDL_NSEG" != "3" ]; then
+        echo "FAIL: esp32_model_segment (segment count $ESP_MDL_NSEG != 3)"
+        ESP_MDL_OK=0
+    fi
+    ESP_M_S0_LOAD=$(esp_field "$ESP_MDL_BIN" $((0x18)))
+    ESP_M_S0_LEN=$(esp_field "$ESP_MDL_BIN" $((0x1C)))
+    if [ "$ESP_M_S0_LOAD" != "$((0x3FFB0000))" ]; then
+        echo "FAIL: esp32_model_segment (blob segment load_addr $ESP_M_S0_LOAD != 0x3FFB0000)"
+        ESP_MDL_OK=0
+    fi
+    # data_len is the raw blob length padded up to 4 (esp_image_segment).
+    if [ "$ESP_M_S0_LEN" != "4004" ]; then
+        echo "FAIL: esp32_model_segment (blob segment data_len $ESP_M_S0_LEN != 4004 = align4(4001))"
+        ESP_MDL_OK=0
+    fi
+    # The blob payload must survive byte-for-byte: it starts at 0x20.
+    dd if="$ESP_MDL_BIN" of="$ESP_MDL_OUT" bs=1 skip=32 count=4001 \
+        >/dev/null 2>&1
+    if ! cmp -s "$ESP_MDL_BLOB" "$ESP_MDL_OUT"; then
+        echo "FAIL: esp32_model_segment (blob payload in the image != the input file)"
+        ESP_MDL_OK=0
+    fi
+    if [ -n "$ESP_M_S0_LEN" ]; then
+        ESP_M_S1_LOAD=$(esp_field "$ESP_MDL_BIN" $((0x20 + ESP_M_S0_LEN)))
+        ESP_M_S1_LEN=$(esp_field "$ESP_MDL_BIN" $((0x24 + ESP_M_S0_LEN)))
+        # align16(4001) = 4016
+        if [ "$ESP_M_S1_LOAD" != "$((0x3FFB0000 + 4016))" ]; then
+            echo "FAIL: esp32_model_segment (.data load_addr $ESP_M_S1_LOAD != 0x3FFB0000+align16(4001))"
+            ESP_MDL_OK=0
+        fi
+        ESP_M_S2_OFF=$((0x28 + ESP_M_S0_LEN + ESP_M_S1_LEN))
+        ESP_M_S2_LOAD=$(esp_field "$ESP_MDL_BIN" "$ESP_M_S2_OFF")
+        if [ "$ESP_M_S2_LOAD" != "$((0x40080400))" ]; then
+            echo "FAIL: esp32_model_segment (code load_addr $ESP_M_S2_LOAD != 0x40080400)"
+            ESP_MDL_OK=0
+        fi
+    else
+        echo "FAIL: esp32_model_segment (blob segment data_len unreadable)"
+        ESP_MDL_OK=0
+    fi
+fi
+if [ "$ESP_MDL_OK" = 1 ]; then
+    PASS=$((PASS + 1))
+    echo "  esp32_model_segment: PASS (3 segments, blob byte-identical @0x3FFB0000, .data at +align16)"
+elif [ "$ESP_MDL_OK" = 0 ]; then
+    FAIL=$((FAIL + 1))
+fi
+rm -f "$ESP_MDL_BIN" "$ESP_MDL_BLOB" "$ESP_MDL_OUT"
+
 # --- esp32 guard tests: unsupported combos must be COMPILE errors ---
 # (1) --target=esp32 without --arch=xtensa --freestanding is rejected.
 # (2) Programs that cannot be laid out safely in the ESP32 memory map must

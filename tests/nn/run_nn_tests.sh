@@ -145,6 +145,34 @@ else
     echo "FAIL: nn_build_mcu"
 fi
 
+# --- the REAL-SILICON driver builds, and its model lands where it says ------
+# tests/nn/nn_model_esp32.mlr hardcodes 0x3FFB0000 for the model because
+# `--model` puts the blob at the bottom of the DRAM window and moves .data up
+# above it. Nothing in CI can boot an ESP32, so this asserts the two things
+# that would silently break that contract: that the driver still compiles for
+# --target=esp32 (a 73728-byte arena + an 89 KB model has to FIT the 192 KiB
+# window), and that segment 0 really is the blob at 0x3FFB0000.
+ESP_BLOB="$TMP/esp_blob.bin"
+ESP_IMG="$TMP/nn_esp32.bin"
+head -c 89304 /dev/zero > "$ESP_BLOB" 2>/dev/null
+if ! $MLRC --arch=xtensa --freestanding --target=esp32 --model "$ESP_BLOB" \
+        "$DIR/nn_model_esp32.mlr" -o "$ESP_IMG" > "$TMP/esp32.log" 2>&1; then
+    echo "FAIL: nn_build_esp32 (build failed)"
+    head -5 "$TMP/esp32.log"
+else
+    ESP_NSEG=$(od -An -tu1 -j 1 -N 1 "$ESP_IMG" | tr -d ' ')
+    ESP_S0=$(od -An -tu4 -j 24 -N 4 "$ESP_IMG" | tr -d ' ')
+    ESP_S0LEN=$(od -An -tu4 -j 28 -N 4 "$ESP_IMG" | tr -d ' ')
+    if [ "$ESP_NSEG" = "3" ] && [ "$ESP_S0" = "$((0x3FFB0000))" ] \
+       && [ "$ESP_S0LEN" = "89304" ]; then
+        echo "PASS: nn_build_esp32 ($(wc -c < "$ESP_IMG" | tr -d ' ')B image," \
+             "89304B model segment at 0x3FFB0000 where the driver reads it)"
+    else
+        echo "FAIL: nn_build_esp32 (segs=$ESP_NSEG seg0=$ESP_S0 len=$ESP_S0LEN," \
+             "want 3 / $((0x3FFB0000)) / 89304)"
+    fi
+fi
+
 # ---------------------------------------------------------------------------
 # 6. The model runner (std/nn_model.mlr) on a synthetic .krnn
 # ---------------------------------------------------------------------------

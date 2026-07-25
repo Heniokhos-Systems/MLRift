@@ -1,0 +1,124 @@
+// tests/nn/nn_model_esp32.mlr — REAL SILICON driver for the std/nn_model.mlr
+// runner validation. Same body as nn_model_host.mlr / nn_model_mcu.mlr (both
+// import nn_model_core.mlr); only where the model comes from and where
+// characters go differ.
+//
+// Build + flash:
+//   mlrc --arch=xtensa --freestanding --target=esp32 \
+//        --model yunet64.krnn tests/nn/nn_model_esp32.mlr -o nn64.bin
+//   esptool --port /dev/ttyAMA0 --baud 115200 \
+//       --before no-reset --after no-reset --no-stub \
+//       write-flash 0x1000 nn64.bin        # BOOT+EN held manually
+//
+// Then tap RST and capture /dev/ttyAMA0 at 115200. Output is one signed
+// decimal per line — every element of every graph output — followed by END.
+// It must be byte-identical to tools/ml/int8_sim.py, to the host driver and
+// to the two qemu drivers.
+//
+// ─────────────────────────────────────────────────────────────────────────
+// WHERE THE MODEL COMES FROM: `--model <file>` (src/main.mlr esp32 finalize)
+// ─────────────────────────────────────────────────────────────────────────
+// The compiler appends the .krnn to the esp-image as an extra RAM segment
+// loaded at 0x3FFB0000 — the BOTTOM of the DRAM window — and moves .data/.bss
+// up above it. The mask ROM copies the segment from flash into RAM before the
+// entry point runs (you can watch it: `load:0x3ffb0000,len:89304` in the boot
+// log), so by the time main() runs the model is simply THERE. No MMU work, no
+// flash driver, no SPI reads.
+//
+// That makes 0x3FFB0000 a compile-time constant this file can hardcode, and
+// it is the same deal the other two MCU drivers get from `qemu -device
+// loader` — the runner never writes to the model and never assumes where it
+// lives. Baking the model into .text is NOT an option at this size: MLRift has
+// no include_bytes and array statics take no initialiser, so a baked model
+// costs ~19 bytes of store32 code per 4 model bytes (see tools/ml/README.md).
+//
+// ⚠️ Build this WITHOUT --model and 0x3FFB0000 is the start of .data instead —
+// nn_model_check() then fails the magic word and the program prints
+// "ERR:model <n>" rather than pretending to run. That is the intended
+// behaviour, not a bug to work around.
+//
+// ─────────────────────────────────────────────────────────────────────────
+// THE DRAM BUDGET IS THE WHOLE DESIGN CONSTRAINT
+// ─────────────────────────────────────────────────────────────────────────
+// The usable DRAM window is [0x3FFB0000, 0x3FFE0000) = 196608 B, and it holds
+// the model blob AND .data/.bss AND the stack (which grows down from
+// 0x3FFE0000). YuNet's .krnn is 89304 B whatever the input size, and the
+// runner's arena is exactly 8 * side^2:
+//
+//   side   arena    model+arena   fits 192 KiB?
+//    64    32768      122072      yes, ~72 KiB spare
+//    96    73728      163040      yes, ~32 KiB spare
+//   128   131072      220376      NO — 24 KiB over, before code or stack
+//
+// So the arena below is 73728: the largest of the two that fit, which means
+// ONE image shape covers both 64 and 96 px (only the --model blob changes).
+// nn_mt_run refuses to start when the model asks for more than
+// nn_mt_arena_cap(), so a 128 px .krnn prints "ERR:arena 131072" instead of
+// running off the end of the arena into the stack. YuNet is fully
+// convolutional, so a smaller input is a valid model, not a broken one — it
+// only reduces detection range.
+//
+// ─────────────────────────────────────────────────────────────────────────
+// Why TWO device blocks — deliberate, NOT a typo (see examples/esp32/hello.mlr)
+// ─────────────────────────────────────────────────────────────────────────
+// ESP32 errata CPU-3.3: consecutive writes to UART0's TX FIFO through the APB
+// bus may be LOST. The documented workaround (and what ESP-IDF's
+// uart_ll_write_txfifo does) is to write the FIFO at its AHB mirror. So we
+// POLL UART_STATUS_REG at APB 0x3FF4001C and WRITE the FIFO at AHB
+// 0x60000000. A single `device` block cannot express "poll here, write
+// there". Dropping characters here would corrupt exactly the decimal stream
+// this test compares byte-for-byte.
+//
+// No UART init: the mask ROM leaves UART0 at 115200 on the 40 MHz XTAL and
+// this target never touches the PLL.
+import "nn_model_core.mlr"
+
+// UART_STATUS_REG — APB. Poll only; never write the FIFO through this block.
+device UartStatus at 0x3FF40000 {
+    status at 0x1C : u32
+}
+
+// UART0 TX FIFO — AHB mirror. Errata CPU-3.3: the byte MUST go here.
+device UartFifo at 0x60000000 {
+    fifo at 0x00 : u32
+}
+
+fn nn_mt_putc(u8 c) {
+    // TXFIFO_CNT is bits 23:16 of UART_STATUS_REG. Wait while the 128-deep
+    // FIFO holds >= 126 bytes.
+    //
+    // ⚠️ MLRift precedence: `&` binds TIGHTER than `>>` (the opposite of C),
+    // so the shift MUST be parenthesized. Written bare, `status >> 16 & 0xFF`
+    // parses as `status >> (16 & 0xFF)` — a silently wrong mask.
+    while ((UartStatus.status >> 16) & 0xFF) >= 126 { }
+    UartFifo.fifo = c
+}
+
+// The arena. All zeros, and declared after nn_mt_seed = 12345 in the imported
+// core, so the trailing-zero trim keeps all 72 KiB of it out of the flash
+// image (the entry preamble's zero loop recreates it at boot).
+static u8[73728] nn_mt_arena
+
+fn nn_mt_arena_p() -> u32 {
+    return nn_mt_arena
+}
+
+fn nn_mt_arena_cap() -> u32 {
+    u32 v = 73728
+    return v
+}
+
+// Freestanding: there is nothing to return to. Falling off the end of main
+// executes whatever follows it in .text, which on this board is a silent
+// death with no UART output at all.
+fn main() {
+    // The --model blob's load address, fixed by the compiler at the bottom of
+    // the DRAM window. See the header.
+    u32 model = 0x3FFB0000
+    nn_mt_run(model, 1000000, 1, 0)
+    nn_mt_putc(69)
+    nn_mt_putc(78)
+    nn_mt_putc(68)
+    nn_mt_putc(10)
+    loop { }
+}
