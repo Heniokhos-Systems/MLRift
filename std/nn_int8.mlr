@@ -323,9 +323,278 @@ fn nn_requantize(i32 acc, i32 multiplier, i32 shift) -> i32 {
 // Full form: adds the output zero point and clamps to an activation range
 // (act_min/act_max are already in the quantized domain, as TFLite stores
 // them — a fused ReLU is just act_min = out_zp).
-fn nn_requantize_zp(i32 acc, i32 multiplier, i32 shift, i32 out_zp, i32 act_min, i32 act_max) -> i32 {
+//
+// THIS IS THE READABLE DEFINITION AND IT IS NOT WHAT THE KERNELS CALL.
+// nn_requantize_zp() below is the same function with every call inlined; this
+// one survives as the reference the equivalence test checks it against, so the
+// composition of nn_mul_by_qm / nn_srdhm / nn_rdbpot stays the spec.
+fn nn_requantize_zp_ref(i32 acc, i32 multiplier, i32 shift, i32 out_zp, i32 act_min, i32 act_max) -> i32 {
     i32 v = nn_mul_by_qm(acc, multiplier, shift) + out_zp
     return nn_clamp_i32(v, act_min, act_max)
+}
+
+// ---------------------------------------------------------------------------
+// The requantization hot path, flattened
+// ---------------------------------------------------------------------------
+// Every convolution output goes through exactly one of these, and on real
+// ESP32 silicon the composed version above measured ~2600 CPU cycles per
+// output — about half of a 20 s YuNet@64 inference, for what is arithmetically
+// a multiply and a shift. The cost is structural, not arithmetic: the composed
+// form is six functions deep (nn_mul_by_qm -> nn_srdhm -> nn_abs_u32 twice,
+// nn_umulhi32, nn_umullo32, nn_u32_to_i32; then nn_rdbpot; then
+// nn_clamp_i32), each one a real call0, and the register allocator has only
+// IR_NUM_REGS = 6 colours, so nearly every intermediate spills to the frame
+// and is reloaded across each call.
+//
+// What follows is the SAME function with all of that inlined into one frame.
+// It is not a fast path, an approximation or a special case: it must return
+// exactly nn_requantize_zp_ref(...) for every input in the declared domain,
+// and nn_requantize_selftest() below proves that on every target the kernels
+// run on (host 64-bit slots, xtensa and riscv32 native 32-bit wrap).
+//
+// The one non-obvious rewrite is the (sign, magnitude) extraction. The
+// composed form does nn_abs_u32(nn_u32_to_i32(ux)), which round-trips through
+// a signed value; here the magnitude is taken straight off the bit pattern as
+//   (ux & 0x80000000) ? ((~ux) + 1) & 0xFFFFFFFF : ux
+// which agrees on the whole range including ux == 0x80000000, where both give
+// 0x80000000 (|INT32_MIN| is exactly representable as an unsigned magnitude —
+// that is the same identity nn_abs_u32's comment relies on).
+//
+// Everything else is a line-for-line inline, deliberately keeping the
+// composed version's masking so the host and the 32-bit targets agree for the
+// same reasons they already did.
+fn nn_requantize_zp(i32 acc, i32 multiplier, i32 shift, i32 out_zp, i32 act_min, i32 act_max) -> i32 {
+    // --- nn_mul_by_qm: split TFLite's signed shift into the two halves ---
+    u32 left_shift = 0
+    u32 right_shift = 0
+    if shift > 0 {
+        left_shift = nn_i32_to_u32(shift)
+        if left_shift > 31 { left_shift = 31 }
+    } else {
+        i32 ns = 0 - shift
+        right_shift = nn_i32_to_u32(ns)
+    }
+
+    // xs = acc << left_shift, carried as its 32-bit pattern.
+    //
+    // ⚠️ nn_i32_to_u32() HERE IS LOAD-BEARING, NOT DECORATION. Writing the
+    // equivalent-looking `u32 ux = acc  ux = ux & 0xFFFFFFFF` makes mlrc treat
+    // ux — and everything derived from it — as SIGNED on the 32-bit backends:
+    // further down, `slo < lo` becomes a signed compare and `slo >> 31` becomes
+    // an arithmetic shift, so 0x80000000 >> 31 yields 0xFFFFFFFF instead of 1.
+    // The host, where u32 lives in a 64-bit slot and 0x80000000 is genuinely
+    // positive, gets the right answer either way — so this is invisible until
+    // it is run on xtensa or riscv32, where it is catastrophic (12856 of 14742
+    // requantizations wrong). Passing through a fn DECLARED to return u32
+    // restores unsigned provenance. This is the implicit-reinterpretation trap
+    // the file header warns about; it applies to every i32 -> u32 assignment
+    // whose result is later compared or right-shifted.
+    u32 ux = nn_i32_to_u32(acc)
+    if left_shift > 0 { ux = (ux << left_shift) & 0xFFFFFFFF }
+
+    // --- nn_srdhm(xs, multiplier), inlined ---
+    // sign and magnitude of the i32 whose pattern is ux
+    u32 neg = 0
+    u32 ua = ux
+    if (ux & 0x80000000) != 0 {
+        neg = 1
+        ua = ((ux ^ 0xFFFFFFFF) + 1) & 0xFFFFFFFF
+    }
+    // sign and magnitude of the multiplier (nn_i32_to_u32 for the same
+    // unsigned-provenance reason as ux above — ub feeds the same compares)
+    u32 ub = nn_i32_to_u32(multiplier)
+    if multiplier < 0 {
+        neg = neg ^ 1
+        ub = ((ub ^ 0xFFFFFFFF) + 1) & 0xFFFFFFFF
+    }
+
+    i32 h = 0
+    u32 sat = 0
+    // |a| == 2^31 only for INT32_MIN, so this is exactly gemmlowp's single
+    // overflow case. Note it saturates the DOUBLING-HIGH-MUL result, so the
+    // right shift below still applies — an early return here would be wrong.
+    if ua == 0x80000000 {
+        if ub == 0x80000000 { sat = 1 }
+    }
+    if sat != 0 {
+        h = nn_i32_max()
+    } else {
+        // nn_umulhi32 from four 16-bit half-products; no intermediate here can
+        // exceed 32 bits, so no masking is needed and the host agrees for free.
+        u32 al = ua & 0xFFFF
+        u32 ah = ua >> 16
+        u32 bl = ub & 0xFFFF
+        u32 bh = ub >> 16
+        u32 pll = al * bl
+        u32 m1 = ah * bl
+        u32 m2 = al * bh
+        u32 t = (pll >> 16) + (m1 & 0xFFFF) + (m2 & 0xFFFF)
+        u32 hi = ah * bh + (m1 >> 16) + (m2 >> 16) + (t >> 16)
+        // nn_umullo32
+        u32 lo = (ua * ub) & 0xFFFFFFFF
+
+        if hi == 0 {
+            if lo == 0 { neg = 0 }
+        }
+        if neg == 1 {
+            u32 carry = 0
+            if lo == 0 { carry = 1 }
+            u32 nlo = ((lo ^ 0xFFFFFFFF) + 1) & 0xFFFFFFFF
+            u32 nhi = ((hi ^ 0xFFFFFFFF) + carry) & 0xFFFFFFFF
+            lo = nlo
+            hi = nhi
+        }
+
+        // nudge as a sign-extended 64-bit addend:
+        //   +2^30    -> (0x00000000, 0x40000000)
+        //   1 - 2^30 -> (0xFFFFFFFF, 0xC0000001)
+        u32 add_hi = 0
+        u32 add_lo = 0x40000000
+        if neg == 1 {
+            add_hi = 0xFFFFFFFF
+            add_lo = 0xC0000001
+        }
+        u32 slo = (lo + add_lo) & 0xFFFFFFFF
+        u32 c2 = 0
+        if slo < lo { c2 = 1 }
+        u32 shi = (hi + add_hi + c2) & 0xFFFFFFFF
+
+        // (hi, lo) >> 31 keeping bits 62..31 — the FLOOR of the division.
+        u32 q = ((shi << 1) | (slo >> 31)) & 0xFFFFFFFF
+        // nn_u32_to_i32(q)
+        if (q & 0x80000000) == 0 {
+            h = q
+        } else {
+            u32 mag = ((q ^ 0xFFFFFFFF) + 1) & 0xFFFFFFFF
+            i32 hr = mag
+            h = 0 - hr
+        }
+        // C divides toward zero, so a negative value with a non-zero remainder
+        // must be bumped from floor to ceil.
+        if (shi & 0x80000000) != 0 {
+            if (slo & 0x7FFFFFFF) != 0 { h = h + 1 }
+        }
+    }
+
+    // --- nn_rdbpot(h, right_shift), inlined ---
+    i32 res = h
+    if right_shift != 0 {
+        u32 e = right_shift
+        if e > 31 { e = 31 }
+        i32 mask = (1 << e) - 1
+        i32 remainder = h & mask
+        i32 threshold = mask >> 1
+        if h < 0 { threshold = threshold + 1 }
+        res = h >> e
+        if remainder > threshold { res = res + 1 }
+    }
+
+    // --- + out_zp, then nn_clamp_i32 ---
+    i32 v = res + out_zp
+    if v < act_min { return act_min }
+    if v > act_max { return act_max }
+    return v
+}
+
+// Prove nn_requantize_zp == nn_requantize_zp_ref. Returns the number of
+// disagreements, so 0 is a pass; the caller prints it.
+//
+// The grid is chosen for the places the two forms could plausibly diverge
+// rather than for size: the accumulator values are the int32 extremes and the
+// bit patterns that straddle the sign boundary and the rounding thresholds,
+// the multipliers include both INT32_MIN and INT32_MAX (the saturating
+// INT32_MIN*INT32_MIN case) plus the [2^30, 2^31) band a real quantizer
+// actually emits, and `shift` sweeps the entire declared [-31, 31] including
+// the left-shift half that YuNet never exercises. The zero-point and clamp
+// arguments are varied too so the tail is covered. An LCG then adds pseudo
+// random triples over the full 32-bit range on top.
+//
+// It runs on host, xtensa and riscv32, which matters: the host carries u32 in
+// 64-bit slots and does NOT wrap, so an inlining mistake that only shows up
+// under real 32-bit truncation would be invisible if this were host-only.
+// Test vectors as 32-bit BIT PATTERNS, not as i32. A `static i32[]` element
+// load does not sign-extend on the host (it yields the raw 4 bytes in a 64-bit
+// slot, so -1 comes back as 4294967295 — a value outside the i32 domain that
+// both functions are then free to disagree about). Storing patterns and
+// converting with nn_u32_to_i32 on the way out is the same discipline
+// nn_load_i32 already uses, and it makes the host and the 32-bit targets feed
+// the two implementations identical arguments.
+static u32[13] nn_rq_accs
+static u32[9] nn_rq_mults
+
+fn nn_requantize_selftest() -> u32 {
+    u32 bad = 0
+
+    nn_rq_accs[0] = 0
+    nn_rq_accs[1] = 1
+    nn_rq_accs[2] = 0xFFFFFFFF          // -1
+    nn_rq_accs[3] = 2
+    nn_rq_accs[4] = 0xFFFFFFFE          // -2
+    nn_rq_accs[5] = 127
+    nn_rq_accs[6] = 0xFFFFFF80          // -128
+    nn_rq_accs[7] = 65536
+    nn_rq_accs[8] = 0xFFFF0000          // -65536
+    nn_rq_accs[9] = 0x40000000          // 2^30
+    nn_rq_accs[10] = 0xC0000000         // -2^30
+    nn_rq_accs[11] = 0x7FFFFFFF         // INT32_MAX
+    nn_rq_accs[12] = 0x80000000         // INT32_MIN
+
+    nn_rq_mults[0] = 1
+    nn_rq_mults[1] = 0xFFFFFFFF         // -1
+    nn_rq_mults[2] = 0x40000000         // 2^30
+    nn_rq_mults[3] = 0x40000001
+    nn_rq_mults[4] = 1500000000
+    nn_rq_mults[5] = 0x7FFFFFFF         // INT32_MAX
+    nn_rq_mults[6] = 0xC0000000         // -2^30
+    nn_rq_mults[7] = 0x80000000         // INT32_MIN
+    nn_rq_mults[8] = 0
+
+    u32 ai = 0
+    while ai < 13 {
+        u32 mi = 0
+        while mi < 9 {
+            i32 av = nn_u32_to_i32(nn_rq_accs[ai])
+            i32 mv = nn_u32_to_i32(nn_rq_mults[mi])
+            i32 sh = 0 - 31
+            while sh <= 31 {
+                i32 got = nn_requantize_zp(av, mv, sh, 0, 0 - 128, 127)
+                i32 wnt = nn_requantize_zp_ref(av, mv, sh, 0, 0 - 128, 127)
+                if got != wnt { bad = bad + 1 }
+                // again with a non-zero zero point and an asymmetric clamp
+                got = nn_requantize_zp(av, mv, sh, 7, 0 - 20, 100)
+                wnt = nn_requantize_zp_ref(av, mv, sh, 7, 0 - 20, 100)
+                if got != wnt { bad = bad + 1 }
+                sh = sh + 1
+            }
+            mi = mi + 1
+        }
+        ai = ai + 1
+    }
+
+    // Pseudo-random sweep. The LCG is the same one tests/nn uses; 20000
+    // triples is a few million equivalent comparisons after the grid above
+    // and still finishes fast enough for qemu.
+    u32 s = 987654321
+    u32 k = 0
+    while k < 20000 {
+        s = ((s * 1103515245) + 12345) & 0xFFFFFFFF
+        i32 a = nn_u32_to_i32(s)
+        s = ((s * 1103515245) + 12345) & 0xFFFFFFFF
+        i32 m = nn_u32_to_i32(s)
+        s = ((s * 1103515245) + 12345) & 0xFFFFFFFF
+        u32 shu = (s >> 13) % 63
+        i32 sh2 = shu
+        sh2 = sh2 - 31
+        s = ((s * 1103515245) + 12345) & 0xFFFFFFFF
+        u32 zu = (s >> 17) % 255
+        i32 zp = zu
+        zp = zp - 128
+        i32 g = nn_requantize_zp(a, m, sh2, zp, 0 - 128, 127)
+        i32 w = nn_requantize_zp_ref(a, m, sh2, zp, 0 - 128, 127)
+        if g != w { bad = bad + 1 }
+        k = k + 1
+    }
+    return bad
 }
 
 // Signed divide truncating toward zero (C semantics), implemented on
@@ -381,6 +650,183 @@ fn nn_out_dim(u32 in_dim, u32 k, u32 stride, u32 pad) -> u32 {
 
 
 // ---------------------------------------------------------------------------
+// Valid tap range — the padding test, hoisted out of the inner loops
+// ---------------------------------------------------------------------------
+// A kernel index k contributes to output position `out_pos` exactly when
+//
+//     0 <= out_pos * stride + k - pad < in_dim
+//
+// which is the pair of bounds checks the spatial kernels used to evaluate PER
+// TAP. Solving it for k gives the half-open range
+//
+//     k in [ max(0, pad - out_pos*stride),  min(k_n, in_dim + pad - out_pos*stride) )
+//
+// so the checks become two computations per output ROW/COLUMN instead of two
+// branches per multiply-accumulate. This is a pure hoist, not a change of
+// behaviour: the range contains exactly the taps the per-tap test admitted, in
+// the same increasing order, so every accumulator sees the same addends in the
+// same sequence and the result is bit-identical. (Order matters here only in
+// principle — these are exact integer adds — but keeping it makes the
+// equivalence trivial to see.)
+//
+// Both return values are clamped into [0, k_n], and the caller must treat
+// hi <= lo as "no valid taps" (which is reachable: a window can fall entirely
+// in the padding).
+fn nn_tap_lo(u32 out_pos, u32 stride, u32 pad, u32 k_n) -> u32 {
+    u32 base = out_pos * stride
+    if pad <= base { return 0 }
+    u32 d = pad - base
+    if d > k_n { return k_n }
+    return d
+}
+
+fn nn_tap_hi(u32 out_pos, u32 stride, u32 pad, u32 k_n, u32 in_dim) -> u32 {
+    u32 base = out_pos * stride
+    u32 lim = in_dim + pad
+    if base >= lim { return 0 }
+    u32 h = lim - base
+    if h > k_n { return k_n }
+    return h
+}
+
+
+// ---------------------------------------------------------------------------
+// Section 2b — int8 dot-product inner loops
+// ---------------------------------------------------------------------------
+// These two functions exist for ONE reason, and it is not tidiness: mlrc
+// allocates registers per FUNCTION, by graph colouring, with IR_NUM_REGS = 6
+// colours. nn_conv2d_int8 and nn_depthwise_conv2d_int8 carry roughly 25 locals
+// that are live around their innermost loop (extents, strides, tap ranges,
+// base addresses, the requantization parameters, the loop indices at four
+// levels), so the innermost loop's own values lose the colouring and every
+// single multiply-accumulate turns into a run of spill loads and stores
+// against the frame. That is measurable: with the loop inlined in the caller a
+// MAC cost ~125 CPU cycles on the ESP32, for what is two byte loads, a compare
+// each, a MULL and an add.
+//
+// Pulled out here, the four values that matter — the accumulator, the two
+// pointers and the counter — fit the budget, and the call is paid once per
+// kernel row instead of once per element.
+//
+// Both are unrolled 4x with a remainder tail. The unrolled body deliberately
+// REUSES one `a`/`b` pair rather than naming four, so the peak live count
+// stays at the same four-plus-two and the unroll does not spend the registers
+// it is trying to save. Taps are still visited in strictly ascending order, so
+// the integer accumulation is bit-identical to the rolled form.
+//
+// The sign extension is nn_load_i8's body MINUS its `& 0xFF`. That mask is
+// provably dead: every backend's byte load already zero-extends (xtensa l8ui,
+// riscv32 lbu, x86_64 movzx), so load8 can only return 0..255. Dropping it is
+// not cosmetic under this codegen — materializing the constant 0xFF costs a
+// movi, a spill store, two spill reloads, the AND and another spill store, i.e.
+// ~6 instructions per operand, twice per multiply-accumulate. Measured on
+// silicon: 542.4M -> 486.5M cycles, 1.115x, for deleting 20 dead masks.
+// `iv - in_zp` is the same subtraction the naive kernels did.
+//
+// TRIED AND REJECTED: fusing nn_dot_i8_str's caller-side kernel-ROW loop into
+// it, so a whole depthwise window was one call instead of one per row. It made
+// depthwise 1.1% SLOWER (149.9M -> 151.6M cycles). Ten parameters puts four of
+// them in the caller's overflow slots and pushes the callee to 16 locals, and
+// that costs more than the two call0s it removes. The per-row call stays.
+
+// Unit stride on both operands — conv2d and pointwise, where a whole kernel
+// row's (kj, ic) taps are contiguous in both NHWC activations and OHWI weights.
+fn nn_dot_i8_run(i32 acc, u32 p, u32 q, u32 n, i32 in_zp) -> i32 {
+    i32 s = acc
+    u32 ip = p
+    u32 wp = q
+    u32 k = n
+    while k >= 4 {
+        i32 a = load8(ip)
+        if a > 127 { a = a - 256 }
+        i32 b = load8(wp)
+        if b > 127 { b = b - 256 }
+        s = s + ((a - in_zp) * b)
+        a = load8(ip + 1)
+        if a > 127 { a = a - 256 }
+        b = load8(wp + 1)
+        if b > 127 { b = b - 256 }
+        s = s + ((a - in_zp) * b)
+        a = load8(ip + 2)
+        if a > 127 { a = a - 256 }
+        b = load8(wp + 2)
+        if b > 127 { b = b - 256 }
+        s = s + ((a - in_zp) * b)
+        a = load8(ip + 3)
+        if a > 127 { a = a - 256 }
+        b = load8(wp + 3)
+        if b > 127 { b = b - 256 }
+        s = s + ((a - in_zp) * b)
+        ip = ip + 4
+        wp = wp + 4
+        k = k - 4
+    }
+    while k > 0 {
+        i32 a = load8(ip)
+        if a > 127 { a = a - 256 }
+        i32 b = load8(wp)
+        if b > 127 { b = b - 256 }
+        s = s + ((a - in_zp) * b)
+        ip = ip + 1
+        wp = wp + 1
+        k = k - 1
+    }
+    return s
+}
+
+// Arbitrary per-tap strides — depthwise, where one output channel's taps sit
+// in_c apart in the activations and out_c apart in the 1HWC weights.
+fn nn_dot_i8_str(i32 acc, u32 p, u32 q, u32 n, u32 ps, u32 qs, i32 in_zp) -> i32 {
+    i32 s = acc
+    u32 ip = p
+    u32 wp = q
+    u32 k = n
+    while k >= 4 {
+        i32 a = load8(ip)
+        if a > 127 { a = a - 256 }
+        i32 b = load8(wp)
+        if b > 127 { b = b - 256 }
+        s = s + ((a - in_zp) * b)
+        ip = ip + ps
+        wp = wp + qs
+        a = load8(ip)
+        if a > 127 { a = a - 256 }
+        b = load8(wp)
+        if b > 127 { b = b - 256 }
+        s = s + ((a - in_zp) * b)
+        ip = ip + ps
+        wp = wp + qs
+        a = load8(ip)
+        if a > 127 { a = a - 256 }
+        b = load8(wp)
+        if b > 127 { b = b - 256 }
+        s = s + ((a - in_zp) * b)
+        ip = ip + ps
+        wp = wp + qs
+        a = load8(ip)
+        if a > 127 { a = a - 256 }
+        b = load8(wp)
+        if b > 127 { b = b - 256 }
+        s = s + ((a - in_zp) * b)
+        ip = ip + ps
+        wp = wp + qs
+        k = k - 4
+    }
+    while k > 0 {
+        i32 a = load8(ip)
+        if a > 127 { a = a - 256 }
+        i32 b = load8(wp)
+        if b > 127 { b = b - 256 }
+        s = s + ((a - in_zp) * b)
+        ip = ip + ps
+        wp = wp + qs
+        k = k - 1
+    }
+    return s
+}
+
+
+// ---------------------------------------------------------------------------
 // Section 3 — convolution kernels
 // ---------------------------------------------------------------------------
 
@@ -394,51 +840,60 @@ fn nn_conv2d_int8(u32 in_p, u32 in_h, u32 in_w, u32 in_c, i32 in_zp,
                   i32 act_min, i32 act_max) {
     u32 out_h = nn_out_dim(in_h, kh, stride_h, pad_h)
     u32 out_w = nn_out_dim(in_w, kw, stride_w, pad_w)
-    i32 ih_i = in_h
-    i32 iw_i = in_w
-    i32 pad_h_i = pad_h
-    i32 pad_w_i = pad_w
+    // (The signed ih_i/iw_i/pad_*_i copies the naive form needed for its
+    // per-tap bounds tests are gone: nn_tap_lo/nn_tap_hi do that in u32.)
+
+    // Row strides, computed once. `k_row` is the weight bytes one kernel row
+    // spans and `k_oc` the bytes one output channel's whole kernel spans, so
+    // every weight address below is an add rather than the four-deep multiply
+    // chain ((((oc*kh)+ki)*kw)+kj)*in_c the naive form recomputed per element.
+    u32 in_row_bytes = in_w * in_c
+    u32 k_row = kw * in_c
+    u32 k_oc = kh * k_row
+    u32 op_run = out_p                 // the output is written strictly in order
 
     u32 oy = 0
     while oy < out_h {
+        // Valid kernel-row range for this output row (see nn_tap_lo/hi).
+        u32 ki_lo = nn_tap_lo(oy, stride_h, pad_h, kh)
+        u32 ki_hi = nn_tap_hi(oy, stride_h, pad_h, kh, in_h)
+        if ki_hi < ki_lo { ki_hi = ki_lo }
+        u32 iy0 = 0
+        if ki_hi > ki_lo { iy0 = ((oy * stride_h) + ki_lo) - pad_h }
+
         u32 ox = 0
         while ox < out_w {
+            u32 kj_lo = nn_tap_lo(ox, stride_w, pad_w, kw)
+            u32 kj_hi = nn_tap_hi(ox, stride_w, pad_w, kw, in_w)
+            if kj_hi < kj_lo { kj_hi = kj_lo }
+            u32 ix0 = 0
+            if kj_hi > kj_lo { ix0 = ((ox * stride_w) + kj_lo) - pad_w }
+
+            // ONE CONTIGUOUS RUN PER KERNEL ROW. Within a kernel row the taps
+            // kj_lo..kj_hi-1 map to ADJACENT input columns (kj advances the
+            // input x by exactly 1 whatever stride_w is — stride only moves the
+            // base), and NHWC puts adjacent columns' channel vectors back to
+            // back. The OHWI weights are contiguous over (kj, ic) for a fixed
+            // (oc, ki) for the same reason. So the kj loop and the ic loop
+            // collapse into a single flat run of `run` bytes on both operands,
+            // visiting exactly the same (kj, ic) pairs in exactly the same
+            // order as the nested form did.
+            u32 run = (kj_hi - kj_lo) * in_c
+            u32 in_base = in_p + (((iy0 * in_w) + ix0) * in_c)
+            u32 w_base = w_p + (ki_lo * k_row) + (kj_lo * in_c)
+
             u32 oc = 0
             while oc < out_c {
                 i32 acc = 0
                 if bias_p != 0 { acc = nn_load_i32(bias_p + (oc * 4)) }
 
-                u32 ki = 0
-                while ki < kh {
-                    u32 iy_base = (oy * stride_h) + ki
-                    i32 iy = iy_base
-                    iy = iy - pad_h_i
-                    if iy >= 0 {
-                        if iy < ih_i {
-                            u32 iy_u = iy
-                            u32 kj = 0
-                            while kj < kw {
-                                u32 ix_base = (ox * stride_w) + kj
-                                i32 ix = ix_base
-                                ix = ix - pad_w_i
-                                if ix >= 0 {
-                                    if ix < iw_i {
-                                        u32 ix_u = ix
-                                        u32 in_row = ((iy_u * in_w) + ix_u) * in_c
-                                        u32 w_row = ((((oc * kh) + ki) * kw) + kj) * in_c
-                                        u32 ic = 0
-                                        while ic < in_c {
-                                            i32 iv = nn_load_i8(in_p + in_row + ic) - in_zp
-                                            i32 wv = nn_load_i8(w_p + w_row + ic)
-                                            acc = acc + (iv * wv)
-                                            ic = ic + 1
-                                        }
-                                    }
-                                }
-                                kj = kj + 1
-                            }
-                        }
-                    }
+                u32 ip = in_base
+                u32 wp = w_base + (oc * k_oc)
+                u32 ki = ki_lo
+                while ki < ki_hi {
+                    acc = nn_dot_i8_run(acc, ip, wp, run, in_zp)
+                    ip = ip + in_row_bytes
+                    wp = wp + k_row
                     ki = ki + 1
                 }
 
@@ -446,7 +901,8 @@ fn nn_conv2d_int8(u32 in_p, u32 in_h, u32 in_w, u32 in_c, i32 in_zp,
                 i32 m = nn_load_i32(mult_p + qi)
                 i32 sh = nn_load_i32(shift_p + qi)
                 i32 ov = nn_requantize_zp(acc, m, sh, out_zp, act_min, act_max)
-                nn_store_i8(out_p + ((((oy * out_w) + ox) * out_c) + oc), ov)
+                nn_store_i8(op_run, ov)
+                op_run = op_run + 1
                 oc = oc + 1
             }
             ox = ox + 1
@@ -467,61 +923,66 @@ fn nn_depthwise_conv2d_int8(u32 in_p, u32 in_h, u32 in_w, u32 in_c, i32 in_zp,
     u32 out_h = nn_out_dim(in_h, kh, stride_h, pad_h)
     u32 out_w = nn_out_dim(in_w, kw, stride_w, pad_w)
     u32 out_c = in_c * depth_mult
-    i32 ih_i = in_h
-    i32 iw_i = in_w
-    i32 pad_h_i = pad_h
-    i32 pad_w_i = pad_w
+    // Strides, once. A depthwise tap walks the input by in_c per kernel column
+    // and by in_w*in_c per kernel row, and the 1HWC weights by out_c per column
+    // and kw*out_c per row — so every address in the loops below is an add.
+    // Unlike conv2d these runs are NOT contiguous (a depthwise output touches
+    // one channel, not all of them), so the kj loop stays, but it loses both
+    // bounds tests and both multiply chains.
+    u32 in_row_bytes = in_w * in_c
+    u32 w_row_bytes = kw * out_c
 
     u32 oy = 0
     while oy < out_h {
+        u32 ki_lo = nn_tap_lo(oy, stride_h, pad_h, kh)
+        u32 ki_hi = nn_tap_hi(oy, stride_h, pad_h, kh, in_h)
+        if ki_hi < ki_lo { ki_hi = ki_lo }
+        u32 iy0 = 0
+        if ki_hi > ki_lo { iy0 = ((oy * stride_h) + ki_lo) - pad_h }
+
         u32 ox = 0
         while ox < out_w {
+            u32 kj_lo = nn_tap_lo(ox, stride_w, pad_w, kw)
+            u32 kj_hi = nn_tap_hi(ox, stride_w, pad_w, kw, in_w)
+            if kj_hi < kj_lo { kj_hi = kj_lo }
+            u32 ix0 = 0
+            if kj_hi > kj_lo { ix0 = ((ox * stride_w) + kj_lo) - pad_w }
+            u32 taps = kj_hi - kj_lo
+            u32 in_base = in_p + (((iy0 * in_w) + ix0) * in_c)
+            u32 w_base = w_p + (ki_lo * w_row_bytes) + (kj_lo * out_c)
+
+            // oc counts up so the output store is sequential; ic/dm are carried
+            // alongside instead of being recovered with a divide. oc == ic when
+            // depth_mult is 1, which is every depthwise layer in YuNet, but the
+            // general mapping oc = ic*depth_mult + dm is preserved exactly.
+            u32 oc = 0
             u32 ic = 0
-            while ic < in_c {
-                u32 dm = 0
-                while dm < depth_mult {
-                    u32 oc = (ic * depth_mult) + dm
-                    i32 acc = 0
-                    if bias_p != 0 { acc = nn_load_i32(bias_p + (oc * 4)) }
+            u32 dm = 0
+            while oc < out_c {
+                i32 acc = 0
+                if bias_p != 0 { acc = nn_load_i32(bias_p + (oc * 4)) }
 
-                    u32 ki = 0
-                    while ki < kh {
-                        u32 iy_base = (oy * stride_h) + ki
-                        i32 iy = iy_base
-                        iy = iy - pad_h_i
-                        if iy >= 0 {
-                            if iy < ih_i {
-                                u32 iy_u = iy
-                                u32 kj = 0
-                                while kj < kw {
-                                    u32 ix_base = (ox * stride_w) + kj
-                                    i32 ix = ix_base
-                                    ix = ix - pad_w_i
-                                    if ix >= 0 {
-                                        if ix < iw_i {
-                                            u32 ix_u = ix
-                                            u32 ipos = (((iy_u * in_w) + ix_u) * in_c) + ic
-                                            u32 wpos = (((ki * kw) + kj) * out_c) + oc
-                                            i32 iv = nn_load_i8(in_p + ipos) - in_zp
-                                            i32 wv = nn_load_i8(w_p + wpos)
-                                            acc = acc + (iv * wv)
-                                        }
-                                    }
-                                    kj = kj + 1
-                                }
-                            }
-                        }
-                        ki = ki + 1
-                    }
-
-                    u32 qi = (oc * q_stride) * 4
-                    i32 m = nn_load_i32(mult_p + qi)
-                    i32 sh = nn_load_i32(shift_p + qi)
-                    i32 ov = nn_requantize_zp(acc, m, sh, out_zp, act_min, act_max)
-                    nn_store_i8(out_p + ((((oy * out_w) + ox) * out_c) + oc), ov)
-                    dm = dm + 1
+                u32 ip = in_base + ic
+                u32 wp = w_base + oc
+                u32 ki = ki_lo
+                while ki < ki_hi {
+                    acc = nn_dot_i8_str(acc, ip, wp, taps, in_c, out_c, in_zp)
+                    ip = ip + in_row_bytes
+                    wp = wp + w_row_bytes
+                    ki = ki + 1
                 }
-                ic = ic + 1
+
+                u32 qi = (oc * q_stride) * 4
+                i32 m = nn_load_i32(mult_p + qi)
+                i32 sh = nn_load_i32(shift_p + qi)
+                i32 ov = nn_requantize_zp(acc, m, sh, out_zp, act_min, act_max)
+                nn_store_i8(out_p + ((((oy * out_w) + ox) * out_c) + oc), ov)
+                dm = dm + 1
+                if dm == depth_mult {
+                    dm = 0
+                    ic = ic + 1
+                }
+                oc = oc + 1
             }
             ox = ox + 1
         }

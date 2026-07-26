@@ -69,9 +69,23 @@
 // there". Dropping characters here would corrupt exactly the decimal stream
 // this test compares byte-for-byte.
 //
-// No UART init: the mask ROM leaves UART0 at 115200 on the 40 MHz XTAL and
-// this target never touches the PLL.
+// ─────────────────────────────────────────────────────────────────────────
+// THE CLOCK: THIS TARGET *DOES* TOUCH THE PLL NOW
+// ─────────────────────────────────────────────────────────────────────────
+// The mask ROM hands over with SOC_CLK_SEL = XTAL, so both the CPU and the APB
+// bus run at 40 MHz — measured, not assumed: CCOUNT advanced 220,001,484 counts
+// in 5.5000 s of host wall clock, and UART0_CLKDIV read 0x0030015B, i.e.
+// 347+3/16, which is 40.0 MHz for 115200 baud.
+//
+// main() now calls esp32_clk_cpu_pll(240) as its FIRST action, which brings up
+// the BBPLL at 480 MHz, selects it, and — critically — rewrites UART0's divisor
+// for the new 80 MHz APB. Skipping that last step turns this driver's decimal
+// stream into garbage, which looks exactly like a hang. Measured result: the
+// same inference, byte-identical output, 6.00x less wall time.
+//
+// No other UART init is needed: the ROM already leaves UART0 at 8N1 on APB.
 import "nn_model_core.mlr"
+import "../../std/esp32_clk.mlr"
 
 // UART_STATUS_REG — APB. Poll only; never write the FIFO through this block.
 device UartStatus at 0x3FF40000 {
@@ -108,12 +122,12 @@ fn nn_mt_arena_cap() -> u32 {
     return v
 }
 
-// Counted busy-wait between runs, ~1 s at 40 MHz — enough for a human or a
+// Counted busy-wait between runs, ~1 s at 240 MHz — enough for a human or a
 // `cat` to notice the gap between two runs. We are timing a terminal, not a
-// protocol.
+// protocol. (6x the iteration count the 40 MHz version used.)
 fn nn_esp_delay() {
     u32 i = 0
-    while i < 4000000 {
+    while i < 24000000 {
         i = i + 1
     }
 }
@@ -148,10 +162,16 @@ fn nn_esp_delay() {
 // tools/ml/int8_sim.py, repeated 11 times in a row. One inference plus its
 // UART dump takes roughly 20 s, so give a capture a good minute.
 fn main() {
+    // CPU 40 -> 240 MHz and APB 40 -> 80 MHz, with UART0's divisor recomputed.
+    // MUST come before the first putc. See the header.
+    u32 clkrc = esp32_clk_cpu_pll(240)
     // The --model blob's load address, fixed by the compiler at the bottom of
     // the DRAM window. See the header.
     u32 model = 0x3FFB0000
     loop {
+        nn_mt_str("CLK ")
+        nn_mt_emit_u32(clkrc)
+        nn_mt_putc(10)
         nn_mt_str("BOOT ")
         nn_mt_emit_u32(load32(model))
         nn_mt_putc(10)
