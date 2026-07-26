@@ -834,6 +834,50 @@ fn main() {
     exit(0)
 }' 0
 
+# --- declared-type signedness must not be inherited from the initialiser ---
+# Regression: `uint32 ux = <int32>` copied the RHS's signed flag, so ux and
+# everything derived from it used SIGNED ops -- `ux >> 1` became an ARITHMETIC
+# shift and comparisons became signed. Invisible on x86_64/arm64, where a
+# uint32 occupies a 64-bit slot and never reaches the sign bit, but silently
+# wrong on the 32-bit backends: 0x80000000 >> 31 gave 0xFFFFFFFF instead of 1.
+# Checked in the IR, because a host run passes either way and hides it.
+TOTAL=$((TOTAL + 1))
+SGN_ROOT="$DIR/.."
+printf 'fn main() -> uint64 {\n    int32 acc = 0 - 5\n    uint32 ux = acc\n    uint32 sh = ux >> 1\n    return sh\n}\n' > "$SGN_ROOT/test_tmp_$$.mlr"
+SGN_OUT=$($MLRC --emit=ir --arch=x86_64 "$SGN_ROOT/test_tmp_$$.mlr" 2>/dev/null)
+# and the converse: a genuinely signed int32 shift must still be arithmetic
+printf 'fn main() -> uint64 {\n    int32 a = 0 - 8\n    int32 b = a >> 1\n    return 0\n}\n' > "$SGN_ROOT/test_tmp2_$$.mlr"
+SGN_OUT2=$($MLRC --emit=ir --arch=x86_64 "$SGN_ROOT/test_tmp2_$$.mlr" 2>/dev/null)
+rm -f "$SGN_ROOT/test_tmp_$$.mlr" "$SGN_ROOT/test_tmp2_$$.mlr"
+if echo "$SGN_OUT" | grep -q "shr" && ! echo "$SGN_OUT" | grep -q "sar" \
+   && echo "$SGN_OUT2" | grep -q "sar"; then
+    PASS=$((PASS + 1))
+    echo "  decl_type_signedness: PASS (uint32 from int32 -> shr; int32 -> sar)"
+else
+    echo "FAIL: decl_type_signedness (uint32-from-int32 shift: $(echo "$SGN_OUT" | grep -oE 'shr|sar' | head -1), int32 shift: $(echo "$SGN_OUT2" | grep -oE 'shr|sar' | head -1))"
+    FAIL=$((FAIL + 1))
+fi
+
+# --- same, on the ASSIGNMENT path: a store cannot retype the variable ---
+# `uint32 ux = 7; ux = <int32>` let the rvalue's signed flag through, so ux
+# became signed from that point on. The LHS local's flag is authoritative in
+# both directions now. Second half checks the direction that must NOT break:
+# a signed local stays signed across `x = x - n`, so `x < 0` keeps SCMP.
+TOTAL=$((TOTAL + 1))
+printf 'fn main() -> uint64 {\n    int32 acc = 0 - 5\n    uint32 ux = 7\n    ux = acc\n    uint32 sh = ux >> 1\n    return sh\n}\n' > "$SGN_ROOT/test_tmp_$$.mlr"
+ASG_OUT=$($MLRC --emit=ir --arch=x86_64 "$SGN_ROOT/test_tmp_$$.mlr" 2>/dev/null)
+printf 'fn main() -> uint64 {\n    int64 x = 3\n    x = x - 5\n    if x < 0 { return 1 }\n    return 0\n}\n' > "$SGN_ROOT/test_tmp2_$$.mlr"
+ASG_OUT2=$($MLRC --emit=ir --arch=x86_64 "$SGN_ROOT/test_tmp2_$$.mlr" 2>/dev/null)
+rm -f "$SGN_ROOT/test_tmp_$$.mlr" "$SGN_ROOT/test_tmp2_$$.mlr"
+if echo "$ASG_OUT" | grep -q "shr" && ! echo "$ASG_OUT" | grep -q "sar" \
+   && echo "$ASG_OUT2" | grep -qi "scmp"; then
+    PASS=$((PASS + 1))
+    echo "  assign_type_signedness: PASS (uint32 = int32 -> shr; signed local keeps scmp)"
+else
+    echo "FAIL: assign_type_signedness (uint32=int32 shift: $(echo "$ASG_OUT" | grep -oE 'shr|sar' | head -1), signed cmp: $(echo "$ASG_OUT2" | grep -oiE 'scmp_[a-z]+|cmp_[a-z]+' | head -1))"
+    FAIL=$((FAIL + 1))
+fi
+
 run_test "signed_lt_true" 'fn main() {
     uint64 a = 0xFFFFFFFFFFFFFFFF
     uint64 b = 1
