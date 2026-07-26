@@ -143,6 +143,13 @@ below.
 
 ### On real ESP32 silicon: `--model` makes the blob a flash segment
 
+**Measured, not projected:** YuNet @64 px on an ESP32-D0WD-V3 (40 MHz XTAL,
+4 MB flash) prints all 1344 output values **byte-identical to
+`int8_sim.py`**, and did so on 11 consecutive runs. So host x86_64,
+xtensa-under-qemu, riscv32-under-qemu and real Xtensa LX6 hardware all agree
+to the byte. One inference plus its UART dump takes ~20 s on the chip.
+
+
 The qemu trick has an exact hardware equivalent, and it is not a flash driver.
 `mlrc --target=esp32 --model <file>` appends the file's raw bytes to the
 esp-image as an extra RAM segment loaded at `0x3FFB0000`; the mask ROM copies
@@ -151,10 +158,15 @@ the boot log:
 
 ```
 rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+mode:DIO, clock div:2
 load:0x3ffb0000,len:89304      <- the model
 load:0x3ffc5ce0,len:60         <- .data, moved up above it
 load:0x40080400,len:13788      <- code
-entry 0x4008384c
+entry 0x40083894
+BOOT 1313755723                <- 0x4E4E524B, 'KRNN' read back from 0x3FFB0000
+BEGIN
+...1344 values...
+END 0
 ```
 
 No MMU work, no SPI reads, and no ~590 KB image. The blob goes at the BOTTOM
