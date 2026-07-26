@@ -1,0 +1,294 @@
+// nn_micro_esp32.mlr — per-primitive cycle micro-benchmark on real silicon.
+//
+// nn_prof_esp32.mlr answers "which LAYER is slow"; this answers "which
+// PRIMITIVE is slow", which is the question that actually picks the next
+// optimisation. It exists because the per-layer numbers were misleading on
+// their own: they showed ~1800-2900 cycles per OUTPUT ELEMENT, near constant
+// whether a layer does 9 MACs per output or 64, with a zero-MAC `add` layer
+// costing the same — per-element, not per-MAC, but silent on which per-element
+// primitive.
+//
+// It also settled the register-allocator question empirically. RAW_MAC8 and
+// DOT8 do the SAME eight int8 MACs, one written inline in the (non-leaf)
+// harness and one inside nn_dot_i8_run. Before the wide colour file:
+// 771 vs 306 cycles — calling out beat inlining by 2.5x purely on register
+// pressure. After: 318 vs 326, i.e. the gap is gone. Keep both entries; that
+// pair is the regression test for the allocator's reach.
+//
+// Not wired into run_nn_tests.sh: it needs a chip, and nothing in CI has one.
+// Build with
+//   mlrc --arch=xtensa --freestanding --target=esp32 tests/nn/nn_micro_esp32.mlr -o m.bin
+//
+// Each loop is bracketed by CCOUNT and the print happens outside the bracket.
+// `acc` is stirred by the loop variable so nothing is loop-invariant enough to
+// hoist, and the result is folded into a sink that gets printed, so no
+// measured call can be dead-code eliminated.
+import "nn_model_core.mlr"
+import "../../std/esp32_clk.mlr"
+
+device UartStatus at 0x3FF40000 {
+    status at 0x1C : u32
+}
+device UartFifo at 0x60000000 {
+    fifo at 0x00 : u32
+}
+
+@naked fn nn_micro_ccount() -> u32 {
+    asm("rsr.ccount a2")
+    asm("ret")
+    return 0
+}
+
+fn nn_mt_putc(u8 c) {
+    while ((UartStatus.status >> 16) & 0xFF) >= 126 { }
+    UartFifo.fifo = c
+}
+
+static u8[73728] nn_mt_arena
+
+fn nn_mt_arena_p() -> u32 {
+    return nn_mt_arena
+}
+
+fn nn_mt_arena_cap() -> u32 {
+    u32 v = 73728
+    return v
+}
+
+// A scratch byte buffer for the load/store and dot benchmarks. Small and in
+// .bss, so it costs nothing in the image.
+static u8[256] nn_micro_buf
+
+fn nn_micro_report(u32 name, u32 iters, u32 cycles, u32 sink) {
+    nn_mt_str(name)
+    nn_mt_putc(32)
+    nn_mt_emit_u32(cycles)
+    nn_mt_str(" cyc / ")
+    nn_mt_emit_u32(iters)
+    nn_mt_str(" iters = ")
+    nn_mt_emit_u32(cycles / iters)
+    nn_mt_str(" cyc/iter  sink=")
+    nn_mt_emit_u32(sink)
+    nn_mt_putc(10)
+}
+
+// --- empty loop: the floor every other number sits on top of --------------
+fn nn_micro_empty(u32 n) -> u32 {
+    u32 t0 = nn_micro_ccount()
+    u32 i = 0
+    u32 s = 0
+    while i < n {
+        s = s + i
+        i = i + 1
+    }
+    u32 t1 = nn_micro_ccount()
+    nn_micro_report("EMPTY", n, (t1 - t0) & 0xFFFFFFFF, s)
+    return s
+}
+
+// --- nn_requantize_zp: once per output element in every conv/pool ---------
+fn nn_micro_requant(u32 n) -> u32 {
+    u32 t0 = nn_micro_ccount()
+    u32 i = 0
+    i32 s = 0
+    while i < n {
+        i32 acc = nn_u32_to_i32(i) - 500
+        i32 v = nn_requantize_zp(acc, 1234567890, 0 - 8, 0 - 12, 0 - 128, 127)
+        s = s + v
+        i = i + 1
+    }
+    u32 t1 = nn_micro_ccount()
+    nn_micro_report("REQUANT", n, (t1 - t0) & 0xFFFFFFFF, nn_i32_to_u32(s))
+    return nn_i32_to_u32(s)
+}
+
+// --- nn_load_i32: three per output element (bias, mult, shift) ------------
+fn nn_micro_load32(u32 n) -> u32 {
+    u32 p = nn_micro_buf
+    u32 t0 = nn_micro_ccount()
+    u32 i = 0
+    i32 s = 0
+    while i < n {
+        s = s + nn_load_i32(p + ((i & 7) * 4))
+        i = i + 1
+    }
+    u32 t1 = nn_micro_ccount()
+    nn_micro_report("LOAD_I32", n, (t1 - t0) & 0xFFFFFFFF, nn_i32_to_u32(s))
+    return nn_i32_to_u32(s)
+}
+
+// --- nn_store_i8: once per output element ---------------------------------
+fn nn_micro_store8(u32 n) -> u32 {
+    u32 p = nn_micro_buf
+    u32 t0 = nn_micro_ccount()
+    u32 i = 0
+    while i < n {
+        nn_store_i8(p + (i & 63), nn_u32_to_i32(i & 127))
+        i = i + 1
+    }
+    u32 t1 = nn_micro_ccount()
+    nn_micro_report("STORE_I8", n, (t1 - t0) & 0xFFFFFFFF, load8(p))
+    return 0
+}
+
+// --- nn_dot_i8_run with run=8: the MAC loop, 8 MACs per call --------------
+fn nn_micro_dot8(u32 n) -> u32 {
+    u32 p = nn_micro_buf
+    u32 t0 = nn_micro_ccount()
+    u32 i = 0
+    i32 s = 0
+    while i < n {
+        s = nn_dot_i8_run(s, p, p + 64, 8, 3)
+        i = i + 1
+    }
+    u32 t1 = nn_micro_ccount()
+    nn_micro_report("DOT8", n, (t1 - t0) & 0xFFFFFFFF, nn_i32_to_u32(s))
+    return nn_i32_to_u32(s)
+}
+
+// --- nn_dot_i8_run with run=1: what a DEPTHWISE layer actually calls ------
+// Depthwise reads ONE input channel per output channel, so its contiguous run
+// is kw elements at most — often 1. If per-CALL overhead dominates, this is
+// where it shows.
+fn nn_micro_dot1(u32 n) -> u32 {
+    u32 p = nn_micro_buf
+    u32 t0 = nn_micro_ccount()
+    u32 i = 0
+    i32 s = 0
+    while i < n {
+        s = nn_dot_i8_run(s, p, p + 64, 1, 3)
+        i = i + 1
+    }
+    u32 t1 = nn_micro_ccount()
+    nn_micro_report("DOT1", n, (t1 - t0) & 0xFFFFFFFF, nn_i32_to_u32(s))
+    return nn_i32_to_u32(s)
+}
+
+// --- nn_tap_lo + nn_tap_hi: twice per output row and twice per column -----
+fn nn_micro_taps(u32 n) -> u32 {
+    u32 t0 = nn_micro_ccount()
+    u32 i = 0
+    u32 s = 0
+    while i < n {
+        s = s + nn_tap_lo(i & 31, 1, 1, 3) + nn_tap_hi(i & 31, 1, 1, 3, 32)
+        i = i + 1
+    }
+    u32 t1 = nn_micro_ccount()
+    nn_micro_report("TAPS", n, (t1 - t0) & 0xFFFFFFFF, s)
+    return s
+}
+
+// --- a bare call to a trivial leaf: isolates raw CALL0 overhead -----------
+fn nn_micro_nop_callee(u32 x) -> u32 {
+    return x + 1
+}
+
+fn nn_micro_call(u32 n) -> u32 {
+    u32 t0 = nn_micro_ccount()
+    u32 i = 0
+    u32 s = 0
+    while i < n {
+        s = nn_micro_nop_callee(s)
+        i = i + 1
+    }
+    u32 t1 = nn_micro_ccount()
+    nn_micro_report("CALL0", n, (t1 - t0) & 0xFFFFFFFF, s)
+    return s
+}
+
+
+// --- RAW builtins, no helper call: isolates helper cost from memory cost ----
+fn nn_micro_raw_load32(u32 n) -> u32 {
+    u32 p = nn_micro_buf
+    u32 t0 = nn_micro_ccount()
+    u32 i = 0
+    u32 s = 0
+    while i < n {
+        s = s + load32(p + ((i & 7) * 4))
+        i = i + 1
+    }
+    u32 t1 = nn_micro_ccount()
+    nn_micro_report("RAW_LOAD32", n, (t1 - t0) & 0xFFFFFFFF, s)
+    return s
+}
+
+fn nn_micro_raw_store8(u32 n) -> u32 {
+    u32 p = nn_micro_buf
+    u32 t0 = nn_micro_ccount()
+    u32 i = 0
+    while i < n {
+        store8(p + (i & 63), i & 127)
+        i = i + 1
+    }
+    u32 t1 = nn_micro_ccount()
+    nn_micro_report("RAW_STORE8", n, (t1 - t0) & 0xFFFFFFFF, load8(p))
+    return 0
+}
+
+// The i32<->u32 conversion helpers the tiny wrappers lean on, timed alone.
+fn nn_micro_conv(u32 n) -> u32 {
+    u32 t0 = nn_micro_ccount()
+    u32 i = 0
+    u32 s = 0
+    while i < n {
+        s = s + nn_i32_to_u32(nn_u32_to_i32(i))
+        i = i + 1
+    }
+    u32 t1 = nn_micro_ccount()
+    nn_micro_report("CONV_PAIR", n, (t1 - t0) & 0xFFFFFFFF, s)
+    return s
+}
+
+// 8 MACs written straight into the loop, no nn_dot_i8_run call. Compare DOT8.
+fn nn_micro_raw_mac8(u32 n) -> u32 {
+    u32 p = nn_micro_buf
+    u32 q = nn_micro_buf + 64
+    u32 t0 = nn_micro_ccount()
+    u32 i = 0
+    i32 s = 0
+    while i < n {
+        u32 k = 0
+        while k < 8 {
+            i32 a = load8(p + k)
+            if a > 127 { a = a - 256 }
+            i32 b = load8(q + k)
+            if b > 127 { b = b - 256 }
+            s = s + ((a - 3) * b)
+            k = k + 1
+        }
+        i = i + 1
+    }
+    u32 t1 = nn_micro_ccount()
+    nn_micro_report("RAW_MAC8", n, (t1 - t0) & 0xFFFFFFFF, nn_i32_to_u32(s))
+    return nn_i32_to_u32(s)
+}
+
+fn nn_micro_delay() {
+    u32 d = 0
+    while d < 4000000 { d = d + 1 }
+}
+
+fn main() {
+    u32 clkrc = esp32_clk_cpu_pll(240)
+    u32 iters = 20000
+    loop {
+        nn_mt_str("CLK ")
+        nn_mt_emit_u32(clkrc)
+        nn_mt_putc(10)
+        nn_mt_str("MBEGIN\n")
+        nn_micro_empty(iters)
+        nn_micro_call(iters)
+        nn_micro_raw_load32(iters)
+        nn_micro_load32(iters)
+        nn_micro_raw_store8(iters)
+        nn_micro_conv(iters)
+        nn_micro_store8(iters)
+        nn_micro_taps(iters)
+        nn_micro_dot1(iters)
+        nn_micro_dot8(iters)
+        nn_micro_raw_mac8(iters)
+        nn_micro_requant(iters)
+        nn_mt_str("MEND\n")
+        nn_micro_delay()
+    }
+}
