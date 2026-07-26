@@ -128,23 +128,32 @@ fn nn_i32_min() -> i32 {
 // Reinterpret a 32-bit pattern as a signed 32-bit integer.
 // On the 32-bit targets this is the identity on the bits; on the host it is
 // the sign extension the hardware would have done for free.
+// Branch-free sign extension: flip the sign bit, then subtract its weight.
+//   0xFFFFFFFB -> ^0x80000000 = 0x7FFFFFFB -> -0x80000000 = -5
+//   0x80000000 -> 0          -> -0x80000000 = INT32_MIN   (the edge case the
+//                                              branchy form called out)
+// Correct on both target classes for the same reason the old form was: on a
+// 64-bit host `v` arrives zero-extended and the subtraction goes genuinely
+// negative, while on a 32-bit target it wraps to the identical bit pattern.
+// Two branches became none — branches are ~4 cycles each on LX6, and this is on
+// the per-element path of every conv.
+//
+// Still a real call, not inlined: it returns i32, and the inliner deliberately
+// skips signed-returning callees (splicing the body loses the declared
+// signedness for direct uses like `nn_u32_to_i32(w) >> 1`). Only the body got
+// cheaper.
 fn nn_u32_to_i32(u32 v) -> i32 {
-    u32 x = v & 0xFFFFFFFF
-    if (x & 0x80000000) == 0 {
-        i32 p = x
-        return p
-    }
-    // magnitude = (~x) + 1; for x == 0x80000000 this is 0x80000000 and the
-    // negation below lands exactly on INT32_MIN on both target classes.
-    u32 mag = (x ^ 0xFFFFFFFF) + 1
-    i32 r = mag
-    return 0 - r
+    return (v ^ 0x80000000) - 0x80000000
 }
 
 // Reinterpret a signed 32-bit integer as its 32-bit pattern.
+// Single `return <pure expr>` on purpose: that is exactly the shape the AST
+// inliner accepts (inline_body_expr path (a)), and it returns u32 so the
+// signed-return guard does not veto it. So this compiles to an AND at each of
+// its call sites rather than a call0 — it measured ~45 cycles per call as a
+// function, and it is called once per stored element.
 fn nn_i32_to_u32(i32 v) -> u32 {
-    u32 p = v
-    return p & 0xFFFFFFFF
+    return v & 0xFFFFFFFF
 }
 
 // |v| as an unsigned 32-bit magnitude. |INT32_MIN| == 0x80000000 is exact.
@@ -619,26 +628,26 @@ fn nn_sdiv_trunc(i32 a, u32 b) -> i32 {
 // ---------------------------------------------------------------------------
 
 // Load one int8 element, sign-extended into an i32.
+// Branch-free, same flip-and-subtract trick as nn_u32_to_i32 but at byte width.
 fn nn_load_i8(u32 p) -> i32 {
-    u32 b = load8(p)
-    i32 v = b & 0xFF
-    if v > 127 { return v - 256 }
-    return v
+    return ((load8(p) & 0xFF) ^ 0x80) - 0x80
 }
 
 // Store the low byte of a (already clamped) i32 as int8.
+// The nn_i32_to_u32 round-trip was redundant: masking to 8 bits already
+// discards everything above the byte, on either target class.
 fn nn_store_i8(u32 p, i32 v) {
-    u32 u = nn_i32_to_u32(v)
-    store8(p, u & 0xFF)
+    store8(p, v & 0xFF)
 }
 
+// Conversion folded in rather than delegated: this was two nested calls per
+// bias/multiplier/shift fetch, i.e. three times per output element.
 fn nn_load_i32(u32 p) -> i32 {
-    u32 w = load32(p)
-    return nn_u32_to_i32(w)
+    return (load32(p) ^ 0x80000000) - 0x80000000
 }
 
 fn nn_store_i32(u32 p, i32 v) {
-    store32(p, nn_i32_to_u32(v))
+    store32(p, v & 0xFFFFFFFF)
 }
 
 // Output spatial extent for a conv/pool with symmetric padding.
