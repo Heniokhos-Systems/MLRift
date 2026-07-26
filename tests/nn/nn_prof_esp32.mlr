@@ -1,0 +1,157 @@
+// tests/nn/nn_prof_esp32.mlr — PER-LAYER CYCLE PROFILER for the int8 model
+// runner, on real ESP32 silicon.
+//
+// This is nn_model_esp32.mlr with one thing added: it brackets every single
+// nn_model_exec() call with a CCOUNT read and prints "P <i> <op> <cycles>"
+// per layer, then the graph outputs exactly as the plain driver does — so a
+// profiling run STILL proves byte-exactness at the same time as measuring.
+// tools/ml/prof_report.py joins the P lines against the .krnn layer table and
+// prints the per-layer / per-op-type breakdown.
+//
+// Build + run (the model blob is what selects 64 vs 96 px):
+//   mlrc --arch=xtensa --target=esp32 --freestanding \
+//        --model yunet64.krnn tests/nn/nn_prof_esp32.mlr -o prof64.bin
+//
+// ─────────────────────────────────────────────────────────────────────────
+// WHY CCOUNT AND NOT A PERIPHERAL TIMER
+// ─────────────────────────────────────────────────────────────────────────
+// CCOUNT (special register 234) is the Xtensa Timer option's free-running
+// 32-bit CPU-cycle counter. It needs no configuration, no clock gate and no
+// divider, it is not affected by which peripheral bus we are on, and reads
+// are non-destructive so nothing has to be reset between layers. At 40 MHz it
+// wraps every 107 s; the whole 106-layer inference is ~20 s, and the longest
+// single layer is far under that, so a plain unsigned subtract is always the
+// true delta.
+//
+// It is a CPU-cycle counter, so if the CPU clock is reconfigured the cycle
+// numbers stay comparable but the WALL time does not follow them — a clock
+// change must be verified against host timestamps, not against CCOUNT.
+//
+// The read costs one RSR; the per-layer print happens strictly OUTSIDE the
+// bracketed region, so the measurement excludes its own UART cost.
+import "nn_model_core.mlr"
+
+// UART_STATUS_REG — APB. Poll only; never write the FIFO through this block.
+device UartStatus at 0x3FF40000 {
+    status at 0x1C : u32
+}
+
+// UART0 TX FIFO — AHB mirror. Errata CPU-3.3: the byte MUST go here.
+device UartFifo at 0x60000000 {
+    fifo at 0x00 : u32
+}
+
+// CCOUNT accessor. @naked + `rsr.ccount a2` + `ret` is the whole function:
+// a2 IS the CALL0 return-value register, @naked emits no prologue to clobber
+// it, and a0 (the caller's return address, set by call0) is untouched so the
+// ret.n goes straight back. See asm_emit_xt in src/ir_xtensa.mlr.
+@naked fn nn_prof_ccount() -> u32 {
+    asm("rsr.ccount a2")
+    asm("ret")
+    // Unreachable — the asm ret above already returned. Present only because
+    // sema requires a value-returning function to return on every path.
+    return 0
+}
+
+fn nn_mt_putc(u8 c) {
+    while ((UartStatus.status >> 16) & 0xFF) >= 126 { }
+    UartFifo.fifo = c
+}
+
+// Same 73728 B arena as nn_model_esp32.mlr — one image shape covers 64 and
+// 96 px, and the cap check still refuses a 128 px model loudly.
+static u8[73728] nn_mt_arena
+
+fn nn_mt_arena_p() -> u32 {
+    return nn_mt_arena
+}
+
+fn nn_mt_arena_cap() -> u32 {
+    u32 v = 73728
+    return v
+}
+
+// Run every layer, timing each one. Emits "P <index> <op> <cycles>" per layer
+// and "PTOT <cycles>" for the sum of the bracketed regions, then returns 0.
+// Deliberately duplicates nn_model_run_prefix's three-constant preamble rather
+// than adding a profiling hook to std/nn_model.mlr: the shipped runner stays
+// free of measurement code.
+fn nn_prof_layers(u32 m, u32 arena) -> u32 {
+    u32 bad = nn_model_check(m)
+    if bad != 0 { return bad }
+    u32 lay = m + load32(m + 16)
+    u32 stride = load32(m + 20)
+    u32 blob = m + load32(m + 32)
+    u32 total = nn_model_layer_count(m)
+    u32 sum = 0
+    u32 i = 0
+    while i < total {
+        u32 r = lay + (i * stride)
+        u32 t0 = nn_prof_ccount()
+        nn_model_exec(r, arena, blob)
+        u32 t1 = nn_prof_ccount()
+        u32 d = (t1 - t0) & 0xFFFFFFFF
+        sum = (sum + d) & 0xFFFFFFFF
+        nn_mt_str("P ")
+        nn_mt_emit_u32(i)
+        nn_mt_putc(32)
+        nn_mt_emit_u32(load32(r))
+        nn_mt_putc(32)
+        nn_mt_emit_u32(d)
+        nn_mt_putc(10)
+        i = i + 1
+    }
+    nn_mt_str("PTOT ")
+    nn_mt_emit_u32(sum)
+    nn_mt_putc(10)
+    return 0
+}
+
+// Fill the input, profile every layer, then dump the graph outputs so the
+// SAME run that produces the timings also proves the numbers did not move.
+fn nn_prof_run(u32 m) -> u32 {
+    u32 bad = nn_model_check(m)
+    if bad != 0 {
+        nn_mt_str("ERR:model ")
+        nn_mt_emit(bad)
+        return bad
+    }
+    if nn_model_arena_bytes(m) > nn_mt_arena_cap() {
+        nn_mt_str("ERR:arena ")
+        nn_mt_emit(nn_model_arena_bytes(m))
+        return 4
+    }
+    nn_mt_fill_input(m)
+    bad = nn_prof_layers(m, nn_mt_arena_p())
+    if bad != 0 {
+        nn_mt_str("ERR:run ")
+        nn_mt_emit(bad)
+        return bad
+    }
+    nn_mt_emit_outputs(m)
+    return 0
+}
+
+// Short inter-run gap: the profile itself is the slow part, and the capture
+// only needs to tell two BEGIN..END blocks apart.
+fn nn_prof_delay() {
+    u32 i = 0
+    while i < 4000000 {
+        i = i + 1
+    }
+}
+
+fn main() {
+    u32 model = 0x3FFB0000
+    loop {
+        nn_mt_str("BOOT ")
+        nn_mt_emit_u32(load32(model))
+        nn_mt_putc(10)
+        nn_mt_str("BEGIN\n")
+        u32 rc = nn_prof_run(model)
+        nn_mt_str("END ")
+        nn_mt_emit_u32(rc)
+        nn_mt_putc(10)
+        nn_prof_delay()
+    }
+}
