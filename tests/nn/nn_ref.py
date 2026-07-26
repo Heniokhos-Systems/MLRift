@@ -553,6 +553,13 @@ def main():
     for v in g:
         emit(v)
 
+    # ---- S17: nn_requantize_zp == nn_requantize_zp_ref -----------------
+    # The target compares its flattened requantization against the composed
+    # definition itself and emits the disagreement count. There is nothing for
+    # Python to recompute here: the assertion is that the two MLRift forms are
+    # the same function, so the reference value is 0.
+    emit(0)
+
     print('\n'.join(OUT))
 
 
