@@ -5456,6 +5456,12 @@ static uint64 ir_reg_assign_cap = 0
 //
 // Only ever populated by the xtensa driver; every other arch leaves the
 // buffer null and the greedy loop below behaves exactly as before.
+// Rep colouring order, built once per function by a counting sort on use
+// count, plus its 256-entry weight histogram. Static buffers, allocated
+// once and reused.
+static uint64 ir_color_order_buf = 0
+static uint64 ir_color_hist_buf = 0
+
 static uint64 ir_color_ceil = 0
 static uint64 ir_color_ceil_cap = 0
 static uint64 ir_color_ceil_used = 0
@@ -5998,12 +6004,71 @@ fn ir_graph_color() {
         vi = vi + 1
     }
 
+    // Colouring ORDER is a spill-cost heuristic. The old ascending-index
+    // walk let function-lifetime vregs (created first during lowering)
+    // seize every colour before the loop-carried values created deep in
+    // the function got a look-in -- exactly backwards for hot loops.
+    // Order reps by saturating use count (0..255) DESCENDING instead.
+    // Stable within a weight class (ascending index). Any order is
+    // CORRECT: interference rows are symmetric and every neighbour lookup
+    // resolves through the union-find rep. This is only SAFE because
+    // ir_spill_offset now maps one slot per vreg -- the old
+    // vreg-IR_NUM_REGS-1 mapping assumed low-numbered vregs never spill,
+    // which holds only under the ascending walk.
+    ir_compute_use_count()
+    if ir_color_order_buf == 0 { ir_color_order_buf = alloc(65536 * 4) }
+    if ir_color_hist_buf == 0 { ir_color_hist_buf = alloc(256 * 8) }
+    uint64 uc_start = ir_color_hist_buf
+    uint64 wci = 0
+    while wci < 256 {
+        uint64 wcp = uc_start + wci * 8
+        unsafe { *(wcp as uint64) = 0 }
+        wci = wci + 1
+    }
     vi = 1
     while vi < vcount {
-        if ir_uf_find(vi) != vi {
-            vi = vi + 1
-            continue
+        if ir_uf_find(vi) == vi {
+            uint64 w = ir_use_count_get(vi)
+            uint64 wcp = uc_start + w * 8
+            uint64 wcv = 0
+            unsafe { *(wcp as uint64) -> wcv }
+            unsafe { *(wcp as uint64) = wcv + 1 }
         }
+        vi = vi + 1
+    }
+    uint64 uc_pos = 0
+    uint64 wdi = 256
+    while wdi > 0 {
+        wdi = wdi - 1
+        uint64 wcp = uc_start + wdi * 8
+        uint64 wcv = 0
+        unsafe { *(wcp as uint64) -> wcv }
+        unsafe { *(wcp as uint64) = uc_pos }
+        uc_pos = uc_pos + wcv
+    }
+    uint64 order_n = uc_pos
+    vi = 1
+    while vi < vcount {
+        if ir_uf_find(vi) == vi {
+            uint64 w = ir_use_count_get(vi)
+            uint64 wcp = uc_start + w * 8
+            uint64 slot = 0
+            unsafe { *(wcp as uint64) -> slot }
+            uint64 op2 = ir_color_order_buf + slot * 4
+            uint32 vi32 = vi
+            unsafe { *(op2 as uint32) = vi32 }
+            unsafe { *(wcp as uint64) = slot + 1 }
+        }
+        vi = vi + 1
+    }
+
+    uint64 oi2 = 0
+    while oi2 < order_n {
+        uint64 oep = ir_color_order_buf + oi2 * 4
+        uint32 ov32 = 0
+        unsafe { *(oep as uint32) -> ov32 }
+        vi = ov32
+        oi2 = oi2 + 1
         // Collect colors used by interfering neighbors
         uint64 used_colors = 0
         uint64 all_colors = (1 << IR_NUM_REGS) - 1
@@ -6047,8 +6112,6 @@ fn ir_graph_color() {
             }
             color = color + 1
         }
-
-        vi = vi + 1
     }
 
     // Propagate rep colours to followers so ir_get_phys_reg works
@@ -6280,8 +6343,8 @@ static uint64 ir_spill_base = 0
 static uint64 ir_spill_count = 0
 
 fn ir_spill_offset(uint64 vreg) -> uint64 {
-    // vreg >= (IR_NUM_REGS+1) are spilled (vregs are 1-based)
-    uint64 slot = vreg - IR_NUM_REGS - 1
+    // One slot per vreg (vregs are 1-based).
+    uint64 slot = vreg - 1
     return ir_spill_base + slot * 8
 }
 
@@ -8299,7 +8362,8 @@ fn ir_emit_x86_insn(uint64 ii) {
                 } else {
                     // Value is spilled — need to load from adjusted offset
                     // Original spill at [rsp + spill_off], now at [rsp + stack_bytes + spill_off]
-                    uint64 spill_off = (arg_vreg - IR_NUM_REGS - 1) * 8
+                    // (must mirror ir_spill_offset's one-slot-per-vreg mapping)
+                    uint64 spill_off = (arg_vreg - 1) * 8
                     uint64 adj_off = stack_bytes + spill_off
                     // mov rax, [rsp + adj_off]
                     emit_byte(0x48); emit_byte(0x8B)
@@ -11635,8 +11699,8 @@ fn ir_emit_x86_function(uint64 fn_node) {
 
     // 4. Compute spill count
     ir_spill_count = 0
-    if ir_vreg_next > IR_NUM_REGS + 1 {
-        ir_spill_count = ir_vreg_next - IR_NUM_REGS - 1
+    if ir_vreg_next > 1 {
+        ir_spill_count = ir_vreg_next - 1
     }
 
     // 4a. Snapshot the function's var map for DWARF (if -g)
