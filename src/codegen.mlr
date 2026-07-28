@@ -45,6 +45,7 @@ static uint64 debug_mode = 0
 // [name_tok_idx(4), code_offset(4)] × 256
 static uint64 fn_table = 0
 static uint64 fn_count = 0
+static uint64 fn_table_cap = 0
 
 // Extern function table — functions declared with `extern fn name(params)`
 // that are resolved at link time by the system linker. Each entry is
@@ -295,7 +296,8 @@ fn codegen_init(uint64 capacity, uint64 source, uint64 tokens) {
     cg_tokens = tokens
     var_table = alloc(4096 * 8)
     var_count = 0
-    fn_table = alloc(2048 * 8)
+    fn_table_cap = 2048
+    fn_table = alloc(fn_table_cap * 8)
     fn_count = 0
     fixup_table = alloc(131072 * 8)
     fixup_count = 0
@@ -1991,10 +1993,18 @@ fn codegen_static_fixup_data_off_at(uint64 i) -> uint64 {
 // Function table
 // ---------------------------------------------------------------------------
 
+// Record an emitted function's code offset. Grows by doubling: the old hard
+// cap meant no program with more than that many emitted functions could be
+// compiled at all. fn_lookup and find_main_offset both re-read the fn_table
+// base per iteration and neither registers while iterating, so growth is safe.
 fn fn_register(uint64 name_tok, uint64 code_offset) {
-    if fn_count >= 2048 {
-        write(2, "error: fn_table overflow (max 2048)\n", 36)
+    if fn_count >= 16777216 {
+        write(2, "error: fn_table exceeded 16777216 functions (compiler bug?)\n", 60)
         exit(1)
+    }
+    if fn_count >= fn_table_cap {
+        fn_table = grow_buf(fn_table, fn_table_cap * 8, fn_table_cap * 16)
+        fn_table_cap = fn_table_cap * 2
     }
     uint64 entry = fn_table + fn_count * 8
     uint32 nt = name_tok
@@ -2064,26 +2074,40 @@ fn fn_section_lookup(uint64 name_tok) -> uint64 {
 // fixup instead of a linear tok_text_eq scan over ~1900 functions).
 // First-insertion-wins to preserve fn_lookup's first-match semantics.
 static uint64 fnh_buf = 0
+// Slot count for fnh_buf; power of two, mask is cap-1. Sized from fn_count
+// at build time so the load factor stays <= 50% however many functions the
+// program has (fn_table itself is now growable).
+static uint64 fnh_cap = 0
 
 fn fn_hash_build() {
-    if fnh_buf == 0 { fnh_buf = alloc(8192 * 4) }
-    memset(fnh_buf, 0, 8192 * 4)
+    // Size for <= 50% load. The old fixed 8192 slots silently overfilled once
+    // a program had more than ~8192 functions -- possible now that fn_table
+    // grows -- and an overfull open-addressed table makes lookups miss.
+    uint64 want = 8192
+    while want < (fn_count + 1) * 2 { want = want * 2 }
+    if fnh_cap < want {
+        if fnh_buf != 0 { dealloc(fnh_buf) }
+        fnh_buf = alloc(want * 4)
+        fnh_cap = want
+    }
+    memset(fnh_buf, 0, fnh_cap * 4)
+    uint64 fnh_mask = fnh_cap - 1
     uint64 i = 0
     while i < fn_count {
         uint64 entry = fn_table + i * 8
         uint32 nt32 = 0
         unsafe { *(entry as uint32) -> nt32 }
         uint64 nt = nt32
-        uint64 h = dce_name_hash(nt)
+        uint64 h = dce_name_hash(nt) & fnh_mask
         uint64 probes = 0
-        while probes < 8192 {
+        while probes < fnh_cap {
             uint64 sp = fnh_buf + h * 4
             uint32 sv = 0
             unsafe { *(sp as uint32) -> sv }
             if sv == 0 {
                 uint32 nv = i + 1
                 unsafe { *(sp as uint32) = nv }
-                probes = 8192
+                probes = fnh_cap
             } else {
                 // Same name already present? Keep the first (linear
                 // fn_lookup returns the first match).
@@ -2094,9 +2118,9 @@ fn fn_hash_build() {
                 unsafe { *(pentry as uint32) -> pt32 }
                 uint64 pt = pt32
                 if tok_text_eq(pt, nt) != 0 {
-                    probes = 8192
+                    probes = fnh_cap
                 } else {
-                    h = (h + 1) & 8191
+                    h = (h + 1) & fnh_mask
                     probes = probes + 1
                 }
             }
@@ -2106,9 +2130,11 @@ fn fn_hash_build() {
 }
 
 fn fn_lookup_hashed(uint64 name_tok) -> uint64 {
-    uint64 h = dce_name_hash(name_tok)
+    if fnh_cap == 0 { return 0xFFFFFFFF }
+    uint64 fnh_mask = fnh_cap - 1
+    uint64 h = dce_name_hash(name_tok) & fnh_mask
     uint64 probes = 0
-    while probes < 8192 {
+    while probes < fnh_cap {
         uint64 sp = fnh_buf + h * 4
         uint32 sv = 0
         unsafe { *(sp as uint32) -> sv }
@@ -2125,7 +2151,7 @@ fn fn_lookup_hashed(uint64 name_tok) -> uint64 {
             unsafe { *(e4 as uint32) -> off }
             return off
         }
-        h = (h + 1) & 8191
+        h = (h + 1) & fnh_mask
         probes = probes + 1
     }
     return 0xFFFFFFFF
@@ -10911,11 +10937,13 @@ fn resolve_fnaddr_fixups() {
 // [name_tok(4)] × 2048
 static uint64 dce_table = 0
 static uint64 dce_count = 0
+static uint64 dce_table_cap = 0
 
 // DCE function map: maps function name tok → function AST node index
 // [name_tok(4), fn_node(4)] × 1024
 static uint64 dce_fn_map = 0
 static uint64 dce_fn_map_count = 0
+static uint64 dce_fn_map_cap = 0
 
 // DCE enabled flag (0 = disabled, 1 = enabled)
 static uint64 dce_enabled = 0
@@ -10932,6 +10960,9 @@ static uint64 dce_keep_all = 0
 // PROTOTYPE: hash set over the live table. 8192 slots, linear probing.
 // Slot stores (dce_table index + 1); 0 = empty.
 static uint64 dce_hash_buf = 0
+// Hash-index capacity; always a power of two, mask is cap-1. Grows with
+// dce_table so the load factor stays <= 50% and probing stays cheap.
+static uint64 dce_hash_cap = 0
 
 fn dce_name_hash(uint64 name_tok) -> uint64 {
     uint64 s = tok_text_start(name_tok)
@@ -10947,18 +10978,67 @@ fn dce_name_hash(uint64 name_tok) -> uint64 {
         h = h & 0xFFFFFFFF
         i = i + 1
     }
-    return h & 8191
+    // Raw hash; callers mask with dce_hash_cap - 1 (the table grows).
+    return h
 }
 
 fn dce_init() {
-    dce_table = alloc(2048 * 4)
+    dce_table_cap = 2048
+    dce_table = alloc(dce_table_cap * 4)
     dce_count = 0
-    dce_fn_map = alloc(2048 * 8)
+    dce_fn_map_cap = 2048
+    dce_fn_map = alloc(dce_fn_map_cap * 8)
     dce_fn_map_count = 0
     dce_enabled = 1
     dce_keep_all = 0
-    if dce_hash_buf == 0 { dce_hash_buf = alloc(8192 * 4) }
-    memset(dce_hash_buf, 0, 8192 * 4)
+    dce_hash_cap = 8192
+    if dce_hash_buf == 0 { dce_hash_buf = alloc(dce_hash_cap * 4) }
+    memset(dce_hash_buf, 0, dce_hash_cap * 4)
+}
+
+// Grow the live-set table and its hash index so there is room for one more
+// entry with the load factor held at or below 50%. Must run BEFORE probing:
+// rehashing changes the mask, so a probe position computed earlier is stale.
+fn dce_capacity_ensure() {
+    if dce_count >= 4194304 {
+        write(2, "error: DCE live set exceeded 4194304 entries (compiler bug?)\n", 61)
+        exit(1)
+    }
+    if dce_count >= dce_table_cap {
+        dce_table = grow_buf(dce_table, dce_table_cap * 4, dce_table_cap * 8)
+        dce_table_cap = dce_table_cap * 2
+    }
+    if (dce_count + 1) * 2 <= dce_hash_cap { return }
+    uint64 ncap = dce_hash_cap * 2
+    while (dce_count + 1) * 2 > ncap { ncap = ncap * 2 }
+    uint64 ntbl = alloc(ncap * 4)
+    memset(ntbl, 0, ncap * 4)
+    // Re-insert from dce_table, the authoritative list of live names. The
+    // hash slot stores index+1, so 0 stays the empty marker.
+    uint64 nmask = ncap - 1
+    uint64 ri = 0
+    while ri < dce_count {
+        uint64 rentry = dce_table + ri * 4
+        uint32 rtok = 0
+        unsafe { *(rentry as uint32) -> rtok }
+        uint64 wrt = rtok
+        uint64 rh = dce_name_hash(wrt) & nmask
+        while 1 == 1 {
+            uint64 rsp = ntbl + rh * 4
+            uint32 rsv = 0
+            unsafe { *(rsp as uint32) -> rsv }
+            if rsv == 0 {
+                uint32 rnv = ri + 1
+                unsafe { *(rsp as uint32) = rnv }
+                break
+            }
+            rh = (rh + 1) & nmask
+        }
+        ri = ri + 1
+    }
+    dealloc(dce_hash_buf)
+    dce_hash_buf = ntbl
+    dce_hash_cap = ncap
 }
 
 @export
@@ -10968,10 +11048,13 @@ fn dce_set_keep_all(uint64 v) {
 
 // Check if a function name token is already in the live set
 fn dce_has(uint64 name_tok) -> uint64 {
-    // PROTOTYPE: hash-set probe replaces O(dce_count) tok_text_eq scan.
-    uint64 h = dce_name_hash(name_tok)
+    // Hash-set probe replaces an O(dce_count) tok_text_eq scan. The load
+    // factor is held <= 50% by dce_capacity_ensure, so an empty slot always
+    // exists and the probe always terminates.
+    uint64 mask = dce_hash_cap - 1
+    uint64 h = dce_name_hash(name_tok) & mask
     uint64 probes = 0
-    while probes < 8192 {
+    while probes < dce_hash_cap {
         uint64 sp = dce_hash_buf + h * 4
         uint32 sv = 0
         unsafe { *(sp as uint32) -> sv }
@@ -10983,7 +11066,7 @@ fn dce_has(uint64 name_tok) -> uint64 {
         unsafe { *(entry as uint32) -> stored }
         uint64 ws = stored
         if tok_text_eq(ws, name_tok) != 0 { return 1 }
-        h = (h + 1) & 8191
+        h = (h + 1) & mask
         probes = probes + 1
     }
     return 0
@@ -10993,28 +11076,26 @@ fn dce_has(uint64 name_tok) -> uint64 {
 // Returns 1 if newly added, 0 if already present
 fn dce_add(uint64 name_tok) -> uint64 {
     if dce_has(name_tok) != 0 { return 0 }
-    if dce_count >= 2048 {
-        write(2, "error: dce_table overflow (max 2048)\n", 37)
-        exit(1)
-    }
+    // Grow BEFORE probing: a rehash changes the mask, so a probe position
+    // computed earlier would be stale. Membership is tested first so a
+    // duplicate never triggers growth.
+    dce_capacity_ensure()
+    uint64 mask = dce_hash_cap - 1
     uint64 entry = dce_table + dce_count * 4
     uint32 nt = name_tok
     unsafe { *(entry as uint32) = nt }
     // Insert into hash set: first empty slot from the name's hash.
-    uint64 h = dce_name_hash(name_tok)
-    uint64 probes = 0
-    while probes < 8192 {
+    uint64 h = dce_name_hash(name_tok) & mask
+    while 1 == 1 {
         uint64 sp = dce_hash_buf + h * 4
         uint32 sv = 0
         unsafe { *(sp as uint32) -> sv }
         if sv == 0 {
             uint32 nv = dce_count + 1
             unsafe { *(sp as uint32) = nv }
-            probes = 8192
-        } else {
-            h = (h + 1) & 8191
-            probes = probes + 1
+            break
         }
+        h = (h + 1) & mask
     }
     dce_count = dce_count + 1
     return 1
@@ -11061,10 +11142,17 @@ fn dce_add_by_str(uint64 str_tok) {
 }
 
 // Register a function in the DCE function map
+// Register a function in the DCE function map. Grows by doubling -- this was
+// a hard wall, and in KernRift the compiler's own source came within nine
+// functions of it and then crossed it.
 fn dce_register_fn(uint64 name_tok, uint64 fn_node) {
-    if dce_fn_map_count >= 2048 {
-        write(2, "error: dce_fn_map overflow (max 2048)\n", 38)
+    if dce_fn_map_count >= 4194304 {
+        write(2, "error: DCE function map exceeded 4194304 entries (compiler bug?)\n", 65)
         exit(1)
+    }
+    if dce_fn_map_count >= dce_fn_map_cap {
+        dce_fn_map = grow_buf(dce_fn_map, dce_fn_map_cap * 8, dce_fn_map_cap * 16)
+        dce_fn_map_cap = dce_fn_map_cap * 2
     }
     uint64 entry = dce_fn_map + dce_fn_map_count * 8
     uint32 nt = name_tok
