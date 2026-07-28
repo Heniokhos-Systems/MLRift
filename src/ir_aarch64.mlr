@@ -355,8 +355,27 @@ fn ir_emit_arm64_win_syscall(uint64 abstract_nr, uint64 dest_v, uint64 dst_r) {
 // Per-instruction emitter
 // ---------------------------------------------------------------------------
 
+// Loud failure for an opcode the arm64 dispatch does not handle. Emitting
+// nothing is never acceptable: the destination register or spill slot is left
+// unwritten and the program reads garbage, with no build error anywhere.
+fn a64_nyi_op(uint64 op) {
+    uint8[24] nbuf
+    uint64 pre = "error: arm64: IR op "
+    write(2, pre, str_len(pre))
+    uint64 nlen = fmt_uint(nbuf, op)
+    write(2, nbuf, nlen)
+    uint64 post = " not yet implemented\n"
+    write(2, post, str_len(post))
+    exit(1)
+}
+
 fn ir_emit_arm64_insn(uint64 ii) {
     uint64 op = ir_insn_opcode(ii)
+    // NOP: LICM blanks an instruction in place rather than removing it, so
+    // op 0 legitimately reaches here and must emit nothing. Previously this
+    // fell through the whole dispatch by accident; the catch-all at the
+    // bottom makes the intent explicit.
+    if op == 0 { return }
     uint64 dest_v = ir_insn_dest(ii)
     uint64 s1_v = ir_insn_src1(ii)
     uint64 s2_v = ir_insn_src2(ii)
@@ -583,6 +602,35 @@ fn ir_emit_arm64_insn(uint64 ii) {
         uint64 d = dst_r
         if d == 0xFFFFFFFF { d = 9 }
         emit_a64_asr(d, a_reg, b_reg)
+        if dst_r == 0xFFFFFFFF {
+            ir_a64_emit_store_spill(9, dest_v)
+        }
+        return
+    }
+
+    // ----- IR_ROR (137) -----
+    // ir_opt_recognize_rotate() collapses the 32-bit rotation idiom into this
+    // opcode. The pass is shared across targets, but arm64 had no handler and
+    // the dispatch had no catch-all, so the destination was never written and
+    // every rotation silently produced garbage -- wrong SHA-2/MD5/ChaCha
+    // output, not a crash. AArch64 has native RORV; the 32-bit form (sf=0)
+    // zeroes the upper half, which keeps the value w32-clean so downstream
+    // `& 0xFFFFFFFF` masks stay elided. The hardware count is taken mod
+    // datasize, so no explicit mask is needed (unlike riscv, which ANDs with 31).
+    if op == 137 {
+        if imm != 32 && imm != 64 {
+            write(2, "error: arm64: IR_ROR width must be 32 or 64\n", 44)
+            exit(1)
+        }
+        uint64 ror_a = ir_a64_resolve_src(s1_v, 9)
+        uint64 ror_b = ir_a64_resolve_src(s2_v, 10)
+        uint64 ror_d = dst_r
+        if ror_d == 0xFFFFFFFF { ror_d = 9 }
+        if imm == 32 {
+            emit_a64_ror_w(ror_d, ror_a, ror_b)
+        } else {
+            emit_a64_ror(ror_d, ror_a, ror_b)
+        }
         if dst_r == 0xFFFFFFFF {
             ir_a64_emit_store_spill(9, dest_v)
         }
@@ -2439,6 +2487,11 @@ fn ir_emit_arm64_insn(uint64 ii) {
         if dst_r == 0xFFFFFFFF { ir_a64_emit_store_spill(9, dest_v) }
         return
     }
+
+    // Catch-all. Without this, an opcode this dispatch does not know emits
+    // NOTHING and the program silently reads garbage -- which is exactly how
+    // a missing IR_ROR handler miscompiled every 32-bit rotation here.
+    a64_nyi_op(op)
 }
 
 // ---------------------------------------------------------------------------
