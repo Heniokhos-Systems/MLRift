@@ -1,0 +1,379 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build release binaries
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build (self-compile from committed build/mlrc)
+        run: |
+          chmod +x build/mlrc
+          # MLRift ships its own bootstrap binary in-tree (build/mlrc) and
+          # self-compiles from it -- unlike KernRift, there is no released
+          # binary to download here. This mirrors ci.yml's build step
+          # exactly (see .github/workflows/ci.yml) so the compiler used to
+          # cut a release is built the same way every CI run already
+          # verifies. Use the Makefile's canonical SRCS list as the single
+          # source of truth so adding/removing a src/*.mlr file never
+          # requires touching this workflow.
+          make build/mlrc.mlr
+          ./build/mlrc --arch=x86_64 build/mlrc.mlr -o build/mlrc.stable
+          mv build/mlrc.stable build/mlrc
+          chmod +x build/mlrc
+
+      - name: Create distribution
+        run: make dist
+
+      - name: Build all platform binaries
+        run: |
+          # mlrc for macOS + Android (make dist only covers linux + windows).
+          ./build/mlrc --arch=x86_64 --emit=macho build/mlrc.mlr -o dist/mlrc-macos-x86_64
+          ./build/mlrc --arch=arm64  --emit=macho build/mlrc.mlr -o dist/mlrc-macos-arm64
+          ./build/mlrc --arch=arm64  --emit=android build/mlrc.mlr -o dist/mlrc-android-arm64
+          ./build/mlrc --arch=x86_64 --emit=android build/mlrc.mlr -o dist/mlrc-android-x86_64
+
+          # mlr runner (merge runner.mlr + bcj.mlr via the Makefile target —
+          # same rationale as build/mlrc.mlr above: never let this drift
+          # from src/*.mlr file additions).
+          make build/mlr-runner.mlr
+          ./build/mlrc --arch=x86_64 build/mlr-runner.mlr -o dist/mlr-linux-x86_64
+          ./build/mlrc --arch=arm64  build/mlr-runner.mlr -o dist/mlr-linux-arm64
+          chmod +x dist/mlr-linux-x86_64 dist/mlr-linux-arm64
+          # mlr runner (Windows)
+          ./build/mlrc --arch=x86_64 --emit=pe build/mlr-runner.mlr -o dist/mlr-windows-x86_64.exe
+          ./build/mlrc --arch=arm64  --emit=pe build/mlr-runner.mlr -o dist/mlr-windows-arm64.exe
+          # mlr runner (macOS)
+          ./build/mlrc --arch=x86_64 --emit=macho build/mlr-runner.mlr -o dist/mlr-macos-x86_64
+          ./build/mlrc --arch=arm64  --emit=macho build/mlr-runner.mlr -o dist/mlr-macos-arm64
+          # mlr runner (Android)
+          ./build/mlrc --arch=arm64  --emit=android build/mlr-runner.mlr -o dist/mlr-android-arm64
+          ./build/mlrc --arch=x86_64 --emit=android build/mlr-runner.mlr -o dist/mlr-android-x86_64
+
+          # License + attribution (Apache 2.0 §4a/§4d) travel with the
+          # standalone single-file downloads too. MLRift's `make dist`
+          # target does not copy these itself (unlike KernRift's), so do
+          # it explicitly here.
+          cp LICENSE NOTICE dist/
+
+      - name: Bundle Windows mlrc+mlr zips
+        # One zip per architecture, each containing mlrc.exe + mlr.exe at
+        # the archive root (renamed from the per-arch artifact names).
+        # Consumed by the winget NestedInstaller manifest below so a
+        # single `winget install Pantelis23.MLRift` drops both binaries
+        # into PATH.
+        run: |
+          cd dist
+          mkdir -p _bundle_x64 _bundle_arm64
+          cp mlrc-windows-x86_64.exe _bundle_x64/mlrc.exe
+          cp mlr-windows-x86_64.exe  _bundle_x64/mlr.exe
+          cp mlrc-windows-arm64.exe  _bundle_arm64/mlrc.exe
+          cp mlr-windows-arm64.exe   _bundle_arm64/mlr.exe
+          cp ../LICENSE ../NOTICE _bundle_x64/
+          cp ../LICENSE ../NOTICE _bundle_arm64/
+          # The standard library MUST travel with the binaries: mlrc
+          # locates std/ relative to its own exe, so a winget/zip install
+          # could not resolve `import "std/..."` without it. Every other
+          # packaging channel (deb, AUR, Homebrew, Scoop, install.sh,
+          # install.ps1) ships std/ too.
+          cp -r ../std _bundle_x64/std
+          cp -r ../std _bundle_arm64/std
+          (cd _bundle_x64   && zip -qr ../mlrc-windows-x86_64.zip mlrc.exe mlr.exe LICENSE NOTICE std)
+          (cd _bundle_arm64 && zip -qr ../mlrc-windows-arm64.zip  mlrc.exe mlr.exe LICENSE NOTICE std)
+          rm -rf _bundle_x64 _bundle_arm64
+
+      - name: Verify binaries
+        run: |
+          echo "=== Distribution ==="
+          ls -la dist/
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd dist
+          sha256sum mlrc-linux-x86_64 mlrc-linux-arm64 \
+                    mlrc-windows-x86_64.exe mlrc-windows-arm64.exe \
+                    mlrc-windows-x86_64.zip mlrc-windows-arm64.zip \
+                    mlrc-macos-x86_64 mlrc-macos-arm64 \
+                    mlrc-android-arm64 mlrc-android-x86_64 \
+                    mlr-linux-x86_64 mlr-linux-arm64 \
+                    mlr-windows-x86_64.exe mlr-windows-arm64.exe \
+                    mlr-macos-x86_64 mlr-macos-arm64 \
+                    mlr-android-arm64 mlr-android-x86_64 \
+                    mlrc.mlrbo mlrc-source.mlr LICENSE NOTICE > SHA256SUMS
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            dist/mlrc-linux-x86_64
+            dist/mlrc-linux-arm64
+            dist/mlrc-windows-x86_64.exe
+            dist/mlrc-windows-arm64.exe
+            dist/mlrc-windows-x86_64.zip
+            dist/mlrc-windows-arm64.zip
+            dist/mlrc-macos-x86_64
+            dist/mlrc-macos-arm64
+            dist/mlrc-android-arm64
+            dist/mlrc-android-x86_64
+            dist/mlr-linux-x86_64
+            dist/mlr-linux-arm64
+            dist/mlr-windows-x86_64.exe
+            dist/mlr-windows-arm64.exe
+            dist/mlr-macos-x86_64
+            dist/mlr-macos-arm64
+            dist/mlr-android-arm64
+            dist/mlr-android-x86_64
+            dist/mlrc.mlrbo
+            dist/mlrc-source.mlr
+            dist/LICENSE
+            dist/NOTICE
+            dist/SHA256SUMS
+          generate_release_notes: true
+
+  update-packaging:
+    # AUR, Homebrew and Scoop manifests are hand-maintained files in this repo,
+    # and every one of them pins both a version and the SHA256 of the published
+    # artifacts -- which do not exist until build-release has finished. This
+    # job runs after the artifacts are live, rewrites the manifests from the
+    # release's own SHA256SUMS, and commits the result to main. See KernRift's
+    # release.yml for the drift this closes (v2.8.33 shipped with the
+    # equivalent manifests still reading 2.8.32 because they were hand-edited).
+    name: Update packaging manifests
+    needs: build-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          # A token with write access is needed to push the commit back.
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Rewrite manifests from the published release
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          bash scripts/update-packaging.sh "$VERSION"
+
+      - name: Verify .SRCINFO stayed in sync
+        run: |
+          # Same check tests/run_tests.sh runs (aur_srcinfo_in_sync), asserted
+          # here too so a broken manifest never reaches main -- this job
+          # commits without running the full suite.
+          GEN=$(bash -c '
+            set -e
+            source packaging/aur/PKGBUILD
+            printf "pkgbase = %s\n" "$pkgname"
+            printf "\tpkgdesc = %s\n" "$pkgdesc"
+            printf "\tpkgver = %s\n" "$pkgver"
+            printf "\tpkgrel = %s\n" "$pkgrel"
+            printf "\turl = %s\n" "$url"
+            for a in "${arch[@]}"; do printf "\tarch = %s\n" "$a"; done
+            for l in "${license[@]}"; do printf "\tlicense = %s\n" "$l"; done
+            for pr in "${provides[@]}"; do printf "\tprovides = %s\n" "$pr"; done
+            for o in "${options[@]}"; do printf "\toptions = %s\n" "$o"; done
+            for x in "${source_x86_64[@]}"; do printf "\tsource_x86_64 = %s\n" "$x"; done
+            for x in "${sha256sums_x86_64[@]}"; do printf "\tsha256sums_x86_64 = %s\n" "$x"; done
+            for x in "${source_aarch64[@]}"; do printf "\tsource_aarch64 = %s\n" "$x"; done
+            for x in "${sha256sums_aarch64[@]}"; do printf "\tsha256sums_aarch64 = %s\n" "$x"; done
+            printf "\npkgname = %s\n" "$pkgname"
+          ')
+          if [ "$GEN" != "$(cat packaging/aur/.SRCINFO)" ]; then
+            echo "FAIL: .SRCINFO does not match PKGBUILD after the rewrite"
+            diff <(printf '%s\n' "$GEN") packaging/aur/.SRCINFO | head -20
+            exit 1
+          fi
+          echo "OK: .SRCINFO in sync"
+
+      - name: Commit and push
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if git diff --quiet -- packaging/ bucket/; then
+            echo "No manifest changes — nothing to commit."
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Explicit paths only: this job must never sweep up anything else
+          # that happens to be in the tree.
+          git add packaging/aur/PKGBUILD packaging/aur/.SRCINFO \
+                  packaging/homebrew/mlrift.rb bucket/mlrift.json
+          git commit \
+            -m "chore(packaging): update AUR/Homebrew/Scoop manifests to v$VERSION" \
+            -m "Generated by scripts/update-packaging.sh from the v$VERSION release's own SHA256SUMS asset."
+          git push origin HEAD:main
+
+  winget-release:
+    # Submits a hand-crafted winget manifest with a zip InstallerType +
+    # NestedInstallerFiles so one `winget install Pantelis23.MLRift` drops
+    # both mlrc.exe and mlr.exe into PATH. Mirrors KernRift's winget-release
+    # job, which moved to this approach after vedantmgoyal9/winget-releaser
+    # (portable single-binary manifests only) silently dropped the runner
+    # binary from the package.
+    #
+    # Known friction (see KernRift's release history): the AUR SSH key has
+    # intermittently blocked KernRift's own AUR submission, and each winget
+    # release tends to trip a fresh SmartScreen/AV false positive on the new
+    # binary hash until it accumulates reputation. Neither blocks this job;
+    # both are just expected noise to triage after it runs.
+    name: Submit winget manifest (nested zip)
+    needs: build-release
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Fetch release zip SHAs
+        id: shas
+        run: |
+          set -euo pipefail
+          V="${{ github.ref_name }}"
+          # Release-upload can be eventually consistent; retry briefly.
+          for url in \
+            "https://github.com/Heniokhos-Systems/MLRift/releases/download/$V/mlrc-windows-x86_64.zip" \
+            "https://github.com/Heniokhos-Systems/MLRift/releases/download/$V/mlrc-windows-arm64.zip"; do
+            for i in 1 2 3 4 5; do
+              if curl -fsSL -o "/tmp/$(basename "$url")" "$url"; then break; fi
+              sleep 10
+            done
+          done
+          echo "x64=$(sha256sum /tmp/mlrc-windows-x86_64.zip | awk '{print toupper($1)}')"   >> "$GITHUB_OUTPUT"
+          echo "arm64=$(sha256sum /tmp/mlrc-windows-arm64.zip | awk '{print toupper($1)}')" >> "$GITHUB_OUTPUT"
+
+      - name: Generate manifests + open winget-pkgs PR
+        env:
+          GH_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          VERSION: ${{ github.ref_name }}
+          X64_SHA: ${{ steps.shas.outputs.x64 }}
+          ARM64_SHA: ${{ steps.shas.outputs.arm64 }}
+        run: |
+          set -euo pipefail
+          TODAY=$(date -u +%Y-%m-%d)
+          WORK=$(mktemp -d)
+          MDIR="$WORK/pkg/manifests/p/Pantelis23/MLRift/$VERSION"
+          mkdir -p "$MDIR"
+
+          cat > "$MDIR/Pantelis23.MLRift.yaml" <<EOF
+          # yaml-language-server: \$schema=https://aka.ms/winget-manifest.version.1.10.0.schema.json
+          PackageIdentifier: Pantelis23.MLRift
+          PackageVersion: $VERSION
+          DefaultLocale: en-US
+          ManifestType: version
+          ManifestVersion: 1.10.0
+          EOF
+
+          # NestedInstallerType lives at the TOP LEVEL (it's the same
+          # across architectures), and only NestedInstallerFiles varies
+          # per-Installer entry. Matches UPX.UPX 5.0.1 and every other
+          # zip+portable package currently accepted by winget-pkgs at
+          # ManifestVersion 1.10.0.
+          cat > "$MDIR/Pantelis23.MLRift.installer.yaml" <<EOF
+          # yaml-language-server: \$schema=https://aka.ms/winget-manifest.installer.1.10.0.schema.json
+          PackageIdentifier: Pantelis23.MLRift
+          PackageVersion: $VERSION
+          InstallerType: zip
+          NestedInstallerType: portable
+          FileExtensions:
+          - exe
+          Commands:
+          - mlrc
+          - mlr
+          ReleaseDate: $TODAY
+          Installers:
+          - Architecture: x64
+            NestedInstallerFiles:
+            - RelativeFilePath: mlrc.exe
+              PortableCommandAlias: mlrc
+            - RelativeFilePath: mlr.exe
+              PortableCommandAlias: mlr
+            InstallerUrl: https://github.com/Heniokhos-Systems/MLRift/releases/download/$VERSION/mlrc-windows-x86_64.zip
+            InstallerSha256: $X64_SHA
+          - Architecture: arm64
+            NestedInstallerFiles:
+            - RelativeFilePath: mlrc.exe
+              PortableCommandAlias: mlrc
+            - RelativeFilePath: mlr.exe
+              PortableCommandAlias: mlr
+            InstallerUrl: https://github.com/Heniokhos-Systems/MLRift/releases/download/$VERSION/mlrc-windows-arm64.zip
+            InstallerSha256: $ARM64_SHA
+          ManifestType: installer
+          ManifestVersion: 1.10.0
+          EOF
+
+          # Locale metadata — matches the set of fields the winget-pkgs bot
+          # flags as "Manifest-Metadata-Consistency" inconsistencies when
+          # comparing against the previously-published version. Keep parity
+          # with KernRift's own locale manifest shape.
+          cat > "$MDIR/Pantelis23.MLRift.locale.en-US.yaml" <<EOF
+          # yaml-language-server: \$schema=https://aka.ms/winget-manifest.defaultLocale.1.10.0.schema.json
+          PackageIdentifier: Pantelis23.MLRift
+          PackageVersion: $VERSION
+          PackageLocale: en-US
+          Publisher: Pantelis Christou
+          PublisherUrl: https://github.com/Heniokhos-Systems/MLRift
+          PublisherSupportUrl: https://github.com/Heniokhos-Systems/MLRift/issues
+          Author: Pantelis Christou
+          PackageName: MLRift
+          PackageUrl: https://github.com/Heniokhos-Systems/MLRift
+          License: Apache-2.0
+          LicenseUrl: https://github.com/Heniokhos-Systems/MLRift/blob/HEAD/LICENSE
+          Copyright: Copyright (c) 2025-2026 Panteleimon-Panagiotis Christou
+          ShortDescription: Self-hosted systems language and compiler for machine-learning workloads
+          Description: MLRift is a self-hosted, zero-dependency compiler forked from KernRift. The package installs two portable command-line tools — mlrc (the compiler) and mlr (the fat-binary runner). It compiles to native x86_64 and ARM64 binaries for Linux, Windows, macOS, and Android, extends the IR backend with ML-specific primitives (tensors, event streams, sparse CSR ops), and includes a native AMDGCN GPU backend that talks to /dev/kfd directly with no ROCm dependency.
+          Moniker: mlrift
+          Tags:
+            - aot
+            - arm64
+            - amdgpu
+            - compiler
+            - cross-compiler
+            - gpu
+            - machine-learning
+            - programming-language
+            - self-hosted
+            - systems-programming
+            - x86_64
+          ReleaseNotes: 'Full Changelog: https://github.com/Heniokhos-Systems/MLRift/releases/tag/$VERSION'
+          ReleaseNotesUrl: https://github.com/Heniokhos-Systems/MLRift/releases/tag/$VERSION
+          InstallationNotes: The install directory is added to PATH automatically by winget (portable nested installer). Run 'mlrc --version' and 'mlr --version' to verify.
+          ManifestType: defaultLocale
+          ManifestVersion: 1.10.0
+          EOF
+
+          git config --global user.email "release-bot@users.noreply.github.com"
+          git config --global user.name  "mlrift-release-bot"
+
+          USER=$(gh api user --jq .login)
+          # Ensure the fork exists under the token holder's account.
+          gh repo fork microsoft/winget-pkgs --clone=false --remote=false >/dev/null 2>&1 || true
+
+          cd "$WORK"
+          git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/$USER/winget-pkgs.git" fork
+          cd fork
+          git remote add upstream https://github.com/microsoft/winget-pkgs.git
+          git fetch --depth 1 upstream master
+          git reset --hard upstream/master
+
+          BRANCH="Pantelis23.MLRift-$VERSION"
+          git checkout -b "$BRANCH"
+          mkdir -p "manifests/p/Pantelis23/MLRift/$VERSION"
+          cp "$MDIR"/*.yaml "manifests/p/Pantelis23/MLRift/$VERSION/"
+          git add "manifests/p/Pantelis23/MLRift/$VERSION"
+          git commit -m "New version: Pantelis23.MLRift $VERSION"
+          git push --force-with-lease origin "$BRANCH"
+
+          gh pr create \
+            --repo microsoft/winget-pkgs \
+            --title "New version: Pantelis23.MLRift $VERSION" \
+            --body  "Automated submission. Zip installer with NestedInstallerFiles so both \`mlrc\` and \`mlr\` land in PATH after one \`winget install\`." \
+            --head  "$USER:$BRANCH" \
+            --base  master
