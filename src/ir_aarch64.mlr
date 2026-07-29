@@ -298,7 +298,10 @@ fn ir_a64_seed_param_ceilings() {
 // (callee reads `[SP + callee_frame + (idx-8)*8]` and finds our
 // values), so we never SUB SP around a call — SUB would invalidate
 // every spill offset we need to read between the overflow args.
-// 128 = 16 slots, more than any call in the compiler today needs.
+// Sized per function by ir_emit_arm64_function's pre-scan: 8 bytes per
+// outgoing overflow-arg slot actually used, 0 for the common case of no
+// 9+-argument calls. Windows and ASM-block functions keep the historical
+// full 128 (16 slots).
 static uint64 IR_A64_OVERFLOW_RESERVE = 128
 
 // Compute the spill slot offset for a spilled vreg. Spill slots live
@@ -3107,12 +3110,15 @@ fn ir_emit_arm64_function(uint64 fn_node) {
     //   - a64_has_asm: an IR_ASM_BLOCK(96) can contain anything (BL,
     //     clobbers of any callee-saved reg, stack use), so fall back to
     //     the old maximally-conservative frame: save all 10 colours +
-    //     x29/x30.
+    //     x29/x30 and keep the full 128-byte overflow reserve.
+    //   - a64_ovf_slots: highest outgoing stack-arg slot used by IR_ARG
+    //     (imm 8..99) — sizes the bottom-of-frame overflow reserve.
     //   - a64_forced_mask: IR_ARG with a direct register target (imm >=
     //     100) that lands on x19-x28 clobbers a callee-saved reg the
     //     allocator never handed out; force it into the save mask.
     uint64 a64_has_call = 0
     uint64 a64_has_asm = 0
+    uint64 a64_ovf_slots = 0
     uint64 a64_forced_mask = 0
     if target_os == 2 { a64_has_call = 1 }
     uint64 psb = 0
@@ -3124,6 +3130,10 @@ fn ir_emit_arm64_function(uint64 fn_node) {
             if pso == 96 { a64_has_asm = 1 }
             if pso == 51 {
                 uint64 psimm = ir_insn_imm(psi)
+                if psimm >= 8 && psimm < 100 {
+                    uint64 slots = psimm - 7
+                    if slots > a64_ovf_slots { a64_ovf_slots = slots }
+                }
                 if psimm >= 100 {
                     uint64 pt = psimm - 100
                     if pt >= 19 && pt <= 28 {
@@ -3138,6 +3148,14 @@ fn ir_emit_arm64_function(uint64 fn_node) {
     uint64 a64_save_lr = 0
     if a64_has_call != 0 { a64_save_lr = 1 }
     if a64_has_asm != 0 { a64_save_lr = 1 }
+
+    // Size the overflow-arg reserve to what this function's calls need.
+    // MUST be set before ir_snapshot_debug_vars and before any emission:
+    // ir_a64_spill_offset and IR_STACK_ADDR read the static. Windows and
+    // ASM-block functions keep the historical full reserve (Windows
+    // lowering writes stack args outside the IR_ARG path).
+    IR_A64_OVERFLOW_RESERVE = a64_ovf_slots * 8
+    if a64_has_asm != 0 || target_os == 2 { IR_A64_OVERFLOW_RESERVE = 128 }
 
     // Callee-saved colours actually used by this function.
     uint64 a64_used_mask = ir_used_color_mask() | a64_forced_mask
