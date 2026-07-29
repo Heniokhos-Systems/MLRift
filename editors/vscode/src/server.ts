@@ -137,13 +137,18 @@ connection.onInitialize((params: InitializeParams): InitializeResult => {
 
 // --- Diagnostics via mlrc check ---
 
-// Parse mlrc's diagnostic output. Current mlrc format (v1.x) is:
-//   <file>:<line>:<col>: error: <message>
-//        3 |     return 0
-//          |     ^~~~~~
-//   1 parse error(s)
-// so we match the header line and ignore the source/caret/summary lines.
-const MLRC_DIAG = /^.*?:(\d+):(\d+): (error|warning): (.+)$/gm;
+// Parse mlrc's diagnostic output. mlrc emits three distinct shapes, and the
+// column is genuinely absent from most of them — unlike krc, which always
+// prints <file>:<line>:<col>. Requiring a column here matches nothing and
+// leaves the editor silently free of diagnostics, so all three are handled:
+//
+//   <file>:<line>: warning: <message>        // no column (the common case)
+//   <file>:<line>:<col>: error: <message>    // column form, krc-style
+//   error at line <line>: <message>          // parse errors: no file, no column
+//
+// Source, caret and "N error(s)" summary lines are ignored.
+const MLRC_DIAG = /^.*?:(\d+)(?::(\d+))?: (error|warning): (.+)$/gm;
+const MLRC_PARSE_DIAG = /^error at line (\d+): (.+)$/gm;
 
 function parseMlrcDiagnostics(output: string, lines: string[]): Diagnostic[] {
     const diagnostics: Diagnostic[] = [];
@@ -151,7 +156,8 @@ function parseMlrcDiagnostics(output: string, lines: string[]): Diagnostic[] {
     let match: RegExpExecArray | null;
     while ((match = MLRC_DIAG.exec(output)) !== null) {
         const line = parseInt(match[1], 10) - 1;
-        const col = Math.max(0, parseInt(match[2], 10) - 1);
+        // mlrc usually omits the column; fall back to the start of the line.
+        const col = match[2] ? Math.max(0, parseInt(match[2], 10) - 1) : 0;
         const severity = match[3] === 'warning'
             ? DiagnosticSeverity.Warning
             : DiagnosticSeverity.Error;
@@ -164,6 +170,23 @@ function parseMlrcDiagnostics(output: string, lines: string[]): Diagnostic[] {
                 end: { line, character: lines[line]?.length || col + 1 }
             },
             message,
+            source: 'mlrc'
+        });
+    }
+
+    // Parse errors carry neither a file nor a column, so they are matched
+    // separately and anchored to the whole line.
+    MLRC_PARSE_DIAG.lastIndex = 0;
+    while ((match = MLRC_PARSE_DIAG.exec(output)) !== null) {
+        const line = parseInt(match[1], 10) - 1;
+        if (line < 0 || line >= lines.length) continue;
+        diagnostics.push({
+            severity: DiagnosticSeverity.Error,
+            range: {
+                start: { line, character: 0 },
+                end: { line, character: lines[line]?.length || 1 }
+            },
+            message: match[2],
             source: 'mlrc'
         });
     }

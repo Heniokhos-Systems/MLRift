@@ -9247,14 +9247,15 @@ connection.onInitialize((params) => {
     }
   };
 });
-var MLRC_DIAG = /^.*?:(\d+):(\d+): (error|warning): (.+)$/gm;
+var MLRC_DIAG = /^.*?:(\d+)(?::(\d+))?: (error|warning): (.+)$/gm;
+var MLRC_PARSE_DIAG = /^error at line (\d+): (.+)$/gm;
 function parseMlrcDiagnostics(output, lines) {
   const diagnostics = [];
   MLRC_DIAG.lastIndex = 0;
   let match;
   while ((match = MLRC_DIAG.exec(output)) !== null) {
     const line = parseInt(match[1], 10) - 1;
-    const col = Math.max(0, parseInt(match[2], 10) - 1);
+    const col = match[2] ? Math.max(0, parseInt(match[2], 10) - 1) : 0;
     const severity = match[3] === "warning" ? import_node.DiagnosticSeverity.Warning : import_node.DiagnosticSeverity.Error;
     const message = match[4];
     if (line < 0 || line >= lines.length) continue;
@@ -9265,6 +9266,20 @@ function parseMlrcDiagnostics(output, lines) {
         end: { line, character: lines[line]?.length || col + 1 }
       },
       message,
+      source: "mlrc"
+    });
+  }
+  MLRC_PARSE_DIAG.lastIndex = 0;
+  while ((match = MLRC_PARSE_DIAG.exec(output)) !== null) {
+    const line = parseInt(match[1], 10) - 1;
+    if (line < 0 || line >= lines.length) continue;
+    diagnostics.push({
+      severity: import_node.DiagnosticSeverity.Error,
+      range: {
+        start: { line, character: 0 },
+        end: { line, character: lines[line]?.length || 1 }
+      },
+      message: match[2],
       source: "mlrc"
     });
   }
