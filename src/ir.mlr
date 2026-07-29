@@ -167,6 +167,16 @@ static uint64 IR_MUL_IMM = 138      // dest = src1 * imm (signed i32)
 // matmul / sort hot loops that pun on byte-offset address math.
 static uint64 IR_LEA_BIS = 139      // dest = src1 + src2 * imm  (imm ∈ {1,2,4,8})
 
+// Immediate shift-left, produced by const-fold's pow2-MUL strength
+// reduction (`x * 2^k` → `x << k`). NOTE the number: KernRift uses 143,
+// but in MLRift 140..147 are already taken by the GPU host ops
+// (IR_GPU_ALLOC..IR_GPU_BARRIER, ir_hip.mlr), so this dialect assigns
+// the first free opcode above them — exactly as the ir_xtensa.mlr
+// opcode-collision note prescribes ("assign fresh opcodes >= 148").
+// Gated to x86 (0) and arm64 (1): riscv/xtensa have no handler for it
+// in MLRift, and their nyi_op guards must stay loud.
+static uint64 IR_SHL_IMM = 148      // dest = src1 << imm (imm 0..63; x86/arm64 only)
+
 // Typed print formatters: dest=len_vreg, src1=buf_vreg, src2=val_vreg
 static uint64 IR_FMT_BOOL = 124     // format bool as "true"/"false" into buf
 static uint64 IR_FMT_F64 = 125      // format f64 as decimal into buf
@@ -5532,6 +5542,7 @@ fn ir_x86_op_widesafe(uint64 o) -> uint64 {
     if o >= 120 && o <= 123 { return 1 }      // signed cmps
     if o == 131 { return 1 }                  // arr_check (trap path exits the process)
     if o >= 132 && o <= 139 { return 1 }      // sdiv/smod (rdx excl), sar, add/sub_imm, ror (CL), mul_imm, lea_bis
+    if o == 148 { return 1 }                  // shl_imm (148 here, not KernRift's 143 — GPU ops own 140..147)
     return 0
 }
 
@@ -7672,6 +7683,29 @@ fn ir_emit_x86_insn(uint64 ii) {
         } else {
             emit_u32_le(imm)
         }
+        if dst_r == 0xFFFFFFFF {
+            ir_emit_store_spill(0, dest_v)
+        }
+        return
+    }
+
+    if op == 148 {
+        // IR_SHL_IMM: dst = src1 << imm via `shl r64, imm8`
+        // (REX.W + C1 /4 ib, 4 bytes). Unlike the variable-count IR_SHL
+        // above there is no CL round-trip, so no rcx special-casing.
+        uint64 a_reg = ir_resolve_src(s1_v, 0)
+        uint64 dst = dst_r
+        if dst == 0xFFFFFFFF { dst = 0 }
+        if dst != a_reg { ir_emit_mov_r64_r64(dst, a_reg) }
+        uint8 rex = 0x48
+        if dst >= 8 { rex = rex | 1 }
+        emit_byte(rex)
+        emit_byte(0xC1)
+        uint64 mv = 0xE0 | (dst & 7)
+        uint8 modrm = mv
+        emit_byte(modrm)
+        uint8 sh8 = imm
+        emit_byte(sh8)
         if dst_r == 0xFFFFFFFF {
             ir_emit_store_spill(0, dest_v)
         }
@@ -11456,6 +11490,47 @@ fn ir_opt_const_fold() {
             }
         }
 
+        // Strength reduction: MUL by a power-of-two constant → IR_SHL_IMM.
+        // `x * 2^k` and `x << k` are the same bit operation for signed and
+        // unsigned alike (two's complement), so this is safe regardless of
+        // the vreg's signed flag. Ported from KernRift (where it runs on
+        // every target); here it is gated to x86 and arm64 because those
+        // are the only MLRift backends with an opcode-148 handler —
+        // enabling riscv/xtensa requires porting their emitters first
+        // (their nyi_op guards will fail loudly otherwise, by design).
+        // arm64 is the measured win: matmul's `i*N` row scalings each
+        // paid a mov_imm + mul; now they are one `lsl`. Runs BEFORE the
+        // IMUL-by-immediate fusion below so pow2 constants become shifts
+        // and only non-pow2 constants reach the x86 MUL_IMM path. The
+        // LEA-BIS matcher (ir_opt_recognize_lea_bis) accepts SHL_IMM 1..3
+        // as a scale, so `add(base, x*8)` still collapses to one LEA /
+        // shifted-register ADD. Skip values 0 and 1: the CONST-0 and COPY
+        // identity rules elsewhere handle those (a shift-by-zero would
+        // defeat them). k ≤ 63 always holds since the constant is a
+        // uint64 power of two. Both operand orders are handled — the IR
+        // does not canonicalise constants to src2. When both sources are
+        // known constants the full fold above already ran, so at most one
+        // side is known here.
+        if (target_arch == 0 || target_arch == 1) && op == 4 {
+            uint64 sr_mval = 0
+            uint64 sr_msrc = 0
+            uint64 sr_mhit = 0
+            if s2_known != 0 && s1_known == 0 { sr_mval = v2; sr_msrc = s1; sr_mhit = 1 }
+            if s1_known != 0 && s2_known == 0 { sr_mval = v1; sr_msrc = s2; sr_mhit = 1 }
+            if sr_mhit != 0 && sr_mval >= 2 {
+                uint64 sr_mp = ir_is_pow2(sr_mval)
+                if sr_mp != 0 {
+                    uint64 sr_mk = sr_mp - 1
+                    ir_insn_set_opcode(ii, 148)   // IR_SHL_IMM
+                    ir_insn_set_src1(ii, sr_msrc)
+                    ir_insn_set_src2(ii, 0)
+                    ir_insn_set_imm(ii, sr_mk)
+                    ii = ii + 1
+                    continue
+                }
+            }
+        }
+
         // IMUL-by-immediate fusion: `t = a * c` where c is a known
         // constant fitting in signed 32-bit → IR_MUL_IMM. x86's
         // three-operand `imul r64, r/m64, imm32` doesn't need the
@@ -11888,6 +11963,12 @@ fn ir_opt_cse_invalidates(uint64 op) -> uint64 {
 
 fn ir_opt_cse_is_pure(uint64 op) -> uint64 {
     if op >= 1 && op <= 19 { return 1 }    // const, arith, logic, cmp
+    // IR_SHL_IMM: pure (dest = src1 << imm; CSE keys and LICM handle the
+    // literal imm correctly). It replaces pow2 IR_MULs in const-fold,
+    // which runs BEFORE CSE/LICM — without this, the rewrite would rob
+    // those ops of the CSE/hoisting the original pure MUL (op 4) had
+    // (e.g. matmul's loop-invariant `i*N` row scaling).
+    if op == 148 { return 1 }
     if op >= 20 && op <= 27 { return 1 }   // float arith + conv
     if op >= 97 && op <= 108 { return 1 }  // float ops
     if op >= 120 && op <= 123 { return 1 } // signed cmp
@@ -12057,6 +12138,12 @@ fn ir_licm_is_hoistable(uint64 op) -> uint64 {
     if op == 79 { return 1 }  // str_const
     if op == 84 { return 1 }  // static_addr
     if op == 86 { return 1 }  // fn_addr
+    // IR_SHL_IMM: pure, src2 unused (0 → treated invariant), imm is a
+    // literal that ir_emit clones along. Replaces pow2 IR_MULs (which
+    // were hoistable as op 4) in const-fold, which runs before LICM —
+    // without this the strength reduction would pin previously-hoistable
+    // invariant scalings inside the loop.
+    if op == 148 { return 1 }
     return 0
 }
 
@@ -12344,6 +12431,14 @@ fn ir_opt_recognize_ffma() {
 
 fn ir_opt_recognize_lea_bis() {
     ir_build_def_idx()
+    // SHL_IMM defs count as a scale too (const-fold turns pow2 MULs into
+    // shifts): shift 1/2/3 ↔ scale 2/4/8. Gated to x86 and arm64 — the
+    // only backends with an IR_LEA_BIS handler (x86 emits a real LEA,
+    // arm64 emits `add Xd, Xn, Xm, LSL #k`) and the only ones where
+    // const-fold produces IR_SHL_IMM at all. MUL_IMM (138) needs no
+    // gate: it is only ever created when target_arch == 0.
+    uint64 shl_ok = 0
+    if target_arch == 0 || target_arch == 1 { shl_ok = 1 }
     uint64 ii = 0
     while ii < ir_insn_count {
         uint64 op = ir_insn_opcode(ii)
@@ -12351,7 +12446,8 @@ fn ir_opt_recognize_lea_bis() {
         uint64 s1 = ir_insn_src1(ii)
         uint64 s2 = ir_insn_src2(ii)
 
-        // Try src2's def as MUL_IMM with scale ∈ {1,2,4,8}.
+        // Try src2's def as MUL_IMM with scale ∈ {1,2,4,8}, or SHL_IMM
+        // with shift ∈ {1,2,3}.
         uint64 base_v = 0
         uint64 idx_v = 0
         uint64 scale = 0
@@ -12364,6 +12460,14 @@ fn ir_opt_recognize_lea_bis() {
                 scale = m_imm
             }
         }
+        if scale == 0 && shl_ok != 0 && d2 != 0xFFFFFFFF && ir_insn_opcode(d2) == 148 {
+            uint64 sh_imm = ir_insn_imm(d2)
+            if sh_imm >= 1 && sh_imm <= 3 {
+                base_v = s1
+                idx_v = ir_insn_src1(d2)
+                scale = 1 << sh_imm
+            }
+        }
         // Try src1 if src2 didn't match (commutative).
         if scale == 0 {
             uint64 d1 = ir_def_idx(s1)
@@ -12373,6 +12477,14 @@ fn ir_opt_recognize_lea_bis() {
                     base_v = s2
                     idx_v = ir_insn_src1(d1)
                     scale = m_imm
+                }
+            }
+            if scale == 0 && shl_ok != 0 && d1 != 0xFFFFFFFF && ir_insn_opcode(d1) == 148 {
+                uint64 sh_imm1 = ir_insn_imm(d1)
+                if sh_imm1 >= 1 && sh_imm1 <= 3 {
+                    base_v = s2
+                    idx_v = ir_insn_src1(d1)
+                    scale = 1 << sh_imm1
                 }
             }
         }
