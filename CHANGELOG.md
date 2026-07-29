@@ -37,6 +37,15 @@ rather than crashes.
   caps could be overrun by large inputs. ELF image buffers are now sized from the
   computed layout instead of a fixed cap.
 - Loud failure on struct field/size overflow and on unhandled x86_64 opcodes.
+- **The standard library now resolves for installed users.** `mlrc` searched
+  `/usr/local/share/kernrift/`, `/usr/share/kernrift/` and
+  `$HOME/.local/share/kernrift/` — never renamed after the fork — while
+  `install.sh` writes the stdlib to `$HOME/.local/share/mlrift/std`. No
+  `import "std/..."` could resolve from an OS-level install on Linux or macOS.
+- **An import that cannot be opened now aborts the build.** It previously
+  printed an error but continued, so a file whose missing module happened not
+  to break the parse produced a binary and exit 0 — a green build and a
+  silently wrong artifact. This is what kept the stdlib path bug hidden.
 
 ### Performance
 
