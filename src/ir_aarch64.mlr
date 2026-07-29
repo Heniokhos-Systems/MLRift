@@ -6,10 +6,13 @@
 //
 // Frame layout (growing downward):
 //   [old SP]
-//     x29, x30          (STP, 16 bytes)
-//     x19-x28           (5 STP pairs, 80 bytes)
-//     spill slots        (ir_spill_count * 8 bytes, 16-aligned)
-//   [new SP]
+//     used callee-saved colours, x29/x30 (non-leaf only), used d8-d15
+//       homes — packed by ir_a64_emit_callee_frame
+//     32-byte scratchpad
+//     stack arrays
+//     spill slots        (ir_spill_count * 8 bytes)
+//     overflow-arg reserve (IR_A64_OVERFLOW_RESERVE)
+//   [new SP]  (total 16-aligned)
 
 // Scratchpad offset within frame: a permanent 32-byte area reserved in the
 // prologue for mid-function temp buffers (fmt_uint digits, timespec, argv, etc).
@@ -39,6 +42,102 @@ fn ir_a64_ldp_sp(uint64 rt1, uint64 rt2, uint64 off) {
     uint64 imm7 = (off / 8) & 0x7F
     uint64 insn = 0xA9400000 | (imm7 << 15) | (rt2 << 10) | (31 << 5) | rt1
     emit_a64(insn)
+}
+
+// Save (restore==0) or restore (restore==1) the function's callee-saved
+// register set at [SP + cs_base ...]. `mask` holds the allocator colours
+// actually used (bit c -> x19+c); `dmask` the d-homes actually used (bit
+// i -> d8+i, from ir_a64_fpr_used_mask); `save_lr` appends x29/x30 for
+// non-leaf functions. Both the prologue and the epilogue call THIS
+// function with identical arguments, so the two sequences are mirror
+// images by construction: same registers, same slots, in the same
+// colour-ascending order (restore order does not matter for SP-relative
+// slots — only the reg<->slot pairing does). Registers are packed
+// pairwise into STP/LDP when every pair base fits the imm7 range;
+// otherwise fall back to per-register STR/LDR via ir_a64_str_sp /
+// ir_a64_ldr_sp / their _d_ variants, which handle arbitrary offsets
+// through a scratch register (x11 — caller-saved, dead in both the
+// prologue and the epilogue). GPRs and d-registers are paired within
+// their own class only (STP Xt and STP Dt are different encodings), so
+// the slot order is: used colours, x29/x30, used d-homes.
+fn ir_a64_emit_callee_frame(uint64 mask, uint64 dmask, uint64 cs_base, uint64 save_lr, uint64 restore) {
+    uint64 n = 0
+    uint64 c = 0
+    while c < 10 {
+        if ((mask >> c) & 1) != 0 { n = n + 1 }
+        c = c + 1
+    }
+    if save_lr != 0 { n = n + 2 }
+    uint64 dc = 0
+    while dc < 8 {
+        if ((dmask >> dc) & 1) != 0 { n = n + 1 }
+        dc = dc + 1
+    }
+    if n == 0 { return }
+    uint64 use_pairs = 0
+    if cs_base + n * 8 <= 512 { use_pairs = 1 }
+    uint64 off = cs_base
+    uint64 pend = 0xFFFFFFFF
+    // GPR phase: used colours ascending, then x29/x30 for non-leaf.
+    c = 0
+    while c < 12 {
+        uint64 r = 0xFFFFFFFF
+        if c < 10 {
+            if ((mask >> c) & 1) != 0 { r = 19 + c }
+        } else {
+            // c == 10 -> x29, c == 11 -> x30 (only for non-leaf)
+            if save_lr != 0 { r = 19 + c }
+        }
+        if r != 0xFFFFFFFF {
+            if use_pairs != 0 {
+                if pend == 0xFFFFFFFF {
+                    pend = r
+                } else {
+                    if restore == 0 { ir_a64_stp_sp(pend, r, off) }
+                    else { ir_a64_ldp_sp(pend, r, off) }
+                    off = off + 16
+                    pend = 0xFFFFFFFF
+                }
+            } else {
+                if restore == 0 { ir_a64_str_sp(r, off) }
+                else { ir_a64_ldr_sp(r, off) }
+                off = off + 8
+            }
+        }
+        c = c + 1
+    }
+    if pend != 0xFFFFFFFF {
+        if restore == 0 { ir_a64_str_sp(pend, off) }
+        else { ir_a64_ldr_sp(pend, off) }
+        off = off + 8
+        pend = 0xFFFFFFFF
+    }
+    // FP phase: used d-homes ascending, paired within the FP class.
+    dc = 0
+    while dc < 8 {
+        if ((dmask >> dc) & 1) != 0 {
+            uint64 dr = 8 + dc
+            if use_pairs != 0 {
+                if pend == 0xFFFFFFFF {
+                    pend = dr
+                } else {
+                    if restore == 0 { ir_a64_stp_d_sp(pend, dr, off) }
+                    else { ir_a64_ldp_d_sp(pend, dr, off) }
+                    off = off + 16
+                    pend = 0xFFFFFFFF
+                }
+            } else {
+                if restore == 0 { ir_a64_str_d_sp(dr, off) }
+                else { ir_a64_ldr_d_sp(dr, off) }
+                off = off + 8
+            }
+        }
+        dc = dc + 1
+    }
+    if pend != 0xFFFFFFFF {
+        if restore == 0 { ir_a64_str_d_sp(pend, off) }
+        else { ir_a64_ldr_d_sp(pend, off) }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -303,6 +402,17 @@ fn ir_a64_str_d_sp(uint64 dt, uint64 off) {
         ir_a64_add_sp_reg(11, 11)
         emit_a64(0xFD000000 | (11 << 5) | dt)
     }
+}
+
+// STP/LDP Dt1, Dt2, [SP, #off] for the prologue/epilogue d8-d15 save.
+fn ir_a64_stp_d_sp(uint64 rt1, uint64 rt2, uint64 off) {
+    uint64 imm7 = (off / 8) & 0x7F
+    emit_a64(0x6D000000 | (imm7 << 15) | (rt2 << 10) | (31 << 5) | rt1)
+}
+
+fn ir_a64_ldp_d_sp(uint64 rt1, uint64 rt2, uint64 off) {
+    uint64 imm7 = (off / 8) & 0x7F
+    emit_a64(0x6D400000 | (imm7 << 15) | (rt2 << 10) | (31 << 5) | rt1)
 }
 
 // Resolve a vreg for use as an f64 operand: its d-home if it has one,
@@ -2831,6 +2941,70 @@ fn ir_emit_arm64_function(uint64 fn_node) {
         ir_spill_count = ir_vreg_next - 1
     }
 
+    // 4b. Pre-scan the (post-optimization) IR: leafness and physical
+    // callee-saved registers written directly by ASM argument constraints.
+    //   - a64_has_call: IR_CALL(50) / IR_CALL_IND(87) emit BL/BLR, so x30
+    //     must be saved. On Windows (target_os==2) nearly every lowered op
+    //     may call through the IAT (BLR x16), so treat everything as
+    //     non-leaf there.
+    //   - a64_has_asm: an IR_ASM_BLOCK(96) can contain anything (BL,
+    //     clobbers of any callee-saved reg, stack use), so fall back to
+    //     the old maximally-conservative frame: save all 10 colours +
+    //     x29/x30.
+    //   - a64_forced_mask: IR_ARG with a direct register target (imm >=
+    //     100) that lands on x19-x28 clobbers a callee-saved reg the
+    //     allocator never handed out; force it into the save mask.
+    uint64 a64_has_call = 0
+    uint64 a64_has_asm = 0
+    uint64 a64_forced_mask = 0
+    if target_os == 2 { a64_has_call = 1 }
+    uint64 psb = 0
+    while psb < ir_bb_count {
+        uint64 psi = ir_bb_first_insn(psb)
+        while psi != 0xFFFFFFFF {
+            uint64 pso = ir_insn_opcode(psi)
+            if pso == 50 || pso == 87 { a64_has_call = 1 }
+            if pso == 96 { a64_has_asm = 1 }
+            if pso == 51 {
+                uint64 psimm = ir_insn_imm(psi)
+                if psimm >= 100 {
+                    uint64 pt = psimm - 100
+                    if pt >= 19 && pt <= 28 {
+                        a64_forced_mask = a64_forced_mask | (1 << (pt - 19))
+                    }
+                }
+            }
+            psi = ir_insn_next(psi)
+        }
+        psb = psb + 1
+    }
+    uint64 a64_save_lr = 0
+    if a64_has_call != 0 { a64_save_lr = 1 }
+    if a64_has_asm != 0 { a64_save_lr = 1 }
+
+    // Callee-saved colours actually used by this function.
+    uint64 a64_used_mask = ir_used_color_mask() | a64_forced_mask
+    if a64_has_asm != 0 { a64_used_mask = 0x3FF }
+    uint64 a64_nsave = 0
+    uint64 a64_mc = 0
+    while a64_mc < 10 {
+        if ((a64_used_mask >> a64_mc) & 1) != 0 { a64_nsave = a64_nsave + 1 }
+        a64_mc = a64_mc + 1
+    }
+
+    // FP callee-saved bank: only the d8-d15 homes ir_a64_fpr_alloc (step
+    // 3a) actually handed out. An ASM block could clobber any d-register,
+    // so has_asm forces the full bank whenever d-homes exist — the same
+    // conservative fallback as the all-colours GPR mask above.
+    uint64 a64_dmask = ir_a64_fpr_used_mask()
+    if a64_has_asm != 0 && a64_dmask != 0 { a64_dmask = 0xFF }
+    uint64 a64_dsave = 0
+    uint64 a64_dc = 0
+    while a64_dc < 8 {
+        if ((a64_dmask >> a64_dc) & 1) != 0 { a64_dsave = a64_dsave + 1 }
+        a64_dc = a64_dc + 1
+    }
+
     // 4a. Snapshot the function's var map for DWARF (if -g)
     ir_snapshot_debug_vars()
 
@@ -2838,11 +3012,13 @@ fn ir_emit_arm64_function(uint64 fn_node) {
     // uses it to distinguish colors from spills. Restore AFTER emission completes.
 
     // 5. Compute frame size
-    // Callee-saved area: x29/x30 (16) + x19-x28 (80) = 96 bytes.
-    // Functions whose f64 vregs live in d8-d15 add 64 bytes for the FP
-    // callee-saved bank (AAPCS64: d8-d15 must be preserved).
-    uint64 callee_save_size = 96
-    if ir_a64_uses_fpr != 0 { callee_save_size = 160 }
+    // Callee-saved area: only the GPR colours actually used, plus x29/x30
+    // for non-leaf functions (a BL clobbers x30; a leaf never touches it),
+    // plus only the d8-d15 homes ir_a64_fpr_alloc actually handed out
+    // (AAPCS64: d8-d15 must be preserved). A function using two d-homes
+    // saves two d-registers, not eight.
+    uint64 callee_save_size = a64_nsave * 8 + a64_dsave * 8
+    if a64_save_lr != 0 { callee_save_size = callee_save_size + 16 }
     uint64 spill_size = ir_spill_count * 8
     // 32-byte scratchpad for mid-function temp buffers (fmt_uint digits,
     // clock_gettime timespec, execve argv, etc). Using a fixed offset avoids
@@ -2938,51 +3114,15 @@ fn ir_emit_arm64_function(uint64 fn_node) {
     }
 
     // 6. Emit prologue (skip for @naked)
+    // Save only the callee-saved colours this function actually uses
+    // (plus x29/x30 when non-leaf) — ir_a64_emit_callee_frame packs them
+    // into STP pairs and is called with identical arguments from the
+    // epilogue, so save and restore mirror by construction.
+    uint64 cs_base = IR_A64_OVERFLOW_RESERVE + spill_size + ir_stack_array_bytes + scratch_size
     if is_naked == 0 {
         // SUB SP, SP, #total_frame
         emit_a64_sub_sp_imm(total_frame)
-        // Save FP/LR and callee-saved regs after spill+scratch area.
-        // Pair them with STP — halves the instruction count vs per-reg
-        // STRs. STP's offset is imm7 scaled by 8, capped at 504; fall
-        // back to individual STR for large frames to stay correct.
-        uint64 cs_base = IR_A64_OVERFLOW_RESERVE + spill_size + ir_stack_array_bytes + scratch_size
-        uint64 fp_off = cs_base + 80
-        if fp_off + 8 <= 504 {
-            ir_a64_stp_sp(19, 20, cs_base)
-            ir_a64_stp_sp(21, 22, cs_base + 16)
-            ir_a64_stp_sp(23, 24, cs_base + 32)
-            ir_a64_stp_sp(25, 26, cs_base + 48)
-            ir_a64_stp_sp(27, 28, cs_base + 64)
-            ir_a64_stp_sp(29, 30, fp_off)
-        } else {
-            ir_a64_str_sp(29, fp_off)
-            ir_a64_str_sp(30, fp_off + 8)
-            ir_a64_str_sp(19, cs_base)
-            ir_a64_str_sp(20, cs_base + 8)
-            ir_a64_str_sp(21, cs_base + 16)
-            ir_a64_str_sp(22, cs_base + 24)
-            ir_a64_str_sp(23, cs_base + 32)
-            ir_a64_str_sp(24, cs_base + 40)
-            ir_a64_str_sp(25, cs_base + 48)
-            ir_a64_str_sp(26, cs_base + 56)
-            ir_a64_str_sp(27, cs_base + 64)
-            ir_a64_str_sp(28, cs_base + 72)
-        }
-        // FP callee-saved bank (only when some f64 vreg is d-homed).
-        // Save only the d-registers ir_a64_fpr_alloc actually handed out
-        // (ir_a64_fpr_used_mask); each dI has a fixed slot at
-        // d_base + (I-8)*8 so the epilogue can mirror the set exactly.
-        if ir_a64_uses_fpr != 0 {
-            uint64 dmask = ir_a64_fpr_used_mask()
-            uint64 d_base = cs_base + 96
-            uint64 dmi = 0
-            while dmi < 8 {
-                if (dmask & (1 << dmi)) != 0 {
-                    ir_a64_str_d_sp(8 + dmi, d_base + dmi * 8)
-                }
-                dmi = dmi + 1
-            }
-        }
+        ir_a64_emit_callee_frame(a64_used_mask, a64_dmask, cs_base, a64_save_lr, 0)
     }
 
     // 7. Allocate branch/return fixup tracking
@@ -3156,43 +3296,10 @@ fn ir_emit_arm64_function(uint64 fn_node) {
                 emit_a64_svc()
             }
         }
-        // Restore callee-saved registers. Mirror the prologue: LDP
-        // pairs when the frame fits, individual LDRs otherwise.
-        uint64 cs_base_e = IR_A64_OVERFLOW_RESERVE + spill_size + ir_stack_array_bytes + scratch_size
-        uint64 fp_off_e = cs_base_e + 80
-        if fp_off_e + 8 <= 504 {
-            ir_a64_ldp_sp(19, 20, cs_base_e)
-            ir_a64_ldp_sp(21, 22, cs_base_e + 16)
-            ir_a64_ldp_sp(23, 24, cs_base_e + 32)
-            ir_a64_ldp_sp(25, 26, cs_base_e + 48)
-            ir_a64_ldp_sp(27, 28, cs_base_e + 64)
-            ir_a64_ldp_sp(29, 30, fp_off_e)
-        } else {
-            ir_a64_ldr_sp(19, cs_base_e)
-            ir_a64_ldr_sp(20, cs_base_e + 8)
-            ir_a64_ldr_sp(21, cs_base_e + 16)
-            ir_a64_ldr_sp(22, cs_base_e + 24)
-            ir_a64_ldr_sp(23, cs_base_e + 32)
-            ir_a64_ldr_sp(24, cs_base_e + 40)
-            ir_a64_ldr_sp(25, cs_base_e + 48)
-            ir_a64_ldr_sp(26, cs_base_e + 56)
-            ir_a64_ldr_sp(27, cs_base_e + 64)
-            ir_a64_ldr_sp(28, cs_base_e + 72)
-            ir_a64_ldr_sp(29, fp_off_e)
-            ir_a64_ldr_sp(30, fp_off_e + 8)
-        }
-        // Restore the FP callee-saved bank (mirrors the prologue).
-        if ir_a64_uses_fpr != 0 {
-            uint64 dmask_e = ir_a64_fpr_used_mask()
-            uint64 d_base_e = cs_base_e + 96
-            uint64 dme = 0
-            while dme < 8 {
-                if (dmask_e & (1 << dme)) != 0 {
-                    ir_a64_ldr_d_sp(8 + dme, d_base_e + dme * 8)
-                }
-                dme = dme + 1
-            }
-        }
+        // Restore callee-saved registers. Exact mirror of the prologue:
+        // same helper, same arguments -> same regs, same slots (GPR
+        // colours, then x29/x30, then the used d8-d15 homes).
+        ir_a64_emit_callee_frame(a64_used_mask, a64_dmask, cs_base, a64_save_lr, 1)
         // ADD SP, SP, #total_frame
         emit_a64_add_sp_imm(total_frame)
         // RET
