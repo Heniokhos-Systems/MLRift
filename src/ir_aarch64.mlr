@@ -560,6 +560,40 @@ fn ir_a64_peephole_reset() {
     ir_a64_last_spill_end = 0xFFFFFFFFFFFFFFFF
 }
 
+// CMP+B.cond fusion handoff (same shape as xtensa's xt_fused_cmp_op):
+// when ir_cmp_fuse_code says a compare's only consumer is the block's
+// BR_COND terminator, the compare handler emits NOTHING and stashes its
+// operands here; the terminator emits `cmp` + `b.<cond>` directly —
+// one branch on flags instead of cset + cbnz + b.
+static uint64 ir_a64_fused_cmp_op = 0
+static uint64 ir_a64_fused_cmp_s1 = 0
+static uint64 ir_a64_fused_cmp_s2 = 0
+static uint64 ir_a64_fused_cmp_imm = 0
+
+// Map an integer compare opcode to the AArch64 condition code that is
+// TRUE exactly when the compare is true. Unsigned: EQ NE LO LS HI HS;
+// signed: LT LE GT GE. Inversion (for branching on the false edge) is
+// cond ^ 1 — architectural for every code except AL/NV, which never
+// appear here.
+fn ir_a64_cmp_cond(uint64 op) -> uint64 {
+    if op == 14 { return 0 }    // EQ
+    if op == 15 { return 1 }    // NE
+    if op == 16 { return 3 }    // LO (unsigned <)
+    if op == 17 { return 9 }    // LS (unsigned <=)
+    if op == 18 { return 8 }    // HI (unsigned >)
+    if op == 19 { return 2 }    // HS (unsigned >=)
+    if op == 120 { return 11 }  // LT
+    if op == 121 { return 13 }  // LE
+    if op == 122 { return 12 }  // GT
+    return 10                   // GE (123)
+}
+
+// CMP Xn, #imm12 (alias for SUBS XZR, Xn, #imm). Caller guarantees
+// imm <= 4095.
+fn ir_a64_cmp_imm(uint64 rn, uint64 imm) {
+    emit_a64(0xF100001F | (imm << 10) | (rn << 5))
+}
+
 // Load a spilled vreg into scratch register (x9 or x10).
 // ARM64 LDR Xt,[Xn,#imm] uses a 12-bit scaled field: max offset = 4095*8 = 32760.
 // For larger offsets, use a scratch register to form the address.
@@ -1137,7 +1171,17 @@ fn ir_emit_arm64_insn(uint64 ii) {
     }
 
     // ----- IR_CMP_EQ (14) through IR_CMP_GE (19) -----
+    // If the compare's single consumer is this block's BR_COND
+    // terminator, defer it entirely — the terminator emits `cmp` +
+    // `b.<cond>` (see fusion handoff above).
     if op >= 14 && op <= 19 {
+        if ir_cmp_fuse_code(ii) != 0 {
+            ir_a64_fused_cmp_op = op
+            ir_a64_fused_cmp_s1 = s1_v
+            ir_a64_fused_cmp_s2 = s2_v
+            ir_a64_fused_cmp_imm = imm
+            return
+        }
         uint64 a_reg = ir_a64_resolve_src(s1_v, 9)
         uint64 b_reg = ir_a64_resolve_src(s2_v, 10)
         emit_a64_cmp(a_reg, b_reg)
@@ -1205,7 +1249,15 @@ fn ir_emit_arm64_insn(uint64 ii) {
     }
 
     // ----- IR_SCMP_LT (120) through IR_SCMP_GE (123) -----
+    // Same fusion handoff as the unsigned compares above.
     if op >= 120 && op <= 123 {
+        if ir_cmp_fuse_code(ii) != 0 {
+            ir_a64_fused_cmp_op = op
+            ir_a64_fused_cmp_s1 = s1_v
+            ir_a64_fused_cmp_s2 = s2_v
+            ir_a64_fused_cmp_imm = imm
+            return
+        }
         uint64 a_reg = ir_a64_resolve_src(s1_v, 9)
         uint64 b_reg = ir_a64_resolve_src(s2_v, 10)
         emit_a64_cmp(a_reg, b_reg)
@@ -3014,6 +3066,11 @@ fn ir_emit_arm64_function(uint64 fn_node) {
     // 2. Compute liveness
     ir_compute_liveness()
 
+    // 2a. Per-vreg use counts — consumed by ir_cmp_fuse_code so the
+    // CMP+B.cond fusion below only fires when the compare's boolean has
+    // exactly one consumer (the BR_COND terminator).
+    ir_compute_use_count()
+
     // 3. Set up ARM64 register allocator. The wide 23-colour file
     // (x19-x28 plus x0-x8/x12-x15) applies to every function without
     // inline asm and not @naked; ir_a64_seed_wide_ceilings caps
@@ -3260,8 +3317,10 @@ fn ir_emit_arm64_function(uint64 fn_node) {
         uint64 bop = ir_block_offsets + bi * 8
         unsafe { *(bop as uint64) = out_len }
         // Reset the spill-reload peephole at every BB boundary so a
-        // branch target never lands mid-pattern.
+        // branch target never lands mid-pattern; clear any stale
+        // compare-fusion handoff for the same reason.
         ir_a64_peephole_reset()
+        ir_a64_fused_cmp_op = 0
 
         // Emit non-terminator instructions
         uint64 ii = ir_bb_first_insn(bi)
@@ -3293,33 +3352,81 @@ fn ir_emit_arm64_function(uint64 fn_node) {
                 }
             }
             if last_op == 41 {
-                // IR_BR_COND: cbnz cond_vreg, true_target; fallthrough or B false_target
-                uint64 cond_v = ir_insn_src1(last)
-                uint64 cond_r = ir_a64_resolve_src(cond_v, 9)
+                // IR_BR_COND. TRUE target = imm, FALSE target = succ0.
+                // Three shapes, cheapest first:
+                //   - fused compare handoff: emit `cmp` here and branch
+                //     directly on flags with B.<cond> — no cset, no cbnz,
+                //     and when the TRUE edge is the fall-through the
+                //     condition is INVERTED to target FALSE, dropping the
+                //     trailing unconditional B entirely (one branch per
+                //     loop iteration, like gcc).
+                //   - non-fused with TRUE edge falling through: CBZ
+                //     cond, false_target (inverted, again no B).
+                //   - non-fused otherwise: CBNZ cond, true; B false.
+                // All conditional placeholders carry their final opcode +
+                // Rt/cond bits; the patcher only fills the imm19 field
+                // (fixup tag bit 31).
                 uint64 target_true = ir_insn_imm(last)
-                // Record fixup for CBNZ -> true target
-                // We encode type=1 (CBNZ) in high bit of target_bb
-                uint64 fp = ir_br_fixups + ir_br_fixup_count * 8
-                uint32 po = out_len
-                unsafe { *(fp as uint32) = po }
-                uint64 fp4 = fp + 4
-                // Encode: bit 31 = 1 for CBNZ, bits 0-30 = target_bb, store cond_r in the insn
-                uint32 tb = target_true | 0x80000000
-                unsafe { *(fp4 as uint32) = tb }
-                ir_br_fixup_count = ir_br_fixup_count + 1
-                // CBNZ cond_r, #0 (placeholder)
-                emit_a64(0xB5000000 | cond_r)
-                // Emit B to false target if not fall-through
                 uint64 target_false = ir_bb_succ0(bi)
-                if target_false != 0xFFFFFFFF && target_false != bi + 1 {
-                    uint64 fp2 = ir_br_fixups + ir_br_fixup_count * 8
-                    uint32 po2 = out_len
-                    unsafe { *(fp2 as uint32) = po2 }
-                    uint64 fp24 = fp2 + 4
-                    uint32 tb2 = target_false
-                    unsafe { *(fp24 as uint32) = tb2 }
+                uint64 br_insn = 0
+                if ir_a64_fused_cmp_op != 0 {
+                    uint64 fa_reg = ir_a64_resolve_src(ir_a64_fused_cmp_s1, 9)
+                    if ir_a64_fused_cmp_s2 == 0 {
+                        ir_a64_cmp_imm(fa_reg, ir_a64_fused_cmp_imm)
+                    } else {
+                        uint64 fb_reg = ir_a64_resolve_src(ir_a64_fused_cmp_s2, 10)
+                        emit_a64_cmp(fa_reg, fb_reg)
+                    }
+                    uint64 fcond = ir_a64_cmp_cond(ir_a64_fused_cmp_op)
+                    ir_a64_fused_cmp_op = 0
+                    // B.cond placeholder — invert if branching to FALSE.
+                    if target_true == bi + 1 {
+                        br_insn = 0x54000000 | (fcond ^ 1)
+                    } else {
+                        br_insn = 0x54000000 | fcond
+                    }
+                } else {
+                    uint64 cond_v = ir_insn_src1(last)
+                    uint64 cond_r = ir_a64_resolve_src(cond_v, 9)
+                    if target_true == bi + 1 {
+                        br_insn = 0xB4000000 | cond_r     // CBZ -> false
+                    } else {
+                        br_insn = 0xB5000000 | cond_r     // CBNZ -> true
+                    }
+                }
+                if target_true == bi + 1 {
+                    // TRUE edge falls through: single inverted branch to
+                    // FALSE (or nothing if FALSE also falls through).
+                    if target_false != 0xFFFFFFFF && target_false != bi + 1 {
+                        uint64 fp = ir_br_fixups + ir_br_fixup_count * 8
+                        uint32 po = out_len
+                        unsafe { *(fp as uint32) = po }
+                        uint64 fp4 = fp + 4
+                        uint32 tb = target_false | 0x80000000
+                        unsafe { *(fp4 as uint32) = tb }
+                        ir_br_fixup_count = ir_br_fixup_count + 1
+                        emit_a64(br_insn)
+                    }
+                } else {
+                    uint64 fp = ir_br_fixups + ir_br_fixup_count * 8
+                    uint32 po = out_len
+                    unsafe { *(fp as uint32) = po }
+                    uint64 fp4 = fp + 4
+                    uint32 tb = target_true | 0x80000000
+                    unsafe { *(fp4 as uint32) = tb }
                     ir_br_fixup_count = ir_br_fixup_count + 1
-                    emit_a64(0x14000000)    // B #0 (placeholder)
+                    emit_a64(br_insn)
+                    // B to false target if not fall-through
+                    if target_false != 0xFFFFFFFF && target_false != bi + 1 {
+                        uint64 fp2 = ir_br_fixups + ir_br_fixup_count * 8
+                        uint32 po2 = out_len
+                        unsafe { *(fp2 as uint32) = po2 }
+                        uint64 fp24 = fp2 + 4
+                        uint32 tb2 = target_false
+                        unsafe { *(fp24 as uint32) = tb2 }
+                        ir_br_fixup_count = ir_br_fixup_count + 1
+                        emit_a64(0x14000000)    // B #0 (placeholder)
+                    }
                 }
             }
         }
@@ -3337,7 +3444,7 @@ fn ir_emit_arm64_function(uint64 fn_node) {
         uint32 target_bb_raw = 0
         unsafe { *(fp4 as uint32) -> target_bb_raw }
         uint64 wraw = target_bb_raw
-        uint64 is_cbnz = wraw & 0x80000000
+        uint64 is_imm19 = wraw & 0x80000000
         uint64 wtb = wraw & 0x7FFFFFFF
         // Get target block offset
         uint64 tbp = ir_block_offsets + wtb * 8
@@ -3346,14 +3453,15 @@ fn ir_emit_arm64_function(uint64 fn_node) {
         uint64 wpo = patch_off
         uint64 disp = target_off - wpo
         uint64 rel = disp / 4
-        if is_cbnz != 0 {
-            // Patch CBNZ: read existing instruction to get Rt
+        if is_imm19 != 0 {
+            // imm19-class branch (CBNZ/CBZ/B.cond): the placeholder
+            // already carries its opcode and Rt/cond bits — fill in only
+            // the displacement field (bits 5-23).
             uint64 insn_addr = out_buf + wpo
             uint32 old_insn = 0
             unsafe { *(insn_addr as uint32) -> old_insn }
             uint64 wo = old_insn
-            uint64 rt = wo & 0x1F
-            uint64 new_insn = 0xB5000000 | ((rel & 0x7FFFF) << 5) | rt
+            uint64 new_insn = (wo & 0xFF00001F) | ((rel & 0x7FFFF) << 5)
             patch_u32(wpo, new_insn)
         } else {
             // Patch B
