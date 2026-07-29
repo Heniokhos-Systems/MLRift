@@ -20,20 +20,20 @@ DSO dependencies on Linux.
 ## Install
 
 One-line installers pull the right `mlrc` (compiler) + `mlr` (runner) for
-your platform from the latest [GitHub release](https://github.com/Pantelis23/MLRift/releases/latest)
+your platform from the latest [GitHub release](https://github.com/Heniokhos-Systems/MLRift/releases/latest)
 and copy every `std/*.mlr` module from `main` into your local standard
 library — no Python, no LLVM, no toolchain prerequisites.
 
 **Linux / macOS / Android (adb or Termux)**
 
 ```sh
-curl -sSf https://raw.githubusercontent.com/Pantelis23/MLRift/main/install.sh | sh
+curl -sSf https://raw.githubusercontent.com/Heniokhos-Systems/MLRift/main/install.sh | sh
 ```
 
 **Windows (PowerShell)**
 
 ```powershell
-irm https://raw.githubusercontent.com/Pantelis23/MLRift/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/Heniokhos-Systems/MLRift/main/install.ps1 | iex
 ```
 
 What lands on disk:
@@ -66,8 +66,8 @@ mlr hello.mlrbo                 # runs the host slice
 
 **Other install paths**
 
-- Build from source: `git clone https://github.com/Pantelis23/MLRift && cd MLRift && make` (the in-tree `build/mlrc` self-compiles).
-- Direct download: every per-arch binary lives under [`releases/latest`](https://github.com/Pantelis23/MLRift/releases/latest) (`mlrc-linux-x86_64`, `mlrc-windows-arm64.exe`, `mlrc.mlrbo`, …).
+- Build from source: `git clone https://github.com/Heniokhos-Systems/MLRift && cd MLRift && make` (the in-tree `build/mlrc` self-compiles).
+- Direct download: every per-arch binary lives under [`releases/latest`](https://github.com/Heniokhos-Systems/MLRift/releases/latest) (`mlrc-linux-x86_64`, `mlrc-windows-arm64.exe`, `mlrc.mlrbo`, …).
 
 ## What works today
 

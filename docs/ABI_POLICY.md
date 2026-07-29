@@ -150,5 +150,5 @@ $ kernriftc --emit=asm file.mlr -o file.s
 $ # compare the generated prologue / epilogue against the ABI spec
 ```
 
-File at https://github.com/Pantelis23/MLRift with both the `.mlr` source,
+File at https://github.com/Heniokhos-Systems/MLRift with both the `.mlr` source,
 the `.s` output, and the target triple.

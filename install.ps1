@@ -1,8 +1,8 @@
 # MLRift Self-Hosted Compiler Installer for Windows
-# Run: irm https://raw.githubusercontent.com/Pantelis23/MLRift/main/install.ps1 | iex
+# Run: irm https://raw.githubusercontent.com/Heniokhos-Systems/MLRift/main/install.ps1 | iex
 
 $ErrorActionPreference = "Stop"
-$Repo = "Pantelis23/MLRift"
+$Repo = "Heniokhos-Systems/MLRift"
 $InstallDir = "$env:LOCALAPPDATA\MLRift\bin"
 
 Write-Host "=== MLRift Self-Hosted Compiler Installer ==="

@@ -12,7 +12,7 @@ first program, and the language features you'll use in day-to-day code.
 ### Linux / macOS
 
 ```bash
-curl -sSf https://raw.githubusercontent.com/Pantelis23/MLRift/main/install.sh | sh
+curl -sSf https://raw.githubusercontent.com/Heniokhos-Systems/MLRift/main/install.sh | sh
 ```
 
 Installs `mlrc` (compiler) and `mlr` (runner) to `~/.local/bin/`, and the
@@ -22,7 +22,7 @@ is on your `PATH`.
 ### Windows
 
 ```powershell
-irm https://raw.githubusercontent.com/Pantelis23/MLRift/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/Heniokhos-Systems/MLRift/main/install.ps1 | iex
 ```
 
 Installs to `%LOCALAPPDATA%\MLRift\bin\` and adds it to `PATH`.

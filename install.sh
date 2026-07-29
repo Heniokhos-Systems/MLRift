@@ -1,13 +1,13 @@
 #!/bin/sh
 # MLRift Installer — download and install mlrc + mlr from GitHub releases
-# Usage: curl -sSf https://raw.githubusercontent.com/Pantelis23/MLRift/main/install.sh | sh
+# Usage: curl -sSf https://raw.githubusercontent.com/Heniokhos-Systems/MLRift/main/install.sh | sh
 #
 # Alternative installation methods:
-#   PowerShell (Windows):    irm https://raw.githubusercontent.com/Pantelis23/MLRift/main/install.ps1 | iex
+#   PowerShell (Windows):    irm https://raw.githubusercontent.com/Heniokhos-Systems/MLRift/main/install.ps1 | iex
 #
 set -e
 
-REPO="Pantelis23/MLRift"
+REPO="Heniokhos-Systems/MLRift"
 
 # Detect platform
 ARCH=$(uname -m)
