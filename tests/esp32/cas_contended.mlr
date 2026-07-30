@@ -4,13 +4,23 @@ import "../../std/esp32_uart.mlr"
 
 static u32[1] shared
 static u32[1] c1_done
+static u32[1] c0_retries
+static u32[1] c1_retries
 
-fn bump(u32 n) {
+// `retry_ctr` is a static u32[1]'s address, passed the same way
+// std/nn_int8.mlr's nn_store_i32(u32 p, ...) takes one: the array name
+// decays to its address as a plain u32.
+fn bump(u32 n, u32 retry_ctr) {
     u32 i = 0
     while i < n {
         loop {
             u32 cur = vload32(shared)
             if atomic_cas(shared, cur, cur + 1) != 0 { break }
+            // Failed CAS: another core wrote `shared` between our vload32
+            // and our atomic_cas. Counting these is the only way to prove
+            // the two cores actually interleaved on the word, rather than
+            // core 1 having simply finished before core 0 ever started.
+            vstore32(retry_ctr, vload32(retry_ctr) + 1)
         }
         i = i + 1
     }
@@ -18,7 +28,7 @@ fn bump(u32 n) {
 
 fn core1_entry() {
     EspSmpDport.appcpu_ctrl_d = 0
-    bump(10000)
+    bump(10000, c1_retries)
     vstore32(c1_done, 1)
     loop { }
 }
@@ -27,18 +37,43 @@ fn main() {
     u32 clkrc = esp32_clk_cpu_pll(240)
     vstore32(shared, 0)
     vstore32(c1_done, 0)
+    vstore32(c0_retries, 0)
+    vstore32(c1_retries, 0)
+
+    // Phase A: uncontended baseline. Core 1 is still held in reset/stall
+    // (esp32_appcpu_start has not been called yet), so this is the same
+    // bump() code path with no other core touching `shared` — the
+    // intrinsic MEMW/WSR/RSYNC/S32C1I cost with zero contention.
+    u32 ta0 = esp32_clk_ccount()
+    bump(10000, c0_retries)
+    u32 ta1 = esp32_clk_ccount()
+    u32 delta_a = (ta1 - ta0) & 0xFFFFFFFF
+
+    // Reset shared for phase B. Both cores add 10000 each starting from 0
+    // again, so the expected total after phase B is still 00004E20 — the
+    // pass criterion below states this explicitly rather than relying on
+    // phase A's leftover value.
+    vstore32(shared, 0)
+
+    // Phase B: release core 1, race it on the same shared word. Same code
+    // path as phase A, same clock, so the CCOUNT delta between the two
+    // phases isolates the marginal cost of real two-core contention.
     esp32_appcpu_start(fn_addr("core1_entry"))
-    u32 t0 = esp32_clk_ccount()
-    bump(10000)
-    u32 t1 = esp32_clk_ccount()
-    // CCOUNT wraps as a plain 32-bit counter; masking matches the pattern
-    // esp32_clk_spin already uses for the same reason.
-    u32 delta = (t1 - t0) & 0xFFFFFFFF
+    u32 tb0 = esp32_clk_ccount()
+    bump(10000, c0_retries)
+    u32 tb1 = esp32_clk_ccount()
+    u32 delta_b = (tb1 - tb0) & 0xFFFFFFFF
+
     loop { if vload32(c1_done) != 0 { break } }
+
     loop {
+        puts("PHASE_A_CCOUNT ") puthex32(delta_a)
+        puts(" PHASE_B_CCOUNT ") puthex32(delta_b)
+        puts("\r\n")
         puts("TOTAL ") puthex32(vload32(shared))
-        puts(" EXPECT 00004E20")
-        puts(" CCOUNT ") puthex32(delta)
+        puts(" EXPECT 00004E20\r\n")
+        puts("C0_RETRIES ") puthex32(vload32(c0_retries))
+        puts(" C1_RETRIES ") puthex32(vload32(c1_retries))
         puts("\r\n")
         delay()
     }
