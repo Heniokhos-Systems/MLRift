@@ -106,18 +106,28 @@ fn import_init() {
     import_buf = alloc(import_buf_cap)
     import_buf_len = 0
     import_seen_cap = 64
-    import_seen = alloc(import_seen_cap * 256)
+    import_seen = alloc(import_seen_cap * 8)
     import_seen_count = 0
     srcmap_cap = 1024
     srcmap_table = alloc(srcmap_cap * 16)
     srcmap_count = 0
 }
 
+// The seen-set stores POINTERS, not inline 256-byte copies. The old layout
+// truncated every entry at 255 chars — so a long path was recorded wrong AND
+// two distinct paths sharing a 255-char prefix collided, making the second
+// look already seen and silently skipping its imports (and a circular import
+// through such a path recursed forever, since dedup never matched). Pointer
+// entries have no length cliff, keep O(1) table indexing, and stay safe
+// across grow_buf: the pointers move with the table, the strings they
+// reference never move. (Ported from KernRift 10f5533.)
 fn import_is_seen(uint64 path) -> uint64 {
     uint64 plen = str_len(path)
     uint64 i = 0
     while i < import_seen_count {
-        uint64 entry = import_seen + i * 256
+        uint64 slot = import_seen + i * 8
+        uint64 entry = 0
+        unsafe { *(slot as uint64) -> entry }
         if str_starts_with(entry, path, plen) != 0 {
             uint64 elen = str_len(entry)
             if elen == plen { return 1 }
@@ -128,30 +138,19 @@ fn import_is_seen(uint64 path) -> uint64 {
 }
 
 fn import_mark_seen(uint64 path) {
-    // Grow the seen-set before writing the new 256-byte entry. Without this
-    // the 65th import silently ran off the end of a fixed 16 KiB block
-    // (KernRift fixed the same class of bug in 8bcc747; MLRift's copy of
-    // import_append/import_mark_seen had no bounds check at all).
     if import_seen_count >= import_seen_cap {
-        import_seen = grow_buf(import_seen, import_seen_cap * 256,
-                               import_seen_cap * 512)
+        import_seen = grow_buf(import_seen, import_seen_cap * 8,
+                               import_seen_cap * 16)
         import_seen_cap = import_seen_cap * 2
     }
     uint64 plen = str_len(path)
-    uint64 entry = import_seen + import_seen_count * 256
-    uint64 i = 0
-    while i < plen && i < 255 {
-        uint64 sp = path + i
-        uint64 dp = entry + i
-        uint64 ch = 0
-        unsafe { *(sp as uint8) -> ch }
-        uint8 cb = ch
-        unsafe { *(dp as uint8) = cb }
-        i = i + 1
-    }
-    uint64 tp = entry + i
+    uint64 copy = alloc(plen + 1)
+    memcpy(copy, path, plen)
+    uint64 tp = copy + plen
     uint8 z = 0
     unsafe { *(tp as uint8) = z }
+    uint64 slot = import_seen + import_seen_count * 8
+    unsafe { *(slot as uint64) = copy }
     import_seen_count = import_seen_count + 1
 }
 
@@ -403,8 +402,16 @@ fn import_check_import_line(uint64 buf, uint64 size, uint64 pos) -> uint64 {
 }
 
 // Stdlib search paths for imports not found relative to source file
+// Stdlib search paths for imports not found relative to the source file.
+// Same shape as import_seen: one u64 pointer per entry to an exact-size heap
+// copy. The old layout was WORSE than import_mark_seen's — 256-byte inline
+// slots with NO length guard on the memcpy (a >255-char search path, e.g. via
+// a long $HOME, overflowed into the next slot) and NO count guard on the fixed
+// 2048-byte table (8 slots, against 5 paths registered on Linux today).
+// (Ported from KernRift 10f5533.)
 static uint64 import_search_paths = 0
 static uint64 import_search_count = 0
+static uint64 import_search_cap = 0
 
 // Stub for bootstrap: overridden by get_module_path built-in in new compiler
 fn get_module_path(uint64 buf, uint64 size) -> uint64 { return 0 }
@@ -457,7 +464,8 @@ fn import_read_home() -> uint64 {
 
 fn import_init_search_paths() {
     if import_search_paths != 0 { return }
-    import_search_paths = alloc(2048)
+    import_search_cap = 16
+    import_search_paths = alloc(import_search_cap * 8)
     import_search_count = 0
 
     uint64 host_os = get_target_os()
@@ -476,21 +484,30 @@ fn import_init_search_paths() {
                 unsafe { *(cp as uint8) -> ch }
                 if ch == 92 { dir_len = dir_len + 1; break }
             }
-            // Try <exe_dir>..\std\ (install.ps1 puts std next to bin)
-            uint64 up_std = alloc(dir_len + 8)
+            // A search path is the PARENT of std\, not std\ itself.
+            // import_resolve_stdlib concatenates base + the import path
+            // verbatim, and imports are written `import "std/io.mlr"` — the
+            // "std" component is already in the import path. Registering
+            // <exe_dir>..\std\ here produced ...\std\std/io.mlr, which never
+            // opens, so stdlib resolution failed on Windows for every import.
+            //   C:\mlrtest\bin\..\std\std/io.mlr  -> fails
+            //   C:\mlrtest\bin\..\std/io.mlr      -> opens
+            // The Linux/macOS branch below already gets this right: it
+            // registers .../mlrift/ while install.sh puts the modules in
+            // .../mlrift/std, so base + "std/io.mlr" composes correctly.
+            // Try <exe_dir>..\ (install.ps1 puts std next to bin)
+            uint64 up_std = alloc(dir_len + 4)
             memcpy(up_std, exe_buf, dir_len)
-            uint64 suffix = "..\\std\\"
-            memcpy(up_std + dir_len, suffix, 7)
+            uint64 suffix = "..\\"
+            memcpy(up_std + dir_len, suffix, 3)
             uint8 z = 0
-            uint64 tp = up_std + dir_len + 7
+            uint64 tp = up_std + dir_len + 3
             unsafe { *(tp as uint8) = z }
             import_add_search_path(up_std)
-            // Also try <exe_dir>std\ (alternative layout)
-            uint64 dir_std = alloc(dir_len + 5)
+            // Also try <exe_dir> itself (std\ sitting beside the exe)
+            uint64 dir_std = alloc(dir_len + 1)
             memcpy(dir_std, exe_buf, dir_len)
-            uint64 suffix2 = "std\\"
-            memcpy(dir_std + dir_len, suffix2, 4)
-            uint64 tp2 = dir_std + dir_len + 4
+            uint64 tp2 = dir_std + dir_len
             unsafe { *(tp2 as uint8) = z }
             import_add_search_path(dir_std)
         }
@@ -498,6 +515,14 @@ fn import_init_search_paths() {
         // Linux/macOS: system paths
         import_add_search_path("/usr/local/share/mlrift/")
         import_add_search_path("/usr/share/mlrift/")
+        // Homebrew prefixes. /usr/local (Intel macOS Homebrew) is already
+        // covered above; /opt/homebrew is Apple Silicon and
+        // /home/linuxbrew/.linuxbrew is the Linux Homebrew default. Neither is
+        // an FHS path, so `brew install` would otherwise land the stdlib where
+        // mlrc never looks. (pacman/AUR use /usr/share, and Scoop resolves
+        // relative to mlrc.exe on Windows -- both already covered.)
+        import_add_search_path("/opt/homebrew/share/mlrift/")
+        import_add_search_path("/home/linuxbrew/.linuxbrew/share/mlrift/")
         // Add user path: $HOME/.local/share/mlrift/
         uint64 home = import_read_home()
         if home != 0 {
@@ -516,12 +541,22 @@ fn import_init_search_paths() {
 }
 
 fn import_add_search_path(uint64 path) {
+    if import_search_count >= import_search_cap {
+        import_search_paths = grow_buf(import_search_paths,
+                                       import_search_cap * 8,
+                                       import_search_cap * 16)
+        import_search_cap = import_search_cap * 2
+    }
+    // Defensive exact-size copy: callers may pass scratch buffers, and the
+    // table must own storage that never moves or gets reused.
     uint64 plen = str_len(path)
-    uint64 entry = import_search_paths + import_search_count * 256
-    memcpy(entry, path, plen)
-    uint64 tp = entry + plen
+    uint64 copy = alloc(plen + 1)
+    memcpy(copy, path, plen)
+    uint64 tp = copy + plen
     uint8 z = 0
     unsafe { *(tp as uint8) = z }
+    uint64 slot = import_search_paths + import_search_count * 8
+    unsafe { *(slot as uint64) = copy }
     import_search_count = import_search_count + 1
 }
 
@@ -530,7 +565,9 @@ fn import_resolve_stdlib(uint64 import_path) -> uint64 {
     uint64 plen = str_len(import_path)
     uint64 i = 0
     while i < import_search_count {
-        uint64 base = import_search_paths + i * 256
+        uint64 base_slot = import_search_paths + i * 8
+        uint64 base = 0
+        unsafe { *(base_slot as uint64) -> base }
         uint64 blen = str_len(base)
         uint64 full = alloc(blen + plen + 1)
         memcpy(full, base, blen)
