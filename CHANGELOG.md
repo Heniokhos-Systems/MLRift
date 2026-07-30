@@ -46,6 +46,18 @@ rather than crashes.
   printed an error but continued, so a file whose missing module happened not
   to break the parse produced a binary and exit 0 — a green build and a
   silently wrong artifact. This is what kept the stdlib path bug hidden.
+- **Windows stdlib imports never resolved.** A search path must be the parent
+  of `std\`, since imports are written `import "std/io.mlr"` and the path is
+  concatenated verbatim; registering `<exe_dir>..\std\` produced
+  `...\std\std/io.mlr`, which never opens.
+- **Homebrew prefixes are now searched** — `/opt/homebrew` (Apple Silicon) and
+  `/home/linuxbrew/.linuxbrew`. Neither is an FHS path, so `brew install` put
+  the stdlib where `mlrc` never looked.
+- **The 255-character path cliff is gone.** The seen-set and search-path tables
+  used fixed 256-byte slots: longer paths were truncated, so a module imported
+  from two files was appended twice (`redefinition of function`), and the
+  search-path table had no length guard on its copy and no count guard at all.
+  Both now store pointers to exact-size copies.
 
 ### Performance
 
