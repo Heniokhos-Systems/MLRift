@@ -2,7 +2,7 @@
 
 All notable changes to `mlrc` are documented in this file.
 
-## v1.1.0 — 2026-07-29
+## v1.1.0 — 2026-07-30
 
 The first release since v1.0.1 (May 2026), covering 342 commits. It brings MCU
 targets, an int8 neural-network layer, a large codegen and register-allocation
