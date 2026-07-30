@@ -24,3 +24,37 @@ device EspSmpRtc at 0x3FF48000 {
     options0 at 0x00 : u32
     sw_cpu_stall at 0xAC : u32
 }
+
+// Clear both stall fields. Neither alone is "not stalled" — ESP-IDF's own
+// stall write is 0x21 into SW_STALL_APPCPU_C1 (sw_cpu_stall bits 25:20) AND
+// 0x2 into SW_STALL_APPCPU_C0 (options0 bits 1:0). We clear unconditionally,
+// the same way ESP-IDF does, rather than assuming the ROM already left them
+// clear.
+//
+// ⚠️ `&` binds TIGHTER than `>>`/`<<` in this dialect (opposite of C), so the
+// masks below are plain hex constants, not shift expressions, to avoid the
+// hazard entirely.
+fn esp32_rtc_unstall_appcpu() {
+    // SW_STALL_APPCPU_C1: bits [25:20] of sw_cpu_stall (mask 0x03F00000).
+    EspSmpRtc.sw_cpu_stall = EspSmpRtc.sw_cpu_stall & 0xFC0FFFFF
+    // SW_STALL_APPCPU_C0: bits [1:0] of options0 (mask 0x3).
+    EspSmpRtc.options0 = EspSmpRtc.options0 & 0xFFFFFFFC
+}
+
+// Order is load-bearing. Clear the stalls first, pulse reset while the core is
+// gated OFF, then arm the boot address, then ungate. The APP CPU's mask ROM
+// polls CTRL_D and jumps when it is non-zero.
+fn esp32_appcpu_start(u32 entry_addr) {
+    // 1. both stall sources (RTC first — it survives non-EN resets)
+    esp32_rtc_unstall_appcpu()
+    EspSmpDport.appcpu_ctrl_c = EspSmpDport.appcpu_ctrl_c & 0xFFFFFFFE
+    // 2. gate the clock off before touching reset
+    EspSmpDport.appcpu_ctrl_b = EspSmpDport.appcpu_ctrl_b & 0xFFFFFFFE
+    // 3. pulse reset
+    EspSmpDport.appcpu_ctrl_a = EspSmpDport.appcpu_ctrl_a | 1
+    EspSmpDport.appcpu_ctrl_a = EspSmpDport.appcpu_ctrl_a & 0xFFFFFFFE
+    // 4. arm the boot address
+    EspSmpDport.appcpu_ctrl_d = entry_addr
+    // 5. ungate — this starts it
+    EspSmpDport.appcpu_ctrl_b = EspSmpDport.appcpu_ctrl_b | 1
+}

@@ -1,0 +1,93 @@
+// examples/esp32/dualcore_hello.mlr — Stage 1 acceptance image for ESP32
+// dual-core bring-up. Releases APP_CPU (core 1) from reset and proves it
+// executes: core 1 writes a marker word and a free-running beat counter to
+// shared DRAM cells; core 0 polls and prints them over UART0.
+//
+// This is a silicon proof, not a synchronization demo — there is no lock
+// around the shared cells, no handshake, and no attempt to make the beat
+// counter meaningful across resets. Passing means core 1 ran at all.
+//
+// Build:
+//   ./build/mlrc --arch=xtensa --freestanding --target=esp32 \
+//       examples/esp32/dualcore_hello.mlr -o /tmp/dual.bin
+//
+// Flash + run: see task-4-report.md — the two helper scripts on the Pi,
+// never hand-rolled esptool (this board has no DTR/RTS wired to the chip).
+
+import "../../std/esp32_clk.mlr"
+import "../../std/esp32_smp.mlr"
+import "../../std/esp32_uart.mlr"
+
+static u32[1] core1_slot
+static u32[1] core1_beat
+
+// Guard word canary. Two copies sit just outside either core's stack span
+// (see stack_prep/stack_report below) so an overflow in either direction is
+// caught rather than silently corrupting the other core's live stack — the
+// one new hazard dual-core introduces that single-core never had.
+static u32 CANARY = 0xCA5AB0DE
+
+// Both guard words sit OUTSIDE either stack's normal span:
+//   0x3FFDF000 — one word above core 1's SP start, one word below core 0's
+//                floor: only a core-0 overflow reaches it
+//   0x3FFDE000 — core 1's floor: only a core-1 overflow reaches it
+// The fill covers core 1's span ONLY: [0x3FFDE004, 0x3FFDEFFC). Core 0's own
+// live frame — including the saved a0 this very call returns through — sits
+// in [0x3FFDF000, 0x3FFE0000); filling that range would destroy the return
+// address and this call would never come back, presenting as a dead board
+// on the very first flash.
+fn stack_prep() {
+    vstore32(0x3FFDF000, CANARY)
+    vstore32(0x3FFDE000, CANARY)
+    u32 a = 0x3FFDE004
+    while a < 0x3FFDEFFC {
+        vstore32(a, 0xEEEEEEEE)
+        a = a + 4
+    }
+}
+
+fn stack_report() {
+    puts(" C0GUARD ") puthex32(vload32(0x3FFDF000))
+    puts(" C1GUARD ") puthex32(vload32(0x3FFDE000))
+    // Lowest address still holding the fill pattern = core 1's high-water
+    // mark. This does NOT observe the APP-CPU ROM stub's own stack — IDF
+    // puts SOC_ROM_STACK_START at 0x3FFE3F20, 15,648 bytes above the top of
+    // this fill span and above MLRift's DRAM ceiling entirely, so it cannot
+    // land here regardless of what it does.
+    u32 a = 0x3FFDE004
+    while a < 0x3FFDEFFC {
+        if vload32(a) != 0xEEEEEEEE { break }
+        a = a + 4
+    }
+    puts(" C1LOW ") puthex32(a)
+}
+
+// Runs on core 1. The compiler emits an SP-init preamble ahead of the normal
+// prologue for any ESP32 function named exactly core1_entry (stack starts at
+// 0x3FFDEFFC, grows down) — no manual SP setup needed here.
+fn core1_entry() {
+    EspSmpDport.appcpu_ctrl_d = 0        // disarm, so a stray reset cannot re-run us
+    vstore32(core1_slot, 0xC0DE0001)
+    u32 n = 0
+    loop {
+        n = n + 1
+        vstore32(core1_beat, n)
+    }
+}
+
+fn main() {
+    // MUST be main's first action, before any putc: this brings the CPU to
+    // 240 MHz / APB to 80 MHz and rewrites UART0's baud divisor for the new
+    // APB clock. Core 1 must NOT call this — the clock is already global and
+    // up by the time core 1 runs.
+    u32 clkrc = esp32_clk_cpu_pll(240)
+    stack_prep()
+    esp32_appcpu_start(fn_addr("core1_entry"))
+    loop {
+        puts("SLOT ")  puthex32(vload32(core1_slot))
+        puts(" BEAT ") puthex32(vload32(core1_beat))
+        stack_report()
+        puts("\r\n")
+        delay()
+    }
+}
