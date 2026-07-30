@@ -70,7 +70,7 @@ build/mlrc: build/mlrc.mlr
 test: build/mlrc
 	@echo "=== Running MLRift test suite ==="
 	@echo '#!/bin/bash' > /tmp/mlrc-test && echo 'exec ./build/mlrc --arch=x86_64 "$$@"' >> /tmp/mlrc-test && chmod +x /tmp/mlrc-test
-	@MLRC=/tmp/mlrc-test bash tests/run_tests.sh || true
+	@MLRC=/tmp/mlrc-test bash tests/run_tests.sh
 
 # Verify self-host fixed point (stage3 == stage4)
 bootstrap: build/mlrc

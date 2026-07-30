@@ -2368,25 +2368,41 @@ run_test "const_neg"    'const i64 X = -42; fn main() { exit(0 - X) }' 42
 echo ""
 echo "--- import after comment (regression) ---"
 TOTAL=$((TOTAL + 1))
-cat > /tmp/imp_test_$$.mlr <<'KREOF'
-// leading comment should not break imports
-import "std/io.mlr"
-fn main() { println("imp_ok"); exit(0) }
+# This test was VACUOUS: it wrote the source to /tmp and imported
+# "std/io.mlr", but imports resolve relative to the SOURCE FILE's directory,
+# so /tmp/std/io.mlr never existed on a clean machine. It only appeared to
+# pass because println is a BUILTIN — the binary printed "imp_ok" whether or
+# not the import resolved. It passed on developer machines (which have a
+# ~/.local/share/mlrift/std install to fall back on) and passed in CI for the
+# wrong reason, until an unopenable import started aborting the compile.
+# Now it imports a module it creates itself and calls a function that exists
+# ONLY in that module, so the assertion cannot be satisfied unless the import
+# genuinely resolved.
+IMPC_DIR=$(mktemp -d /tmp/mlrc_impc_XXXXXX)
+cat > "$IMPC_DIR/impmod.mlr" <<'KREOF'
+fn imp_after_comment_helper() -> uint64 { return 7 }
 KREOF
-if $MLRC $MLRC_FLAGS /tmp/imp_test_$$.mlr -o /tmp/imp_test_bin_$$ > /dev/null 2>&1; then
-    got=$(/tmp/imp_test_bin_$$ 2>/dev/null)
-    if [ "$got" = "imp_ok" ]; then
+cat > "$IMPC_DIR/impmain.mlr" <<'KREOF'
+// leading comment should not break imports
+import "impmod.mlr"
+fn main() { exit(imp_after_comment_helper() + 35) }
+KREOF
+if $MLRC $MLRC_FLAGS "$IMPC_DIR/impmain.mlr" -o "$IMPC_DIR/impbin" > /dev/null 2>&1; then
+    chmod +x "$IMPC_DIR/impbin"
+    "$IMPC_DIR/impbin" > /dev/null 2>&1
+    imp_ec=$?
+    if [ "$imp_ec" -eq 42 ]; then
         PASS=$((PASS + 1))
-        echo "  import_after_comment: PASS"
+        echo "  import_after_comment: PASS (imported symbol resolved, exit 42)"
     else
         FAIL=$((FAIL + 1))
-        echo "  import_after_comment: FAIL (got: $got)"
+        echo "  import_after_comment: FAIL (exit $imp_ec, expected 42)"
     fi
 else
     FAIL=$((FAIL + 1))
     echo "  import_after_comment: FAIL (compile)"
 fi
-rm -f /tmp/imp_test_$$.mlr /tmp/imp_test_bin_$$
+rm -rf "$IMPC_DIR"
 
 echo ""
 echo "--- char literals ---"
