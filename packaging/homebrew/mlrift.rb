@@ -10,9 +10,12 @@ class Mlrift < Formula
   version "1.1.0"
   license "Apache-2.0"
 
-  # PLACEHOLDER — v1.1.0 has not been released yet. Every sha256 below is
-  # rewritten by scripts/update-packaging.sh once build-release publishes
-  # SHA256SUMS for this tag; do not push this formula to the tap as-is.
+  # Every sha256 below is generated, not hand-written: on each release,
+  # .github/workflows/release.yml's update-packaging job runs
+  # scripts/update-packaging.sh, which reads the hashes out of the release's
+  # own published SHA256SUMS asset. They are therefore the hashes of the
+  # artifacts users actually download, not of a local rebuild that merely
+  # ought to match. Do not edit them by hand — re-run the script.
   REL = "https://github.com/Heniokhos-Systems/MLRift/releases/download/v#{version}".freeze
   RAW = "https://raw.githubusercontent.com/Heniokhos-Systems/MLRift/v#{version}".freeze
 
