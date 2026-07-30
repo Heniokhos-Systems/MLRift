@@ -5035,7 +5035,7 @@ echo ""
 echo "--- esp32 import failure aborts (exit code, not just error text) ---"
 ESP_IMP_SRC="/tmp/mlrc_esp32_import_fail_src_$$.mlr"
 ESP_IMP_BIN="/tmp/mlrc_esp32_import_fail_bin_$$.bin"
-printf 'import "std/esp32_clk.mlr"\nfn main() { loop { } }\n' > "$ESP_IMP_SRC"
+printf 'import "std/__import_failure_regression_nonexistent.mlr"\nfn main() { loop { } }\n' > "$ESP_IMP_SRC"
 rm -f "$ESP_IMP_BIN"
 $MLRC --arch=xtensa --freestanding --target=esp32 "$ESP_IMP_SRC" -o "$ESP_IMP_BIN" >/dev/null 2>&1
 ESP_IMP_EXIT=$?
