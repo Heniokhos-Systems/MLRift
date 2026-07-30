@@ -7,6 +7,20 @@ static u32[1] c1_done
 static u32[1] c0_retries
 static u32[1] c1_retries
 
+// Phase C: a deliberate correctness PROBE, not a benchmark. Separate word
+// and separate counters from phase A/B so the honest performance figures
+// above are never touched by this. Phase A/B never observed a single failed
+// CAS on this board (see the fix-round report), meaning the CAS failure
+// path itself — materialise 0, fall through, re-read, retry — has never
+// actually executed on this silicon. Widening core 1's window between its
+// vload32 and its atomic_cas deterministically (not randomly, so the run
+// stays reproducible) forces that path to run.
+static u32[1] shared_p
+static u32[1] c0_ready_p
+static u32[1] c1_done_p
+static u32[1] c0_retries_p
+static u32[1] c1_retries_p
+
 // `retry_ctr` is a static u32[1]'s address, passed the same way
 // std/nn_int8.mlr's nn_store_i32(u32 p, ...) takes one: the array name
 // decays to its address as a plain u32.
@@ -26,10 +40,44 @@ fn bump(u32 n, u32 retry_ctr) {
     }
 }
 
+// Plain counted busy-wait — no CCOUNT read, deliberately cheap, used only to
+// widen the collision window a fixed, reproducible amount. Not a benchmark
+// primitive.
+fn spin(u32 n) {
+    u32 i = 0
+    while i < n {
+        i = i + 1
+    }
+}
+
+// Same shape as bump(), but operates on shared_p and can widen the window
+// between the read and the CAS by `delay` spin iterations. `delay` is 0 for
+// core 0 and a fixed nonzero constant for core 1 only — deterministic, not
+// randomised, so the probe stays reproducible run to run.
+fn bump_p(u32 n, u32 retry_ctr, u32 delay) {
+    u32 i = 0
+    while i < n {
+        loop {
+            u32 cur = vload32(shared_p)
+            if delay != 0 { spin(delay) }
+            if atomic_cas(shared_p, cur, cur + 1) != 0 { break }
+            vstore32(retry_ctr, vload32(retry_ctr) + 1)
+        }
+        i = i + 1
+    }
+}
+
 fn core1_entry() {
     EspSmpDport.appcpu_ctrl_d = 0
     bump(10000, c1_retries)
     vstore32(c1_done, 1)
+    // Phase C: wait for core 0 to zero the phase-C state before touching
+    // shared_p — same "core 0 zeroes before core 1 reads" discipline as the
+    // top-level shared/c1_done, just enforced with an explicit handshake
+    // flag here because core 1 is already running by this point.
+    loop { if vload32(c0_ready_p) != 0 { break } }
+    bump_p(2000, c1_retries_p, 300)
+    vstore32(c1_done_p, 1)
     loop { }
 }
 
@@ -39,6 +87,14 @@ fn main() {
     vstore32(c1_done, 0)
     vstore32(c0_retries, 0)
     vstore32(c1_retries, 0)
+    // Phase C state, zeroed here too (before core 1 is released) even
+    // though core 1 does not read shared_p/c1_done_p until well after phase
+    // B — same "never rely on .bss" discipline as the rest of this file.
+    vstore32(shared_p, 0)
+    vstore32(c0_ready_p, 0)
+    vstore32(c1_done_p, 0)
+    vstore32(c0_retries_p, 0)
+    vstore32(c1_retries_p, 0)
 
     // Phase A: uncontended baseline. Core 1 is still held in reset/stall
     // (esp32_appcpu_start has not been called yet), so this is the same
@@ -66,6 +122,18 @@ fn main() {
 
     loop { if vload32(c1_done) != 0 { break } }
 
+    // Phase C: correctness PROBE, not a benchmark — see the comment on the
+    // phase-C statics above. shared_p/c1_done_p/etc. were already zeroed at
+    // the top of main(), before core 1 was ever released, so it is safe to
+    // signal readiness now without a fresh zero here. Core 0 runs bump_p
+    // with delay=0 (unwidened); core 1, released back in core1_entry after
+    // it finishes phase B, runs with a fixed 300-iteration spin between its
+    // vload32 and its atomic_cas, deterministically forcing the CAS failure
+    // path to execute at least once.
+    vstore32(c0_ready_p, 1)
+    bump_p(2000, c0_retries_p, 0)
+    loop { if vload32(c1_done_p) != 0 { break } }
+
     loop {
         puts("PHASE_A_CCOUNT ") puthex32(delta_a)
         puts(" PHASE_B_CCOUNT ") puthex32(delta_b)
@@ -74,6 +142,11 @@ fn main() {
         puts(" EXPECT 00004E20\r\n")
         puts("C0_RETRIES ") puthex32(vload32(c0_retries))
         puts(" C1_RETRIES ") puthex32(vload32(c1_retries))
+        puts("\r\n")
+        puts("PROBE_TOTAL ") puthex32(vload32(shared_p))
+        puts(" PROBE_EXPECT 00000FA0\r\n")
+        puts("PROBE_C0_RETRIES ") puthex32(vload32(c0_retries_p))
+        puts(" PROBE_C1_RETRIES ") puthex32(vload32(c1_retries_p))
         puts("\r\n")
         delay()
     }
