@@ -66,15 +66,13 @@ class Mlrift < Formula
 
     # Standard library, installed under Homebrew's prefix (share/mlrift).
     #
-    # KNOWN BUG: as of v1.1.0, mlrc's Linux/macOS stdlib search paths are
-    # still hardcoded in src/main.mlr to /usr/local/share/kernrift/,
-    # /usr/share/kernrift/ and $HOME/.local/share/kernrift/ -- a leftover
-    # from the KernRift fork that was never renamed to mlrift, and there is
-    # no MLR_STDLIB override. share/mlrift is therefore NOT currently on
-    # mlrc's search path; `import "std/..."` will not resolve until that is
-    # fixed upstream. Installing here anyway to match install.sh's (also
-    # currently broken) convention, so the fix is a one-line rename away
-    # from making every packaging channel work at once.
+    # mlrc searches /usr/local/share/mlrift/, /usr/share/mlrift/,
+    # $HOME/.local/share/mlrift/ and both Homebrew prefixes
+    # (/opt/homebrew/share/mlrift/ on Apple Silicon,
+    # /home/linuxbrew/.linuxbrew/share/mlrift/ on Linux), so share/mlrift is
+    # on the search path for every Homebrew layout. Those paths said
+    # "kernrift" until v1.1.0 — a leftover from the fork that meant no
+    # OS-level install could resolve `import "std/..."` at all.
     std = share/"mlrift/std"
     std.mkpath
     %w[
@@ -87,10 +85,11 @@ class Mlrift < Formula
 
   test do
     # Importing a stdlib module is the real test: it only compiles if the
-    # formula installed std/ where mlrc searches. NOTE: given the known bug
-    # above, this test will currently FAIL against share/mlrift until the
-    # search-path rename lands in src/main.mlr — kept as the target-state
-    # test so it starts passing the moment that fix ships.
+    # formula installed std/ somewhere mlrc actually searches. It is also
+    # load-bearing as a regression test — the search paths said "kernrift"
+    # until v1.1.0, and a failed import used to emit a binary and exit 0
+    # rather than failing, so this assertion would have passed while the
+    # stdlib was entirely unreachable.
     (testpath/"t.mlr").write <<~MLR
       import "std/io.mlr"
       fn main() -> uint64 {
