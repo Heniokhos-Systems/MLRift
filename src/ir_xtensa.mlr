@@ -108,11 +108,14 @@ static uint64 XT_ESP32_STACK_TOP = 0x3FFE0000
 // xt_esp32_check_layout.
 static uint64 XT_ESP32_MIN_STACK = 8192
 
-// Core 1's initial SP. Four bytes BELOW 0x3FFDF000, not equal to it, so the
-// word at 0x3FFDF000 is written by neither core in normal operation and can
-// serve as a core-0 overflow guard. Core 1's frames therefore occupy
-// (0x3FFDE000, 0x3FFDEFFC].
-static uint64 XT_ESP32_CORE1_STACK = 0x3FFDEFFC
+// Core 1's initial SP. 16 bytes BELOW 0x3FFDF000 (not 4, which would land on
+// 0x3FFDEFFC ≡ 12 mod 16 and permanently violate the 16-byte frame alignment
+// total_frame maintains everywhere else in this backend — benign today only
+// because WOE=0 and nothing on this path needs >4-byte alignment), so the
+// word at 0x3FFDF000 is still written by neither core in normal operation
+// and still serves as a core-0 overflow guard. Core 1's frames therefore
+// occupy (0x3FFDE000, 0x3FFDEFF0].
+static uint64 XT_ESP32_CORE1_STACK = 0x3FFDEFF0
 
 // --- ESP32 model/blob segment (--model <file>) ------------------------------
 // `--model <file>` appends the file's bytes to the esp-image as an EXTRA RAM
@@ -179,6 +182,13 @@ static uint64 XT_ESP32_PS = 0x2F
 // is known: the park sits in the preamble, ahead of every relaxable branch,
 // so its offset never shifts (same stability argument as the .bss l32r's).
 static uint64 xt_esp32_park_pool_off = 0
+
+// Same idea, core-1 side (Important finding 1): core1_entry's own park
+// address word, reserved in core1_entry's pre-scan and patched at
+// xt_emit_core1_preamble-emit time. Separate slot from
+// xt_esp32_park_pool_off because it lives in a different function's pool
+// (core1_entry's own literal pool, not the entry fn's).
+static uint64 xt_esp32_core1_park_pool_off = 0
 
 fn xt_err(uint64 msg) {
     write(2, msg, str_len(msg))
@@ -1456,6 +1466,27 @@ fn xt_emit_core1_preamble() {
     xt_rsync()
     uint64 slot = xt_lit_intern(XT_ESP32_CORE1_STACK)   // deduped: pre-scan's slot
     xt_l32r(XT_SP, xt_lit_base + slot * 4)
+    // Core-1 return safety net (Important finding 1) — mirrors the core-0
+    // park at the tail of xt_emit_raw_sp_preamble (see xt_esp32_park_pool_off)
+    // for exactly the same reason: a0 at core-1 hand-off holds ROM garbage
+    // (core 1's mask-ROM boot stub used it before jumping here — there is no
+    // "undefined at reset" guarantee to lean on the way core 0's has), so a
+    // core1_entry that falls off its end would `ret.n` into that garbage and
+    // decode whatever follows as an instruction. On ESP32 that is an
+    // illegal-instruction exception, which resets the WHOLE CHIP (both
+    // cores) and reboot-loops indistinguishably from a watchdog failure —
+    // the exact undiagnosable failure the core-0 park exists to prevent.
+    // Preset a0 = &park so a returning core1_entry instead falls into a
+    // genuine self-branch, a visible hang. The prologue immediately
+    // frame-saves a0, so a normal (non-recursive) core1_entry parks on
+    // return; @naked is rejected at the call site below for the same
+    // reason it is rejected for the main entry.
+    xt_l32r(XT_A0, xt_esp32_core1_park_pool_off)  // a0 = &park (pool, patched below)
+    uint64 c1_skip_site = out_len
+    xt_j(c1_skip_site + 6)                         // j past the 3-byte park
+    uint64 c1_park_off = out_len
+    xt_j(c1_park_off)                              // park: j park  (self-branch)
+    patch_u32(xt_esp32_core1_park_pool_off, XT_ESP32_IRAM_BASE + c1_park_off)
 }
 
 // --- Offset-remap after relaxation (rv_c_remap analog) ------------------
@@ -2967,6 +2998,7 @@ fn ir_xtensa_gen(uint64 fn_node, uint64 xt_entry_node) {
     uint64 xt_bss_lo_slot = 0
     uint64 xt_bss_hi_slot = 0
     uint64 xt_esp32_park_slot = 0
+    uint64 xt_esp32_core1_park_slot = 0
     if fn_node == xt_entry_node {
         xt_bss_lo_slot = xt_lit_reserve()
         xt_bss_hi_slot = xt_lit_reserve()
@@ -2977,6 +3009,13 @@ fn ir_xtensa_gen(uint64 fn_node, uint64 xt_entry_node) {
         if xt_esp32_target != 0 {
             xt_esp32_park_slot = xt_lit_reserve()
         }
+    }
+    // Core-1 park-address word (Important finding 1): same reservation rule
+    // as the entry fn's park slot above — reserved (never interned), tail of
+    // core1_entry's OWN pool (this is a different function, and thus a
+    // different pool, from the entry fn above).
+    if xt_esp32_target != 0 && tok_matches(ast_data1(fn_node), "core1_entry", 11) != 0 {
+        xt_esp32_core1_park_slot = xt_lit_reserve()
     }
     // CALL0 targets — and thus every function's code_start (= e_entry / the
     // call destination) — must be 4-byte aligned: the LX6 computes the target
@@ -2996,6 +3035,9 @@ fn ir_xtensa_gen(uint64 fn_node, uint64 xt_entry_node) {
         if xt_esp32_target != 0 {
             xt_esp32_park_pool_off = xt_lit_base + xt_esp32_park_slot * 4
         }
+    }
+    if xt_esp32_target != 0 && tok_matches(ast_data1(fn_node), "core1_entry", 11) != 0 {
+        xt_esp32_core1_park_pool_off = xt_lit_base + xt_esp32_core1_park_slot * 4
     }
 
     // 6a. Self-register at code_start (past the pool) so find_main_offset /
@@ -3039,7 +3081,17 @@ fn ir_xtensa_gen(uint64 fn_node, uint64 xt_entry_node) {
     //     frame; if it got the preamble in place of the prologue, a0 would
     //     never be saved and the first call0 in its body would destroy the
     //     return address.
+    //
+    // ⚠️ Same @naked hazard as the main entry (Important finding 1): the
+    // core-1 preamble parks a0 on a self-branch so a returning core1_entry
+    // hangs visibly instead of rebooting BOTH cores in a loop indistinguishable
+    // from a watchdog failure, and @naked skips the prologue that saves a0, so
+    // the first call0 in the body would destroy the park address. Reject the
+    // combination outright, same as the entry fn does.
     if xt_esp32_target != 0 && tok_matches(fn_name_tok, "core1_entry", 11) != 0 {
+        if is_naked != 0 {
+            xt_err("error: xtensa/esp32: core1_entry may not be @naked — the core-1 preamble parks a0 on a self-branch so a returning core1_entry hangs visibly instead of rebooting both cores in a loop that mimics a watchdog failure, and @naked skips the prologue that saves a0, so the first call0 destroys it. Drop @naked from core1_entry.\n")
+        }
         xt_emit_core1_preamble()
     }
 
@@ -3528,6 +3580,6 @@ fn xt_esp32_check_layout(uint64 code_len, uint64 data_memsz, uint64 entry_off) {
     // bytes. That is silent data corruption on a board with no debugger: the
     // exact failure class this target's guards exist to make impossible.
     if xt_esp32_data_base + data_memsz + XT_ESP32_MIN_STACK > XT_ESP32_DRAM_LIMIT {
-        xt_err("error: xtensa/esp32: data+bss leave less than 4 KiB below the initial stack pointer 0x3FFE0000 — the entry prologue's frame push would overwrite the tail of .bss after the zero loop has run (silent corruption). Shrink the statics, or move the bulk of them into a runtime-allocated region.\n")
+        xt_err("error: xtensa/esp32: data+bss leave less than 8 KiB below the initial stack pointer 0x3FFE0000 — the entry prologue's frame push would overwrite the tail of .bss after the zero loop has run (silent corruption). Shrink the statics, or move the bulk of them into a runtime-allocated region.\n")
     }
 }

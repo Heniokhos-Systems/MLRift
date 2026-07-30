@@ -4283,7 +4283,9 @@ rm -f "$ESP_MDL_BIN" "$ESP_MDL_BLOB" "$ESP_MDL_OUT"
 #   (b) resolve_addr_fixups_xtensa_esp32, per-datum, "falls outside the DRAM
 #       window";
 #   (c) xt_esp32_check_layout, whole-segment, "data+bss exceed the DRAM
-#       window" / "less than 4 KiB below the initial stack pointer".
+#       window" / "less than 8 KiB below the initial stack pointer" (the
+#       floor is XT_ESP32_MIN_STACK = 8192; the error text used to say 4 KiB,
+#       fixed as Minor finding 4 in the final review).
 esp_guard_expect() {
     # $1 = case label, $2 = expected error substring, $3 = source file
     rm -f "$ESP_G_BIN"
@@ -4349,12 +4351,12 @@ ESP_G_EOF
 esp_guard_expect "200 KiB array spanning past the window (base in-window)" \
     "data+bss exceed the DRAM window" "$ESP_G_SRC"
 # (c2) 189.8 KiB array: FITS the raw DRAM window (0x2F6E0 < 0x30000) but
-# leaves under 4 KiB below the initial SP. The stack grows DOWN from
-# 0x3FFE0000, which is the same address the window ends at, so the entry
-# prologue's first `s32i a0, a1, N-4` writes the saved return address on top
-# of the .bss tail — AFTER the zero loop has run, so nothing restores it.
-# Without XT_ESP32_MIN_STACK this program compiles clean and corrupts itself
-# on real silicon.
+# leaves under 8 KiB (XT_ESP32_MIN_STACK) below the initial SP. The stack
+# grows DOWN from 0x3FFE0000, which is the same address the window ends at,
+# so the entry prologue's first `s32i a0, a1, N-4` writes the saved return
+# address on top of the .bss tail — AFTER the zero loop has run, so nothing
+# restores it. Without XT_ESP32_MIN_STACK this program compiles clean and
+# corrupts itself on real silicon.
 cat > "$ESP_G_SRC" <<'ESP_G_EOF'
 static u32[48600] big
 
@@ -4364,7 +4366,7 @@ fn main() {
 }
 ESP_G_EOF
 esp_guard_expect "190 KiB statics (fits the window, starves the stack)" \
-    "less than 4 KiB below the initial stack pointer" "$ESP_G_SRC"
+    "less than 8 KiB below the initial stack pointer" "$ESP_G_SRC"
 # (a) THE IRAM BYTE-ACCESS GUARD — the whole justification for splitting code
 # and data across two load addresses. IRAM services only aligned 32-bit
 # accesses, so an l8ui (which is how every string read, strlen and memcpy
@@ -5006,6 +5008,35 @@ else
 fi
 rm -rf "$TWAI_DIR"
 
+# --- esp32 dual-core / atomic-CAS build gate ---
+# Important finding 2 (final review): esp32_krc_identity above only builds
+# the fixed hello/minimal/twai_loopback set, so none of this branch's
+# xtensa-specific work — op-93 (atomic CAS) emission, the core1_entry
+# preamble/predicate, the 6c dispatch, or the "../../std/" import convention
+# these three sources use — was ever compiled by either test suite. This does
+# not need hardware: compile-only, assert exit 0 and that an esp-image with
+# the correct magic byte was produced.
+echo ""
+echo "--- esp32 dual-core / atomic-CAS build gate ---"
+for ESP_DC_SRC in tests/esp32/cas_single.mlr tests/esp32/cas_contended.mlr examples/esp32/dualcore_hello.mlr; do
+    ESP_DC_NAME=$(basename "$ESP_DC_SRC" .mlr)
+    ESP_DC_BIN="/tmp/mlrc_esp32_dc_${ESP_DC_NAME}_$$.bin"
+    rm -f "$ESP_DC_BIN"
+    TOTAL=$((TOTAL + 1))
+    if $MLRC --arch=xtensa --freestanding --target=esp32 "$DIR/../$ESP_DC_SRC" \
+         -o "$ESP_DC_BIN" >/dev/null 2>&1 \
+       && [ -s "$ESP_DC_BIN" ] \
+       && [ "$(od -An -tu1 -N1 "$ESP_DC_BIN" | tr -d ' ')" = "233" ]; then
+        PASS=$((PASS + 1))
+        echo "  esp32_dualcore_build[$ESP_DC_NAME]: PASS ($(wc -c < "$ESP_DC_BIN" | tr -d ' ')B image)"
+    else
+        FAIL=$((FAIL + 1))
+        echo "FAIL: esp32_dualcore_build[$ESP_DC_NAME] (build failed or no valid esp-image produced)"
+        $MLRC --arch=xtensa --freestanding --target=esp32 "$DIR/../$ESP_DC_SRC" -o "$ESP_DC_BIN" 2>&1 | head -3
+    fi
+    rm -f "$ESP_DC_BIN"
+done
+
 # --- esp32 image byte-identity vs the KernRift reference compiler ---
 # MLRift's xtensa/esp32 backend is a near-verbatim graft of KernRift's, and the
 # bar the plain-xtensa port met was 17/17 byte-identical images. Hold the same
@@ -5076,6 +5107,34 @@ else
     FAIL=$((FAIL + 1))
 fi
 rm -f "$ESP_IMP_SRC" "$ESP_IMP_BIN"
+
+# --- esp32 import-free build: positive control for the test above ---
+# Minor finding 7 (final review): esp32_import_failure_aborts above asserts
+# exit 1 + no file, but never proves the esp32 path can exit 0 + write a file
+# AT ALL. If the esp32 build path ever starts exiting 1 for some unrelated
+# reason (e.g. a bug in a completely different check), the test above would
+# keep passing vacuously -- even with the import_failed guard deleted
+# entirely. Pair it with the same-shape build MINUS the bad import, asserting
+# the opposite: exit 0 and a file present.
+echo ""
+echo "--- esp32 import-free build succeeds (positive control) ---"
+ESP_IMP_OK_SRC="/tmp/mlrc_esp32_import_ok_src_$$.mlr"
+ESP_IMP_OK_BIN="/tmp/mlrc_esp32_import_ok_bin_$$.bin"
+printf 'fn main() { loop { } }\n' > "$ESP_IMP_OK_SRC"
+rm -f "$ESP_IMP_OK_BIN"
+$MLRC --arch=xtensa --freestanding --target=esp32 "$ESP_IMP_OK_SRC" -o "$ESP_IMP_OK_BIN" >/dev/null 2>&1
+ESP_IMP_OK_EXIT=$?
+TOTAL=$((TOTAL + 1))
+if [ "$ESP_IMP_OK_EXIT" = 0 ] && [ -e "$ESP_IMP_OK_BIN" ] && [ -s "$ESP_IMP_OK_BIN" ]; then
+    PASS=$((PASS + 1))
+    echo "  esp32_import_free_build_ok: PASS (exit=0, $(wc -c < "$ESP_IMP_OK_BIN" | tr -d ' ')B image written)"
+else
+    ESP_IMP_OK_HAVE_FILE="no"
+    [ -e "$ESP_IMP_OK_BIN" ] && ESP_IMP_OK_HAVE_FILE="yes"
+    echo "FAIL: esp32_import_free_build_ok (expected exit 0 and an output file, got exit=$ESP_IMP_OK_EXIT, file written=$ESP_IMP_OK_HAVE_FILE)"
+    FAIL=$((FAIL + 1))
+fi
+rm -f "$ESP_IMP_OK_SRC" "$ESP_IMP_OK_BIN"
 
 # ---------------------------------------------------------------------------
 # int8 quantized NN kernels (std/nn_int8.mlr)
