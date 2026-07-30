@@ -1429,6 +1429,28 @@ fn xt_emit_raw_sp_preamble() {
     }
 }
 
+// Core-1 (APP_CPU) SP preamble. Deliberately NOT xt_emit_raw_sp_preamble:
+//   - no WDT disable: core 0 already did it, and the WDT registers are global
+//   - no .bss zeroing: core 0's live globals are in .bss; zeroing from core 1
+//     would wipe them mid-run
+//   - a different stack: XT_ESP32_CORE1_STACK, just below core 0's
+// PS is pinned to the SAME value core 0 uses (XT_ESP32_PS = 0x2F). No
+// WindowBase/WindowStart/VECBASE writes: the backend is CALL0-only (WOE=0),
+// so window state is never consulted; writing WINDOWBASE here would remap
+// which physical AR `a1` names and throw the stack pointer away, and writing
+// VECBASE would move the exception vectors away from the ROM's, turning every
+// fault into an unrecoverable jump into unmapped space.
+//
+// Like the core-0 preamble this records NO pool fixup: it sits at code_start
+// for its function, ahead of every branch, so relaxation never shifts it.
+fn xt_emit_core1_preamble() {
+    xt_movi(XT_A8, XT_ESP32_PS)
+    xt_wsr(XT_SR_PS, XT_A8)
+    xt_rsync()
+    uint64 slot = xt_lit_intern(XT_ESP32_CORE1_STACK)   // deduped: pre-scan's slot
+    xt_l32r(XT_SP, xt_lit_base + slot * 4)
+}
+
 // --- Offset-remap after relaxation (rv_c_remap analog) ------------------
 // The relaxed set is the ascending list of ORIGINAL patch offsets of the
 // conditional branches chosen for `Binv; J` rewriting. Each inserts 3 bytes
@@ -2856,6 +2878,13 @@ fn ir_xtensa_gen(uint64 fn_node, uint64 xt_entry_node) {
             xt_lit_intern(XT_ESP32_MWDT1_CFG0)
         }
     }
+    // Core-1 entry (Task 3): same rule as XT_STACK_TOP above — the SP literal
+    // must be interned here, before the flush, so the l32r in
+    // xt_emit_core1_preamble has a backing pool word. That emitter re-interns
+    // (deduped) to recover this exact slot.
+    if xt_esp32_target != 0 && tok_matches(ast_data1(fn_node), "core1_entry", 11) != 0 {
+        xt_lit_intern(XT_ESP32_CORE1_STACK)
+    }
     // PIC address sites (H1/M1): capture the first PIC slot, then walk the IR
     // AGAIN in the SAME block/insn order reserving ONE non-deduped pool word per
     // STR_CONST site (contiguous, so site k -> slot xt_pic_base + k). Emission
@@ -2956,6 +2985,16 @@ fn ir_xtensa_gen(uint64 fn_node, uint64 xt_entry_node) {
             xt_err("error: xtensa/esp32: the entry function may not be @naked — the entry preamble parks a0 on a self-branch so a returning entry hangs visibly instead of rebooting in a loop, and @naked skips the prologue that saves a0, so the first call0 destroys it. Drop @naked from the entry function.\n")
         }
         xt_emit_raw_sp_preamble()
+    }
+
+    // 6c. Core-1 entry preamble (Task 3): same placement rule as 6b — before
+    //     the prologue, in ADDITION to it (never instead of it). core1_entry
+    //     is an ordinary function that calls other functions and needs a real
+    //     frame; if it got the preamble in place of the prologue, a0 would
+    //     never be saved and the first call0 in its body would destroy the
+    //     return address.
+    if xt_esp32_target != 0 && tok_matches(fn_name_tok, "core1_entry", 11) != 0 {
+        xt_emit_core1_preamble()
     }
 
     // 7. Prologue (skip for @naked). CALL0: lower SP, save a0 (return addr)
