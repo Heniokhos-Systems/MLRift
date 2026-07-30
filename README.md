@@ -1,17 +1,17 @@
-# MLRift — v1.0.0
+# MLRift — v1.1.0
 
 A self-hosted systems language and compiler for machine-learning
-workloads. Forked from [KernRift](https://github.com/Pantelis23/KernRift)
+workloads. Forked from [KernRift](https://github.com/Heniokhos-Systems/KernRift)
 at commit `6cf758b` (v2.8.15); MLRift extends the IR backend with
 ML-specific primitives (tensors, event streams, continuous-time
 dynamics, sparse CSR ops, plasticity rules) and ships a native
 AMDGCN GPU emitter that talks to `/dev/kfd` directly with zero ROCm
 DSO dependencies on Linux.
 
-**v1.0.0 highlights**
+**v1.1.0 highlights**
 
 - Self-hosted (`build/mlrc` is built from `src/*.mlr` by `build/mlrc`).
-- 439/439 tests pass, self-host fixed point holds.
+- 487/487 tests pass, self-host fixed point holds.
 - 8-target fat binary (`.mlrbo`) — Linux/macOS/Windows/Android × x86_64/arm64.
 - Native AMDGCN backend for gfx1100 + gfx1030; 31 LLM kernels reachable.
 - Four-platform benchmark report — see `benchmarks/BENCHMARKS.md`
@@ -19,10 +19,55 @@ DSO dependencies on Linux.
 
 ## Install
 
-One-line installers pull the right `mlrc` (compiler) + `mlr` (runner) for
-your platform from the latest [GitHub release](https://github.com/Heniokhos-Systems/MLRift/releases/latest)
+Prebuilt binaries for Linux, macOS, Windows and Android, on x86_64 and
+ARM64. Every package ships `mlrc` (compiler), `mlr` (fat-binary runner)
+and the standard library — no Python, no LLVM, no toolchain
+prerequisites.
+
+### Package managers
+
+**Debian / Ubuntu** — signed APT repository, amd64 and arm64:
+
+```sh
+curl -fsSL https://apt.mlrift.org/mlrift-repo-public.asc \
+  | sudo gpg --dearmor -o /usr/share/keyrings/mlrift-archive-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/mlrift-archive-keyring.gpg] https://apt.mlrift.org ./" \
+  | sudo tee /etc/apt/sources.list.d/mlrift.list
+sudo apt update && sudo apt install mlrift
+```
+
+**macOS (Apple Silicon + Intel) and Linux** — Homebrew:
+
+```sh
+brew install heniokhos-systems/mlrift/mlrift
+```
+
+**Arch Linux and derivatives** — AUR:
+
+```sh
+yay -S mlrift
+```
+
+**Windows** — winget or Scoop:
+
+```powershell
+winget install Pantelis23.MLRift
+
+scoop bucket add mlrift https://github.com/Heniokhos-Systems/MLRift
+scoop install mlrift
+```
+
+These install to system paths (`/usr/bin/mlrc`, stdlib at
+`/usr/share/mlrift/std`, or the Homebrew prefix). `mlrc` searches all of
+them, plus both Homebrew prefixes and `$HOME/.local/share/mlrift/`.
+
+### One-line installers
+
+These pull the right binaries from the latest
+[GitHub release](https://github.com/Heniokhos-Systems/MLRift/releases/latest)
 and copy every `std/*.mlr` module from `main` into your local standard
-library — no Python, no LLVM, no toolchain prerequisites.
+library. Use these on Android, or when you want a per-user install with
+no root.
 
 **Linux / macOS / Android (adb or Termux)**
 
@@ -36,7 +81,7 @@ curl -sSf https://raw.githubusercontent.com/Heniokhos-Systems/MLRift/main/instal
 irm https://raw.githubusercontent.com/Heniokhos-Systems/MLRift/main/install.ps1 | iex
 ```
 
-What lands on disk:
+What the one-line installers land on disk:
 
 | File | Path |
 |---|---|
@@ -398,7 +443,7 @@ mlrc --version
 
 ## Lineage — forked from KernRift
 
-MLRift began as a soft fork of [KernRift](https://github.com/Pantelis23/KernRift)
+MLRift began as a soft fork of [KernRift](https://github.com/Heniokhos-Systems/KernRift)
 at v2.8.15 and shares its type system, IR-level optimization pipeline, and the
 host code generators for x86_64 + ARM64 across Linux / macOS / Windows /
 Android. MLRift-specific work lives in added passes, added IR ops, the AMDGCN
