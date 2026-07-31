@@ -32,6 +32,26 @@
 
 import "../../std/nn_int8.mlr"
 
+// Every buffer here is a fixed-size static and the statics are laid out back to
+// back, so an oversized configuration does not fault — it walks quietly into the
+// next one. The bias/mult/shift trio is the dangerous case, because what sits
+// immediately after it is this program's own bookkeeping:
+//
+//   nn_se_bias | nn_se_mult | nn_se_shift | nn_se_cbuf | nn_se_seed |
+//   nn_se_fails | nn_se_checks
+//
+// A future case with out_c > NN_SE_QUANT (YuNet-class layers are 16/32/64, so
+// this ceiling is TIGHT) would run nn_se_fill_quant off the end of nn_se_shift,
+// through nn_se_cbuf, and straight into nn_se_fails and nn_se_checks — BEFORE a
+// single comparison had run. If the garbage that landed in nn_se_fails happened
+// to be zero, the program would exit 0 with an entirely plausible `checks=`
+// line: a silent false PASS in the one gate standing between a partitioning bug
+// and silicon. So every case declares its footprint up front via nn_se_need()
+// and dies loudly instead. Keep the declarations in step when adding cases.
+static u32 nn_se_cap   = 1024      // nn_se_in / in2 / wt / a / b
+static u32 nn_se_quant = 16        // nn_se_bias / mult / shift, in elements
+static u32 nn_se_guard = 16        // trailing guard band inside nn_se_a/b
+
 static u8[1024] nn_se_in
 static u8[1024] nn_se_in2
 static u8[1024] nn_se_wt
@@ -86,7 +106,33 @@ fn nn_se_emit_u32(u32 v) {
     }
 }
 
-// Compare the two buffers over `n` bytes and report the first divergence.
+// Capacity assertion. `want` is what a case is about to write, `have` is what
+// the static actually holds. Overrunning a harness buffer here does not crash;
+// it silently rewrites the pass/fail counters (see the layout note above), so
+// this is a hard stop with its own exit code rather than a recorded failure —
+// the counters cannot be trusted once a buffer has been overrun.
+fn nn_se_need(u32 have, u32 want, u32 which) {
+    if want > have {
+        print_str("ERROR: harness buffer ")
+        nn_se_emit_u32(which)
+        print_str(" too small: need ")
+        nn_se_emit_u32(want)
+        print_str(", have ")
+        nn_se_emit_u32(have)
+        print_str(" -- widen the static in nn_split_equiv.mlr\n")
+        exit(3)
+    }
+}
+
+// Compare the two buffers over `n` bytes and report the first divergence, then
+// check the guard band in BOTH buffers.
+//
+// The guard exists because comparing only [0, n) catches a kernel that writes
+// too LITTLE but not one that writes too MUCH: an overrun past the end of the
+// output tensor shows up only indirectly, via the poison it failed to overwrite
+// somewhere else, and in Task 5/6 banding it would land in the next tensor
+// rather than in slack. Bytes [n, n + nn_se_guard) are poisoned by nn_se_poison
+// and must still be poison when the kernel is done.
 fn nn_se_cmp(u32 n, u32 k) {
     nn_se_checks = nn_se_checks + 1
     u32 a = nn_se_a
@@ -107,6 +153,34 @@ fn nn_se_cmp(u32 n, u32 k) {
             return
         }
         i = i + 1
+    }
+    u32 g = 0
+    while g < nn_se_guard {
+        i32 ga = load8(a + (n + g)) & 0xFF
+        i32 gb = load8(b + (n + g)) & 0xFF
+        if ga != 0x5A {
+            nn_se_fails = nn_se_fails + 1
+            print_str("  OVERRUN split k=")
+            nn_se_emit_u32(k)
+            print_str(": full range wrote ")
+            nn_se_emit_u32(ga)
+            print_str(" at guard byte ")
+            nn_se_emit_u32(n + g)
+            print_str("\n")
+            return
+        }
+        if gb != 0x5A {
+            nn_se_fails = nn_se_fails + 1
+            print_str("  OVERRUN split k=")
+            nn_se_emit_u32(k)
+            print_str(": split wrote ")
+            nn_se_emit_u32(gb)
+            print_str(" at guard byte ")
+            nn_se_emit_u32(n + g)
+            print_str("\n")
+            return
+        }
+        g = g + 1
     }
 }
 
@@ -142,9 +216,13 @@ fn nn_se_fill(u32 p, u32 n) {
 
 // Poison a buffer with a value the kernels are very unlikely to produce
 // everywhere, so "wrote nothing" cannot masquerade as "wrote the right thing".
+// The poison runs nn_se_guard bytes PAST the region the kernel owns; nn_se_cmp
+// asserts that tail survived, which is what turns "wrote too much" from an
+// indirect symptom into a direct one.
 fn nn_se_poison(u32 p, u32 n) {
     u32 i = 0
-    while i < n {
+    u32 lim = n + nn_se_guard
+    while i < lim {
         store8(p + i, 0x5A)
         i = i + 1
     }
@@ -154,7 +232,12 @@ fn nn_se_poison(u32 p, u32 n) {
 // values are irrelevant — both sides of every comparison use the same ones —
 // but they are drawn from the same ranges TFLite produces (a multiplier
 // normalised into [2^30, 2^31) and a negative shift) so the requantizer is
-// exercised on its real domain rather than on a degenerate identity.
+// exercised on its real domain rather than on a degenerate identity. The 30-bit
+// addend is what makes the multiplier span the FULL normalised interval and
+// stay a positive i32 (0x40000000 + 0x3FFFFFFF == 0x7FFFFFFF).
+//
+// The caller MUST have asserted n <= nn_se_quant first: nn_se_fails and
+// nn_se_checks sit a short way past nn_se_shift.
 fn nn_se_fill_quant(u32 n) {
     u32 bp = nn_se_bias
     u32 mp = nn_se_mult
@@ -163,7 +246,7 @@ fn nn_se_fill_quant(u32 n) {
     while i < n {
         i32 bx = nn_u32_to_i32(nn_se_r32())
         nn_store_i32(bp + (i * 4), bx >> 20)
-        u32 m = 0x40000000 + ((nn_se_r32() >> 3) & 0x1FFFFFFF)
+        u32 m = 0x40000000 + ((nn_se_r32() >> 2) & 0x3FFFFFFF)
         nn_store_i32(mp + (i * 4), nn_u32_to_i32(m))
         u32 svu = (nn_se_r32() >> 28) % 12
         i32 sv = svu
@@ -194,16 +277,24 @@ fn nn_se_conv2d(u32 in_h, u32 in_w, u32 in_c, u32 out_c,
     u32 bp = nn_se_bias
     u32 mp = nn_se_mult
     u32 sp = nn_se_shift
+
+    u32 out_h = nn_out_dim(in_h, kh, sh, ph)
+    u32 out_w = nn_out_dim(in_w, kw, sw, pw)
+    u32 obytes = (out_h * out_w) * out_c
+
+    // Declare the footprint before writing a single byte.
+    nn_se_need(nn_se_cap, (in_h * in_w) * in_c, 0)          // nn_se_in
+    nn_se_need(nn_se_cap, ((out_c * kh) * kw) * in_c, 1)    // nn_se_wt
+    nn_se_need(nn_se_cap, obytes + nn_se_guard, 2)          // nn_se_a
+    nn_se_need(nn_se_cap, obytes + nn_se_guard, 3)          // nn_se_b
+    nn_se_need(nn_se_quant, out_c, 4)                       // bias/mult/shift
+
     nn_se_fill(ip, (in_h * in_w) * in_c)
     nn_se_fill(wp, ((out_c * kh) * kw) * in_c)
     nn_se_fill_quant(out_c)
     i32 izp = 0 - 3
     i32 ozp = 11
     i32 lo = 0 - 128
-
-    u32 out_h = nn_out_dim(in_h, kh, sh, ph)
-    u32 out_w = nn_out_dim(in_w, kw, sw, pw)
-    u32 obytes = (out_h * out_w) * out_c
 
     nn_se_poison(a, obytes)
     nn_conv2d_int8(ip, in_h, in_w, in_c, izp, wp, kh, kw, bp, mp, sp, 1,
@@ -236,16 +327,23 @@ fn nn_se_dwconv(u32 in_h, u32 in_w, u32 in_c, u32 dm,
     u32 mp = nn_se_mult
     u32 sp = nn_se_shift
     u32 out_c = in_c * dm
+
+    u32 out_h = nn_out_dim(in_h, kh, sh, ph)
+    u32 out_w = nn_out_dim(in_w, kw, sw, pw)
+    u32 obytes = (out_h * out_w) * out_c
+
+    nn_se_need(nn_se_cap, (in_h * in_w) * in_c, 0)          // nn_se_in
+    nn_se_need(nn_se_cap, (kh * kw) * out_c, 1)             // nn_se_wt
+    nn_se_need(nn_se_cap, obytes + nn_se_guard, 2)          // nn_se_a
+    nn_se_need(nn_se_cap, obytes + nn_se_guard, 3)          // nn_se_b
+    nn_se_need(nn_se_quant, out_c, 4)                       // bias/mult/shift
+
     nn_se_fill(ip, (in_h * in_w) * in_c)
     nn_se_fill(wp, (kh * kw) * out_c)
     nn_se_fill_quant(out_c)
     i32 izp = 0 - 12
     i32 ozp = 0 - 2
     i32 lo = 0 - 128
-
-    u32 out_h = nn_out_dim(in_h, kh, sh, ph)
-    u32 out_w = nn_out_dim(in_w, kw, sw, pw)
-    u32 obytes = (out_h * out_w) * out_c
 
     nn_se_poison(a, obytes)
     nn_depthwise_conv2d_int8(ip, in_h, in_w, in_c, izp, wp, kh, kw, bp, mp, sp, 1,
@@ -271,10 +369,13 @@ fn nn_se_maxpool(u32 in_h, u32 in_w, u32 in_c,
     u32 ip = nn_se_in
     u32 a = nn_se_a
     u32 b = nn_se_b
-    nn_se_fill(ip, in_h * in_w * in_c)
     u32 out_h = nn_out_dim(in_h, kh, sh, ph)
     u32 out_w = nn_out_dim(in_w, kw, sw, pw)
     u32 obytes = (out_h * out_w) * in_c
+    nn_se_need(nn_se_cap, (in_h * in_w) * in_c, 0)
+    nn_se_need(nn_se_cap, obytes + nn_se_guard, 2)
+    nn_se_need(nn_se_cap, obytes + nn_se_guard, 3)
+    nn_se_fill(ip, (in_h * in_w) * in_c)
 
     nn_se_poison(a, obytes)
     nn_maxpool_int8(ip, in_h, in_w, in_c, a, kh, kw, sh, sw, ph, pw, 0 - 128, 127)
@@ -297,10 +398,13 @@ fn nn_se_avgpool(u32 in_h, u32 in_w, u32 in_c,
     u32 ip = nn_se_in
     u32 a = nn_se_a
     u32 b = nn_se_b
-    nn_se_fill(ip, in_h * in_w * in_c)
     u32 out_h = nn_out_dim(in_h, kh, sh, ph)
     u32 out_w = nn_out_dim(in_w, kw, sw, pw)
     u32 obytes = (out_h * out_w) * in_c
+    nn_se_need(nn_se_cap, (in_h * in_w) * in_c, 0)
+    nn_se_need(nn_se_cap, obytes + nn_se_guard, 2)
+    nn_se_need(nn_se_cap, obytes + nn_se_guard, 3)
+    nn_se_fill(ip, (in_h * in_w) * in_c)
 
     nn_se_poison(a, obytes)
     nn_avgpool_int8(ip, in_h, in_w, in_c, a, kh, kw, sh, sw, ph, pw, 0 - 128, 127)
@@ -322,10 +426,13 @@ fn nn_se_resize(u32 in_h, u32 in_w, u32 in_c, u32 scale_h, u32 scale_w) {
     u32 ip = nn_se_in
     u32 a = nn_se_a
     u32 b = nn_se_b
-    nn_se_fill(ip, in_h * in_w * in_c)
     u32 out_h = in_h * scale_h
     u32 out_w = in_w * scale_w
     u32 obytes = (out_h * out_w) * in_c
+    nn_se_need(nn_se_cap, (in_h * in_w) * in_c, 0)
+    nn_se_need(nn_se_cap, obytes + nn_se_guard, 2)
+    nn_se_need(nn_se_cap, obytes + nn_se_guard, 3)
+    nn_se_fill(ip, (in_h * in_w) * in_c)
 
     nn_se_poison(a, obytes)
     nn_resize_nearest_int8(ip, in_h, in_w, in_c, a, scale_h, scale_w)
@@ -350,10 +457,15 @@ fn nn_se_relu(u32 n) {
     u32 ip = nn_se_in
     u32 a = nn_se_a
     u32 b = nn_se_b
+    nn_se_need(nn_se_cap, n, 0)
+    nn_se_need(nn_se_cap, n + nn_se_guard, 2)
+    nn_se_need(nn_se_cap, n + nn_se_guard, 3)
     nn_se_fill(ip, n)
     i32 zp = 0 - 7
 
     // ReLU is in place, so each side needs its own fresh copy of the input.
+    // Poison first so the trailing guard band is armed on this side too.
+    nn_se_poison(a, n)
     nn_copy_i8(a, ip, n)
     nn_relu_int8(a, n, zp)
 
@@ -373,6 +485,9 @@ fn nn_se_copy(u32 n) {
     u32 ip = nn_se_in
     u32 a = nn_se_a
     u32 b = nn_se_b
+    nn_se_need(nn_se_cap, n, 0)
+    nn_se_need(nn_se_cap, n + nn_se_guard, 2)
+    nn_se_need(nn_se_cap, n + nn_se_guard, 3)
     nn_se_fill(ip, n)
 
     nn_se_poison(a, n)
@@ -394,6 +509,10 @@ fn nn_se_add(u32 n) {
     u32 ip2 = nn_se_in2
     u32 a = nn_se_a
     u32 b = nn_se_b
+    nn_se_need(nn_se_cap, n, 0)
+    nn_se_need(nn_se_cap, n + nn_se_guard, 2)
+    nn_se_need(nn_se_cap, n + nn_se_guard, 3)
+    nn_se_need(nn_se_cap, n, 5)
     nn_se_fill(ip, n)
     nn_se_fill(ip2, n)
     i32 azp = 0 - 3
@@ -428,6 +547,9 @@ fn nn_se_sigmoid(u32 n) {
     u32 a = nn_se_a
     u32 b = nn_se_b
     u32 lp = nn_se_lut
+    nn_se_need(nn_se_cap, n, 0)
+    nn_se_need(nn_se_cap, n + nn_se_guard, 2)
+    nn_se_need(nn_se_cap, n + nn_se_guard, 3)
     nn_se_fill(ip, n)
     // A non-trivial, non-identity table so a dropped element cannot coincide
     // with the value it replaced.
