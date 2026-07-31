@@ -157,27 +157,24 @@
 //
 // The four elementwise kernels above (RELU, ADD, SIGMOID_LUT, COPY) each have
 // an nn_<name>_range(..., start, count) sibling in nn_int8.mlr, bounded to
-// [start, start+count) over the same buffer. Dispatch here always uses the
-// full-range entry point; a later stage hands each core a disjoint half via
-// the _range variants directly, without going through nn_model_exec.
+// [start, start+count) over the same buffer. nn_model_exec() always uses the
+// full-range entry point; nn_model_exec_range() below is the banded twin that
+// hands one core a disjoint sub-range of the SAME layer.
 //
-// The SPATIAL kernels are partitioned the other way — on output rows. MAXPOOL,
-// AVGPOOL and RESIZE_NN each have an nn_<name>_rows(..., oy_lo, oy_hi) sibling
-// covering output rows [oy_lo, oy_hi); the original entry point is now a thin
-// forwarder calling rows(0, out_h). All three address their output absolutely
-// from `oy`, so a band writes into the whole tensor's `out_p` and the caller
-// must NOT pre-offset it.
+// The SPATIAL kernels are partitioned the other way — on output rows. All five
+// (CONV2D, DEPTHWISE, MAXPOOL, AVGPOOL, RESIZE_NN) have an
+// nn_<name>_rows(..., oy_lo, oy_hi) sibling covering output rows
+// [oy_lo, oy_hi); the original entry point is a thin forwarder calling
+// rows(0, out_h). Four of the five address their output absolutely from `oy`,
+// so a band writes into the whole tensor's `out_p` and the caller must NOT
+// pre-offset it; CONV2D is the exception and re-bases its own running pointer
+// internally, so its caller must not pre-offset it either. POINTWISE has no
+// _rows twin because it is a forwarder, not a kernel: band it by calling
+// nn_conv2d_int8_rows with kh = kw = stride = 1, pad = 0.
 //
-// CONV2D and DEPTHWISE do NOT yet have _rows siblings. The refactor itself is
-// straightforward — depthwise needs only its loop bounds changed, and conv2d
-// additionally re-bases its running output pointer to
-// out_p + oy_lo*out_w*out_c — but both take 21 parameters today and the two
-// extra bounds put the call at 23 arguments, one past the xtensa backend's
-// hard ceiling of 22 (6 register + 16 overflow slots, ir_xtensa.mlr:1885;
-// riscv32 reaches 24). Lifting that ceiling means changing XT_OVERFLOW_RESERVE
-// and the frame layout of every function on the backend, which is a compiler
-// change, not a library one. tests/nn/nn_split_equiv.mlr already covers the
-// three converted kernels and will cover these two unchanged once they land.
+// nn_model_exec_range() dispatches the ELEMENTWISE ops only. Row-banding the
+// spatial ops through the model runner is a separate change; nothing here
+// depends on it.
 // ===========================================================================
 
 import "nn_int8.mlr"
@@ -360,6 +357,98 @@ fn nn_model_exec(u32 r, u32 arena, u32 blob) {
                        load32(r + 48), load32(r + 52),
                        load32(r + 56), load32(r + 60),
                        act_min, act_max)
+        return
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Banded dispatch — the opt-in split list
+// ---------------------------------------------------------------------------
+
+// Is this op allowed to be split across cores? The answer defaults to NO and
+// each opcode has to be added deliberately, because a wrong answer here is a
+// data race, not a slowdown.
+//
+// The list is the four ELEMENTWISE ops: 4 RELU, 6 ADD, 8 SIGMOID_LUT, 9 COPY.
+// Each is a pure per-element map over one flat index space of n_elem bytes, so
+// two disjoint index ranges touch two disjoint sets of output bytes — which is
+// exactly the property tests/esp32/par_coherency.mlr proved this chip honours
+// for plain store8 from two cores.
+//
+// The spatial ops (1, 2, 3, 5, 7, 10) are NOT on the list even though their
+// kernels now have _rows variants: banding them needs a row split rather than
+// an element split, and the model runner has no policy for that yet.
+//
+// Op 0 (NOP) must never be on this list. It aliases its output onto its input
+// and does no work at all.
+fn nn_model_op_splittable(u32 op) -> u32 {
+    if op == 4 { return 1 }
+    if op == 6 { return 1 }
+    if op == 8 { return 1 }
+    if op == 9 { return 1 }
+    return 0
+}
+
+// Where to cut a splittable layer: the midpoint of its element count. Callers
+// give the low core [0, mid) and the high core [mid, n_elem). Both degenerate
+// cases are safe — n_elem 0 makes both bands empty, n_elem 1 makes the low band
+// empty — because nn_model_exec_range returns immediately when lo >= hi.
+fn nn_model_split_mid(u32 r) -> u32 {
+    return load32(r + 104) / 2
+}
+
+// Execute ONLY elements [lo, hi) of layer `r`. The union of a partition of
+// [0, n_elem) over any number of calls is byte-identical to one nn_model_exec()
+// of the same layer — that identity is swept exhaustively on the host by
+// tests/nn/nn_split_equiv.mlr, over both the kernels and this dispatcher.
+//
+// Contract:
+//   * `r` MUST be a layer whose op nn_model_op_splittable() accepts. Any other
+//     op is a no-op here rather than a partial execution, so a caller that gets
+//     the predicate wrong produces an obviously-empty output instead of a
+//     plausible-looking half-computed one.
+//   * The caller does NOT pre-offset any pointer. Every _range kernel indexes
+//     absolutely from the tensor base, exactly like its full-range twin.
+//   * Op 4 is in place whenever the memory planner could alias the output onto
+//     the input. When it could not, the copy is banded too — each core copies
+//     and then ReLUs its OWN range, so the two never touch the same byte. That
+//     assumes in0 and out are either identical or disjoint, which is what the
+//     planner emits; a partial overlap would already corrupt the single-core
+//     forward copy in nn_model_exec.
+fn nn_model_exec_range(u32 r, u32 arena, u32 blob, u32 lo, u32 hi) {
+    if lo >= hi { return }
+    u32 op = load32(r)
+    u32 in0 = arena + load32(r + 4)
+    u32 out = arena + load32(r + 12)
+    i32 in_zp = nn_load_i32(r + 88)
+    u32 n_elem = load32(r + 104)
+    u32 cnt = hi - lo
+
+    if op == 4 {
+        if in0 != out { nn_copy_i8_range(out, in0, n_elem, lo, cnt) }
+        nn_relu_int8_range(out, n_elem, in_zp, lo, cnt)
+        return
+    }
+    if op == 8 {
+        nn_sigmoid_lut_int8_range(in0, n_elem,
+                                  nn_model_blob_ptr(blob, load32(r + 140)),
+                                  out, lo, cnt)
+        return
+    }
+    if op == 9 {
+        nn_copy_i8_range(out, in0, n_elem, lo, cnt)
+        return
+    }
+    if op == 6 {
+        nn_add_int8_range(in0, in_zp, nn_load_i32(r + 112), nn_load_i32(r + 116),
+                          arena + load32(r + 8), nn_load_i32(r + 108),
+                          nn_load_i32(r + 120), nn_load_i32(r + 124),
+                          out, nn_load_i32(r + 92),
+                          nn_load_i32(r + 128), nn_load_i32(r + 132),
+                          n_elem, load32(r + 136),
+                          nn_load_i32(r + 96), nn_load_i32(r + 100),
+                          lo, cnt)
         return
     }
 }
