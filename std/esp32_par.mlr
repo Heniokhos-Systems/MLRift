@@ -1,0 +1,47 @@
+// ESP32 two-core synchronization: a sense-reversing barrier over S32C1I
+// (atomic_cas). This is the primitive Stage 4's parallel NN dispatch sits
+// on — every layer, split or not, has both cores call par_barrier() exactly
+// once so they cannot desynchronise by a round.
+//
+// Contract reminder (docs/UNDEFINED_BEHAVIOR.md): atomic_cas returns 1 if it
+// swapped, 0 if not — a boolean, not the old value. A retry loop must
+// re-read the current value with vload32 each iteration or it spins
+// forever.
+
+// `sense` alternates so consecutive barriers cannot alias — without it, a
+// fast core can race through barrier N+1 while the slow core is still
+// leaving barrier N.
+static u32[1] par_count
+static u32[1] par_sense
+
+// Explicitly zero the barrier state. Core 0's preamble zeroes .bss before
+// core 1 is released, and core1_entry deliberately does not re-zero
+// (ir_xtensa.mlr:1394-1414, :1459), so this happens to work without an
+// explicit init. But tests/esp32/cas_contended.mlr records the rule "never
+// rely on .bss" for exactly this class of cross-core state, and depending
+// on preamble ordering is a needless assumption in the one primitive
+// everything else rests on. Call this on core 0 BEFORE releasing core 1.
+fn par_init() {
+    vstore32(par_count, 0)
+    vstore32(par_sense, 0)
+}
+
+// Two-core sense-reversing barrier. Each core flips its own sense bit and
+// waits for the other. Hand-traced across three consecutive rounds for both
+// arrival orders during plan review: no deadlock, no aliasing between
+// rounds, and the retry loop correctly re-reads via vload32.
+fn par_barrier() {
+    u32 my_sense = vload32(par_sense) ^ 1
+    loop {
+        u32 cur = vload32(par_count)
+        if atomic_cas(par_count, cur, cur + 1) != 0 {
+            if cur + 1 == 2 {
+                vstore32(par_count, 0)
+                vstore32(par_sense, my_sense)
+                return
+            }
+            break
+        }
+    }
+    loop { if vload32(par_sense) == my_sense { return } }
+}

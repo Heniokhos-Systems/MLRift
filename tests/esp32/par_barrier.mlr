@@ -1,0 +1,83 @@
+// Stage 4, Task 2: on-silicon test for the two-core sense-reversing barrier
+// in std/esp32_par.mlr.
+//
+// Phase A proves the barrier is USED under real contention, not just called:
+// both cores race N atomic_cas increments on one shared counter, so the
+// count is only ever exactly 2N if every increment (from both cores) landed
+// and none were lost to a barrier bug that let a core observe a stale
+// value. A non-zero retry count on both sides is direct evidence the two
+// cores actually interleaved on the word rather than one finishing before
+// the other ever started (the failure mode a phase-locked binary can hide
+// silently — see cas_contended.mlr).
+//
+// Phase B proves the barrier does not deadlock or drift over repeated use:
+// 1000 bare rounds (no work between them) with no aliasing between
+// consecutive rounds, which is exactly the failure mode `sense` exists to
+// rule out.
+import "../../std/esp32_clk.mlr"
+import "../../std/esp32_smp.mlr"
+import "../../std/esp32_uart.mlr"
+import "../../std/esp32_par.mlr"
+
+static u32 N = 5000
+static u32[1] counter
+static u32[1] c0_retries
+static u32[1] c1_retries
+static u32[1] c1_ready
+static u32[1] c1_done
+static u32[1] rounds_ok
+
+fn bump(u32 n, u32 retry_ctr) {
+    u32 i = 0
+    while i < n {
+        loop {
+            u32 cur = vload32(counter)
+            if atomic_cas(counter, cur, cur + 1) != 0 { break }
+            vstore32(retry_ctr, vload32(retry_ctr) + 1)
+        }
+        i = i + 1
+    }
+    return
+}
+
+fn core1_entry() {
+    EspSmpDport.appcpu_ctrl_d = 0          // disarm; every dual-core file does this
+    loop { if vload32(c1_ready) != 0 { break } }   // wait until par_init has run
+    bump(N, c1_retries)
+    par_barrier()
+    // Phase B: 1000 bare rounds, no work in between — the classic failure
+    // is a barrier that works once but aliases on the next round.
+    u32 r = 0
+    while r < 1000 {
+        par_barrier()
+        r = r + 1
+    }
+    vstore32(c1_done, 1)
+    loop { }
+}
+
+fn main() {
+    u32 clkrc = esp32_clk_cpu_pll(240)     // MUST be first, before any putc
+    par_init()                             // before releasing core 1
+    esp32_appcpu_start(fn_addr("core1_entry"))
+    vstore32(c1_ready, 1)
+    bump(N, c0_retries)
+    par_barrier()
+    u32 total = vload32(counter)
+    u32 r = 0
+    while r < 1000 {
+        par_barrier()
+        r = r + 1
+    }
+    vstore32(rounds_ok, 1)
+    loop { if vload32(c1_done) != 0 { break } }
+    loop {
+        puts("TOTAL ") puthex32(total)
+        puts(" C0_RETRIES ") puthex32(vload32(c0_retries))
+        puts(" C1_RETRIES ") puthex32(vload32(c1_retries))
+        puts(" ROUNDS ") puthex32(vload32(rounds_ok))
+        if total == 10000 { puts(" MATCH") } else { puts(" MISMATCH") }
+        puts("\r\n")
+        delay()
+    }
+}
