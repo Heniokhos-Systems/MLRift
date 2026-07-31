@@ -1,0 +1,231 @@
+// tests/nn/nn_prof_host.mlr — HOST-SIDE per-opcode cycle-share estimator for
+// the int8 model runner. Not part of run_nn_tests.sh; a standalone tool for
+// the Task 6 sizing question (see docs/ or the commit message for context).
+//
+//   nn_prof_host <model.krnn> [reps]
+//
+// reps defaults to 300. Build with --arch=x86_64 (or arm64) — a bare
+// invocation makes a FAT binary that will not run.
+//
+// METHOD
+// ------
+// Pass 1 runs the whole model once, in layer order, so every layer's INPUT
+// tensor holds whatever the real graph would have produced there. Pass 2
+// then times each layer INDIVIDUALLY: nn_model_exec() on the same record is
+// called `reps` times back to back and bracketed by time_now() (nanosecond
+// CLOCK_MONOTONIC), so the model's own byte-for-byte side effects give a
+// stable, cache-warm timing without needing correctness across iterations
+// (see MEASURE ACCURATELY: repetition breaks the "one call is faster than
+// clock resolution" problem, and re-running an int8 kernel on already-
+// requantized data changes VALUES, not the number of loads/stores/branches
+// it takes — cycle share depends on shape, not on weight/activation values).
+//
+// This is a HOST measurement (x86_64 or arm64, whatever mlrc's host target
+// is) on a normal Linux box: out-of-order execution, deep caches, DRAM, no
+// PSRAM. It is NOT a prediction of xtensa ESP32 cycles — different ISA,
+// different memory system, single-issue in-order core there. Treat every
+// percentage this prints as "host-relative op-mix", not "device cycles".
+import "nn_model_core.mlr"
+import "../../std/io.mlr"
+import "../../std/time.mlr"
+
+// Generous host-only buffers — no freestanding image-size cap here.
+static u8[4194304] nn_mh_model
+static u8[2] nn_mh_cbuf
+static u8[4194304] nn_mt_arena
+
+static u64 cli_argc = 0
+static u64 cli_argv = 0
+
+fn nn_mt_arena_p() -> u32 { return nn_mt_arena }
+fn nn_mt_arena_cap() -> u32 { u32 v = 4194304  return v }
+
+fn nn_mt_putc(u8 c) {
+    u32 p = nn_mh_cbuf
+    store8(p, c)
+    store8(p + 1, 0)
+    print_str(p)
+}
+
+fn nn_mh_arg(u64 i) -> u64 {
+    if i >= cli_argc { return 0 }
+    u64 slot = cli_argv + i * 8
+    u64 a = 0
+    unsafe { *(slot as u64) -> a }
+    return a
+}
+
+fn nn_mh_num(u64 i, u64 dflt) -> u64 {
+    u64 s = nn_mh_arg(i)
+    if s == 0 { return dflt }
+    u64 v = 0
+    u64 k = 0
+    u64 c = load8(s)
+    while c >= 48 && c <= 57 {
+        v = v * 10 + (c - 48)
+        k = k + 1
+        c = load8(s + k)
+    }
+    if k == 0 { return dflt }
+    return v
+}
+
+// Per-opcode accumulators. 16 slots (opcodes 0..10 used), 8 bytes each.
+static u8[128] nn_ph_ns_lo   // u64 ns, one per opcode
+static u8[128] nn_ph_cnt     // u64 layer count, one per opcode
+static u8[128] nn_ph_elem    // u64 sum of n_elem, one per opcode
+
+fn nn_ph_add(u32 base, u32 op, u64 v) {
+    u32 p = base + (op * 8)
+    u64 cur = load64(p)
+    store64(p, cur + v)
+}
+
+fn nn_ph_get(u32 base, u32 op) -> u64 {
+    return load64(base + (op * 8))
+}
+
+fn nn_ph_zero() {
+    u32 i = 0
+    while i < 128 {
+        store8(nn_ph_ns_lo + i, 0)
+        store8(nn_ph_cnt + i, 0)
+        store8(nn_ph_elem + i, 0)
+        i = i + 1
+    }
+}
+
+fn nn_ph_opname(u32 op) -> u32 {
+    if op == 0 { return "nop" }
+    if op == 1 { return "conv2d" }
+    if op == 2 { return "depthwise" }
+    if op == 3 { return "pointwise" }
+    if op == 4 { return "relu" }
+    if op == 5 { return "maxpool" }
+    if op == 6 { return "add" }
+    if op == 7 { return "resize_nn" }
+    if op == 8 { return "sigmoid_lut" }
+    if op == 9 { return "copy" }
+    if op == 10 { return "avgpool" }
+    return "unknown"
+}
+
+fn nn_mt_emit_u64(u64 v) {
+    if v == 0 {
+        nn_mt_putc(48)
+        return
+    }
+    u64 div = 1000000000000000000
+    u32 started = 0
+    while div > 0 {
+        u64 d = (v / div) % 10
+        if d != 0 { started = 1 }
+        if started != 0 { nn_mt_putc(d + 48) }
+        div = div / 10
+    }
+}
+
+fn main() {
+    u64 path = nn_mh_arg(1)
+    if path == 0 {
+        println_str("usage: nn_prof_host <model.krnn> [reps]")
+        exit(2)
+    }
+    u64 reps = nn_mh_num(2, 300)
+
+    u64 fd = file_open(path, 0)
+    if is_errno(fd) != 0 {
+        println_str("cannot open model")
+        exit(2)
+    }
+    u64 size = file_size(fd)
+    if size > 4194304 {
+        println_str("model larger than the static model buffer")
+        exit(2)
+    }
+    file_read(fd, nn_mh_model, size)
+    file_close(fd)
+
+    u32 m = nn_mh_model
+    u32 bad = nn_model_check(m)
+    if bad != 0 {
+        print_str("ERR:model ")
+        nn_mt_emit(bad)
+        exit(2)
+    }
+    if nn_model_arena_bytes(m) > nn_mt_arena_cap() {
+        print_str("ERR:arena ")
+        nn_mt_emit_u32(nn_model_arena_bytes(m))
+        exit(2)
+    }
+
+    nn_mt_fill_input(m)
+
+    u32 lay = m + load32(m + 16)
+    u32 stride = load32(m + 20)
+    u32 blob = m + load32(m + 32)
+    u32 total = nn_model_layer_count(m)
+
+    // Pass 1: run the model once, in order, so every layer's real input is
+    // sitting in the arena before it is timed in isolation.
+    u32 i = 0
+    while i < total {
+        u32 r = lay + (i * stride)
+        nn_model_exec(r, nn_mt_arena_p(), blob)
+        i = i + 1
+    }
+
+    nn_ph_zero()
+    u64 grand_ns = 0
+
+    // Pass 2: time each layer individually, `reps` calls back to back.
+    i = 0
+    while i < total {
+        u32 r = lay + (i * stride)
+        u32 op = load32(r)
+        u32 n_elem = load32(r + 104)
+        u64 t0 = time_now()
+        u64 k = 0
+        while k < reps {
+            nn_model_exec(r, nn_mt_arena_p(), blob)
+            k = k + 1
+        }
+        u64 t1 = time_now()
+        u64 dt = t1 - t0
+        u64 per_call = dt / reps
+        nn_ph_add(nn_ph_ns_lo, op, per_call)
+        nn_ph_add(nn_ph_cnt, op, 1)
+        u64 ne = n_elem
+        nn_ph_add(nn_ph_elem, op, ne)
+        grand_ns = grand_ns + per_call
+        print_str("L ")
+        nn_mt_emit_u32(i)
+        nn_mt_putc(32)
+        nn_mt_str(nn_ph_opname(op))
+        nn_mt_putc(32)
+        nn_mt_emit_u64(per_call)
+        nn_mt_putc(10)
+        i = i + 1
+    }
+
+    print_str("--- per-opcode totals ---\n")
+    u32 op2 = 0
+    while op2 <= 10 {
+        u64 c = nn_ph_get(nn_ph_cnt, op2)
+        if c != 0 {
+            nn_mt_str(nn_ph_opname(op2))
+            print_str(" layers=")
+            nn_mt_emit_u64(c)
+            print_str(" ns=")
+            nn_mt_emit_u64(nn_ph_get(nn_ph_ns_lo, op2))
+            print_str(" elems=")
+            nn_mt_emit_u64(nn_ph_get(nn_ph_elem, op2))
+            nn_mt_putc(10)
+        }
+        op2 = op2 + 1
+    }
+    print_str("GRAND_NS ")
+    nn_mt_emit_u64(grand_ns)
+    nn_mt_putc(10)
+    exit(0)
+}
