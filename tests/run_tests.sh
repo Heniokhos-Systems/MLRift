@@ -5345,6 +5345,47 @@ for GOOD in x86_64 x86-64 amd64 x64 arm64 aarch64 riscv32; do
 done
 rm -f "$AV_SRC" "$AV_BIN"
 
+echo ""
+echo "--- --emit / --target value validation ---"
+MEV_SRC="/tmp/mlrc_ev_$$.mlr"
+MEV_BIN="/tmp/mlrc_ev_$$.bin"
+printf 'fn main() { uint32 x = 3\n exit(x) }\n' > "$MEV_SRC"
+for BAD in elfBANANA winBANANA asmBANANA; do
+    TOTAL=$((TOTAL + 1))
+    $MLRC --emit=$BAD "$MEV_SRC" -o "$MEV_BIN" >/dev/null 2>&1; ME_ST=$?
+    if [ "$ME_ST" != "0" ]; then
+        PASS=$((PASS + 1)); echo "  emit_reject_$BAD: PASS (exit $ME_ST)"
+    else
+        echo "FAIL: emit_reject_$BAD (expected non-zero exit, got 0)"; FAIL=$((FAIL + 1))
+    fi
+done
+for BAD in macosBANANA windowsBANANA hip-amdBANANA amdgpu-nativeBANANA; do
+    TOTAL=$((TOTAL + 1))
+    $MLRC --target=$BAD "$MEV_SRC" -o "$MEV_BIN" >/dev/null 2>&1; MT_ST=$?
+    if [ "$MT_ST" != "0" ]; then
+        PASS=$((PASS + 1)); echo "  target_reject_$BAD: PASS (exit $MT_ST)"
+    else
+        echo "FAIL: target_reject_$BAD (expected non-zero exit, got 0)"; FAIL=$((FAIL + 1))
+    fi
+done
+# Alias preservation. MLRift accepts the SAME 25 non-lkm spellings as KernRift
+# (verified); `lkm` has no arm here (rejects, exit 1) and `ir` writes no output
+# file (prints to stdout, exits 0), so both are excluded for the same reasons
+# as KernRift's Task 2.
+for GOOD in elf elf-arm64 elf-x86_64 elfexe linux linux-x86_64 linux-arm64 linux-x86-64 \
+            macho mac macos mac-x64 mac-arm64 darwin \
+            windows windows-x64 windows-arm64 win win-x64 win-arm64 pe \
+            obj android asm; do
+    TOTAL=$((TOTAL + 1))
+    rm -f "$MEV_BIN"
+    if $MLRC --emit=$GOOD "$MEV_SRC" -o "$MEV_BIN" >/dev/null 2>&1 && [ -s "$MEV_BIN" ]; then
+        PASS=$((PASS + 1)); echo "  emit_accept_$GOOD: PASS"
+    else
+        echo "FAIL: emit_accept_$GOOD (alias must keep working)"; FAIL=$((FAIL + 1))
+    fi
+done
+rm -f "$MEV_SRC" "$MEV_BIN"
+
 # --- Summary ---
 echo ""
 echo "=== Results: $PASS/$TOTAL passed, $FAIL failed ==="
