@@ -506,6 +506,92 @@ fn main() {
     exit(fails)
 }' 0
 
+# --- std/tokenizer.mlr BPE pre-tokenizer: control whitespace ---
+# tk_bpe_pretoken_end(input, len, p) returns the end offset of the pre-token
+# starting at p, i.e. exactly the byte spans the byte-level BPE regex
+#   (?i:...)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*
+#   |\s*[\r\n]+|\s+(?!\S)|\s+
+# produces. The old code emitted every \t/\n/\r as an isolated single-byte
+# pre-token, which silently diverged from HuggingFace `tokenizers` for any
+# input with a tab or a blank line. Boundaries below were taken from
+# tokenizer.pre_tokenizer.pre_tokenize_str() on the real
+# unsloth/Llama-3.2-1B-Instruct and Qwen/Qwen3.5-0.8B tokenizer.json, and
+# cross-checked as token IDs through tokenizer_load_from_gguf against the
+# matching local GGUFs.
+#
+# "Hello\tworld" -> ["Hello", "\tworld"]  (ids 9906, 77608 on Llama-3.2)
+# The tab folds into the following letter run; it used to stand alone.
+run_test "bpe_pretok_tab_folds_into_letters" 'import "std/tokenizer.mlr"
+fn main() {
+    u64 s = "Hello\tworld"
+    u64 n = str_len(s)
+    if tk_bpe_pretoken_end(s, n, 0) != 5 { exit(1) }
+    if tk_bpe_pretoken_end(s, n, 5) != 11 { exit(2) }
+    exit(0)
+}' 0
+# "tab\ttab\ttab" -> ["tab", "\ttab", "\ttab"]  (ids 6323, 59249, 59249)
+run_test "bpe_pretok_tab_folds_repeated" 'import "std/tokenizer.mlr"
+fn main() {
+    u64 s = "tab\ttab\ttab"
+    u64 n = str_len(s)
+    if tk_bpe_pretoken_end(s, n, 0) != 3 { exit(1) }
+    if tk_bpe_pretoken_end(s, n, 3) != 7 { exit(2) }
+    if tk_bpe_pretoken_end(s, n, 7) != 11 { exit(3) }
+    exit(0)
+}' 0
+# "\n\nnewlines\n\n" -> ["\n\n", "newlines", "\n\n"]  (ids 271, 943, 8128, 271)
+# Consecutive newlines merge into ONE pre-token (regex alt `\s*[\r\n]+`);
+# they used to be emitted one byte at a time.
+run_test "bpe_pretok_newline_run_merges" 'import "std/tokenizer.mlr"
+fn main() {
+    u64 s = "\n\nnewlines\n\n"
+    u64 n = str_len(s)
+    if tk_bpe_pretoken_end(s, n, 0) != 2 { exit(1) }
+    if tk_bpe_pretoken_end(s, n, 2) != 10 { exit(2) }
+    if tk_bpe_pretoken_end(s, n, 10) != 12 { exit(3) }
+    exit(0)
+}' 0
+# A lone \r\n pair is one pre-token, and \r\n runs merge like \n runs.
+run_test "bpe_pretok_crlf_merges" 'import "std/tokenizer.mlr"
+fn main() {
+    u64 s = "a\r\n\r\nb"
+    u64 n = str_len(s)
+    if tk_bpe_pretoken_end(s, n, 0) != 1 { exit(1) }
+    if tk_bpe_pretoken_end(s, n, 1) != 5 { exit(2) }
+    if tk_bpe_pretoken_end(s, n, 5) != 6 { exit(3) }
+    exit(0)
+}' 0
+# \r and \n are excluded from the fold class, so a newline before a letter
+# stays its own pre-token: "\nHello" -> ["\n", "Hello"], not ["\nHello"].
+run_test "bpe_pretok_newline_does_not_fold" 'import "std/tokenizer.mlr"
+fn main() {
+    u64 s = "\nHello"
+    u64 n = str_len(s)
+    if tk_bpe_pretoken_end(s, n, 0) != 1 { exit(1) }
+    if tk_bpe_pretoken_end(s, n, 1) != 6 { exit(2) }
+    exit(0)
+}' 0
+# Trailing spaces on a blank line belong to the newline run, not to the
+# spaces: "a  \n\nb" -> ["a", "  \n\n", "b"].
+run_test "bpe_pretok_spaces_join_newline_run" 'import "std/tokenizer.mlr"
+fn main() {
+    u64 s = "a  \n\nb"
+    u64 n = str_len(s)
+    if tk_bpe_pretoken_end(s, n, 0) != 1 { exit(1) }
+    if tk_bpe_pretoken_end(s, n, 1) != 5 { exit(2) }
+    if tk_bpe_pretoken_end(s, n, 5) != 6 { exit(3) }
+    exit(0)
+}' 0
+# The plain-space fold must keep working: "  Hello" -> [" ", " Hello"].
+run_test "bpe_pretok_space_fold_unchanged" 'import "std/tokenizer.mlr"
+fn main() {
+    u64 s = "  Hello"
+    u64 n = str_len(s)
+    if tk_bpe_pretoken_end(s, n, 0) != 1 { exit(1) }
+    if tk_bpe_pretoken_end(s, n, 1) != 7 { exit(2) }
+    exit(0)
+}' 0
+
 # --- str_to_float exponent handling ---
 # Negative exponents used to multiply by 1/10 once per digit. 1/10 is inexact
 # in binary, so the error compounded: one multiply survived, two did not.
