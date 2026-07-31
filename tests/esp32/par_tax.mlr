@@ -1,0 +1,442 @@
+// tests/esp32/par_tax.mlr — Stage 4, Task 5 follow-up: WHERE does the ~45%
+// second-core tax come from?
+//
+// Task 5 measured, on this board, that core 0 runs ~45% slower as soon as core
+// 1 exists at all — the same ~45% whether core 1 is spinning in the barrier
+// (SERIAL, 1504208 cyc) or doing useful work (PAR, 1356412 cyc), against a
+// core-1-in-reset baseline of 1033078 cyc. Splitting 20% of the work cannot pay
+// that back, so whether Task 6 is worth building turns entirely on which of two
+// worlds we are in:
+//
+//   TRACTABLE   the tax is core 1's own BUS TRAFFIC — instruction fetch from
+//               IRAM, data loads from DRAM, or both. Then it disappears when
+//               core 1 stops issuing, and Task 6 can park core 1 cheaply
+//               between bands instead of spinning it.
+//   STRUCTURAL  the tax is the cost of the APP CPU being ENABLED — arbitration,
+//               clock/power domain, bus reconfiguration done once at release.
+//               Then no amount of parking helps and Stage 4 needs re-scoping.
+//
+// ─────────────────────────────────────────────────────────────────────────
+// THE LADDER
+// ─────────────────────────────────────────────────────────────────────────
+// One image, one boot, core 0 running an identical fixed workload under every
+// core-1 state we can reach. Every state is a rung on a ladder from "core 1
+// does not exist" to "core 1 hammers memory":
+//
+//   RESET     core 1 held in reset, never released. The Task 5 BASE.
+//   PRESTART  everything esp32_appcpu_start does EXCEPT the final clock ungate:
+//             RTC stall cleared, RUNSTALL cleared, clock gated off, reset
+//             pulsed, boot address armed. Core 1 is still not executing. If the
+//             tax is already here, it is a one-time CONFIG side effect and no
+//             core-1 behaviour can explain it.
+//   RUNSTALL  core 1 released, running, then halted with DPORT APPCPU_RUNSTALL.
+//   RTCSTALL  same, halted instead with the RTC-domain software stall
+//             (SW_STALL_APPCPU_C0/C1) — ESP-IDF's own esp_cpu_stall. Two
+//             independent halt mechanisms, because one of them agreeing with
+//             RESET by accident is a real possibility and both agreeing is not.
+//   WAITI     core 1 parks itself in `waiti 0`. Clocked, enabled, un-stalled,
+//             issuing nothing. This is the rung the brief asked for.
+//   ALU       core 1 in a register-only loop: maximum instruction fetch,
+//             ZERO data accesses.
+//   SPIN      core 1 in a tight poll loop on a shared word: fetch AND a load
+//             every iteration. This is what par_barrier's wait loop does.
+//   LOAD      core 1 streaming bytes out of its own DRAM buffer: fetch AND
+//             maximum data traffic.
+//
+// ALU vs SPIN vs LOAD separates instruction fetch from data traffic, because
+// on this layout they are in DIFFERENT SRAM banks: ir_xtensa.mlr puts code at
+// 0x40080400 (IRAM, SRAM0) and all statics at 0x3FFB0000 (DRAM, SRAM2). A
+// core-1 loop with no loads still fetches SRAM0 flat out.
+//
+// Core 0 runs four workloads at every rung, because the SHAPE of the tax is as
+// diagnostic as its size: W_ALU touches no memory at all, W_LD8/W_LD32 stream
+// reads at two bandwidths, W_LDST8 reads and writes. A tax that scales with
+// core 0's data intensity is a data-bus story; a flat tax across all four is a
+// fetch story.
+//
+// ─────────────────────────────────────────────────────────────────────────
+// EVERY RUNG VERIFIES ITSELF
+// ─────────────────────────────────────────────────────────────────────────
+// Core 1 bumps a heartbeat at the top of its dispatch loop, so core 0 can prove
+// what core 1 is doing rather than assume it:
+//   * entering a running mode: core 0 waits for the heartbeat to ADVANCE past
+//     the mode store, which is what proves core 1 read the new mode.
+//   * a halted rung: core 0 prints the heartbeat delta ACROSS the measurement.
+//     It must be 0. A stall that silently did not take would otherwise read as
+//     "the tax is structural", which is the exact wrong answer.
+// The per-rung "HB" column in the output is that check, not decoration.
+//
+// The board is phase-locked, so a single interleaving proves nothing: the whole
+// ladder repeats forever and the report is the spread over passes, not one row.
+//
+// ⚠️ ORDER IS LOAD-BEARING. RESET and PRESTART can only be measured before core
+// 1 is released, and WAITI is a ONE-WAY DOOR (nothing wakes core 1 again on an
+// image with no vectors and INTENABLE == 0), so it is last. Everything
+// reversible is measured, repeatedly, in between.
+//
+// Build + flash:
+//   ./build/mlrc --arch=xtensa --freestanding --target=esp32 \
+//                tests/esp32/par_tax.mlr -o tax.bin
+//   ~/esp32_flash.sh tax.bin && ~/esp32_run.sh 120 out.txt
+import "../../std/esp32_clk.mlr"
+import "../../std/esp32_smp.mlr"
+import "../../std/esp32_uart.mlr"
+
+// CCOUNT. @naked + rsr into a2 (the CALL0 return register) + ret; see
+// tests/nn/nn_prof_esp32.mlr for why this needs no prologue.
+@naked fn tax_ccount() -> u32 {
+    asm("rsr.ccount a2")
+    asm("ret")
+    // Unreachable — the asm ret already returned. Present only because sema
+    // requires a value-returning function to return on every path.
+    return 0
+}
+
+// ---------------------------------------------------------------------------
+// Shared state
+// ---------------------------------------------------------------------------
+// c1_mode is the only thing core 0 ever tells core 1. c1_hb is the only thing
+// core 1 ever tells core 0. Neither needs an atomic: single writer each.
+static u32[1] c1_mode
+static u32[1] c1_hb
+static u32[1] c1_ready
+static u32[1] c1_waiti_mark
+// Core 1's accumulator sink. Written once per burst so neither the ALU nor the
+// LOAD body can be dead-code eliminated — a core 1 optimised down to an empty
+// loop would be a silently different rung from the one the row is labelled.
+static u32[1] c1_sink
+
+// Core 0's workload buffers and core 1's, kept separate so a LOAD-mode core 1
+// is not sharing a cache line or a hot address with core 0's stream.
+static u8[16384] buf_a
+static u8[16384] buf_b
+static u8[8192] c1_buf
+
+// Decimal scratch for putu32.
+static u8[16] dec_buf
+
+fn putu32(u32 v) {
+    u32 x = v
+    if x == 0 { putc(48) return }
+    u32 i = 0
+    while x != 0 {
+        store8(dec_buf + i, 48 + (x % 10))
+        x = x / 10
+        i = i + 1
+    }
+    while i != 0 {
+        i = i - 1
+        putc(load8(dec_buf + i))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Core 0's four workloads
+// ---------------------------------------------------------------------------
+// Each returns a sink that is printed, so nothing here can be dead-code
+// eliminated, and each stirs its accumulator with the loop variable so no body
+// is loop-invariant enough to hoist out.
+
+// No memory operand at all — the pure instruction-fetch case.
+fn w_alu(u32 n) -> u32 {
+    u32 i = 0
+    u32 a = 1
+    while i < n {
+        a = a * 3 + i
+        a = a ^ (a >> 7)
+        i = i + 1
+    }
+    return a
+}
+
+// Streaming byte reads, `reps` passes over the 16 KiB buffer.
+fn w_ld8(u32 reps) -> u32 {
+    u32 p = buf_a
+    u32 r = 0
+    u32 a = 0
+    while r < reps {
+        u32 i = 0
+        while i < 16384 {
+            a = a + load8(p + i)
+            i = i + 1
+        }
+        r = r + 1
+    }
+    return a
+}
+
+// Streaming word reads — four times the bytes per iteration, same instruction
+// count, so this is the high-data-intensity end of the sweep.
+fn w_ld32(u32 reps) -> u32 {
+    u32 p = buf_a
+    u32 r = 0
+    u32 a = 0
+    while r < reps {
+        u32 i = 0
+        while i < 4096 {
+            a = a + load32(p + (i * 4))
+            i = i + 1
+        }
+        r = r + 1
+    }
+    return a
+}
+
+// Read one buffer, write another — the shape the elementwise NN kernels have.
+fn w_ldst8(u32 reps) -> u32 {
+    u32 p = buf_a
+    u32 q = buf_b
+    u32 r = 0
+    u32 a = 0
+    while r < reps {
+        u32 i = 0
+        while i < 16384 {
+            u8 v = load8(p + i)
+            store8(q + i, v + 1)
+            a = a + v
+            i = i + 1
+        }
+        r = r + 1
+    }
+    return a
+}
+
+// ---------------------------------------------------------------------------
+// Core 1
+// ---------------------------------------------------------------------------
+// One dispatch loop. Every running mode does a fixed 4096-iteration burst and
+// returns to the top, so the heartbeat keeps advancing (proving liveness and
+// mode uptake) while the per-burst top-of-loop traffic — one store, one load —
+// is under 0.05% of core 1's memory operations and cannot itself be the tax.
+static u32 MODE_SPIN = 0
+static u32 MODE_ALU = 1
+static u32 MODE_LOAD = 2
+static u32 MODE_WAITI = 3
+
+fn core1_entry() {
+    EspSmpDport.appcpu_ctrl_d = 0          // disarm; every dual-core file does this
+    loop { if vload32(c1_ready) != 0 { break } }
+    loop {
+        vstore32(c1_hb, vload32(c1_hb) + 1)
+        u32 m = vload32(c1_mode)
+        if m == 0 {
+            // Exactly par_barrier's wait loop: re-read the shared word every
+            // iteration, branch on it. Fetch plus one DRAM load per iteration.
+            u32 c = 0
+            while c < 4096 {
+                if vload32(c1_mode) != 0 { break }
+                c = c + 1
+            }
+        }
+        if m == 1 {
+            // Register-only: maximum IRAM fetch rate, zero data accesses.
+            u32 c = 0
+            u32 a = 1
+            while c < 4096 {
+                a = a * 3 + c
+                a = a ^ (a >> 7)
+                c = c + 1
+            }
+            vstore32(c1_sink, a)
+        }
+        if m == 2 {
+            // Maximum DRAM read traffic from core 1's own buffer.
+            u32 p = c1_buf
+            u32 c = 0
+            u32 a = 0
+            while c < 4096 {
+                a = a + load8(p + c)
+                c = c + 1
+            }
+            vstore32(c1_sink, a)
+        }
+        if m == 3 {
+            // ⚠️ ONE-WAY DOOR. INTENABLE is 0 and no vectors are installed, so
+            // nothing wakes core 1 again. The mark is stored FIRST so core 0
+            // can prove core 1 reached the instruction rather than infer it.
+            vstore32(c1_waiti_mark, 1)
+            loop { asm("waiti 0") }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Core 0's driver
+// ---------------------------------------------------------------------------
+// esp32_appcpu_start, split at the clock ungate. PRESTART is everything the
+// real function does except step 5, so a tax that appears here is a one-time
+// configuration side effect of the DPORT/RTC writes and NOT anything core 1
+// does. Kept byte-identical to std/esp32_smp.mlr's body, in order.
+fn appcpu_prestart(u32 entry_addr) {
+    esp32_rtc_unstall_appcpu()
+    EspSmpDport.appcpu_ctrl_c = EspSmpDport.appcpu_ctrl_c & 0xFFFFFFFE
+    EspSmpDport.appcpu_ctrl_b = EspSmpDport.appcpu_ctrl_b & 0xFFFFFFFE
+    EspSmpDport.appcpu_ctrl_a = EspSmpDport.appcpu_ctrl_a | 1
+    EspSmpDport.appcpu_ctrl_a = EspSmpDport.appcpu_ctrl_a & 0xFFFFFFFE
+    EspSmpDport.appcpu_ctrl_d = entry_addr
+}
+
+fn appcpu_ungate() {
+    EspSmpDport.appcpu_ctrl_b = EspSmpDport.appcpu_ctrl_b | 1
+}
+
+// DPORT hardware run-stall. Reversible, and independent of the RTC path below.
+fn appcpu_runstall(u32 on) {
+    if on != 0 {
+        EspSmpDport.appcpu_ctrl_c = EspSmpDport.appcpu_ctrl_c | 1
+    } else {
+        EspSmpDport.appcpu_ctrl_c = EspSmpDport.appcpu_ctrl_c & 0xFFFFFFFE
+    }
+}
+
+// RTC-domain software stall — ESP-IDF's esp_cpu_stall. BOTH fields must be
+// written: 0x21 into SW_STALL_APPCPU_C1 (sw_cpu_stall bits 25:20) and 0x2 into
+// SW_STALL_APPCPU_C0 (options0 bits 1:0). Any other combination is "running".
+//
+// ⚠️ `&` and `|` bind TIGHTER than `+`/`<<` here, so the field values are
+// written as pre-shifted hex constants rather than shift expressions.
+fn appcpu_rtcstall(u32 on) {
+    if on != 0 {
+        EspSmpRtc.sw_cpu_stall = (EspSmpRtc.sw_cpu_stall & 0xFC0FFFFF) | 0x02100000
+        EspSmpRtc.options0 = (EspSmpRtc.options0 & 0xFFFFFFFC) | 0x2
+    } else {
+        esp32_rtc_unstall_appcpu()
+    }
+}
+
+// Wait until core 1 has been round the top of its dispatch loop at least three
+// times since now. Two would be enough to guarantee one full re-read of
+// c1_mode after core 0's store; three is the same argument with a margin, and
+// the cost is microseconds.
+fn c1_settle() {
+    u32 h0 = vload32(c1_hb)
+    loop { if (vload32(c1_hb) - h0) >= 3 { return } }
+}
+
+// One rung. Runs all four workloads back to back and prints a row. HB is the
+// heartbeat delta across the whole rung: non-zero means core 1 was executing,
+// zero means it was not, and for the four halted rungs zero is the assertion
+// that makes the row mean anything.
+static u32 REPS = 16
+
+fn rung(u32 name) {
+    u32 hb0 = vload32(c1_hb)
+
+    u32 a0 = tax_ccount()
+    u32 s0 = w_alu(262144)
+    u32 a1 = tax_ccount()
+
+    u32 b0 = tax_ccount()
+    u32 s1 = w_ld8(REPS)
+    u32 b1 = tax_ccount()
+
+    u32 c0 = tax_ccount()
+    // 4x the passes because each iteration covers 4x the bytes: this keeps the
+    // ITERATION count equal across LD8 and LD32, so the pair differs only in
+    // data intensity per instruction, which is the variable being swept.
+    u32 s2 = w_ld32(REPS * 4)
+    u32 c1 = tax_ccount()
+
+    u32 d0 = tax_ccount()
+    u32 s3 = w_ldst8(REPS)
+    u32 d1 = tax_ccount()
+
+    u32 hb1 = vload32(c1_hb)
+
+    puts(name)
+    puts(" ALU ")   putu32((a1 - a0) & 0xFFFFFFFF)
+    puts(" LD8 ")   putu32((b1 - b0) & 0xFFFFFFFF)
+    puts(" LD32 ")  putu32((c1 - c0) & 0xFFFFFFFF)
+    puts(" LDST8 ") putu32((d1 - d0) & 0xFFFFFFFF)
+    puts(" HB ")    putu32((hb1 - hb0) & 0xFFFFFFFF)
+    puts(" SINK ")  putu32(((s0 + s1) + (s2 + s3)) & 0xFFFFFFFF)
+    puts("\r\n")
+}
+
+// Fill both buffers so the streams read defined bytes rather than whatever the
+// preamble left, and so the sink is a fixed number every pass — a sink that
+// drifts between passes would mean a workload is reading something it should
+// not.
+fn fill_buffers() {
+    u32 i = 0
+    while i < 16384 {
+        store8(buf_a + i, i & 0xFF)
+        store8(buf_b + i, 0)
+        i = i + 1
+    }
+    i = 0
+    while i < 8192 {
+        store8(c1_buf + i, i & 0xFF)
+        i = i + 1
+    }
+}
+
+fn main() {
+    // PLL first, before any putc — the UART divisor is rewritten in here.
+    u32 clkrc = esp32_clk_cpu_pll(240)
+    puts("CLK ") putu32(clkrc) puts("\r\n")
+    fill_buffers()
+    vstore32(c1_mode, MODE_SPIN)
+    vstore32(c1_hb, 0)
+    vstore32(c1_ready, 0)
+    vstore32(c1_waiti_mark, 0)
+
+    // ---- rungs that only exist before core 1 is released ----
+    puts("PHASE A core 1 in reset\r\n")
+    u32 k = 0
+    while k < 3 {
+        rung("RESET")
+        k = k + 1
+    }
+
+    puts("PHASE A2 appcpu configured, clock still gated\r\n")
+    appcpu_prestart(fn_addr("core1_entry"))
+    k = 0
+    while k < 3 {
+        rung("PRESTART")
+        k = k + 1
+    }
+
+    // ---- release core 1 ----
+    appcpu_ungate()
+    vstore32(c1_ready, 1)
+    loop { if vload32(c1_hb) != 0 { break } }   // core 1 is alive
+    puts("PHASE B core 1 released\r\n")
+
+    // ---- the reversible rungs, repeated for spread ----
+    u32 pass = 0
+    while pass < 4 {
+        puts("PASS ") putu32(pass) puts("\r\n")
+
+        vstore32(c1_mode, MODE_ALU)  c1_settle()  rung("ALU")
+        vstore32(c1_mode, MODE_LOAD) c1_settle()  rung("LOAD")
+        vstore32(c1_mode, MODE_SPIN) c1_settle()  rung("SPIN")
+
+        // Halt from a KNOWN running mode, so "HB 0" is evidence the stall took
+        // rather than evidence core 1 was idle already.
+        vstore32(c1_mode, MODE_ALU)  c1_settle()
+        appcpu_runstall(1)
+        rung("RUNSTALL")
+        appcpu_runstall(0)
+        c1_settle()
+
+        vstore32(c1_mode, MODE_ALU)  c1_settle()
+        appcpu_rtcstall(1)
+        rung("RTCSTALL")
+        appcpu_rtcstall(0)
+        c1_settle()
+
+        pass = pass + 1
+    }
+
+    // ---- the one-way door, last ----
+    puts("PHASE C waiti\r\n")
+    vstore32(c1_mode, MODE_WAITI)
+    loop { if vload32(c1_waiti_mark) != 0 { break } }   // core 1 reached it
+    // Give it room to actually retire the instruction before measuring.
+    u32 spin = 0
+    while spin < 1000000 { spin = spin + 1 }
+    loop {
+        rung("WAITI")
+    }
+}

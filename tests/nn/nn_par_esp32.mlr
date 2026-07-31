@@ -252,6 +252,83 @@ fn nn_par_base_layers(u32 m, u32 arena) -> u32 {
     return 0
 }
 
+// ---------------------------------------------------------------------------
+// Core 0, PARKED variant — the Task 6 shape, measured against the same BASE
+// ---------------------------------------------------------------------------
+// tests/esp32/par_tax.mlr established that the ~45% tax the comment above
+// records is core 1's INSTRUCTION FETCH, and that it vanishes to the cycle when
+// core 1 stops issuing — under five independent mechanisms, including DPORT
+// APPCPU_RUNSTALL, which core 0 can assert and release for ~150 cycles a round
+// with no interrupt plumbing on core 1 (tests/esp32/par_park_cost.mlr).
+//
+// So this variant keeps core 1 STALLED except inside a split band. That changes
+// the barrier discipline, and the change is the whole point:
+//
+//   nn_par_layers  every layer publishes and barriers, so core 1 must be
+//                  running for every layer, so it spins through all of them.
+//   nn_park_layers only SPLITTABLE layers publish and barrier. A
+//                  non-splittable layer does not involve core 1 at all, so
+//                  core 1 stays stalled through it and costs core 0 nothing.
+//
+// The invariant is still structural, just a different one: `unstall, publish,
+// work, barrier, stall` is a single straight-line block with no branch inside
+// it, so core 1's round count still equals core 0's publish count and the
+// single-slot descriptor is still safe. Parking core 1 immediately after core 0
+// leaves the barrier is safe in both arrival orders — if core 0 arrived second
+// it has already flipped `sense` and core 1 resumes into a satisfied wait; if
+// core 0 arrived first it only left because core 1 flipped `sense`, which is
+// after core 1's own barrier work is done.
+//
+// ⚠️ Core 1 must be stalled on entry and is stalled on exit, so this may only
+// be called with core 1 sitting in par_take, never mid-barrier.
+fn nn_park_runstall(u32 on) {
+    if on != 0 {
+        EspSmpDport.appcpu_ctrl_c = EspSmpDport.appcpu_ctrl_c | 1
+    } else {
+        EspSmpDport.appcpu_ctrl_c = EspSmpDport.appcpu_ctrl_c & 0xFFFFFFFE
+    }
+}
+
+fn nn_park_layers(u32 m, u32 arena) -> u32 {
+    u32 bad = nn_model_check(m)
+    if bad != 0 { return bad }
+    u32 lay = m + load32(m + 16)
+    u32 stride = load32(m + 20)
+    u32 blob = m + load32(m + 32)
+    u32 total = nn_model_layer_count(m)
+    u32 ew = 0
+    u32 bar = 0
+    nn_park_runstall(1)
+    u32 t_start = nn_par_ccount()
+    u32 i = 0
+    while i < total {
+        u32 r = lay + (i * stride)
+        u32 n = load32(r + 104)
+        if nn_model_op_splittable(load32(r)) != 0 {
+            u32 mid = nn_model_split_mid(r)
+            nn_park_runstall(0)
+            par_publish(1, r, arena, blob, mid, n)
+            u32 t0 = nn_par_ccount()
+            nn_model_exec_range(r, arena, blob, 0, mid)
+            u32 t1 = nn_par_ccount()
+            par_barrier()
+            nn_park_runstall(1)
+            u32 t2 = nn_par_ccount()
+            ew = (ew + ((t1 - t0) & 0xFFFFFFFF)) & 0xFFFFFFFF
+            bar = (bar + ((t2 - t1) & 0xFFFFFFFF)) & 0xFFFFFFFF
+        } else {
+            nn_model_exec(r, arena, blob)
+        }
+        i = i + 1
+    }
+    u32 t_end = nn_par_ccount()
+    nn_park_runstall(1)
+    vstore32(nn_par_tot, (t_end - t_start) & 0xFFFFFFFF)
+    vstore32(nn_par_ew, ew)
+    vstore32(nn_par_bar, bar)
+    return 0
+}
+
 fn nn_par_report(u32 tag) {
     nn_mt_str(tag)
     nn_mt_str(" TOT ")
@@ -312,6 +389,34 @@ fn nn_par_run(u32 m, u32 par_on, u32 tag) -> u32 {
         return bad
     }
     nn_par_report(tag)
+    nn_mt_emit_outputs(m)
+    return 0
+}
+
+// The parked variant's run wrapper. Same poison + fill + dump as nn_par_run, so
+// its output block is directly comparable with the others — and it has to be:
+// the whole claim is that parking core 1 changes only the cycles, not a byte.
+fn nn_park_run(u32 m) -> u32 {
+    u32 bad = nn_model_check(m)
+    if bad != 0 {
+        nn_mt_str("ERR:model ")
+        nn_mt_emit(bad)
+        return bad
+    }
+    if nn_model_arena_bytes(m) > nn_mt_arena_cap() {
+        nn_mt_str("ERR:arena ")
+        nn_mt_emit(nn_model_arena_bytes(m))
+        return 4
+    }
+    nn_par_poison(m)
+    nn_mt_fill_input(m)
+    bad = nn_park_layers(m, nn_mt_arena_p())
+    if bad != 0 {
+        nn_mt_str("ERR:run ")
+        nn_mt_emit(bad)
+        return bad
+    }
+    nn_par_report("PARK")
     nn_mt_emit_outputs(m)
     return 0
 }
@@ -392,8 +497,13 @@ fn main() {
         u32 rc0 = nn_par_run(model, 0, "SERIAL")
         nn_mt_str("BEGIN PAR\n")
         u32 rc1 = nn_par_run(model, 1, "PAR")
+        // Core 1 is sitting in par_take here, which is the only state
+        // nn_park_layers may be entered from.
+        nn_mt_str("BEGIN PARK\n")
+        u32 rc2 = nn_park_run(model)
+        nn_park_runstall(0)                // back to spinning for the next SERIAL
         nn_mt_str("END ")
-        nn_mt_emit_u32(rc0 + rc1)
+        nn_mt_emit_u32((rc0 + rc1) + rc2)
         nn_mt_putc(10)
         nn_par_delay()
     }

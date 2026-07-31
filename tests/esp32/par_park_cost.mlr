@@ -1,0 +1,254 @@
+// tests/esp32/par_park_cost.mlr — Stage 4: what does it cost to PARK core 1?
+//
+// tests/esp32/par_tax.mlr established that the ~45% second-core tax is entirely
+// core 1's instruction fetch, and that it vanishes — to the cycle, under five
+// independent mechanisms — the moment core 1 stops issuing. Of those mechanisms
+// only DPORT APPCPU_RUNSTALL is both reversible and driveable from core 0 with
+// no interrupt plumbing on core 1: core 0 writes one register, core 1 freezes
+// wherever it is, core 0 writes it back, core 1 resumes mid-loop.
+//
+// That makes it the obvious park for Task 6, and turns the whole question into
+// three numbers this file measures:
+//
+//   PAIR   cycles core 0 spends on a runstall(1)/runstall(0) pair. This is
+//          per-round overhead, paid ~12 times per inference, so it competes
+//          with the 263 cyc/round the barrier already costs.
+//   WAKE   cycles from the un-stall write until core 1 makes observable
+//          progress. A park that takes thousands of cycles to come back would
+//          eat the solo section it was supposed to protect.
+//   LEAK   core-1 ticks that still land AFTER the stall write returns. If core
+//          1 keeps running for a while after core 0 thinks it stopped, a short
+//          solo section gains nothing and the row above is a fiction.
+//
+// SOLO is the end-to-end version of the same question: identical core-0 work,
+// once with core 1 running and once bracketed by a stall/unstall pair. The
+// difference between those two rows is exactly what Task 6 buys per solo
+// section, measured rather than extrapolated.
+//
+// ⚠️ RUNSTALL freezes core 1 mid-instruction, so it is only safe if core 1's
+// state survives it intact. CHK is that check and it is not decoration: core 1
+// re-checksums a fixed buffer every tick, and core 0 verifies the value after
+// several thousand stall/unstall pairs have hit it at arbitrary points. A
+// mismatch would mean the park corrupts core 1 and the whole plan is void.
+//
+// Build + flash:
+//   ./build/mlrc --arch=xtensa --freestanding --target=esp32 \
+//                tests/esp32/par_park_cost.mlr -o park.bin
+//   ~/esp32_flash.sh park.bin && ~/esp32_run.sh 45 out.txt
+import "../../std/esp32_clk.mlr"
+import "../../std/esp32_smp.mlr"
+import "../../std/esp32_uart.mlr"
+
+@naked fn park_ccount() -> u32 {
+    asm("rsr.ccount a2")
+    asm("ret")
+    return 0
+}
+
+static u32[1] c1_ready
+static u32[1] c1_tick
+static u32[1] c1_sum
+static u8[32] c1_buf
+
+static u8[16384] buf_a
+static u8[16384] buf_b
+static u8[16] dec_buf
+
+fn putu32(u32 v) {
+    u32 x = v
+    if x == 0 { putc(48) return }
+    u32 i = 0
+    while x != 0 {
+        store8(dec_buf + i, 48 + (x % 10))
+        x = x / 10
+        i = i + 1
+    }
+    while i != 0 {
+        i = i - 1
+        putc(load8(dec_buf + i))
+    }
+}
+
+// Core 1: checksum a fixed buffer, publish it, tick. The checksum is the state
+// RUNSTALL must not disturb; the tick is how core 0 observes progress. Nothing
+// here polls a mode word — under this design core 1 never needs to be told
+// anything, which is the whole point of parking it from the outside.
+fn core1_entry() {
+    EspSmpDport.appcpu_ctrl_d = 0
+    loop { if vload32(c1_ready) != 0 { break } }
+    u32 p = c1_buf
+    loop {
+        u32 i = 0
+        u32 s = 0
+        while i < 32 {
+            s = s + load8(p + i)
+            i = i + 1
+        }
+        vstore32(c1_sum, s)
+        vstore32(c1_tick, vload32(c1_tick) + 1)
+    }
+}
+
+fn appcpu_runstall(u32 on) {
+    if on != 0 {
+        EspSmpDport.appcpu_ctrl_c = EspSmpDport.appcpu_ctrl_c | 1
+    } else {
+        EspSmpDport.appcpu_ctrl_c = EspSmpDport.appcpu_ctrl_c & 0xFFFFFFFE
+    }
+}
+
+// The core-0 workload the SOLO rows time. Same shape as the elementwise NN
+// kernels: read one buffer, write another.
+fn solo_work(u32 reps) -> u32 {
+    u32 p = buf_a
+    u32 q = buf_b
+    u32 r = 0
+    u32 a = 0
+    while r < reps {
+        u32 i = 0
+        while i < 16384 {
+            u8 v = load8(p + i)
+            store8(q + i, v + 1)
+            a = a + v
+            i = i + 1
+        }
+        r = r + 1
+    }
+    return a
+}
+
+// Burn core-0 cycles without touching anything core 1 cares about.
+fn spin_cycles(u32 n) -> u32 {
+    u32 i = 0
+    u32 a = 1
+    while i < n {
+        a = a + i
+        i = i + 1
+    }
+    return a
+}
+
+static u32 PAIRS = 1000
+
+// PAIR, measured against an empty loop of the same trip count so the loop
+// itself is subtracted rather than blamed on the DPORT writes.
+fn measure_pair(u32 tag) {
+    u32 e0 = park_ccount()
+    u32 sink = spin_cycles(PAIRS)
+    u32 e1 = park_ccount()
+
+    u32 t0 = park_ccount()
+    u32 i = 0
+    while i < PAIRS {
+        appcpu_runstall(1)
+        appcpu_runstall(0)
+        i = i + 1
+    }
+    u32 t1 = park_ccount()
+
+    u32 empty = (e1 - e0) & 0xFFFFFFFF
+    u32 both = (t1 - t0) & 0xFFFFFFFF
+    puts(tag)
+    puts(" PAIR_TOTAL ") putu32(both)
+    puts(" EMPTY ")      putu32(empty)
+    puts(" PER_PAIR ")   putu32(((both - empty) & 0xFFFFFFFF) / PAIRS)
+    puts(" SINK ")       putu32(sink)
+    puts("\r\n")
+}
+
+fn main() {
+    u32 clkrc = esp32_clk_cpu_pll(240)
+    puts("CLK ") putu32(clkrc) puts("\r\n")
+
+    u32 i = 0
+    while i < 16384 {
+        store8(buf_a + i, i & 0xFF)
+        store8(buf_b + i, 0)
+        i = i + 1
+    }
+    i = 0
+    while i < 32 {
+        store8(c1_buf + i, i + 1)
+        i = i + 1
+    }
+    // 1+2+...+32 == 528. Core 1 must still be producing exactly this after
+    // every stall/unstall pair below.
+    puts("EXPECT_CHK 528\r\n")
+
+    vstore32(c1_ready, 0)
+    vstore32(c1_tick, 0)
+    vstore32(c1_sum, 0)
+
+    // The DPORT write cost with no second core in existence — the floor the
+    // released-core number is compared against.
+    measure_pair("COLD")
+
+    // Baseline solo work with core 1 still in reset.
+    u32 z0 = park_ccount()
+    u32 zs = solo_work(8)
+    u32 z1 = park_ccount()
+    puts("BASE SOLO ") putu32((z1 - z0) & 0xFFFFFFFF)
+    puts(" SINK ") putu32(zs) puts("\r\n")
+
+    esp32_appcpu_start(fn_addr("core1_entry"))
+    vstore32(c1_ready, 1)
+    loop { if vload32(c1_tick) != 0 { break } }
+    puts("core 1 alive\r\n")
+
+    measure_pair("HOT")
+    puts("CHK ") putu32(vload32(c1_sum)) puts("\r\n")
+
+    // Cycles per core-1 tick, so LEAK can be read as a time and not just a
+    // count. Measured with core 1 free-running.
+    u32 k0 = vload32(c1_tick)
+    u32 p0 = park_ccount()
+    u32 ps = spin_cycles(400000)
+    u32 p1 = park_ccount()
+    u32 k1 = vload32(c1_tick)
+    puts("TICK_CYC ") putu32(((p1 - p0) & 0xFFFFFFFF) / ((k1 - k0) & 0xFFFFFFFF))
+    puts(" TICKS ") putu32((k1 - k0) & 0xFFFFFFFF)
+    puts(" SINK ") putu32(ps) puts("\r\n")
+
+    // The three per-round numbers, repeated — the board is phase-locked, so a
+    // single WAKE is one interleaving and not a distribution.
+    u32 pass = 0
+    while pass < 8 {
+        // LEAK: ticks that land after the stall write has already returned.
+        appcpu_runstall(1)
+        u32 l0 = vload32(c1_tick)
+        u32 burn = spin_cycles(200000)
+        u32 l1 = vload32(c1_tick)
+
+        // WAKE: from the un-stall write to core 1's first observable progress.
+        u32 w0 = park_ccount()
+        appcpu_runstall(0)
+        loop { if vload32(c1_tick) != l1 { break } }
+        u32 w1 = park_ccount()
+
+        // SOLO, both ways round, same work, same image, back to back.
+        u32 a0 = park_ccount()
+        u32 sa = solo_work(8)
+        u32 a1 = park_ccount()
+
+        appcpu_runstall(1)
+        u32 b0 = park_ccount()
+        u32 sb = solo_work(8)
+        u32 b1 = park_ccount()
+        appcpu_runstall(0)
+
+        puts("PASS ") putu32(pass)
+        puts(" LEAK ")        putu32((l1 - l0) & 0xFFFFFFFF)
+        puts(" WAKE ")        putu32((w1 - w0) & 0xFFFFFFFF)
+        puts(" SOLO_HOT ")    putu32((a1 - a0) & 0xFFFFFFFF)
+        puts(" SOLO_PARKED ") putu32((b1 - b0) & 0xFFFFFFFF)
+        puts(" CHK ")         putu32(vload32(c1_sum))
+        puts(" SINK ")        putu32(((sa + sb) + burn) & 0xFFFFFFFF)
+        puts("\r\n")
+        pass = pass + 1
+    }
+
+    puts("FINAL CHK ") putu32(vload32(c1_sum))
+    puts(" TICKS ") putu32(vload32(c1_tick))
+    puts("\r\n")
+    loop { }
+}
