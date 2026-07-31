@@ -848,6 +848,37 @@ fn nn_conv2d_int8(u32 in_p, u32 in_h, u32 in_w, u32 in_c, i32 in_zp,
                   u32 stride_h, u32 stride_w, u32 pad_h, u32 pad_w,
                   i32 act_min, i32 act_max) {
     u32 out_h = nn_out_dim(in_h, kh, stride_h, pad_h)
+    nn_conv2d_int8_rows(in_p, in_h, in_w, in_c, in_zp,
+                        w_p, kh, kw,
+                        bias_p, mult_p, shift_p, q_stride,
+                        out_p, out_c, out_zp,
+                        stride_h, stride_w, pad_h, pad_w,
+                        act_min, act_max, 0, out_h)
+}
+
+// Row-range variant: the same nest, bounded to output rows [oy_lo, oy_hi) so a
+// caller can hand each core a disjoint horizontal band of the same output.
+//
+// EVERY hoist below is preserved verbatim, and partitioning on `oy` is exactly
+// why it can be: `in_row_bytes`/`k_row`/`k_oc` depend only on the shape,
+// `ki_lo`/`ki_hi`/`iy0` only on the current `oy`, and `kj_lo`/`kj_hi`/`ix0`/
+// `in_base`/`w_base` only on the current `(oy, ox)`. A band is a contiguous run
+// of whole output rows, so each core recomputes precisely the values it needs
+// and each stays amortised over the whole `out_c` run. Do not move any of them
+// inward.
+//
+// This is the ONE kernel here that needs a pointer offset. It does not address
+// the output from `oy`; it walks a single running pointer `op_run` on the
+// invariant that the output is written strictly in order, and that order starts
+// at row `oy_lo` — hence the re-base below. The other spatial kernels compute
+// an absolute address from `oy` and must NOT be offset.
+fn nn_conv2d_int8_rows(u32 in_p, u32 in_h, u32 in_w, u32 in_c, i32 in_zp,
+                       u32 w_p, u32 kh, u32 kw,
+                       u32 bias_p, u32 mult_p, u32 shift_p, u32 q_stride,
+                       u32 out_p, u32 out_c, i32 out_zp,
+                       u32 stride_h, u32 stride_w, u32 pad_h, u32 pad_w,
+                       i32 act_min, i32 act_max,
+                       u32 oy_lo, u32 oy_hi) {
     u32 out_w = nn_out_dim(in_w, kw, stride_w, pad_w)
     // (The signed ih_i/iw_i/pad_*_i copies the naive form needed for its
     // per-tap bounds tests are gone: nn_tap_lo/nn_tap_hi do that in u32.)
@@ -859,10 +890,11 @@ fn nn_conv2d_int8(u32 in_p, u32 in_h, u32 in_w, u32 in_c, i32 in_zp,
     u32 in_row_bytes = in_w * in_c
     u32 k_row = kw * in_c
     u32 k_oc = kh * k_row
-    u32 op_run = out_p                 // the output is written strictly in order
+    // The output is written strictly in order, from the first byte of row oy_lo.
+    u32 op_run = out_p + ((oy_lo * out_w) * out_c)
 
-    u32 oy = 0
-    while oy < out_h {
+    u32 oy = oy_lo
+    while oy < oy_hi {
         // Valid kernel-row range for this output row (see nn_tap_lo/hi).
         u32 ki_lo = nn_tap_lo(oy, stride_h, pad_h, kh)
         u32 ki_hi = nn_tap_hi(oy, stride_h, pad_h, kh, in_h)
@@ -930,6 +962,31 @@ fn nn_depthwise_conv2d_int8(u32 in_p, u32 in_h, u32 in_w, u32 in_c, i32 in_zp,
                             u32 stride_h, u32 stride_w, u32 pad_h, u32 pad_w,
                             u32 depth_mult, i32 act_min, i32 act_max) {
     u32 out_h = nn_out_dim(in_h, kh, stride_h, pad_h)
+    nn_depthwise_conv2d_int8_rows(in_p, in_h, in_w, in_c, in_zp,
+                                  w_p, kh, kw,
+                                  bias_p, mult_p, shift_p, q_stride,
+                                  out_p, out_zp,
+                                  stride_h, stride_w, pad_h, pad_w,
+                                  depth_mult, act_min, act_max, 0, out_h)
+}
+
+// Row-range variant: the same nest, bounded to output rows [oy_lo, oy_hi).
+//
+// Unlike nn_conv2d_int8 this kernel addresses the output ABSOLUTELY from `oy`
+// (`out_p + (((oy * out_w) + ox) * out_c) + oc` below) and derives that stride
+// itself from `in_c * depth_mult`. Bounding the loop is therefore the ENTIRE
+// change — adding an oy_lo offset to `out_p` would double-offset every band.
+//
+// The hoists are untouched and stay valid for the same reason as in conv2d:
+// `in_row_bytes`/`w_row_bytes`/`out_c` depend only on the shape, the tap range
+// only on `oy`, and `in_base`/`w_base` only on `(oy, ox)`.
+fn nn_depthwise_conv2d_int8_rows(u32 in_p, u32 in_h, u32 in_w, u32 in_c, i32 in_zp,
+                                 u32 w_p, u32 kh, u32 kw,
+                                 u32 bias_p, u32 mult_p, u32 shift_p, u32 q_stride,
+                                 u32 out_p, i32 out_zp,
+                                 u32 stride_h, u32 stride_w, u32 pad_h, u32 pad_w,
+                                 u32 depth_mult, i32 act_min, i32 act_max,
+                                 u32 oy_lo, u32 oy_hi) {
     u32 out_w = nn_out_dim(in_w, kw, stride_w, pad_w)
     u32 out_c = in_c * depth_mult
     // Strides, once. A depthwise tap walks the input by in_c per kernel column
@@ -941,8 +998,8 @@ fn nn_depthwise_conv2d_int8(u32 in_p, u32 in_h, u32 in_w, u32 in_c, i32 in_zp,
     u32 in_row_bytes = in_w * in_c
     u32 w_row_bytes = kw * out_c
 
-    u32 oy = 0
-    while oy < out_h {
+    u32 oy = oy_lo
+    while oy < oy_hi {
         u32 ki_lo = nn_tap_lo(oy, stride_h, pad_h, kh)
         u32 ki_hi = nn_tap_hi(oy, stride_h, pad_h, kh, in_h)
         if ki_hi < ki_lo { ki_hi = ki_lo }
@@ -1002,6 +1059,10 @@ fn nn_depthwise_conv2d_int8(u32 in_p, u32 in_h, u32 in_w, u32 in_c, i32 in_zp,
 // 1x1 (pointwise) convolution — stride 1, no padding, output extent equals
 // input extent. Weights are [out_c][1][1][in_c], i.e. a plain [out_c][in_c]
 // matrix, which is why this is also spelled gemm.
+//
+// This is a forwarder, not a kernel, so it needs no `_rows` twin of its own: it
+// inherits conv2d's row bounding directly. A caller that wants a band of a
+// pointwise layer calls nn_conv2d_int8_rows with kh = kw = stride = 1, pad = 0.
 fn nn_pointwise_conv_int8(u32 in_p, u32 in_h, u32 in_w, u32 in_c, i32 in_zp,
                           u32 w_p, u32 bias_p, u32 mult_p, u32 shift_p, u32 q_stride,
                           u32 out_p, u32 out_c, i32 out_zp,
