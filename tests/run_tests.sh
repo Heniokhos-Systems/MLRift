@@ -431,6 +431,81 @@ fn main() { println_str(str_upper("HeLLo 123")) }' "HELLO 123"
 run_test_output "str_replace_basic" 'import "std/string.mlr"
 fn main() { println_str(str_replace("a.b.c.d", ".", "-")) }' "a-b-c-d"
 
+# --- Three verified stdlib crashes (fmt_f64, vec_remove, sqrt_int) ---
+# fmt_f64_pos computed leading_zeros = decimals - frac_len as an unsigned
+# u64. With decimals=0, frac_len is always >= 1 (fmt_dec(0) == "0"), so the
+# subtraction underflowed to ~2^64 and the zero-pad loop wrote far past the
+# alloc(total) buffer -> SIGSEGV on every call. Now decimals==0 skips the
+# fractional section entirely (matches printf "%.0f").
+run_test_output "fmt_f64_zero_decimals" 'import "std/math_float.mlr"
+fn main() { println_str(fmt_f64(int_to_f64(7), 0)) }' "7"
+run_test_output "fmt_f32_zero_decimals" 'import "std/math_float.mlr"
+fn main() { println_str(fmt_f32(f64_to_f32(int_to_f64(7)), 0)) }' "7"
+run_test_output "fmt_f64_zero_decimals_negative" 'import "std/math_float.mlr"
+fn main() { println_str(fmt_f64(int_to_f64(0) - int_to_f64(9), 0)) }' "-9"
+# |value| >= 2^63 saturates f64_to_int, so int_part no longer reconstructs
+# aval's integer part and `frac` can land outside [0,1). frac_len then
+# exceeds `decimals`, and the fractional copy loop wrote past the `total`
+# allocation -> SIGSEGV. Reached via str_to_float since float literals cap
+# at 1e18. Now frac is clamped to [0,1) before use, so this cannot corrupt
+# the heap; the printed value is documented as wrong-but-safe for such
+# out-of-range magnitudes (this does not assert an exact string — only
+# that it terminates cleanly with a nonempty, sane-looking result).
+run_test "fmt_f64_extreme_magnitude_no_crash" 'import "std/math_float.mlr"
+import "std/string.mlr"
+fn main() {
+    f64 v = str_to_float("1e22")
+    u64 s = fmt_f64(v, 12)
+    u64 len = str_len(s)
+    if len > 0 { exit(0) }
+    exit(1)
+}' 0
+# vec_remove(v, idx) computed len - 1 as unsigned. On an empty vec (len==0)
+# this underflows to ~2^64, turning the shift loop's bound into a runaway
+# out-of-bounds read/write -> SIGSEGV. Now a no-op on an empty vec.
+run_test "vec_remove_empty_no_crash" 'import "std/vec.mlr"
+fn main() {
+    u64 v = vec_new()
+    vec_remove(v, 0)
+    exit(42)
+}' 42
+# An out-of-range idx on a non-empty vec did not crash (the shift loop
+# condition `i < len - 1` is false immediately since idx >= len), but it
+# silently decremented the stored length anyway, corrupting the vec even
+# though nothing was actually removed. Now out-of-range idx is a no-op.
+run_test "vec_remove_out_of_range_no_corrupt" 'import "std/vec.mlr"
+fn main() {
+    u64 v = vec_new()
+    vec_push(v, 10)
+    vec_push(v, 20)
+    vec_push(v, 30)
+    vec_remove(v, 99)
+    exit(vec_len(v))
+}' 3
+# sqrt_int(n) seeded y = (x + 1) / 2 with x = n. At n == u64::MAX, x + 1
+# overflows to 0, so y becomes 0; the next iteration then divides n/x by
+# zero -> SIGFPE. Now the one x for which x+1 overflows (u64::MAX) is
+# special-cased with the exact value the addition would have produced,
+# leaving every other n bit-for-bit unchanged. Verified against Python 3's
+# math.isqrt across a range spanning small values, both sides of 2^32,
+# both sides of 2^63, and both sides of 2^64 (isqrt(2^64-1) == 4294967295).
+run_test "sqrt_int_max_no_crash_matches_isqrt" 'import "std/math.mlr"
+fn main() {
+    u64 fails = 0
+    if sqrt_int(0) != 0 { fails = fails + 1 }
+    if sqrt_int(1) != 1 { fails = fails + 1 }
+    if sqrt_int(2) != 1 { fails = fails + 1 }
+    if sqrt_int(4) != 2 { fails = fails + 1 }
+    if sqrt_int(99) != 9 { fails = fails + 1 }
+    if sqrt_int(4294967296) != 65536 { fails = fails + 1 }
+    if sqrt_int(4294967295) != 65535 { fails = fails + 1 }
+    if sqrt_int(9223372036854775808) != 3037000499 { fails = fails + 1 }
+    if sqrt_int(9223372036854775807) != 3037000499 { fails = fails + 1 }
+    if sqrt_int(18446744073709551614) != 4294967295 { fails = fails + 1 }
+    if sqrt_int(0xFFFFFFFFFFFFFFFF) != 4294967295 { fails = fails + 1 }
+    exit(fails)
+}' 0
+
 # --- str_to_float exponent handling ---
 # Negative exponents used to multiply by 1/10 once per digit. 1/10 is inexact
 # in binary, so the error compounded: one multiply survived, two did not.
