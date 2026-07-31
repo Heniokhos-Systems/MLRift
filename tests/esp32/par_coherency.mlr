@@ -1,0 +1,67 @@
+// Stage 4, Task 1: coherency spike for two-core disjoint store8/load8 writes.
+//
+// The design for parallelising int8 NN inference across both ESP32 cores
+// assumes two cores can write disjoint byte ranges of one buffer and see
+// each other's writes after a barrier. That is an assumption about this
+// chip's memory model, and it must be proven with the SAME access pattern
+// std/nn_int8.mlr's kernels actually use — plain store8/load8 — not
+// vstore32 (which is only used here for the two handshake flags).
+//
+// The obvious version of this test is vacuous: if core 0 fills the whole
+// buffer to compute a reference, and then both cores refill their halves
+// with the same patterns, every byte already holds the expected value and
+// the totals match even if core 1 never ran, or every cross-core write
+// were invisible. To rule that out, both passes zero the buffer first, so
+// a dead core 1 (or an invisible write) leaves core 1's half at 0 instead
+// of its pattern, and the checksums diverge.
+import "../../std/esp32_clk.mlr"
+import "../../std/esp32_smp.mlr"
+import "../../std/esp32_uart.mlr"
+
+static u8[2048] buf
+static u32[1] c1_go
+static u32[1] c1_done
+
+// Distinct patterns per half, so a half that was never written sums differently.
+fn fill(u32 base, u32 lo, u32 hi, u32 seed) {
+    u32 i = lo
+    while i < hi { store8(base + i, (i * 31 + seed) & 0xFF)  i = i + 1 }
+    return
+}
+fn sum_all(u32 base, u32 n) -> u32 {
+    u32 s = 0
+    u32 i = 0
+    while i < n { s = s + load8(base + i)  i = i + 1 }
+    return s
+}
+fn zero(u32 base, u32 n) { u32 i = 0  while i < n { store8(base + i, 0)  i = i + 1 } return }
+
+fn core1_entry() {
+    EspSmpDport.appcpu_ctrl_d = 0          // disarm; every dual-core file does this
+    loop { if vload32(c1_go) != 0 { break } }
+    fill(buf, 1024, 2048, 77)              // core 1 writes ONLY the high half
+    vstore32(c1_done, 1)
+    loop { }
+}
+
+fn main() {
+    u32 clkrc = esp32_clk_cpu_pll(240)     // MUST be first, before any putc
+    // Pass 1 — single-core reference, both halves, same patterns.
+    zero(buf, 2048)
+    fill(buf, 0, 1024, 11)
+    fill(buf, 1024, 2048, 77)
+    u32 ref = sum_all(buf, 2048)
+    // Pass 2 — zero, then let the two cores write one half each.
+    zero(buf, 2048)
+    esp32_appcpu_start(fn_addr("core1_entry"))
+    fill(buf, 0, 1024, 11)                 // core 0 writes ONLY the low half
+    vstore32(c1_go, 1)
+    loop { if vload32(c1_done) != 0 { break } }
+    u32 got = sum_all(buf, 2048)
+    loop {
+        puts("REF ") puthex32(ref) puts(" GOT ") puthex32(got)
+        if got == ref { puts(" MATCH") } else { puts(" MISMATCH") }
+        puts("\r\n")
+        delay()
+    }
+}
