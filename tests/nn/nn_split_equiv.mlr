@@ -1,0 +1,400 @@
+// tests/nn/nn_split_equiv.mlr — host-only SUB-RANGE equivalence check for the
+// partitioned kernel variants in std/nn_int8.mlr.
+//
+// WHY THIS EXISTS, and what it catches that nothing else does.
+//
+// tests/nn/run_nn_tests.sh proves the kernels are byte-exact against an
+// independent Python reference — but it only ever calls them over their FULL
+// range. A `_rows`/`_range` variant that is correct for [0, h) yet broken for
+// some proper sub-range (a hoisted value that silently assumes oy == 0, an
+// off-by-one at a band boundary, an output pointer that gets double-offset)
+// passes every existing gate and first misbehaves once the work is actually
+// split across two cores — on silicon, where diagnosis is far harder.
+//
+// The check is the algebraic identity the whole parallel decomposition rests
+// on: for every split point k,
+//
+//     kernel(0, h)  ==  kernel(0, k) followed by kernel(k, h)
+//
+// byte for byte over the entire output. Run the full range into buffer A, run
+// the two bands into buffer B, compare. Nothing here needs a board, a model,
+// or Python.
+//
+// Splits are tested EXHAUSTIVELY: every k in [0, h] for every configuration,
+// which subsumes "use an odd split" — it covers odd k, k != h/2, and the two
+// degenerate empty-band cases k == 0 and k == h. Several configurations are
+// chosen to have an ODD extent, because the smoke model's out_h values are all
+// even (8, 4, 4, 8) and a bug that only shows when a split lands mid-something
+// would otherwise never be exercised.
+//
+// Buffer B is pre-poisoned before the split runs, so a variant that writes
+// nothing at all is a mismatch rather than an accidental pass.
+
+import "../../std/nn_int8.mlr"
+
+static u8[1024] nn_se_in
+static u8[1024] nn_se_in2
+static u8[1024] nn_se_a
+static u8[1024] nn_se_b
+static u8[256]  nn_se_lut
+static u8[2]    nn_se_cbuf
+static u32 nn_se_seed = 0
+static u32 nn_se_fails = 0
+static u32 nn_se_checks = 0
+
+// The deliberate-failure switch. Passing any argv[1] shifts the SECOND band's
+// start up by one, so exactly one row/element of every split is left unwritten.
+// That MUST make this program report mismatches and exit non-zero. A harness
+// that has never been observed to fail proves nothing, so run_nn_tests.sh runs
+// the program twice — clean, then perturbed — and only reports PASS when the
+// clean run is green AND the perturbed run is red.
+static u32 nn_se_perturb = 0
+
+// Opt in to the compiler's argc/argv plumbing: declaring these two names makes
+// main()'s prologue populate them.
+static u64 cli_argc = 0
+static u64 cli_argv = 0
+
+
+// ---------------------------------------------------------------------------
+// Reporting
+// ---------------------------------------------------------------------------
+
+fn nn_se_putc(u8 c) {
+    u32 p = nn_se_cbuf
+    store8(p, c)
+    store8(p + 1, 0)
+    print_str(p)
+}
+
+fn nn_se_emit_u32(u32 v) {
+    if v == 0 {
+        nn_se_putc(48)
+        return
+    }
+    u32 div = 1000000000
+    u32 started = 0
+    while div > 0 {
+        u32 d = (v / div) % 10
+        if d != 0 { started = 1 }
+        if started != 0 { nn_se_putc(d + 48) }
+        div = div / 10
+    }
+}
+
+// Compare the two buffers over `n` bytes and report the first divergence.
+fn nn_se_cmp(u32 n, u32 k) {
+    nn_se_checks = nn_se_checks + 1
+    u32 a = nn_se_a
+    u32 b = nn_se_b
+    u32 i = 0
+    while i < n {
+        if load8(a + i) != load8(b + i) {
+            nn_se_fails = nn_se_fails + 1
+            print_str("  MISMATCH split k=")
+            nn_se_emit_u32(k)
+            print_str(" at byte ")
+            nn_se_emit_u32(i)
+            print_str(": full=")
+            nn_se_emit_u32(load8(a + i) & 0xFF)
+            print_str(" split=")
+            nn_se_emit_u32(load8(b + i) & 0xFF)
+            print_str("\n")
+            return
+        }
+        i = i + 1
+    }
+}
+
+// The second band's start. Identical to `k` unless the deliberate-failure
+// switch is on, in which case it skips one row/element.
+fn nn_se_pk(u32 k, u32 h) -> u32 {
+    if nn_se_perturb != 0 {
+        if k < h { return k + 1 }
+    }
+    return k
+}
+
+
+// ---------------------------------------------------------------------------
+// Deterministic input
+// ---------------------------------------------------------------------------
+
+fn nn_se_r32() -> u32 {
+    u32 s = nn_se_seed
+    s = ((s * 1103515245) + 12345) & 0xFFFFFFFF
+    nn_se_seed = s
+    return s
+}
+
+fn nn_se_fill(u32 p, u32 n) {
+    u32 i = 0
+    while i < n {
+        u32 v = (nn_se_r32() >> 16) & 0xFF
+        store8(p + i, v)
+        i = i + 1
+    }
+}
+
+// Poison a buffer with a value the kernels are very unlikely to produce
+// everywhere, so "wrote nothing" cannot masquerade as "wrote the right thing".
+fn nn_se_poison(u32 p, u32 n) {
+    u32 i = 0
+    while i < n {
+        store8(p + i, 0x5A)
+        i = i + 1
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Spatial kernels — split on output ROWS
+// ---------------------------------------------------------------------------
+
+fn nn_se_maxpool(u32 in_h, u32 in_w, u32 in_c,
+                 u32 kh, u32 kw, u32 sh, u32 sw, u32 ph, u32 pw) {
+    u32 ip = nn_se_in
+    u32 a = nn_se_a
+    u32 b = nn_se_b
+    nn_se_fill(ip, in_h * in_w * in_c)
+    u32 out_h = nn_out_dim(in_h, kh, sh, ph)
+    u32 out_w = nn_out_dim(in_w, kw, sw, pw)
+    u32 obytes = (out_h * out_w) * in_c
+
+    nn_se_poison(a, obytes)
+    nn_maxpool_int8(ip, in_h, in_w, in_c, a, kh, kw, sh, sw, ph, pw, 0 - 128, 127)
+
+    u32 k = 0
+    while k <= out_h {
+        nn_se_poison(b, obytes)
+        u32 k2 = nn_se_pk(k, out_h)
+        nn_maxpool_int8_rows(ip, in_h, in_w, in_c, b, kh, kw, sh, sw, ph, pw,
+                             0 - 128, 127, 0, k)
+        nn_maxpool_int8_rows(ip, in_h, in_w, in_c, b, kh, kw, sh, sw, ph, pw,
+                             0 - 128, 127, k2, out_h)
+        nn_se_cmp(obytes, k)
+        k = k + 1
+    }
+}
+
+fn nn_se_avgpool(u32 in_h, u32 in_w, u32 in_c,
+                 u32 kh, u32 kw, u32 sh, u32 sw, u32 ph, u32 pw) {
+    u32 ip = nn_se_in
+    u32 a = nn_se_a
+    u32 b = nn_se_b
+    nn_se_fill(ip, in_h * in_w * in_c)
+    u32 out_h = nn_out_dim(in_h, kh, sh, ph)
+    u32 out_w = nn_out_dim(in_w, kw, sw, pw)
+    u32 obytes = (out_h * out_w) * in_c
+
+    nn_se_poison(a, obytes)
+    nn_avgpool_int8(ip, in_h, in_w, in_c, a, kh, kw, sh, sw, ph, pw, 0 - 128, 127)
+
+    u32 k = 0
+    while k <= out_h {
+        nn_se_poison(b, obytes)
+        u32 k2 = nn_se_pk(k, out_h)
+        nn_avgpool_int8_rows(ip, in_h, in_w, in_c, b, kh, kw, sh, sw, ph, pw,
+                             0 - 128, 127, 0, k)
+        nn_avgpool_int8_rows(ip, in_h, in_w, in_c, b, kh, kw, sh, sw, ph, pw,
+                             0 - 128, 127, k2, out_h)
+        nn_se_cmp(obytes, k)
+        k = k + 1
+    }
+}
+
+fn nn_se_resize(u32 in_h, u32 in_w, u32 in_c, u32 scale_h, u32 scale_w) {
+    u32 ip = nn_se_in
+    u32 a = nn_se_a
+    u32 b = nn_se_b
+    nn_se_fill(ip, in_h * in_w * in_c)
+    u32 out_h = in_h * scale_h
+    u32 out_w = in_w * scale_w
+    u32 obytes = (out_h * out_w) * in_c
+
+    nn_se_poison(a, obytes)
+    nn_resize_nearest_int8(ip, in_h, in_w, in_c, a, scale_h, scale_w)
+
+    u32 k = 0
+    while k <= out_h {
+        nn_se_poison(b, obytes)
+        u32 k2 = nn_se_pk(k, out_h)
+        nn_resize_nearest_int8_rows(ip, in_h, in_w, in_c, b, scale_h, scale_w, 0, k)
+        nn_resize_nearest_int8_rows(ip, in_h, in_w, in_c, b, scale_h, scale_w, k2, out_h)
+        nn_se_cmp(obytes, k)
+        k = k + 1
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Elementwise kernels (Task 3) — split on ELEMENT count
+// ---------------------------------------------------------------------------
+
+fn nn_se_relu(u32 n) {
+    u32 ip = nn_se_in
+    u32 a = nn_se_a
+    u32 b = nn_se_b
+    nn_se_fill(ip, n)
+    i32 zp = 0 - 7
+
+    // ReLU is in place, so each side needs its own fresh copy of the input.
+    nn_copy_i8(a, ip, n)
+    nn_relu_int8(a, n, zp)
+
+    u32 k = 0
+    while k <= n {
+        nn_se_poison(b, n)
+        nn_copy_i8(b, ip, n)
+        u32 k2 = nn_se_pk(k, n)
+        nn_relu_int8_range(b, n, zp, 0, k)
+        nn_relu_int8_range(b, n, zp, k2, n - k2)
+        nn_se_cmp(n, k)
+        k = k + 1
+    }
+}
+
+fn nn_se_copy(u32 n) {
+    u32 ip = nn_se_in
+    u32 a = nn_se_a
+    u32 b = nn_se_b
+    nn_se_fill(ip, n)
+
+    nn_se_poison(a, n)
+    nn_copy_i8(a, ip, n)
+
+    u32 k = 0
+    while k <= n {
+        nn_se_poison(b, n)
+        u32 k2 = nn_se_pk(k, n)
+        nn_copy_i8_range(b, ip, n, 0, k)
+        nn_copy_i8_range(b, ip, n, k2, n - k2)
+        nn_se_cmp(n, k)
+        k = k + 1
+    }
+}
+
+fn nn_se_add(u32 n) {
+    u32 ip = nn_se_in
+    u32 ip2 = nn_se_in2
+    u32 a = nn_se_a
+    u32 b = nn_se_b
+    nn_se_fill(ip, n)
+    nn_se_fill(ip2, n)
+    i32 azp = 0 - 3
+    i32 bzp = 5
+    i32 ozp = 0 - 11
+    i32 am = 0x50000000
+    i32 bm = 0x6A000000
+    i32 om = 0x40000000
+    i32 ash = 0 - 3
+    i32 bsh = 0 - 4
+    i32 osh = 0 - 20
+
+    nn_se_poison(a, n)
+    nn_add_int8(ip, azp, am, ash, ip2, bzp, bm, bsh, a, ozp, om, osh,
+                n, 20, 0 - 128, 127)
+
+    u32 k = 0
+    while k <= n {
+        nn_se_poison(b, n)
+        u32 k2 = nn_se_pk(k, n)
+        nn_add_int8_range(ip, azp, am, ash, ip2, bzp, bm, bsh, b, ozp, om, osh,
+                          n, 20, 0 - 128, 127, 0, k)
+        nn_add_int8_range(ip, azp, am, ash, ip2, bzp, bm, bsh, b, ozp, om, osh,
+                          n, 20, 0 - 128, 127, k2, n - k2)
+        nn_se_cmp(n, k)
+        k = k + 1
+    }
+}
+
+fn nn_se_sigmoid(u32 n) {
+    u32 ip = nn_se_in
+    u32 a = nn_se_a
+    u32 b = nn_se_b
+    u32 lp = nn_se_lut
+    nn_se_fill(ip, n)
+    // A non-trivial, non-identity table so a dropped element cannot coincide
+    // with the value it replaced.
+    u32 t = 0
+    while t < 256 {
+        store8(lp + t, ((t * 7) + 13) & 0xFF)
+        t = t + 1
+    }
+
+    nn_se_poison(a, n)
+    nn_sigmoid_lut_int8(ip, n, lp, a)
+
+    u32 k = 0
+    while k <= n {
+        nn_se_poison(b, n)
+        u32 k2 = nn_se_pk(k, n)
+        nn_sigmoid_lut_int8_range(ip, n, lp, b, 0, k)
+        nn_sigmoid_lut_int8_range(ip, n, lp, b, k2, n - k2)
+        nn_se_cmp(n, k)
+        k = k + 1
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Cases
+// ---------------------------------------------------------------------------
+
+fn nn_se_run() {
+    nn_se_seed = 12345
+
+    // --- spatial: split on output rows -------------------------------------
+    // out_h is noted per case; several are ODD on purpose.
+    print_str("maxpool\n")
+    nn_se_maxpool(7, 5, 2, 2, 2, 2, 2, 0, 0)      // out_h 3 (odd)
+    nn_se_maxpool(7, 7, 3, 3, 3, 2, 2, 1, 1)      // out_h 4, padded
+    nn_se_maxpool(9, 4, 1, 3, 3, 1, 1, 1, 1)      // out_h 9 (odd), stride 1
+    nn_se_maxpool(5, 5, 2, 3, 3, 2, 2, 1, 1)      // out_h 3 (odd), padded
+    nn_se_maxpool(4, 4, 2, 4, 4, 4, 4, 0, 0)      // out_h 1, whole-window
+
+    print_str("avgpool\n")
+    nn_se_avgpool(7, 5, 2, 2, 2, 2, 2, 0, 0)
+    nn_se_avgpool(7, 7, 3, 3, 3, 2, 2, 1, 1)
+    nn_se_avgpool(9, 4, 1, 3, 3, 1, 1, 1, 1)
+    nn_se_avgpool(5, 5, 2, 3, 3, 2, 2, 1, 1)
+    nn_se_avgpool(4, 4, 2, 4, 4, 4, 4, 0, 0)
+
+    print_str("resize_nearest\n")
+    nn_se_resize(3, 2, 2, 3, 2)                   // out_h 9 (odd)
+    nn_se_resize(2, 3, 1, 2, 1)                   // out_h 4
+    nn_se_resize(5, 2, 3, 1, 2)                   // out_h 5 (odd), scale_h 1
+    nn_se_resize(1, 1, 4, 7, 7)                   // out_h 7 (odd), degenerate
+
+    // --- elementwise: split on element count (Task 3) -----------------------
+    print_str("elementwise\n")
+    nn_se_relu(37)                                // odd, prime
+    nn_se_relu(16)
+    nn_se_relu(1)
+    nn_se_copy(37)
+    nn_se_copy(16)
+    nn_se_copy(1)
+    nn_se_add(37)
+    nn_se_add(16)
+    nn_se_add(1)
+    nn_se_sigmoid(37)
+    nn_se_sigmoid(16)
+    nn_se_sigmoid(1)
+}
+
+fn main() {
+    if cli_argc > 1 { nn_se_perturb = 1 }
+    nn_se_run()
+    print_str("checks=")
+    nn_se_emit_u32(nn_se_checks)
+    print_str(" fails=")
+    nn_se_emit_u32(nn_se_fails)
+    print_str("\n")
+    if nn_se_fails != 0 { exit(1) }
+    // A harness that silently ran nothing must not report success.
+    if nn_se_checks < 200 {
+        print_str("ERROR: too few comparisons — harness did not run\n")
+        exit(2)
+    }
+    exit(0)
+}

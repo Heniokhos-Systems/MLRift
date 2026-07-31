@@ -174,6 +174,40 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 5b. Sub-range equivalence of the partitioned kernel variants
+# ---------------------------------------------------------------------------
+# Everything above only ever calls the kernels over their FULL range, so a
+# `_rows`/`_range` variant that is wrong for a proper SUB-range passes all of
+# it and first misbehaves once the work is actually split across two cores.
+# tests/nn/nn_split_equiv.mlr closes that gap on the host: for every split
+# point k it asserts kernel(0,h) == kernel(0,k) then kernel(k,h), byte for
+# byte, over every converted kernel.
+#
+# The harness is run TWICE. The second run passes an argument that deliberately
+# shifts one band boundary, which must make it fail — a check that has never
+# been observed failing proves nothing, so a perturbed run that comes back
+# green means the harness itself is broken and this reports FAIL.
+if ! $MLRC --arch="$(uname -m)" "$DIR/nn_split_equiv.mlr" -o "$TMP/nn_se" \
+        > "$TMP/sebuild.txt" 2>&1; then
+    echo "FAIL: nn_split_equiv (build failed)"
+    head -5 "$TMP/sebuild.txt"
+else
+    chmod +x "$TMP/nn_se"
+    SE_CLEAN_OUT=$("$TMP/nn_se" 2>&1); SE_CLEAN_RC=$?
+    "$TMP/nn_se" perturb > "$TMP/se_perturb.txt" 2>&1; SE_DIRTY_RC=$?
+    SE_N=$(printf '%s\n' "$SE_CLEAN_OUT" | sed -n 's/^checks=\([0-9]*\).*/\1/p')
+    if [ "$SE_CLEAN_RC" != 0 ]; then
+        echo "FAIL: nn_split_equiv (a split differs from the full range)"
+        printf '%s\n' "$SE_CLEAN_OUT" | head -10
+    elif [ "$SE_DIRTY_RC" = 0 ]; then
+        echo "FAIL: nn_split_equiv (negative control passed — the harness cannot detect a bad band)"
+    else
+        echo "PASS: nn_split_equiv ($SE_N splits byte-identical to the full range;" \
+             "perturbed control correctly fails)"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # 6. The model runner (std/nn_model.mlr) on a synthetic .krnn
 # ---------------------------------------------------------------------------
 # tests/nn/nn_model_ref.py builds a small model covering every opcode and
