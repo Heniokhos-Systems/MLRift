@@ -1,0 +1,400 @@
+// tests/nn/nn_par_esp32.mlr — Stage 4, Task 5: TWO-CORE model inference on
+// real ESP32 silicon, elementwise ops only.
+//
+// This is nn_model_esp32.mlr with a second core attached. Core 0 walks the
+// layer table exactly as std/nn_model.mlr's nn_model_run_prefix does; for a
+// layer on the opt-in split list it publishes a work descriptor, runs the low
+// half itself and lets core 1 run the high half; for anything else it runs the
+// whole layer alone. Both cores hit ONE barrier per layer either way.
+//
+// Build + flash (the .krnn is what selects the model):
+//   mlrc --arch=xtensa --freestanding --target=esp32 \
+//        --model smoke.krnn tests/nn/nn_par_esp32.mlr -o par.bin
+//   ~/esp32_flash.sh par.bin && ~/esp32_run.sh 90 out.txt
+//
+// ─────────────────────────────────────────────────────────────────────────
+// THE INVARIANT, AND WHY IT IS STRUCTURAL RATHER THAN REMEMBERED
+// ─────────────────────────────────────────────────────────────────────────
+// For EVERY layer, both cores call par_barrier() exactly once. Not once per
+// SPLIT layer — once per layer, including op 0 (NOP), which nn_model_exec
+// returns from immediately without touching a byte.
+//
+// If one core ever skipped a barrier the two would desynchronise by one round
+// and every subsequent layer would read half-written data. That does not
+// present as a sync bug; it presents as numbers that are wrong in a way that
+// looks like memory corruption, on a board with no debugger.
+//
+// So the barrier here is NOT inside the split branch. In nn_par_layers it is
+// the last statement of the loop body, outside the if/else, and in
+// core1_entry it is the last statement of the take loop, outside the
+// `if kind`. A new opcode branch cannot forget it, because there is nowhere
+// to put a branch that skips it. par_publish is placed the same way: exactly
+// one call, ahead of the branch, so "publish once per barrier" — the rule
+// std/esp32_par.mlr's single-slot descriptor depends on — is also structural.
+//
+// A non-splittable layer therefore parks core 1 AT THE BARRIER. Core 1 still
+// takes a fresh descriptor for that round; it just gets PARK and does nothing.
+// It is never left spinning on a stale one.
+//
+// ─────────────────────────────────────────────────────────────────────────
+// WHAT MAKES THE SPLIT SAFE
+// ─────────────────────────────────────────────────────────────────────────
+//   * Disjoint bytes. The four opt-in ops (4 RELU, 6 ADD, 8 SIGMOID_LUT,
+//     9 COPY) are per-element maps over one flat index space, so [0, mid) and
+//     [mid, n) name disjoint output bytes. tests/esp32/par_coherency.mlr
+//     proved on this chip that two cores writing disjoint byte ranges with
+//     plain store8 are coherent across a handshake.
+//   * Correct bands. tests/nn/nn_split_equiv.mlr sweeps EVERY split point on
+//     the host, against both the kernels and nn_model_exec_range itself. If
+//     silicon disagrees with the host, the bug is here, in the wiring — that
+//     is the entire point of having proven the kernels separately first.
+//   * Ordering. Layer i's inputs are layer i-1's outputs, and the barrier at
+//     the end of round i-1 is what makes both halves of i-1 visible before
+//     either core starts i.
+//
+// ─────────────────────────────────────────────────────────────────────────
+// IT MEASURES ITSELF: SAME BINARY, PARALLELISM OFF THEN ON
+// ─────────────────────────────────────────────────────────────────────────
+// Each iteration runs the model TWICE — once with par_on = 0, so every layer
+// publishes PARK and core 0 does all the work, then once with par_on = 1 —
+// and prints CCOUNT cycles for both plus the graph outputs for both. Same
+// image, same clock, same cache state, back to back, so the two numbers are
+// directly comparable and neither can be blamed on a build difference.
+//
+// Printing BOTH output blocks also makes byte-exactness self-checking on the
+// board: the serial block and the parallel block must be identical to each
+// other AND to tests/nn/nn_model_ref.py.
+//
+// Three cycle counts are reported per run:
+//   TOT  the whole layer loop, barriers and publishes included
+//   EW   time inside the four opt-in ops only — core 0's share of it. In the
+//        serial run this is the ENTIRE elementwise cost, i.e. the numerator of
+//        the Amdahl bound on what any elementwise-only split can ever win.
+//   BAR  time inside par_barrier(), summed over every layer. This is the price
+//        of the invariant, and it is paid on non-splittable layers too.
+//
+// ─────────────────────────────────────────────────────────────────────────
+// The rest — the model at 0x3FFB0000, the two UART device blocks (errata
+// CPU-3.3), the PLL-before-first-putc rule, the run-forever loop for a board
+// with no DTR/RTS — is unchanged from nn_model_esp32.mlr, which documents all
+// four at length.
+import "nn_model_core.mlr"
+import "../../std/esp32_clk.mlr"
+import "../../std/esp32_smp.mlr"
+import "../../std/esp32_par.mlr"
+
+// UART_STATUS_REG — APB. Poll only; never write the FIFO through this block.
+device UartStatus at 0x3FF40000 {
+    status at 0x1C : u32
+}
+
+// UART0 TX FIFO — AHB mirror. Errata CPU-3.3: the byte MUST go here.
+device UartFifo at 0x60000000 {
+    fifo at 0x00 : u32
+}
+
+fn nn_mt_putc(u8 c) {
+    // ⚠️ `&` binds TIGHTER than `>>` here, so the shift must be parenthesized.
+    while ((UartStatus.status >> 16) & 0xFF) >= 126 { }
+    UartFifo.fifo = c
+}
+
+// CCOUNT. @naked + rsr into a2 (the CALL0 return register) + ret; see
+// tests/nn/nn_prof_esp32.mlr for why this needs no prologue.
+@naked fn nn_par_ccount() -> u32 {
+    asm("rsr.ccount a2")
+    asm("ret")
+    // Unreachable — the asm ret already returned. Present only because sema
+    // requires a value-returning function to return on every path.
+    return 0
+}
+
+// Same 73728 B arena as the other two esp32 drivers, so one image shape covers
+// the smoke model, YuNet@64 and YuNet@96 and the cap check still refuses a
+// 128 px model loudly.
+static u8[73728] nn_mt_arena
+
+fn nn_mt_arena_p() -> u32 {
+    return nn_mt_arena
+}
+
+fn nn_mt_arena_cap() -> u32 {
+    u32 v = 73728
+    return v
+}
+
+// Core-1 handshake and the three cycle accumulators. Written by core 0 only,
+// except c1_ready which core 1 polls.
+static u32[1] nn_par_c1_ready
+static u32[1] nn_par_tot
+static u32[1] nn_par_ew
+static u32[1] nn_par_bar
+static u32[1] nn_par_base_tot
+static u32[1] nn_par_base_ew
+
+// ---------------------------------------------------------------------------
+// Core 1
+// ---------------------------------------------------------------------------
+// Take a job, maybe run it, barrier. Forever — core 1 has no idea how many
+// layers there are and does not need one: core 0 publishes exactly once per
+// barrier round, so the two loop counts match by construction, and between
+// inferences core 1 simply blocks inside par_take() waiting for the next
+// round's descriptor. That is a wait for something FRESH, not a spin on
+// something stale.
+fn core1_entry() {
+    EspSmpDport.appcpu_ctrl_d = 0          // disarm; every dual-core file does this
+    loop { if vload32(nn_par_c1_ready) != 0 { break } }   // wait for par_init
+    loop {
+        u32 kind = par_take()
+        if kind == 1 {
+            nn_model_exec_range(par_job_a0(), par_job_a1(), par_job_a2(),
+                                par_job_lo(), par_job_hi())
+        }
+        par_barrier()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Core 0
+// ---------------------------------------------------------------------------
+// par_on = 0 makes every layer publish PARK, which is the single-core control:
+// same code path, same barriers, same publishes, all the work on core 0.
+fn nn_par_layers(u32 m, u32 arena, u32 par_on) -> u32 {
+    u32 bad = nn_model_check(m)
+    if bad != 0 { return bad }
+    u32 lay = m + load32(m + 16)
+    u32 stride = load32(m + 20)
+    u32 blob = m + load32(m + 32)
+    u32 total = nn_model_layer_count(m)
+    u32 ew = 0
+    u32 bar = 0
+    u32 t_start = nn_par_ccount()
+    u32 i = 0
+    while i < total {
+        u32 r = lay + (i * stride)
+        u32 n = load32(r + 104)
+        // `mid` is where core 0 stops. For a PARK round it is n, so even a
+        // core 1 that ignored `kind` would be handed the empty range [n, n).
+        u32 mid = n
+        u32 kind = 0
+        u32 splittable = nn_model_op_splittable(load32(r))
+        if par_on != 0 {
+            if splittable != 0 {
+                mid = nn_model_split_mid(r)
+                kind = 1
+            }
+        }
+        par_publish(kind, r, arena, blob, mid, n)
+
+        u32 t0 = nn_par_ccount()
+        if kind != 0 {
+            nn_model_exec_range(r, arena, blob, 0, mid)
+        } else {
+            nn_model_exec(r, arena, blob)
+        }
+        u32 t1 = nn_par_ccount()
+        if splittable != 0 { ew = (ew + ((t1 - t0) & 0xFFFFFFFF)) & 0xFFFFFFFF }
+
+        // UNCONDITIONAL. Outside the branch above, on purpose. See the header.
+        par_barrier()
+
+        u32 t2 = nn_par_ccount()
+        bar = (bar + ((t2 - t1) & 0xFFFFFFFF)) & 0xFFFFFFFF
+        i = i + 1
+    }
+    u32 t_end = nn_par_ccount()
+    vstore32(nn_par_tot, (t_end - t_start) & 0xFFFFFFFF)
+    vstore32(nn_par_ew, ew)
+    vstore32(nn_par_bar, bar)
+    return 0
+}
+
+// THE TRUE SINGLE-CORE BASELINE, and why it needs its own function.
+//
+// nn_par_layers with par_on = 0 is NOT a single-core baseline. Core 1 is
+// released by then, so it spends every one of core 0's layers spinning inside
+// par_barrier's wait loop, issuing a load from shared internal SRAM as fast as
+// it can. That contends for the same memory the kernels are streaming through,
+// and it taxes core 0 heavily — measured at roughly 45% on this board. Reporting
+// PAR against that baseline would credit the split with undoing a cost the
+// split's own machinery created.
+//
+// So this runs BEFORE esp32_appcpu_start, with core 1 still in reset: no
+// barrier, no publish, no second core in existence. It is deliberately a
+// SEPARATE function rather than a flag on nn_par_layers, because the whole
+// point of nn_par_layers is that its barrier cannot be skipped by any branch.
+//
+// ⚠️ MUST be called only while core 1 is in reset. Calling it afterwards would
+// leave core 1 waiting for a barrier that never comes.
+fn nn_par_base_layers(u32 m, u32 arena) -> u32 {
+    u32 bad = nn_model_check(m)
+    if bad != 0 { return bad }
+    u32 lay = m + load32(m + 16)
+    u32 stride = load32(m + 20)
+    u32 blob = m + load32(m + 32)
+    u32 total = nn_model_layer_count(m)
+    u32 ew = 0
+    u32 t_start = nn_par_ccount()
+    u32 i = 0
+    while i < total {
+        u32 r = lay + (i * stride)
+        u32 t0 = nn_par_ccount()
+        nn_model_exec(r, arena, blob)
+        u32 t1 = nn_par_ccount()
+        if nn_model_op_splittable(load32(r)) != 0 {
+            ew = (ew + ((t1 - t0) & 0xFFFFFFFF)) & 0xFFFFFFFF
+        }
+        i = i + 1
+    }
+    u32 t_end = nn_par_ccount()
+    vstore32(nn_par_base_tot, (t_end - t_start) & 0xFFFFFFFF)
+    vstore32(nn_par_base_ew, ew)
+    return 0
+}
+
+fn nn_par_report(u32 tag) {
+    nn_mt_str(tag)
+    nn_mt_str(" TOT ")
+    nn_mt_emit_u32(vload32(nn_par_tot))
+    nn_mt_str(" EW ")
+    nn_mt_emit_u32(vload32(nn_par_ew))
+    nn_mt_str(" BAR ")
+    nn_mt_emit_u32(vload32(nn_par_bar))
+    nn_mt_putc(10)
+}
+
+// POISON THE ARENA BEFORE EVERY RUN. This is not hygiene, it is the only thing
+// that makes the parallel run's output mean anything.
+//
+// The serial run happens first and leaves the CORRECT answer in every
+// intermediate tensor. Without this, a parallel run that failed to write some
+// band — core 1 never started, took a stale descriptor, or ran the empty range
+// — would read the previous run's values straight through and print a
+// byte-perfect result. That is not hypothetical: a deliberately broken build
+// with core 1's nn_model_exec_range call removed printed output identical to
+// tools/ml/nn_model_ref.py's golden, on this board, before this function
+// existed. It only got caught because its cycle counts were wrong.
+//
+// 0x5A is the same poison tests/nn/nn_split_equiv.mlr uses. Only the model's
+// declared arena_bytes are poisoned, not the whole 72 KiB static, and this runs
+// OUTSIDE the timed region in nn_par_layers, so it does not enter TOT.
+fn nn_par_poison(u32 m) {
+    u32 p = nn_mt_arena_p()
+    u32 n = nn_model_arena_bytes(m)
+    u32 i = 0
+    while i < n {
+        store8(p + i, 0x5A)
+        i = i + 1
+    }
+}
+
+// One inference. Poisons the arena and refills the input every time, so the two
+// runs of an iteration start from identical state and neither can inherit the
+// other's answers.
+fn nn_par_run(u32 m, u32 par_on, u32 tag) -> u32 {
+    u32 bad = nn_model_check(m)
+    if bad != 0 {
+        nn_mt_str("ERR:model ")
+        nn_mt_emit(bad)
+        return bad
+    }
+    if nn_model_arena_bytes(m) > nn_mt_arena_cap() {
+        nn_mt_str("ERR:arena ")
+        nn_mt_emit(nn_model_arena_bytes(m))
+        return 4
+    }
+    nn_par_poison(m)
+    nn_mt_fill_input(m)
+    bad = nn_par_layers(m, nn_mt_arena_p(), par_on)
+    if bad != 0 {
+        nn_mt_str("ERR:run ")
+        nn_mt_emit(bad)
+        return bad
+    }
+    nn_par_report(tag)
+    nn_mt_emit_outputs(m)
+    return 0
+}
+
+// The baseline's own run wrapper. Same poison + fill + dump as nn_par_run, so
+// its output block is directly comparable with the other two.
+fn nn_par_base_run(u32 m) -> u32 {
+    u32 bad = nn_model_check(m)
+    if bad != 0 {
+        nn_mt_str("ERR:model ")
+        nn_mt_emit(bad)
+        return bad
+    }
+    if nn_model_arena_bytes(m) > nn_mt_arena_cap() {
+        nn_mt_str("ERR:arena ")
+        nn_mt_emit(nn_model_arena_bytes(m))
+        return 4
+    }
+    nn_par_poison(m)
+    nn_mt_fill_input(m)
+    bad = nn_par_base_layers(m, nn_mt_arena_p())
+    if bad != 0 {
+        nn_mt_str("ERR:run ")
+        nn_mt_emit(bad)
+        return bad
+    }
+    nn_mt_str("BASE TOT ")
+    nn_mt_emit_u32(vload32(nn_par_base_tot))
+    nn_mt_str(" EW ")
+    nn_mt_emit_u32(vload32(nn_par_base_ew))
+    nn_mt_putc(10)
+    nn_mt_emit_outputs(m)
+    return 0
+}
+
+// ~1 s at 240 MHz, so a human or a `cat` can see the gap between iterations.
+fn nn_par_delay() {
+    u32 i = 0
+    while i < 24000000 {
+        i = i + 1
+    }
+}
+
+fn main() {
+    // PLL first, before any putc — the UART divisor is rewritten in here.
+    u32 clkrc = esp32_clk_cpu_pll(240)
+    u32 model = 0x3FFB0000
+    nn_mt_str("CLK ")
+    nn_mt_emit_u32(clkrc)
+    nn_mt_putc(10)
+    nn_mt_str("BOOT ")
+    nn_mt_emit_u32(load32(model))
+    nn_mt_putc(10)
+
+    // ---- the true single-core baseline, core 1 still in reset ----
+    nn_mt_str("BEGIN BASE\n")
+    u32 rcb = nn_par_base_run(model)
+    nn_mt_str("END BASE ")
+    nn_mt_emit_u32(rcb)
+    nn_mt_putc(10)
+
+    par_init()                             // before releasing core 1
+    esp32_appcpu_start(fn_addr("core1_entry"))
+    vstore32(nn_par_c1_ready, 1)
+    loop {
+        nn_mt_str("CLK ")
+        nn_mt_emit_u32(clkrc)
+        nn_mt_putc(10)
+        nn_mt_str("BOOT ")
+        nn_mt_emit_u32(load32(model))
+        nn_mt_putc(10)
+        nn_mt_str("BASE TOT ")
+        nn_mt_emit_u32(vload32(nn_par_base_tot))
+        nn_mt_str(" EW ")
+        nn_mt_emit_u32(vload32(nn_par_base_ew))
+        nn_mt_putc(10)
+        nn_mt_str("BEGIN SERIAL\n")
+        u32 rc0 = nn_par_run(model, 0, "SERIAL")
+        nn_mt_str("BEGIN PAR\n")
+        u32 rc1 = nn_par_run(model, 1, "PAR")
+        nn_mt_str("END ")
+        nn_mt_emit_u32(rc0 + rc1)
+        nn_mt_putc(10)
+        nn_par_delay()
+    }
+}
