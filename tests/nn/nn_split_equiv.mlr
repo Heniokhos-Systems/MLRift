@@ -34,9 +34,13 @@ import "../../std/nn_int8.mlr"
 
 static u8[1024] nn_se_in
 static u8[1024] nn_se_in2
+static u8[1024] nn_se_wt
 static u8[1024] nn_se_a
 static u8[1024] nn_se_b
 static u8[256]  nn_se_lut
+static i32[16]  nn_se_bias
+static i32[16]  nn_se_mult
+static i32[16]  nn_se_shift
 static u8[2]    nn_se_cbuf
 static u32 nn_se_seed = 0
 static u32 nn_se_fails = 0
@@ -146,10 +150,121 @@ fn nn_se_poison(u32 p, u32 n) {
     }
 }
 
+// Per-channel requantization parameters for the convolution cases. The exact
+// values are irrelevant — both sides of every comparison use the same ones —
+// but they are drawn from the same ranges TFLite produces (a multiplier
+// normalised into [2^30, 2^31) and a negative shift) so the requantizer is
+// exercised on its real domain rather than on a degenerate identity.
+fn nn_se_fill_quant(u32 n) {
+    u32 bp = nn_se_bias
+    u32 mp = nn_se_mult
+    u32 sp = nn_se_shift
+    u32 i = 0
+    while i < n {
+        i32 bx = nn_u32_to_i32(nn_se_r32())
+        nn_store_i32(bp + (i * 4), bx >> 20)
+        u32 m = 0x40000000 + ((nn_se_r32() >> 3) & 0x1FFFFFFF)
+        nn_store_i32(mp + (i * 4), nn_u32_to_i32(m))
+        u32 svu = (nn_se_r32() >> 28) % 12
+        i32 sv = svu
+        nn_store_i32(sp + (i * 4), (0 - sv) - 1)
+        i = i + 1
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // Spatial kernels — split on output ROWS
 // ---------------------------------------------------------------------------
+
+// nn_conv2d_int8 is the one kernel here that does NOT address its output from
+// `oy`: it walks a single running pointer on the invariant that the output is
+// written strictly in order, so its `_rows` variant has to re-base that pointer
+// to the first byte of row oy_lo. Get that offset wrong in either direction —
+// forget it, or add it to a kernel that already computes an absolute address —
+// and the bands land on top of each other or past the end. This is exactly the
+// class of bug the full-range tests cannot see, so the exhaustive split sweep
+// matters most here.
+fn nn_se_conv2d(u32 in_h, u32 in_w, u32 in_c, u32 out_c,
+                u32 kh, u32 kw, u32 sh, u32 sw, u32 ph, u32 pw) {
+    u32 ip = nn_se_in
+    u32 wp = nn_se_wt
+    u32 a = nn_se_a
+    u32 b = nn_se_b
+    u32 bp = nn_se_bias
+    u32 mp = nn_se_mult
+    u32 sp = nn_se_shift
+    nn_se_fill(ip, (in_h * in_w) * in_c)
+    nn_se_fill(wp, ((out_c * kh) * kw) * in_c)
+    nn_se_fill_quant(out_c)
+    i32 izp = 0 - 3
+    i32 ozp = 11
+    i32 lo = 0 - 128
+
+    u32 out_h = nn_out_dim(in_h, kh, sh, ph)
+    u32 out_w = nn_out_dim(in_w, kw, sw, pw)
+    u32 obytes = (out_h * out_w) * out_c
+
+    nn_se_poison(a, obytes)
+    nn_conv2d_int8(ip, in_h, in_w, in_c, izp, wp, kh, kw, bp, mp, sp, 1,
+                   a, out_c, ozp, sh, sw, ph, pw, lo, 127)
+
+    u32 k = 0
+    while k <= out_h {
+        nn_se_poison(b, obytes)
+        u32 k2 = nn_se_pk(k, out_h)
+        nn_conv2d_int8_rows(ip, in_h, in_w, in_c, izp, wp, kh, kw, bp, mp, sp, 1,
+                            b, out_c, ozp, sh, sw, ph, pw, lo, 127, 0, k)
+        nn_conv2d_int8_rows(ip, in_h, in_w, in_c, izp, wp, kh, kw, bp, mp, sp, 1,
+                            b, out_c, ozp, sh, sw, ph, pw, lo, 127, k2, out_h)
+        nn_se_cmp(obytes, k)
+        k = k + 1
+    }
+}
+
+// nn_depthwise_conv2d_int8 addresses its output absolutely from `oy` and works
+// out the row stride itself from in_c * depth_mult, so bounding the loop is its
+// whole change. A spurious out_p offset would show up here as a mismatch on
+// every k except 0 and out_h.
+fn nn_se_dwconv(u32 in_h, u32 in_w, u32 in_c, u32 dm,
+                u32 kh, u32 kw, u32 sh, u32 sw, u32 ph, u32 pw) {
+    u32 ip = nn_se_in
+    u32 wp = nn_se_wt
+    u32 a = nn_se_a
+    u32 b = nn_se_b
+    u32 bp = nn_se_bias
+    u32 mp = nn_se_mult
+    u32 sp = nn_se_shift
+    u32 out_c = in_c * dm
+    nn_se_fill(ip, (in_h * in_w) * in_c)
+    nn_se_fill(wp, (kh * kw) * out_c)
+    nn_se_fill_quant(out_c)
+    i32 izp = 0 - 12
+    i32 ozp = 0 - 2
+    i32 lo = 0 - 128
+
+    u32 out_h = nn_out_dim(in_h, kh, sh, ph)
+    u32 out_w = nn_out_dim(in_w, kw, sw, pw)
+    u32 obytes = (out_h * out_w) * out_c
+
+    nn_se_poison(a, obytes)
+    nn_depthwise_conv2d_int8(ip, in_h, in_w, in_c, izp, wp, kh, kw, bp, mp, sp, 1,
+                             a, ozp, sh, sw, ph, pw, dm, lo, 127)
+
+    u32 k = 0
+    while k <= out_h {
+        nn_se_poison(b, obytes)
+        u32 k2 = nn_se_pk(k, out_h)
+        nn_depthwise_conv2d_int8_rows(ip, in_h, in_w, in_c, izp, wp, kh, kw,
+                                      bp, mp, sp, 1, b, ozp, sh, sw, ph, pw,
+                                      dm, lo, 127, 0, k)
+        nn_depthwise_conv2d_int8_rows(ip, in_h, in_w, in_c, izp, wp, kh, kw,
+                                      bp, mp, sp, 1, b, ozp, sh, sw, ph, pw,
+                                      dm, lo, 127, k2, out_h)
+        nn_se_cmp(obytes, k)
+        k = k + 1
+    }
+}
 
 fn nn_se_maxpool(u32 in_h, u32 in_w, u32 in_c,
                  u32 kh, u32 kw, u32 sh, u32 sw, u32 ph, u32 pw) {
@@ -346,6 +461,25 @@ fn nn_se_run() {
 
     // --- spatial: split on output rows -------------------------------------
     // out_h is noted per case; several are ODD on purpose.
+    print_str("conv2d\n")
+    //             in_h in_w in_c out_c  kh kw  sh sw  ph pw
+    nn_se_conv2d(     5,   5,   2,    3,  3, 3,  1, 1,  1, 1)   // out_h 5 (odd)
+    nn_se_conv2d(     6,   6,   2,    2,  3, 3,  2, 2,  0, 0)   // out_h 2, unpadded
+    nn_se_conv2d(     7,   4,   3,    4,  3, 3,  2, 1,  1, 1)   // out_h 4, strided+padded
+    nn_se_conv2d(     9,   3,   1,    5,  3, 3,  1, 1,  1, 1)   // out_h 9 (odd)
+    nn_se_conv2d(     3,   3,   2,    2,  3, 3,  1, 1,  2, 2)   // out_h 5 (odd), pad > k/2
+    nn_se_conv2d(     4,   4,   2,    3,  4, 4,  4, 4,  0, 0)   // out_h 1, whole-window
+    nn_se_conv2d(     5,   5,   3,    4,  1, 1,  1, 1,  0, 0)   // out_h 5 (odd), 1x1 = pointwise
+
+    print_str("depthwise\n")
+    //             in_h in_w in_c  dm  kh kw  sh sw  ph pw
+    nn_se_dwconv(     5,   5,   3,  1,  3, 3,  1, 1,  1, 1)     // out_h 5 (odd)
+    nn_se_dwconv(     4,   4,   2,  2,  3, 3,  2, 2,  1, 1)     // out_h 2, depth_mult 2
+    nn_se_dwconv(     7,   3,   2,  1,  3, 3,  2, 1,  1, 1)     // out_h 4, strided
+    nn_se_dwconv(     9,   4,   1,  3,  3, 3,  1, 1,  1, 1)     // out_h 9 (odd), depth_mult 3
+    nn_se_dwconv(     3,   3,   4,  1,  3, 3,  1, 1,  2, 2)     // out_h 5 (odd), pad > k/2
+    nn_se_dwconv(     4,   4,   2,  1,  4, 4,  4, 4,  0, 0)     // out_h 1, whole-window
+
     print_str("maxpool\n")
     nn_se_maxpool(7, 5, 2, 2, 2, 2, 2, 0, 0)      // out_h 3 (odd)
     nn_se_maxpool(7, 7, 3, 3, 3, 2, 2, 1, 1)      // out_h 4, padded
