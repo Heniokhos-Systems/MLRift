@@ -4171,6 +4171,53 @@ else
 fi
 rm -f "$ESP_SRC" "$ESP_BIN" "$ESP_OUT"
 
+# --- Xtensa LX6 many-argument boot test (per-function overflow reserve) ---
+# The outgoing-arg reserve at the bottom of every xtensa frame used to be a
+# FIXED 64 bytes = 16 slots, so 6 (CALL0 arg registers) + 16 = 22 was a hard
+# ceiling and every leaf paid 64 unusable bytes. ir_xtensa_gen step 4a now
+# sizes it per function from that function's own IR_ARG scan (port of
+# ir_aarch64.mlr's a64_ovf_slots).
+# many_args.mlr covers all three resulting frame shapes in one boot:
+#   sum24  - 18 overflow args (72 bytes): does not even COMPILE on the old
+#            fixed reserve, and its stack array's IR_STACK_ADDR base is
+#            measured from the reserve, so a pre-scan/accessor mismatch
+#            aliases buf onto the outgoing args and changes the sum
+#   sum7   - exactly ONE overflow arg: the smallest non-zero reserve (4 bytes)
+#   leafsq - no call at all: a ZERO-byte reserve
+# Every function is self-recursive, so the AST inliner cannot erase the calls
+# — an inlined probe reports a false pass at any argument count.
+# Full-output equality, not a grep: a wrong slot offset changes a digit.
+echo ""
+echo "--- xtensa LX6 many-argument boot test ---"
+if command -v qemu-system-xtensa >/dev/null 2>&1; then
+    TOTAL=$((TOTAL + 1))
+    XT_MA_ELF="/tmp/mlrc_xt_manyargs_$$.elf"
+    XT_MA_OK=1
+    if ! $MLRC --arch=xtensa --freestanding "$DIR/../examples/xtensa/many_args.mlr" -o "$XT_MA_ELF" >/dev/null 2>&1; then
+        echo "FAIL: xtensa_many_args_boot (compilation failed)"
+        XT_MA_OK=0
+    fi
+    if [ "$XT_MA_OK" = 1 ]; then
+        XT_MA_EXP=$(printf '319\n30\n385')
+        XT_MA_RAW=$(timeout 8 qemu-system-xtensa -M lx60 -nographic -semihosting -kernel "$XT_MA_ELF" 2>/dev/null); XT_MA_STATUS=$?
+        XT_MA_OUT=$(echo "$XT_MA_RAW" | tr -d '\r')
+        if [ "$XT_MA_STATUS" = "42" ] && [ "$XT_MA_OUT" = "$XT_MA_EXP" ]; then
+            PASS=$((PASS + 1))
+            echo "  xtensa_many_args_boot: PASS (24-arg call + 1-slot and 0-slot reserves all correct, exited 42)"
+        else
+            echo "FAIL: xtensa_many_args_boot (output mismatch or status $XT_MA_STATUS != 42)"
+            echo "    expected: $(echo "$XT_MA_EXP" | tr '\n' ' ')"
+            echo "    got:      $(echo "$XT_MA_OUT" | tr '\n' ' ')"
+            FAIL=$((FAIL + 1))
+        fi
+    else
+        FAIL=$((FAIL + 1))
+    fi
+    rm -f "$XT_MA_ELF"
+else
+    echo "  xtensa_many_args_boot: SKIP (qemu-system-xtensa not installed)"
+fi
+
 # --- esp32 machine target: --target=esp32 image structure + IRAM/DRAM guard ---
 # Compiles examples/esp32/minimal.mlr with --arch=xtensa --freestanding
 # --target=esp32 and asserts the esp-image structure with od ONLY:
