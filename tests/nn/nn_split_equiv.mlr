@@ -30,7 +30,9 @@
 // Buffer B is pre-poisoned before the split runs, so a variant that writes
 // nothing at all is a mismatch rather than an accidental pass.
 
-import "../../std/nn_int8.mlr"
+// std/nn_model.mlr pulls in std/nn_int8.mlr; the dispatch section at the bottom
+// needs the model runner as well as the raw kernels.
+import "../../std/nn_model.mlr"
 
 // Every buffer here is a fixed-size static and the statics are laid out back to
 // back, so an oversized configuration does not fault — it walks quietly into the
@@ -52,12 +54,20 @@ static u32 nn_se_cap   = 1024      // nn_se_in / in2 / wt / a / b
 static u32 nn_se_quant = 16        // nn_se_bias / mult / shift, in elements
 static u32 nn_se_guard = 16        // trailing guard band inside nn_se_a/b
 
+static u32 nn_se_arena = 1024      // nn_se_ar, the dispatch section's fake arena
+static u32 nn_se_ar_out = 512      // where a dispatch case's output tensor sits
+
 static u8[1024] nn_se_in
 static u8[1024] nn_se_in2
 static u8[1024] nn_se_wt
 static u8[1024] nn_se_a
 static u8[1024] nn_se_b
 static u8[256]  nn_se_lut
+// The dispatch section's scratch: one activation arena and one hand-built
+// 160-byte KRNN layer record. The record is u32[40] rather than u8[160] so its
+// base is word-aligned for the store32/nn_store_i32 field writes.
+static u8[1024] nn_se_ar
+static u32[40]  nn_se_rec
 static i32[16]  nn_se_bias
 static i32[16]  nn_se_mult
 static i32[16]  nn_se_shift
@@ -575,6 +585,195 @@ fn nn_se_sigmoid(u32 n) {
 
 
 // ---------------------------------------------------------------------------
+// The MODEL-RUNNER dispatcher — std/nn_model.mlr's nn_model_exec_range
+// ---------------------------------------------------------------------------
+// Everything above proves the KERNELS partition correctly. It says nothing
+// about the layer of code that decides WHICH kernel to call and pulls its
+// twenty-odd arguments out of a 160-byte binary record at fixed byte offsets.
+// That layer is new, it is duplicated (nn_model_exec and nn_model_exec_range
+// each decode the same record independently), and its characteristic failure
+// is a single wrong offset — say reading out_zp where act_min belongs — which
+// produces confidently wrong numbers, not a crash. On silicon it would look
+// exactly like a cross-core data race.
+//
+// So the same identity is asserted one level up, against the dispatcher:
+//
+//     nn_model_exec(r)  ==  nn_model_exec_range(r, 0, k) then (r, k, n)
+//
+// for every split point k, over a hand-built record for each of the four
+// opt-in opcodes. Because the full-range side goes through nn_model_exec and
+// the split side through nn_model_exec_range, a divergence between the two
+// decoders is caught even at k = 0 and k = n, where the kernels themselves are
+// not being split at all.
+//
+// Arena layout (byte offsets into nn_se_ar):
+//        0  input A
+//      256  input B      (ADD only)
+//      512  the output tensor, plus nn_se_guard bytes of poison behind it
+// nn_se_disp_grab copies output+guard into nn_se_a / nn_se_b so nn_se_cmp's
+// existing overrun check sees the ARENA's guard band, not a private one.
+
+fn nn_se_rec_zero() {
+    u32 r = nn_se_rec
+    u32 i = 0
+    while i < 160 {
+        store8(r + i, 0)
+        i = i + 1
+    }
+}
+
+fn nn_se_rec_set(u32 off, u32 v) {
+    store32(nn_se_rec + off, v)
+}
+
+fn nn_se_rec_seti(u32 off, i32 v) {
+    nn_store_i32(nn_se_rec + off, v)
+}
+
+fn nn_se_bytes(u32 dst, u32 src, u32 n) {
+    u32 i = 0
+    while i < n {
+        store8(dst + i, load8(src + i))
+        i = i + 1
+    }
+}
+
+fn nn_se_fillbyte(u32 dst, u32 n, u32 v) {
+    u32 i = 0
+    while i < n {
+        store8(dst + i, v)
+        i = i + 1
+    }
+}
+
+// Reset the arena to its pre-run state. `inplace` means the layer's output
+// aliases its input (op 4 as the memory planner usually emits it), in which
+// case the output region must hold the pristine INPUT rather than poison —
+// there is nowhere else for it to come from.
+fn nn_se_disp_prep(u32 n, u32 inplace) {
+    u32 ar = nn_se_ar
+    u32 op = ar + nn_se_ar_out
+    nn_se_bytes(ar, nn_se_in, n)
+    nn_se_bytes(ar + 256, nn_se_in2, n)
+    if inplace != 0 {
+        nn_se_bytes(op, nn_se_in, n)
+    } else {
+        nn_se_fillbyte(op, n, 0x5A)
+    }
+    nn_se_fillbyte(op + n, nn_se_guard, 0x5A)
+}
+
+fn nn_se_disp_grab(u32 dst, u32 n) {
+    nn_se_fillbyte(dst, n + nn_se_guard, 0x5A)
+    nn_se_bytes(dst, nn_se_ar + nn_se_ar_out, n + nn_se_guard)
+}
+
+// Sweep every split point for whatever record nn_se_rec currently holds.
+fn nn_se_dispatch(u32 n, u32 inplace) {
+    nn_se_need(nn_se_cap, n, 0)                                    // nn_se_in
+    nn_se_need(nn_se_cap, n, 5)                                    // nn_se_in2
+    nn_se_need(nn_se_cap, n + nn_se_guard, 2)                      // nn_se_a
+    nn_se_need(nn_se_cap, n + nn_se_guard, 3)                      // nn_se_b
+    nn_se_need(nn_se_arena, nn_se_ar_out + n + nn_se_guard, 6)     // nn_se_ar
+
+    u32 r = nn_se_rec
+    u32 ar = nn_se_ar
+    u32 blob = nn_se_lut
+
+    nn_se_disp_prep(n, inplace)
+    nn_model_exec(r, ar, blob)
+    nn_se_disp_grab(nn_se_a, n)
+
+    u32 k = 0
+    while k <= n {
+        nn_se_disp_prep(n, inplace)
+        u32 k2 = nn_se_pk(k, n)
+        nn_model_exec_range(r, ar, blob, 0, k)
+        nn_model_exec_range(r, ar, blob, k2, n)
+        nn_se_disp_grab(nn_se_b, n)
+        nn_se_cmp(n, k)
+        k = k + 1
+    }
+}
+
+// op 4 RELU. `inplace` selects the two shapes the planner can emit: output
+// aliased onto the input (the common case), and a distinct output, where
+// nn_model_exec_range has to band the COPY as well as the ReLU.
+fn nn_se_disp_relu(u32 n, u32 inplace) {
+    nn_se_fill(nn_se_in, n)
+    nn_se_rec_zero()
+    nn_se_rec_set(0, 4)
+    if inplace != 0 {
+        nn_se_rec_set(4, nn_se_ar_out)
+    } else {
+        nn_se_rec_set(4, 0)
+    }
+    nn_se_rec_set(12, nn_se_ar_out)
+    nn_se_rec_seti(88, 0 - 7)               // in_zp
+    nn_se_rec_set(104, n)                   // n_elem
+    nn_se_dispatch(n, inplace)
+}
+
+// op 9 COPY.
+fn nn_se_disp_copy(u32 n) {
+    nn_se_fill(nn_se_in, n)
+    nn_se_rec_zero()
+    nn_se_rec_set(0, 9)
+    nn_se_rec_set(4, 0)
+    nn_se_rec_set(12, nn_se_ar_out)
+    nn_se_rec_set(104, n)
+    nn_se_dispatch(n, 0)
+}
+
+// op 8 SIGMOID_LUT. The blob base is nn_se_lut and lut_off is 0, so
+// nn_model_blob_ptr resolves to the table below. A non-identity table means a
+// dropped element cannot coincide with the value it replaced.
+fn nn_se_disp_sigmoid(u32 n) {
+    nn_se_fill(nn_se_in, n)
+    u32 lp = nn_se_lut
+    u32 t = 0
+    while t < 256 {
+        store8(lp + t, ((t * 7) + 13) & 0xFF)
+        t = t + 1
+    }
+    nn_se_rec_zero()
+    nn_se_rec_set(0, 8)
+    nn_se_rec_set(4, 0)
+    nn_se_rec_set(12, nn_se_ar_out)
+    nn_se_rec_set(104, n)
+    nn_se_rec_set(140, 0)                   // lut_off
+    nn_se_dispatch(n, 0)
+}
+
+// op 6 ADD. Sixteen fields come out of the record here, which is why this case
+// exists: it is by far the easiest of the four to mis-decode, and the two
+// decoders have to agree on every one of them.
+fn nn_se_disp_add(u32 n) {
+    nn_se_fill(nn_se_in, n)
+    nn_se_fill(nn_se_in2, n)
+    nn_se_rec_zero()
+    nn_se_rec_set(0, 6)
+    nn_se_rec_set(4, 0)                     // in0_off
+    nn_se_rec_set(8, 256)                   // in1_off
+    nn_se_rec_set(12, nn_se_ar_out)         // out_off
+    nn_se_rec_seti(88, 0 - 3)               // in_zp   (A)
+    nn_se_rec_seti(92, 0 - 11)              // out_zp
+    nn_se_rec_seti(96, 0 - 128)             // act_min
+    nn_se_rec_seti(100, 127)                // act_max
+    nn_se_rec_set(104, n)                   // n_elem
+    nn_se_rec_seti(108, 5)                  // in1_zp  (B)
+    nn_se_rec_seti(112, 0x50000000)         // a_mult
+    nn_se_rec_seti(116, 0 - 3)              // a_shift
+    nn_se_rec_seti(120, 0x6A000000)         // b_mult
+    nn_se_rec_seti(124, 0 - 4)              // b_shift
+    nn_se_rec_seti(128, 0x40000000)         // o_mult
+    nn_se_rec_seti(132, 0 - 20)             // o_shift
+    nn_se_rec_set(136, 20)                  // left_shift
+    nn_se_dispatch(n, 0)
+}
+
+
+// ---------------------------------------------------------------------------
 // Cases
 // ---------------------------------------------------------------------------
 
@@ -636,6 +835,14 @@ fn nn_se_run() {
     nn_se_sigmoid(37)
     nn_se_sigmoid(16)
     nn_se_sigmoid(1)
+
+    // --- the model runner's banded dispatcher (Task 5) ----------------------
+    print_str("dispatch\n")
+    nn_se_disp_relu(37, 1)      nn_se_disp_relu(16, 1)      nn_se_disp_relu(1, 1)
+    nn_se_disp_relu(37, 0)      nn_se_disp_relu(16, 0)      nn_se_disp_relu(1, 0)
+    nn_se_disp_copy(37)         nn_se_disp_copy(16)         nn_se_disp_copy(1)
+    nn_se_disp_sigmoid(37)      nn_se_disp_sigmoid(16)      nn_se_disp_sigmoid(1)
+    nn_se_disp_add(37)          nn_se_disp_add(16)          nn_se_disp_add(1)
 }
 
 fn main() {
