@@ -4,6 +4,30 @@ All notable changes to `mlrc` are documented in this file.
 
 ## Unreleased
 
+### Fixed
+
+- **`fn f() -> f32 { return 1.5f }` no longer fails type checking.** Sema
+  reported every float literal as `f64` regardless of the `f` suffix, so the
+  return-kind check saw f32-declared against f64-actual and rejected it —
+  while the identical literal bound to an `f32` local first passed, because
+  there the local's declared kind was consulted. The `f` suffix now types the
+  literal as `f32`, matching what the IR already does (it lowers a suffixed
+  literal with an explicit `IR_F64TOF32`).
+  - Because sema checks every function in an imported file whether or not it
+    is called, the four bare `return 0.0f` statements in
+    `gguf_meta_array_f32_get` made **all 26 examples that import
+    `std/gguf.mlr` fail to build** — including `qwen36_4b_generate`,
+    `llama3_3b_generate` and `tokenizer_gguf_smoke`. Those now compile, as do
+    16 further examples (the `bp_wzma_*` family) that returned f32 literals
+    directly.
+  - `gguf_meta_array_f32_get` also now routes its miss value through an `f32`
+    local, matching the rest of that file, so it still builds on older
+    compilers.
+  - As a consequence the check now also fires on the reverse mismatch,
+    `fn f() -> f64 { return 1.5f }`, which previously compiled and was a
+    silent miscompile: the callee left f32 bits in `xmm0` and a non-inlined
+    caller read them as `f64` (returned `0.0` for `1.5f`).
+
 ### Breaking
 
 - **CLI flag values (`--arch=`, `--emit=`, `--target=`, `--target-arch=`) now
