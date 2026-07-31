@@ -172,9 +172,11 @@
 // _rows twin because it is a forwarder, not a kernel: band it by calling
 // nn_conv2d_int8_rows with kh = kw = stride = 1, pad = 0.
 //
-// nn_model_exec_range() dispatches the ELEMENTWISE ops only. Row-banding the
-// spatial ops through the model runner is a separate change; nothing here
-// depends on it.
+// nn_model_exec_range() dispatches BOTH families. Which one an opcode belongs
+// to is nn_model_op_rowsplit()'s answer, and it decides what `lo`/`hi` mean for
+// that layer: OUTPUT ROWS for the six spatial ops, flat ELEMENTS for the four
+// elementwise ones. nn_model_split_n() gives the extent of whichever space
+// applies, so a caller never has to know which family it is holding.
 // ===========================================================================
 
 import "nn_int8.mlr"
@@ -370,52 +372,121 @@ fn nn_model_exec(u32 r, u32 arena, u32 blob) {
 // each opcode has to be added deliberately, because a wrong answer here is a
 // data race, not a slowdown.
 //
-// The list is the four ELEMENTWISE ops: 4 RELU, 6 ADD, 8 SIGMOID_LUT, 9 COPY.
-// Each is a pure per-element map over one flat index space of n_elem bytes, so
-// two disjoint index ranges touch two disjoint sets of output bytes — which is
-// exactly the property tests/esp32/par_coherency.mlr proved this chip honours
-// for plain store8 from two cores.
+// TWO FAMILIES, and the disjointness argument is different for each.
 //
-// The spatial ops (1, 2, 3, 5, 7, 10) are NOT on the list even though their
-// kernels now have _rows variants: banding them needs a row split rather than
-// an element split, and the model runner has no policy for that yet.
+//   ELEMENTWISE — 4 RELU, 6 ADD, 8 SIGMOID_LUT, 9 COPY. Each is a pure
+//   per-element map over one flat index space of n_elem bytes, so two disjoint
+//   index ranges touch two disjoint sets of output bytes.
+//
+//   SPATIAL — 1 CONV2D, 2 DEPTHWISE, 3 POINTWISE, 5 MAXPOOL, 7 RESIZE_NN,
+//   10 AVGPOOL. These are NOT per-element maps: an output pixel reads a whole
+//   receptive field, so neighbouring bands READ overlapping input rows. That is
+//   harmless — the input tensor is read-only for the duration of the layer, and
+//   the barrier at the end of the previous layer already made it complete — and
+//   what matters is the WRITE side, which is disjoint: a band of whole output
+//   rows [oy_lo, oy_hi) owns exactly rows oy_lo..oy_hi-1 of the output and
+//   nothing else. Splitting on output rows rather than on output elements is
+//   what buys that, which is why nn_model_op_rowsplit() exists.
+//
+// Either way the property tests/esp32/par_coherency.mlr proved on this chip —
+// two cores writing disjoint byte ranges with plain store8 are coherent across
+// a handshake — is the one being relied on.
 //
 // Op 0 (NOP) must never be on this list. It aliases its output onto its input
 // and does no work at all.
 fn nn_model_op_splittable(u32 op) -> u32 {
+    if op == 1 { return 1 }
+    if op == 2 { return 1 }
+    if op == 3 { return 1 }
     if op == 4 { return 1 }
+    if op == 5 { return 1 }
     if op == 6 { return 1 }
+    if op == 7 { return 1 }
     if op == 8 { return 1 }
     if op == 9 { return 1 }
+    if op == 10 { return 1 }
     return 0
 }
 
-// Where to cut a splittable layer: the midpoint of its element count. Callers
-// give the low core [0, mid) and the high core [mid, n_elem). Both degenerate
-// cases are safe — n_elem 0 makes both bands empty, n_elem 1 makes the low band
-// empty — because nn_model_exec_range returns immediately when lo >= hi.
-fn nn_model_split_mid(u32 r) -> u32 {
-    return load32(r + 104) / 2
+// Does this op split on OUTPUT ROWS (1) or on flat ELEMENTS (0)? This is the
+// single place the two families are told apart; nn_model_split_n() and
+// nn_model_exec_range() both defer to it, so they cannot disagree about what a
+// given layer's `lo`/`hi` mean.
+fn nn_model_op_rowsplit(u32 op) -> u32 {
+    if op == 1 { return 1 }
+    if op == 2 { return 1 }
+    if op == 3 { return 1 }
+    if op == 5 { return 1 }
+    if op == 7 { return 1 }
+    if op == 10 { return 1 }
+    return 0
 }
 
-// Execute ONLY elements [lo, hi) of layer `r`. The union of a partition of
-// [0, n_elem) over any number of calls is byte-identical to one nn_model_exec()
-// of the same layer — that identity is swept exhaustively on the host by
-// tests/nn/nn_split_equiv.mlr, over both the kernels and this dispatcher.
+// Output row count of a spatial layer, derived from EXACTLY the fields
+// nn_model_exec() hands the corresponding kernel — so it cannot drift away from
+// the extent the kernel's own full-range forwarder computes.
+//
+//   1/2/5/10  nn_out_dim(in_h, kh @ +40, stride_h @ +48, pad_h @ +56)
+//   7         in_h * scale_h @ +48   (nn_resize_nearest_int8's own out_h)
+//   3         in_h                   (1x1, stride 1, no pad, so out_h == in_h)
+//
+// Meaningless for an elementwise or NOP layer; nn_model_split_n() is the entry
+// point that knows when to ask.
+fn nn_model_out_h(u32 r) -> u32 {
+    u32 op = load32(r)
+    u32 in_h = load32(r + 16)
+    if op == 3 { return in_h }
+    if op == 7 { return in_h * load32(r + 48) }
+    return nn_out_dim(in_h, load32(r + 40), load32(r + 48), load32(r + 56))
+}
+
+// The extent of this layer's split space: rows for a spatial op, elements for
+// an elementwise one. A caller partitions [0, nn_model_split_n(r)) and passes
+// the pieces to nn_model_exec_range() without needing to know which it is.
+fn nn_model_split_n(u32 r) -> u32 {
+    if nn_model_op_rowsplit(load32(r)) != 0 { return nn_model_out_h(r) }
+    return load32(r + 104)
+}
+
+// Where to cut a splittable layer: the midpoint of its split space. Callers
+// give the low core [0, mid) and the high core [mid, n). Both degenerate cases
+// are safe — n == 0 makes both bands empty, n == 1 makes the low band empty —
+// because nn_model_exec_range returns immediately when lo >= hi.
+//
+// A ROW split is coarse: a layer with out_h == 2 can only be cut 1/1, and one
+// with out_h == 1 cannot be cut at all (the low core gets nothing and the high
+// core gets everything, which is correct but pointless). That is a load-balance
+// property, not a correctness one.
+fn nn_model_split_mid(u32 r) -> u32 {
+    return nn_model_split_n(r) / 2
+}
+
+// Execute ONLY the sub-range [lo, hi) of layer `r` — output ROWS when
+// nn_model_op_rowsplit(op) says so, flat ELEMENTS otherwise. The union of a
+// partition of [0, nn_model_split_n(r)) over any number of calls is
+// byte-identical to one nn_model_exec() of the same layer — that identity is
+// swept exhaustively on the host by tests/nn/nn_split_equiv.mlr, over both the
+// kernels and this dispatcher.
 //
 // Contract:
 //   * `r` MUST be a layer whose op nn_model_op_splittable() accepts. Any other
 //     op is a no-op here rather than a partial execution, so a caller that gets
 //     the predicate wrong produces an obviously-empty output instead of a
 //     plausible-looking half-computed one.
-//   * The caller does NOT pre-offset any pointer. Every _range kernel indexes
-//     absolutely from the tensor base, exactly like its full-range twin.
+//   * The caller does NOT pre-offset any pointer. Every _range and _rows kernel
+//     indexes absolutely from the tensor base, exactly like its full-range twin
+//     — including nn_conv2d_int8_rows, which re-bases its own running output
+//     pointer from oy_lo internally. Pre-offsetting would double-offset a band.
 //   * Op 4 is in place whenever the memory planner could alias the output onto
 //     the input. When it could not, the copy is banded too — each core copies
 //     and then ReLUs its OWN range, so the two never touch the same byte. That
 //     assumes in0 and out are either identical or disjoint, which is what the
 //     planner emits; a partial overlap would already corrupt the single-core
 //     forward copy in nn_model_exec.
+//   * The spatial bands READ overlapping input rows and that is intended: the
+//     input tensor is not written by this layer, and the previous layer's
+//     barrier already made it whole. Only the WRITES have to be disjoint, and a
+//     band of whole output rows guarantees that.
 fn nn_model_exec_range(u32 r, u32 arena, u32 blob, u32 lo, u32 hi) {
     if lo >= hi { return }
     u32 op = load32(r)
@@ -449,6 +520,83 @@ fn nn_model_exec_range(u32 r, u32 arena, u32 blob, u32 lo, u32 hi) {
                           n_elem, load32(r + 136),
                           nn_load_i32(r + 96), nn_load_i32(r + 100),
                           lo, cnt)
+        return
+    }
+
+    // ---- spatial: [lo, hi) are OUTPUT ROWS from here down -----------------
+    // Field offsets are read here exactly as nn_model_exec() reads them, and
+    // the _rows kernels are handed the identical arguments plus the band. The
+    // duplication is deliberate and is what nn_split_equiv.mlr's dispatch
+    // section exists to police: a single wrong offset here produces confidently
+    // wrong numbers, and on silicon that looks precisely like a cross-core race.
+    u32 in_h = load32(r + 16)
+    u32 in_w = load32(r + 20)
+    u32 in_c = load32(r + 24)
+    i32 act_min = nn_load_i32(r + 96)
+    i32 act_max = nn_load_i32(r + 100)
+
+    if op == 7 {
+        nn_resize_nearest_int8_rows(in0, in_h, in_w, in_c, out,
+                                    load32(r + 48), load32(r + 52), lo, hi)
+        return
+    }
+    if op == 5 {
+        nn_maxpool_int8_rows(in0, in_h, in_w, in_c, out,
+                             load32(r + 40), load32(r + 44),
+                             load32(r + 48), load32(r + 52),
+                             load32(r + 56), load32(r + 60),
+                             act_min, act_max, lo, hi)
+        return
+    }
+    if op == 10 {
+        nn_avgpool_int8_rows(in0, in_h, in_w, in_c, out,
+                             load32(r + 40), load32(r + 44),
+                             load32(r + 48), load32(r + 52),
+                             load32(r + 56), load32(r + 60),
+                             act_min, act_max, lo, hi)
+        return
+    }
+
+    u32 out_c = load32(r + 36)
+    i32 out_zp = nn_load_i32(r + 92)
+    u32 w_p = nn_model_blob_ptr(blob, load32(r + 72))
+    u32 bias_p = nn_model_blob_ptr(blob, load32(r + 76))
+    u32 mult_p = nn_model_blob_ptr(blob, load32(r + 80))
+    u32 shift_p = nn_model_blob_ptr(blob, load32(r + 84))
+    u32 q_stride = load32(r + 68)
+
+    if op == 3 {
+        // POINTWISE has no _rows twin because it is a forwarder, not a kernel:
+        // it IS conv2d with kh = kw = stride = 1 and no padding, so it inherits
+        // conv2d's row bounding directly (nn_int8.mlr:1063-1065). Passing those
+        // five constants here is the same substitution nn_pointwise_conv_int8
+        // makes, so the band and the full range go through one kernel.
+        nn_conv2d_int8_rows(in0, in_h, in_w, in_c, in_zp,
+                            w_p, 1, 1,
+                            bias_p, mult_p, shift_p, q_stride,
+                            out, out_c, out_zp,
+                            1, 1, 0, 0,
+                            act_min, act_max, lo, hi)
+        return
+    }
+    if op == 2 {
+        nn_depthwise_conv2d_int8_rows(in0, in_h, in_w, in_c, in_zp,
+                                      w_p, load32(r + 40), load32(r + 44),
+                                      bias_p, mult_p, shift_p, q_stride,
+                                      out, out_zp,
+                                      load32(r + 48), load32(r + 52),
+                                      load32(r + 56), load32(r + 60),
+                                      load32(r + 64), act_min, act_max, lo, hi)
+        return
+    }
+    if op == 1 {
+        nn_conv2d_int8_rows(in0, in_h, in_w, in_c, in_zp,
+                            w_p, load32(r + 40), load32(r + 44),
+                            bias_p, mult_p, shift_p, q_stride,
+                            out, out_c, out_zp,
+                            load32(r + 48), load32(r + 52),
+                            load32(r + 56), load32(r + 60),
+                            act_min, act_max, lo, hi)
         return
     }
 }

@@ -1,5 +1,13 @@
-// tests/nn/nn_par_esp32.mlr — Stage 4, Task 5: TWO-CORE model inference on
-// real ESP32 silicon, elementwise ops only.
+// tests/nn/nn_par_esp32.mlr — Stage 4, Tasks 5/6: TWO-CORE model inference on
+// real ESP32 silicon.
+//
+// Task 5 wired the four ELEMENTWISE opcodes and measured a net LOSS (0.762x
+// against true single core), because a second ESP32 core that is merely awake
+// costs core 0 ~45% in instruction-fetch contention. Task 6 adds the six
+// SPATIAL opcodes, split on output ROWS, and keeps core 1 RUNSTALLed whenever
+// it is not inside a split band — the mechanism tests/esp32/par_tax.mlr and
+// tests/esp32/par_park_cost.mlr established. nn_park_layers is that shape;
+// nn_par_layers is Task 5's, kept for continuity.
 //
 // This is nn_model_esp32.mlr with a second core attached. Core 0 walks the
 // layer table exactly as std/nn_model.mlr's nn_model_run_prefix does; for a
@@ -123,6 +131,155 @@ fn nn_mt_arena_cap() -> u32 {
     return v
 }
 
+// ---------------------------------------------------------------------------
+// Core 1's stack, and why one canary word would not do
+// ---------------------------------------------------------------------------
+// Core 1 has 4 KiB: XT_ESP32_CORE1_STACK == 0x3FFDEFF0, frames in
+// (0x3FFDE000, 0x3FFDEFF0]. From Task 6 on it runs the deepest nests in the
+// codebase — nn_model_exec_range -> nn_conv2d_int8_rows -> nn_dot_i8_run, and
+// for a pointwise layer nn_conv2d_int8_rows is entered directly with its
+// twenty arguments — and ir_xtensa.mlr's own comment warns that a SINGLE frame
+// may legitimately reach 32752 bytes.
+//
+// What is directly below core 1's floor is .bss, and in this program .bss is
+// the ACTIVATION ARENA. An overflow therefore does not fault; it rewrites
+// activations, and the result is wrong numbers that look exactly like a
+// cross-core race. So this has to be detected, not hoped away.
+//
+// Three separate things are placed, because they fail differently:
+//
+//   1. A GUARD BAND of NN_C1_BAND_BYTES below the floor, filled with
+//      NN_C1_BAND_PAT. A single canary word is not enough: a frame larger than
+//      4 bytes can step clean over one word and land in the arena undetected,
+//      and the whole point of the 32752-byte warning is that frames here can be
+//      enormous. Core 0 scans the band for the LOWEST disturbed word, which
+//      says how far past the floor core 1 actually reached.
+//   2. The two single-word guards std/esp32_smp.mlr already names. The one at
+//      ESP32_C0_GUARD_ADDR (0x3FFDF000) is load-bearing for (3): core 0 runs
+//      the same deep nests, and it must cross that word to reach core 1's span
+//      at all. If it is intact, the low-water mark below is core 1's alone.
+//   3. A low-water fill over core 1's own span, exactly Stage 1's C1LOW: the
+//      lowest address still holding NN_C1_FILL is core 1's high-water mark, so
+//      the report says how close core 1 came even when it never crossed.
+//
+// If the band is ever disturbed, STOP. The fix is a memory-map change — moving
+// core 1's stack, or shrinking the arena — not a retry.
+//
+// THE BAND IS 4 KiB, AND THAT IT IS FREE MEMORY IS MEASURED, NOT ASSUMED.
+// xt_esp32_check_layout refuses a build whose .data+.bss reach past
+// 0x3FFDE000, so the largest dummy static that still compiles equals the free
+// space between the top of .bss and core 1's floor exactly. Binary-searching
+// that on THIS driver with the smoke model gives 111128 bytes: .bss ends at
+// 0x3FFC2DE8 and the band at [0x3FFDD000, 0x3FFDE000) sits 108 KiB clear of it.
+// With a real 89 KB YuNet blob the whole of .data/.bss moves up by ~86 KB and
+// the band still clears the arena by ~21 KiB. Re-run that probe if either the
+// arena or the model grows a lot.
+//
+// It is also self-detecting: if a static ever DID overlap the band, nn_par_poison
+// writes 0x5A over the whole arena before every single run, so the very first
+// report would show the band disturbed. Overlap and overflow both stop the run;
+// they are told apart by re-running the probe, not by guessing.
+//
+// 4 KiB below the floor plus core 1's own 4 KiB span is 8 KiB of contiguous
+// covered memory, so no plausible frame steps over the whole of it — and the
+// low-water mark says what the frames actually cost, which is the number that
+// settles the 32752-byte question empirically.
+static u32 NN_C1_FILL       = 0xEEEEEEEE
+static u32 NN_C1_BAND_PAT   = 0xB0DEC0DE
+static u32 NN_C1_BAND_BYTES = 4096
+
+fn nn_c1_band_base() -> u32 {
+    return ESP32_C1_GUARD_ADDR - NN_C1_BAND_BYTES
+}
+
+// ⚠️ Call from core 0 only, AFTER the single-core baseline and BEFORE
+// esp32_appcpu_start. Core 0's own live frames sit above ESP32_C0_GUARD_ADDR
+// while this runs (it is called straight out of main), so the fill cannot
+// destroy the return address it comes back through — the failure
+// examples/esp32/dualcore_hello.mlr warns about.
+fn nn_c1_stack_prep() {
+    u32 a = nn_c1_band_base()
+    while a < ESP32_C1_GUARD_ADDR {
+        vstore32(a, NN_C1_BAND_PAT)
+        a = a + 4
+    }
+    vstore32(ESP32_C1_GUARD_ADDR, NN_C1_BAND_PAT)
+    vstore32(ESP32_C0_GUARD_ADDR, NN_C1_BAND_PAT)
+    a = ESP32_C1_GUARD_ADDR + 4
+    while a < ESP32_CORE1_STACK_TOP {
+        vstore32(a, NN_C1_FILL)
+        a = a + 4
+    }
+}
+
+fn nn_par_hex32(u32 v) {
+    u32 i = 0
+    while i < 8 {
+        u32 d = (v >> (28 - (i * 4))) & 0xF
+        if d < 10 {
+            nn_mt_putc(d + 48)
+        } else {
+            nn_mt_putc((d - 10) + 65)
+        }
+        i = i + 1
+    }
+}
+
+// BAND is 0 when the band below the floor is untouched, and otherwise the
+// LOWEST disturbed address — i.e. how deep past its floor core 1 went. Anything
+// but 0 means stop.
+fn nn_c1_stack_report() {
+    u32 bad = 0
+    u32 a = nn_c1_band_base()
+    while a < ESP32_C1_GUARD_ADDR {
+        if vload32(a) != NN_C1_BAND_PAT {
+            bad = a
+            break
+        }
+        a = a + 4
+    }
+    u32 lo = ESP32_C1_GUARD_ADDR + 4
+    while lo < ESP32_CORE1_STACK_TOP {
+        if vload32(lo) != NN_C1_FILL { break }
+        lo = lo + 4
+    }
+    nn_mt_str("GUARD BAND ")
+    nn_par_hex32(bad)
+    nn_mt_str(" FLOOR ")
+    nn_par_hex32(vload32(ESP32_C1_GUARD_ADDR))
+    nn_mt_str(" C0 ")
+    nn_par_hex32(vload32(ESP32_C0_GUARD_ADDR))
+    nn_mt_str(" C1LOW ")
+    nn_par_hex32(lo)
+    nn_mt_str(" C1USED ")
+    nn_mt_emit_u32(ESP32_CORE1_STACK_TOP - lo)
+    nn_mt_str(" C1FREE ")
+    nn_mt_emit_u32(lo - ESP32_C1_GUARD_ADDR)
+    nn_mt_putc(10)
+}
+
+// ---------------------------------------------------------------------------
+// The enable ladder
+// ---------------------------------------------------------------------------
+// The brief enables the opcodes one at a time and checks byte-exactness after
+// each. Doing that with six BUILDS would change code layout six times, and code
+// layout is the variable every cycle number in this file is trying to hold
+// still. So the ladder is a runtime MASK instead: one image, one boot, one
+// cache state, seven stages, each with its own full output dump.
+//
+// The mask ANDs with nn_model_op_splittable(), it does not replace it — the
+// library predicate stays the only place an opcode is declared safe to split,
+// and the mask can only ever take ops AWAY from it.
+static u32[1] nn_par_mask
+
+fn nn_par_split_ok(u32 op) -> u32 {
+    if nn_model_op_splittable(op) == 0 { return 0 }
+    // ⚠️ `&` binds TIGHTER than `>>` in this dialect, so the shift MUST be
+    // parenthesised — `m >> op & 1` would parse as `m >> (op & 1)`.
+    if ((vload32(nn_par_mask) >> op) & 1) == 0 { return 0 }
+    return 1
+}
+
 // Core-1 handshake and the three cycle accumulators. Written by core 0 only,
 // except c1_ready which core 1 polls.
 static u32[1] nn_par_c1_ready
@@ -131,6 +288,27 @@ static u32[1] nn_par_ew
 static u32[1] nn_par_bar
 static u32[1] nn_par_base_tot
 static u32[1] nn_par_base_ew
+
+// Per-layer cycle profile, for the load-balance question the brief's Step 4
+// asks. Three numbers per layer:
+//   nn_par_base_lay  core 0 alone, core 1 in reset — the serial cost
+//   nn_par_c0_lay    core 0's own band, in the parked parallel run
+//   nn_par_c1_lay    core 1's band for the SAME layer, timed by core 1 itself
+//
+// c1 is passed through a single slot rather than indexed by core 1, because
+// core 1 does not know the layer index and giving it one would mean a second
+// copy of a fact core 0 already holds. The barrier is what makes the handoff
+// safe: core 1 stores its count BEFORE par_barrier(), so by the time core 0
+// leaves the same barrier the store has happened.
+//
+// max(C0, C1) is what the layer actually costs wall-clock; |C0 - C1| is the
+// skew a static half-split leaves on the table. 16 slots covers the 12-layer
+// smoke model; the writes are bounds-checked, so a larger model simply
+// profiles its first 16 layers instead of corrupting the next static.
+static u32[16] nn_par_base_lay
+static u32[16] nn_par_c0_lay
+static u32[16] nn_par_c1_lay
+static u32[1]  nn_par_c1_last
 
 // ---------------------------------------------------------------------------
 // Core 1
@@ -146,10 +324,17 @@ fn core1_entry() {
     loop { if vload32(nn_par_c1_ready) != 0 { break } }   // wait for par_init
     loop {
         u32 kind = par_take()
+        // Timed from AFTER par_take returns, so this is core 1's WORK only.
+        // Whatever it costs to wake core 1 out of RUNSTALL is deliberately not
+        // in here — it shows up in core 0's BAR instead, which is where it
+        // belongs and where it can be told apart from genuine skew.
+        u32 ca = nn_par_ccount()
         if kind == 1 {
             nn_model_exec_range(par_job_a0(), par_job_a1(), par_job_a2(),
                                 par_job_lo(), par_job_hi())
         }
+        u32 cb = nn_par_ccount()
+        vstore32(nn_par_c1_last, (cb - ca) & 0xFFFFFFFF)
         par_barrier()
     }
 }
@@ -172,12 +357,16 @@ fn nn_par_layers(u32 m, u32 arena, u32 par_on) -> u32 {
     u32 i = 0
     while i < total {
         u32 r = lay + (i * stride)
-        u32 n = load32(r + 104)
+        // The extent of THIS layer's split space — output rows for a spatial
+        // op, flat elements for an elementwise one. nn_model_split_n() is the
+        // one place that distinction is made; nothing here needs to know which
+        // family the layer belongs to.
+        u32 n = nn_model_split_n(r)
         // `mid` is where core 0 stops. For a PARK round it is n, so even a
         // core 1 that ignored `kind` would be handed the empty range [n, n).
         u32 mid = n
         u32 kind = 0
-        u32 splittable = nn_model_op_splittable(load32(r))
+        u32 splittable = nn_par_split_ok(load32(r))
         if par_on != 0 {
             if splittable != 0 {
                 mid = nn_model_split_mid(r)
@@ -241,9 +430,10 @@ fn nn_par_base_layers(u32 m, u32 arena) -> u32 {
         u32 t0 = nn_par_ccount()
         nn_model_exec(r, arena, blob)
         u32 t1 = nn_par_ccount()
-        if nn_model_op_splittable(load32(r)) != 0 {
+        if nn_par_split_ok(load32(r)) != 0 {
             ew = (ew + ((t1 - t0) & 0xFFFFFFFF)) & 0xFFFFFFFF
         }
+        if i < 16 { vstore32(nn_par_base_lay + (i * 4), (t1 - t0) & 0xFFFFFFFF) }
         i = i + 1
     }
     u32 t_end = nn_par_ccount()
@@ -303,21 +493,32 @@ fn nn_park_layers(u32 m, u32 arena) -> u32 {
     u32 i = 0
     while i < total {
         u32 r = lay + (i * stride)
-        u32 n = load32(r + 104)
-        if nn_model_op_splittable(load32(r)) != 0 {
+        u32 n = nn_model_split_n(r)
+        u32 t0 = 0
+        u32 t1 = 0
+        u32 c1 = 0
+        if nn_par_split_ok(load32(r)) != 0 {
             u32 mid = nn_model_split_mid(r)
             nn_park_runstall(0)
             par_publish(1, r, arena, blob, mid, n)
-            u32 t0 = nn_par_ccount()
+            t0 = nn_par_ccount()
             nn_model_exec_range(r, arena, blob, 0, mid)
-            u32 t1 = nn_par_ccount()
+            t1 = nn_par_ccount()
             par_barrier()
             nn_park_runstall(1)
             u32 t2 = nn_par_ccount()
+            // Safe only after the barrier: core 1 stored this before arriving.
+            c1 = vload32(nn_par_c1_last)
             ew = (ew + ((t1 - t0) & 0xFFFFFFFF)) & 0xFFFFFFFF
             bar = (bar + ((t2 - t1) & 0xFFFFFFFF)) & 0xFFFFFFFF
         } else {
+            t0 = nn_par_ccount()
             nn_model_exec(r, arena, blob)
+            t1 = nn_par_ccount()
+        }
+        if i < 16 {
+            vstore32(nn_par_c0_lay + (i * 4), (t1 - t0) & 0xFFFFFFFF)
+            vstore32(nn_par_c1_lay + (i * 4), c1)
         }
         i = i + 1
     }
@@ -329,8 +530,40 @@ fn nn_park_layers(u32 m, u32 arena) -> u32 {
     return 0
 }
 
+// Per-layer profile of the LAST parked run, next to the single-core cost of the
+// same layer. SER is what one core paid; C0/C1 are the two bands of the parallel
+// run. A layer where C0 and C1 differ a lot is a static-half-split skew, and the
+// fix for that is a shared atomic work counter, not a tweak here.
+fn nn_par_dump_layers(u32 m) {
+    u32 total = nn_model_layer_count(m)
+    u32 i = 0
+    while i < total {
+        if i < 16 {
+            u32 r = nn_model_layer_rec(m, i)
+            nn_mt_str("LAY ")
+            nn_mt_emit_u32(i)
+            nn_mt_str(" op ")
+            nn_mt_emit_u32(load32(r))
+            nn_mt_str(" n ")
+            nn_mt_emit_u32(nn_model_split_n(r))
+            nn_mt_str(" mid ")
+            nn_mt_emit_u32(nn_model_split_mid(r))
+            nn_mt_str(" SER ")
+            nn_mt_emit_u32(vload32(nn_par_base_lay + (i * 4)))
+            nn_mt_str(" C0 ")
+            nn_mt_emit_u32(vload32(nn_par_c0_lay + (i * 4)))
+            nn_mt_str(" C1 ")
+            nn_mt_emit_u32(vload32(nn_par_c1_lay + (i * 4)))
+            nn_mt_putc(10)
+        }
+        i = i + 1
+    }
+}
+
 fn nn_par_report(u32 tag) {
     nn_mt_str(tag)
+    nn_mt_str(" MASK ")
+    nn_par_hex32(vload32(nn_par_mask))
     nn_mt_str(" TOT ")
     nn_mt_emit_u32(vload32(nn_par_tot))
     nn_mt_str(" EW ")
@@ -421,6 +654,15 @@ fn nn_park_run(u32 m) -> u32 {
     return 0
 }
 
+// One rung of the enable ladder: set the mask, then run the parked variant.
+// The output dump that follows is what makes the rung byte-checkable on its
+// own — every rung must print the same 120 values as BASE and as
+// tests/nn/nn_model_ref.py, or that opcode's row split is wrong.
+fn nn_park_stage(u32 m, u32 mask) -> u32 {
+    vstore32(nn_par_mask, mask)
+    return nn_park_run(m)
+}
+
 // The baseline's own run wrapper. Same poison + fill + dump as nn_par_run, so
 // its output block is directly comparable with the other two.
 fn nn_par_base_run(u32 m) -> u32 {
@@ -472,11 +714,20 @@ fn main() {
     nn_mt_putc(10)
 
     // ---- the true single-core baseline, core 1 still in reset ----
+    // The mask is FULL here so BASE's EW is core 0's time in every op the
+    // ladder can ever split — the Amdahl numerator for the whole ladder, not
+    // for one rung of it.
+    vstore32(nn_par_mask, 0xFFFFFFFF)
     nn_mt_str("BEGIN BASE\n")
     u32 rcb = nn_par_base_run(model)
     nn_mt_str("END BASE ")
     nn_mt_emit_u32(rcb)
     nn_mt_putc(10)
+
+    // Guard band goes down AFTER the baseline (so core 0's own deep frames
+    // during BASE cannot be mistaken for core 1's) and BEFORE core 1 exists.
+    nn_c1_stack_prep()
+    nn_c1_stack_report()                   // the pristine reading, for contrast
 
     par_init()                             // before releasing core 1
     esp32_appcpu_start(fn_addr("core1_entry"))
@@ -493,15 +744,44 @@ fn main() {
         nn_mt_str(" EW ")
         nn_mt_emit_u32(vload32(nn_par_base_ew))
         nn_mt_putc(10)
+        // Task 5's two shapes first, for continuity: core 1 released and
+        // spinning in the barrier for every layer, split off then on.
+        vstore32(nn_par_mask, 0xFFFFFFFF)
         nn_mt_str("BEGIN SERIAL\n")
         u32 rc0 = nn_par_run(model, 0, "SERIAL")
         nn_mt_str("BEGIN PAR\n")
         u32 rc1 = nn_par_run(model, 1, "PAR")
+
         // Core 1 is sitting in par_take here, which is the only state
         // nn_park_layers may be entered from.
-        nn_mt_str("BEGIN PARK\n")
-        u32 rc2 = nn_park_run(model)
+        //
+        // THE LADDER. Ops are added in the brief's order — 5 maxpool, 10
+        // avgpool, 7 resize, 3 pointwise, 2 depthwise, 1 conv2d — each rung
+        // dumping its own 120 values. conv2d is last because it is the deepest
+        // nest and the largest share of the work.
+        //
+        //   PK0  0x00000000  nothing split: core 1 stays RUNSTALLed for the
+        //                    whole inference. The parked-serial control, and
+        //                    the number BASE should be within noise of.
+        //   PKE  0x00000350  4 RELU, 6 ADD, 8 SIGMOID_LUT, 9 COPY   (Task 5)
+        //   PK5  0x00000370  + 5  MAXPOOL
+        //   PKA  0x00000770  + 10 AVGPOOL
+        //   PK7  0x000007F0  + 7  RESIZE_NN
+        //   PK3  0x000007F8  + 3  POINTWISE
+        //   PK2  0x000007FC  + 2  DEPTHWISE
+        //   PK1  0x000007FE  + 1  CONV2D
+        u32 rc2 = nn_park_stage(model, 0x00000000)
+        rc2 = rc2 + nn_park_stage(model, 0x00000350)
+        rc2 = rc2 + nn_park_stage(model, 0x00000370)
+        rc2 = rc2 + nn_park_stage(model, 0x00000770)
+        rc2 = rc2 + nn_park_stage(model, 0x000007F0)
+        rc2 = rc2 + nn_park_stage(model, 0x000007F8)
+        rc2 = rc2 + nn_park_stage(model, 0x000007FC)
+        rc2 = rc2 + nn_park_stage(model, 0x000007FE)
+        nn_par_dump_layers(model)
+
         nn_park_runstall(0)                // back to spinning for the next SERIAL
+        nn_c1_stack_report()
         nn_mt_str("END ")
         nn_mt_emit_u32((rc0 + rc1) + rc2)
         nn_mt_putc(10)

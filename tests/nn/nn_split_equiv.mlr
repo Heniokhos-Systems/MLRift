@@ -668,6 +668,78 @@ fn nn_se_disp_grab(u32 dst, u32 n) {
     nn_se_bytes(dst, nn_se_ar + nn_se_ar_out, n + nn_se_guard)
 }
 
+// ---- spatial dispatch: the arena, the band space, and the extent check -----
+//
+// The spatial cases below reuse the same fake arena, but their input and output
+// are DIFFERENT sizes, so they need their own prep. Input lands at arena+0 and
+// the output tensor at arena+nn_se_ar_out with nn_se_guard poison behind it,
+// exactly as the elementwise cases arrange it.
+//
+// `blob` is passed as 0 and every blob offset in the record is the ABSOLUTE
+// address of a static. nn_model_blob_ptr(0, off) == off, so the weights, bias
+// and quant tables resolve to nn_se_wt / nn_se_bias / nn_se_mult / nn_se_shift
+// without having to pack a contiguous blob. (0xFFFFFFFF is the only offset with
+// a special meaning and no static can live there.)
+fn nn_se_disp_sp_prep(u32 ibytes, u32 obytes) {
+    u32 ar = nn_se_ar
+    nn_se_bytes(ar, nn_se_in, ibytes)
+    nn_se_fillbyte(ar + nn_se_ar_out, obytes + nn_se_guard, 0x5A)
+}
+
+// Sweep every ROW split point for the spatial record nn_se_rec currently holds.
+//
+// The first thing it does is check that nn_model_split_n() — which is what a
+// caller uses to decide where to cut, and which derives out_h from the record's
+// own fields — agrees with the out_h this case computed the way the kernel's
+// full-range forwarder does. That is the one failure mode a band sweep alone
+// cannot see: if BOTH the sweep bound and the dispatcher used a wrong out_h,
+// every split would still agree with a full range that was equally truncated.
+fn nn_se_dispatch_sp(u32 ibytes, u32 obytes, u32 out_h) {
+    nn_se_need(nn_se_cap, ibytes, 0)                               // nn_se_in
+    nn_se_need(nn_se_cap, obytes + nn_se_guard, 2)                 // nn_se_a
+    nn_se_need(nn_se_cap, obytes + nn_se_guard, 3)                 // nn_se_b
+    nn_se_need(nn_se_arena, nn_se_ar_out + obytes + nn_se_guard, 6) // nn_se_ar
+
+    u32 r = nn_se_rec
+    u32 ar = nn_se_ar
+
+    nn_se_checks = nn_se_checks + 1
+    u32 sn = nn_model_split_n(r)
+    if sn != out_h {
+        nn_se_fails = nn_se_fails + 1
+        print_str("  EXTENT op=")
+        nn_se_emit_u32(load32(r))
+        print_str(": nn_model_split_n=")
+        nn_se_emit_u32(sn)
+        print_str(" but the kernel's out_h=")
+        nn_se_emit_u32(out_h)
+        print_str("\n")
+        return
+    }
+    if nn_model_op_rowsplit(load32(r)) == 0 {
+        nn_se_fails = nn_se_fails + 1
+        print_str("  EXTENT op=")
+        nn_se_emit_u32(load32(r))
+        print_str(": spatial case is not on the rowsplit list\n")
+        return
+    }
+
+    nn_se_disp_sp_prep(ibytes, obytes)
+    nn_model_exec(r, ar, 0)
+    nn_se_disp_grab(nn_se_a, obytes)
+
+    u32 k = 0
+    while k <= out_h {
+        nn_se_disp_sp_prep(ibytes, obytes)
+        u32 k2 = nn_se_pk(k, out_h)
+        nn_model_exec_range(r, ar, 0, 0, k)
+        nn_model_exec_range(r, ar, 0, k2, out_h)
+        nn_se_disp_grab(nn_se_b, obytes)
+        nn_se_cmp(obytes, k)
+        k = k + 1
+    }
+}
+
 // Sweep every split point for whatever record nn_se_rec currently holds.
 fn nn_se_dispatch(u32 n, u32 inplace) {
     nn_se_need(nn_se_cap, n, 0)                                    // nn_se_in
@@ -772,6 +844,165 @@ fn nn_se_disp_add(u32 n) {
     nn_se_dispatch(n, 0)
 }
 
+// --- the six SPATIAL opcodes, through the dispatcher ------------------------
+// Same shape as the four above: build a record, hand it to the sweeper. The
+// field offsets written here are the ones nn_model_exec() READS, so a case that
+// wrote the wrong offset would make BOTH sides of the comparison wrong in the
+// same way and prove nothing — which is why each of these is also mirrored by a
+// kernel-level case above using the same shapes, and why the extent check in
+// nn_se_dispatch_sp exists.
+
+// op 1 CONV2D.
+fn nn_se_disp_conv(u32 in_h, u32 in_w, u32 in_c, u32 out_c,
+                   u32 kh, u32 kw, u32 sh, u32 sw, u32 ph, u32 pw) {
+    u32 out_h = nn_out_dim(in_h, kh, sh, ph)
+    u32 out_w = nn_out_dim(in_w, kw, sw, pw)
+    u32 ibytes = (in_h * in_w) * in_c
+    u32 obytes = (out_h * out_w) * out_c
+    nn_se_need(nn_se_cap, ((out_c * kh) * kw) * in_c, 1)    // nn_se_wt
+    nn_se_need(nn_se_quant, out_c, 4)                       // bias/mult/shift
+    nn_se_fill(nn_se_in, ibytes)
+    nn_se_fill(nn_se_wt, ((out_c * kh) * kw) * in_c)
+    nn_se_fill_quant(out_c)
+
+    nn_se_rec_zero()
+    nn_se_rec_set(0, 1)
+    nn_se_rec_set(4, 0)                     // in0_off
+    nn_se_rec_set(12, nn_se_ar_out)         // out_off
+    nn_se_rec_set(16, in_h)  nn_se_rec_set(20, in_w)  nn_se_rec_set(24, in_c)
+    nn_se_rec_set(36, out_c)
+    nn_se_rec_set(40, kh)    nn_se_rec_set(44, kw)
+    nn_se_rec_set(48, sh)    nn_se_rec_set(52, sw)
+    nn_se_rec_set(56, ph)    nn_se_rec_set(60, pw)
+    nn_se_rec_set(68, 1)                    // q_stride: per-channel
+    nn_se_rec_set(72, nn_se_wt)             // w_off    (blob == 0, see above)
+    nn_se_rec_set(76, nn_se_bias)
+    nn_se_rec_set(80, nn_se_mult)
+    nn_se_rec_set(84, nn_se_shift)
+    nn_se_rec_seti(88, 0 - 3)               // in_zp
+    nn_se_rec_seti(92, 11)                  // out_zp
+    nn_se_rec_seti(96, 0 - 128)             // act_min
+    nn_se_rec_seti(100, 127)                // act_max
+    nn_se_rec_set(104, obytes)
+    nn_se_dispatch_sp(ibytes, obytes, out_h)
+}
+
+// op 3 POINTWISE. Deliberately built as its OWN opcode rather than as a 1x1
+// conv2d: the whole claim is that the dispatcher can band a layer whose record
+// carries no kh/kw/stride/pad at all, by substituting the five constants
+// nn_pointwise_conv_int8 substitutes. Those fields are left ZERO here, so a
+// dispatcher that read them instead of hardcoding 1/1/1/1/0 would produce
+// out_dim(in_h, 0, 0, 0) and fail loudly rather than coincidentally work.
+fn nn_se_disp_pointwise(u32 in_h, u32 in_w, u32 in_c, u32 out_c) {
+    u32 ibytes = (in_h * in_w) * in_c
+    u32 obytes = (in_h * in_w) * out_c
+    nn_se_need(nn_se_cap, out_c * in_c, 1)
+    nn_se_need(nn_se_quant, out_c, 4)
+    nn_se_fill(nn_se_in, ibytes)
+    nn_se_fill(nn_se_wt, out_c * in_c)
+    nn_se_fill_quant(out_c)
+
+    nn_se_rec_zero()
+    nn_se_rec_set(0, 3)
+    nn_se_rec_set(4, 0)
+    nn_se_rec_set(12, nn_se_ar_out)
+    nn_se_rec_set(16, in_h)  nn_se_rec_set(20, in_w)  nn_se_rec_set(24, in_c)
+    nn_se_rec_set(36, out_c)
+    nn_se_rec_set(68, 1)
+    nn_se_rec_set(72, nn_se_wt)
+    nn_se_rec_set(76, nn_se_bias)
+    nn_se_rec_set(80, nn_se_mult)
+    nn_se_rec_set(84, nn_se_shift)
+    nn_se_rec_seti(88, 0 - 6)
+    nn_se_rec_seti(92, 4)
+    nn_se_rec_seti(96, 0 - 128)
+    nn_se_rec_seti(100, 127)
+    nn_se_rec_set(104, obytes)
+    nn_se_dispatch_sp(ibytes, obytes, in_h)
+}
+
+// op 2 DEPTHWISE.
+fn nn_se_disp_dw(u32 in_h, u32 in_w, u32 in_c, u32 dm,
+                 u32 kh, u32 kw, u32 sh, u32 sw, u32 ph, u32 pw) {
+    u32 out_c = in_c * dm
+    u32 out_h = nn_out_dim(in_h, kh, sh, ph)
+    u32 out_w = nn_out_dim(in_w, kw, sw, pw)
+    u32 ibytes = (in_h * in_w) * in_c
+    u32 obytes = (out_h * out_w) * out_c
+    nn_se_need(nn_se_cap, (kh * kw) * out_c, 1)
+    nn_se_need(nn_se_quant, out_c, 4)
+    nn_se_fill(nn_se_in, ibytes)
+    nn_se_fill(nn_se_wt, (kh * kw) * out_c)
+    nn_se_fill_quant(out_c)
+
+    nn_se_rec_zero()
+    nn_se_rec_set(0, 2)
+    nn_se_rec_set(4, 0)
+    nn_se_rec_set(12, nn_se_ar_out)
+    nn_se_rec_set(16, in_h)  nn_se_rec_set(20, in_w)  nn_se_rec_set(24, in_c)
+    nn_se_rec_set(36, out_c)
+    nn_se_rec_set(40, kh)    nn_se_rec_set(44, kw)
+    nn_se_rec_set(48, sh)    nn_se_rec_set(52, sw)
+    nn_se_rec_set(56, ph)    nn_se_rec_set(60, pw)
+    nn_se_rec_set(64, dm)                   // depth_mult
+    nn_se_rec_set(68, 1)
+    nn_se_rec_set(72, nn_se_wt)
+    nn_se_rec_set(76, nn_se_bias)
+    nn_se_rec_set(80, nn_se_mult)
+    nn_se_rec_set(84, nn_se_shift)
+    nn_se_rec_seti(88, 0 - 12)
+    nn_se_rec_seti(92, 0 - 2)
+    nn_se_rec_seti(96, 0 - 128)
+    nn_se_rec_seti(100, 127)
+    nn_se_rec_set(104, obytes)
+    nn_se_dispatch_sp(ibytes, obytes, out_h)
+}
+
+// ops 5 MAXPOOL and 10 AVGPOOL — identical record shape, so one builder.
+fn nn_se_disp_pool(u32 op, u32 in_h, u32 in_w, u32 in_c,
+                   u32 kh, u32 kw, u32 sh, u32 sw, u32 ph, u32 pw) {
+    u32 out_h = nn_out_dim(in_h, kh, sh, ph)
+    u32 out_w = nn_out_dim(in_w, kw, sw, pw)
+    u32 ibytes = (in_h * in_w) * in_c
+    u32 obytes = (out_h * out_w) * in_c
+    nn_se_fill(nn_se_in, ibytes)
+
+    nn_se_rec_zero()
+    nn_se_rec_set(0, op)
+    nn_se_rec_set(4, 0)
+    nn_se_rec_set(12, nn_se_ar_out)
+    nn_se_rec_set(16, in_h)  nn_se_rec_set(20, in_w)  nn_se_rec_set(24, in_c)
+    nn_se_rec_set(40, kh)    nn_se_rec_set(44, kw)
+    nn_se_rec_set(48, sh)    nn_se_rec_set(52, sw)
+    nn_se_rec_set(56, ph)    nn_se_rec_set(60, pw)
+    nn_se_rec_seti(96, 0 - 128)
+    nn_se_rec_seti(100, 127)
+    nn_se_rec_set(104, obytes)
+    nn_se_dispatch_sp(ibytes, obytes, out_h)
+}
+
+// op 7 RESIZE_NN. scale_h/scale_w live at +48/+52 — the SAME two words that
+// carry stride_h/stride_w for every other spatial op, which is precisely why
+// nn_model_out_h has to special-case this opcode instead of calling
+// nn_out_dim() on those fields.
+fn nn_se_disp_resize(u32 in_h, u32 in_w, u32 in_c, u32 scale_h, u32 scale_w) {
+    u32 out_h = in_h * scale_h
+    u32 out_w = in_w * scale_w
+    u32 ibytes = (in_h * in_w) * in_c
+    u32 obytes = (out_h * out_w) * in_c
+    nn_se_fill(nn_se_in, ibytes)
+
+    nn_se_rec_zero()
+    nn_se_rec_set(0, 7)
+    nn_se_rec_set(4, 0)
+    nn_se_rec_set(12, nn_se_ar_out)
+    nn_se_rec_set(16, in_h)  nn_se_rec_set(20, in_w)  nn_se_rec_set(24, in_c)
+    nn_se_rec_set(48, scale_h)
+    nn_se_rec_set(52, scale_w)
+    nn_se_rec_set(104, obytes)
+    nn_se_dispatch_sp(ibytes, obytes, out_h)
+}
+
 
 // ---------------------------------------------------------------------------
 // Cases
@@ -843,6 +1074,54 @@ fn nn_se_run() {
     nn_se_disp_copy(37)         nn_se_disp_copy(16)         nn_se_disp_copy(1)
     nn_se_disp_sigmoid(37)      nn_se_disp_sigmoid(16)      nn_se_disp_sigmoid(1)
     nn_se_disp_add(37)          nn_se_disp_add(16)          nn_se_disp_add(1)
+
+    // --- the same dispatcher on the six SPATIAL opcodes (Task 6) ------------
+    // Shapes mirror the kernel-level cases above, including the odd out_h and
+    // the degenerate out_h == 1 (which no row split can cut, and which must
+    // still be byte-identical rather than merely "not crash").
+    print_str("dispatch-spatial\n")
+    //               in_h in_w in_c out_c  kh kw  sh sw  ph pw
+    nn_se_disp_conv(    5,   5,   2,    3,  3, 3,  1, 1,  1, 1)   // out_h 5 (odd)
+    nn_se_disp_conv(    6,   6,   2,    2,  3, 3,  2, 2,  0, 0)   // out_h 2
+    nn_se_disp_conv(    7,   4,   3,    4,  3, 3,  2, 1,  1, 1)   // out_h 4
+    nn_se_disp_conv(    9,   3,   1,    5,  3, 3,  1, 1,  1, 1)   // out_h 9 (odd)
+    nn_se_disp_conv(    3,   3,   2,    2,  3, 3,  1, 1,  2, 2)   // out_h 5, pad > k/2
+    nn_se_disp_conv(    4,   4,   2,    3,  4, 4,  4, 4,  0, 0)   // out_h 1
+    // ph != pw and kh != kw, so a dispatcher that swapped either pair — the
+    // easiest possible mis-decode, since the fields are adjacent — diverges.
+    nn_se_disp_conv(    5,   5,   2,    3,  3, 1,  1, 1,  1, 0)   // out_h 5 (odd)
+
+    nn_se_disp_pointwise(5, 5, 3, 4)                              // out_h 5 (odd)
+    nn_se_disp_pointwise(4, 4, 2, 6)
+    nn_se_disp_pointwise(7, 2, 2, 5)                              // out_h 7 (odd)
+    nn_se_disp_pointwise(1, 3, 4, 3)                              // out_h 1
+
+    //             in_h in_w in_c  dm  kh kw  sh sw  ph pw
+    nn_se_disp_dw(    5,   5,   3,  1,  3, 3,  1, 1,  1, 1)       // out_h 5 (odd)
+    nn_se_disp_dw(    4,   4,   2,  2,  3, 3,  2, 2,  1, 1)       // out_h 2, dm 2
+    nn_se_disp_dw(    7,   3,   2,  1,  3, 3,  2, 1,  1, 1)       // out_h 4
+    nn_se_disp_dw(    9,   4,   1,  3,  3, 3,  1, 1,  1, 1)       // out_h 9 (odd), dm 3
+    nn_se_disp_dw(    3,   3,   4,  1,  3, 3,  1, 1,  2, 2)       // out_h 5, pad > k/2
+    nn_se_disp_dw(    4,   4,   2,  1,  4, 4,  4, 4,  0, 0)       // out_h 1
+    nn_se_disp_dw(    5,   5,   2,  1,  3, 1,  1, 1,  1, 0)       // out_h 5, ph != pw
+
+    nn_se_disp_pool(5, 7, 5, 2, 2, 2, 2, 2, 0, 0)                 // out_h 3 (odd)
+    nn_se_disp_pool(5, 7, 7, 3, 3, 3, 2, 2, 1, 1)                 // out_h 4
+    nn_se_disp_pool(5, 9, 4, 1, 3, 3, 1, 1, 1, 1)                 // out_h 9 (odd)
+    nn_se_disp_pool(5, 5, 5, 2, 3, 3, 2, 2, 1, 1)                 // out_h 3 (odd)
+    nn_se_disp_pool(5, 4, 4, 2, 4, 4, 4, 4, 0, 0)                 // out_h 1
+    nn_se_disp_pool(5, 6, 6, 2, 3, 2, 2, 2, 1, 0)                 // out_h 3, ph != pw
+    nn_se_disp_pool(10, 7, 5, 2, 2, 2, 2, 2, 0, 0)
+    nn_se_disp_pool(10, 7, 7, 3, 3, 3, 2, 2, 1, 1)
+    nn_se_disp_pool(10, 9, 4, 1, 3, 3, 1, 1, 1, 1)
+    nn_se_disp_pool(10, 5, 5, 2, 3, 3, 2, 2, 1, 1)
+    nn_se_disp_pool(10, 4, 4, 2, 4, 4, 4, 4, 0, 0)
+    nn_se_disp_pool(10, 6, 6, 2, 3, 2, 2, 2, 1, 0)
+
+    nn_se_disp_resize(3, 2, 2, 3, 2)                              // out_h 9 (odd)
+    nn_se_disp_resize(2, 3, 1, 2, 1)                              // out_h 4
+    nn_se_disp_resize(5, 2, 3, 1, 2)                              // out_h 5 (odd)
+    nn_se_disp_resize(1, 1, 4, 7, 7)                              // out_h 7 (odd)
 }
 
 fn main() {
