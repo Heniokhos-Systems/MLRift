@@ -5320,6 +5320,31 @@ else
 fi
 rm -f "$XT_WR_SRC"
 
+echo ""
+echo "--- --arch value validation ---"
+AV_SRC="/tmp/mlrc_archv_$$.mlr"
+AV_BIN="/tmp/mlrc_archv_$$.bin"
+printf 'fn main() { uint32 x = 3\n exit(x) }\n' > "$AV_SRC"
+for BAD in GARBAGE riscv64 riscv riscvBANANA arm64BANANA; do
+    TOTAL=$((TOTAL + 1))
+    $MLRC --arch=$BAD "$AV_SRC" -o "$AV_BIN" >/dev/null 2>&1; AV_ST=$?
+    if [ "$AV_ST" != "0" ]; then
+        PASS=$((PASS + 1)); echo "  arch_reject_$BAD: PASS (exit $AV_ST)"
+    else
+        echo "FAIL: arch_reject_$BAD (expected non-zero exit, got 0)"; FAIL=$((FAIL + 1))
+    fi
+done
+for GOOD in x86_64 x86-64 amd64 x64 arm64 aarch64 riscv32; do
+    TOTAL=$((TOTAL + 1))
+    rm -f "$AV_BIN"
+    if $MLRC --arch=$GOOD "$AV_SRC" -o "$AV_BIN" >/dev/null 2>&1 && [ -s "$AV_BIN" ]; then
+        PASS=$((PASS + 1)); echo "  arch_accept_$GOOD: PASS"
+    else
+        echo "FAIL: arch_accept_$GOOD (should compile and produce a non-empty artifact)"; FAIL=$((FAIL + 1))
+    fi
+done
+rm -f "$AV_SRC" "$AV_BIN"
+
 # --- Summary ---
 echo ""
 echo "=== Results: $PASS/$TOTAL passed, $FAIL failed ==="
