@@ -36,6 +36,38 @@ run_test() {
     rm -f "$REPO_ROOT/test_tmp_$$.mlr" /tmp/mlrc_test_$$
 }
 
+# Like run_test, but bounds wall-clock time. A timeout is reported distinctly
+# from a wrong exit code, because "took too long" and "computed the wrong
+# answer" are different failures and conflating them hides regressions.
+run_test_timed() {
+    local name="$1"
+    local input="$2"
+    local expected="$3"
+    local secs="$4"
+    TOTAL=$((TOTAL + 1))
+
+    local REPO_ROOT="$DIR/.."
+    printf '%s\n' "$input" > "$REPO_ROOT/test_tmp_$$.mlr"
+    if $MLRC $MLRC_FLAGS "$REPO_ROOT/test_tmp_$$.mlr" -o /tmp/mlrc_test_$$ > /dev/null 2>&1; then
+        chmod +x /tmp/mlrc_test_$$
+        local got=0
+        timeout "$secs" /tmp/mlrc_test_$$ > /dev/null 2>&1 && got=0 || got=$?
+        if [ "$got" = "124" ]; then
+            echo "FAIL: $name (exceeded ${secs}s wall clock)"
+            FAIL=$((FAIL + 1))
+        elif [ "$got" = "$expected" ]; then
+            PASS=$((PASS + 1))
+        else
+            echo "FAIL: $name (expected $expected, got $got)"
+            FAIL=$((FAIL + 1))
+        fi
+    else
+        echo "FAIL: $name (compilation failed)"
+        FAIL=$((FAIL + 1))
+    fi
+    rm -f "$REPO_ROOT/test_tmp_$$.mlr" /tmp/mlrc_test_$$
+}
+
 run_test_output() {
     local name="$1"
     local input="$2"
@@ -398,6 +430,255 @@ run_test_output "str_upper_basic" 'import "std/string.mlr"
 fn main() { println_str(str_upper("HeLLo 123")) }' "HELLO 123"
 run_test_output "str_replace_basic" 'import "std/string.mlr"
 fn main() { println_str(str_replace("a.b.c.d", ".", "-")) }' "a-b-c-d"
+
+# --- Three verified stdlib crashes (fmt_f64, vec_remove, sqrt_int) ---
+# fmt_f64_pos computed leading_zeros = decimals - frac_len as an unsigned
+# u64. With decimals=0, frac_len is always >= 1 (fmt_dec(0) == "0"), so the
+# subtraction underflowed to ~2^64 and the zero-pad loop wrote far past the
+# alloc(total) buffer -> SIGSEGV on every call. Now decimals==0 skips the
+# fractional section entirely (matches printf "%.0f").
+run_test_output "fmt_f64_zero_decimals" 'import "std/math_float.mlr"
+fn main() { println_str(fmt_f64(int_to_f64(7), 0)) }' "7"
+run_test_output "fmt_f32_zero_decimals" 'import "std/math_float.mlr"
+fn main() { println_str(fmt_f32(f64_to_f32(int_to_f64(7)), 0)) }' "7"
+run_test_output "fmt_f64_zero_decimals_negative" 'import "std/math_float.mlr"
+fn main() { println_str(fmt_f64(int_to_f64(0) - int_to_f64(9), 0)) }' "-9"
+# |value| >= 2^63 saturates f64_to_int, so int_part no longer reconstructs
+# aval's integer part and `frac` can land outside [0,1). frac_len then
+# exceeds `decimals`, and the fractional copy loop wrote past the `total`
+# allocation -> SIGSEGV. Reached via str_to_float since float literals cap
+# at 1e18. Now frac is clamped to [0,1) before use, so this cannot corrupt
+# the heap; the printed value is documented as wrong-but-safe for such
+# out-of-range magnitudes (this does not assert an exact string — only
+# that it terminates cleanly with a nonempty, sane-looking result).
+run_test "fmt_f64_extreme_magnitude_no_crash" 'import "std/math_float.mlr"
+import "std/string.mlr"
+fn main() {
+    f64 v = str_to_float("1e22")
+    u64 s = fmt_f64(v, 12)
+    u64 len = str_len(s)
+    if len > 0 { exit(0) }
+    exit(1)
+}' 0
+# vec_remove(v, idx) computed len - 1 as unsigned. On an empty vec (len==0)
+# this underflows to ~2^64, turning the shift loop's bound into a runaway
+# out-of-bounds read/write -> SIGSEGV. Now a no-op on an empty vec.
+run_test "vec_remove_empty_no_crash" 'import "std/vec.mlr"
+fn main() {
+    u64 v = vec_new()
+    vec_remove(v, 0)
+    exit(42)
+}' 42
+# An out-of-range idx on a non-empty vec did not crash (the shift loop
+# condition `i < len - 1` is false immediately since idx >= len), but it
+# silently decremented the stored length anyway, corrupting the vec even
+# though nothing was actually removed. Now out-of-range idx is a no-op.
+run_test "vec_remove_out_of_range_no_corrupt" 'import "std/vec.mlr"
+fn main() {
+    u64 v = vec_new()
+    vec_push(v, 10)
+    vec_push(v, 20)
+    vec_push(v, 30)
+    vec_remove(v, 99)
+    exit(vec_len(v))
+}' 3
+# sqrt_int(n) seeded y = (x + 1) / 2 with x = n. At n == u64::MAX, x + 1
+# overflows to 0, so y becomes 0; the next iteration then divides n/x by
+# zero -> SIGFPE. Now the one x for which x+1 overflows (u64::MAX) is
+# special-cased with the exact value the addition would have produced,
+# leaving every other n bit-for-bit unchanged. Verified against Python 3's
+# math.isqrt across a range spanning small values, both sides of 2^32,
+# both sides of 2^63, and both sides of 2^64 (isqrt(2^64-1) == 4294967295).
+run_test "sqrt_int_max_no_crash_matches_isqrt" 'import "std/math.mlr"
+fn main() {
+    u64 fails = 0
+    if sqrt_int(0) != 0 { fails = fails + 1 }
+    if sqrt_int(1) != 1 { fails = fails + 1 }
+    if sqrt_int(2) != 1 { fails = fails + 1 }
+    if sqrt_int(4) != 2 { fails = fails + 1 }
+    if sqrt_int(99) != 9 { fails = fails + 1 }
+    if sqrt_int(4294967296) != 65536 { fails = fails + 1 }
+    if sqrt_int(4294967295) != 65535 { fails = fails + 1 }
+    if sqrt_int(9223372036854775808) != 3037000499 { fails = fails + 1 }
+    if sqrt_int(9223372036854775807) != 3037000499 { fails = fails + 1 }
+    if sqrt_int(18446744073709551614) != 4294967295 { fails = fails + 1 }
+    if sqrt_int(0xFFFFFFFFFFFFFFFF) != 4294967295 { fails = fails + 1 }
+    exit(fails)
+}' 0
+
+# --- std/tokenizer.mlr BPE pre-tokenizer: control whitespace ---
+# tk_bpe_pretoken_end(input, len, p) returns the end offset of the pre-token
+# starting at p, i.e. exactly the byte spans the byte-level BPE regex
+#   (?i:...)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*
+#   |\s*[\r\n]+|\s+(?!\S)|\s+
+# produces. The old code emitted every \t/\n/\r as an isolated single-byte
+# pre-token, which silently diverged from HuggingFace `tokenizers` for any
+# input with a tab or a blank line. Boundaries below were taken from
+# tokenizer.pre_tokenizer.pre_tokenize_str() on the real
+# unsloth/Llama-3.2-1B-Instruct and Qwen/Qwen3.5-0.8B tokenizer.json, and
+# cross-checked as token IDs through tokenizer_load_from_gguf against the
+# matching local GGUFs.
+#
+# "Hello\tworld" -> ["Hello", "\tworld"]  (ids 9906, 77608 on Llama-3.2)
+# The tab folds into the following letter run; it used to stand alone.
+run_test "bpe_pretok_tab_folds_into_letters" 'import "std/tokenizer.mlr"
+fn main() {
+    u64 s = "Hello\tworld"
+    u64 n = str_len(s)
+    if tk_bpe_pretoken_end(s, n, 0) != 5 { exit(1) }
+    if tk_bpe_pretoken_end(s, n, 5) != 11 { exit(2) }
+    exit(0)
+}' 0
+# "tab\ttab\ttab" -> ["tab", "\ttab", "\ttab"]  (ids 6323, 59249, 59249)
+run_test "bpe_pretok_tab_folds_repeated" 'import "std/tokenizer.mlr"
+fn main() {
+    u64 s = "tab\ttab\ttab"
+    u64 n = str_len(s)
+    if tk_bpe_pretoken_end(s, n, 0) != 3 { exit(1) }
+    if tk_bpe_pretoken_end(s, n, 3) != 7 { exit(2) }
+    if tk_bpe_pretoken_end(s, n, 7) != 11 { exit(3) }
+    exit(0)
+}' 0
+# "\n\nnewlines\n\n" -> ["\n\n", "newlines", "\n\n"]  (ids 271, 943, 8128, 271)
+# Consecutive newlines merge into ONE pre-token (regex alt `\s*[\r\n]+`);
+# they used to be emitted one byte at a time.
+run_test "bpe_pretok_newline_run_merges" 'import "std/tokenizer.mlr"
+fn main() {
+    u64 s = "\n\nnewlines\n\n"
+    u64 n = str_len(s)
+    if tk_bpe_pretoken_end(s, n, 0) != 2 { exit(1) }
+    if tk_bpe_pretoken_end(s, n, 2) != 10 { exit(2) }
+    if tk_bpe_pretoken_end(s, n, 10) != 12 { exit(3) }
+    exit(0)
+}' 0
+# A lone \r\n pair is one pre-token, and \r\n runs merge like \n runs.
+run_test "bpe_pretok_crlf_merges" 'import "std/tokenizer.mlr"
+fn main() {
+    u64 s = "a\r\n\r\nb"
+    u64 n = str_len(s)
+    if tk_bpe_pretoken_end(s, n, 0) != 1 { exit(1) }
+    if tk_bpe_pretoken_end(s, n, 1) != 5 { exit(2) }
+    if tk_bpe_pretoken_end(s, n, 5) != 6 { exit(3) }
+    exit(0)
+}' 0
+# \r and \n are excluded from the fold class, so a newline before a letter
+# stays its own pre-token: "\nHello" -> ["\n", "Hello"], not ["\nHello"].
+run_test "bpe_pretok_newline_does_not_fold" 'import "std/tokenizer.mlr"
+fn main() {
+    u64 s = "\nHello"
+    u64 n = str_len(s)
+    if tk_bpe_pretoken_end(s, n, 0) != 1 { exit(1) }
+    if tk_bpe_pretoken_end(s, n, 1) != 6 { exit(2) }
+    exit(0)
+}' 0
+# Trailing spaces on a blank line belong to the newline run, not to the
+# spaces: "a  \n\nb" -> ["a", "  \n\n", "b"].
+run_test "bpe_pretok_spaces_join_newline_run" 'import "std/tokenizer.mlr"
+fn main() {
+    u64 s = "a  \n\nb"
+    u64 n = str_len(s)
+    if tk_bpe_pretoken_end(s, n, 0) != 1 { exit(1) }
+    if tk_bpe_pretoken_end(s, n, 1) != 5 { exit(2) }
+    if tk_bpe_pretoken_end(s, n, 5) != 6 { exit(3) }
+    exit(0)
+}' 0
+# The plain-space fold must keep working: "  Hello" -> [" ", " Hello"].
+run_test "bpe_pretok_space_fold_unchanged" 'import "std/tokenizer.mlr"
+fn main() {
+    u64 s = "  Hello"
+    u64 n = str_len(s)
+    if tk_bpe_pretoken_end(s, n, 0) != 1 { exit(1) }
+    if tk_bpe_pretoken_end(s, n, 1) != 7 { exit(2) }
+    exit(0)
+}' 0
+
+# --- str_to_float exponent handling ---
+# Negative exponents used to multiply by 1/10 once per digit. 1/10 is inexact
+# in binary, so the error compounded: one multiply survived, two did not.
+# These two cases both failed before the exactly-built power-of-ten fix.
+run_test "str_to_float_neg_exp" 'import "std/string.mlr"
+fn main() {
+    if str_to_float("1.5e-2") == 0.015 { exit(0) }
+    exit(1)
+}' 0
+run_test "str_to_float_neg_exp_alt" 'import "std/string.mlr"
+fn main() {
+    if str_to_float("15e-3") == 0.015 { exit(0) }
+    exit(1)
+}' 0
+# Positive controls: these passed before and must keep passing.
+run_test "str_to_float_pos_exp" 'import "std/string.mlr"
+fn main() {
+    if str_to_float("1e2") == 100.0 { exit(0) }
+    exit(1)
+}' 0
+run_test "str_to_float_signed" 'import "std/string.mlr"
+fn main() {
+    if str_to_float("-3.14e2") == 0.0 - 314.0 { exit(0) }
+    exit(1)
+}' 0
+# The exponent loop is clamped at 400 because 10^309 is already +inf. This is
+# TIMED, not just checked for exit code: without the clamp the loop still
+# terminates, it just takes ~0.58 s per parse (measured), so a plain exit-code
+# test passes against the unfixed stdlib and proves nothing. 50 parses is
+# ~29 s unclamped versus instant clamped.
+run_test_timed "str_to_float_exp_clamped" 'import "std/string.mlr"
+fn main() {
+    u64 n = 0
+    u64 hits = 0
+    while n < 50 {
+        f64 v = str_to_float("1e999999999")
+        if v > 1.0 { hits = hits + 1 }
+        n = n + 1
+    }
+    if hits == 50 { exit(0) }
+    exit(1)
+}' 0 5
+# Exactness across the negative-exponent range. Every one of these is a
+# distinct number of compounding steps in the old implementation.
+run_test "str_to_float_neg_exp_range" 'import "std/string.mlr"
+fn main() {
+    if str_to_float("1e-1") != 0.1 { exit(1) }
+    if str_to_float("1e-2") != 0.01 { exit(2) }
+    if str_to_float("1e-3") != 0.001 { exit(3) }
+    if str_to_float("1e-4") != 0.0001 { exit(4) }
+    if str_to_float("1e-5") != 0.00001 { exit(5) }
+    if str_to_float("1e-6") != 0.000001 { exit(6) }
+    if str_to_float("1e-7") != 0.0000001 { exit(7) }
+    exit(0)
+}' 0
+# Mantissa/exponent combinations, and the equivalent spellings of one value.
+run_test "str_to_float_equivalent_spellings" 'import "std/string.mlr"
+fn main() {
+    f64 a = str_to_float("0.015")
+    if str_to_float("1.5e-2") != a { exit(1) }
+    if str_to_float("15e-3")  != a { exit(2) }
+    if str_to_float("150e-4") != a { exit(3) }
+    if str_to_float("1.5E-2") != a { exit(4) }
+    exit(0)
+}' 0
+# Accepted syntax that is easy to regress: leading +, bare .5, trailing .,
+# capital E, explicit +exponent, and a trailing-garbage stop.
+run_test "str_to_float_syntax_forms" 'import "std/string.mlr"
+fn main() {
+    if str_to_float("+3.5")   != 3.5   { exit(1) }
+    if str_to_float(".5")     != 0.5   { exit(2) }
+    if str_to_float("5.")     != 5.0   { exit(3) }
+    if str_to_float("1E3")    != 1000.0 { exit(4) }
+    if str_to_float("1e+3")   != 1000.0 { exit(5) }
+    if str_to_float("3.5abc") != 3.5   { exit(6) }
+    if str_to_float("0e0")    != 0.0   { exit(7) }
+    exit(0)
+}' 0
+# No-digit inputs return 0.0 rather than reading past the string.
+run_test "str_to_float_no_digits" 'import "std/string.mlr"
+fn main() {
+    if str_to_float("")    != 0.0 { exit(1) }
+    if str_to_float("abc") != 0.0 { exit(2) }
+    if str_to_float("e5")  != 0.0 { exit(3) }
+    if str_to_float("-")   != 0.0 { exit(4) }
+    exit(0)
+}' 0
 run_test_output "str_replace_longer" 'import "std/string.mlr"
 fn main() { println_str(str_replace("hi world hi", "hi", "HELLO")) }' "HELLO world HELLO"
 run_test_output "str_replace_noop" 'import "std/string.mlr"
@@ -1596,6 +1877,54 @@ run_test "asm_shl_in_out" 'fn shl_by(uint64 v, uint64 n) -> uint64 {
     return r
 }
 fn main() { exit(shl_by(3, 4)) }' 48
+
+# --- asm blocks must not destroy the CALLER's callee-saved registers ---
+# The prologue's push set used to be built purely from colours the register
+# allocator handed out, so a callee-saved register touched only by an asm
+# block was neither pushed nor popped. std/thread.mlr's tp_spawn_raw used
+# `in(flags -> r15)` and SIGSEGV'd thread_pool_init, which keeps a live
+# value in r15 across the call. Both shapes below must survive; each caller
+# keeps six values live across the call, which forces the allocator to fill
+# rbx/r12/r13/r14/r15/rbp.
+#
+# `body` is the one that matters most: r15 is written by a raw instruction
+# INSIDE the opaque asm text and named in no constraint list, so only a
+# whole-function "has asm -> save everything" rule catches it. That is
+# exactly the std/vec_f64_dispatch CPUID-writes-r13 shape, which did not
+# crash purely because r13 was dead at its call sites.
+run_test "asm_callee_saved_body_write" 'fn clobber(uint64 x) -> uint64 {
+    uint64 r = 0
+    asm { "0x49 0x89 0xC7" } in(x -> rax) out(rax -> r)
+    return r
+}
+fn caller(uint64 seed) -> uint64 {
+    uint64 a = seed + 1
+    uint64 b = seed + 2
+    uint64 c = seed + 3
+    uint64 d = seed + 4
+    uint64 e = seed + 5
+    uint64 f = seed + 6
+    uint64 t = clobber(seed)
+    return a + b + c + d + e + f + t
+}
+fn main() { exit(caller(1)) }' 28
+
+run_test "asm_callee_saved_in_constraint" 'fn clobber(uint64 x) -> uint64 {
+    uint64 r = 0
+    asm { "0x4C 0x89 0xF8" } in(x -> r15) out(rax -> r)
+    return r
+}
+fn caller(uint64 seed) -> uint64 {
+    uint64 a = seed + 1
+    uint64 b = seed + 2
+    uint64 c = seed + 3
+    uint64 d = seed + 4
+    uint64 e = seed + 5
+    uint64 f = seed + 6
+    uint64 t = clobber(seed)
+    return a + b + c + d + e + f + t
+}
+fn main() { exit(caller(1)) }' 28
 fi
 
 # nop with no constraints — ensures backward-compat with existing asm blocks.
@@ -4123,6 +4452,53 @@ else
 fi
 rm -f "$ESP_SRC" "$ESP_BIN" "$ESP_OUT"
 
+# --- Xtensa LX6 many-argument boot test (per-function overflow reserve) ---
+# The outgoing-arg reserve at the bottom of every xtensa frame used to be a
+# FIXED 64 bytes = 16 slots, so 6 (CALL0 arg registers) + 16 = 22 was a hard
+# ceiling and every leaf paid 64 unusable bytes. ir_xtensa_gen step 4a now
+# sizes it per function from that function's own IR_ARG scan (port of
+# ir_aarch64.mlr's a64_ovf_slots).
+# many_args.mlr covers all three resulting frame shapes in one boot:
+#   sum24  - 18 overflow args (72 bytes): does not even COMPILE on the old
+#            fixed reserve, and its stack array's IR_STACK_ADDR base is
+#            measured from the reserve, so a pre-scan/accessor mismatch
+#            aliases buf onto the outgoing args and changes the sum
+#   sum7   - exactly ONE overflow arg: the smallest non-zero reserve (4 bytes)
+#   leafsq - no call at all: a ZERO-byte reserve
+# Every function is self-recursive, so the AST inliner cannot erase the calls
+# — an inlined probe reports a false pass at any argument count.
+# Full-output equality, not a grep: a wrong slot offset changes a digit.
+echo ""
+echo "--- xtensa LX6 many-argument boot test ---"
+if command -v qemu-system-xtensa >/dev/null 2>&1; then
+    TOTAL=$((TOTAL + 1))
+    XT_MA_ELF="/tmp/mlrc_xt_manyargs_$$.elf"
+    XT_MA_OK=1
+    if ! $MLRC --arch=xtensa --freestanding "$DIR/../examples/xtensa/many_args.mlr" -o "$XT_MA_ELF" >/dev/null 2>&1; then
+        echo "FAIL: xtensa_many_args_boot (compilation failed)"
+        XT_MA_OK=0
+    fi
+    if [ "$XT_MA_OK" = 1 ]; then
+        XT_MA_EXP=$(printf '319\n30\n385')
+        XT_MA_RAW=$(timeout 8 qemu-system-xtensa -M lx60 -nographic -semihosting -kernel "$XT_MA_ELF" 2>/dev/null); XT_MA_STATUS=$?
+        XT_MA_OUT=$(echo "$XT_MA_RAW" | tr -d '\r')
+        if [ "$XT_MA_STATUS" = "42" ] && [ "$XT_MA_OUT" = "$XT_MA_EXP" ]; then
+            PASS=$((PASS + 1))
+            echo "  xtensa_many_args_boot: PASS (24-arg call + 1-slot and 0-slot reserves all correct, exited 42)"
+        else
+            echo "FAIL: xtensa_many_args_boot (output mismatch or status $XT_MA_STATUS != 42)"
+            echo "    expected: $(echo "$XT_MA_EXP" | tr '\n' ' ')"
+            echo "    got:      $(echo "$XT_MA_OUT" | tr '\n' ' ')"
+            FAIL=$((FAIL + 1))
+        fi
+    else
+        FAIL=$((FAIL + 1))
+    fi
+    rm -f "$XT_MA_ELF"
+else
+    echo "  xtensa_many_args_boot: SKIP (qemu-system-xtensa not installed)"
+fi
+
 # --- esp32 machine target: --target=esp32 image structure + IRAM/DRAM guard ---
 # Compiles examples/esp32/minimal.mlr with --arch=xtensa --freestanding
 # --target=esp32 and asserts the esp-image structure with od ONLY:
@@ -5344,6 +5720,290 @@ for GOOD in x86_64 x86-64 amd64 x64 arm64 aarch64 riscv32; do
     fi
 done
 rm -f "$AV_SRC" "$AV_BIN"
+
+echo ""
+echo "--- std/alloc.mlr + std/io.mlr regression tests ---"
+# Five allocator bugs + one I/O bug, all verified against a pre-fix copy of
+# std/alloc.mlr / std/io.mlr (each test genuinely FAILED before its fix and
+# PASSES after — see the task notes for the paste of the pre-fix failures).
+
+# Bug 1: guard pages never guard anything. arena_new's guard_addr was
+# base+40+capacity, page-aligned (so mprotect succeeds) only when capacity
+# happens to leave the right residue mod 4096 -- true for almost no
+# requested capacity. mprotect's return value was never checked, so the
+# EINVAL failure was silent and the "guard" was a no-op. capacity=100 is
+# deliberately NOT the coincidentally-aligned case.
+#
+# The guard page, once correctly placed, starts at round_up(raw_end, 4096)
+# -- somewhere in [raw_end, raw_end+4095] -- and is 4096 bytes wide. Probing
+# at offsets 0 and 4096 from raw_end is enough to guarantee landing inside
+# that window regardless of the exact rounding remainder: if the remainder
+# is 0 the window is [raw_end, raw_end+4096) and offset 0 hits it; if the
+# remainder is d>0 the window is [raw_end+d, raw_end+d+4096) and offset
+# 4096 always falls inside it (d <= 4095 < 4096 < d+4096). Both offsets
+# stay well inside the slab's actual mmap'd pages either way (mmap always
+# rounds the reservation up to whole pages, so even the smaller pre-fix
+# reservation covers this), so a fault here is unambiguously the guard
+# page firing, not an unrelated out-of-bounds access past the mapping.
+# Pre-fix, mprotect silently no-ops and both stores succeed, reaching
+# exit(0); post-fix, one of them must SIGSEGV (rc=139).
+run_test "alloc_guard_page_protects_unaligned_capacity" 'import "std/alloc.mlr"
+fn main() {
+    uint64 a = arena_new(100)
+    uint64 cap = load64(a)
+    uint64 raw_end = a + 40 + cap
+    store8(raw_end, 1)
+    store8(raw_end + 4096, 1)
+    exit(0)
+}' 139
+
+# Bug 2: heap_new(capacity < 40) underflows `capacity - 40` on u64,
+# producing a phantom ~2^64-byte free block instead of rejecting the
+# nonsensical request. Pre-fix this "succeeds" (exit 0); post-fix it must
+# be rejected up front.
+run_test "alloc_heap_new_rejects_underflow_capacity" 'import "std/alloc.mlr"
+fn main() {
+    uint64 h = heap_new(10)
+    exit(0)
+}' 1
+
+# Bug 3: pool_new(size, 0) sets free_head to a slot address unconditionally,
+# even when count == 0 (so there are no real slots) -- pool_alloc then
+# hands out that phantom slot instead of correctly reporting "out of
+# slots". Pre-fix, pool_alloc succeeds and the program reaches exit(0).
+run_test "alloc_pool_new_zero_count_no_phantom_slot" 'import "std/alloc.mlr"
+fn main() {
+    uint64 p = pool_new(16, 0)
+    uint64 s = pool_alloc(p)
+    exit(0)
+}' 1
+
+# Bug 4: heap_free only coalesces forward (into the next physical block),
+# never backward (into the preceding one). Allocate 40/40/80 out of a
+# 280-byte heap (exactly filling it, no leftover tail block), then free
+# the middle block, then the first (forward-merges into one 120-byte free
+# block), then the last (the only adjacent free block is BEHIND it, which
+# forward coalescing cannot see). Without backward merging the free list
+# ends up with two blocks (120 and 80) neither large enough for a 150-byte
+# request, even though 200+ contiguous bytes are free -- heap_alloc aborts
+# "out of memory" (exit 1). With backward merging the whole heap reunites
+# into one free block and the allocation succeeds (exit 0).
+run_test "alloc_heap_free_backward_coalesce" 'import "std/alloc.mlr"
+fn main() {
+    uint64 h = heap_new(280)
+    uint64 a = heap_alloc(h, 40)
+    uint64 b = heap_alloc(h, 40)
+    uint64 c = heap_alloc(h, 80)
+    heap_free(h, b)
+    heap_free(h, a)
+    heap_free(h, c)
+    uint64 d = heap_alloc(h, 150)
+    exit(0)
+}' 0
+
+# Bug 5: read_file returned 0 both when `path` could not be opened AND
+# when it opened fine but was zero-length -- the two were indistinguishable.
+# Create a genuinely empty (but existing) file, then check read_file
+# returns non-zero for it while still returning 0 for a path that does not
+# exist at all. Pre-fix, the empty-file case incorrectly returns 0 too
+# (exit 1 below); post-fix both checks pass (exit 0).
+run_test "io_read_file_empty_vs_missing" 'import "std/io.mlr"
+fn main() {
+    uint64 empty_path = "/tmp/mlrc_test_read_file_bug5_empty.txt"
+    uint64 missing_path = "/tmp/mlrc_test_read_file_bug5_does_not_exist_xyz.txt"
+    uint64 fd = file_open(empty_path, 1)
+    file_close(fd)
+    uint64 empty_buf = read_file(empty_path)
+    uint64 missing_buf = read_file(missing_path)
+    if empty_buf == 0 {
+        exit(1)
+    }
+    if missing_buf != 0 {
+        exit(2)
+    }
+    exit(0)
+}' 0
+
+echo ""
+echo "--- call-argument capacity ---"
+# call_arg_vregs holds 32 slots. The arg-collection loop stops at 32; without
+# the post-loop guard the extra arguments are silently DROPPED and the callee
+# reads garbage — a 33-arg call returned sum(1..32) with no diagnostic.
+# MLRift had drifted without this guard while KernRift always had it.
+# `many` is self-recursive ON PURPOSE: a non-recursive version gets erased by
+# the AST inliner, the IR_CALL path never runs, and the test passes vacuously
+# against an unguarded compiler. Do not "simplify" the recursion away.
+CA_SRC="/tmp/mlrc_callargs_$$.mlr"
+CA_BIN="/tmp/mlrc_callargs_$$.bin"
+gen_call_args() {   # $1 = arg count -> writes CA_SRC
+    { printf 'fn many('
+      i=1; while [ $i -le $1 ]; do [ $i -gt 1 ] && printf ', '; printf 'uint64 p%s' $i; i=$((i+1)); done
+      printf ') -> uint64 {\n    if p1 > 1000000 {\n        return many('
+      i=1; while [ $i -le $1 ]; do [ $i -gt 1 ] && printf ', '; printf 'p%s - 1' $i; i=$((i+1)); done
+      printf ')\n    }\n    return p1 + p%s\n}\n' $1
+      printf 'fn main() {\n    uint64 r = many('
+      i=1; while [ $i -le $1 ]; do [ $i -gt 1 ] && printf ', '; printf '%s' $i; i=$((i+1)); done
+      printf ')\n    exit(r)\n}\n'
+    } > "$CA_SRC"
+}
+TOTAL=$((TOTAL + 1))
+gen_call_args 33
+CA_ERR=$($MLRC --arch=x86_64 "$CA_SRC" -o "$CA_BIN" 2>&1); CA_ST=$?
+if [ "$CA_ST" != "0" ] && echo "$CA_ERR" | grep -q "too many call arguments (max 32)"; then
+    PASS=$((PASS + 1)); echo "  call_args_33_rejected: PASS (exit $CA_ST, clean diagnostic)"
+else
+    echo "FAIL: call_args_33_rejected (expected non-zero + 'too many call arguments', got exit $CA_ST: '$CA_ERR')"
+    FAIL=$((FAIL + 1))
+fi
+# Positive control: 32 must still compile AND run correctly. Without this, a
+# parser that rejected every call would pass the test above.
+TOTAL=$((TOTAL + 1))
+gen_call_args 32
+rm -f "$CA_BIN"
+if $MLRC --arch=x86_64 "$CA_SRC" -o "$CA_BIN" >/dev/null 2>&1 && [ -s "$CA_BIN" ]; then
+    chmod +x "$CA_BIN"; "$CA_BIN"; CA_RUN=$?
+    if [ "$CA_RUN" = "33" ]; then    # p1 + p32 = 1 + 32
+        PASS=$((PASS + 1)); echo "  call_args_32_accepted: PASS (compiles and returns 33)"
+    else
+        echo "FAIL: call_args_32_accepted (ran but returned $CA_RUN, want 33)"; FAIL=$((FAIL + 1))
+    fi
+else
+    echo "FAIL: call_args_32_accepted (should compile to a non-empty artifact)"; FAIL=$((FAIL + 1))
+fi
+rm -f "$CA_SRC" "$CA_BIN"
+
+echo ""
+echo "--- float literal return kinds ---"
+# tc_expr_kind reported EVERY FloatLit as f64, ignoring the `f` suffix, so the
+# return-kind check rejected `fn f() -> f32 { return 1.5f }` while the very
+# same literal bound to an `f32` local first sailed through. std/gguf.mlr
+# routes every f32 return through a local for exactly this reason, and because
+# sema checks every function in an imported file whether or not it is called,
+# one un-worked-around `return 0.0f` in gguf_meta_array_f32_get made all 26
+# examples importing that file fail to build.
+#
+# The functions below are self-recursive ON PURPOSE: a straight-line version
+# gets erased by the AST inliner (which runs even at -O0), the IR_CALL/IR_RET
+# path never executes, and the returned bits are never actually tested. Do not
+# "simplify" the recursion away.
+#
+# This asserts VALUES, not just "it compiles": a fix that silenced the
+# diagnostic while leaving f64 bits in xmm0 would still fail here.
+FR_SRC="/tmp/mlrc_fret_$$.mlr"
+FR_BIN="/tmp/mlrc_fret_$$.bin"
+cat > "$FR_SRC" <<'MLREOF'
+fn f32_lit_pos(uint64 n) -> f32 {
+    if n > 1000000 { return f32_lit_pos(n - 1) }
+    return 42.5f
+}
+fn f32_var_pos(uint64 n) -> f32 {
+    if n > 1000000 { return f32_var_pos(n - 1) }
+    f32 z = 42.5f
+    return z
+}
+fn f32_lit_neg(uint64 n) -> f32 {
+    if n > 1000000 { return f32_lit_neg(n - 1) }
+    return -7.25f
+}
+fn f32_var_neg(uint64 n) -> f32 {
+    if n > 1000000 { return f32_var_neg(n - 1) }
+    f32 z = -7.25f
+    return z
+}
+fn f32_lit_zero(uint64 n) -> f32 {
+    if n > 1000000 { return f32_lit_zero(n - 1) }
+    return 0.0f
+}
+fn f32_lit_sci(uint64 n) -> f32 {
+    if n > 1000000 { return f32_lit_sci(n - 1) }
+    return 1.25e2f
+}
+fn f64_lit_pos(uint64 n) -> f64 {
+    if n > 1000000 { return f64_lit_pos(n - 1) }
+    return 42.5
+}
+fn f64_var_pos(uint64 n) -> f64 {
+    if n > 1000000 { return f64_var_pos(n - 1) }
+    f64 z = 42.5
+    return z
+}
+fn f64_lit_neg(uint64 n) -> f64 {
+    if n > 1000000 { return f64_lit_neg(n - 1) }
+    return -7.25
+}
+fn f64_var_neg(uint64 n) -> f64 {
+    if n > 1000000 { return f64_var_neg(n - 1) }
+    f64 z = -7.25
+    return z
+}
+fn f64_lit_zero(uint64 n) -> f64 {
+    if n > 1000000 { return f64_lit_zero(n - 1) }
+    return 0.0
+}
+fn fret_fail(uint64 rc, uint64 id) -> uint64 {
+    if rc != 0 { return rc }
+    return id
+}
+fn main() {
+    uint64 rc = 0
+    f32 s4 = 4.0f
+    f64 d4 = 4.0
+    if f32_to_int(f32_lit_pos(1) * s4) != 170 { rc = fret_fail(rc, 1) }
+    if f32_to_int(f32_var_pos(1) * s4) != 170 { rc = fret_fail(rc, 2) }
+    if f32_to_int(f32_lit_neg(1) * s4) != -29 { rc = fret_fail(rc, 3) }
+    if f32_to_int(f32_var_neg(1) * s4) != -29 { rc = fret_fail(rc, 4) }
+    f32 zf = f32_lit_zero(1)
+    if f32_to_int(zf) != 0 { rc = fret_fail(rc, 5) }
+    if zf > 0.0f { rc = fret_fail(rc, 6) }
+    if zf < 0.0f { rc = fret_fail(rc, 7) }
+    if f32_to_int(f32_lit_sci(1)) != 125 { rc = fret_fail(rc, 8) }
+    if f64_to_int(f64_lit_pos(1) * d4) != 170 { rc = fret_fail(rc, 9) }
+    if f64_to_int(f64_var_pos(1) * d4) != 170 { rc = fret_fail(rc, 10) }
+    if f64_to_int(f64_lit_neg(1) * d4) != -29 { rc = fret_fail(rc, 11) }
+    if f64_to_int(f64_var_neg(1) * d4) != -29 { rc = fret_fail(rc, 12) }
+    f64 zd = f64_lit_zero(1)
+    if f64_to_int(zd) != 0 { rc = fret_fail(rc, 13) }
+    if zd > 0.0 { rc = fret_fail(rc, 14) }
+    if zd < 0.0 { rc = fret_fail(rc, 15) }
+    exit(rc)
+}
+MLREOF
+TOTAL=$((TOTAL + 1))
+FR_ERR=$($MLRC --arch=x86_64 "$FR_SRC" -o "$FR_BIN" 2>&1); FR_ST=$?
+if [ "$FR_ST" = "0" ] && [ -s "$FR_BIN" ]; then
+    chmod +x "$FR_BIN"; "$FR_BIN"; FR_RUN=$?
+    if [ "$FR_RUN" = "0" ]; then
+        PASS=$((PASS + 1)); echo "  float_literal_return_values: PASS (15 checks)"
+    else
+        echo "FAIL: float_literal_return_values (check #$FR_RUN returned the wrong value)"
+        FAIL=$((FAIL + 1))
+    fi
+else
+    echo "FAIL: float_literal_return_values (should compile: '$FR_ERR')"; FAIL=$((FAIL + 1))
+fi
+# Negative controls: the return-kind check must still FIRE on a genuine
+# mismatch. Both directions were silent miscompiles, not harmless: a
+# non-inlined `-> f64 { return 1.5f }` put f32 bits in xmm0 and the caller
+# read 0.0.
+TOTAL=$((TOTAL + 1))
+printf 'fn g(uint64 n) -> f64 {\n if n > 1000000 { return g(n - 1) }\n return 1.5f\n}\nfn main() { exit(f64_to_int(g(1))) }\n' > "$FR_SRC"
+FR_ERR=$($MLRC --arch=x86_64 "$FR_SRC" -o "$FR_BIN" 2>&1); FR_ST=$?
+if [ "$FR_ST" != "0" ] && echo "$FR_ERR" | grep -q "return value float kind does not match"; then
+    PASS=$((PASS + 1)); echo "  f32_literal_in_f64_fn_rejected: PASS (exit $FR_ST)"
+else
+    echo "FAIL: f32_literal_in_f64_fn_rejected (expected the float-kind diagnostic, got exit $FR_ST: '$FR_ERR')"
+    FAIL=$((FAIL + 1))
+fi
+TOTAL=$((TOTAL + 1))
+printf 'fn g(uint64 n) -> f32 {\n if n > 1000000 { return g(n - 1) }\n return 1.5\n}\nfn main() { exit(f32_to_int(g(1))) }\n' > "$FR_SRC"
+FR_ERR=$($MLRC --arch=x86_64 "$FR_SRC" -o "$FR_BIN" 2>&1); FR_ST=$?
+if [ "$FR_ST" != "0" ] && echo "$FR_ERR" | grep -q "return value float kind does not match"; then
+    PASS=$((PASS + 1)); echo "  f64_literal_in_f32_fn_rejected: PASS (exit $FR_ST)"
+else
+    echo "FAIL: f64_literal_in_f32_fn_rejected (expected the float-kind diagnostic, got exit $FR_ST: '$FR_ERR')"
+    FAIL=$((FAIL + 1))
+fi
+rm -f "$FR_SRC" "$FR_BIN"
 
 echo ""
 echo "--- --target-arch value validation ---"

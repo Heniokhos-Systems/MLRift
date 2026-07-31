@@ -1,218 +1,205 @@
-# MLRift multi-threading — kickoff spec
+# Multi-threading in MLRift
 
-Status: **design-approved, implementation not started.** Sister doc to
-`docs/GPU_BACKEND.md`. A fresh session picks up from here.
+How the thread pool works, how to use it, and what it will not do.
 
-## Goal
+**Platform: Linux x86_64 only.** Built on raw `clone()` + `futex()` syscalls —
+no libc, no libpthread, no dynamic linker. macOS and Windows have no
+implementation; the pool silently has zero workers there and every `_mt`
+helper falls back to its single-threaded path.
 
-Parallelize the per-step simulation phases across CPU cores — 8-16×
-wall-clock speedup on tier-1 Noesis workloads, stacking on whatever
-AVX2 codegen lands later.
+Implementation: `std/thread.mlr`. Smoke test: `examples/thread_pool_hello.mlr`.
 
-The real prize: **move stage 13's 9.3 s runtime closer to 1 s**, which
-puts Noesis tier-1 on a single CPU node under the 5-minute-per-genome
-target *without needing GPU at all* for the development loop.
-
-## Why not pthreads
-
-The standard libpthread route requires:
-- Dynamic linking (MLRift currently emits static ELFs)
-- dlopen infrastructure (doesn't exist in MLRift today)
-- libc dependency at runtime (breaks the "self-contained binary" property)
-
-Instead use **raw Linux `clone()` + `futex()` syscalls**. Matches
-MLRift's "emit bytes, no runtime deps" ethos and avoids the
-linker/loader complexity. Tradeoff: we write the thread-pool and
-synchronization primitives ourselves, ~300-500 lines of kr.
-
-macOS doesn't have clone/futex — Mach threads + pthreads-via-libSystem
-instead. Phase 2 only. Linux-first.
-
-## Architecture
+## Quick start
 
 ```
-  Main thread                    Worker N (of 4-16)
-  ───────────                    ──────────────────
-  startup:
-    init_thread_pool(n_workers)
-      → spawn N workers via clone()
-      → each worker enters spin-wait on job_queue[worker_id]
-      → workers block on futex when idle
-  ...
-  per simulation step:
-    for phase in (decay, integrate, deliver, stdp):
-      dispatch_parallel(fn, buf, n, extra_args)
-        → split range 0..n into N chunks
-        → for each worker: write (fn, start, end, args) into
-          job_queue[worker_id], futex_wake
-        → main waits on completion_barrier (atomic counter == N)
-  ...
-  shutdown:
-    signal_shutdown() — workers exit
-    join all via clone_exit + tid_futex
+import "std/thread.mlr"
+
+// Single-element array so the bare identifier evaluates to the slot address.
+static uint64[1] shared_counter
+
+fn bump(uint64 start, uint64 end, uint64 counter_addr) {
+    uint64 i = start
+    while i < end {
+        atomic_add(counter_addr, 1)
+        i = i + 1
+    }
+}
+
+fn main() {
+    thread_pool_init(6)                       // spawn 6 workers, once
+    uint64 job     = fn_addr("bump")
+    uint64 counter = shared_counter
+
+    uint64 w = 0
+    while w < 6 {
+        thread_pool_submit(w, job, w * 100, w * 100 + 100, counter)
+        w = w + 1
+    }
+    thread_pool_wait()                        // barrier — 600 increments done
+
+    thread_pool_shutdown()
+}
 ```
 
-Pool is STATIC: created once at start, reused forever. No create/join
-per barrier — that's what killed the naive fork-join model.
+That is `examples/thread_pool_hello.mlr` reduced to one round; run it with
+`mlrc --arch=x86_64 examples/thread_pool_hello.mlr -o /tmp/tph`.
 
-## New primitives needed
+The submitted function is called as `fn(a0, a1, a2)` inside the worker. Splitting
+a range into `[start, end)` chunks is a *caller* convention, not something the
+pool imposes — the three arguments are yours to use however you like.
 
-In `src/codegen.mlr` or a new `src/thread_runtime.mlr`:
+## API
 
-### Syscalls
+| Function | Notes |
+|---|---|
+| `thread_pool_init(n)` | Spawn `n` workers. Returns nothing — there is no pool handle; the pool is a process-wide singleton. **Idempotent**: if the pool already has `n` or more workers it returns unchanged. Capped at `TP_MAX = 32`. |
+| `thread_pool_submit(wid, fn_ptr, a0, a1, a2)` | Hand a job to worker `wid`. Non-blocking. |
+| `thread_pool_wait()` | Barrier on all workers that have an outstanding job. |
+| `thread_pool_shutdown()` | Terminate every worker thread and reset the pool to empty. |
 
-| syscall        | nr (x86_64) | nr (arm64) | purpose |
-|---------------|-------------|------------|---------|
-| clone         | 56          | 220        | spawn thread (CLONE_VM \| CLONE_FS \| CLONE_FILES \| CLONE_SIGHAND \| CLONE_THREAD \| CLONE_SYSVSEM) |
-| futex         | 202         | 98         | wait / wake (FUTEX_WAIT_PRIVATE / FUTEX_WAKE_PRIVATE) |
-| mmap          | 9           | 222        | allocate thread stacks (guard page + stack) |
-| exit          | 60          | 93         | thread exit |
+`tp_n` holds the current worker count — read it to decide whether to
+parallelise at all.
 
-### IR ops / builtins
+Each worker gets a 2 MB stack (`TP_STACK_SIZE`), matching the glibc default.
 
-- `thread_pool_init(n_workers) -> uint64` — opaque pool handle
-- `thread_pool_submit(pool, fn_ptr, start, end, ctx_ptr)` — submit work to one worker
-- `thread_pool_wait(pool)` — barrier: wait for all outstanding jobs
-- `atomic_fetch_add_u64(ptr, delta) -> uint64` — for completion counter (needs lock-prefix emit)
-- `atomic_store_u32(ptr, val)`, `atomic_load_u32(ptr) -> uint32` — seq-cst stores/loads (plain on x86 with compiler barrier)
+## How it works
 
-All of these can be kr functions that emit raw syscalls or use inline
-asm — no external libraries.
+Each worker owns a state word, and everything is driven by that one value:
 
-### Function-pointer calls from new thread
+| state | meaning |
+|---|---|
+| 0 | idle |
+| 1 | has job |
+| 2 | done, awaiting reset by main |
+| 3 | shutdown |
 
-kr already has `fn_addr("name")` → returns function address, and
-`call_ptr(fn_ptr, args...)` → calls through a pointer. The worker
-thread entry point receives a `(fn_ptr, ctx_ptr)` pair and does
-`call_ptr(fn_ptr, ctx_ptr)` — reuses existing machinery.
+**Submit** writes the job descriptor (`fn`, `a0`, `a1`, `a2`) into the worker's
+slots, then `atomic_store`s state to 1 and wakes the futex. The atomic store is
+a full barrier, so the worker's subsequent reads see the committed descriptor.
 
-## Clone-based thread spawn details
+**The worker loop** sleeps on the futex whenever state is 0 or 2, waking only
+for 1 (job) or 3 (shutdown). Sleeping on 2 matters: a worker that finished
+before main got round to resetting it would otherwise spin and burn a core.
 
-x86_64 clone() syscall return convention:
-- rdi = flags
-- rsi = child_stack (top of stack, 16-aligned)
-- rdx = &parent_tid
-- r10 = &child_tid
-- r8  = new_tls
-- rax = syscall_nr (56)
-- after `syscall`: rax = child_tid (parent) OR 0 (child)
+**Wait** polls each worker until state reaches 2, then resets it to 0 for the
+next round. Workers still at 0 are *skipped* — they were never submitted to
+this round, and blocking on them would hang forever since nothing will ever
+flip them to 2.
 
-In the child, rsp is already set to child_stack. The first thing to do
-is pop our entry args from the top of the stack (we'll have placed
-`(fn_ptr, ctx_ptr)` there before the syscall), then call through the
-fn_ptr.
+**Shutdown** sets state 3 and wakes each worker; the worker calls `exit` (60)
+for itself only, not the process.
 
-On child return, syscall(exit) to terminate. Never returns to caller.
+### Spawning
 
-This requires **raw assembly bytes** because the child's entry point
-is AFTER the clone syscall in parent code, but with a different call
-stack. Simplest pattern: inline a small asm blob that does
+`tp_spawn_raw` issues `clone()` directly with
+
 ```
-    syscall (clone)
-    test rax, rax
-    jnz .parent_return
-    ; in child
-    pop rdi      ; ctx_ptr from top of stack
-    pop rax      ; fn_ptr
-    call rax
-    mov rax, 60  ; exit
-    xor rdi, rdi
-    syscall
-.parent_return:
-    ret to caller
+CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM
 ```
 
-~30 bytes of x86 machine code. Write as an extern assembly block or
-as an emit_byte sequence in codegen.mlr.
+Before the syscall it stashes `(worker_fn, ctx_ptr)` on the child's stack. After
+it, `rax == 0` means we are the child: pop both, call through the function
+pointer, and `exit` if it ever returns. The parent falls through and captures
+the child TID.
 
-## Futex barrier
+This has to be raw machine-code bytes, because the child's entry point *is* the
+instruction after the syscall but running on a different stack.
 
-Simplest form: each worker has a private `state` uint32 (0=idle,
-1=has_job, 2=job_done). Main writes job fields + sets state=1 +
-`futex_wake(state, 1)`. Worker calls `futex_wait(state, 0)` when idle,
-wakes, processes job, sets state=2 + futex_wake. Main barrier:
-`for each worker: futex_wait(state[i], 1)` until state==2.
+### Why the state arrays are heap-allocated
 
-For the "start all at once" dispatch phase, batch the wakes.
+They are `alloc`'d in `thread_pool_init`, not declared as `static uint64[32]`.
+The static allocator does not reliably 8-byte-align static arrays, and the Linux
+futex syscall returns `EINVAL` on a misaligned `uaddr`. `alloc` hands back
+page-aligned memory, which satisfies the 4-byte requirement trivially.
 
-## Scope expectations
+The futex watches the low 32 bits of a `uint64`; on little-endian x86_64 that
+coincides with the low byte of the value.
 
-Phase 2 of the CPU track ships in 3 commits:
+## Writing a parallel helper
 
-**M1 — syscalls + thread pool primitive (1-2 days)**
-  clone/futex/mmap bindings, thread_pool_init, thread_pool_submit,
-  thread_pool_wait. Toy test: 4-worker pool, each increments a shared
-  atomic counter to 100, main waits and verifies.
+The `_mt` helpers in `std/vec_f64_mt.mlr` and `std/matmul.mlr` follow one shape.
+Two details in it are worth copying deliberately.
 
-**M2 — parallel vec_f64_decay_inplace (1 day)**
-  `vec_f64_decay_inplace_mt(buf, n, factor, pool)` — submits N/nw-size
-  chunks, waits on completion. Benchmark on microbench (65k × 1000
-  rounds):
-  - target: 3× (close to nw=4) on the microbench
-  - expected end-to-end: stage 12 ~1.4× (decay is ~30% of stage 12)
+**Fall back when it isn't worth it.** Every helper checks the pool size and a
+size threshold first:
 
-**M3 — parallel integrate + delivery (2-3 days)**
-  Integrate is embarrassingly parallel per-neuron. Delivery has
-  scatter-add conflicts — use atomic_fetch_add on s_exc[tgt] /
-  s_inh[tgt]. Benchmark stage 12 full. Target: 2-3× end-to-end.
+```
+uint64 nw = tp_n
+if nw == 0 || n < VEC_MT_THRESHOLD {     // 500000 in vec_f64_mt.mlr
+    v_decay(buf, n, factor)              // single-threaded path
+    return
+}
+```
 
-Total: ~1 week. Combined with BSS/helpers already shipped, CPU-track
-gets stage 12 from 859 ms to maybe 250-350 ms. That's the "is it
-close enough to GPU target" data we need.
+`nw == 0` is what makes these helpers safe on macOS and Windows, and safe for a
+caller who never called `thread_pool_init`.
 
-## What this does NOT do
+**Let main run the last slice.** `std/matmul.mlr` submits to `num_workers - 1`
+workers and runs the final chunk on the calling thread:
 
-- **Dynamic scheduling** — static chunk size N/nw, no work-stealing.
-  For regular loops (decay, integrate) that's fine. Delivery-phase
-  load imbalance (some fired sources have more fan-out) is real but
-  tolerable at phase-1 scale.
-- **Thread-local storage** — not needed for our workloads; everything
-  is in shared static arrays addressed by thread's assigned chunk.
-- **False-sharing mitigation** — workers write to disjoint ranges of
-  the SAME static array. Cache-line level false sharing could bite on
-  the chunk boundaries. Not addressed in M2; if benchmark shows it
-  hurting, pad chunk boundaries to 64-byte multiples.
-- **Cross-platform** — Linux only initially. macOS needs Mach threads
-  or libSystem pthreads; Windows needs CreateThread via kernel32.
-  Both are phase-3 concerns.
+```
+u64 main_start = (num_workers - 1) * chunk
+u64 main_end   = N                       // absorbs the ragged tail
+mm_worker_bf16_f32_avx2_naive_2w(main_start, main_end, main_ctx)
+thread_pool_wait()
+```
 
-## Testing strategy
+Main would otherwise sit blocked in `wait()` doing nothing, and ending the last
+slice at `N` handles `N` not dividing evenly by the worker count without a
+separate tail case.
 
-Byte-identical output vs single-threaded kr version across per-neuron
-spike counts. Scatter-adds in delivery are atomic, so the sum is
-deterministic. Non-determinism could creep in from thread scheduling
-affecting float-reduction order in sum aggregations — those are
-OUTSIDE the per-step hot loop and not parallelised in M2/M3.
+### Passing more than three arguments
 
-## Open questions for the M0 session to resolve
+`thread_pool_submit` takes exactly three. For anything larger, pass a pointer to
+a per-worker context block. `std/matmul.mlr` strides these blocks by **64 bytes
+— one cache line per worker** so that workers writing their own context do not
+false-share:
 
-- Does MLRift's current binary (static ELF) tolerate multiple stacks
-  from mmap?  Answer during M0: yes, mmap with MAP_STACK | MAP_GROWSDOWN
-  + use the returned address as the new rsp for the cloned thread.
-- Register save/restore at the clone boundary: child starts fresh,
-  doesn't inherit caller regs. Fn-ptr entry discipline: ctx_ptr in
-  rdi (first arg), nothing else relied on. Write the clone asm blob
-  accordingly.
-- Futex ABI: uint32 futex variables, FUTEX_WAIT returns 0 on success,
-  EAGAIN if val already changed (no wait needed).
+```
+u64 ctx_w = mm_ctx_base + w * 64
+thread_pool_submit(w, fn_ptr, start_n, end_n, ctx_w)
+```
 
-## Related work already shipped
+Globals also work, and the `vec_f64_mt.mlr` helpers use them (`vec_mt_buf`,
+`vec_mt_factor`) for values identical across all workers. Anything a worker
+*writes* wants the per-worker block instead.
 
-- `src/codegen.mlr` `emit_win_call_iat`, `exec_process_argv` — patterns
-  for emitting carefully-packed syscall sequences by hand
-- `std/vec_f64.mlr` — the helpers this effort extends (vec_f64_decay_inplace
-  gets an `_mt` counterpart)
-- `docs/GPU_BACKEND.md` — sister doc; GPU track runs in parallel with
-  this one
+## Gotchas
 
-## Kickoff actions for the next session
+- **Inline asm in `std/thread.mlr` may only name caller-saved registers**
+  (`rax`, `rcx`, `rdx`, `rsi`, `rdi`, `r8`–`r11`). The compiler does not add
+  asm-named registers to a function's prologue save set, so naming a
+  callee-saved register (`rbx`, `rbp`, `r12`–`r15`) silently destroys a live
+  value in the caller. This was a real crash: `flags -> r15` segfaulted the pool
+  the moment the register allocator started handing `r15` to callers.
+- **`thread_pool_init` is deliberately idempotent.** Two independent components
+  initialising the pool used to double-spawn workers onto the same state slots
+  and deadlock the futex hand-off.
+- **Never block on a worker you did not submit to.** `thread_pool_wait` skips
+  state-0 workers for this reason; hand-rolled wait loops must do the same.
+- **Workers write to disjoint ranges of the same array.** That is safe, but
+  chunk boundaries can false-share a cache line. Pad to 64-byte multiples if a
+  benchmark shows it hurting.
 
-1. Read this doc end-to-end
-2. Write `examples/clone_hello.mlr` that uses raw clone()+futex() to
-   spawn one worker, have it write to a shared counter, main reads it.
-   This is M0 — gate before any IR or stdlib work.
-3. Decide where the new primitives live (new file `std/thread.mlr`? new
-   section in `std/mem.mlr`? builtin in codegen.mlr?).
-4. Begin M1.
+## What this does not do
 
-End of spec.
+- **No dynamic scheduling** — chunks are a static `n / nw` split, no
+  work-stealing. Fine for regular loops; load imbalance is on the caller.
+- **No thread-local storage** — everything lives in shared arrays indexed by the
+  worker's assigned chunk.
+- **No cross-platform support** — Linux x86_64 only. macOS would need Mach
+  threads or libSystem pthreads; Windows would need `CreateThread` via
+  `kernel32`.
+- **No nested parallelism** — workers must not submit to the pool themselves.
+
+## Where things live
+
+| File | Contents |
+|---|---|
+| `std/thread.mlr` | The pool: spawn, worker loop, submit/wait/shutdown |
+| `std/vec_f64_mt.mlr` | Parallel f64 vector ops, with AVX2 variants |
+| `std/matmul.mlr` | Column-sharded matmul, the per-worker ctx-block pattern |
+| `std/inference.mlr` | `matmul_bf16_weights_f32_mt` — the LLM hot path |
+| `examples/thread_pool_hello.mlr` | Smoke test: 6 workers × 10 rounds |
+| `examples/clone_hello.mlr` | Minimal single `clone()` spawn, no pool |
+| `examples/vec_microbench_mt.mlr`, `examples/mt_avx2_all.mlr` | Benchmarks |

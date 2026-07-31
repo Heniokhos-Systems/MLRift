@@ -1206,17 +1206,21 @@ fn tokenizer_lookup(Tokenizer tk, u64 id, u64 out_ptr, u64 out_len) {
 //          groups of up to 3 with no space folding (llama-bpe / qwen2),
 //          or one unbounded run with an optional leading space (GPT-2).
 //        - "symbol" = any other ASCII byte.
-//        - A single leading SPACE (0x20, not tab/newline) folds into a
-//          following letter-run OR symbol-run; trailing/multiple spaces
-//          fall through to a whitespace-only pre-token.
-//        - Newlines, tabs, and other ASCII whitespace do NOT fold — they
-//          form their own single-char pre-token (verified against the
-//          canonical regex output: '\tHello' → ['ĉHello'], so tab DOES
-//          fold; '\nHello' → ['Ċ', 'Hello'], so newline does NOT fold).
-//          We approximate by treating space (0x20) as foldable and
-//          everything else as non-foldable. Tab-prefix prompts get
-//          slightly different IDs than canonical but our 3 chat-REPL
-//          test corpus (Hello / What is 2+2? / etc.) has no tabs.
+//        - Whitespace is handled as a whole `\s` run, spaces and control
+//          whitespace together, exactly as the regex sees it:
+//            · A run holding any \r or \n is one pre-token ending at its
+//              LAST \r/\n (alt `\s*[\r\n]+`), so '\n\n' is a single
+//              pre-token and " \n" glues the space onto the newline.
+//            · Otherwise a run of length 1 folds into a following letter
+//              run when it is not \r/\n (alt `[^\r\n\p{L}\p{N}]?\p{L}+`),
+//              so '\tHello' → ['ĉHello'] and ' Hello' → ['ĠHello'], while
+//              '\nHello' → ['Ċ', 'Hello'].
+//            · Only a literal SPACE folds into a following symbol run
+//              (alt ` ?[^\s\p{L}\p{N}]+[\r\n]*`) — the class there is a
+//              plain ' ', so a lone tab before punctuation stands alone.
+//            · A longer run with no \r/\n emits all but its final byte
+//              (alt `\s+(?!\S)`) and re-enters with that byte, which is
+//              how "  Hello" becomes [' ', ' Hello'].
 //        - Contractions ('s, 't, 're, 've, 'm, 'll, 'd) ARE recognised
 //          (case-insensitively), matching the leading alternative of all
 //          three byte-level regex families.
@@ -1441,10 +1445,164 @@ fn tk_bpe_encode_pretoken(Tokenizer tk, u64 in_ptr, u64 in_len,
     dealloc(tok_len)
 }
 
-// Top-level BPE encoder — pre-tokenizes the input, then runs
-// tk_bpe_encode_pretoken on each pre-token span.
+// Pre-tokenizer core — given the input and a start offset `p`, return the
+// END offset of the pre-token that starts there. Every regex alternative
+// reduces to exactly this question, so the encoder below is just
+//
+//     while p < len { end = tk_bpe_pretoken_end(...); emit(p, end); p = end }
+//
+// and the boundary rules can be unit-tested without a loaded model.
+// Always returns a value strictly greater than `p` for p < input_len.
 //
 // Pre-tokenization rules — see the table at the top of this section.
+fn tk_bpe_pretoken_end(u64 input, u64 input_len, u64 p) -> u64 {
+    u64 c = load8(input + p)
+    u64 cls = tk_bpe_byte_class(c)
+
+    // Contraction alternative — `(?i:'s|'t|'re|'ve|'m|'ll|'d)`. It's the
+    // first alternative in the GPT-2, llama-bpe AND qwen2 regexes alike,
+    // so it applies to every byte-level family. Without it an apostrophe
+    // starts a symbol run and "don't" pre-tokenizes as "don" + "'" + "t".
+    u64 contr = tk_bpe_contraction_len(input, input_len, p)
+    if contr != 0 { return p + contr }
+
+    if cls == 0 {
+        // Digit run — capped at 3 under the llama-bpe rule, unbounded
+        // under the GPT-2 rule.
+        u64 lim = 3
+        if tk_bpe_gpt2_digits != 0 { lim = 0xFFFFFFFFFFFFFFFF }
+        u64 end = p + 1
+        u64 take = 1
+        u64 stop = 0
+        while stop == 0 && end < input_len && take < lim {
+            if tk_bpe_byte_class(load8(input + end)) != 0 { stop = 1 }
+            else {
+                end = end + 1
+                take = take + 1
+            }
+        }
+        return end
+    }
+    if cls == 1 {
+        // Letter run.
+        u64 end = p + 1
+        u64 stop = 0
+        while stop == 0 && end < input_len {
+            if tk_bpe_byte_class(load8(input + end)) != 1 { stop = 1 }
+            else { end = end + 1 }
+        }
+        return end
+    }
+    if cls == 2 || cls == 3 {
+        // Whitespace run. The regex treats ALL of `\s` here, not just
+        // 0x20, so tabs and newlines belong to the same run as the
+        // spaces around them. Four alternatives can claim it, and the
+        // regex tries them in this order:
+        //
+        //   alt 2  `[^\r\n\p{L}\p{N}]?\p{L}+`  — a SINGLE whitespace
+        //          byte other than \r/\n (so space, \t, \v, \f) folds
+        //          into a following letter run. "Hello\tworld" is
+        //          ['Hello', '\tworld'], not ['Hello', '\t', 'world'].
+        //   alt 4  ` ?[^\s\p{L}\p{N}]+[\r\n]*` — only a literal space
+        //          folds into a following symbol run; the class is a
+        //          plain ' ', so a lone tab never folds this way.
+        //   alt 5  `\s*[\r\n]+`  — a run containing any \r/\n is one
+        //          pre-token ending at its LAST \r/\n. This is what
+        //          merges "\n\n" into a single token and glues the
+        //          spaces of a blank line onto the newline after them.
+        //   alt 6/7 `\s+(?!\S)` / `\s+` — no \r/\n in the run, so it is
+        //          its own pre-token; when non-whitespace follows we
+        //          hold back the final byte, which the next call
+        //          re-enters here as a single-byte run so alt 2 / alt 4
+        //          get their chance to fold it.
+        //
+        // A run of length > 1 can never satisfy alt 2 or alt 4, because
+        // both look at the byte immediately after the optional one and
+        // that byte is still whitespace. So `single` gates them.
+        u64 w_end = p
+        u64 stop_w = 0
+        while stop_w == 0 && w_end < input_len {
+            u64 wcls = tk_bpe_byte_class(load8(input + w_end))
+            if wcls != 2 && wcls != 3 { stop_w = 1 }
+            else { w_end = w_end + 1 }
+        }
+        u64 single = 0
+        if w_end - p == 1 { single = 1 }
+        // Class of the byte that ends the run — 0xFF..FF at end of input.
+        u64 ncls = 0xFFFFFFFFFFFFFFFF
+        if w_end < input_len { ncls = tk_bpe_byte_class(load8(input + w_end)) }
+
+        if single == 1 && c != 10 && c != 13 && ncls == 1 {
+            // alt 2 — whitespace byte + following letter run.
+            u64 run_end = w_end + 1
+            u64 stop_l = 0
+            while stop_l == 0 && run_end < input_len {
+                if tk_bpe_byte_class(load8(input + run_end)) != 1 { stop_l = 1 }
+                else { run_end = run_end + 1 }
+            }
+            return run_end
+        }
+        if single == 1 && c == 32 && ncls == 4 {
+            // alt 4 — space + symbol run, absorbing trailing newlines.
+            u64 run_end = w_end + 1
+            u64 stop_sym = 0
+            while stop_sym == 0 && run_end < input_len {
+                if tk_bpe_byte_class(load8(input + run_end)) != 4 { stop_sym = 1 }
+                else { run_end = run_end + 1 }
+            }
+            u64 stop_nl = 0
+            while stop_nl == 0 && run_end < input_len {
+                u64 rc = load8(input + run_end)
+                if rc != 10 && rc != 13 { stop_nl = 1 }
+                else { run_end = run_end + 1 }
+            }
+            return run_end
+        }
+        if single == 1 && c == 32 && ncls == 0 && tk_bpe_gpt2_digits != 0 {
+            // GPT-2's ` ?\p{N}+` — space + unbounded digit run. The
+            // llama-bpe / qwen2 rule never folds a space into digits.
+            u64 run_end = w_end + 1
+            u64 stop_d = 0
+            while stop_d == 0 && run_end < input_len {
+                if tk_bpe_byte_class(load8(input + run_end)) != 0 { stop_d = 1 }
+                else { run_end = run_end + 1 }
+            }
+            return run_end
+        }
+        // alt 5 — find the last \r/\n in the run, if any.
+        u64 last_nl = 0xFFFFFFFFFFFFFFFF
+        u64 wi = p
+        while wi < w_end {
+            u64 wb = load8(input + wi)
+            if wb == 10 || wb == 13 { last_nl = wi }
+            wi = wi + 1
+        }
+        if last_nl != 0xFFFFFFFFFFFFFFFF { return last_nl + 1 }
+        // alt 6 — hold back the final byte for a fold attempt.
+        if single == 0 && w_end < input_len { return w_end - 1 }
+        // alt 7 (or alt 6 at end of input) — the whole run.
+        return w_end
+    }
+
+    // Symbol run, no leading space.
+    u64 end = p + 1
+    u64 stop_sym = 0
+    while stop_sym == 0 && end < input_len {
+        if tk_bpe_byte_class(load8(input + end)) != 4 { stop_sym = 1 }
+        else { end = end + 1 }
+    }
+    // Absorb trailing newlines per regex alt 4 ([\r\n]*).
+    u64 stop_nl = 0
+    while stop_nl == 0 && end < input_len {
+        u64 nc = load8(input + end)
+        if nc != 10 && nc != 13 { stop_nl = 1 }
+        else { end = end + 1 }
+    }
+    return end
+}
+
+// Top-level BPE encoder — walks the pre-token boundaries from
+// tk_bpe_pretoken_end and runs tk_bpe_encode_pretoken on each span.
 // Pre-tokens are emitted in input-order; each is a contiguous byte
 // range [start, end) of the original input.
 fn tk_bpe_encode(Tokenizer tk, u64 input, u64 input_len,
@@ -1460,138 +1618,9 @@ fn tk_bpe_encode(Tokenizer tk, u64 input, u64 input_len,
 
     u64 p = 0
     while p < input_len {
-        u64 c = load8(input + p)
-        u64 cls = tk_bpe_byte_class(c)
-
-        // Contraction alternative — `(?i:'s|'t|'re|'ve|'m|'ll|'d)`. It's the
-        // first alternative in the GPT-2, llama-bpe AND qwen2 regexes alike,
-        // so it applies to every byte-level family. Without it an apostrophe
-        // starts a symbol run and "don't" pre-tokenizes as "don" + "'" + "t".
-        u64 contr = tk_bpe_contraction_len(input, input_len, p)
-        if contr != 0 {
-            tk_bpe_encode_pretoken(tk, input + p, contr, buf_box, cnt_box, cap_box)
-            p = p + contr
-            continue
-        }
-
-        if cls == 0 {
-            // Digit run — capped at 3 under the llama-bpe rule, unbounded
-            // under the GPT-2 rule.
-            u64 lim = 3
-            if tk_bpe_gpt2_digits != 0 { lim = 0xFFFFFFFFFFFFFFFF }
-            u64 end = p + 1
-            u64 take = 1
-            u64 stop = 0
-            while stop == 0 && end < input_len && take < lim {
-                if tk_bpe_byte_class(load8(input + end)) != 0 { stop = 1 }
-                else {
-                    end = end + 1
-                    take = take + 1
-                }
-            }
-            tk_bpe_encode_pretoken(tk, input + p, end - p, buf_box, cnt_box, cap_box)
-            p = end
-        } else if cls == 1 {
-            // Letter run.
-            u64 end = p + 1
-            u64 stop = 0
-            while stop == 0 && end < input_len {
-                if tk_bpe_byte_class(load8(input + end)) != 1 { stop = 1 }
-                else { end = end + 1 }
-            }
-            tk_bpe_encode_pretoken(tk, input + p, end - p, buf_box, cnt_box, cap_box)
-            p = end
-        } else if cls == 2 {
-            // Space — find end of contiguous space run, decide folding.
-            u64 sp_end = p + 1
-            u64 stop_s = 0
-            while stop_s == 0 && sp_end < input_len {
-                if load8(input + sp_end) != 32 { stop_s = 1 }
-                else { sp_end = sp_end + 1 }
-            }
-            // If the byte after the space run is letter or symbol, the
-            // LAST space folds into that following run.
-            u64 fold = 0
-            if sp_end < input_len {
-                u64 nc = load8(input + sp_end)
-                u64 ncls = tk_bpe_byte_class(nc)
-                if ncls == 1 { fold = 1 }
-                if ncls == 4 { fold = 1 }
-                // GPT-2's ` ?\p{N}+` also folds the space into a digit run.
-                if ncls == 0 && tk_bpe_gpt2_digits != 0 { fold = 1 }
-            }
-            if fold == 1 {
-                if sp_end - p > 1 {
-                    // Emit all but last space as one whitespace pre-token.
-                    tk_bpe_encode_pretoken(tk, input + p, sp_end - p - 1, buf_box, cnt_box, cap_box)
-                }
-                // Last space + following run.
-                u64 fold_start = sp_end - 1
-                u64 nc = load8(input + sp_end)
-                u64 ncls = tk_bpe_byte_class(nc)
-                u64 run_end = sp_end + 1
-                if ncls == 1 {
-                    u64 stop_l = 0
-                    while stop_l == 0 && run_end < input_len {
-                        if tk_bpe_byte_class(load8(input + run_end)) != 1 { stop_l = 1 }
-                        else { run_end = run_end + 1 }
-                    }
-                } else if ncls == 0 {
-                    // Digit run — only reachable with tk_bpe_gpt2_digits set,
-                    // since that's the only case where fold turns on for a
-                    // digit. Consume the whole run.
-                    u64 stop_d = 0
-                    while stop_d == 0 && run_end < input_len {
-                        if tk_bpe_byte_class(load8(input + run_end)) != 0 { stop_d = 1 }
-                        else { run_end = run_end + 1 }
-                    }
-                } else {
-                    // Symbol run — keep extending while we see symbols,
-                    // then absorb any trailing newlines.
-                    u64 stop_sym = 0
-                    while stop_sym == 0 && run_end < input_len {
-                        if tk_bpe_byte_class(load8(input + run_end)) != 4 { stop_sym = 1 }
-                        else { run_end = run_end + 1 }
-                    }
-                    u64 stop_nl = 0
-                    while stop_nl == 0 && run_end < input_len {
-                        u64 rc = load8(input + run_end)
-                        if rc != 10 && rc != 13 { stop_nl = 1 }
-                        else { run_end = run_end + 1 }
-                    }
-                }
-                tk_bpe_encode_pretoken(tk, input + fold_start, run_end - fold_start, buf_box, cnt_box, cap_box)
-                p = run_end
-            } else {
-                // No folding — entire whitespace run is its own pre-token.
-                tk_bpe_encode_pretoken(tk, input + p, sp_end - p, buf_box, cnt_box, cap_box)
-                p = sp_end
-            }
-        } else if cls == 3 {
-            // Non-space whitespace (\t \n \r etc.) — single-byte
-            // pre-token, no folding. (Tab actually DOES fold per the
-            // canonical regex but we don't bother — see the rules block
-            // above.)
-            tk_bpe_encode_pretoken(tk, input + p, 1, buf_box, cnt_box, cap_box)
-            p = p + 1
-        } else {
-            // Symbol run, no leading space.
-            u64 end = p + 1
-            u64 stop_sym = 0
-            while stop_sym == 0 && end < input_len {
-                if tk_bpe_byte_class(load8(input + end)) != 4 { stop_sym = 1 }
-                else { end = end + 1 }
-            }
-            // Absorb trailing newlines per regex alt 4 ([\r\n]*).
-            u64 stop_nl = 0
-            while stop_nl == 0 && end < input_len {
-                u64 nc = load8(input + end)
-                if nc != 10 && nc != 13 { stop_nl = 1 }
-                else { end = end + 1 }
-            }
-            tk_bpe_encode_pretoken(tk, input + p, end - p, buf_box, cnt_box, cap_box)
-            p = end
-        }
+        u64 end = tk_bpe_pretoken_end(input, input_len, p)
+        tk_bpe_encode_pretoken(tk, input + p, end - p, buf_box, cnt_box, cap_box)
+        p = end
     }
 
     unsafe { *(buf_box as u64) -> out_buf }
