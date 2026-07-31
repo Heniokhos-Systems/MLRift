@@ -5238,17 +5238,43 @@ else
 fi
 rm -f "$RV_K_SRC" "$RV_K_BIN"
 
+# A bare-metal rv32 image has no OS to service write(2), so IR_SYSCALL
+# (op 52) must fail loud with an NYI error instead of silently falling
+# through to a meaningless Linux ecall. This is the exact test that caught
+# the original Task 3 bug on the riscv side (a freestanding-only guard let
+# write() compile to the exit sequence) -- ported from KernRift's
+# riscv_freestanding_syscall_nyi (tests/run_tests.sh:6740), which MLRift had
+# no equivalent of.
+echo ""
+echo "--- riscv32 freestanding write() NYI gate ---"
+TOTAL=$((TOTAL + 1))
+RV_WR_SRC="/tmp/mlrc_rv_fs_write_$$.mlr"
+RV_WR_BIN="/tmp/mlrc_rv_fs_write_$$.bin"
+printf 'fn main() { write(1, "hi", 2) }\n' > "$RV_WR_SRC"
+RV_WR_ERR=$($MLRC --arch=riscv32 --freestanding "$RV_WR_SRC" -o "$RV_WR_BIN" 2>&1)
+if echo "$RV_WR_ERR" | grep -q "op 52 not yet implemented"; then
+    PASS=$((PASS + 1))
+    echo "  riscv_freestanding_syscall_nyi: PASS (op 52 gated loud on freestanding)"
+else
+    echo "FAIL: riscv_freestanding_syscall_nyi (got '$RV_WR_ERR', want NYI on op 52)"
+    FAIL=$((FAIL + 1))
+fi
+rm -f "$RV_WR_SRC" "$RV_WR_BIN"
+
 echo ""
 echo "--- xtensa exit() ---"
 TOTAL=$((TOTAL + 1))
 XT_E_SRC="/tmp/mlrc_xt_exit_$$.mlr"
 printf 'fn main() { exit(42) }\n' > "$XT_E_SRC"
-# esp32 must REFUSE, with the new wording
-if $MLRC --arch=xtensa --freestanding --target=esp32 "$XT_E_SRC" -o /dev/null 2>&1 \
-     | grep -q "no OS to return an exit status to"; then
+# esp32 must REFUSE, with the new wording, and must exit non-zero: a
+# print-and-continue regression would still match the grep below while
+# happily emitting SIMCALL into an ESP32 image.
+XT_REFUSE_ERR=$($MLRC --arch=xtensa --freestanding --target=esp32 "$XT_E_SRC" -o /dev/null 2>&1)
+XT_REFUSE_RC=$?
+if [ $XT_REFUSE_RC -ne 0 ] && echo "$XT_REFUSE_ERR" | grep -q "no OS to return an exit status to"; then
     PASS=$((PASS + 1)); echo "  xtensa_esp32_exit_refused: PASS"
 else
-    echo "FAIL: xtensa_esp32_exit_refused (expected an error mentioning 'no OS to return an exit status to')"; FAIL=$((FAIL + 1))
+    echo "FAIL: xtensa_esp32_exit_refused (rc=$XT_REFUSE_RC, expected nonzero rc and an error mentioning 'no OS to return an exit status to')"; FAIL=$((FAIL + 1))
 fi
 # lx60 must terminate qemu with 42
 if command -v qemu-system-xtensa >/dev/null 2>&1; then
@@ -5268,6 +5294,31 @@ if command -v qemu-system-xtensa >/dev/null 2>&1; then
     rm -f "$XT_E_BIN"
 fi
 rm -f "$XT_E_SRC"
+
+# Same shape as riscv_freestanding_syscall_nyi above: op 52 carries EVERY
+# syscall, not just exit(), and the SIMCALL exit lowering in ir_xtensa.mlr is
+# gated on imm == 231 (exit_group) specifically. A freestanding write() must
+# still fail loud with the NYI error instead of silently falling through
+# into the exit sequence -- if the `imm != 231` gate were removed, this
+# write(1,...) call (imm == 1) would skip straight past the freestanding and
+# esp32 checks and get lowered as if it were exit(1), succeeding silently
+# instead of erroring, so this assertion cannot pass without the gate. Task 3
+# hit exactly this bug shape on the riscv side; xtensa had no analogous
+# coverage until now.
+echo ""
+echo "--- xtensa freestanding write() NYI gate ---"
+TOTAL=$((TOTAL + 1))
+XT_WR_SRC="/tmp/mlrc_xt_fs_write_$$.mlr"
+printf 'fn main() { write(1, "hi", 2) }\n' > "$XT_WR_SRC"
+XT_WR_ERR=$($MLRC --arch=xtensa --freestanding "$XT_WR_SRC" -o /dev/null 2>&1)
+if echo "$XT_WR_ERR" | grep -q "xtensa: IR op 52 not yet implemented"; then
+    PASS=$((PASS + 1))
+    echo "  xtensa_freestanding_syscall_nyi: PASS (op 52 gated loud on freestanding write())"
+else
+    echo "FAIL: xtensa_freestanding_syscall_nyi (got '$XT_WR_ERR', want NYI on op 52)"
+    FAIL=$((FAIL + 1))
+fi
+rm -f "$XT_WR_SRC"
 
 # --- Summary ---
 echo ""
