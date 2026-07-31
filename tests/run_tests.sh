@@ -5346,6 +5346,31 @@ done
 rm -f "$AV_SRC" "$AV_BIN"
 
 echo ""
+echo "--- --target-arch value validation ---"
+TA_SRC="/tmp/mlrc_ta_$$.mlr"
+TA_BIN="/tmp/mlrc_ta_$$.bin"
+printf 'fn main() { uint32 x = 3\n exit(x) }\n' > "$TA_SRC"
+for BAD in gfx1100BANANA GARBAGE; do
+    TOTAL=$((TOTAL + 1))
+    $MLRC --target-arch=$BAD "$TA_SRC" -o "$TA_BIN" >/dev/null 2>&1; TA_ST=$?
+    if [ "$TA_ST" != "0" ]; then
+        PASS=$((PASS + 1)); echo "  target_arch_reject_$BAD: PASS (exit $TA_ST)"
+    else
+        echo "FAIL: target_arch_reject_$BAD (expected non-zero exit, got 0)"; FAIL=$((FAIL + 1))
+    fi
+done
+# Positive control: a real gfx name must still work (guards against the fix
+# over-tightening into rejecting valid values).
+TOTAL=$((TOTAL + 1))
+rm -f "$TA_BIN"
+if $MLRC --target-arch=gfx1100 "$TA_SRC" -o "$TA_BIN" >/dev/null 2>&1 && [ -s "$TA_BIN" ]; then
+    PASS=$((PASS + 1)); echo "  target_arch_accept_gfx1100: PASS"
+else
+    echo "FAIL: target_arch_accept_gfx1100 (should compile and produce a non-empty artifact)"; FAIL=$((FAIL + 1))
+fi
+rm -f "$TA_SRC" "$TA_BIN"
+
+echo ""
 echo "--- --emit / --target value validation ---"
 MEV_SRC="/tmp/mlrc_ev_$$.mlr"
 MEV_BIN="/tmp/mlrc_ev_$$.bin"
@@ -5372,14 +5397,44 @@ done
 # (verified); `lkm` has no arm here (rejects, exit 1) and `ir` writes no output
 # file (prints to stdout, exits 0), so both are excluded for the same reasons
 # as KernRift's Task 2.
+# Assert the container magic bytes, not merely non-emptiness -- a compiler
+# that collapsed every alias to one format would still pass an [ -s ] only
+# check. ELF 7f454c46, Mach-O cffaedfe, PE 4d5a0000; asm is text (no fixed
+# magic, so just check for the '; ' comment lead-in).
+emit_expected_magic() {
+    case "$1" in
+        elf|elf-arm64|elf-x86_64|elfexe|linux|linux-x86_64|linux-arm64|linux-x86-64|obj|android)
+            echo "7f454c46" ;;
+        macho|mac|macos|mac-x64|mac-arm64|darwin)
+            echo "cffaedfe" ;;
+        windows|windows-x64|windows-arm64|win|win-x64|win-arm64|pe)
+            echo "4d5a0000" ;;
+        asm)
+            echo "TEXT" ;;
+    esac
+}
 for GOOD in elf elf-arm64 elf-x86_64 elfexe linux linux-x86_64 linux-arm64 linux-x86-64 \
             macho mac macos mac-x64 mac-arm64 darwin \
             windows windows-x64 windows-arm64 win win-x64 win-arm64 pe \
             obj android asm; do
     TOTAL=$((TOTAL + 1))
     rm -f "$MEV_BIN"
+    EXP_MAGIC=$(emit_expected_magic "$GOOD")
     if $MLRC --emit=$GOOD "$MEV_SRC" -o "$MEV_BIN" >/dev/null 2>&1 && [ -s "$MEV_BIN" ]; then
-        PASS=$((PASS + 1)); echo "  emit_accept_$GOOD: PASS"
+        if [ "$EXP_MAGIC" = "TEXT" ]; then
+            if head -c2 "$MEV_BIN" | grep -q '; '; then
+                PASS=$((PASS + 1)); echo "  emit_accept_$GOOD: PASS (text asm)"
+            else
+                echo "FAIL: emit_accept_$GOOD (expected text asm output)"; FAIL=$((FAIL + 1))
+            fi
+        else
+            GOT_MAGIC=$(xxd -p -l4 "$MEV_BIN")
+            if [ "$GOT_MAGIC" = "$EXP_MAGIC" ]; then
+                PASS=$((PASS + 1)); echo "  emit_accept_$GOOD: PASS (magic $GOT_MAGIC)"
+            else
+                echo "FAIL: emit_accept_$GOOD (expected magic $EXP_MAGIC, got $GOT_MAGIC)"; FAIL=$((FAIL + 1))
+            fi
+        fi
     else
         echo "FAIL: emit_accept_$GOOD (alias must keep working)"; FAIL=$((FAIL + 1))
     fi
