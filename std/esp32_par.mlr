@@ -14,6 +14,104 @@
 static u32[1] par_count
 static u32[1] par_sense
 
+// ---------------------------------------------------------------------------
+// The work descriptor
+// ---------------------------------------------------------------------------
+// One producer (core 0), one consumer (core 1), one job in flight. The layout
+// is six words plus a sequence number:
+//
+//   par_desc[0] kind    PAR_KIND_PARK (0) = nothing to do, go straight to the
+//                       barrier; PAR_KIND_RANGE (1) = run arg0 over [lo, hi).
+//   par_desc[1] a0      opaque argument 0  (the NN driver passes the layer record)
+//   par_desc[2] a1      opaque argument 1  (the activation arena base)
+//   par_desc[3] a2      opaque argument 2  (the parameter blob base)
+//   par_desc[4] lo      range start, inclusive
+//   par_desc[5] hi      range end, exclusive
+//   par_seq             bumped by par_publish AFTER the six fields are stored
+//   par_taken           core-1 private: the last sequence number consumed
+//
+// `kind` is the descriptor's own opcode, not the NN opcode. The NN opcode
+// lives inside the record `a0` points at, so core 1 reads it with the same
+// load32(r) core 0 uses and the two can never disagree about it.
+//
+// TWO ORDERING FACTS MAKE THIS RACE-FREE, AND BOTH ARE LOAD-BEARING.
+//
+// 1. Publish happens-before take. par_publish stores the six fields first and
+//    par_seq LAST; par_take spins until par_seq differs from par_taken, so it
+//    cannot observe a half-written descriptor. (There is no store buffer to
+//    fence on here — both cores address the same physically-single-ported
+//    internal SRAM and Task 1 proved plain store8/load8 across cores are
+//    coherent — but the store order is still written this way deliberately so
+//    the argument does not depend on that.)
+//
+// 2. Take happens-before the NEXT publish, and this is guaranteed by the
+//    BARRIER, not by anything in here. The caller's contract is: publish once
+//    per round, then barrier once per round. Core 0 cannot reach round i+1's
+//    par_publish until it has passed round i's barrier, which requires core 1
+//    to have ARRIVED at that barrier, which is strictly after its par_take.
+//    So the single slot can never be overwritten under a reader.
+//
+//    Because of (2), par_take deliberately does NOT snapshot the fields: a
+//    snapshot would suggest the descriptor is safe to read without the
+//    barrier discipline, which it is not — core 0 could clobber it mid-copy
+//    just as easily as mid-use. Core 1 reads the fields directly through the
+//    accessors below, for as long as it is between its take and its barrier.
+static u32[6] par_desc
+static u32[1] par_seq
+static u32[1] par_taken
+
+fn par_kind_park() -> u32 {
+    u32 v = 0
+    return v
+}
+
+fn par_kind_range() -> u32 {
+    u32 v = 1
+    return v
+}
+
+// Core 0 only. Call exactly once per barrier round, BEFORE doing its own share
+// of the work. Publishing PARK is not optional for a round with no parallel
+// work: core 1 must consume a FRESH descriptor every round or it would either
+// re-run the previous round's job or spin on a stale one.
+fn par_publish(u32 kind, u32 a0, u32 a1, u32 a2, u32 lo, u32 hi) {
+    vstore32(par_desc + 4, a0)
+    vstore32(par_desc + 8, a1)
+    vstore32(par_desc + 12, a2)
+    vstore32(par_desc + 16, lo)
+    vstore32(par_desc + 20, hi)
+    vstore32(par_desc, kind)
+    // Release: the sequence bump is the last store, and it is what makes the
+    // five above visible to a taker.
+    vstore32(par_seq, vload32(par_seq) + 1)
+}
+
+// Core 1 only. Blocks until core 0 has published a descriptor this round, then
+// returns its `kind`. The fields are read with the accessors below.
+//
+// par_seq is read ONCE into a local before it is compared and latched: reading
+// it twice could latch a different value than the one that satisfied the test.
+// (Under the barrier discipline core 0 cannot publish twice here, but the
+// function should not be correct only by that argument.)
+fn par_take() -> u32 {
+    loop {
+        u32 s = vload32(par_seq)
+        if s != vload32(par_taken) {
+            vstore32(par_taken, s)
+            return vload32(par_desc)
+        }
+    }
+    // Unreachable — the loop above only exits via that return. Present only
+    // because sema requires a value-returning function to return on every path.
+    return 0
+}
+
+fn par_job_a0() -> u32 { return vload32(par_desc + 4) }
+fn par_job_a1() -> u32 { return vload32(par_desc + 8) }
+fn par_job_a2() -> u32 { return vload32(par_desc + 12) }
+fn par_job_lo() -> u32 { return vload32(par_desc + 16) }
+fn par_job_hi() -> u32 { return vload32(par_desc + 20) }
+
 // Explicitly zero the barrier state. Core 0's preamble zeroes .bss before
 // core 1 is released, and core1_entry deliberately does not re-zero
 // (ir_xtensa.mlr:1394-1414, :1459), so this happens to work without an
@@ -24,6 +122,9 @@ static u32[1] par_sense
 fn par_init() {
     vstore32(par_count, 0)
     vstore32(par_sense, 0)
+    vstore32(par_seq, 0)
+    vstore32(par_taken, 0)
+    vstore32(par_desc, 0)
 }
 
 // Two-core sense-reversing barrier. Each core flips its own sense bit and
