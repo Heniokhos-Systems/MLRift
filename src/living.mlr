@@ -1581,9 +1581,21 @@ fn mig_append_width(uint64 dst, uint64 dst_pos_ptr, uint64 width) {
     if width == 8 { mig_append_str(dst, dst_pos_ptr, "64") }
 }
 
-// Main migration pass. Scans `source` and builds a rewritten output in `out_buf`.
-// Returns (bytes_written, matches_applied).
-// If dry_run is non-zero, nothing is written, but matches are still counted.
+// Unsafe-pointer-op migration pass. Scans `source` for `unsafe { *(EXPR as
+// TYPE) -> DEST }` / `unsafe { *(EXPR as TYPE) = VAL }` blocks and rewrites
+// them to `DEST = loadN(EXPR)` / `storeN(EXPR, VAL)`. Returns
+// (bytes_written, matches_applied). If dry_run is non-zero, nothing is
+// written, but matches are still counted.
+//
+// This used to ALSO rewrite long-form type keywords (uint8..int64) by
+// scanning raw bytes for the substring, which could not tell code from a
+// string or comment -- on src/lexer.mlr it corrupted the literal inside
+// match_keyword(start, len, "uint64", 6), leaving the length argument at 6
+// while the string shrank to "u64", so the keyword stopped matching either
+// spelling. That half moved to the token-driven mig_tok_rewrite (see below);
+// run_migration now runs both passes. This pass still walks raw bytes for
+// the `unsafe` keyword itself -- Task 4 is expected to give it the same
+// token-driven treatment.
 @export
 fn mig_scan_and_rewrite(uint64 source, uint64 src_size, uint64 out_buf_a, uint64 matches_out) -> uint64 {
     uint64 sp_pos = 0
@@ -1595,75 +1607,6 @@ fn mig_scan_and_rewrite(uint64 source, uint64 src_size, uint64 out_buf_a, uint64
         uint64 bp = source + sp_pos
         uint64 ch = 0
         unsafe { *(bp as uint8) -> ch }
-
-        // Look for 'u' or 'i' at a word boundary and try to match a long-form
-        // type name (uint8..int64). If matched, emit the short form alias.
-        if (ch == 117 || ch == 105) && sp_pos + 4 <= src_size {
-            uint64 lprev_ok = 1
-            if sp_pos > 0 {
-                uint64 lpbp = source + sp_pos - 1
-                uint64 lpc = 0
-                unsafe { *(lpbp as uint8) -> lpc }
-                if mig_is_word(lpc) != 0 { lprev_ok = 0 }
-            }
-            if lprev_ok != 0 {
-                uint64 matched_long = 0
-                uint64 short_form = 0
-                uint64 match_len = 0
-                // Try longest matches first to avoid prefix ambiguity
-                if mig_text_eq(source, sp_pos, src_size, "uint64", 6) != 0 {
-                    matched_long = 1; short_form = "u64"; match_len = 6
-                }
-                if matched_long == 0 && mig_text_eq(source, sp_pos, src_size, "uint32", 6) != 0 {
-                    matched_long = 1; short_form = "u32"; match_len = 6
-                }
-                if matched_long == 0 && mig_text_eq(source, sp_pos, src_size, "uint16", 6) != 0 {
-                    matched_long = 1; short_form = "u16"; match_len = 6
-                }
-                if matched_long == 0 && mig_text_eq(source, sp_pos, src_size, "int64", 5) != 0 {
-                    matched_long = 1; short_form = "i64"; match_len = 5
-                }
-                if matched_long == 0 && mig_text_eq(source, sp_pos, src_size, "int32", 5) != 0 {
-                    matched_long = 1; short_form = "i32"; match_len = 5
-                }
-                if matched_long == 0 && mig_text_eq(source, sp_pos, src_size, "int16", 5) != 0 {
-                    matched_long = 1; short_form = "i16"; match_len = 5
-                }
-                if matched_long == 0 && mig_text_eq(source, sp_pos, src_size, "uint8", 5) != 0 {
-                    matched_long = 1; short_form = "u8"; match_len = 5
-                }
-                if matched_long == 0 && mig_text_eq(source, sp_pos, src_size, "int8", 4) != 0 {
-                    matched_long = 1; short_form = "i8"; match_len = 4
-                }
-                if matched_long != 0 {
-                    // Verify the next char is NOT a word character (word boundary)
-                    uint64 nafter = sp_pos + match_len
-                    uint64 nafter_ok = 1
-                    if nafter < src_size {
-                        uint64 nap = source + nafter
-                        uint64 nac = 0
-                        unsafe { *(nap as uint8) -> nac }
-                        if mig_is_word(nac) != 0 { nafter_ok = 0 }
-                    }
-                    if nafter_ok != 0 {
-                        // Copy pre-match bytes
-                        uint64 pre_len = sp_pos - last_copied
-                        uint8[8] dp_bufm
-                        uint64 dpm = dp_bufm
-                        unsafe { *(dpm as uint64) = dp }
-                        mig_append_bytes(out_buf_a, dpm, source, last_copied, pre_len)
-                        // Emit short form
-                        mig_append_str(out_buf_a, dpm, short_form)
-                        unsafe { *(dpm as uint64) -> dp }
-                        last_copied = sp_pos + match_len
-                        sp_pos = sp_pos + match_len
-                        applied = applied + 1
-                        unsafe { *(matches_out as uint64) = applied }
-                        continue
-                    }
-                }
-            }
-        }
 
         // Look for 'u' and try to match "unsafe" at a word boundary
         if ch == 117 && sp_pos + 6 <= src_size {
@@ -1870,16 +1813,33 @@ fn run_migration(uint64 input_path, uint64 dry_run) {
     uint8 z = 0
     unsafe { *(tp as uint8) = z }
 
-    // Worst-case output: every unsafe{} block becomes a slightly longer
-    // form (never more than 2x), so 4x is a safe upper bound.
-    uint64 out_buf_m = alloc(fsize * 4 + 1024)
-    uint64 matches = 0
+    // Pass 1: token-driven rewrite of long-form type keywords (uint8/16/
+    // 32/64 -> u8/u16/u32/u64). Only real KwUint* tokens at their long-form
+    // length are sites, so comments and string/f-string contents are never
+    // touched -- this is what fixes the match_keyword("uint64", 6)
+    // corruption the old byte-scanner caused. A rewrite only ever shrinks
+    // the source, so fsize + 1 bounds the output.
+    uint64 sites_probe = alloc(MIG_SITE_CAP * 8)
+    uint64 type_matches = mig_tok_scan(src_buf, fsize, sites_probe)
+    dealloc(sites_probe)
+    uint64 buf1 = alloc(fsize + 1)
+    uint64 size1 = mig_tok_rewrite(src_buf, fsize, buf1)
+    dealloc(src_buf)
+
+    // Pass 2: byte-level rewrite of unsafe{}-pointer-op blocks into
+    // load*/store* calls, over the already-type-rewritten buffer. Worst-case
+    // output: every unsafe{} block becomes a slightly longer form (never
+    // more than 2x), so 4x is a safe upper bound.
+    uint64 out_buf_m = alloc(size1 * 4 + 1024)
+    uint64 unsafe_matches = 0
     uint8[8] mbuf
     uint64 m_addr = mbuf
     unsafe { *(m_addr as uint64) = 0 }
 
-    uint64 new_size = mig_scan_and_rewrite(src_buf, fsize, out_buf_m, m_addr)
-    unsafe { *(m_addr as uint64) -> matches }
+    uint64 new_size = mig_scan_and_rewrite(buf1, size1, out_buf_m, m_addr)
+    unsafe { *(m_addr as uint64) -> unsafe_matches }
+    dealloc(buf1)
+    uint64 matches = type_matches + unsafe_matches
 
     if dry_run != 0 {
         // Print matches count and the first 1K of the rewritten file
@@ -1988,6 +1948,72 @@ fn mig_tok_scan(uint64 source, uint64 src_size, uint64 sites_out) -> uint64 {
     }
     dealloc(toks)
     return n
+}
+
+// ---------------------------------------------------------------------------
+// Token-driven rewriter (Task 3)
+// ---------------------------------------------------------------------------
+//
+// mig_scan_and_rewrite (above) walks raw bytes and cannot tell code from a
+// string literal, so on src/lexer.mlr it turns match_keyword(start, len,
+// "uint64", 6) into match_keyword(start, len, "u64", 6) -- the length
+// argument stays 6 while the literal shrinks to 3 characters, so the
+// keyword-length check `if len != kw_len { return 0 }` never matches either
+// spelling again and every integer type keyword silently stops lexing. This
+// rewriter instead replaces exactly the sites mig_tok_scan reports -- real
+// KwUint* tokens at their long-form length -- leaving everything else,
+// including string and f-string contents, byte-for-byte untouched.
+//
+// Writes the short-form spelling for `kind` at `out_p`. Returns the number of
+// bytes written (2 for u8, 3 for u16/u32/u64).
+fn mig_short_form(uint32 kind, uint64 out_p) -> uint64 {
+    if kind == 80 { store8(out_p, 117)  store8(out_p + 1, 56)  return 2 }        // u8
+    if kind == 81 { store8(out_p, 117)  store8(out_p + 1, 49)  store8(out_p + 2, 54)  return 3 }  // u16
+    if kind == 82 { store8(out_p, 117)  store8(out_p + 1, 51)  store8(out_p + 2, 50)  return 3 }  // u32
+    if kind == 83 { store8(out_p, 117)  store8(out_p + 1, 54)  store8(out_p + 2, 52)  return 3 }  // u64
+    return 0
+}
+
+// Copy `source` into `out_buf_a`, replacing each scanned site with its short
+// form. Sites come back in ascending `start` order because the token stream
+// is ordered, so a single forward copy pass suffices. Returns the length of
+// the rewritten output.
+@export
+fn mig_tok_rewrite(uint64 source, uint64 src_size, uint64 out_buf_a) -> uint64 {
+    uint64 sites = alloc(MIG_SITE_CAP * 8)
+    uint64 n = mig_tok_scan(source, src_size, sites)
+    uint64 src_i = 0
+    uint64 out_i = 0
+    uint64 s = 0
+    while s < n {
+        uint64 rec = sites + s * 8
+        uint32 st = 0
+        uint32 kd = 0
+        unsafe { *(rec as uint32) -> st }
+        uint64 rec1 = rec + 4
+        unsafe { *(rec1 as uint32) -> kd }
+        while src_i < st {
+            uint64 sp = source + src_i
+            uint64 c = 0
+            unsafe { *(sp as uint8) -> c }
+            store8(out_buf_a + out_i, c)
+            src_i = src_i + 1
+            out_i = out_i + 1
+        }
+        out_i = out_i + mig_short_form(kd, out_buf_a + out_i)
+        src_i = src_i + mig_long_form_len(kd)
+        s = s + 1
+    }
+    while src_i < src_size {
+        uint64 sp2 = source + src_i
+        uint64 c2 = 0
+        unsafe { *(sp2 as uint8) -> c2 }
+        store8(out_buf_a + out_i, c2)
+        src_i = src_i + 1
+        out_i = out_i + 1
+    }
+    dealloc(sites)
+    return out_i
 }
 
 // CLI entry point for `lc --scan-sites <file>`. Reads the file, runs the

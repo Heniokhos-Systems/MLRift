@@ -5913,6 +5913,47 @@ fi
 rm -f "$LCF_SRC"
 
 echo ""
+echo "--- lc token rewriter ---"
+# This is the exact damage the old byte-scanner does on src/lexer.mlr itself
+# (the first file in SRCS): match_keyword(start, len, "uint64", 6) has its
+# string literal rewritten to "u64" while the length argument stays 6, so
+# neither spelling matches and every integer type keyword silently stops
+# being recognised. The token-driven rewriter must leave the string literal
+# untouched while still rewriting the real `uint64` keyword on the same file.
+LCR_SRC="/tmp/mlrc_lcrw_$$.mlr"
+cat > "$LCR_SRC" <<'EOF'
+// keyword table: the literal below must survive, length argument and all
+fn classify(u64 start, u64 len) -> u64 {
+    if match_keyword(start, len, "uint64", 6) != 0 { return 83 }
+    return 0
+}
+fn main() { uint64 x = 0  exit(x) }
+EOF
+TOTAL=$((TOTAL + 1))
+$MLRC lc --fix --dry-run "$LCR_SRC" > /tmp/mlrc_lcrw_out_$$ 2>&1
+if grep -q '"uint64", 6' /tmp/mlrc_lcrw_out_$$ && grep -q 'u64 x = 0' /tmp/mlrc_lcrw_out_$$; then
+    PASS=$((PASS + 1)); echo "  lc_rewrite_preserves_string_literals: PASS"
+else
+    echo "FAIL: lc_rewrite_preserves_string_literals (string literal or code site wrong)"; FAIL=$((FAIL + 1))
+fi
+rm -f "$LCR_SRC" /tmp/mlrc_lcrw_out_$$
+
+# Running the migration twice must produce a byte-identical file: after one
+# pass every site is u64 (len 3), which mig_long_form_len does not match.
+TOTAL=$((TOTAL + 1))
+LCI="/tmp/mlrc_lci_$$.mlr"
+printf 'fn main() {\n    uint64 a = 1\n    uint32 b = 2\n    exit(0)\n}\n' > "$LCI"
+$MLRC lc --fix "$LCI" >/dev/null 2>&1
+cp "$LCI" "${LCI}.once"
+$MLRC lc --fix "$LCI" >/dev/null 2>&1
+if cmp -s "$LCI" "${LCI}.once"; then
+    PASS=$((PASS + 1)); echo "  lc_rewrite_idempotent: PASS"
+else
+    echo "FAIL: lc_rewrite_idempotent (second pass changed the file)"; FAIL=$((FAIL + 1))
+fi
+rm -f "$LCI" "${LCI}.once"
+
+echo ""
 echo "--- float literal return kinds ---"
 # tc_expr_kind reported EVERY FloatLit as f64, ignoring the `f` suffix, so the
 # return-kind check rejected `fn f() -> f32 { return 1.5f }` while the very
