@@ -133,12 +133,18 @@ static uint64 static_elem_sizes = 0
 static uint64 static_fixups = 0
 static uint64 static_fixup_count = 0
 
-// String literal table: raw string bytes stored contiguously
+// String literal table: raw string bytes stored contiguously. Grows
+// (doubling) via str_buf_grow_check instead of a hard cap — see
+// grow_buf's doc comment for why a realloc here is safe (nothing holds a
+// raw pointer into str_buf; everything is an offset resolved at emit time).
 static uint64 str_buf = 0
 static uint64 str_len = 0
-// String fixup table: [code_patch_offset(4), str_data_offset(4)] × 1024
+static uint64 str_cap = 0
+// String fixup table: [code_patch_offset(4), str_data_offset(4)] × 1024,
+// grown via str_fixups_grow_check.
 static uint64 str_fixups = 0
 static uint64 str_fixup_count = 0
+static uint64 str_fixup_cap = 0
 
 // Target OS: 0=linux, 1=macos, 2=windows
 static uint64 target_os = 0
@@ -333,8 +339,10 @@ fn codegen_init(uint64 capacity, uint64 source, uint64 tokens) {
     static_fixup_count = 0
     str_buf = alloc(65536)
     str_len = 0
+    str_cap = 65536
     str_fixups = alloc(4096 * 8)
     str_fixup_count = 0
+    str_fixup_cap = 4096
     a64_var_base = 32
     win_iat_fixups = alloc(8192 * 8)
     win_iat_fixup_count = 0
@@ -421,6 +429,33 @@ fn grow_buf(uint64 old_ptr, uint64 used_bytes, uint64 new_bytes) -> uint64 {
     memcpy(np, old_ptr, used_bytes)
     dealloc(old_ptr)
     return np
+}
+
+// Ensure str_buf can hold at least `need` bytes, doubling geometrically
+// (matching fn_register's growth idiom above) until it does. Safe to call
+// from any backend file concatenated after this one: str_buf/str_len are
+// re-read fresh by every write site (str_buf + str_len computed on every
+// byte), record_string-style helpers return byte OFFSETS not pointers, and
+// str_fixups entries store offsets resolved against str_data_start at emit
+// time — so a realloc here never strands a raw pointer.
+fn str_buf_grow_check(uint64 need) {
+    while need > str_cap {
+        uint64 new_cap = str_cap * 2
+        str_buf = grow_buf(str_buf, str_len, new_cap)
+        str_cap = new_cap
+    }
+}
+
+// Ensure str_fixups has room for one more 8-byte [code_off(4), str_off(4)]
+// entry, doubling geometrically. Same offset-not-pointer reasoning as
+// str_buf_grow_check applies: entries are read back by index (str_fixups +
+// i * 8) at resolve time, never cached across a grow.
+fn str_fixups_grow_check() {
+    if str_fixup_count >= str_fixup_cap {
+        uint64 new_cap = str_fixup_cap * 2
+        str_fixups = grow_buf(str_fixups, str_fixup_count * 8, new_cap * 8)
+        str_fixup_cap = new_cap
+    }
 }
 
 fn patch_u32(uint64 offset, uint64 val) {
@@ -3072,10 +3107,7 @@ fn resolver_add_str(uint64 s) -> uint64 {
     uint64 ch = 0
     unsafe { *(p as uint8) -> ch }
     while ch != 0 {
-        if str_len >= 65536 {
-            write(2, "error: str_buf overflow (max 65536)\n", 36)
-            exit(1)
-        }
+        str_buf_grow_check(str_len + 1)
         uint8 cb = ch
         uint64 dp = str_buf + str_len
         unsafe { *(dp as uint8) = cb }
@@ -3084,10 +3116,7 @@ fn resolver_add_str(uint64 s) -> uint64 {
         p = s + i
         unsafe { *(p as uint8) -> ch }
     }
-    if str_len >= 65536 {
-        write(2, "error: str_buf overflow (max 65536)\n", 36)
-        exit(1)
-    }
+    str_buf_grow_check(str_len + 1)
     uint64 dp = str_buf + str_len
     uint8 nz = 0
     unsafe { *(dp as uint8) = nz }
@@ -3097,10 +3126,7 @@ fn resolver_add_str(uint64 s) -> uint64 {
 
 // Helper: emit lea rdx, [rip+disp32] with string fixup
 fn emit_lea_rdx_str(uint64 str_offset) {
-    if str_fixup_count >= 4096 {
-        write(2, "error: str_fixups overflow (max 4096)\n", 38)
-        exit(1)
-    }
+    str_fixups_grow_check()
     emit_byte(0x48); emit_byte(0x8D); emit_byte(0x15)
     uint64 fentry = str_fixups + str_fixup_count * 8
     uint32 cp = out_len
@@ -3114,10 +3140,7 @@ fn emit_lea_rdx_str(uint64 str_offset) {
 
 // Helper: emit lea rcx, [rip+disp32] with string fixup
 fn emit_lea_rcx_str(uint64 str_offset) {
-    if str_fixup_count >= 4096 {
-        write(2, "error: str_fixups overflow (max 4096)\n", 38)
-        exit(1)
-    }
+    str_fixups_grow_check()
     emit_byte(0x48); emit_byte(0x8D); emit_byte(0x0D)
     uint64 fentry = str_fixups + str_fixup_count * 8
     uint32 cp = out_len
@@ -3538,11 +3561,8 @@ fn gen_expr(uint64 node) {
         uint64 wtok = tok
         uint64 tstart = tok_text_start(wtok)
         uint64 tlen = tok_text_len(wtok)
-        // Check str_buf capacity before copying
-        if str_len + tlen >= 65536 {
-            write(2, "error: str_buf overflow (max 65536)\n", 36)
-            exit(1)
-        }
+        // Ensure str_buf capacity before copying
+        str_buf_grow_check(str_len + tlen + 1)
         // String data offset in str_buf
         uint64 str_offset = str_len
         // Copy string bytes (skip opening quote, process escapes, skip closing quote)
@@ -3575,10 +3595,7 @@ fn gen_expr(uint64 node) {
         unsafe { *(sp as uint8) = zero }
         str_len = str_len + 1
         // Emit: lea disp32(%rip), %rax → 48 8D 05 [disp32]
-        if str_fixup_count >= 4096 {
-            write(2, "error: str_fixups overflow (max 4096)\n", 38)
-            exit(1)
-        }
+        str_fixups_grow_check()
         emit_byte(0x48)
         emit_byte(0x8D)
         emit_byte(0x05)
@@ -3625,10 +3642,7 @@ fn gen_expr(uint64 node) {
                     uint64 wfs_tok = fs_tok
                     uint64 fs_tlen = tok_text_len(wfs_tok)
                     if fs_tlen != 0 {
-                        if str_len + fs_tlen >= 65536 {
-                            write(2, "error: str_buf overflow\n", 24)
-                            exit(1)
-                        }
+                        str_buf_grow_check(str_len + fs_tlen + 1)
                         uint64 fs_soff = str_len
                         uint64 fs_si = 0
                         while fs_si < fs_tlen {
@@ -3643,10 +3657,7 @@ fn gen_expr(uint64 node) {
                         uint8 fs_nz = 0
                         unsafe { *(fs_nsp as uint8) = fs_nz }
                         str_len = str_len + 1
-                        if str_fixup_count >= 4096 {
-                            write(2, "error: str_fixups overflow\n", 27)
-                            exit(1)
-                        }
+                        str_fixups_grow_check()
                         // lea rsi, [rip + fs_soff]  (source)
                         emit_byte(0x48); emit_byte(0x8D); emit_byte(0x35)
                         uint64 fs_fe = str_fixups + str_fixup_count * 8

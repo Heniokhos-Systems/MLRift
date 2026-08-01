@@ -5873,6 +5873,27 @@ fi
 rm -f "$CA_SRC" "$CA_BIN"
 
 echo ""
+echo "--- growable string pool ---"
+SP_SRC="/tmp/mlrc_strpool_$$.mlr"
+{
+  echo 'fn main() {'
+  i=0
+  while [ $i -lt 900 ]; do
+    printf '    print_str("padpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpad-%s")\n' "$i"
+    i=$((i + 1))
+  done
+  echo '    exit(0)'
+  echo '}'
+} > "$SP_SRC"
+TOTAL=$((TOTAL + 1))
+if $MLRC --arch=x86_64 "$SP_SRC" -o /tmp/mlrc_strpool_bin_$$ > /tmp/mlrc_strpool_err_$$ 2>&1; then
+    PASS=$((PASS + 1)); echo "  str_pool_grows_past_64k: PASS"
+else
+    echo "FAIL: str_pool_grows_past_64k ($(head -1 /tmp/mlrc_strpool_err_$$))"; FAIL=$((FAIL + 1))
+fi
+rm -f "$SP_SRC" /tmp/mlrc_strpool_bin_$$ /tmp/mlrc_strpool_err_$$
+
+echo ""
 echo "--- lc verification harness ---"
 TOTAL=$((TOTAL + 1))
 LCV="/tmp/mlrc_lcv_$$.mlr"
