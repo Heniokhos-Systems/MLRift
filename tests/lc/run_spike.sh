@@ -205,5 +205,11 @@ if [ "$FAIL" = 0 ]; then
 else
   echo "FAIL: re-entrancy behavior did not match the recorded boundary -- see MISMATCH lines above."
 fi
-echo "WORK=$WORK"
+# Keep the artifacts only when there is something to inspect -- the pattern
+# prove_full_scale.sh uses. A passing run used to leave its mktemp -d behind.
+if [ "$FAIL" = 0 ]; then
+  rm -rf "$WORK"
+else
+  echo "artifacts kept for inspection: WORK=$WORK"
+fi
 exit "$FAIL"

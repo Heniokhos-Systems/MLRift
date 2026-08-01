@@ -6179,7 +6179,124 @@ if [ "$CAP2_ST" != "0" ] && echo "$CAP2_OUT" | grep -q "assigned more than once"
 else
     echo "FAIL: lc_double_srcs_assignment_refused (exit $CAP2_ST, got '$CAP2_OUT')"; FAIL=$((FAIL + 1))
 fi
+
+# `$(VAR)` in SRCS used to be SKIPPED without a word -- the one dropping path
+# in the mapper that was neither a cap nor guarded. Demonstrated before the
+# fix: `SRCS = $(CORE) src/a.mlr` assembled a ONE-member unit missing the file
+# that holds main(), verified the rewrite inside it, found it identical and
+# WROTE the file while printing "build units: build/mlrc.mlr" -- the name of a
+# unit it had not built. Not live in this tree's Makefile, but the reason the
+# Makefile is parsed at all is fork portability.
+TOTAL=$((TOTAL + 1))
+printf 'fn helper(uint64 a) -> uint64 {\n    return a\n}\n' > "$CAPD/src/x.mlr"
+printf 'CORE = src/y.mlr\nSRCS = $(CORE) src/x.mlr\n\nall:\n\t@true\n' > "$CAPD/Makefile"
+CAP3_OUT=$(cd "$CAPD" && "$MLRC_ABS" --arch=x86_64 lc --fix=types --dry-run src/x.mlr 2>&1); CAP3_ST=$?
+if [ "$CAP3_ST" != "0" ] && echo "$CAP3_OUT" | grep -q 'unexpanded make variable'; then
+    PASS=$((PASS + 1)); echo "  lc_unexpanded_make_variable_refused: PASS"
+else
+    echo "FAIL: lc_unexpanded_make_variable_refused (exit $CAP3_ST, got '$CAP3_OUT')"; FAIL=$((FAIL + 1))
+fi
+
+# `SRCS ?=` matched NO assignment operator, so SRCS resolved to zero members
+# and the file fell through to `src/x.mlr (module)` -- a silently narrower
+# unit, reported as success. It must read as a real assignment.
+TOTAL=$((TOTAL + 1))
+printf 'SRCS ?= src/x.mlr\n\nall:\n\t@true\n' > "$CAPD/Makefile"
+CAP4_OUT=$(cd "$CAPD" && "$MLRC_ABS" --arch=x86_64 lc --fix=types --dry-run src/x.mlr 2>&1 | grep "build units:")
+if echo "$CAP4_OUT" | grep -q "build/mlrc.mlr" && ! echo "$CAP4_OUT" | grep -q "(module)"; then
+    PASS=$((PASS + 1)); echo "  lc_optional_assignment_is_read: PASS"
+else
+    echo "FAIL: lc_optional_assignment_is_read (got '$CAP4_OUT')"; FAIL=$((FAIL + 1))
+fi
+
+# `!=` is make's SHELL assignment: the value only exists after running a
+# shell. Refuse by name rather than silently missing it the way `?=` was.
+TOTAL=$((TOTAL + 1))
+printf 'SRCS != echo src/x.mlr\n\nall:\n\t@true\n' > "$CAPD/Makefile"
+CAP5_OUT=$(cd "$CAPD" && "$MLRC_ABS" --arch=x86_64 lc --fix=types --dry-run src/x.mlr 2>&1); CAP5_ST=$?
+if [ "$CAP5_ST" != "0" ] && echo "$CAP5_OUT" | grep -q 'shell assignment'; then
+    PASS=$((PASS + 1)); echo "  lc_shell_assignment_refused: PASS"
+else
+    echo "FAIL: lc_shell_assignment_refused (exit $CAP5_ST, got '$CAP5_OUT')"; FAIL=$((FAIL + 1))
+fi
 rm -rf "$CAPD"
+
+# Membership is decided by CONTENT, not by the path tail, so it survives the
+# working directory. Run from src/, `lexer.mlr` is shorter than the Makefile
+# token `src/lexer.mlr`, so a tail comparison could never match it and the
+# file silently downgraded to `lexer.mlr (module)` -- verified against none of
+# its real units -- while the SAME file named from the repo root resolved to
+# build/mlrc.mlr. All three spellings must now agree.
+TOTAL=$((TOTAL + 1))
+SUB_A=$(cd "$RR/src" && "$MLRC_ABS" --arch=x86_64 lc --fix=types --dry-run lexer.mlr 2>&1 | grep "build units:")
+SUB_B=$(cd "$RR" && "$MLRC_ABS" --arch=x86_64 lc --fix=types --dry-run src/lexer.mlr 2>&1 | grep "build units:")
+if echo "$SUB_A" | grep -q "build/mlrc.mlr" && ! echo "$SUB_A" | grep -q "(module)" && \
+   echo "$SUB_B" | grep -q "build/mlrc.mlr"; then
+    PASS=$((PASS + 1)); echo "  lc_maps_file_from_a_subdirectory: PASS"
+else
+    echo "FAIL: lc_maps_file_from_a_subdirectory (from src/: '$SUB_A'; from root: '$SUB_B')"; FAIL=$((FAIL + 1))
+fi
+
+# A file OUTSIDE the repo whose path tail matches a member was spliced into
+# THIS repo's build unit in place of the real member. It matters here
+# specifically: MLRift, MLRift-lc and the other worktrees are siblings with
+# identical file names, so `lc --fix ../MLRift/src/living.mlr` run from this
+# checkout would have verified that file inside this checkout's unit. Refuse.
+TOTAL=$((TOTAL + 1))
+FGN="/tmp/mlrc_lcforeign_$$"
+rm -rf "$FGN"; mkdir -p "$FGN/src"
+printf 'fn q(uint64 z) -> uint64 {\n    return z\n}\n' > "$FGN/src/lexer.mlr"
+cp "$FGN/src/lexer.mlr" "$FGN/src/lexer.orig"
+FGN_OUT=$(cd "$RR" && "$MLRC_ABS" --arch=x86_64 lc --fix=types "$FGN/src/lexer.mlr" 2>&1); FGN_ST=$?
+if [ "$FGN_ST" != "0" ] && echo "$FGN_OUT" | grep -q "by name but is not that file" && \
+   cmp -s "$FGN/src/lexer.mlr" "$FGN/src/lexer.orig"; then
+    PASS=$((PASS + 1)); echo "  lc_refuses_foreign_file_with_matching_tail: PASS"
+else
+    echo "FAIL: lc_refuses_foreign_file_with_matching_tail (exit $FGN_ST, got '$FGN_OUT')"; FAIL=$((FAIL + 1))
+fi
+rm -rf "$FGN"
+
+# The set of targets and the set of BACKENDS a run actually compared must be
+# stated, not inferred. `--emit=obj` is gated OUT of the IR path
+# (src/main.mlr:2790,:2799), so an object comparison alone checks the LEGACY
+# backend -- not the one that ships. A unit with an entry point is therefore
+# also linked and compared on the IR backend; a unit without one cannot be,
+# and has to say so. riscv32/xtensa were named only in source comments.
+TOTAL=$((TOTAL + 1))
+BK_SRC="/tmp/mlrc_lcbk_$$.mlr"
+printf 'fn main() {\n    uint64 a = 1\n    exit(0)\n}\n' > "$BK_SRC"
+BK_OUT=$($MLRC lc --fix=types "$BK_SRC" 2>&1); BK_ST=$?
+BK_MOD=$(cd "$RR" && $MLRC lc --fix=types --dry-run std/color.mlr 2>&1)
+if [ "$BK_ST" = "0" ] && echo "$BK_OUT" | grep -q "IR codegen (linked executable" && \
+   echo "$BK_OUT" | grep -q "legacy codegen (--emit=obj)" && \
+   echo "$BK_OUT" | grep -q "riscv32, xtensa" && \
+   echo "$BK_MOD" | grep -q "ONLY -- no entry point"; then
+    PASS=$((PASS + 1)); echo "  lc_states_backends_and_targets: PASS"
+else
+    echo "FAIL: lc_states_backends_and_targets (exit $BK_ST, got '$BK_OUT' / '$BK_MOD')"; FAIL=$((FAIL + 1))
+fi
+rm -f "$BK_SRC" "$BK_SRC".lcverify.mlr
+
+# A unit whose ORIGINAL does not pass the front end is refused BY RETURN, not
+# by compile() calling exit(1) from underneath the harness. The difference is
+# visible on disk: a hard exit skips mig_scratch_clear and leaves the staged
+# rewrite at FULL content (measured at 4,379,185 bytes for an assembled unit,
+# and 55 bytes for a small one); a returned refusal unwinds and truncates it.
+# It also distinguishes "the original does not build" from "the rewrite does
+# not build", which used to collapse into one anonymous non-zero exit.
+TOTAL=$((TOTAL + 1))
+BAD_SRC="/tmp/mlrc_lcbad_$$.mlr"
+printf 'fn main() {\n    uint64 a = 1\n    dealloc(a, 3)\n    exit(0)\n}\n' > "$BAD_SRC"
+cp "$BAD_SRC" "$BAD_SRC.orig"
+BAD_OUT=$($MLRC lc --fix=types "$BAD_SRC" 2>&1); BAD_ST=$?
+BAD_SCRATCH=$(stat -c%s "$BAD_SRC.lcverify.mlr" 2>/dev/null || echo missing)
+if [ "$BAD_ST" != "0" ] && echo "$BAD_OUT" | grep -q "ORIGINAL build unit" && \
+   cmp -s "$BAD_SRC" "$BAD_SRC.orig" && [ "$BAD_SCRATCH" = "0" ]; then
+    PASS=$((PASS + 1)); echo "  lc_unbuildable_original_refused_and_scratch_cleared: PASS"
+else
+    echo "FAIL: lc_unbuildable_original_refused_and_scratch_cleared (exit $BAD_ST, scratch $BAD_SCRATCH, got '$BAD_OUT')"; FAIL=$((FAIL + 1))
+fi
+rm -f "$BAD_SRC" "$BAD_SRC.orig" "$BAD_SRC.lcverify.mlr"
 
 echo ""
 echo "--- growable string pool ---"
@@ -6201,6 +6318,43 @@ else
     echo "FAIL: str_pool_grows_past_64k ($(head -1 /tmp/mlrc_strpool_err_$$))"; FAIL=$((FAIL + 1))
 fi
 rm -f "$SP_SRC" /tmp/mlrc_strpool_bin_$$ /tmp/mlrc_strpool_err_$$
+
+# The legacy ARM64 f-string path used to gate every baked byte on
+# `if str_len < 65535` with NO else: past the cap the byte was dropped and the
+# compile still exited 0. It is the harness's own arm64 leg (mig_verify_unit
+# compiles at --emit=obj, which is legacy codegen), so a silent truncation
+# there makes the arm64 half of "byte-identical on both targets" blind past
+# ~64 KB of string data.
+#
+# Content, not exit status, is the assertion: the defect NEVER failed a build.
+# Measured before the fix on exactly this input: x86_64 900/900 segments,
+# arm64 521/900, both exit 0.
+FS_SRC="/tmp/mlrc_fstr_$$.mlr"
+{
+  echo 'fn main() {'
+  echo '    u64 n = 7'
+  i=0
+  while [ $i -lt 900 ]; do
+    printf '    print_str(f"padpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpad{n}SEG%s-END")\n' "$i"
+    i=$((i + 1))
+  done
+  echo '    exit(0)'
+  echo '}'
+} > "$FS_SRC"
+for FS_A in x86_64 arm64; do
+  TOTAL=$((TOTAL + 1))
+  if $MLRC --arch=$FS_A --emit=obj "$FS_SRC" -o /tmp/mlrc_fstr_$$.o > /tmp/mlrc_fstr_err_$$ 2>&1; then
+      FS_N=$(grep -ao 'SEG[0-9]*-END' /tmp/mlrc_fstr_$$.o | sort -u | wc -l)
+      if [ "$FS_N" = "900" ]; then
+          PASS=$((PASS + 1)); echo "  fstring_segments_survive_past_64k_$FS_A: PASS"
+      else
+          echo "FAIL: fstring_segments_survive_past_64k_$FS_A (only $FS_N/900 segments baked, silently)"; FAIL=$((FAIL + 1))
+      fi
+  else
+      echo "FAIL: fstring_segments_survive_past_64k_$FS_A ($(head -1 /tmp/mlrc_fstr_err_$$))"; FAIL=$((FAIL + 1))
+  fi
+done
+rm -f "$FS_SRC" /tmp/mlrc_fstr_$$.o /tmp/mlrc_fstr_err_$$
 
 echo ""
 echo "--- lc verification harness ---"

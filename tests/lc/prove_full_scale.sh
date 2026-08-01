@@ -211,9 +211,14 @@ for A in x86_64 arm64; do
   fi
 done
 
-# Linked executables too. Not required by the criterion (--emit=obj is the
-# contract the verifier itself checks) but it is nearly free, and it covers
+# Linked executables too -- and this is NOT a bonus leg, it is half the
+# criterion. `--emit=obj` is gated OUT of the IR path (src/main.mlr:2790,:2799
+# skip IR codegen when emit_mode == 3, because the object path needs legacy for
+# extern relocations), so every object compared above was produced by the
+# LEGACY code generator. The executables below are the ones the IR backend
+# emits -- the default, and what a user actually builds -- and they also cover
 # the layout and relocation stages a relocatable .o never reaches.
+# `mlrc lc --fix` now runs both legs itself for any unit with an entry point.
 for A in x86_64 arm64; do
   run "$A reference executable"       "$MLRC" --arch=$A build/mlrc.mlr    -o "$WORK/exe_before_$A"
   run "$A executable after migration" "$MLRC" --arch=$A "$WORK/unit.mlr"  -o "$WORK/exe_after_$A"

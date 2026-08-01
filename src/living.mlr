@@ -1677,8 +1677,6 @@ fn mig_ptrops_rewrite(uint64 source, uint64 src_size, uint64 out_buf_a, uint64 m
                                                 p = as_pos + 4  // skip " as "
                                                 p = mig_skip_ws(source, p, src_size)
                                                 uint64 width = 0
-                                                uint64 wp = 0 + 0
-                                                // Actually allocate a local to capture the width
                                                 uint8[8] width_buf
                                                 uint64 wp_addr = width_buf
                                                 p = mig_parse_type(source, p, src_size, wp_addr)
@@ -1858,7 +1856,18 @@ static uint64 mig_uk = 0          // unit kinds
 static uint64 mig_up = 0          // unit paths (for messages and scratch names)
 static uint64 mig_um = 0          // unit member arrays (CONCAT only)
 static uint64 mig_un = 0          // unit member counts (CONCAT only)
+static uint64 mig_ul = 0          // 1 if the unit has an entry point and links
+static uint64 mig_ui = 0          // 1 + index of the member that IS the file
 static uint64 mig_ucount = 0
+
+// Set the moment any in-process compile has registered @dynamic symbols. The
+// registry does not reset between compiles in one process (task 1), and at
+// emit_mode 0 that leak reaches the output -- the second compile of a clean
+// module came out an 8416-byte clone of the dynamic-ELF shape. The executable
+// (IR-backend) leg is therefore refused from that point on, OUT LOUD, so a
+// unit is never reported as IR-verified on the strength of a comparison the
+// registry could have poisoned.
+static uint64 mig_dyn_seen = 0
 
 
 // Fault injection (--fix-inject-fault), for testing the rejection path only:
@@ -1975,14 +1984,43 @@ fn mig_bytes_equal(uint64 a, uint64 b, uint64 len) -> uint64 {
     return 1
 }
 
-// Returns 1 if the rewrite left emitted code byte-identical on every target
-// this unit supports, 0 otherwise (printing which target disagreed, and how).
+// ---------------------------------------------------------------------------
+// WHICH BACKEND IS BEING VERIFIED -- read this before changing emit modes.
+// ---------------------------------------------------------------------------
+//
+// MLRift has two code generators and `--emit=obj` does NOT reach the one that
+// ships. src/main.mlr:2790,:2799 gate the IR path on `emit_mode != 3`
+// ("skip for --emit=obj which needs legacy for extern relocations"), so an
+// object compiled at emit mode 3 is byte-identical to `--legacy --emit=obj`
+// on both architectures, while a default executable is not. A harness that
+// compared only objects would therefore be checking the LEAST exercised
+// backend in the compiler -- the one the str_buf memory-safety hole lived in
+// precisely because nothing exercised it -- and calling it a guarantee about
+// shipped code.
+//
+// So each unit is verified on both backends wherever both are reachable:
+//
+//   leg 1  emit_mode 3, x86_64 + arm64   -- relocatable object, LEGACY codegen
+//   leg 2  emit_mode 0, x86_64 + arm64   -- linked executable, IR codegen
+//
+// Leg 2 needs an entry point, which is why leg 1 exists at all: a bare std/
+// module has no main() and cannot be linked, and --emit=obj is the only way to
+// compile it as its own unit. Such a unit is verified on the legacy backend
+// ONLY, and mig_report_backends says so in the run output rather than leaving
+// the user to infer it.
+//
+// Leg 2 is the mode task 1 found unsafe to re-enter: at emit_mode 0 the
+// @dynamic symbol registry's leak reaches the output. That is handled by
+// measurement, not by assumption -- dyn_sym_count_get() is read after the
+// first compile of the pair and a non-zero count refuses the leg out loud
+// (mig_dyn_seen), for this unit and every later one in the process.
 //
 // Applicable targets are x86_64 and arm64 only. riscv32 and xtensa are NOT
-// applicable to a unit of this kind: riscv32 compiles 7 of 75 std/ modules and
-// 0 of src/, xtensa the same, and neither has a relocatable (.o) writer wired
-// through compile() at all -- emit_mode 3 hits riscv32_nyi/xtensa_nyi, which
-// exits. They are named as skipped in the report rather than silently dropped.
+// applicable: neither has a relocatable (.o) writer wired through compile()
+// -- emit_mode 3 hits riscv32_nyi/xtensa_nyi, which exits -- and riscv32
+// compiles 7 of 75 std/ modules and 0 of src/. mig_print_targets names them
+// at runtime rather than leaving the exclusion in a source comment no user
+// reads.
 //
 // A target where the ORIGINAL fails to compile is "not applicable"; a target
 // where the original compiles and the rewrite does not is a hard failure. Note
@@ -1991,50 +2029,149 @@ fn mig_bytes_equal(uint64 a, uint64 b, uint64 len) -> uint64 {
 // the whole `lc --fix` run, with the file left untouched because verification
 // runs strictly before the write-back. That is fail-safe but it cannot tell
 // the two apart. See the task-5 report.
+
+// One leg: compile both versions for `arch` at `emit_mode` and compare the
+// emitted bytes in memory. 1 = identical, 0 = MISMATCH, 2 = not checked
+// (having said why).
+fn mig_verify_leg(uint64 unit_path, uint64 rewritten_path, uint64 arch, uint64 emit_mode, uint64 what) -> uint64 {
+    if emit_mode == 0 && mig_dyn_seen != 0 { return 2 }
+    compile(unit_path, mig_scratch_path(), arch, emit_mode)
+    if emit_mode == 0 && dyn_sym_count_get() > 0 {
+        // The registry is per-process and never resets, so the rewrite's
+        // compile would start from this count and emit a different image for
+        // a reason that has nothing to do with the rewrite. Refuse the leg
+        // instead of reporting either a false match or a false mismatch.
+        mig_dyn_seen = 1
+        uint64 d0 = "migration: IR/executable leg NOT RUN -- this unit registers "
+        write(2, d0, str_len(d0))
+        uint8[32] db
+        uint64 dl = fmt_uint(db, dyn_sym_count_get())
+        write(2, db, dl)
+        uint64 d1 = " @dynamic symbol(s), and the registry does not reset between in-process compiles, so the two sides would not be comparable\n"
+        write(2, d1, str_len(d1))
+        return 2
+    }
+    uint64 len_a = codegen_output_len()
+    uint64 snap = alloc(len_a + 1)
+    memcpy(snap, codegen_buf_ptr(), len_a)
+    compile(rewritten_path, mig_scratch_path(), arch, emit_mode)
+    uint64 len_b = codegen_output_len()
+    uint64 same = 0
+    if len_b == len_a {
+        same = mig_bytes_equal(snap, codegen_buf_ptr(), len_a)
+    }
+    dealloc(snap)
+    if same != 0 { return 1 }
+    uint64 m0 = "migration: VERIFY MISMATCH on target "
+    write(2, m0, str_len(m0))
+    uint64 an = mig_arch_name(arch)
+    write(2, an, str_len(an))
+    uint64 mw = ", "
+    write(2, mw, 2)
+    write(2, what, str_len(what))
+    uint64 m1 = " ("
+    write(2, m1, 2)
+    uint8[32] nb
+    uint64 nl = fmt_uint(nb, len_a)
+    write(2, nb, nl)
+    uint64 m2 = " vs "
+    write(2, m2, 4)
+    nl = fmt_uint(nb, len_b)
+    write(2, nb, nl)
+    uint64 m3 = " bytes)\n"
+    write(2, m3, 8)
+    return 0
+}
+
+// State, per unit, exactly which backends were compared -- because "verified"
+// with no scope is the overclaim this whole harness exists to remove.
+fn mig_report_backends(uint64 unit_path, uint64 linkable, uint64 ir_checked, uint64 ok) {
+    uint64 h = "migration: verified "
+    if ok == 0 { h = "migration: CHECKED (and refused) " }
+    write(1, h, str_len(h))
+    write(1, unit_path, str_len(unit_path))
+    uint64 t = " on x86_64 and arm64 -- backends: legacy codegen (--emit=obj)"
+    write(1, t, str_len(t))
+    if ir_checked != 0 {
+        uint64 b = " AND IR codegen (linked executable; the default backend, and what ships)\n"
+        write(1, b, str_len(b))
+        return
+    }
+    if linkable != 0 {
+        uint64 c = " ONLY -- the IR leg was refused this run (see the message above), so the backend that ships is NOT verified for this unit\n"
+        write(1, c, str_len(c))
+        return
+    }
+    uint64 d = " ONLY -- this unit has no entry point, so it cannot be linked and the IR backend (the default, and what ships) is NOT verified for it\n"
+    write(1, d, str_len(d))
+}
+
+// Named at RUNTIME, not in a comment: the spec binds riscv32 and xtensa to be
+// "explicitly out of scope and named as such in the report -- never silently
+// skipped", and before this line a full `lc --fix` run's combined output
+// mentioned neither.
+fn mig_print_targets() {
+    uint64 a = "migration: targets verified: x86_64, arm64\n"
+    write(1, a, str_len(a))
+    uint64 b = "migration: targets not applicable: riscv32, xtensa (no relocatable writer is wired through compile() for either -- emit_mode 3 refuses via riscv32_nyi/xtensa_nyi)\n"
+    write(1, b, str_len(b))
+}
+
 @export
-fn mig_verify_unit(uint64 unit_path, uint64 rewritten_path) -> uint64 {
-    uint64 archs = alloc(2 * 8)
-    unsafe { *(archs as uint64) = 0 }            // x86_64
-    uint64 a1 = archs + 8
-    unsafe { *(a1 as uint64) = 1 }               // arm64
+fn mig_verify_unit(uint64 unit_path, uint64 rewritten_path, uint64 linkable, uint64 report_path) -> uint64 {
+    // Ask the front end first, and RETURN the answer instead of dying on it.
+    // Two things depend on this:
+    //
+    //   1. Scratch cleanup. compile() reports every error by calling exit(1),
+    //      which skips mig_scratch_clear entirely and leaves the staged files
+    //      at FULL content -- measured at 4,379,185 bytes for an assembled
+    //      unit. Inside this repo they are gitignored; in a user's own project
+    //      they are not. A returned failure unwinds through run_migration,
+    //      which clears them.
+    //   2. Telling "the original does not build" (not applicable) apart from
+    //      "the rewrite does not build" (a hard failure). Both used to collapse
+    //      into one anonymous non-zero exit.
+    //
+    // What this still cannot notice: only the SEMANTIC class of error returns
+    // here. Lexer and parser errors, and anything that fails later in
+    // codegen (a fixed-size table overflowing, say), still exit(1) from inside
+    // compile() and still leave scratch behind. It is fail-safe either way --
+    // the write-back is strictly downstream of this function.
+    if unit_front_end_errors(unit_path) != 0 {
+        uint64 o0 = "migration: the ORIGINAL build unit "
+        write(2, o0, str_len(o0))
+        write(2, report_path, str_len(report_path))
+        uint64 o1 = " does not pass the front end, so there is nothing to verify the rewrite against -- refusing, file unchanged\n"
+        write(2, o1, str_len(o1))
+        return 0
+    }
+    if unit_front_end_errors(rewritten_path) != 0 {
+        uint64 w0 = "migration: the REWRITTEN build unit "
+        write(2, w0, str_len(w0))
+        write(2, report_path, str_len(report_path))
+        uint64 w1 = " does not pass the front end -- the rewrite is not valid source; refusing, file unchanged\n"
+        write(2, w1, str_len(w1))
+        return 0
+    }
     uint64 ok = 1
     uint64 i = 0
     while i < 2 {
-        uint64 ap = archs + i * 8
-        uint64 arch = 0
-        unsafe { *(ap as uint64) -> arch }
-        compile(unit_path, mig_scratch_path(), arch, 3)
-        uint64 len_a = codegen_output_len()
-        uint64 snap = alloc(len_a + 1)
-        memcpy(snap, codegen_buf_ptr(), len_a)
-        compile(rewritten_path, mig_scratch_path(), arch, 3)
-        uint64 len_b = codegen_output_len()
-        uint64 same = 0
-        if len_b == len_a {
-            same = mig_bytes_equal(snap, codegen_buf_ptr(), len_a)
-        }
-        if same == 0 {
-            ok = 0
-            uint64 m0 = "migration: VERIFY MISMATCH on target "
-            write(2, m0, str_len(m0))
-            uint64 an = mig_arch_name(arch)
-            write(2, an, str_len(an))
-            uint64 m1 = " ("
-            write(2, m1, 2)
-            uint8[32] nb
-            uint64 nl = fmt_uint(nb, len_a)
-            write(2, nb, nl)
-            uint64 m2 = " vs "
-            write(2, m2, 4)
-            nl = fmt_uint(nb, len_b)
-            write(2, nb, nl)
-            uint64 m3 = " bytes)\n"
-            write(2, m3, 8)
-        }
-        dealloc(snap)
+        uint64 r = mig_verify_leg(unit_path, rewritten_path, i, 3, "relocatable object, legacy codegen")
+        if r == 0 { ok = 0 }
         i = i + 1
     }
-    dealloc(archs)
+    uint64 ir_checked = 0
+    if linkable != 0 {
+        ir_checked = 1
+        uint64 j = 0
+        while j < 2 {
+            uint64 r2 = mig_verify_leg(unit_path, rewritten_path, j, 0, "linked executable, IR codegen")
+            if r2 == 0 { ok = 0 }
+            if r2 == 2 { ir_checked = 0 }
+            j = j + 1
+        }
+    }
+    mig_report_backends(report_path, linkable, ir_checked, ok)
     return ok
 }
 
@@ -2105,12 +2242,62 @@ fn mig_read_all(uint64 path, uint64 len_out) -> uint64 {
     return buf
 }
 
-fn mig_write_all(uint64 path, uint64 buf, uint64 len) -> uint64 {
+// Write `len` bytes to `path`, then CHECK that the file really is `len` bytes.
+// Returns 1 on success; on failure it names the path and what it got, and
+// returns 0.
+//
+// The obvious check -- comparing file_write's return against `len` -- is not
+// portable here: on Unix the builtin lowers to write(2) and returns the byte
+// count, but on Windows it lowers to WriteFile, which returns a BOOL, so
+// `!= len` would fire on every successful write. Re-opening the file and
+// asking its size puts the same question to the ARTIFACT instead of the call,
+// which is portable and strictly stronger -- it also catches a close() that
+// failed to flush.
+//
+// What this still cannot notice: a write that lands the right NUMBER of bytes
+// with the wrong CONTENT (silent media corruption), and a file that changes
+// between the check and any later read.
+fn mig_write_checked(uint64 path, uint64 buf, uint64 len) -> uint64 {
     uint64 fd = file_open(path, 1)
-    if fd > 0xFFFFFFFFFFFFF000 { return 0 }
+    if fd > 0xFFFFFFFFFFFFF000 {
+        uint64 e0 = "migration: cannot open for writing: "
+        write(2, e0, str_len(e0))
+        write(2, path, str_len(path))
+        write(2, "\n", 1)
+        return 0
+    }
     file_write(fd, buf, len)
     file_close(fd)
-    return 1
+    uint64 vfd = file_open(path, 0)
+    if vfd > 0xFFFFFFFFFFFFF000 {
+        uint64 e1 = "migration: wrote but cannot re-open to confirm the size: "
+        write(2, e1, str_len(e1))
+        write(2, path, str_len(path))
+        write(2, "\n", 1)
+        return 0
+    }
+    uint64 got = file_size(vfd)
+    file_close(vfd)
+    if got == len { return 1 }
+    uint64 e2 = "migration: SHORT WRITE -- "
+    write(2, e2, str_len(e2))
+    write(2, path, str_len(path))
+    uint64 e3 = " is "
+    write(2, e3, 4)
+    uint8[32] nb
+    uint64 nl = fmt_uint(nb, got)
+    write(2, nb, nl)
+    uint64 e4 = " bytes, expected "
+    write(2, e4, str_len(e4))
+    nl = fmt_uint(nb, len)
+    write(2, nb, nl)
+    uint64 e5 = " -- the file on disk is NOT what was verified\n"
+    write(2, e5, str_len(e5))
+    return 0
+}
+
+fn mig_write_all(uint64 path, uint64 buf, uint64 len) -> uint64 {
+    return mig_write_checked(path, buf, len)
 }
 
 // Fresh NUL-terminated copy of buf[off .. off+len).
@@ -2186,9 +2373,27 @@ fn mig_cap_exceeded(uint64 what, uint64 limit, uint64 dropped) {
     exit(1)
 }
 
+// A `$`-leading token is a make variable reference. Expanding it needs a make
+// evaluator this parser does not have, and SKIPPING it is the one dropping
+// path in this file that is neither a cap nor guarded: `SRCS = $(CORE) src/a.mlr`
+// would assemble a one-member "build unit", verify the rewrite inside it,
+// find it identical and write the file while printing the name of a unit it
+// never built. Demonstrated end to end before this refusal existed. Refuse.
+fn mig_mk_unexpanded(uint64 label, uint64 tok) {
+    uint64 m0 = "migration: "
+    write(2, m0, str_len(m0))
+    write(2, label, str_len(label))
+    uint64 m1 = " contains the unexpanded make variable "
+    write(2, m1, str_len(m1))
+    write(2, tok, str_len(tok))
+    uint64 m2 = "; this parser cannot expand it, and dropping it would verify against an incomplete build unit -- refusing\n"
+    write(2, m2, str_len(m2))
+    exit(1)
+}
+
 // Collect whitespace-separated tokens starting at `pos` to the end of the
-// LOGICAL line, following backslash continuations. `$(...)` tokens are
-// skipped (a variable reference is not a file) and `#` ends collection.
+// LOGICAL line, following backslash continuations. A `$(...)` token is
+// REFUSED (see mig_mk_unexpanded) and `#` ends collection.
 // Overflowing `max` is fatal, not truncating -- see mig_cap_exceeded.
 fn mig_mk_collect(uint64 mk, uint64 mk_len, uint64 pos, uint64 out_arr, uint64 max, uint64 label) -> uint64 {
     uint64 n = 0
@@ -2216,13 +2421,12 @@ fn mig_mk_collect(uint64 mk, uint64 mk_len, uint64 pos, uint64 out_arr, uint64 m
                 uint64 fc = 0
                 uint64 fp = mk + tstart
                 unsafe { *(fp as uint8) -> fc }
-                if fc != 36 {
-                    uint64 s = mig_substr(mk, tstart, tlen)
-                    if n >= max { mig_cap_exceeded(label, max, s) }
-                    uint64 slot = out_arr + n * 8
-                    unsafe { *(slot as uint64) = s }
-                    n = n + 1
-                }
+                uint64 s = mig_substr(mk, tstart, tlen)
+                if fc == 36 { mig_mk_unexpanded(label, s) }
+                if n >= max { mig_cap_exceeded(label, max, s) }
+                uint64 slot = out_arr + n * 8
+                unsafe { *(slot as uint64) = s }
+                n = n + 1
                 tlen = 0
             }
             if c == 10 {
@@ -2239,21 +2443,28 @@ fn mig_mk_collect(uint64 mk, uint64 mk_len, uint64 pos, uint64 out_arr, uint64 m
         uint64 fc2 = 0
         uint64 fp2 = mk + tstart
         unsafe { *(fp2 as uint8) -> fc2 }
-        if fc2 != 36 {
-            uint64 s2 = mig_substr(mk, tstart, tlen)
-            if n >= max { mig_cap_exceeded(label, max, s2) }
-            uint64 slot2 = out_arr + n * 8
-            unsafe { *(slot2 as uint64) = s2 }
-            n = n + 1
-        }
+        uint64 s2 = mig_substr(mk, tstart, tlen)
+        if fc2 == 36 { mig_mk_unexpanded(label, s2) }
+        if n >= max { mig_cap_exceeded(label, max, s2) }
+        uint64 slot2 = out_arr + n * 8
+        unsafe { *(slot2 as uint64) = s2 }
+        n = n + 1
     }
     return n
 }
 
-// Value of make variable `name` (SRCS), split into tokens. Accepts `=`, `:=`
-// and `+=`. The whole file is scanned: a SECOND assignment to the same
-// variable is refused rather than ignored, because reading only the first one
-// would silently drop every member a later `+=` adds.
+// Value of make variable `name` (SRCS), split into tokens. Accepts `=`, `:=`,
+// `::=`, `+=` and `?=`. The whole file is scanned: a SECOND assignment to the
+// same variable is refused rather than ignored, because reading only the first
+// one would silently drop every member a later `+=` adds.
+//
+// `?=` used to match NOTHING, so `SRCS ?= src/a.mlr` resolved to zero members
+// and the file fell through to the weakest unit kind -- reported as
+// `src/a.mlr (module)` with no hint that the SRCS line had been read and
+// discarded. Anything that looks like an assignment but is not one of the
+// five forms above (make's `!=` shell assignment is the live example, whose
+// value only exists after running a shell) is now refused rather than
+// stepped over.
 fn mig_mk_var(uint64 mk, uint64 mk_len, uint64 name, uint64 out_arr, uint64 max) -> uint64 {
     uint64 nl = str_len(name)
     uint64 pos = 0
@@ -2273,9 +2484,24 @@ fn mig_mk_var(uint64 mk, uint64 mk_len, uint64 name, uint64 out_arr, uint64 max)
             uint64 pc = mk + q
             uint64 c2 = 0
             unsafe { *(pc as uint8) -> c2 }
-            if c2 == 58 || c2 == 43 { q = q + 1 }
-            pc = mk + q
-            unsafe { *(pc as uint8) -> c2 }
+            // Step over the operator prefix of `:=`, `::=`, `+=` and `?=`.
+            // 33 is `!`, make's shell-assignment operator: recognised only so
+            // it can be refused by name below instead of silently missing.
+            uint64 opk = 0
+            while c2 == 58 || c2 == 43 || c2 == 63 || c2 == 33 {
+                if c2 == 33 { opk = 33 }
+                q = q + 1
+                pc = mk + q
+                unsafe { *(pc as uint8) -> c2 }
+            }
+            if c2 == 61 && opk == 33 {
+                uint64 s0 = "migration: "
+                write(2, s0, str_len(s0))
+                write(2, name, str_len(name))
+                uint64 s1 = " is assigned with `!=` (shell assignment); its value only exists after running a shell, so this parser cannot read the build unit -- refusing rather than reporting a narrower unit\n"
+                write(2, s1, str_len(s1))
+                exit(1)
+            }
             if c2 == 61 {
                 if found != 0 {
                     uint64 d0 = "migration: "
@@ -2345,16 +2571,92 @@ fn mig_tail_eq(uint64 path, uint64 tok) -> uint64 {
     return 0
 }
 
-fn mig_list_has(uint64 arr, uint64 n, uint64 path) -> uint64 {
+// Which member of `arr` IS this file? Returns 1 + the index, or 0 for none.
+//
+// Identity is decided by CONTENT -- the bytes at <root>/<token> compared with
+// the bytes the caller read from the input -- not by how the user happened to
+// spell the path. Matching on the path tail alone was wrong in both
+// directions, and both were demonstrated:
+//
+//   * `cd src && mlrc lc --fix lexer.mlr` found the repo Makefile (mig_root
+//     became "../") and then matched NOTHING, because the user's spelling
+//     `lexer.mlr` is shorter than the token `src/lexer.mlr` and mig_tail_eq
+//     bails when the token is longer. The file silently downgraded to
+//     `lexer.mlr (module)` -- verified against none of its real units --
+//     while the same file named from the repo root resolved to
+//     build/mlrc.mlr. Joining the token to mig_root and comparing bytes
+//     answers the question from either directory.
+//
+//   * a file OUTSIDE the repo whose path tail happens to match a member
+//     (`/tmp/other/src/lexer.mlr`, while cwd is this repo) was spliced into
+//     THIS repo's unit in place of the real member. That matters here
+//     specifically: MLRift, MLRift-lc and the other worktrees are siblings
+//     with identical file names, and a near-identical sibling is exactly the
+//     case where the wrong splice might still compile.
+//
+// A name match with different content is therefore REFUSED, not ignored:
+// falling through would verify the file against a unit it is not in.
+// Ambiguity is refused too -- two members with identical bytes make "which
+// member is this file" unanswerable, and substituting both would build a unit
+// that never existed.
+//
+// What this still cannot notice: a member listed in the Makefile that cannot
+// be read at all is skipped here (mig_assemble refuses on it later, which is
+// where a missing member actually bites), and a file whose bytes match a
+// member exactly IS treated as that member wherever it lives -- correct for
+// the unit's purposes, since the assembled bytes are identical either way.
+fn mig_member_index(uint64 arr, uint64 n, uint64 src_buf, uint64 src_len, uint64 path) -> uint64 {
+    uint64 hit = 0
+    uint64 hit_tok = 0
+    uint64 name_tok = 0
     uint64 i = 0
     while i < n {
         uint64 slot = arr + i * 8
         uint64 tok = 0
         unsafe { *(slot as uint64) -> tok }
-        if mig_tail_eq(path, tok) != 0 { return 1 }
+        uint64 fp = mig_path_join(mig_root, tok)
+        uint64 fd = file_open(fp, 0)
+        if fd <= 0xFFFFFFFFFFFFF000 {
+            uint64 sz = file_size(fd)
+            if sz == src_len {
+                uint64 mb = alloc(sz + 1)
+                file_read(fd, mb, sz)
+                if mig_bytes_equal(mb, src_buf, sz) != 0 {
+                    if hit != 0 {
+                        uint64 a0 = "migration: "
+                        write(2, a0, str_len(a0))
+                        write(2, path, str_len(path))
+                        uint64 a1 = " is byte-identical to two build-unit members ("
+                        write(2, a1, str_len(a1))
+                        write(2, hit_tok, str_len(hit_tok))
+                        write(2, " and ", 5)
+                        write(2, tok, str_len(tok))
+                        uint64 a2 = "); which one it is cannot be decided, and substituting both would build a unit that does not exist -- refusing\n"
+                        write(2, a2, str_len(a2))
+                        exit(1)
+                    }
+                    hit = i + 1
+                    hit_tok = tok
+                }
+                dealloc(mb)
+            }
+            file_close(fd)
+        }
+        if mig_tail_eq(path, tok) != 0 { name_tok = tok }
         i = i + 1
     }
-    return 0
+    if hit == 0 && name_tok != 0 {
+        uint64 f0 = "migration: "
+        write(2, f0, str_len(f0))
+        write(2, path, str_len(path))
+        uint64 f1 = " matches the build-unit member "
+        write(2, f1, str_len(f1))
+        write(2, name_tok, str_len(name_tok))
+        uint64 f2 = " by name but is not that file (contents differ); verifying it inside this repo's build unit would splice a foreign file into it -- refusing\n"
+        write(2, f2, str_len(f2))
+        exit(1)
+    }
+    return hit
 }
 
 // Does the source define a top-level main()? Column 0 only: `fn main` inside
@@ -2374,11 +2676,17 @@ fn mig_has_main(uint64 src, uint64 len) -> uint64 {
     return 0
 }
 
-// Rebuild a CONCAT unit by concatenating its members in Makefile order --
-// byte for byte what the Makefile's `cat` produces. If `sub` is non-zero, the
-// member matching `target` is replaced by the file at `sub`; that is how the
-// rewritten file is compared inside its real unit instead of on its own.
-fn mig_assemble(uint64 out_path, uint64 mem, uint64 memn, uint64 target, uint64 sub) -> uint64 {
+// Concatenate a CONCAT unit's members in Makefile order -- byte for byte what
+// the Makefile's `cat` produces -- and return the buffer, with its length
+// stored through len_out. Returns 0 if any member cannot be read.
+//
+// `sub_index` is 1 + the index of the member to replace with the file at
+// `sub` (0 = no substitution); that is how the rewritten file is compared
+// inside its real unit instead of on its own. It is an INDEX, resolved by
+// mig_member_index from the file's contents, not a name re-matched here --
+// re-matching by name is what let a foreign file with the same tail be
+// spliced into this repo's unit.
+fn mig_concat_members(uint64 mem, uint64 memn, uint64 sub_index, uint64 sub, uint64 len_out) -> uint64 {
     uint64 bufs = alloc(memn * 8 + 8)
     uint64 lens = alloc(memn * 8 + 8)
     uint8[8] lbuf
@@ -2391,7 +2699,7 @@ fn mig_assemble(uint64 out_path, uint64 mem, uint64 memn, uint64 target, uint64 
         unsafe { *(slot as uint64) -> tok }
         uint64 fp = mig_path_join(mig_root, tok)
         if sub != 0 {
-            if mig_tail_eq(target, tok) != 0 { fp = sub }
+            if sub_index == i + 1 { fp = sub }
         }
         unsafe { *(lp as uint64) = 0 }
         uint64 b = mig_read_all(fp, lp)
@@ -2400,6 +2708,8 @@ fn mig_assemble(uint64 out_path, uint64 mem, uint64 memn, uint64 target, uint64 
             write(2, em, str_len(em))
             write(2, fp, str_len(fp))
             write(2, "\n", 1)
+            dealloc(bufs)
+            dealloc(lens)
             return 0
         }
         uint64 l = 0
@@ -2426,14 +2736,45 @@ fn mig_assemble(uint64 out_path, uint64 mem, uint64 memn, uint64 target, uint64 
         dealloc(b2)
         i = i + 1
     }
-    uint64 ok = mig_write_all(out_path, out, total)
-    dealloc(out)
+    uint64 tz = out + total
+    uint8 zb = 0
+    unsafe { *(tz as uint8) = zb }
     dealloc(bufs)
     dealloc(lens)
+    unsafe { *(len_out as uint64) = total }
+    return out
+}
+
+// Does the assembled unit define a top-level main()? Asked of the ASSEMBLED
+// bytes, not of any single member: `cat` is what the Makefile runs, and a
+// member that does not end in a newline shifts the next member off column 0.
+fn mig_unit_has_main(uint64 mem, uint64 memn) -> uint64 {
+    uint8[8] lb
+    uint64 lp = lb
+    unsafe { *(lp as uint64) = 0 }
+    uint64 buf = mig_concat_members(mem, memn, 0, 0, lp)
+    if buf == 0 { return 0 }
+    uint64 blen = 0
+    unsafe { *(lp as uint64) -> blen }
+    uint64 r = mig_has_main(buf, blen)
+    dealloc(buf)
+    return r
+}
+
+fn mig_assemble(uint64 out_path, uint64 mem, uint64 memn, uint64 sub_index, uint64 sub) -> uint64 {
+    uint8[8] lb2
+    uint64 lp2 = lb2
+    unsafe { *(lp2 as uint64) = 0 }
+    uint64 out = mig_concat_members(mem, memn, sub_index, sub, lp2)
+    if out == 0 { return 0 }
+    uint64 total = 0
+    unsafe { *(lp2 as uint64) -> total }
+    uint64 ok = mig_write_all(out_path, out, total)
+    dealloc(out)
     return ok
 }
 
-fn mig_add_unit(uint64 kind, uint64 path, uint64 mem, uint64 memn) {
+fn mig_add_unit(uint64 kind, uint64 path, uint64 mem, uint64 memn, uint64 linkable, uint64 sub_index) {
     if mig_ucount >= 4 { mig_cap_exceeded("build units for one file", 4, path) }
     uint64 ks = mig_uk + mig_ucount * 8
     unsafe { *(ks as uint64) = kind }
@@ -2443,6 +2784,10 @@ fn mig_add_unit(uint64 kind, uint64 path, uint64 mem, uint64 memn) {
     unsafe { *(ms as uint64) = mem }
     uint64 ns = mig_un + mig_ucount * 8
     unsafe { *(ns as uint64) = memn }
+    uint64 ls = mig_ul + mig_ucount * 8
+    unsafe { *(ls as uint64) = linkable }
+    uint64 xs = mig_ui + mig_ucount * 8
+    unsafe { *(xs as uint64) = sub_index }
     mig_ucount = mig_ucount + 1
 }
 
@@ -2456,6 +2801,8 @@ fn mig_resolve_units(uint64 input_path, uint64 src_buf, uint64 src_len) -> uint6
         mig_up = alloc(4 * 8)
         mig_um = alloc(4 * 8)
         mig_un = alloc(4 * 8)
+        mig_ul = alloc(4 * 8)
+        mig_ui = alloc(4 * 8)
     }
 
     uint8[8] mkl
@@ -2467,20 +2814,26 @@ fn mig_resolve_units(uint64 input_path, uint64 src_buf, uint64 src_len) -> uint6
         unsafe { *(mklp as uint64) -> mk_len }
         uint64 srcs = alloc(256 * 8)
         uint64 ns = mig_mk_var(mk, mk_len, "SRCS", srcs, 256)
-        if mig_list_has(srcs, ns, input_path) != 0 {
-            mig_add_unit(1, mig_path_join(mig_root, "build/mlrc.mlr"), srcs, ns)
+        uint64 si = mig_member_index(srcs, ns, src_buf, src_len, input_path)
+        if si != 0 {
+            mig_add_unit(1, mig_path_join(mig_root, "build/mlrc.mlr"), srcs, ns,
+                         mig_unit_has_main(srcs, ns), si)
         }
         uint64 rmem = alloc(32 * 8)
         uint64 nr = mig_mk_rule(mk, mk_len, "build/mlr-runner.mlr", rmem, 32)
-        if mig_list_has(rmem, nr, input_path) != 0 {
-            mig_add_unit(1, mig_path_join(mig_root, "build/mlr-runner.mlr"), rmem, nr)
+        uint64 ri = mig_member_index(rmem, nr, src_buf, src_len, input_path)
+        if ri != 0 {
+            mig_add_unit(1, mig_path_join(mig_root, "build/mlr-runner.mlr"), rmem, nr,
+                         mig_unit_has_main(rmem, nr), ri)
         }
         dealloc(mk)
     }
     if mig_ucount != 0 { return mig_ucount }
 
     if mig_has_main(src_buf, src_len) != 0 {
-        mig_add_unit(0, input_path, 0, 0)
+        // SELF: a standalone program, so it links -- the IR backend can be
+        // verified on it as well as the legacy one.
+        mig_add_unit(0, input_path, 0, 0, 1, 0)
         return 1
     }
 
@@ -2492,12 +2845,40 @@ fn mig_resolve_units(uint64 input_path, uint64 src_buf, uint64 src_len) -> uint6
     // place and writes nothing, so resolution -- including the --dry-run
     // path -- leaves the working tree untouched.
     if unit_front_end_errors(input_path) != 0 { return 0 }
-    mig_add_unit(2, input_path, 0, 0)
+    // MODULE: no entry point, so it cannot be linked and the IR backend
+    // cannot be reached for it. --emit=obj only. Stated in the report.
+    mig_add_unit(2, input_path, 0, 0, 0, 0)
     return 1
 }
 
+// Prospective backend scope, for the --dry-run path where nothing is
+// compiled. The write path prints the same fact per unit AFTER the fact,
+// from mig_report_backends.
+fn mig_print_unit_backends() {
+    uint64 i = 0
+    while i < mig_ucount {
+        uint64 ps = mig_up + i * 8
+        uint64 p = 0
+        unsafe { *(ps as uint64) -> p }
+        uint64 ls = mig_ul + i * 8
+        uint64 lk = 0
+        unsafe { *(ls as uint64) -> lk }
+        uint64 h = "migration: "
+        write(1, h, str_len(h))
+        write(1, p, str_len(p))
+        if lk != 0 {
+            uint64 a = ": backends checkable here: legacy codegen (--emit=obj) AND IR codegen (linked executable; the default backend, and what ships)\n"
+            write(1, a, str_len(a))
+        } else {
+            uint64 b = ": backends checkable here: legacy codegen (--emit=obj) ONLY -- no entry point, so the unit cannot be linked and the IR backend cannot be reached for it\n"
+            write(1, b, str_len(b))
+        }
+        i = i + 1
+    }
+}
+
 @export
-fn mig_print_units() {
+fn mig_print_units(uint64 dry_run) {
     uint64 h = "migration: build units: "
     write(1, h, str_len(h))
     uint64 i = 0
@@ -2521,6 +2902,8 @@ fn mig_print_units() {
         i = i + 1
     }
     write(1, "\n", 1)
+    if dry_run != 0 { mig_print_unit_backends() }
+    mig_print_targets()
 }
 
 // Verify the rewrite inside EVERY unit that contains the file. All of them
@@ -2537,6 +2920,10 @@ fn mig_verify_all_units(uint64 input_path, uint64 rewritten_path) -> uint64 {
         uint64 upath = 0
         unsafe { *(ps as uint64) -> upath }
 
+        uint64 lsx = mig_ul + i * 8
+        uint64 linkable = 0
+        unsafe { *(lsx as uint64) -> linkable }
+
         uint64 ua = input_path
         uint64 ub = rewritten_path
         if kind == 1 {
@@ -2546,15 +2933,18 @@ fn mig_verify_all_units(uint64 input_path, uint64 rewritten_path) -> uint64 {
             uint64 nsx = mig_un + i * 8
             uint64 memn = 0
             unsafe { *(nsx as uint64) -> memn }
+            uint64 xsx = mig_ui + i * 8
+            uint64 sub_index = 0
+            unsafe { *(xsx as uint64) -> sub_index }
             ua = mig_path_join(upath, ".lcunit_a.mlr")
             ub = mig_path_join(upath, ".lcunit_b.mlr")
-            if mig_assemble(ua, mem, memn, input_path, 0) == 0 { return 0 }
-            if mig_assemble(ub, mem, memn, input_path, rewritten_path) == 0 { return 0 }
+            if mig_assemble(ua, mem, memn, 0, 0) == 0 { return 0 }
+            if mig_assemble(ub, mem, memn, sub_index, rewritten_path) == 0 { return 0 }
         }
         // kind 0 (SELF) and kind 2 (MODULE) both compile the file itself
         // against the staged rewrite, so ua/ub keep their initial values.
 
-        if mig_verify_unit(ua, ub) == 0 {
+        if mig_verify_unit(ua, ub, linkable, upath) == 0 {
             ok = 0
             uint64 iu = "migration: ... while verifying build unit "
             write(2, iu, str_len(iu))
@@ -2644,8 +3034,12 @@ fn run_migration(uint64 input_path, uint64 dry_run, uint64 fix_scope) {
         // source -- the type pass does not run, so long-form type keywords
         // outside a ptrops block are left alone. mig_parse_type already
         // understands both spellings, so a cast like `as uint64` still
-        // converts correctly. Worst case a block becomes slightly longer
-        // (never more than 2x), so 4x is a safe upper bound.
+        // converts correctly. The rewrite is monotonically SHRINKING -- a
+        // block `unsafe{*(X as u8)=Y}` is 18 + |X| + |Y| bytes and becomes
+        // `store8(X, Y)`, 10 + |X| + |Y| -- so fsize + 1 already bounds it
+        // and the 4x here is slack, not a derived bound. (The old comment
+        // claimed "never more than 2x longer", which was wrong in the safe
+        // direction: the allocation held, the reasoning for it did not.)
         uint64 out_p = alloc(fsize * 4 + 1024)
         uint8[8] mbuf
         uint64 m_addr = mbuf
@@ -2697,7 +3091,7 @@ fn run_migration(uint64 input_path, uint64 dry_run, uint64 fix_scope) {
         write(1, "\n", 1)
         // Printed LAST on purpose: the migration report must stay the first
         // line of output (tests read it with `head -1`).
-        mig_print_units()
+        mig_print_units(1)
         return
     }
 
@@ -2715,14 +3109,15 @@ fn run_migration(uint64 input_path, uint64 dry_run, uint64 fix_scope) {
     // This applies to whichever scope was requested: --fix=types,
     // --fix=ptrops and bare --fix all go through it.
     mig_scratch_init(input_path)
-    uint64 sfd = file_open(mig_scratch_src_path(), 1)
-    if sfd > 0xFFFFFFFFFFFFF000 {
-        uint64 se = "error: cannot stage scratch file\n"
-        write(2, se, 33)
+    // Checked, not assumed: a short write here would feed a TRUNCATED source
+    // into verification, and a truncated source that still compiles is
+    // exactly how a "byte-identical" verdict could be reached about bytes
+    // nobody meant to compile.
+    if mig_write_checked(mig_scratch_src_path(), out_buf_m, new_size) == 0 {
+        uint64 se = "migration: could not stage the rewrite for verification -- refusing, file unchanged\n"
+        write(2, se, str_len(se))
         exit(1)
     }
-    file_write(sfd, out_buf_m, new_size)
-    file_close(sfd)
 
     uint64 verified = mig_verify_all_units(input_path, mig_scratch_src_path())
     mig_scratch_clear(mig_scratch_src_path())
@@ -2736,14 +3131,20 @@ fn run_migration(uint64 input_path, uint64 dry_run, uint64 fix_scope) {
         exit(1)
     }
 
-    // Write rewritten source back to the same file
-    uint64 ofd = file_open(input_path, 1)
-    if ofd > 0xFFFFFFFFFFFFF000 {
-        write(2, "error: cannot open output file for writing\n", 43)
+    // Write rewritten source back to the same file, and CHECK the write.
+    // file_open was already checked here; file_write's result was discarded,
+    // so a short or failed write (full disk, quota) left the user's source
+    // truncated while the tool exited 0 reporting "N migration site(s)
+    // rewritten". The whole premise of this harness is that the file is never
+    // left damaged silently -- a damaged file must at least say so.
+    if mig_write_checked(input_path, out_buf_m, new_size) == 0 {
+        uint64 we = "migration: the write-back did not complete -- "
+        write(2, we, str_len(we))
+        write(2, input_path, str_len(input_path))
+        uint64 we2 = " may now be TRUNCATED on disk; it was verified in memory, so re-running the write is safe once the cause is fixed\n"
+        write(2, we2, str_len(we2))
         exit(1)
     }
-    file_write(ofd, out_buf_m, new_size)
-    file_close(ofd)
 
     if fix_scope == 1 {
         mig_report_line(type_matches, "", input_path)
@@ -2753,7 +3154,7 @@ fn run_migration(uint64 input_path, uint64 dry_run, uint64 fix_scope) {
         mig_report_line(type_matches, " (type)", input_path)
         mig_report_line(unsafe_matches, " (ptrops)", input_path)
     }
-    mig_print_units()
+    mig_print_units(0)
 }
 
 // ---------------------------------------------------------------------------
