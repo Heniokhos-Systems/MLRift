@@ -264,6 +264,19 @@ split_mode comment build/mlrc.mlr   > "$WORK/comments_before.txt"
 split_mode comment "$WORK/unit.mlr" > "$WORK/comments_after.txt"
 NCOM=$(wc -l < "$WORK/comments_before.txt")
 NWHOLE=$(grep -cE '^[0-9]+:W:' "$WORK/comments_before.txt" || true)
+# Floor, cross-checked against a measure that shares no code with the splitter.
+# Without this the diff below is vacuous-proof only by luck: if the splitter's
+# comment branch ever emitted nothing, both sides would be empty and `diff -q`
+# would report success -- a check that passes precisely because it stopped
+# looking. grep is the independent witness. The two legitimately disagree by
+# the handful of lines where `//` sits inside STRING DATA
+# (hip_emit_cstr("// AUTO-GENERATED ...")), which grep counts and the splitter
+# correctly does not, so allow a small gap rather than demanding equality.
+NCOM_NAIVE=$(grep -c '//' build/mlrc.mlr || true)
+if [ "$NCOM" -lt $(( NCOM_NAIVE - NCOM_NAIVE / 100 )) ]; then
+  fail "comment splitter produced $NCOM comments but grep sees $NCOM_NAIVE lines containing '//'"
+  echo "    the comment diff below would pass vacuously -- fix the splitter" >&2
+fi
 if diff -q "$WORK/comments_before.txt" "$WORK/comments_after.txt" >/dev/null; then
   echo "  all $NCOM comments byte-identical ($NWHOLE whole-line, $((NCOM - NWHOLE)) trailing)"
 else
