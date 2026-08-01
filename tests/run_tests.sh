@@ -2541,7 +2541,7 @@ else
     echo "FAIL: migration_apply (command failed)"
     FAIL=$((FAIL + 1))
 fi
-rm -f /tmp/mlrc_mig2_$$.mlr /tmp/mlrc_mig2_bin_$$
+rm -f /tmp/mlrc_mig2_$$.mlr /tmp/mlrc_mig2_bin_$$ /tmp/mlrc_mig2_$$.mlr.lcverify.mlr /tmp/mlrc_mig2_$$.mlr.lcverify.o
 
 # mlrc lc on a file with unsafe ops should report legacy_ptr_ops
 TOTAL=$((TOTAL + 1))
@@ -2613,7 +2613,7 @@ else
     echo "FAIL: migration_types (command failed)"
     FAIL=$((FAIL + 1))
 fi
-rm -f /tmp/mlrc_migtypes_$$.mlr
+rm -f /tmp/mlrc_migtypes_$$.mlr /tmp/mlrc_migtypes_$$.mlr.lcverify.mlr /tmp/mlrc_migtypes_$$.mlr.lcverify.o
 
 # --- Bootstrap test ---
 echo ""
@@ -5873,6 +5873,41 @@ fi
 rm -f "$CA_SRC" "$CA_BIN"
 
 echo ""
+echo "--- lc verification harness ---"
+TOTAL=$((TOTAL + 1))
+LCV="/tmp/mlrc_lcv_$$.mlr"
+printf 'fn main() {\n    uint64 a = 1\n    exit(0)\n}\n' > "$LCV"
+cp "$LCV" "${LCV}.orig"
+# --fix-inject-fault rewrites uint64 -> f64, which changes emitted code.
+# (The plan said u32; measured, every integer width emits a byte-identical
+# object for `uint64 a = 1` on both targets, so u32 is not a fault at all.
+# See the comment on mig_short_form in src/living.mlr.)
+$MLRC lc --fix --fix-inject-fault "$LCV" > /tmp/lcv_out_$$ 2>&1
+LCV_ST=$?
+if [ "$LCV_ST" != "0" ] && grep -qi "mismatch" /tmp/lcv_out_$$ && cmp -s "$LCV" "${LCV}.orig"; then
+    PASS=$((PASS + 1)); echo "  lc_harness_rejects_and_leaves_file: PASS"
+else
+    echo "FAIL: lc_harness_rejects_and_leaves_file (exit $LCV_ST, or the file was modified)"; FAIL=$((FAIL + 1))
+fi
+rm -f "$LCV" "${LCV}.orig" /tmp/lcv_out_$$ "${LCV}.lcverify.mlr" "${LCV}.lcverify.o"
+
+# Positive control. Without it, a harness that rejects EVERYTHING would pass
+# the test above. This also happens to be the only end-to-end coverage of
+# --fix in write mode (everything else is dry-run), and it is the in-process
+# re-entrancy proof: it only passes if compile() called four times in one
+# process still produces identical bytes for identical input.
+TOTAL=$((TOTAL + 1))
+LCP="/tmp/mlrc_lcp_$$.mlr"
+printf 'fn main() {\n    uint64 a = 1\n    exit(0)\n}\n' > "$LCP"
+$MLRC lc --fix "$LCP" >/dev/null 2>&1
+if grep -q "u64 a = 1" "$LCP" && ! grep -q "uint64" "$LCP"; then
+    PASS=$((PASS + 1)); echo "  lc_harness_accepts_valid_rewrite: PASS"
+else
+    echo "FAIL: lc_harness_accepts_valid_rewrite (a correct rewrite was refused)"; FAIL=$((FAIL + 1))
+fi
+rm -f "$LCP" "${LCP}.lcverify.mlr" "${LCP}.lcverify.o"
+
+echo ""
 echo "--- lc --fix migration split ---"
 
 # --fix=types must never touch a ptrops site: the unsafe{} block stays
@@ -6009,7 +6044,7 @@ if $MLRC lc --fix=ptrops "$LCW" > /dev/null 2>&1; then
 else
     echo "FAIL: lc_fix_ptrops_write_compiles (command failed)"; FAIL=$((FAIL + 1))
 fi
-rm -f "$LCW" /tmp/mlrc_lcwrite_bin_$$
+rm -f "$LCW" /tmp/mlrc_lcwrite_bin_$$ "${LCW}.lcverify.mlr" "${LCW}.lcverify.o"
 
 # Unknown --fix= value must be a clean, non-zero-exit diagnostic, not a
 # silent no-op or a crash.
@@ -6104,7 +6139,7 @@ if cmp -s "$LCI" "${LCI}.once"; then
 else
     echo "FAIL: lc_rewrite_idempotent (second pass changed the file)"; FAIL=$((FAIL + 1))
 fi
-rm -f "$LCI" "${LCI}.once"
+rm -f "$LCI" "${LCI}.once" "${LCI}.lcverify.mlr" "${LCI}.lcverify.o"
 
 # The signed family (int8/16/32/64, kinds 84-87) has DIFFERENT long lengths
 # than unsigned (4/5/5/5 vs 5/6/6/6 -- int8 is the odd short one, not uint8).
@@ -6147,7 +6182,7 @@ if grep -q 'i64 a' "$LCIS" && grep -q 'i8 b' "$LCIS"; then
 else
     echo "FAIL: lc_rewrite_idempotent_signed (first pass did not rewrite int64/int8)"; FAIL=$((FAIL + 1))
 fi
-rm -f "$LCIS" "${LCIS}.once"
+rm -f "$LCIS" "${LCIS}.once" "${LCIS}.lcverify.mlr" "${LCIS}.lcverify.o"
 
 echo ""
 echo "--- float literal return kinds ---"

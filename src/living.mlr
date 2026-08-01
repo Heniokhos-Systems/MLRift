@@ -1822,6 +1822,176 @@ fn mig_report_line(uint64 count, uint64 tag, uint64 input_path) {
     write(1, "\n", 1)
 }
 
+// ---------------------------------------------------------------------------
+// Verification harness (Task 5)
+// ---------------------------------------------------------------------------
+//
+// A rewrite may only touch the file if it provably changed nothing the
+// compiler emits. mig_verify_unit compiles the original and the rewritten
+// source for every applicable target, in this process, and compares the
+// emitted object bytes in memory -- codegen_buf_ptr()/codegen_output_len(),
+// which is exactly the buffer codegen_write_output would have flushed to
+// disk (emit_elf_relocatable rebuilds the whole .o into it).
+//
+// Emit mode is fixed at 3 (--emit=obj) and MUST stay there. Task 1 measured
+// the compiler's re-entrancy boundary: compiling two sources in one process
+// is only unsafe at emit_mode 0, where a stale dyn_sym_count left by the
+// first module steers the second into the dynamic-ELF path. Both branches
+// that can do that are gated on `emit_mode == 0`, and the mode-3 path returns
+// before either of them, so mode 3 is safe by construction. State does still
+// leak across the calls (the dyn_sym_count diagnostic still prints) -- it
+// simply never reaches the object bytes. Do not switch this to another emit
+// mode without redoing Task 1's measurement.
+
+// Scratch paths, derived once per run from the unit being migrated so they
+// land in a directory already known to be writable (we are about to rewrite a
+// file in it). /dev/null is deliberately NOT used: it is Unix-only and this
+// project takes no platform-specific dependencies.
+static uint64 mig_scratch_obj = 0
+static uint64 mig_scratch_src = 0
+
+// Fault injection (--fix-inject-fault), for testing the rejection path only:
+// makes the type pass emit `f64` where a `uint64` site should become `u64`,
+// which genuinely changes emitted code (see mig_short_form for why not `u32`).
+// A harness that has never refused a bad rewrite is an unexercised branch,
+// not evidence.
+static uint64 mig_inject_fault = 0
+
+@export
+fn mig_set_inject_fault(uint64 v) {
+    mig_inject_fault = v
+}
+
+// Returns a fresh NUL-terminated `base_path ++ suffix`.
+fn mig_path_join(uint64 base_path, uint64 suffix) -> uint64 {
+    uint64 bl = str_len(base_path)
+    uint64 sl = str_len(suffix)
+    uint64 p = alloc(bl + sl + 1)
+    memcpy(p, base_path, bl)
+    memcpy(p + bl, suffix, sl)
+    uint64 tp = (p + bl) + sl
+    uint8 z = 0
+    unsafe { *(tp as uint8) = z }
+    return p
+}
+
+@export
+fn mig_scratch_init(uint64 base_path) {
+    mig_scratch_obj = mig_path_join(base_path, ".lcverify.o")
+    mig_scratch_src = mig_path_join(base_path, ".lcverify.mlr")
+}
+
+// Throwaway compile-output path. The bytes written there are never read --
+// the comparison happens in memory -- but the path must be openable for
+// writing on every platform.
+@export
+fn mig_scratch_path() -> uint64 {
+    return mig_scratch_obj
+}
+
+// Path the rewritten source is staged at. It is a SIBLING of the unit on
+// purpose: import_resolve() resolves `import "x.mlr"` relative to the
+// importing file's directory, so staging the rewrite anywhere else would
+// silently change which files the verification compile pulls in.
+@export
+fn mig_scratch_src_path() -> uint64 {
+    return mig_scratch_src
+}
+
+// Best-effort cleanup: truncate a scratch file to zero bytes. There is no
+// portable delete builtin (no unlink/remove; syscall_raw would be Linux-only),
+// so the two `.lcverify.*` files are left behind EMPTY and reused on the next
+// run rather than accumulating.
+fn mig_scratch_clear(uint64 path) {
+    uint64 fd = file_open(path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 { return }
+    file_close(fd)
+}
+
+fn mig_arch_name(uint64 arch) -> uint64 {
+    uint64 n = "arm64"
+    if arch == 0 { n = "x86_64" }
+    return n
+}
+
+fn mig_bytes_equal(uint64 a, uint64 b, uint64 len) -> uint64 {
+    uint64 i = 0
+    while i < len {
+        uint64 pa = a + i
+        uint64 pb = b + i
+        uint64 va = 0
+        uint64 vb = 0
+        unsafe { *(pa as uint8) -> va }
+        unsafe { *(pb as uint8) -> vb }
+        if va != vb { return 0 }
+        i = i + 1
+    }
+    return 1
+}
+
+// Returns 1 if the rewrite left emitted code byte-identical on every target
+// this unit supports, 0 otherwise (printing which target disagreed, and how).
+//
+// Applicable targets are x86_64 and arm64 only. riscv32 and xtensa are NOT
+// applicable to a unit of this kind: riscv32 compiles 7 of 75 std/ modules and
+// 0 of src/, xtensa the same, and neither has a relocatable (.o) writer wired
+// through compile() at all -- emit_mode 3 hits riscv32_nyi/xtensa_nyi, which
+// exits. They are named as skipped in the report rather than silently dropped.
+//
+// A target where the ORIGINAL fails to compile is "not applicable"; a target
+// where the original compiles and the rewrite does not is a hard failure. Note
+// the in-process limitation: compile() reports every compile error by calling
+// exit(1), so neither case returns here -- both surface as a non-zero exit of
+// the whole `lc --fix` run, with the file left untouched because verification
+// runs strictly before the write-back. That is fail-safe but it cannot tell
+// the two apart. See the task-5 report.
+@export
+fn mig_verify_unit(uint64 unit_path, uint64 rewritten_path) -> uint64 {
+    uint64 archs = alloc(2 * 8)
+    unsafe { *(archs as uint64) = 0 }            // x86_64
+    uint64 a1 = archs + 8
+    unsafe { *(a1 as uint64) = 1 }               // arm64
+    uint64 ok = 1
+    uint64 i = 0
+    while i < 2 {
+        uint64 ap = archs + i * 8
+        uint64 arch = 0
+        unsafe { *(ap as uint64) -> arch }
+        compile(unit_path, mig_scratch_path(), arch, 3)
+        uint64 len_a = codegen_output_len()
+        uint64 snap = alloc(len_a + 1)
+        memcpy(snap, codegen_buf_ptr(), len_a)
+        compile(rewritten_path, mig_scratch_path(), arch, 3)
+        uint64 len_b = codegen_output_len()
+        uint64 same = 0
+        if len_b == len_a {
+            same = mig_bytes_equal(snap, codegen_buf_ptr(), len_a)
+        }
+        if same == 0 {
+            ok = 0
+            uint64 m0 = "migration: VERIFY MISMATCH on target "
+            write(2, m0, str_len(m0))
+            uint64 an = mig_arch_name(arch)
+            write(2, an, str_len(an))
+            uint64 m1 = " ("
+            write(2, m1, 2)
+            uint8[32] nb
+            uint64 nl = fmt_uint(nb, len_a)
+            write(2, nb, nl)
+            uint64 m2 = " vs "
+            write(2, m2, 4)
+            nl = fmt_uint(nb, len_b)
+            write(2, nb, nl)
+            uint64 m3 = " bytes)\n"
+            write(2, m3, 8)
+        }
+        dealloc(snap)
+        i = i + 1
+    }
+    dealloc(archs)
+    return ok
+}
+
 // Run the migration engine on `input_path`. `fix_scope` selects which
 // migration(s) run: 0 = both (bare --fix), 1 = types only (--fix=types),
 // 2 = ptrops only (--fix=ptrops). If dry_run, print the rewritten source and
@@ -1938,6 +2108,36 @@ fn run_migration(uint64 input_path, uint64 dry_run, uint64 fix_scope) {
         return
     }
 
+    // Verify BEFORE writing. The rewritten bytes are staged in a sibling
+    // scratch file, both versions are compiled for every applicable target,
+    // and the emitted objects are compared in memory. Nothing reaches
+    // `input_path` unless every target agrees byte-for-byte -- so a refused
+    // rewrite leaves the user's file exactly as it was.
+    //
+    // This applies to whichever scope was requested: --fix=types,
+    // --fix=ptrops and bare --fix all go through it.
+    mig_scratch_init(input_path)
+    uint64 sfd = file_open(mig_scratch_src_path(), 1)
+    if sfd > 0xFFFFFFFFFFFFF000 {
+        uint64 se = "error: cannot stage scratch file\n"
+        write(2, se, 33)
+        exit(1)
+    }
+    file_write(sfd, out_buf_m, new_size)
+    file_close(sfd)
+
+    uint64 verified = mig_verify_unit(input_path, mig_scratch_src_path())
+    mig_scratch_clear(mig_scratch_src_path())
+    mig_scratch_clear(mig_scratch_path())
+
+    if verified == 0 {
+        uint64 vr = "migration: refused, unchanged: "
+        write(2, vr, 31)
+        write(2, input_path, str_len(input_path))
+        write(2, "\n", 1)
+        exit(1)
+    }
+
     // Write rewritten source back to the same file
     uint64 ofd = file_open(input_path, 1)
     if ofd > 0xFFFFFFFFFFFFF000 {
@@ -2049,7 +2249,24 @@ fn mig_short_form(uint32 kind, uint64 out_p) -> uint64 {
     if kind == 80 { store8(out_p, 117)  store8(out_p + 1, 56)  return 2 }        // u8
     if kind == 81 { store8(out_p, 117)  store8(out_p + 1, 49)  store8(out_p + 2, 54)  return 3 }  // u16
     if kind == 82 { store8(out_p, 117)  store8(out_p + 1, 51)  store8(out_p + 2, 50)  return 3 }  // u32
-    if kind == 83 { store8(out_p, 117)  store8(out_p + 1, 54)  store8(out_p + 2, 52)  return 3 }  // u64
+    if kind == 83 {
+        // --fix-inject-fault: emit `f64` where a `uint64` site should become
+        // `u64`. Not a migration -- it exists solely so the verification
+        // harness can be observed refusing a rewrite that really does change
+        // emitted code.
+        //
+        // The brief specified `u32` here. Measured, that does not work: for
+        // `uint64 a = 1` every integer width (u8/u16/u32/u64 and the signed
+        // family) emits a byte-identical object on x86_64 AND arm64 -- the
+        // declared width does not change the store of a constant into an
+        // 8-byte local slot, so a u32 "fault" is genuinely emission-
+        // preserving and the harness is right to accept it. `f64` moves the
+        // value through the float path and does change emitted code on both
+        // targets (70 -> 71 bytes on x86_64), so it is a fault the harness
+        // must catch.
+        if mig_inject_fault != 0 { store8(out_p, 102)  store8(out_p + 1, 54)  store8(out_p + 2, 52)  return 3 }
+        store8(out_p, 117)  store8(out_p + 1, 54)  store8(out_p + 2, 52)  return 3    // u64
+    }
     if kind == 84 { store8(out_p, 105)  store8(out_p + 1, 56)  return 2 }        // i8
     if kind == 85 { store8(out_p, 105)  store8(out_p + 1, 49)  store8(out_p + 2, 54)  return 3 }  // i16
     if kind == 86 { store8(out_p, 105)  store8(out_p + 1, 51)  store8(out_p + 2, 50)  return 3 }  // i32
