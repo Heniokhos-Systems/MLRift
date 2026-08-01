@@ -6277,6 +6277,31 @@ else
 fi
 rm -f "$BK_SRC" "$BK_SRC".lcverify.mlr
 
+# The IR leg needs emit_mode 0, which is the mode task 1 proved leaks the
+# @dynamic symbol registry across in-process compiles. The guard has to be
+# read BEFORE that compile, not after it: the four --emit=obj compiles have
+# already accumulated the count (68 -> 85 -> 102 -> 119 for a program
+# importing std/hip.mlr), and at emit_mode 0 an inflated count does not merely
+# change the output, it routes through format_elf_dyn and EXITS ("R segment
+# exceeds one page"). A post-compile check could therefore never fire -- which
+# is exactly what constructing this input revealed. The leg must be refused by
+# name, the obj verification must still stand, and the file must still be
+# written on its strength.
+TOTAL=$((TOTAL + 1))
+DYD="/tmp/mlrc_lcdyn_$$"
+rm -rf "$DYD"; mkdir -p "$DYD"
+ln -s "$(cd "$RR" && pwd)/std" "$DYD/std"
+printf 'import "std/hip.mlr"\n\nfn main() {\n    uint64 a = 1\n    exit(0)\n}\n' > "$DYD/d.mlr"
+DY_OUT=$($MLRC lc --fix=types "$DYD/d.mlr" 2>&1); DY_ST=$?
+if [ "$DY_ST" = "0" ] && echo "$DY_OUT" | grep -q "IR/executable leg NOT RUN" && \
+   echo "$DY_OUT" | grep -q "the IR leg was refused this run" && \
+   grep -q "u64 a = 1" "$DYD/d.mlr"; then
+    PASS=$((PASS + 1)); echo "  lc_dynamic_unit_refuses_ir_leg_by_name: PASS"
+else
+    echo "FAIL: lc_dynamic_unit_refuses_ir_leg_by_name (exit $DY_ST, got '$DY_OUT')"; FAIL=$((FAIL + 1))
+fi
+rm -rf "$DYD"
+
 # A unit whose ORIGINAL does not pass the front end is refused BY RETURN, not
 # by compile() calling exit(1) from underneath the harness. The difference is
 # visible on disk: a hard exit skips mig_scratch_clear and leaves the staged
