@@ -1927,3 +1927,92 @@ fn run_migration(uint64 input_path, uint64 dry_run) {
     write(1, input_path, pl)
     write(1, "\n", 1)
 }
+
+// ---------------------------------------------------------------------------
+// Token-driven site scanner (Task 2)
+// ---------------------------------------------------------------------------
+//
+// The byte-scanner above (mig_scan_and_rewrite) walks raw source bytes, so it
+// cannot tell code from comments or string contents -- on src/lexer.mlr it
+// rewrites the *literal* "uint64" inside match_keyword("uint64", 6) too,
+// corrupting the string while leaving the length argument at 6. This scanner
+// instead walks the token stream lex_all() produces, so only tokens that are
+// actually the long-form uint8/16/32/64 keyword are ever reported as sites.
+//
+// Long-form type keywords are exactly the four KwUint* kinds AT their long
+// length. `uint64` and `u64` lex to the SAME kind (83), so length is what
+// tells them apart -- see src/lexer.mlr:417-420 vs :428-431.
+fn mig_long_form_len(uint32 kind) -> uint32 {
+    if kind == 80 { return 5 }      // uint8
+    if kind == 81 { return 6 }      // uint16
+    if kind == 82 { return 6 }      // uint32
+    if kind == 83 { return 6 }      // uint64
+    return 0
+}
+
+// MIG_SITE_CAP bounds the sites buffer. Writing past it would corrupt whatever
+// follows -- the same silent-overrun class that made a test harness report a
+// false PASS earlier in this project. Refuse loudly instead.
+static uint64 MIG_SITE_CAP = 1048576
+
+fn mig_tok_scan(uint64 source, uint64 src_size, uint64 sites_out) -> uint64 {
+    uint64 tok_cap = 1048576
+    uint64 toks = alloc(tok_cap * 16)
+    lexer_init(source, src_size, toks, tok_cap)
+    lexer_run()
+    uint64 n = 0
+    uint64 i = 0
+    while i < tok_count {
+        uint64 rec = toks + i * 16
+        uint32 k = 0
+        uint32 st = 0
+        uint32 ln = 0
+        unsafe { *(rec as uint32) -> k }
+        uint64 rec1 = rec + 4
+        unsafe { *(rec1 as uint32) -> st }
+        uint64 rec2 = rec + 8
+        unsafe { *(rec2 as uint32) -> ln }
+        uint32 want = mig_long_form_len(k)
+        if want != 0 && ln == want {
+            if n >= MIG_SITE_CAP {
+                write(2, "error: lc: too many migration sites (buffer full)\n", 50)
+                exit(1)
+            }
+            uint64 o = sites_out + n * 8
+            unsafe { *(o as uint32) = st }
+            uint64 o1 = o + 4
+            unsafe { *(o1 as uint32) = k }
+            n = n + 1
+        }
+        i = i + 1
+    }
+    dealloc(toks)
+    return n
+}
+
+// CLI entry point for `lc --scan-sites <file>`. Reads the file, runs the
+// token-driven scanner, and prints `sites: <n>` -- Task 3's rewrite path
+// will consume the sites buffer directly instead of printing it.
+fn run_scan_sites(uint64 input_path) {
+    uint64 fd = file_open(input_path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 {
+        write(2, "error: cannot open input file\n", 30)
+        exit(1)
+    }
+    uint64 fsize = file_size(fd)
+    uint64 src_buf = alloc(fsize + 1)
+    file_read(fd, src_buf, fsize)
+    file_close(fd)
+    uint64 tp = src_buf + fsize
+    uint8 z = 0
+    unsafe { *(tp as uint8) = z }
+
+    uint64 sites_out = alloc(MIG_SITE_CAP * 8)
+    uint64 n = mig_tok_scan(src_buf, fsize, sites_out)
+
+    write(1, "sites: ", 7)
+    uint8[32] nb
+    uint64 nl = fmt_uint(nb, n)
+    write(1, nb, nl)
+    write(1, "\n", 1)
+}

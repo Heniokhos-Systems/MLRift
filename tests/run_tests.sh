@@ -5873,6 +5873,46 @@ fi
 rm -f "$CA_SRC" "$CA_BIN"
 
 echo ""
+echo "--- lc token-driven site scan ---"
+LCS_SRC="/tmp/mlrc_lcscan_$$.mlr"
+cat > "$LCS_SRC" <<'EOF'
+// a uint64 in a comment must not be a site
+fn main() {
+    uint64 x = 0
+    print_str("a uint64 in a string must not be a site")
+    exit(x)
+}
+EOF
+TOTAL=$((TOTAL + 1))
+LCS_OUT=$($MLRC lc --scan-sites "$LCS_SRC" 2>&1)
+if [ "$LCS_OUT" = "sites: 1" ]; then
+    PASS=$((PASS + 1)); echo "  lc_scan_skips_comments_and_strings: PASS"
+else
+    echo "FAIL: lc_scan_skips_comments_and_strings (want 'sites: 1', got '$LCS_OUT')"; FAIL=$((FAIL + 1))
+fi
+rm -f "$LCS_SRC"
+
+# StrPart tokens (f-string interior text) carry a real span, so span geometry
+# alone does not protect them the way whole-string StrLit tokens do -- the
+# "uint64" inside f"..." below must NOT be reported as a site.
+TOTAL=$((TOTAL + 1))
+LCF_SRC="/tmp/mlrc_lcfstr_$$.mlr"
+cat > "$LCF_SRC" <<'EOF'
+fn main() {
+    uint64 v = 7
+    print_str(f"uint64 = {v}")
+    exit(0)
+}
+EOF
+LCF_OUT=$($MLRC lc --scan-sites "$LCF_SRC" 2>&1)
+if [ "$LCF_OUT" = "sites: 1" ]; then
+    PASS=$((PASS + 1)); echo "  lc_scan_skips_fstring_text: PASS"
+else
+    echo "FAIL: lc_scan_skips_fstring_text (want 'sites: 1', got '$LCF_OUT')"; FAIL=$((FAIL + 1))
+fi
+rm -f "$LCF_SRC"
+
+echo ""
 echo "--- float literal return kinds ---"
 # tc_expr_kind reported EVERY FloatLit as f64, ignoring the `f` suffix, so the
 # return-kind check rejected `fn f() -> f32 { return 1.5f }` while the very
