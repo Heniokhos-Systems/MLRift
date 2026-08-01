@@ -5953,6 +5953,49 @@ else
 fi
 rm -f "$LCI" "${LCI}.once"
 
+# The signed family (int8/16/32/64, kinds 84-87) has DIFFERENT long lengths
+# than unsigned (4/5/5/5 vs 5/6/6/6 -- int8 is the odd short one, not uint8).
+# Mirrors lc_rewrite_preserves_string_literals above but for `int64`: the
+# string literal AND the comment must survive untouched while the real
+# `int64` keyword on the same file gets rewritten to `i64`.
+LCRS_SRC="/tmp/mlrc_lcrws_$$.mlr"
+cat > "$LCRS_SRC" <<'EOF'
+// keyword table: the literal below must survive, an int64 comment mention too
+fn classify(u64 start, u64 len) -> u64 {
+    if match_keyword(start, len, "int64", 5) != 0 { return 87 }
+    return 0
+}
+fn main() { int64 x = 0  exit(x) }
+EOF
+TOTAL=$((TOTAL + 1))
+$MLRC lc --fix --dry-run "$LCRS_SRC" > /tmp/mlrc_lcrws_out_$$ 2>&1
+if grep -q '"int64", 5' /tmp/mlrc_lcrws_out_$$ && grep -q 'int64 comment mention' /tmp/mlrc_lcrws_out_$$ && grep -q 'i64 x = 0' /tmp/mlrc_lcrws_out_$$; then
+    PASS=$((PASS + 1)); echo "  lc_rewrite_preserves_string_literals_signed: PASS"
+else
+    echo "FAIL: lc_rewrite_preserves_string_literals_signed (string/comment literal or code site wrong)"; FAIL=$((FAIL + 1))
+fi
+rm -f "$LCRS_SRC" /tmp/mlrc_lcrws_out_$$
+
+# Idempotence across the signed family too, covering both the odd-length
+# int8 (long len 4) and int64 (long len 5): after one pass every site is
+# i8/i64 (len 2/3), which mig_long_form_len must not re-match.
+TOTAL=$((TOTAL + 1))
+LCIS="/tmp/mlrc_lci_signed_$$.mlr"
+printf 'fn main() {\n    int64 a = 1\n    int8 b = 2\n    exit(0)\n}\n' > "$LCIS"
+$MLRC lc --fix "$LCIS" >/dev/null 2>&1
+if grep -q 'i64 a' "$LCIS" && grep -q 'i8 b' "$LCIS"; then
+    cp "$LCIS" "${LCIS}.once"
+    $MLRC lc --fix "$LCIS" >/dev/null 2>&1
+    if cmp -s "$LCIS" "${LCIS}.once"; then
+        PASS=$((PASS + 1)); echo "  lc_rewrite_idempotent_signed: PASS"
+    else
+        echo "FAIL: lc_rewrite_idempotent_signed (second pass changed the file)"; FAIL=$((FAIL + 1))
+    fi
+else
+    echo "FAIL: lc_rewrite_idempotent_signed (first pass did not rewrite int64/int8)"; FAIL=$((FAIL + 1))
+fi
+rm -f "$LCIS" "${LCIS}.once"
+
 echo ""
 echo "--- float literal return kinds ---"
 # tc_expr_kind reported EVERY FloatLit as f64, ignoring the `f` suffix, so the
