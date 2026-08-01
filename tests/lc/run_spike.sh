@@ -2,9 +2,28 @@
 # MLRift -- living-compiler verified-migrations, Task 1
 #
 # Re-entrancy spike: can compile() run twice on different sources in one
-# process? Pins std/hip.mlr (18 @dynamic declarations) against
+# process? Pins std/hip.mlr (17 @dynamic declarations) against
 # std/sha256.mlr (none) -- see task-1-brief.md for why this pairing
 # matters. Do not substitute inputs.
+#
+# Two boundaries are asserted here, both discovered empirically (see
+# task-1-report.md):
+#
+#   1. --emit=obj (emit_mode=3) is safe by construction: compile()
+#      returns before either dyn_sym_count-gated branch in src/main.mlr
+#      (:3108, :3239), both of which require emit_mode==0. Both
+#      orderings therefore MATCH under obj mode; only one is checked
+#      here since the code path can't distinguish them.
+#
+#   2. --emit=elfexe (emit_mode=0, the real default build path) leaks
+#      dyn_sym_count across compile() calls because dyn_sym_init() only
+#      runs once per process (guarded by `dyn_sym_tokens == 0`). The
+#      leak is ONE-DIRECTIONAL: a @dynamic-declaring module compiled
+#      before a clean module corrupts the clean module's output (hip ->
+#      sha256: sha256 gets routed down the dynamic-ELF path it should
+#      never take). The reverse order does not corrupt anything (sha256
+#      -> hip: sha256 contributes zero symbols, so nothing leaks
+#      forward, and hip's own registrations are unaffected).
 set -e
 MLRC=./build/mlrc
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -21,37 +40,104 @@ WORK=$(mktemp -d)
 # std/sha256.mlr, not whatever happens to be installed on the host.
 ln -s "$REPO_ROOT/std" "$WORK/std"
 
-# Step 1/2: Reference -- each compiled alone, in its own process.
+FAIL=0
+
+# check <label> <expected: MATCH|DIFFER> <fileA> <fileB>
+check() {
+  local label="$1" expected="$2" a="$3" b="$4"
+  local actual
+  if cmp -s "$a" "$b"; then actual=MATCH; else actual=DIFFER; fi
+  if [ "$actual" = "$expected" ]; then
+    echo "  $label: $actual (expected)"
+  else
+    echo "  $label: $actual -- MISMATCH, expected $expected"
+    FAIL=1
+  fi
+}
+
 for M in hip sha256; do
   printf 'import "std/%s.mlr"\nfn main() { exit(0) }\n' "$M" > "$WORK/drv_$M.mlr"
+done
+
+# --- Boundary 1: --emit=obj (emit_mode=3), ordering hip -> sha256 -------
+
+for M in hip sha256; do
   $MLRC --arch=x86_64 --emit=obj "$WORK/drv_$M.mlr" -o "$WORK/ref_$M.o" >/dev/null 2>&1
 done
-echo "reference objects built"
+echo "reference objects built (--emit=obj):"
 for M in hip sha256; do
   echo "  ref_$M.o: $(md5sum "$WORK/ref_$M.o" | cut -d' ' -f1)"
 done
 
-# Step 3: Two-in-one-process driver -- build/mlrc.mlr with main renamed
-# and a new main() that calls compile() twice in a row.
-sed 's/^fn main()/fn orig_main()/' build/mlrc.mlr > "$WORK/twice.mlr"
-cat >> "$WORK/twice.mlr" <<'EOF'
+sed 's/^fn main()/fn orig_main()/' build/mlrc.mlr > "$WORK/twice_obj.mlr"
+cat >> "$WORK/twice_obj.mlr" <<EOF
 fn main() {
-    compile("A_PATH", "A_OUT", 0, 3)
-    compile("B_PATH", "B_OUT", 0, 3)
+    compile("$WORK/drv_hip.mlr", "$WORK/obj_hip.o", 0, 3)
+    compile("$WORK/drv_sha256.mlr", "$WORK/obj_sha256.o", 0, 3)
     exit(0)
 }
 EOF
-sed -i "s|A_PATH|$WORK/drv_hip.mlr|; s|A_OUT|$WORK/two_hip.o|; s|B_PATH|$WORK/drv_sha256.mlr|; s|B_OUT|$WORK/two_sha256.o|" "$WORK/twice.mlr"
-$MLRC --arch=x86_64 "$WORK/twice.mlr" -o "$WORK/twice" && chmod +x "$WORK/twice" && "$WORK/twice"
+$MLRC --arch=x86_64 "$WORK/twice_obj.mlr" -o "$WORK/twice_obj" >/dev/null 2>&1
+chmod +x "$WORK/twice_obj" && "$WORK/twice_obj"
 
-# Step 4: Compare and report the boundary.
-echo "comparison:"
+echo "obj mode (--emit=obj), two-in-process, ordering hip -> sha256:"
+check "hip.o   " MATCH "$WORK/ref_hip.o" "$WORK/obj_hip.o"
+check "sha256.o" MATCH "$WORK/ref_sha256.o" "$WORK/obj_sha256.o"
+
+# --- Boundary 2: --emit=elfexe (emit_mode=0), both orderings ------------
+
 for M in hip sha256; do
-  if cmp -s "$WORK/ref_$M.o" "$WORK/two_$M.o"; then
-    echo "  $M: MATCH"
-  else
-    echo "  $M: DIFFER"
-  fi
+  $MLRC --arch=x86_64 --emit=elfexe "$WORK/drv_$M.mlr" -o "$WORK/ref_${M}_exe" >/dev/null 2>&1
+done
+echo "reference executables built (--emit=elfexe):"
+for M in hip sha256; do
+  echo "  ref_${M}_exe: $(stat -c%s "$WORK/ref_${M}_exe") bytes"
 done
 
+# Ordering A: hip -> sha256 (the @dynamic module runs first).
+sed 's/^fn main()/fn orig_main()/' build/mlrc.mlr > "$WORK/twice_exe_a.mlr"
+cat >> "$WORK/twice_exe_a.mlr" <<EOF
+fn main() {
+    compile("$WORK/drv_hip.mlr", "$WORK/a_hip_exe", 0, 0)
+    compile("$WORK/drv_sha256.mlr", "$WORK/a_sha256_exe", 0, 0)
+    exit(0)
+}
+EOF
+$MLRC --arch=x86_64 "$WORK/twice_exe_a.mlr" -o "$WORK/twice_exe_a" >/dev/null 2>&1
+chmod +x "$WORK/twice_exe_a" && "$WORK/twice_exe_a" > "$WORK/twice_exe_a.log" 2>&1
+
+# Ordering B: sha256 -> hip (the clean module runs first).
+sed 's/^fn main()/fn orig_main()/' build/mlrc.mlr > "$WORK/twice_exe_b.mlr"
+cat >> "$WORK/twice_exe_b.mlr" <<EOF
+fn main() {
+    compile("$WORK/drv_sha256.mlr", "$WORK/b_sha256_exe", 0, 0)
+    compile("$WORK/drv_hip.mlr", "$WORK/b_hip_exe", 0, 0)
+    exit(0)
+}
+EOF
+$MLRC --arch=x86_64 "$WORK/twice_exe_b.mlr" -o "$WORK/twice_exe_b" >/dev/null 2>&1
+chmod +x "$WORK/twice_exe_b" && "$WORK/twice_exe_b" > "$WORK/twice_exe_b.log" 2>&1
+
+echo "elfexe mode, two-in-process, ordering hip -> sha256:"
+echo "  a_hip_exe:    $(stat -c%s "$WORK/a_hip_exe") bytes"
+echo "  a_sha256_exe: $(stat -c%s "$WORK/a_sha256_exe") bytes (ref is $(stat -c%s "$WORK/ref_sha256_exe") bytes)"
+check "hip_exe   " MATCH  "$WORK/ref_hip_exe" "$WORK/a_hip_exe"
+check "sha256_exe" DIFFER "$WORK/ref_sha256_exe" "$WORK/a_sha256_exe"
+
+echo "elfexe mode, two-in-process, ordering sha256 -> hip:"
+echo "  b_sha256_exe: $(stat -c%s "$WORK/b_sha256_exe") bytes"
+echo "  b_hip_exe:    $(stat -c%s "$WORK/b_hip_exe") bytes"
+check "sha256_exe" MATCH "$WORK/ref_sha256_exe" "$WORK/b_sha256_exe"
+check "hip_exe   " MATCH "$WORK/ref_hip_exe" "$WORK/b_hip_exe"
+
+echo
+if [ "$FAIL" = 0 ]; then
+  echo "PASS: boundary confirmed as expected -- obj mode is safe by construction (returns before"
+  echo "the dyn_sym_count-gated branches); elfexe mode leaks dyn_sym_count one-directionally --"
+  echo "a @dynamic module compiled BEFORE a clean module corrupts the clean module's output,"
+  echo "the reverse order does not."
+else
+  echo "FAIL: re-entrancy behavior did not match the recorded boundary -- see MISMATCH lines above."
+fi
 echo "WORK=$WORK"
+exit "$FAIL"
