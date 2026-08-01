@@ -6132,6 +6132,38 @@ rm -f "$RR"/std/lc_dynprobe_$$.mlr* "$RR"/std/hip.mlr.lcverify.mlr \
 # particular not inside tracked std/ -- this project has a recorded incident
 # where a blind `git add -A` swept 767 stray files into a public commit, so a
 # scratch file in a tracked directory is a live hazard, not untidiness.
+# A name that merely STARTS with `main` is not an entry point. `fn main_loop`
+# once matched the column-0 prefix test that decides whether a unit can be
+# linked -- harmless while that answer only picked a unit kind, but it now
+# selects the IR-backend leg, which compiles at emit mode 0 and REQUIRES a
+# real main(). The result was a working migration failing with
+# `error: no 'main' function found`, a diagnostic naming neither lc nor the
+# file, plus a full-content scratch file left behind. No `fn main_*` exists
+# anywhere in src/, std/ or examples/, which is precisely why the rest of
+# the suite cannot see this.
+TOTAL=$((TOTAL + 1))
+ML_DIR=$(mktemp -d)
+printf 'fn main_loop(uint64 n) -> uint64 { return n }\n' > "$ML_DIR/ml.mlr"
+ML_OUT=$(cd "$RR" && $MLRC lc --fix=types "$ML_DIR/ml.mlr" 2>&1); ML_ST=$?
+if [ "$ML_ST" = "0" ] && echo "$ML_OUT" | grep -q "(module)" && grep -q 'u64' "$ML_DIR/ml.mlr"; then
+    PASS=$((PASS + 1)); echo "  lc_fn_main_prefix_is_not_an_entry_point: PASS"
+else
+    echo "FAIL: lc_fn_main_prefix_is_not_an_entry_point (exit $ML_ST: '$(echo "$ML_OUT" | tail -1)')"
+    FAIL=$((FAIL + 1))
+fi
+# The counterpart: a real main() MUST still take the IR leg, or the fix above
+# would "pass" by classifying everything as unlinkable.
+TOTAL=$((TOTAL + 1))
+printf 'fn helper(uint64 n) -> uint64 { return n }\nfn main() { exit(helper(0)) }\n' > "$ML_DIR/rm.mlr"
+RM_OUT=$(cd "$RR" && $MLRC lc --fix=types "$ML_DIR/rm.mlr" 2>&1); RM_ST=$?
+if [ "$RM_ST" = "0" ] && echo "$RM_OUT" | grep -q "IR codegen (linked executable"; then
+    PASS=$((PASS + 1)); echo "  lc_real_main_takes_the_ir_leg: PASS"
+else
+    echo "FAIL: lc_real_main_takes_the_ir_leg (exit $RM_ST: '$(echo "$RM_OUT" | tail -1)')"
+    FAIL=$((FAIL + 1))
+fi
+rm -rf "$ML_DIR"
+
 TOTAL=$((TOTAL + 1))
 BEFORE=$(ls -A "$RR/std" | wc -l)
 (cd "$RR" && $MLRC lc --fix=types --dry-run std/color.mlr >/dev/null 2>&1)
