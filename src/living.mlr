@@ -1992,6 +1992,536 @@ fn mig_verify_unit(uint64 unit_path, uint64 rewritten_path) -> uint64 {
     return ok
 }
 
+// ---------------------------------------------------------------------------
+// Build-unit mapping (Task 6)
+// ---------------------------------------------------------------------------
+//
+// A file does not verify on its own. It verifies as part of every BUILD UNIT
+// that contains it, and a file can belong to more than one:
+//
+//   src/bcj.mlr    is concatenated into build/mlrc.mlr (Makefile SRCS) AND
+//                  into build/mlr-runner.mlr (Makefile:40,42)
+//   std/sha256.mlr is in SRCS -- so it is a member of the src/ unit -- and is
+//                  simultaneously a std/ module
+//
+// Verifying against only one of a file's units leaves the other unverified,
+// so the mapper returns a LIST and every entry has to agree before a byte is
+// written.
+//
+// Membership is PARSED OUT OF THE MAKEFILE, never hardcoded. SRCS differs per
+// fork, and src/living.mlr and src/living.kr are deliberately kept at a
+// one-line divergence, so a per-fork list cannot live in this file at all.
+//
+// Unit kinds:
+//   0 SELF   -- the file is its own unit: a standalone program defining main().
+//   1 CONCAT -- `cat` of an ordered member list taken from the Makefile.
+//   2 DRIVER -- the file is a module; the unit is a synthesised
+//               `import "<module>"` program written beside it.
+//
+// Resolution order (1 and 2 can BOTH match; 3 and 4 are last-resort):
+//   1. listed in Makefile SRCS                 -> build/mlrc.mlr       (CONCAT)
+//   2. listed in the build/mlr-runner.mlr rule -> build/mlr-runner.mlr (CONCAT)
+//   3. defines main() at column 0              -> itself               (SELF)
+//   4. otherwise a module                      -> synthesised driver   (DRIVER)
+//
+// Case 4 only counts if the synthesised driver actually BUILDS. A module that
+// cannot be compiled at all is covered by no build unit, and `lc --fix`
+// refuses to touch it instead of aborting halfway through verification.
+// std/net.mlr is that file here: it is imported by no example or test, and a
+// driver importing it fails semantic analysis at net.mlr:153 (dealloc/2).
+//
+// Not-applicable targets are unchanged from Task 5 and are named rather than
+// silently skipped: riscv32 and xtensa have no relocatable writer wired
+// through compile() at all, and compile 7 of 75 std/ modules and 0 of src/.
+// Every unit here is verified on x86_64 and arm64 only.
+
+static uint64 mig_root = 0        // path prefix from cwd to the repo root
+static uint64 mig_uk = 0          // unit kinds
+static uint64 mig_up = 0          // unit paths (for messages and scratch names)
+static uint64 mig_um = 0          // unit member arrays (CONCAT only)
+static uint64 mig_un = 0          // unit member counts (CONCAT only)
+static uint64 mig_ucount = 0
+
+// Read a whole file. Returns 0 if it cannot be opened; otherwise a
+// NUL-terminated buffer, with the length stored through len_out.
+fn mig_read_all(uint64 path, uint64 len_out) -> uint64 {
+    uint64 fd = file_open(path, 0)
+    if fd > 0xFFFFFFFFFFFFF000 { return 0 }
+    uint64 sz = file_size(fd)
+    uint64 buf = alloc(sz + 1)
+    file_read(fd, buf, sz)
+    file_close(fd)
+    uint64 tp = buf + sz
+    uint8 z = 0
+    unsafe { *(tp as uint8) = z }
+    unsafe { *(len_out as uint64) = sz }
+    return buf
+}
+
+fn mig_write_all(uint64 path, uint64 buf, uint64 len) -> uint64 {
+    uint64 fd = file_open(path, 1)
+    if fd > 0xFFFFFFFFFFFFF000 { return 0 }
+    file_write(fd, buf, len)
+    file_close(fd)
+    return 1
+}
+
+// Fresh NUL-terminated copy of buf[off .. off+len).
+fn mig_substr(uint64 buf, uint64 off, uint64 len) -> uint64 {
+    uint64 s = alloc(len + 1)
+    memcpy(s, buf + off, len)
+    uint64 tp = s + len
+    uint8 z = 0
+    unsafe { *(tp as uint8) = z }
+    return s
+}
+
+// n repetitions of "../", NUL-terminated ("" for n == 0).
+fn mig_updots(uint64 n) -> uint64 {
+    uint64 s = alloc(n * 3 + 1)
+    uint64 i = 0
+    uint8 dot = 46
+    uint8 sl = 47
+    while i < n {
+        uint64 p0 = s + i * 3
+        unsafe { *(p0 as uint8) = dot }
+        uint64 p1 = p0 + 1
+        unsafe { *(p1 as uint8) = dot }
+        uint64 p2 = p0 + 2
+        unsafe { *(p2 as uint8) = sl }
+        i = i + 1
+    }
+    uint64 t = s + n * 3
+    uint8 z = 0
+    unsafe { *(t as uint8) = z }
+    return s
+}
+
+// Locate and read the Makefile, walking up from the working directory. Sets
+// mig_root to the prefix that reached it, so unit and member paths can be
+// rebuilt relative to the same root. Returns 0 if no Makefile is in reach --
+// which is the normal case for a standalone file in /tmp, not an error.
+fn mig_find_makefile(uint64 len_out) -> uint64 {
+    uint64 i = 0
+    while i < 4 {
+        uint64 prefix = mig_updots(i)
+        uint64 path = mig_path_join(prefix, "Makefile")
+        uint64 buf = mig_read_all(path, len_out)
+        if buf != 0 {
+            mig_root = prefix
+            return buf
+        }
+        i = i + 1
+    }
+    mig_root = ""
+    return 0
+}
+
+// Collect whitespace-separated tokens starting at `pos` to the end of the
+// LOGICAL line, following backslash continuations. `$(...)` tokens are
+// skipped (a variable reference is not a file) and `#` ends collection.
+fn mig_mk_collect(uint64 mk, uint64 mk_len, uint64 pos, uint64 out_arr, uint64 max) -> uint64 {
+    uint64 n = 0
+    uint64 tstart = 0
+    uint64 tlen = 0
+    uint64 cont = 0
+    uint64 done = 0
+    while done == 0 && pos < mk_len {
+        uint64 pp = mk + pos
+        uint64 c = 0
+        unsafe { *(pp as uint8) -> c }
+        uint64 is_sep = 0
+        if c == 32 || c == 9 || c == 13 { is_sep = 1 }
+        if c == 92 {
+            is_sep = 1
+            cont = 1
+        }
+        if c == 10 { is_sep = 1 }
+        if c == 35 {
+            is_sep = 1
+            done = 1
+        }
+        if is_sep != 0 {
+            if tlen != 0 {
+                uint64 fc = 0
+                uint64 fp = mk + tstart
+                unsafe { *(fp as uint8) -> fc }
+                if fc != 36 && n < max {
+                    uint64 s = mig_substr(mk, tstart, tlen)
+                    uint64 slot = out_arr + n * 8
+                    unsafe { *(slot as uint64) = s }
+                    n = n + 1
+                }
+                tlen = 0
+            }
+            if c == 10 {
+                if cont == 0 { done = 1 }
+                cont = 0
+            }
+        } else {
+            if tlen == 0 { tstart = pos }
+            tlen = tlen + 1
+        }
+        pos = pos + 1
+    }
+    if tlen != 0 && n < max {
+        uint64 fc2 = 0
+        uint64 fp2 = mk + tstart
+        unsafe { *(fp2 as uint8) -> fc2 }
+        if fc2 != 36 {
+            uint64 s2 = mig_substr(mk, tstart, tlen)
+            uint64 slot2 = out_arr + n * 8
+            unsafe { *(slot2 as uint64) = s2 }
+            n = n + 1
+        }
+    }
+    return n
+}
+
+// Value of make variable `name` (SRCS), split into tokens. Accepts `=`, `:=`
+// and `+=` at the assignment; only the first assignment is read.
+fn mig_mk_var(uint64 mk, uint64 mk_len, uint64 name, uint64 out_arr, uint64 max) -> uint64 {
+    uint64 nl = str_len(name)
+    uint64 pos = 0
+    uint64 line_start = 1
+    while pos < mk_len {
+        if line_start != 0 && mig_text_eq(mk, pos, mk_len, name, nl) != 0 {
+            uint64 q = pos + nl
+            while q < mk_len {
+                uint64 pq = mk + q
+                uint64 cq = 0
+                unsafe { *(pq as uint8) -> cq }
+                if cq != 32 && cq != 9 { break }
+                q = q + 1
+            }
+            uint64 pc = mk + q
+            uint64 c2 = 0
+            unsafe { *(pc as uint8) -> c2 }
+            if c2 == 58 || c2 == 43 { q = q + 1 }
+            pc = mk + q
+            unsafe { *(pc as uint8) -> c2 }
+            if c2 == 61 {
+                return mig_mk_collect(mk, mk_len, q + 1, out_arr, max)
+            }
+        }
+        uint64 pp = mk + pos
+        uint64 c = 0
+        unsafe { *(pp as uint8) -> c }
+        line_start = 0
+        if c == 10 { line_start = 1 }
+        pos = pos + 1
+    }
+    return 0
+}
+
+// Prerequisites of the rule whose target is exactly `target` at column 0.
+fn mig_mk_rule(uint64 mk, uint64 mk_len, uint64 target, uint64 out_arr, uint64 max) -> uint64 {
+    uint64 tl = str_len(target)
+    uint64 pos = 0
+    uint64 line_start = 1
+    while pos < mk_len {
+        if line_start != 0 && mig_text_eq(mk, pos, mk_len, target, tl) != 0 {
+            uint64 q = pos + tl
+            uint64 pq = mk + q
+            uint64 cq = 0
+            unsafe { *(pq as uint8) -> cq }
+            if cq == 58 {
+                return mig_mk_collect(mk, mk_len, q + 1, out_arr, max)
+            }
+        }
+        uint64 pp = mk + pos
+        uint64 c = 0
+        unsafe { *(pp as uint8) -> c }
+        line_start = 0
+        if c == 10 { line_start = 1 }
+        pos = pos + 1
+    }
+    return 0
+}
+
+// Does `path` name the same file as the Makefile token `tok`? The user may
+// spell the path as `src/bcj.mlr`, `./src/bcj.mlr` or absolute, while the
+// Makefile always spells it relative to the root, so compare on the tail at
+// a component boundary.
+fn mig_tail_eq(uint64 path, uint64 tok) -> uint64 {
+    uint64 p = path
+    if mig_text_eq(p, 0, str_len(p), "./", 2) != 0 { p = p + 2 }
+    uint64 pl = str_len(p)
+    uint64 tl = str_len(tok)
+    if tl == 0 { return 0 }
+    if tl > pl { return 0 }
+    uint64 off = pl - tl
+    if mig_text_eq(p, off, pl, tok, tl) == 0 { return 0 }
+    if off == 0 { return 1 }
+    uint64 cp = (p + off) - 1
+    uint64 c = 0
+    unsafe { *(cp as uint8) -> c }
+    if c == 47 { return 1 }
+    return 0
+}
+
+fn mig_list_has(uint64 arr, uint64 n, uint64 path) -> uint64 {
+    uint64 i = 0
+    while i < n {
+        uint64 slot = arr + i * 8
+        uint64 tok = 0
+        unsafe { *(slot as uint64) -> tok }
+        if mig_tail_eq(path, tok) != 0 { return 1 }
+        i = i + 1
+    }
+    return 0
+}
+
+// Last path component of `path` (the pointer is into `path`, not a copy).
+fn mig_basename(uint64 path) -> uint64 {
+    uint64 l = str_len(path)
+    uint64 i = l
+    while i > 0 {
+        uint64 cp = (path + i) - 1
+        uint64 c = 0
+        unsafe { *(cp as uint8) -> c }
+        if c == 47 { return path + i }
+        i = i - 1
+    }
+    return path
+}
+
+// Does the source define a top-level main()? Column 0 only: `fn main` inside
+// a comment (std/hip.mlr's header has one) is indented and must not count.
+fn mig_has_main(uint64 src, uint64 len) -> uint64 {
+    uint64 pos = 0
+    uint64 line_start = 1
+    while pos < len {
+        if line_start != 0 && mig_text_eq(src, pos, len, "fn main", 7) != 0 { return 1 }
+        uint64 pp = src + pos
+        uint64 c = 0
+        unsafe { *(pp as uint8) -> c }
+        line_start = 0
+        if c == 10 { line_start = 1 }
+        pos = pos + 1
+    }
+    return 0
+}
+
+// Write the synthesised driver: a program whose only content is an import of
+// the module under test. `import "x.mlr"` resolves relative to the IMPORTING
+// file's directory, so the driver must be a sibling of the module -- which is
+// also why the rewritten module is staged as a sibling (see Task 5).
+fn mig_driver_write(uint64 out_path, uint64 name) -> uint64 {
+    uint64 buf = alloc(str_len(name) + 64)
+    uint8[8] pbuf
+    uint64 pp = pbuf
+    unsafe { *(pp as uint64) = 0 }
+    mig_append_str(buf, pp, "import \"")
+    mig_append_str(buf, pp, name)
+    mig_append_str(buf, pp, "\"\nfn main() { exit(0) }\n")
+    uint64 n = 0
+    unsafe { *(pp as uint64) -> n }
+    return mig_write_all(out_path, buf, n)
+}
+
+// Rebuild a CONCAT unit by concatenating its members in Makefile order --
+// byte for byte what the Makefile's `cat` produces. If `sub` is non-zero, the
+// member matching `target` is replaced by the file at `sub`; that is how the
+// rewritten file is compared inside its real unit instead of on its own.
+fn mig_assemble(uint64 out_path, uint64 mem, uint64 memn, uint64 target, uint64 sub) -> uint64 {
+    uint64 bufs = alloc(memn * 8 + 8)
+    uint64 lens = alloc(memn * 8 + 8)
+    uint8[8] lbuf
+    uint64 lp = lbuf
+    uint64 total = 0
+    uint64 i = 0
+    while i < memn {
+        uint64 slot = mem + i * 8
+        uint64 tok = 0
+        unsafe { *(slot as uint64) -> tok }
+        uint64 fp = mig_path_join(mig_root, tok)
+        if sub != 0 {
+            if mig_tail_eq(target, tok) != 0 { fp = sub }
+        }
+        unsafe { *(lp as uint64) = 0 }
+        uint64 b = mig_read_all(fp, lp)
+        if b == 0 {
+            uint64 em = "migration: cannot read build-unit member "
+            write(2, em, str_len(em))
+            write(2, fp, str_len(fp))
+            write(2, "\n", 1)
+            return 0
+        }
+        uint64 l = 0
+        unsafe { *(lp as uint64) -> l }
+        uint64 bslot = bufs + i * 8
+        unsafe { *(bslot as uint64) = b }
+        uint64 lslot = lens + i * 8
+        unsafe { *(lslot as uint64) = l }
+        total = total + l
+        i = i + 1
+    }
+    uint64 out = alloc(total + 1)
+    uint64 pos = 0
+    i = 0
+    while i < memn {
+        uint64 bslot2 = bufs + i * 8
+        uint64 b2 = 0
+        unsafe { *(bslot2 as uint64) -> b2 }
+        uint64 lslot2 = lens + i * 8
+        uint64 l2 = 0
+        unsafe { *(lslot2 as uint64) -> l2 }
+        memcpy(out + pos, b2, l2)
+        pos = pos + l2
+        dealloc(b2)
+        i = i + 1
+    }
+    uint64 ok = mig_write_all(out_path, out, total)
+    dealloc(out)
+    dealloc(bufs)
+    dealloc(lens)
+    return ok
+}
+
+fn mig_add_unit(uint64 kind, uint64 path, uint64 mem, uint64 memn) {
+    if mig_ucount >= 4 { return }
+    uint64 ks = mig_uk + mig_ucount * 8
+    unsafe { *(ks as uint64) = kind }
+    uint64 ps = mig_up + mig_ucount * 8
+    unsafe { *(ps as uint64) = path }
+    uint64 ms = mig_um + mig_ucount * 8
+    unsafe { *(ms as uint64) = mem }
+    uint64 ns = mig_un + mig_ucount * 8
+    unsafe { *(ns as uint64) = memn }
+    mig_ucount = mig_ucount + 1
+}
+
+// Resolve every build unit that contains `input_path`. Returns the number
+// found; 0 means no build unit covers the file and the caller must refuse.
+@export
+fn mig_resolve_units(uint64 input_path, uint64 src_buf, uint64 src_len) -> uint64 {
+    mig_ucount = 0
+    if mig_uk == 0 {
+        mig_uk = alloc(4 * 8)
+        mig_up = alloc(4 * 8)
+        mig_um = alloc(4 * 8)
+        mig_un = alloc(4 * 8)
+    }
+
+    uint8[8] mkl
+    uint64 mklp = mkl
+    unsafe { *(mklp as uint64) = 0 }
+    uint64 mk = mig_find_makefile(mklp)
+    if mk != 0 {
+        uint64 mk_len = 0
+        unsafe { *(mklp as uint64) -> mk_len }
+        uint64 srcs = alloc(256 * 8)
+        uint64 ns = mig_mk_var(mk, mk_len, "SRCS", srcs, 256)
+        if mig_list_has(srcs, ns, input_path) != 0 {
+            mig_add_unit(1, mig_path_join(mig_root, "build/mlrc.mlr"), srcs, ns)
+        }
+        uint64 rmem = alloc(32 * 8)
+        uint64 nr = mig_mk_rule(mk, mk_len, "build/mlr-runner.mlr", rmem, 32)
+        if mig_list_has(rmem, nr, input_path) != 0 {
+            mig_add_unit(1, mig_path_join(mig_root, "build/mlr-runner.mlr"), rmem, nr)
+        }
+        dealloc(mk)
+    }
+    if mig_ucount != 0 { return mig_ucount }
+
+    if mig_has_main(src_buf, src_len) != 0 {
+        mig_add_unit(0, input_path, 0, 0)
+        return 1
+    }
+
+    // A module. Its unit is a driver we synthesise -- but only if that driver
+    // builds. unit_front_end_errors runs import + lex + parse + sema and
+    // RETURNS the error count rather than exiting, which is the only way to
+    // ask the question without killing this process (compile() exits on every
+    // error, and exec_process_argv is execve, not fork).
+    uint64 drv = mig_path_join(input_path, ".lcunit_a.mlr")
+    if mig_driver_write(drv, mig_basename(input_path)) == 0 { return 0 }
+    uint64 errs = unit_front_end_errors(drv)
+    mig_scratch_clear(drv)
+    if errs != 0 { return 0 }
+    mig_add_unit(2, input_path, 0, 0)
+    return 1
+}
+
+@export
+fn mig_print_units() {
+    uint64 h = "migration: build units: "
+    write(1, h, str_len(h))
+    uint64 i = 0
+    while i < mig_ucount {
+        if i != 0 { write(1, " ", 1) }
+        uint64 ps = mig_up + i * 8
+        uint64 p = 0
+        unsafe { *(ps as uint64) -> p }
+        write(1, p, str_len(p))
+        uint64 ks = mig_uk + i * 8
+        uint64 k = 0
+        unsafe { *(ks as uint64) -> k }
+        if k == 0 {
+            uint64 t0 = " (self)"
+            write(1, t0, str_len(t0))
+        }
+        if k == 2 {
+            uint64 t2 = " (synthesised driver)"
+            write(1, t2, str_len(t2))
+        }
+        i = i + 1
+    }
+    write(1, "\n", 1)
+}
+
+// Verify the rewrite inside EVERY unit that contains the file. All of them
+// must agree; one disagreement refuses the whole rewrite.
+@export
+fn mig_verify_all_units(uint64 input_path, uint64 rewritten_path) -> uint64 {
+    uint64 ok = 1
+    uint64 i = 0
+    while i < mig_ucount {
+        uint64 ks = mig_uk + i * 8
+        uint64 kind = 0
+        unsafe { *(ks as uint64) -> kind }
+        uint64 ps = mig_up + i * 8
+        uint64 upath = 0
+        unsafe { *(ps as uint64) -> upath }
+
+        uint64 ua = input_path
+        uint64 ub = rewritten_path
+        if kind == 1 {
+            uint64 ms = mig_um + i * 8
+            uint64 mem = 0
+            unsafe { *(ms as uint64) -> mem }
+            uint64 nsx = mig_un + i * 8
+            uint64 memn = 0
+            unsafe { *(nsx as uint64) -> memn }
+            ua = mig_path_join(upath, ".lcunit_a.mlr")
+            ub = mig_path_join(upath, ".lcunit_b.mlr")
+            if mig_assemble(ua, mem, memn, input_path, 0) == 0 { return 0 }
+            if mig_assemble(ub, mem, memn, input_path, rewritten_path) == 0 { return 0 }
+        }
+        if kind == 2 {
+            ua = mig_path_join(input_path, ".lcunit_a.mlr")
+            ub = mig_path_join(input_path, ".lcunit_b.mlr")
+            if mig_driver_write(ua, mig_basename(input_path)) == 0 { return 0 }
+            if mig_driver_write(ub, mig_basename(rewritten_path)) == 0 { return 0 }
+        }
+
+        if mig_verify_unit(ua, ub) == 0 {
+            ok = 0
+            uint64 iu = "migration: ... while verifying build unit "
+            write(2, iu, str_len(iu))
+            write(2, upath, str_len(upath))
+            write(2, "\n", 1)
+        }
+        if kind != 0 {
+            mig_scratch_clear(ua)
+            mig_scratch_clear(ub)
+        }
+        i = i + 1
+    }
+    return ok
+}
+
 // Run the migration engine on `input_path`. `fix_scope` selects which
 // migration(s) run: 0 = both (bare --fix), 1 = types only (--fix=types),
 // 2 = ptrops only (--fix=ptrops). If dry_run, print the rewritten source and
@@ -2022,6 +2552,20 @@ fn run_migration(uint64 input_path, uint64 dry_run, uint64 fix_scope) {
     uint64 tp = src_buf + fsize
     uint8 z = 0
     unsafe { *(tp as uint8) = z }
+
+    // Which build unit(s) verify this file? Resolved BEFORE anything is
+    // rewritten, and before --dry-run's early return, because "no build unit
+    // covers this file" is a refusal to rewrite it at all -- not a verdict
+    // that only matters at write time.
+    uint64 nunits = mig_resolve_units(input_path, src_buf, fsize)
+    if nunits == 0 {
+        uint64 nu = "migration: no build unit covers "
+        write(2, nu, str_len(nu))
+        write(2, input_path, str_len(input_path))
+        uint64 nu2 = " -- refusing to rewrite it\n"
+        write(2, nu2, str_len(nu2))
+        exit(1)
+    }
 
     uint64 type_matches = 0
     uint64 unsafe_matches = 0
@@ -2100,6 +2644,9 @@ fn run_migration(uint64 input_path, uint64 dry_run, uint64 fix_scope) {
         if preview > 512 { preview = 512 }
         write(1, out_buf_m, preview)
         write(1, "\n", 1)
+        // Printed LAST on purpose: the migration report must stay the first
+        // line of output (tests read it with `head -1`).
+        mig_print_units()
         return
     }
 
@@ -2126,7 +2673,7 @@ fn run_migration(uint64 input_path, uint64 dry_run, uint64 fix_scope) {
     file_write(sfd, out_buf_m, new_size)
     file_close(sfd)
 
-    uint64 verified = mig_verify_unit(input_path, mig_scratch_src_path())
+    uint64 verified = mig_verify_all_units(input_path, mig_scratch_src_path())
     mig_scratch_clear(mig_scratch_src_path())
     mig_scratch_clear(mig_scratch_path())
 
@@ -2155,6 +2702,7 @@ fn run_migration(uint64 input_path, uint64 dry_run, uint64 fix_scope) {
         mig_report_line(type_matches, " (type)", input_path)
         mig_report_line(unsafe_matches, " (ptrops)", input_path)
     }
+    mig_print_units()
 }
 
 // ---------------------------------------------------------------------------

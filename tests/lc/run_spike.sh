@@ -130,12 +130,78 @@ echo "  b_hip_exe:    $(stat -c%s "$WORK/b_hip_exe") bytes"
 check "sha256_exe" MATCH "$WORK/ref_sha256_exe" "$WORK/b_sha256_exe"
 check "hip_exe   " MATCH "$WORK/ref_hip_exe" "$WORK/b_hip_exe"
 
+# --- Boundary 3: the verification harness's OWN call pattern (Task 6) ----
+#
+# Boundary 1 above measures two compiles. The Task 5 harness makes FOUR per
+# build unit (original + rewrite, x86_64 + arm64), and Task 6 lets one file
+# belong to several units (src/bcj.mlr is in both build/mlrc.mlr and
+# build/mlr-runner.mlr), so a single `lc --fix` run can compile several
+# DIFFERENT sources, eight or more times, in one process. That is the exact
+# shape of the emit_mode-0 hazard -- a @dynamic-declaring source compiled
+# before a clean one -- so it is measured here rather than assumed safe by
+# extrapolation from the two-compile case.
+#
+# The question this answers: does verifying a std/ module in-process need an
+# outer per-compile driver process? At emit_mode 3 the answer is no.
+
+for M in hip sha256; do
+  $MLRC --arch=arm64 --emit=obj "$WORK/drv_$M.mlr" -o "$WORK/ref_${M}_arm.o" >/dev/null 2>&1
+done
+
+# gen_harness <outfile> <first module> <second module>
+# Emits the mig_verify_unit sequence for two units, in the given order.
+gen_harness() {
+  local out="$1" first="$2" second="$3"
+  sed 's/^fn main()/fn orig_main()/' build/mlrc.mlr > "$out.mlr"
+  cat >> "$out.mlr" <<EOF
+fn main() {
+    compile("$WORK/drv_$first.mlr", "$WORK/h_${first}_x86_a.o", 0, 3)
+    compile("$WORK/drv_$first.mlr", "$WORK/h_${first}_x86_b.o", 0, 3)
+    compile("$WORK/drv_$first.mlr", "$WORK/h_${first}_arm_a.o", 1, 3)
+    compile("$WORK/drv_$first.mlr", "$WORK/h_${first}_arm_b.o", 1, 3)
+    compile("$WORK/drv_$second.mlr", "$WORK/h_${second}_x86_a.o", 0, 3)
+    compile("$WORK/drv_$second.mlr", "$WORK/h_${second}_x86_b.o", 0, 3)
+    compile("$WORK/drv_$second.mlr", "$WORK/h_${second}_arm_a.o", 1, 3)
+    compile("$WORK/drv_$second.mlr", "$WORK/h_${second}_arm_b.o", 1, 3)
+    exit(0)
+}
+EOF
+  $MLRC --arch=x86_64 "$out.mlr" -o "$out" >/dev/null 2>&1
+  chmod +x "$out" && "$out" >/dev/null 2>&1
+}
+
+# Ordering A: the @dynamic unit first -- the direction that corrupts at mode 0.
+gen_harness "$WORK/harness_a" hip sha256
+echo "obj mode, EIGHT compiles in one process, ordering hip -> sha256:"
+for M in hip sha256; do
+  check "$M x86 #1" MATCH "$WORK/ref_$M.o"      "$WORK/h_${M}_x86_a.o"
+  check "$M x86 #2" MATCH "$WORK/ref_$M.o"      "$WORK/h_${M}_x86_b.o"
+  check "$M arm #1" MATCH "$WORK/ref_${M}_arm.o" "$WORK/h_${M}_arm_a.o"
+  check "$M arm #2" MATCH "$WORK/ref_${M}_arm.o" "$WORK/h_${M}_arm_b.o"
+done
+
+# Ordering B: the clean unit first. Harmless at mode 0 too, kept as the
+# control so an all-MATCH result above cannot be read as "the check is inert".
+gen_harness "$WORK/harness_b" sha256 hip
+echo "obj mode, EIGHT compiles in one process, ordering sha256 -> hip:"
+for M in sha256 hip; do
+  check "$M x86 #1" MATCH "$WORK/ref_$M.o"      "$WORK/h_${M}_x86_a.o"
+  check "$M x86 #2" MATCH "$WORK/ref_$M.o"      "$WORK/h_${M}_x86_b.o"
+  check "$M arm #1" MATCH "$WORK/ref_${M}_arm.o" "$WORK/h_${M}_arm_a.o"
+  check "$M arm #2" MATCH "$WORK/ref_${M}_arm.o" "$WORK/h_${M}_arm_b.o"
+done
+
 echo
 if [ "$FAIL" = 0 ]; then
   echo "PASS: boundary confirmed as expected -- obj mode is safe by construction (returns before"
   echo "the dyn_sym_count-gated branches); elfexe mode leaks dyn_sym_count one-directionally --"
   echo "a @dynamic module compiled BEFORE a clean module corrupts the clean module's output,"
   echo "the reverse order does not."
+  echo
+  echo "Boundary 3 (Task 6): the safety of obj mode holds at the verification harness's own"
+  echo "scale -- eight compiles of two different sources in one process, both orderings, both"
+  echo "targets, every object byte-identical to a single-shot reference. std/ therefore needs"
+  echo "NO outer per-compile driver process; lc --fix verifies std/ modules in-process."
 else
   echo "FAIL: re-entrancy behavior did not match the recorded boundary -- see MISMATCH lines above."
 fi

@@ -5873,6 +5873,85 @@ fi
 rm -f "$CA_SRC" "$CA_BIN"
 
 echo ""
+echo "--- lc build-unit mapping ---"
+# A file is verified as part of every BUILD UNIT that contains it, and the
+# membership is parsed out of the Makefile (SRCS and the build/mlr-runner.mlr
+# rule), never hardcoded -- SRCS differs per fork, and src/living.mlr /
+# src/living.kr are held at a one-line divergence. These tests must run with
+# the repo root as the working directory: that is where the Makefile is, and
+# $MLRC is a wrapper around a relative ./build/mlrc path.
+RR="$DIR/.."
+
+# std/net.mlr is imported by no example or test, and a synthesised driver for
+# it fails semantic analysis (net.mlr:153, dealloc/2 -- unrelated to any
+# migration). No build unit covers it, so lc must refuse to rewrite it rather
+# than abort halfway through verification. --dry-run on purpose: "nothing
+# covers this file" is a refusal to touch it at all, not a write-time verdict.
+TOTAL=$((TOTAL + 1))
+NET_OUT=$(cd "$RR" && $MLRC lc --fix --dry-run std/net.mlr 2>&1); NET_ST=$?
+if [ "$NET_ST" != "0" ] && echo "$NET_OUT" | grep -qi "no build unit"; then
+    PASS=$((PASS + 1)); echo "  lc_refuses_uncovered_file: PASS"
+else
+    echo "FAIL: lc_refuses_uncovered_file (exit $NET_ST, got '$NET_OUT')"; FAIL=$((FAIL + 1))
+fi
+
+# src/bcj.mlr is in BOTH units: SRCS (Makefile:17 -> build/mlrc.mlr) and the
+# build/mlr-runner.mlr rule (Makefile:40,42). Verifying against one leaves the
+# other unverified, so both must be reported and both must be checked.
+TOTAL=$((TOTAL + 1))
+BCJ_OUT=$(cd "$RR" && $MLRC lc --fix=types --dry-run src/bcj.mlr 2>&1 | grep "build units:")
+if echo "$BCJ_OUT" | grep -q "build/mlrc.mlr" && echo "$BCJ_OUT" | grep -q "build/mlr-runner.mlr"; then
+    PASS=$((PASS + 1)); echo "  lc_maps_file_to_every_unit: PASS"
+else
+    echo "FAIL: lc_maps_file_to_every_unit (got '$BCJ_OUT')"; FAIL=$((FAIL + 1))
+fi
+
+# std/sha256.mlr is a std/ module that is ALSO in SRCS (Makefile:18). It must
+# resolve to build/mlrc.mlr, not to a synthesised driver. This is the test
+# that fails if the mapping guesses from the path prefix instead of reading
+# the Makefile: no "src/ means mlrc.mlr" rule can get this file right.
+TOTAL=$((TOTAL + 1))
+SHA_OUT=$(cd "$RR" && $MLRC lc --fix=types --dry-run std/sha256.mlr 2>&1 | grep "build units:")
+if echo "$SHA_OUT" | grep -q "build/mlrc.mlr" && ! echo "$SHA_OUT" | grep -q "synthesised driver"; then
+    PASS=$((PASS + 1)); echo "  lc_srcs_membership_read_from_makefile: PASS"
+else
+    echo "FAIL: lc_srcs_membership_read_from_makefile (got '$SHA_OUT')"; FAIL=$((FAIL + 1))
+fi
+
+# A std/ module that no unit builds gets a synthesised `import` driver, and
+# that driver is verified IN THIS PROCESS -- no outer per-compile driver.
+# Measured, not assumed: tests/lc/run_spike.sh boundary 3 shows eight compiles
+# of two different sources in one process, both orderings, both targets, all
+# byte-identical to single-shot references at --emit=obj. The emit_mode-0
+# dyn_sym_count leak that would have forced an outer driver cannot reach the
+# object at emit_mode 3.
+#
+# The content is a byte copy of std/hip.mlr, the module the measurement names:
+# 17 @dynamic declarations, the exact input that corrupts a later compile at
+# emit_mode 0. It runs at a scratch path so an interrupted suite can never
+# leave a tracked file rewritten.
+TOTAL=$((TOTAL + 1))
+HIPC="$RR/std/lc_dynprobe_$$.mlr"
+cp "$RR/std/hip.mlr" "$HIPC"
+HIP_OUT=$(cd "$RR" && $MLRC lc --fix=types "std/lc_dynprobe_$$.mlr" 2>&1); HIP_ST=$?
+# The negative half checks no @dynamic DECLARATION still spells a long-form
+# type; the file's header comment still says `uint32` and must, because the
+# token rewriter never touches comments (lc_rewrite_preserves_string_literals).
+if [ "$HIP_ST" = "0" ] && echo "$HIP_OUT" | grep -q "synthesised driver" && \
+   grep -q "hipGetErrorString(u32 err) -> u64" "$HIPC" && \
+   ! grep -q "^@dynamic extern fn .*uint" "$HIPC"; then
+    PASS=$((PASS + 1)); echo "  lc_verifies_dynamic_std_module_in_process: PASS"
+else
+    echo "FAIL: lc_verifies_dynamic_std_module_in_process (exit $HIP_ST, got '$HIP_OUT')"; FAIL=$((FAIL + 1))
+fi
+
+# Scratch units are truncated, not deleted -- there is no portable delete
+# builtin (see the task-5 report). Clear the empty files this block leaves.
+rm -f "$RR"/std/lc_dynprobe_$$.mlr* "$RR"/std/net.mlr.lcunit_*.mlr \
+      "$RR"/std/sha256.mlr.lcverify.* "$RR"/src/bcj.mlr.lcverify.* \
+      "$RR"/build/mlrc.mlr.lcunit_*.mlr "$RR"/build/mlr-runner.mlr.lcunit_*.mlr
+
+echo ""
 echo "--- growable string pool ---"
 SP_SRC="/tmp/mlrc_strpool_$$.mlr"
 {
