@@ -1850,6 +1850,17 @@ fn mig_report_line(uint64 count, uint64 tag, uint64 input_path) {
 static uint64 mig_scratch_obj = 0
 static uint64 mig_scratch_src = 0
 
+// Build-unit table (Task 6). Declared here rather than beside the mapper
+// because mig_scratch_init below reads it to decide where scratch may live.
+static uint64 mig_root = 0        // path prefix from cwd to the repo root
+static uint64 mig_root_found = 0  // 1 if a Makefile was actually located
+static uint64 mig_uk = 0          // unit kinds
+static uint64 mig_up = 0          // unit paths (for messages and scratch names)
+static uint64 mig_um = 0          // unit member arrays (CONCAT only)
+static uint64 mig_un = 0          // unit member counts (CONCAT only)
+static uint64 mig_ucount = 0
+
+
 // Fault injection (--fix-inject-fault), for testing the rejection path only:
 // makes the type pass emit `f64` where a `uint64` site should become `u64`,
 // which genuinely changes emitted code (see mig_short_form for why not `u32`).
@@ -1875,10 +1886,46 @@ fn mig_path_join(uint64 base_path, uint64 suffix) -> uint64 {
     return p
 }
 
+// Choose where the two scratch files live. Scratch is truncated but never
+// deleted (there is no portable delete builtin), so WHERE it lands is a
+// correctness question, not a tidiness one: a stray artifact in a tracked
+// directory is exactly what a blind `git add -A` sweeps up.
+//
+//   - The throwaway .o always goes under <root>build/, which is gitignored,
+//     whenever a repo root was found. Nothing ever reads it back.
+//   - The staged rewrite goes under <root>build/ too WHEN EVERY UNIT IS
+//     CONCAT, because an assembled unit only ever reads it as bytes.
+//   - It must stay a SIBLING of the file for a SELF or MODULE unit, which is
+//     compiled directly: import_resolve() resolves `import "x.mlr"` relative
+//     to the importing file's directory, and 39 of 75 std/ modules have
+//     imports, so staging it elsewhere would silently change which files the
+//     verification compile pulls in -- or fall through to an installed
+//     stdlib copy. That residual is covered by a .gitignore rule.
+//
+// With no Makefile in reach (a standalone file in /tmp) both fall back beside
+// the file, which is the only directory known to be writable.
 @export
 fn mig_scratch_init(uint64 base_path) {
-    mig_scratch_obj = mig_path_join(base_path, ".lcverify.o")
-    mig_scratch_src = mig_path_join(base_path, ".lcverify.mlr")
+    uint64 sibling_src = 0
+    uint64 i = 0
+    while i < mig_ucount {
+        uint64 ks = mig_uk + i * 8
+        uint64 k = 0
+        unsafe { *(ks as uint64) -> k }
+        if k != 1 { sibling_src = 1 }
+        i = i + 1
+    }
+    if mig_root_found == 0 {
+        mig_scratch_obj = mig_path_join(base_path, ".lcverify.o")
+        mig_scratch_src = mig_path_join(base_path, ".lcverify.mlr")
+        return
+    }
+    mig_scratch_obj = mig_path_join(mig_root, "build/lcverify.o")
+    if sibling_src != 0 {
+        mig_scratch_src = mig_path_join(base_path, ".lcverify.mlr")
+        return
+    }
+    mig_scratch_src = mig_path_join(mig_root, "build/lcverify_src.mlr")
 }
 
 // Throwaway compile-output path. The bytes written there are never read --
@@ -1889,10 +1936,8 @@ fn mig_scratch_path() -> uint64 {
     return mig_scratch_obj
 }
 
-// Path the rewritten source is staged at. It is a SIBLING of the unit on
-// purpose: import_resolve() resolves `import "x.mlr"` relative to the
-// importing file's directory, so staging the rewrite anywhere else would
-// silently change which files the verification compile pulls in.
+// Path the rewritten source is staged at -- see mig_scratch_init for where
+// that is and why it is not always the same place.
 @export
 fn mig_scratch_src_path() -> uint64 {
     return mig_scratch_src
@@ -1900,8 +1945,9 @@ fn mig_scratch_src_path() -> uint64 {
 
 // Best-effort cleanup: truncate a scratch file to zero bytes. There is no
 // portable delete builtin (no unlink/remove; syscall_raw would be Linux-only),
-// so the two `.lcverify.*` files are left behind EMPTY and reused on the next
-// run rather than accumulating.
+// so scratch files are left behind EMPTY and reused on the next run rather
+// than accumulating. mig_scratch_init keeps them out of tracked directories
+// wherever the import rules allow it.
 fn mig_scratch_clear(uint64 path) {
     uint64 fd = file_open(path, 1)
     if fd > 0xFFFFFFFFFFFFF000 { return }
@@ -2015,32 +2061,33 @@ fn mig_verify_unit(uint64 unit_path, uint64 rewritten_path) -> uint64 {
 // Unit kinds:
 //   0 SELF   -- the file is its own unit: a standalone program defining main().
 //   1 CONCAT -- `cat` of an ordered member list taken from the Makefile.
-//   2 DRIVER -- the file is a module; the unit is a synthesised
-//               `import "<module>"` program written beside it.
+//   2 MODULE -- the file is a module (no main()); it IS its own unit, because
+//               --emit=obj compiles a bare module directly.
 //
 // Resolution order (1 and 2 can BOTH match; 3 and 4 are last-resort):
 //   1. listed in Makefile SRCS                 -> build/mlrc.mlr       (CONCAT)
 //   2. listed in the build/mlr-runner.mlr rule -> build/mlr-runner.mlr (CONCAT)
 //   3. defines main() at column 0              -> itself               (SELF)
-//   4. otherwise a module                      -> synthesised driver   (DRIVER)
+//   4. otherwise a module                      -> itself               (MODULE)
 //
-// Case 4 only counts if the synthesised driver actually BUILDS. A module that
-// cannot be compiled at all is covered by no build unit, and `lc --fix`
-// refuses to touch it instead of aborting halfway through verification.
-// std/net.mlr is that file here: it is imported by no example or test, and a
-// driver importing it fails semantic analysis at net.mlr:153 (dealloc/2).
+// Case 4 only counts if the module actually BUILDS. A module that cannot be
+// compiled at all is covered by no build unit, and `lc --fix` refuses to touch
+// it instead of aborting halfway through verification. std/net.mlr is that
+// file here: it fails semantic analysis at net.mlr:153 (dealloc/2).
+//
+// An earlier revision synthesised an `import "<module>"` driver program for
+// case 4 and wrote it beside the module. That is gone: relocatable emission
+// needs no entry point, so the module compiles on its own, and measured on
+// std/color.mlr and std/vec.mlr the driver emitted exactly 60 more bytes than
+// the module alone -- its own main() and nothing else, with no module code
+// dropped either way. Removing it costs no coverage and buys two things that
+// matter: --dry-run now writes NOTHING to disk, and nothing is ever created
+// inside tracked std/.
 //
 // Not-applicable targets are unchanged from Task 5 and are named rather than
 // silently skipped: riscv32 and xtensa have no relocatable writer wired
 // through compile() at all, and compile 7 of 75 std/ modules and 0 of src/.
 // Every unit here is verified on x86_64 and arm64 only.
-
-static uint64 mig_root = 0        // path prefix from cwd to the repo root
-static uint64 mig_uk = 0          // unit kinds
-static uint64 mig_up = 0          // unit paths (for messages and scratch names)
-static uint64 mig_um = 0          // unit member arrays (CONCAT only)
-static uint64 mig_un = 0          // unit member counts (CONCAT only)
-static uint64 mig_ucount = 0
 
 // Read a whole file. Returns 0 if it cannot be opened; otherwise a
 // NUL-terminated buffer, with the length stored through len_out.
@@ -2109,18 +2156,41 @@ fn mig_find_makefile(uint64 len_out) -> uint64 {
         uint64 buf = mig_read_all(path, len_out)
         if buf != 0 {
             mig_root = prefix
+            mig_root_found = 1
             return buf
         }
         i = i + 1
     }
     mig_root = ""
+    mig_root_found = 0
     return 0
+}
+
+// A cap that silently drops input is the defect class this harness exists to
+// prevent: a mapper that quietly loses the 257th SRCS entry would verify
+// against an incomplete unit and still report success. Every limit in this
+// file refuses out loud instead, naming the limit and what overflowed.
+fn mig_cap_exceeded(uint64 what, uint64 limit, uint64 dropped) {
+    uint64 m0 = "migration: too many "
+    write(2, m0, str_len(m0))
+    write(2, what, str_len(what))
+    uint64 m1 = " (limit "
+    write(2, m1, str_len(m1))
+    uint8[32] nb
+    uint64 nl = fmt_uint(nb, limit)
+    write(2, nb, nl)
+    uint64 m2 = "), refusing rather than verifying against an incomplete build unit; first dropped: "
+    write(2, m2, str_len(m2))
+    write(2, dropped, str_len(dropped))
+    write(2, "\n", 1)
+    exit(1)
 }
 
 // Collect whitespace-separated tokens starting at `pos` to the end of the
 // LOGICAL line, following backslash continuations. `$(...)` tokens are
 // skipped (a variable reference is not a file) and `#` ends collection.
-fn mig_mk_collect(uint64 mk, uint64 mk_len, uint64 pos, uint64 out_arr, uint64 max) -> uint64 {
+// Overflowing `max` is fatal, not truncating -- see mig_cap_exceeded.
+fn mig_mk_collect(uint64 mk, uint64 mk_len, uint64 pos, uint64 out_arr, uint64 max, uint64 label) -> uint64 {
     uint64 n = 0
     uint64 tstart = 0
     uint64 tlen = 0
@@ -2146,8 +2216,9 @@ fn mig_mk_collect(uint64 mk, uint64 mk_len, uint64 pos, uint64 out_arr, uint64 m
                 uint64 fc = 0
                 uint64 fp = mk + tstart
                 unsafe { *(fp as uint8) -> fc }
-                if fc != 36 && n < max {
+                if fc != 36 {
                     uint64 s = mig_substr(mk, tstart, tlen)
+                    if n >= max { mig_cap_exceeded(label, max, s) }
                     uint64 slot = out_arr + n * 8
                     unsafe { *(slot as uint64) = s }
                     n = n + 1
@@ -2164,12 +2235,13 @@ fn mig_mk_collect(uint64 mk, uint64 mk_len, uint64 pos, uint64 out_arr, uint64 m
         }
         pos = pos + 1
     }
-    if tlen != 0 && n < max {
+    if tlen != 0 {
         uint64 fc2 = 0
         uint64 fp2 = mk + tstart
         unsafe { *(fp2 as uint8) -> fc2 }
         if fc2 != 36 {
             uint64 s2 = mig_substr(mk, tstart, tlen)
+            if n >= max { mig_cap_exceeded(label, max, s2) }
             uint64 slot2 = out_arr + n * 8
             unsafe { *(slot2 as uint64) = s2 }
             n = n + 1
@@ -2179,11 +2251,15 @@ fn mig_mk_collect(uint64 mk, uint64 mk_len, uint64 pos, uint64 out_arr, uint64 m
 }
 
 // Value of make variable `name` (SRCS), split into tokens. Accepts `=`, `:=`
-// and `+=` at the assignment; only the first assignment is read.
+// and `+=`. The whole file is scanned: a SECOND assignment to the same
+// variable is refused rather than ignored, because reading only the first one
+// would silently drop every member a later `+=` adds.
 fn mig_mk_var(uint64 mk, uint64 mk_len, uint64 name, uint64 out_arr, uint64 max) -> uint64 {
     uint64 nl = str_len(name)
     uint64 pos = 0
     uint64 line_start = 1
+    uint64 found = 0
+    uint64 count = 0
     while pos < mk_len {
         if line_start != 0 && mig_text_eq(mk, pos, mk_len, name, nl) != 0 {
             uint64 q = pos + nl
@@ -2201,7 +2277,16 @@ fn mig_mk_var(uint64 mk, uint64 mk_len, uint64 name, uint64 out_arr, uint64 max)
             pc = mk + q
             unsafe { *(pc as uint8) -> c2 }
             if c2 == 61 {
-                return mig_mk_collect(mk, mk_len, q + 1, out_arr, max)
+                if found != 0 {
+                    uint64 d0 = "migration: "
+                    write(2, d0, str_len(d0))
+                    write(2, name, str_len(name))
+                    uint64 d1 = " is assigned more than once in the Makefile; refusing rather than reading only the first assignment\n"
+                    write(2, d1, str_len(d1))
+                    exit(1)
+                }
+                found = 1
+                count = mig_mk_collect(mk, mk_len, q + 1, out_arr, max, name)
             }
         }
         uint64 pp = mk + pos
@@ -2211,7 +2296,7 @@ fn mig_mk_var(uint64 mk, uint64 mk_len, uint64 name, uint64 out_arr, uint64 max)
         if c == 10 { line_start = 1 }
         pos = pos + 1
     }
-    return 0
+    return count
 }
 
 // Prerequisites of the rule whose target is exactly `target` at column 0.
@@ -2226,7 +2311,7 @@ fn mig_mk_rule(uint64 mk, uint64 mk_len, uint64 target, uint64 out_arr, uint64 m
             uint64 cq = 0
             unsafe { *(pq as uint8) -> cq }
             if cq == 58 {
-                return mig_mk_collect(mk, mk_len, q + 1, out_arr, max)
+                return mig_mk_collect(mk, mk_len, q + 1, out_arr, max, target)
             }
         }
         uint64 pp = mk + pos
@@ -2272,20 +2357,6 @@ fn mig_list_has(uint64 arr, uint64 n, uint64 path) -> uint64 {
     return 0
 }
 
-// Last path component of `path` (the pointer is into `path`, not a copy).
-fn mig_basename(uint64 path) -> uint64 {
-    uint64 l = str_len(path)
-    uint64 i = l
-    while i > 0 {
-        uint64 cp = (path + i) - 1
-        uint64 c = 0
-        unsafe { *(cp as uint8) -> c }
-        if c == 47 { return path + i }
-        i = i - 1
-    }
-    return path
-}
-
 // Does the source define a top-level main()? Column 0 only: `fn main` inside
 // a comment (std/hip.mlr's header has one) is indented and must not count.
 fn mig_has_main(uint64 src, uint64 len) -> uint64 {
@@ -2301,23 +2372,6 @@ fn mig_has_main(uint64 src, uint64 len) -> uint64 {
         pos = pos + 1
     }
     return 0
-}
-
-// Write the synthesised driver: a program whose only content is an import of
-// the module under test. `import "x.mlr"` resolves relative to the IMPORTING
-// file's directory, so the driver must be a sibling of the module -- which is
-// also why the rewritten module is staged as a sibling (see Task 5).
-fn mig_driver_write(uint64 out_path, uint64 name) -> uint64 {
-    uint64 buf = alloc(str_len(name) + 64)
-    uint8[8] pbuf
-    uint64 pp = pbuf
-    unsafe { *(pp as uint64) = 0 }
-    mig_append_str(buf, pp, "import \"")
-    mig_append_str(buf, pp, name)
-    mig_append_str(buf, pp, "\"\nfn main() { exit(0) }\n")
-    uint64 n = 0
-    unsafe { *(pp as uint64) -> n }
-    return mig_write_all(out_path, buf, n)
 }
 
 // Rebuild a CONCAT unit by concatenating its members in Makefile order --
@@ -2380,7 +2434,7 @@ fn mig_assemble(uint64 out_path, uint64 mem, uint64 memn, uint64 target, uint64 
 }
 
 fn mig_add_unit(uint64 kind, uint64 path, uint64 mem, uint64 memn) {
-    if mig_ucount >= 4 { return }
+    if mig_ucount >= 4 { mig_cap_exceeded("build units for one file", 4, path) }
     uint64 ks = mig_uk + mig_ucount * 8
     unsafe { *(ks as uint64) = kind }
     uint64 ps = mig_up + mig_ucount * 8
@@ -2430,16 +2484,14 @@ fn mig_resolve_units(uint64 input_path, uint64 src_buf, uint64 src_len) -> uint6
         return 1
     }
 
-    // A module. Its unit is a driver we synthesise -- but only if that driver
-    // builds. unit_front_end_errors runs import + lex + parse + sema and
-    // RETURNS the error count rather than exiting, which is the only way to
-    // ask the question without killing this process (compile() exits on every
-    // error, and exec_process_argv is execve, not fork).
-    uint64 drv = mig_path_join(input_path, ".lcunit_a.mlr")
-    if mig_driver_write(drv, mig_basename(input_path)) == 0 { return 0 }
-    uint64 errs = unit_front_end_errors(drv)
-    mig_scratch_clear(drv)
-    if errs != 0 { return 0 }
+    // A module: it is its own unit, but only if it BUILDS.
+    // unit_front_end_errors runs import + lex + parse + sema and RETURNS the
+    // error count rather than exiting, which is the only way to ask the
+    // question without killing this process (compile() exits on every error,
+    // and exec_process_argv is execve, not fork). It reads the module in
+    // place and writes nothing, so resolution -- including the --dry-run
+    // path -- leaves the working tree untouched.
+    if unit_front_end_errors(input_path) != 0 { return 0 }
     mig_add_unit(2, input_path, 0, 0)
     return 1
 }
@@ -2463,7 +2515,7 @@ fn mig_print_units() {
             write(1, t0, str_len(t0))
         }
         if k == 2 {
-            uint64 t2 = " (synthesised driver)"
+            uint64 t2 = " (module)"
             write(1, t2, str_len(t2))
         }
         i = i + 1
@@ -2499,12 +2551,8 @@ fn mig_verify_all_units(uint64 input_path, uint64 rewritten_path) -> uint64 {
             if mig_assemble(ua, mem, memn, input_path, 0) == 0 { return 0 }
             if mig_assemble(ub, mem, memn, input_path, rewritten_path) == 0 { return 0 }
         }
-        if kind == 2 {
-            ua = mig_path_join(input_path, ".lcunit_a.mlr")
-            ub = mig_path_join(input_path, ".lcunit_b.mlr")
-            if mig_driver_write(ua, mig_basename(input_path)) == 0 { return 0 }
-            if mig_driver_write(ub, mig_basename(rewritten_path)) == 0 { return 0 }
-        }
+        // kind 0 (SELF) and kind 2 (MODULE) both compile the file itself
+        // against the staged rewrite, so ua/ub keep their initial values.
 
         if mig_verify_unit(ua, ub) == 0 {
             ok = 0
@@ -2513,7 +2561,10 @@ fn mig_verify_all_units(uint64 input_path, uint64 rewritten_path) -> uint64 {
             write(2, upath, str_len(upath))
             write(2, "\n", 1)
         }
-        if kind != 0 {
+        // ONLY kind 1 may be cleared. For kinds 0 and 2, `ua` IS the user's
+        // file and `ub` is the shared staged rewrite that later units still
+        // need -- truncating either here would destroy the input.
+        if kind == 1 {
             mig_scratch_clear(ua)
             mig_scratch_clear(ub)
         }

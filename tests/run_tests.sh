@@ -5912,14 +5912,15 @@ fi
 # the Makefile: no "src/ means mlrc.mlr" rule can get this file right.
 TOTAL=$((TOTAL + 1))
 SHA_OUT=$(cd "$RR" && $MLRC lc --fix=types --dry-run std/sha256.mlr 2>&1 | grep "build units:")
-if echo "$SHA_OUT" | grep -q "build/mlrc.mlr" && ! echo "$SHA_OUT" | grep -q "synthesised driver"; then
+if echo "$SHA_OUT" | grep -q "build/mlrc.mlr" && ! echo "$SHA_OUT" | grep -q "(module)"; then
     PASS=$((PASS + 1)); echo "  lc_srcs_membership_read_from_makefile: PASS"
 else
     echo "FAIL: lc_srcs_membership_read_from_makefile (got '$SHA_OUT')"; FAIL=$((FAIL + 1))
 fi
 
-# A std/ module that no unit builds gets a synthesised `import` driver, and
-# that driver is verified IN THIS PROCESS -- no outer per-compile driver.
+# A std/ module that no Makefile unit covers IS its own build unit (--emit=obj
+# needs no entry point), and it is verified IN THIS PROCESS -- no outer
+# per-compile driver process.
 # Measured, not assumed: tests/lc/run_spike.sh boundary 3 shows eight compiles
 # of two different sources in one process, both orderings, both targets, all
 # byte-identical to single-shot references at --emit=obj. The emit_mode-0
@@ -5937,7 +5938,7 @@ HIP_OUT=$(cd "$RR" && $MLRC lc --fix=types "std/lc_dynprobe_$$.mlr" 2>&1); HIP_S
 # The negative half checks no @dynamic DECLARATION still spells a long-form
 # type; the file's header comment still says `uint32` and must, because the
 # token rewriter never touches comments (lc_rewrite_preserves_string_literals).
-if [ "$HIP_ST" = "0" ] && echo "$HIP_OUT" | grep -q "synthesised driver" && \
+if [ "$HIP_ST" = "0" ] && echo "$HIP_OUT" | grep -q "(module)" && \
    grep -q "hipGetErrorString(u32 err) -> u64" "$HIPC" && \
    ! grep -q "^@dynamic extern fn .*uint" "$HIPC"; then
     PASS=$((PASS + 1)); echo "  lc_verifies_dynamic_std_module_in_process: PASS"
@@ -5945,11 +5946,66 @@ else
     echo "FAIL: lc_verifies_dynamic_std_module_in_process (exit $HIP_ST, got '$HIP_OUT')"; FAIL=$((FAIL + 1))
 fi
 
-# Scratch units are truncated, not deleted -- there is no portable delete
-# builtin (see the task-5 report). Clear the empty files this block leaves.
-rm -f "$RR"/std/lc_dynprobe_$$.mlr* "$RR"/std/net.mlr.lcunit_*.mlr \
-      "$RR"/std/sha256.mlr.lcverify.* "$RR"/src/bcj.mlr.lcverify.* \
+# Scratch is truncated, not deleted -- there is no portable delete builtin
+# (see the task-5 report). Everything that CAN live under the gitignored
+# build/ does; the staged rewrite beside a directly-compiled unit cannot move
+# (import resolution) and is covered by a .gitignore rule. Clear both here.
+rm -f "$RR"/std/lc_dynprobe_$$.mlr* "$RR"/std/hip.mlr.lcverify.mlr \
+      "$RR"/build/lcverify.o "$RR"/build/lcverify_src.mlr \
       "$RR"/build/mlrc.mlr.lcunit_*.mlr "$RR"/build/mlr-runner.mlr.lcunit_*.mlr
+
+# --dry-run previews without writing. It must therefore create NOTHING, in
+# particular not inside tracked std/ -- this project has a recorded incident
+# where a blind `git add -A` swept 767 stray files into a public commit, so a
+# scratch file in a tracked directory is a live hazard, not untidiness.
+TOTAL=$((TOTAL + 1))
+BEFORE=$(ls -A "$RR/std" | wc -l)
+(cd "$RR" && $MLRC lc --fix=types --dry-run std/color.mlr >/dev/null 2>&1)
+(cd "$RR" && $MLRC lc --fix --dry-run std/net.mlr >/dev/null 2>&1)
+AFTER=$(ls -A "$RR/std" | wc -l)
+if [ "$BEFORE" = "$AFTER" ]; then
+    PASS=$((PASS + 1)); echo "  lc_dry_run_creates_no_files: PASS"
+else
+    echo "FAIL: lc_dry_run_creates_no_files (std/ went from $BEFORE to $AFTER entries)"
+    ls -A "$RR/std" | grep -i lcverify; FAIL=$((FAIL + 1))
+fi
+
+# Every cap in the mapper must refuse out loud. A cap that silently truncates
+# would let the harness verify against an INCOMPLETE unit set and still report
+# success -- the exact overclaim this verification exists to prevent, and the
+# same "length asserted rather than derived" family as the .strtab overflow
+# and the str_buf cap fixed earlier on this branch.
+#
+# Uses an absolute compiler path on purpose: the cap is reached by walking up
+# from the working directory to a Makefile, so these run from a scratch dir,
+# and $MLRC is a wrapper around a relative ./build/mlrc.
+MLRC_ABS="$(cd "$RR" && pwd)/build/mlrc"
+CAPD="/tmp/mlrc_lccap_$$"
+rm -rf "$CAPD"; mkdir -p "$CAPD/src"
+printf 'fn helper(uint64 a) -> uint64 {\n    return a\n}\n' > "$CAPD/src/x.mlr"
+
+TOTAL=$((TOTAL + 1))
+{ printf 'SRCS = src/x.mlr'
+  i=0; while [ $i -lt 300 ]; do printf ' src/f%s.mlr' $i; i=$((i+1)); done
+  printf '\n\nall:\n\t@true\n'; } > "$CAPD/Makefile"
+CAP_OUT=$(cd "$CAPD" && "$MLRC_ABS" --arch=x86_64 lc --fix=types --dry-run src/x.mlr 2>&1); CAP_ST=$?
+if [ "$CAP_ST" != "0" ] && echo "$CAP_OUT" | grep -q "too many SRCS (limit 256)"; then
+    PASS=$((PASS + 1)); echo "  lc_srcs_cap_refuses_loudly: PASS"
+else
+    echo "FAIL: lc_srcs_cap_refuses_loudly (exit $CAP_ST, got '$CAP_OUT')"; FAIL=$((FAIL + 1))
+fi
+
+# Reading only the first assignment would silently drop everything a later
+# `+=` adds, so a second assignment is refused rather than ignored.
+TOTAL=$((TOTAL + 1))
+printf 'SRCS = src/x.mlr src/a.mlr\nSRCS += src/b.mlr\n\nall:\n\t@true\n' > "$CAPD/Makefile"
+CAP2_OUT=$(cd "$CAPD" && "$MLRC_ABS" --arch=x86_64 lc --fix=types --dry-run src/x.mlr 2>&1); CAP2_ST=$?
+if [ "$CAP2_ST" != "0" ] && echo "$CAP2_OUT" | grep -q "assigned more than once"; then
+    PASS=$((PASS + 1)); echo "  lc_double_srcs_assignment_refused: PASS"
+else
+    echo "FAIL: lc_double_srcs_assignment_refused (exit $CAP2_ST, got '$CAP2_OUT')"; FAIL=$((FAIL + 1))
+fi
+rm -rf "$CAPD"
 
 echo ""
 echo "--- growable string pool ---"
