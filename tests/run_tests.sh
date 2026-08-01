@@ -5873,6 +5873,159 @@ fi
 rm -f "$CA_SRC" "$CA_BIN"
 
 echo ""
+echo "--- lc --fix migration split ---"
+
+# --fix=types must never touch a ptrops site: the unsafe{} block stays
+# unsafe{} (only its `uint64` cast keyword gets renamed to `u64`, since that
+# is a real long-form type token like any other -- "load64" text must never
+# appear because the ptrops pass does not run at all).
+TOTAL=$((TOTAL + 1))
+LCT="/tmp/mlrc_lctypes_$$.mlr"
+cat > "$LCT" <<'EOF'
+fn main() {
+    uint64 v = 0
+    u64 p = alloc(8)
+    unsafe { *(p as uint64) -> v }
+    exit(0)
+}
+EOF
+OUT_T=$($MLRC lc --fix=types --dry-run "$LCT" 2>&1 | grep -c "load64")
+if [ "$OUT_T" = "0" ]; then
+    PASS=$((PASS + 1)); echo "  lc_fix_types_leaves_ptrops: PASS"
+else
+    echo "FAIL: lc_fix_types_leaves_ptrops (--fix=types rewrote a pointer op)"; FAIL=$((FAIL + 1))
+fi
+rm -f "$LCT"
+
+# Symmetric case: --fix=ptrops must never touch a standalone long-form type
+# declaration outside an unsafe{} block, even though it DOES still convert
+# the unsafe{} block itself (mig_parse_type understands both spellings, so
+# `as uint64` still resolves to load64 without the type pass having run).
+TOTAL=$((TOTAL + 1))
+LCP="/tmp/mlrc_lcptrops_$$.mlr"
+cat > "$LCP" <<'EOF'
+fn main() {
+    uint64 v = 0
+    u64 p = alloc(8)
+    unsafe { *(p as uint64) -> v }
+    exit(0)
+}
+EOF
+OUT_P=$($MLRC lc --fix=ptrops --dry-run "$LCP" 2>&1)
+if echo "$OUT_P" | grep -q "load64" && ! echo "$OUT_P" | grep -q "u64 v = 0"; then
+    PASS=$((PASS + 1)); echo "  lc_fix_ptrops_leaves_types: PASS"
+else
+    echo "FAIL: lc_fix_ptrops_leaves_types (expected load64 present, standalone uint64->u64 absent)"; FAIL=$((FAIL + 1))
+fi
+rm -f "$LCP"
+
+# Task 3's review found run_migration double-counting compound sites: an
+# unsafe{} block whose cast uses a long-form type (`as uint32`) gets counted
+# once by the type pass (a real KwUint32 token) and again by the ptrops pass
+# (the whole block's conversion), so 3 standalone long-form declarations
+# plus 1 combined block used to report "5 migration site(s)" instead of a
+# defensible 4. Each flag must report only its own pass's count, and bare
+# --fix must not sum them into a single inflated total.
+TOTAL=$((TOTAL + 1))
+LCD="/tmp/mlrc_lcdup_$$.mlr"
+cat > "$LCD" <<'EOF'
+fn main() {
+    uint64 a = 1
+    uint32 b = 2
+    uint16 c = 3
+    u64 p = alloc(8)
+    u64 v = 0
+    unsafe { *(p as uint64) -> v }
+    exit(0)
+}
+EOF
+OUT_D=$($MLRC lc --fix --dry-run "$LCD" 2>&1)
+if echo "$OUT_D" | grep -q "4 migration site(s) rewritten (type)" && \
+   echo "$OUT_D" | grep -q "1 migration site(s) rewritten (ptrops)" && \
+   ! echo "$OUT_D" | grep -q "5 migration site(s)"; then
+    PASS=$((PASS + 1)); echo "  lc_fix_reports_no_double_count: PASS"
+else
+    echo "FAIL: lc_fix_reports_no_double_count (bare --fix double-counted a compound site)"
+    echo "$OUT_D"
+    FAIL=$((FAIL + 1))
+fi
+rm -f "$LCD"
+
+# --fix=types and --fix=ptrops must each report only their own count on the
+# same compound file, with no cross-contamination between the two flags.
+TOTAL=$((TOTAL + 1))
+LCS="/tmp/mlrc_lcsolo_$$.mlr"
+cat > "$LCS" <<'EOF'
+fn main() {
+    uint64 a = 1
+    uint32 b = 2
+    uint16 c = 3
+    u64 p = alloc(8)
+    u64 v = 0
+    unsafe { *(p as uint64) -> v }
+    exit(0)
+}
+EOF
+OUT_ST=$($MLRC lc --fix=types --dry-run "$LCS" 2>&1 | head -1)
+cp "$LCS" "${LCS}.p"
+OUT_SP=$($MLRC lc --fix=ptrops --dry-run "${LCS}.p" 2>&1 | head -1)
+if [ "$OUT_ST" = "migration: 4 migration site(s) rewritten" ] && \
+   [ "$OUT_SP" = "migration: 1 migration site(s) rewritten" ]; then
+    PASS=$((PASS + 1)); echo "  lc_fix_scopes_report_own_count: PASS"
+else
+    echo "FAIL: lc_fix_scopes_report_own_count (got types='$OUT_ST' ptrops='$OUT_SP')"; FAIL=$((FAIL + 1))
+fi
+rm -f "$LCS" "${LCS}.p"
+
+# --fix=ptrops writes back to the file and the result must still compile and
+# run -- exercises the write path (not just --dry-run) for the split flag.
+TOTAL=$((TOTAL + 1))
+LCW="/tmp/mlrc_lcwrite_$$.mlr"
+cat > "$LCW" <<'EOF'
+fn main() {
+    u64 buf = alloc(16)
+    u64 v = 0
+    store32(buf, 42)
+    unsafe { *(buf as u32) -> v }
+    exit(v)
+}
+EOF
+if $MLRC lc --fix=ptrops "$LCW" > /dev/null 2>&1; then
+    if grep -q "v = load32(buf)" "$LCW"; then
+        if $MLRC $MLRC_FLAGS "$LCW" -o /tmp/mlrc_lcwrite_bin_$$ > /dev/null 2>&1; then
+            chmod +x /tmp/mlrc_lcwrite_bin_$$
+            /tmp/mlrc_lcwrite_bin_$$ > /dev/null 2>&1
+            if [ "$?" = "42" ]; then
+                PASS=$((PASS + 1)); echo "  lc_fix_ptrops_write_compiles: PASS"
+            else
+                echo "FAIL: lc_fix_ptrops_write_compiles (rewritten binary exit != 42)"; FAIL=$((FAIL + 1))
+            fi
+        else
+            echo "FAIL: lc_fix_ptrops_write_compiles (rewritten file did not compile)"; FAIL=$((FAIL + 1))
+        fi
+    else
+        echo "FAIL: lc_fix_ptrops_write_compiles (file was not rewritten)"; FAIL=$((FAIL + 1))
+    fi
+else
+    echo "FAIL: lc_fix_ptrops_write_compiles (command failed)"; FAIL=$((FAIL + 1))
+fi
+rm -f "$LCW" /tmp/mlrc_lcwrite_bin_$$
+
+# Unknown --fix= value must be a clean, non-zero-exit diagnostic, not a
+# silent no-op or a crash.
+TOTAL=$((TOTAL + 1))
+LCB="/tmp/mlrc_lcbad_$$.mlr"
+printf 'fn main() {\n    exit(0)\n}\n' > "$LCB"
+LCB_ERR=$($MLRC lc --fix=bogus --dry-run "$LCB" 2>&1); LCB_ST=$?
+if [ "$LCB_ST" != "0" ] && echo "$LCB_ERR" | grep -q "unknown --fix="; then
+    PASS=$((PASS + 1)); echo "  lc_fix_unknown_scope_rejected: PASS"
+else
+    echo "FAIL: lc_fix_unknown_scope_rejected (expected non-zero + diagnostic, got exit $LCB_ST: '$LCB_ERR')"
+    FAIL=$((FAIL + 1))
+fi
+rm -f "$LCB"
+
+echo ""
 echo "--- lc token-driven site scan ---"
 LCS_SRC="/tmp/mlrc_lcscan_$$.mlr"
 cat > "$LCS_SRC" <<'EOF'

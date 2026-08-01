@@ -1581,23 +1581,28 @@ fn mig_append_width(uint64 dst, uint64 dst_pos_ptr, uint64 width) {
     if width == 8 { mig_append_str(dst, dst_pos_ptr, "64") }
 }
 
-// Unsafe-pointer-op migration pass. Scans `source` for `unsafe { *(EXPR as
-// TYPE) -> DEST }` / `unsafe { *(EXPR as TYPE) = VAL }` blocks and rewrites
-// them to `DEST = loadN(EXPR)` / `storeN(EXPR, VAL)`. Returns
-// (bytes_written, matches_applied). If dry_run is non-zero, nothing is
-// written, but matches are still counted.
+// Unsafe-pointer-op migration pass, selected by `--fix=ptrops` (bare `--fix`
+// runs it too, alongside mig_tok_rewrite). Scans `source` for `unsafe {
+// *(EXPR as TYPE) -> DEST }` / `unsafe { *(EXPR as TYPE) = VAL }` blocks and
+// rewrites them to `DEST = loadN(EXPR)` / `storeN(EXPR, VAL)`. Returns
+// bytes_written; the number of blocks converted is written to
+// `matches_out`.
 //
 // This used to ALSO rewrite long-form type keywords (uint8..int64) by
 // scanning raw bytes for the substring, which could not tell code from a
 // string or comment -- on src/lexer.mlr it corrupted the literal inside
 // match_keyword(start, len, "uint64", 6), leaving the length argument at 6
 // while the string shrank to "u64", so the keyword stopped matching either
-// spelling. That half moved to the token-driven mig_tok_rewrite (see below);
-// run_migration now runs both passes. This pass still walks raw bytes for
-// the `unsafe` keyword itself -- Task 4 is expected to give it the same
-// token-driven treatment.
+// spelling. That half moved to the token-driven mig_tok_rewrite (see below)
+// and Task 4 gave the two migrations independent `--fix=types` /
+// `--fix=ptrops` flags. This pass, now named mig_ptrops_rewrite, still walks
+// raw bytes for the `unsafe` keyword itself and the TYPE it casts to -- it
+// is therefore just as unaware of comments and string literals as the old
+// combined pass was, and just as capable of corrupting them. Converting it
+// to the token-driven approach is a follow-on, deliberately out of scope
+// here; `--fix=ptrops`'s help text says so.
 @export
-fn mig_scan_and_rewrite(uint64 source, uint64 src_size, uint64 out_buf_a, uint64 matches_out) -> uint64 {
+fn mig_ptrops_rewrite(uint64 source, uint64 src_size, uint64 out_buf_a, uint64 matches_out) -> uint64 {
     uint64 sp_pos = 0
     uint64 dp = 0
     uint64 last_copied = 0
@@ -1796,10 +1801,45 @@ fn mig_scan_and_rewrite(uint64 source, uint64 src_size, uint64 out_buf_a, uint64
     return dp
 }
 
-// Run the migration engine on `input_path`. If dry_run, print the rewritten
-// source and match count to stdout. If not, write back to the file.
+// Print one "migration: N migration site(s) rewritten" line to fd 1,
+// optionally tagged with `tag` (e.g. " (type)" / " (ptrops)", or "" for the
+// untagged single-migration form) and optionally followed by " in <path>"
+// when `input_path` is non-zero (write-mode; dry-run passes 0). Shared by
+// both dry-run and write-mode reporting so the two stay in sync.
+fn mig_report_line(uint64 count, uint64 tag, uint64 input_path) {
+    write(1, "migration: ", 11)
+    uint8[32] nb
+    uint64 nl = fmt_uint(nb, count)
+    write(1, nb, nl)
+    uint64 mid = " migration site(s) rewritten"
+    write(1, mid, str_len(mid))
+    if input_path != 0 {
+        uint64 in_kw = " in "
+        write(1, in_kw, str_len(in_kw))
+        write(1, input_path, str_len(input_path))
+    }
+    write(1, tag, str_len(tag))
+    write(1, "\n", 1)
+}
+
+// Run the migration engine on `input_path`. `fix_scope` selects which
+// migration(s) run: 0 = both (bare --fix), 1 = types only (--fix=types),
+// 2 = ptrops only (--fix=ptrops). If dry_run, print the rewritten source and
+// match count(s) to stdout. If not, write back to the file.
+//
+// Each pass reports only the sites IT rewrote. Task 3's review found that
+// summing the two passes' counts for bare --fix double-counts a compound
+// site: `unsafe { *(p as uint32) -> v }` is one logical edit, but the type
+// pass counts the `uint32` token (a real KwUint32 site regardless of being
+// inside an unsafe block) while the ptrops pass separately counts the whole
+// block's conversion to load32 -- one edit reported as two. Rather than
+// invent a de-duplicated total (which would need to distinguish a migrated
+// type keyword from same-length non-migration cast keywords like `byte`/
+// `addr`, itself a source of bugs), bare --fix reports the two counts
+// separately and un-summed. That is honest: neither number is wrong, and
+// nothing claims to be a single deduplicated site count that isn't.
 @export
-fn run_migration(uint64 input_path, uint64 dry_run) {
+fn run_migration(uint64 input_path, uint64 dry_run, uint64 fix_scope) {
     uint64 fd = file_open(input_path, 0)
     if fd > 0xFFFFFFFFFFFFF000 {
         write(2, "error: cannot open input file\n", 30)
@@ -1813,41 +1853,78 @@ fn run_migration(uint64 input_path, uint64 dry_run) {
     uint8 z = 0
     unsafe { *(tp as uint8) = z }
 
-    // Pass 1: token-driven rewrite of long-form type keywords (uint8/16/
-    // 32/64 -> u8/u16/u32/u64). Only real KwUint* tokens at their long-form
-    // length are sites, so comments and string/f-string contents are never
-    // touched -- this is what fixes the match_keyword("uint64", 6)
-    // corruption the old byte-scanner caused. A rewrite only ever shrinks
-    // the source, so fsize + 1 bounds the output.
-    uint64 sites_probe = alloc(MIG_SITE_CAP * 8)
-    uint64 type_matches = mig_tok_scan(src_buf, fsize, sites_probe)
-    dealloc(sites_probe)
-    uint64 buf1 = alloc(fsize + 1)
-    uint64 size1 = mig_tok_rewrite(src_buf, fsize, buf1)
-    dealloc(src_buf)
-
-    // Pass 2: byte-level rewrite of unsafe{}-pointer-op blocks into
-    // load*/store* calls, over the already-type-rewritten buffer. Worst-case
-    // output: every unsafe{} block becomes a slightly longer form (never
-    // more than 2x), so 4x is a safe upper bound.
-    uint64 out_buf_m = alloc(size1 * 4 + 1024)
+    uint64 type_matches = 0
     uint64 unsafe_matches = 0
-    uint8[8] mbuf
-    uint64 m_addr = mbuf
-    unsafe { *(m_addr as uint64) = 0 }
+    uint64 out_buf_m = 0
+    uint64 new_size = 0
 
-    uint64 new_size = mig_scan_and_rewrite(buf1, size1, out_buf_m, m_addr)
-    unsafe { *(m_addr as uint64) -> unsafe_matches }
-    dealloc(buf1)
-    uint64 matches = type_matches + unsafe_matches
+    if fix_scope == 1 {
+        // --fix=types only: token-driven rewrite of long-form type keywords
+        // (uint8/16/32/64 -> u8/u16/u32/u64), nothing else runs. Only real
+        // KwUint*/KwInt* tokens at their long-form length are sites, so
+        // comments and string/f-string contents are never touched. A
+        // rewrite only ever shrinks the source, so fsize + 1 bounds it.
+        uint64 buf1 = alloc(fsize + 1)
+        uint8[8] tmbuf
+        uint64 tm_addr = tmbuf
+        unsafe { *(tm_addr as uint64) = 0 }
+        uint64 size1 = mig_tok_rewrite(src_buf, fsize, buf1, tm_addr)
+        unsafe { *(tm_addr as uint64) -> type_matches }
+        dealloc(src_buf)
+        out_buf_m = buf1
+        new_size = size1
+    } else if fix_scope == 2 {
+        // --fix=ptrops only: raw byte-scan rewrite of unsafe{}-pointer-op
+        // blocks into load*/store* calls, run directly over the ORIGINAL
+        // source -- the type pass does not run, so long-form type keywords
+        // outside a ptrops block are left alone. mig_parse_type already
+        // understands both spellings, so a cast like `as uint64` still
+        // converts correctly. Worst case a block becomes slightly longer
+        // (never more than 2x), so 4x is a safe upper bound.
+        uint64 out_p = alloc(fsize * 4 + 1024)
+        uint8[8] mbuf
+        uint64 m_addr = mbuf
+        unsafe { *(m_addr as uint64) = 0 }
+        uint64 nsz = mig_ptrops_rewrite(src_buf, fsize, out_p, m_addr)
+        unsafe { *(m_addr as uint64) -> unsafe_matches }
+        dealloc(src_buf)
+        out_buf_m = out_p
+        new_size = nsz
+    } else {
+        // Bare --fix: both passes, type-alias pass first so the ptrops pass
+        // sees a source with consistent offsets to rewrite over.
+        uint64 buf1 = alloc(fsize + 1)
+        uint8[8] tmbuf
+        uint64 tm_addr = tmbuf
+        unsafe { *(tm_addr as uint64) = 0 }
+        uint64 size1 = mig_tok_rewrite(src_buf, fsize, buf1, tm_addr)
+        unsafe { *(tm_addr as uint64) -> type_matches }
+        dealloc(src_buf)
+
+        uint64 out_p2 = alloc(size1 * 4 + 1024)
+        uint8[8] mbuf2
+        uint64 m_addr2 = mbuf2
+        unsafe { *(m_addr2 as uint64) = 0 }
+        uint64 nsz2 = mig_ptrops_rewrite(buf1, size1, out_p2, m_addr2)
+        unsafe { *(m_addr2 as uint64) -> unsafe_matches }
+        dealloc(buf1)
+        out_buf_m = out_p2
+        new_size = nsz2
+    }
+
+    uint64 any_sites = 0
+    if type_matches != 0 { any_sites = 1 }
+    if unsafe_matches != 0 { any_sites = 1 }
 
     if dry_run != 0 {
-        // Print matches count and the first 1K of the rewritten file
-        write(1, "migration: ", 11)
-        uint8[32] nb
-        uint64 nl = fmt_uint(nb, matches)
-        write(1, nb, nl)
-        write(1, " migration site(s) rewritten\n", 34)
+        if fix_scope == 1 {
+            mig_report_line(type_matches, "", 0)
+        } else if fix_scope == 2 {
+            mig_report_line(unsafe_matches, "", 0)
+        } else {
+            mig_report_line(type_matches, " (type)", 0)
+            mig_report_line(unsafe_matches, " (ptrops)", 0)
+        }
         write(1, "--- dry-run output preview (first 512 bytes) ---\n", 49)
         uint64 preview = new_size
         if preview > 512 { preview = 512 }
@@ -1856,7 +1933,7 @@ fn run_migration(uint64 input_path, uint64 dry_run) {
         return
     }
 
-    if matches == 0 {
+    if any_sites == 0 {
         write(1, "migration: no sites found\n", 26)
         return
     }
@@ -1864,35 +1941,27 @@ fn run_migration(uint64 input_path, uint64 dry_run) {
     // Write rewritten source back to the same file
     uint64 ofd = file_open(input_path, 1)
     if ofd > 0xFFFFFFFFFFFFF000 {
-        write(2, "error: cannot open output file for writing\n", 44)
+        write(2, "error: cannot open output file for writing\n", 43)
         exit(1)
     }
     file_write(ofd, out_buf_m, new_size)
     file_close(ofd)
 
-    write(1, "migration: ", 11)
-    uint8[32] nb2
-    uint64 nl2 = fmt_uint(nb2, matches)
-    write(1, nb2, nl2)
-    write(1, " migration site(s) rewritten in ", 32)
-    uint64 pl = 0
-    uint64 pp = input_path
-    uint64 pc = 0
-    unsafe { *(pp as uint8) -> pc }
-    while pc != 0 {
-        pl = pl + 1
-        pp = input_path + pl
-        unsafe { *(pp as uint8) -> pc }
+    if fix_scope == 1 {
+        mig_report_line(type_matches, "", input_path)
+    } else if fix_scope == 2 {
+        mig_report_line(unsafe_matches, "", input_path)
+    } else {
+        mig_report_line(type_matches, " (type)", input_path)
+        mig_report_line(unsafe_matches, " (ptrops)", input_path)
     }
-    write(1, input_path, pl)
-    write(1, "\n", 1)
 }
 
 // ---------------------------------------------------------------------------
 // Token-driven site scanner (Task 2)
 // ---------------------------------------------------------------------------
 //
-// The byte-scanner above (mig_scan_and_rewrite) walks raw source bytes, so it
+// The byte-scanner above (mig_ptrops_rewrite) walks raw source bytes, so it
 // cannot tell code from comments or string contents -- on src/lexer.mlr it
 // rewrites the *literal* "uint64" inside match_keyword("uint64", 6) too,
 // corrupting the string while leaving the length argument at 6. This scanner
@@ -1964,7 +2033,7 @@ fn mig_tok_scan(uint64 source, uint64 src_size, uint64 sites_out) -> uint64 {
 // Token-driven rewriter (Task 3)
 // ---------------------------------------------------------------------------
 //
-// mig_scan_and_rewrite (above) walks raw bytes and cannot tell code from a
+// mig_ptrops_rewrite (above) walks raw bytes and cannot tell code from a
 // string literal, so on src/lexer.mlr it turns match_keyword(start, len,
 // "uint64", 6) into match_keyword(start, len, "u64", 6) -- the length
 // argument stays 6 while the literal shrinks to 3 characters, so the
@@ -1991,11 +2060,15 @@ fn mig_short_form(uint32 kind, uint64 out_p) -> uint64 {
 // Copy `source` into `out_buf_a`, replacing each scanned site with its short
 // form. Sites come back in ascending `start` order because the token stream
 // is ordered, so a single forward copy pass suffices. Returns the length of
-// the rewritten output.
+// the rewritten output; the number of sites rewritten is written to
+// `matches_out`, following the same out-param convention mig_ptrops_rewrite
+// uses -- callers that need both the size and the count (run_migration) get
+// them from one lexer pass instead of scanning twice.
 @export
-fn mig_tok_rewrite(uint64 source, uint64 src_size, uint64 out_buf_a) -> uint64 {
+fn mig_tok_rewrite(uint64 source, uint64 src_size, uint64 out_buf_a, uint64 matches_out) -> uint64 {
     uint64 sites = alloc(MIG_SITE_CAP * 8)
     uint64 n = mig_tok_scan(source, src_size, sites)
+    unsafe { *(matches_out as uint64) = n }
     uint64 src_i = 0
     uint64 out_i = 0
     uint64 s = 0
